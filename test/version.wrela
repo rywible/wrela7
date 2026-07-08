@@ -1,0 +1,3 @@
+# RUN: %wrela --version | %FileCheck %s
+
+# CHECK: wrela 0.1.0

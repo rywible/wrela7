@@ -53,3 +53,23 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# CMake and build output
+/build*/
+/cmake-build-*/
+/out/
+CMakeUserPresets.json
+compile_commands.json
+
+# Tool caches
+/.cache/
+/.ccache/
+
+# Test output
+/Testing/
+/test-results/
+
+# Local environment
+.DS_Store
+.env
+.env.*

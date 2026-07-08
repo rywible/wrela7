@@ -1,0 +1,3 @@
+# RUN: %wrela check %s | %FileCheck %s
+
+# CHECK: ok
