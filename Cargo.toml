@@ -1,0 +1,49 @@
+[workspace]
+members = [
+    "crates/wrela-backend",
+    "crates/wrela-backend-protocol",
+    "crates/wrela-cli",
+    "crates/wrela-codegen-llvm",
+    "crates/wrela-diagnostics",
+    "crates/wrela-driver",
+    "crates/wrela-hir",
+    "crates/wrela-hir-lower",
+    "crates/wrela-image-report",
+    "crates/wrela-link-efi",
+    "crates/wrela-lld-sys",
+    "crates/wrela-sema",
+    "crates/wrela-source",
+    "crates/wrela-syntax",
+    "crates/wrela-target",
+    "crates/wrela-toolchain",
+    "crates/wrela-wir",
+    "crates/wrela-wir-codec",
+    "crates/wrela-wir-lower",
+    "crates/wrela-wir-passes",
+    "xtask",
+]
+default-members = ["crates/wrela-cli"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["The wrela contributors"]
+license = "MIT"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
+
+[profile.dist]
+inherits = "release"
+lto = "fat"
+panic = "abort"

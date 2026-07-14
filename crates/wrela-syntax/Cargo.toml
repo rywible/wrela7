@@ -1,0 +1,16 @@
+[package]
+name = "wrela-syntax"
+description = "Lexer, parser, recoverable syntax tree, and syntax dumps for wrela"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-diagnostics = { path = "../wrela-diagnostics" }
+wrela-source = { path = "../wrela-source" }
+
+[lints]
+workspace = true
+

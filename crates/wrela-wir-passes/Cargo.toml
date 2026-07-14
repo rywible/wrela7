@@ -1,0 +1,18 @@
+[package]
+name = "wrela-wir-passes"
+description = "Verification and semantics-preserving whole-image transformations over WIR"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-wir = { path = "../wrela-wir" }
+
+[dev-dependencies]
+wrela-target = { path = "../wrela-target" }
+
+[lints]
+workspace = true
+

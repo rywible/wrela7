@@ -1,0 +1,19 @@
+[package]
+name = "wrela-sema"
+description = "Whole-image type, effect, ownership, region, actor, capacity, and hardware analysis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-diagnostics = { path = "../wrela-diagnostics" }
+wrela-hir = { path = "../wrela-hir" }
+wrela-target = { path = "../wrela-target" }
+
+[dev-dependencies]
+wrela-source = { path = "../wrela-source" }
+
+[lints]
+workspace = true

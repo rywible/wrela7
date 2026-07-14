@@ -1,0 +1,11 @@
+[package]
+name = "wrela-toolchain"
+description = "Discovery and validation of a self-contained wrela distribution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

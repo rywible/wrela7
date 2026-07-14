@@ -1,0 +1,15 @@
+[package]
+name = "wrela-hir"
+description = "Backend-neutral high-level representation of resolved wrela programs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-source = { path = "../wrela-source" }
+
+[lints]
+workspace = true
+

@@ -1,0 +1,20 @@
+[package]
+name = "wrela-link-efi"
+description = "Safe target-policy layer from COFF objects to final UEFI PE/COFF images"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+bundled-lld = ["wrela-lld-sys/bundled-lld"]
+
+[dependencies]
+wrela-lld-sys = { path = "../wrela-lld-sys" }
+wrela-target = { path = "../wrela-target" }
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "wrela-diagnostics"
+description = "Structured source diagnostics and why-chains for wrela"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-source = { path = "../wrela-source" }
+
+[lints]
+workspace = true
+

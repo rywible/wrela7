@@ -1,0 +1,18 @@
+[package]
+name = "wrela-hir-lower"
+description = "Desugaring and name-resolution boundary from wrela syntax to HIR"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-diagnostics = { path = "../wrela-diagnostics" }
+wrela-hir = { path = "../wrela-hir" }
+wrela-source = { path = "../wrela-source" }
+wrela-syntax = { path = "../wrela-syntax" }
+
+[lints]
+workspace = true
+

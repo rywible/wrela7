@@ -1,0 +1,25 @@
+[package]
+name = "wrela-driver"
+description = "Command orchestration for the wrela toolchain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-backend-protocol = { path = "../wrela-backend-protocol" }
+wrela-diagnostics = { path = "../wrela-diagnostics" }
+wrela-hir-lower = { path = "../wrela-hir-lower" }
+wrela-image-report = { path = "../wrela-image-report" }
+wrela-sema = { path = "../wrela-sema" }
+wrela-source = { path = "../wrela-source" }
+wrela-syntax = { path = "../wrela-syntax" }
+wrela-target = { path = "../wrela-target" }
+wrela-toolchain = { path = "../wrela-toolchain" }
+wrela-wir-codec = { path = "../wrela-wir-codec" }
+wrela-wir-lower = { path = "../wrela-wir-lower" }
+wrela-wir-passes = { path = "../wrela-wir-passes" }
+
+[lints]
+workspace = true

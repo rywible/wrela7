@@ -1,0 +1,14 @@
+[package]
+name = "wrela-wir"
+description = "Typed backend-independent whole-image intermediate representation for wrela"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-target = { path = "../wrela-target" }
+
+[lints]
+workspace = true

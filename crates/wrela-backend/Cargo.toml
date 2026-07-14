@@ -1,0 +1,28 @@
+[package]
+name = "wrela-backend"
+description = "Private LLVM and LLD backend shipped inside the wrela toolchain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+bundled-backend = ["wrela-codegen-llvm/llvm", "wrela-link-efi/bundled-lld"]
+
+[dependencies]
+wrela-backend-protocol = { path = "../wrela-backend-protocol" }
+wrela-codegen-llvm = { path = "../wrela-codegen-llvm" }
+wrela-image-report = { path = "../wrela-image-report" }
+wrela-link-efi = { path = "../wrela-link-efi" }
+wrela-target = { path = "../wrela-target" }
+wrela-wir-codec = { path = "../wrela-wir-codec" }
+wrela-wir-passes = { path = "../wrela-wir-passes" }
+
+[dev-dependencies]
+wrela-wir = { path = "../wrela-wir" }
+
+[lints]
+workspace = true
