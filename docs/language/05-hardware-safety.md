@@ -270,8 +270,8 @@ Their normative ordering is:
 5. ownership returns to the CPU only after all required acquire/invalidate work.
 
 The target library lowers these operations to the correct compiler barriers,
-CPU fences, cache maintenance, and I/O barriers. This API must work on weakly
-ordered targets; x86 behavior is not the specification.
+CPU fences, cache maintenance, and I/O barriers. The revision 0.1 AArch64 target
+is weakly ordered; a compiler may not assume stronger host ordering.
 
 A custom queue library MAY replace the standard implementation only by
 implementing the sealed target ordering interface. It cannot bypass the DMA
@@ -322,6 +322,13 @@ arbitrary shared line.
 
 The generated vector table and routing metadata come from the image graph.
 Source cannot register an ISR for an unowned vector.
+
+For the revision 0.1 target, whole-image lowering resolves each ISR's declared
+device binding to the target package's GICv3 SPI/INTID pair. MachineWir retains
+that binding, INTID, and unique no-argument handler. Codegen emits the canonical
+runtime-ABI route table sorted by INTID; the target runtime supplies the 2 KiB
+aligned exception table and dispatcher. A missing, duplicate, spurious-range,
+or package-mismatched INTID is a compiler error, not a boot-time discovery.
 
 ## 10. The `isr` color
 
@@ -398,14 +405,14 @@ The compiler reports the maximum duration of every generated
 interrupt-masked section, including ready-queue handle resolution. A target
 profile may impose a hard latency ceiling.
 
-Revision 0.1 masks the current vector on entry and forbids same-vector reentry.
-A target may support nested interrupts only when the image assigns a strict
+Revision 0.1 masks the current vector on entry, forbids same-vector reentry, and
+disables nested preemption entirely. Its target contract fixes GICv3 exception
+entry, 16-byte stack alignment, no SIMD save or ISR SIMD use, the spurious INTID
+range, and acknowledgement/masking/end-of-interrupt order. A future target may
+support nesting only with a versioned semantic/backend contract and a strict
 static priority order; only a strictly higher-priority vector may preempt, and
-the compiler includes the maximum nesting chain in ISR stack and masked-interval
-bounds. Equal/lower-priority vectors remain pending. The target contract fixes
-the ISR ABI, saved integer state, optional SIMD prohibition, per-level stack
-space, and acknowledgement/masking order. A target unable to prove these bounds
-must disable nesting.
+the compiler must then include the maximum nesting chain in ISR stack and
+masked-interval bounds. Equal/lower-priority vectors remain pending.
 
 ## 12. Bottom halves
 

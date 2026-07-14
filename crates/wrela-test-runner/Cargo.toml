@@ -1,0 +1,17 @@
+[package]
+name = "wrela-test-runner"
+description = "QEMU full-image and compiler test orchestration for wrela"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
+wrela-target = { path = "../wrela-target" }
+wrela-test-model = { path = "../wrela-test-model" }
+wrela-toolchain = { path = "../wrela-toolchain" }
+
+[lints]
+workspace = true

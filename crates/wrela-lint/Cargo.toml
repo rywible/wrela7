@@ -1,0 +1,17 @@
+[package]
+name = "wrela-lint"
+description = "Syntax, HIR, semantic, and whole-image lints for wrela"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-diagnostics = { path = "../wrela-diagnostics" }
+wrela-hir = { path = "../wrela-hir" }
+wrela-sema = { path = "../wrela-sema" }
+wrela-syntax = { path = "../wrela-syntax" }
+
+[lints]
+workspace = true

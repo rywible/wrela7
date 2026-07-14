@@ -13,10 +13,19 @@ proofs, observable scheduling contracts, and required diagnostics. Performance
 is not itself a license to weaken ownership, cancellation, DMA, ISR, fault, or
 capacity rules.
 
-## 2. Verified whole-image IR
+## 2. Verified whole-image representations
 
-The compiler lowers specialized source into a typed whole-image intermediate
-representation, called WIR in this specification. WIR retains:
+The compiler uses three named whole-image representations. They are not
+interchangeable and a successful value at one boundary cannot be substituted
+for another.
+
+`SemanticWir` is the first representation after successful semantic analysis.
+It is fully specialized and syntax-free, but retains structured language
+operations, types, effects, linearity, image topology, regions/scopes, actors,
+async/tasks, hardware transitions, tests, and proof records.
+
+`FlowWir` lowers SemanticWir into target-layout-independent typed SSA. It is the
+only serialized frontend/backend IR and retains:
 
 - concrete actor identities and logical message admissions;
 - ownership, access, region, and DMA states;
@@ -26,17 +35,24 @@ representation, called WIR in this specification. WIR retains:
 - abandonment attribution and supervisor actions; and
 - target effects, typed MMIO operations, fences, and interrupt transitions.
 
-Safety and capacity validation operates on this semantic representation, not on
+Safety and capacity validation operates on SemanticWir and FlowWir, not on
 patterns guessed from backend IR. Each transformation that changes control
 flow, ownership placement, frame storage, actor dispatch, or check placement
-MUST leave enough proof information for a WIR verifier to re-establish the
-affected invariants.
+MUST leave enough proof information for the FlowWir verifier to re-establish
+the affected invariants. Ordinary optimization remains in FlowWir; an
+intermediate representation is not renamed for each optimization pass.
+
+`MachineWir` is created only after FlowWir optimization. It fixes the AArch64
+ABI, data layout, sections, symbols, stack/frame slots, runtime intrinsic calls,
+memory semantics, and every undefined-behavior-bearing backend fact. LLVM may
+translate MachineWir and perform backend peepholes, but it is not another
+language-semantic lowering phase.
 
 The backend may receive additional proven facts such as alignment, non-aliasing,
 value ranges, and unreachable branches. It MUST NOT invent LLVM `noalias`,
 `inbounds`, non-null, alignment, overflow, or similar undefined-behavior-bearing
 claims from naming conventions or optimistic inference. Every such fact traces
-to a WIR proof.
+through a MachineWir proof to a FlowWir/semantic proof.
 
 ## 3. Closed-world specialization
 
@@ -47,14 +63,16 @@ Before target code generation, the compiler SHOULD perform:
 - constant propagation from image and target configuration;
 - removal of unreachable comptime branches and unused target paths;
 - whole-image inlining and dead code/data elimination;
-- specialization for exact declared CPU features and device modes;
+- specialization for exact target-owned CPU features and declared device modes;
 - scalar replacement, loop simplification, and proved bounds-check elimination;
   and
 - hot/cold code and data placement when declared profile guidance supports it.
 
-An exact CPU feature or profile-guidance input is part of the image build
-contract. It is hashed, reported, and reproducible. Runtime probing may select
-only among variants that were declared and bounded in the sealed image.
+The target package's exact CPU/features and every profile-guidance input are
+part of the image build contract. They are hashed, reported, and reproducible.
+Runtime device probing may select only among variants that were declared and
+bounded in the sealed image; it cannot change the compiler's CPU ABI or
+register-reservation contract.
 
 Optimization cannot be required to discover a safety bound that the semantic
 analysis lacks. For example, optional tail-call elimination does not make
@@ -154,9 +172,9 @@ The ownership model can prove facts useful to native code generation:
 
 The compiler SHOULD use these facts for scalar replacement, vectorization,
 load/store forwarding, check hoisting, and alias analysis. It may eliminate a
-bounds, generation, capacity, or arithmetic check only when WIR proves the
+bounds, generation, capacity, or arithmetic check only when FlowWir proves the
 failure case unreachable under the selected profile. Device-derived values are
-validated at their trust boundary; a validated range may then flow through WIR
+validated at their trust boundary; a validated range may then flow through FlowWir
 without redundant checks.
 
 Typed MMIO, device-shared memory, `InterruptCell` publication, and DMA ownership

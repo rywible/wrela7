@@ -1,0 +1,31 @@
+schema = 1
+
+[qemu]
+version = "10.0.11"
+source = "https://download.qemu.org/qemu-10.0.11.tar.xz"
+sha256 = "22e410fe784021c535756350a811ee78ae71356546ff90f5418493448a34b871"
+signature = "https://download.qemu.org/qemu-10.0.11.tar.xz.sig"
+signing_key_fingerprint = "CEACC9E15534EBABB82D3FA03353C9CEF108B584"
+system_targets = ["aarch64-softmmu"]
+machine_contract = "virt-10.0"
+cpu_contract = "cortex-a57"
+accelerator_contract = "tcg,thread=single"
+
+# These firmware images are the exact decompressed blobs shipped in the signed
+# QEMU source release. Distribution assembly renames them into the target
+# package and independently verifies the decompressed digests below.
+[[firmware]]
+name = "code"
+source_path = "pc-bios/edk2-aarch64-code.fd.bz2"
+compression = "bzip2"
+install_path = "targets/aarch64-qemu-virt-uefi/firmware/QEMU_EFI.fd"
+sha256 = "47765fe344818cbc464b1c14ae658fb4b854f5c2ceffa982411731eb4865594d"
+license_manifest = "pc-bios/edk2-licenses.txt"
+
+[[firmware]]
+name = "variables-template"
+source_path = "pc-bios/edk2-arm-vars.fd.bz2"
+compression = "bzip2"
+install_path = "targets/aarch64-qemu-virt-uefi/firmware/QEMU_VARS.fd"
+sha256 = "b3b855c5a80310168051164986855692d1bdb06e67619856177965cd87c6774f"
+license_manifest = "pc-bios/edk2-licenses.txt"

@@ -10,3 +10,6 @@ license.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+unicode-normalization = "0.1.25"
+wrela-build-model = { path = "../wrela-build-model" }

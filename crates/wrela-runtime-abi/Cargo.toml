@@ -1,0 +1,11 @@
+[package]
+name = "wrela-runtime-abi"
+description = "Minimal versioned compiler-owned runtime intrinsic contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "wrela-machine-wir"
+description = "Target-laid-out machine IR consumed by wrela code generation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
+wrela-runtime-abi = { path = "../wrela-runtime-abi" }
+wrela-source = { path = "../wrela-source" }
+wrela-target = { path = "../wrela-target" }
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "wrela-flow-lower"
+description = "Lowering from SemanticWir to typed SSA FlowWir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-diagnostics = { path = "../wrela-diagnostics" }
+wrela-flow-wir = { path = "../wrela-flow-wir" }
+wrela-semantic-wir = { path = "../wrela-semantic-wir" }
+
+[lints]
+workspace = true

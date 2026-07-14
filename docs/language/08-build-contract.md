@@ -142,7 +142,7 @@ The report contains at least:
 An illustrative summary might read:
 
 ```text
-wrela build appliance.image --target x86_64-uefi
+wrela build wrela.toml appliance --target aarch64-qemu-virt-uefi
   language revision ................. 0.1-design
   closed runtime declarations ....... 418
   generic instantiations ............ 67
@@ -337,8 +337,9 @@ A profile declares at least:
 - device reset time bounds and quarantine policy;
 - record/replay mode and log capacity;
 - development diagnostics/watchdogs;
-- optimization level, exact target CPU/features, and declared profile-guidance
-  inputs.
+- optimization level and declared profile-guidance inputs. The exact CPU,
+  register reservations, and backend features belong to the selected target
+  package and cannot be overridden by a profile.
 
 A “release” profile cannot disable the language's ownership, view, actor,
 checked-arithmetic, bounds, capability, ISR, or DMA rules. It may change logging,
@@ -426,7 +427,14 @@ A conforming toolchain test suite includes, at minimum:
 32. state-sensitive frame overlay with cancellation/abandonment at every state;
 33. logical versus physical mailbox accounting and actor-chatter diagnostics;
     and
-34. emitted section sizes and target-runtime reservations matching the report.
+34. emitted section sizes and target-runtime reservations matching the report;
+35. compiler-evaluated `@test comptime fn` quota/cache/failure reporting,
+    generated integration-test image isolation and bounds, declared image-test
+    scenarios, framed-event corruption/sequence/terminal rejection, boot/crash/
+    timeout/protocol failure classification, and evidence that no runtime test
+    executes through a hosted target or ambient QEMU/firmware; and
+36. AArch64 PE/COFF machine/entry/subsystem inspection plus boot under the
+    digest-pinned versioned QEMU `virt`/UEFI runner profile.
 
 The corrected virtio appliance in
 [`examples/virtio-storage.wr`](examples/virtio-storage.wr) is a required

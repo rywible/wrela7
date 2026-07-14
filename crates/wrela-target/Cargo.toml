@@ -7,6 +7,9 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
+wrela-runtime-abi = { path = "../wrela-runtime-abi" }
+
 [lints]
 workspace = true
-

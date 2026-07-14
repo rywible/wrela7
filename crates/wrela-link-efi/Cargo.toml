@@ -13,6 +13,7 @@ default = []
 bundled-lld = ["wrela-lld-sys/bundled-lld"]
 
 [dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
 wrela-lld-sys = { path = "../wrela-lld-sys" }
 wrela-target = { path = "../wrela-target" }
 

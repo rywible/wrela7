@@ -1,3 +1,7 @@
 [alias]
 xtask = "run --package xtask --"
-
+xarch = "run --package xtask -- architecture-check"
+xcheck = "run --package xtask -- check"
+xtest = "run --package xtask -- test"
+xlint = "run --package xtask -- lint"
+xfmt = "fmt --all -- --check"

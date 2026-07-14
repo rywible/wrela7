@@ -1,0 +1,16 @@
+[package]
+name = "wrela-package"
+description = "Deterministic package identities, manifests, module paths, and source graphs for wrela"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+unicode-normalization = "0.1.25"
+wrela-build-model = { path = "../wrela-build-model" }
+wrela-source = { path = "../wrela-source" }
+
+[lints]
+workspace = true

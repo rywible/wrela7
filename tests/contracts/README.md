@@ -10,7 +10,9 @@ Planned fixture families:
 syntax/       source text → syntax dump + diagnostics
 hir/          syntax fixture → normalized HIR dump + diagnostics
 sema/         hand-built/decoded HIR → analysis facts + diagnostics
-wir/          WIR input → verified/optimized WIR + proof report
+semantic-wir/ analyzed image → validated SemanticWir + exact lowering report
+flow-wir/     SemanticWir → validated/optimized FlowWir + proof/pass reports
+machine-wir/  optimized FlowWir + target → validated MachineWir + layout report
 codegen/      verified WIR → inspected COFF object
 link/         COFF object(s) → inspected and QEMU-booted .efi
 protocol/     frontend/backend compatibility and corruption cases
@@ -19,4 +21,3 @@ protocol/     frontend/backend compatibility and corruption cases
 Serialized formats are versioned. A fixture remains under its original schema
 directory when a format changes, allowing compatibility and rejection behavior
 to be tested explicitly.
-

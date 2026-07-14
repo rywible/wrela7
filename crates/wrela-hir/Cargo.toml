@@ -8,8 +8,12 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+unicode-normalization = "0.1.25"
+wrela-package = { path = "../wrela-package" }
 wrela-source = { path = "../wrela-source" }
+
+[dev-dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
 
 [lints]
 workspace = true
-

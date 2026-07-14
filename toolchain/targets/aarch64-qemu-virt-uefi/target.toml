@@ -1,0 +1,75 @@
+schema = 1
+name = "aarch64-qemu-virt-uefi"
+
+# Only this section is visible to source-language semantic analysis.
+[semantic]
+architecture = "aarch64"
+pointer_width = 64
+endianness = "little"
+uefi_revision = "2.11"
+coherent_dma = false
+iommu_available = false
+
+[semantic.interrupts]
+controller = "gic-v3"
+# Revision 0.1 proves every ISR independently and masks its current route.
+nested_preemption = false
+
+# QEMU `virt` hardware identities used by the revision 0.1 worked image.
+# SPI 16 is GIC INTID 48; the first virtio-mmio transport is at 0x0a000000.
+[semantic.platform]
+machine = "qemu-virt"
+virtio_mmio_base = 0x0a000000
+virtio_mmio_size = 0x200
+virtio_mmio_gic_spi = 16
+virtio_mmio_gic_intid = 48
+
+# This section is unavailable to semantic analysis and is opened only after
+# successful whole-image analysis.
+[backend]
+llvm_triple = "aarch64-unknown-uefi"
+llvm_data_layout = "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32"
+llvm_cpu = "cortex-a57"
+# UEFI 2.11 AArch64 binding declares X18 "do not use".
+llvm_features = ["+reserve-x18"]
+coff_machine = "arm64"
+object_format = "coff"
+image_format = "pe-coff"
+subsystem = "efi_application"
+entry = "wrela_image_entry"
+runtime_object = "runtime/wrela-runtime-aarch64.obj"
+runtime_abi_version = 1
+
+[backend.interrupts]
+controller = "gic-v3"
+vector_table_alignment = 2048
+stack_alignment = 16
+nested_preemption = false
+saves_simd = false
+# Entry reads ICC_IAR1_EL1, dispatches with PSTATE.I set, then completes through
+# ICC_EOIR1_EL1. EOImode 0 makes that write both drop priority and deactivate.
+cpu_irq_masked_during_handler = true
+eoi_deactivates = true
+# GICv3 reserves INTIDs 1020-1023 for special/spurious responses.
+spurious_global_id_minimum = 1020
+
+[backend.link]
+driver = "lld-coff"
+dynamic_linking = false
+default_libraries = false
+relocations = true
+
+# Full-image tests always execute the emitted artifact. The QEMU executable and
+# both firmware files are shipped, hashed toolchain components; ambient PATH
+# and system firmware are never consulted.
+[runner]
+emulator = "qemu-system-aarch64"
+machine = "virt-10.0,gic-version=3,secure=off"
+cpu = "cortex-a57"
+accelerator = "tcg,thread=single"
+memory_mib = 512
+virtual_cpus = 1
+firmware_code = "firmware/QEMU_EFI.fd"
+firmware_variables_template = "firmware/QEMU_VARS.fd"
+boot = "virtio-block-fat"
+test_transport = "pl011-framed"

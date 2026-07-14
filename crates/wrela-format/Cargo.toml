@@ -1,0 +1,15 @@
+[package]
+name = "wrela-format"
+description = "Canonical source formatter over the lossless wrela AST"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-source = { path = "../wrela-source" }
+wrela-syntax = { path = "../wrela-syntax" }
+
+[lints]
+workspace = true

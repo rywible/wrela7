@@ -14,15 +14,15 @@ bundled-backend = ["wrela-codegen-llvm/llvm", "wrela-link-efi/bundled-lld"]
 
 [dependencies]
 wrela-backend-protocol = { path = "../wrela-backend-protocol" }
+wrela-build-model = { path = "../wrela-build-model" }
 wrela-codegen-llvm = { path = "../wrela-codegen-llvm" }
+wrela-flow-opt = { path = "../wrela-flow-opt" }
+wrela-flow-wir = { path = "../wrela-flow-wir" }
+wrela-flow-wir-codec = { path = "../wrela-flow-wir-codec" }
 wrela-image-report = { path = "../wrela-image-report" }
 wrela-link-efi = { path = "../wrela-link-efi" }
+wrela-machine-lower = { path = "../wrela-machine-lower" }
 wrela-target = { path = "../wrela-target" }
-wrela-wir-codec = { path = "../wrela-wir-codec" }
-wrela-wir-passes = { path = "../wrela-wir-passes" }
-
-[dev-dependencies]
-wrela-wir = { path = "../wrela-wir" }
 
 [lints]
 workspace = true

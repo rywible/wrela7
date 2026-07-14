@@ -1,0 +1,16 @@
+[package]
+name = "wrela-package-loader"
+description = "Hermetic manifest, lockfile, and source graph loading for wrela"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
+wrela-package = { path = "../wrela-package" }
+wrela-source = { path = "../wrela-source" }
+
+[lints]
+workspace = true

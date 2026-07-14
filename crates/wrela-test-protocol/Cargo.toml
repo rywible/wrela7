@@ -1,0 +1,14 @@
+[package]
+name = "wrela-test-protocol"
+description = "Bounded checksummed host/guest protocol for full-image tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-test-model = { path = "../wrela-test-model" }
+
+[lints]
+workspace = true

@@ -341,11 +341,16 @@ inversion, and masked-interrupt bounds. Final physical frame and mailbox sizes
 are determined from these proofs in phase 7. Unprovable required bounds fail
 here.
 
-### Phase 7: optimize and lay out the image
+### Phase 7: lower, optimize, and lay out the image
 
-The compiler performs semantics-preserving whole-image WIR optimization,
-including required state-sensitive frame layout, mailbox representation,
-continuation forwarding, and proved actor fast paths. It then places static
+The compiler first seals `SemanticWir`, preserving specialized language
+operations and proofs, then lowers it to target-independent typed-SSA
+`FlowWir`. Semantics-preserving whole-image optimization remains in FlowWir and
+produces a separately sealed optimized value. The compiler then lowers to
+AArch64 `MachineWir`, fixing ABI, data layout, stack/frame objects, sections,
+runtime intrinsics, and proof-bearing backend facts. Required state-sensitive
+frame layout, mailbox representation, continuation forwarding, and proved actor
+fast paths are recorded as optimization/layout decisions. It then places static
 objects, generated runtime tables, baked artifacts, zero-filled reservations,
 task frames, stacks, mailboxes, and pool backing memory. It produces a read-only
 `ImageReport` that exposes the optimized physical layout and its logical source
@@ -383,11 +388,110 @@ generation, and shader preprocessing are appropriate comptime uses. Very large
 artifact generation belongs in the hermetic build system and enters comptime as
 a declared hashed input.
 
-## 12. Bootable output
+## 12. Tests
 
-The reference revision 0.1 target is an x86-64 PE32+ UEFI application. The
-worked virtio-MMIO appliance uses the separate conforming
-`aarch64_qemu_virt_uefi` target because QEMU's `virt` platform defines its first
+Revision 0.1 has three test forms but only two execution semantics.
+
+A zero-argument `@test comptime fn` is a pure unit test. The compiler evaluates
+it with the ordinary comptime evaluator, target semantics, quotas, dependency
+tracking, and cache identity. A returned `Err`, failed assertion, evaluator
+failure, or quota exhaustion is a test failure with its source and evaluator
+stack. A unit test cannot perform runtime I/O, access image capabilities, read
+ambient host state, or introduce a special test-only comptime effect.
+
+A zero-argument `@test fn` or `@test async fn` is an integration test. The
+compiler constructs a generated, bounded `@image` harness containing the
+selected tests and the same runtime/standard-library/target semantics as an
+ordinary image. Each test has a statically allocated activation, stack/frame,
+event, output, and timeout bound. The harness reports assertion/log/terminal
+events through the compiler-owned test runtime intrinsic; it is not a hosted
+executable and cannot call host libraries.
+
+An image test is declared in `wrela.toml`. It selects an existing declared
+`@image` root, a host scenario, finite boot/shutdown/event/output time and size
+bounds, and an optional deterministic seed. It tests boot, image wiring,
+drivers, scheduling, teardown, and protocol behavior without changing the image
+language semantics.
+
+Discovery produces one canonical, build-bound plan. Test IDs, scenario IDs,
+and independently compiled image-group IDs are dense within that plan;
+generated runtime tests additionally carry a fixed-size content identity for
+the exact monomorphized function. The plan retains finite ceilings for test and
+group counts, scenario steps, plan/report payload, events, process output, and
+wall-clock execution. Compilation and reporting consume the sealed plan rather
+than reconstructing selection from display names.
+
+The scenario is a declared, digest-bound, schema-versioned TOML input returned
+by package loading and included in the source-graph identity. Revision 0.1
+scenario steps may send or expect bounded framed PL011 bytes, expect a typed
+test event, expect emulator exit, or request bounded shutdown. Every wait has a
+nonzero host timeout. Scenario waits do not advance, replace, or redefine guest
+language time; the process executor applies them to the live QEMU session.
+
+The canonical scenario schema is closed: unknown keys, duplicate keys, unknown
+step kinds, invalid hex, empty byte sequences, zero waits, and trailing data are
+errors. Wait budgets use checked addition. A scenario must observe either one
+`run-finished` event or one final process exit; it cannot perform another action
+after exit, and a referenced test ID must belong to the consuming image group.
+A representative scenario is:
+
+```toml
+schema = 1
+name = "boots-and-serves"
+
+[[step]]
+kind = "expect-test-event"
+event = "run-started"
+timeout_ns = 30000000000
+
+[[step]]
+kind = "send-serial"
+bytes_hex = "70696e670a"
+
+[[step]]
+kind = "expect-serial"
+bytes_hex = "706f6e670a"
+timeout_ns = 1000000000
+
+[[step]]
+kind = "request-shutdown"
+timeout_ns = 5000000000
+
+[[step]]
+kind = "expect-exit"
+code = 0
+timeout_ns = 5000000000
+```
+
+`event` is one of `run-started`, `test-started`, `log`, `assertion-failed`,
+`test-finished`, `heartbeat`, or `run-finished`. An event step may additionally
+name a discovered test ID and a nonempty message substring where that event has
+text. Steps execute in file order. The codec enforces manifest and per-step byte
+limits before constructing a test plan.
+
+Both runtime forms compile and link an ordinary AArch64 UEFI application and
+boot it under the complete runner contract of
+`aarch64-qemu-virt-uefi`. The target contract pins the versioned QEMU `virt`
+machine, CPU, TCG policy, vCPU/memory configuration, UEFI firmware, boot medium,
+and PL011 transport. The emulator, firmware, target runtime, target package, and
+test image are digest-checked build/test inputs. A toolchain cannot substitute a
+hosted target, native host execution, a mock standard library, or a second
+runtime semantics for an integration or image test.
+
+Guest/compiler events use one versioned, bounded, checksummed frame format with
+strictly increasing sequence numbers and exactly one terminal run event. The
+host distinguishes assertion/test failure from discovery, compile, link, boot,
+timeout, crash, protocol, and shutdown infrastructure failure. Missing QEMU or
+firmware is an infrastructure error, never an implicit skip or pass. The test
+report records image, complete target-package (including firmware), emulator,
+invocation, and event-stream digests.
+
+## 13. Bootable output
+
+The revision 0.1 target set contains only the
+`aarch64-qemu-virt-uefi` ARM64 PE/COFF UEFI full-image target (spelled
+`Target.aarch64_qemu_virt_uefi` in source). The worked virtio-MMIO appliance
+uses QEMU's `virt` platform, whose first
 transport at 0x0a000000 with SPI 16 (GIC INTID 48 / 0x30). Addresses and IRQs
 belong to a target package and cannot be copied across machine profiles. Other
 targets may conform if they implement the same language invariants.
@@ -419,7 +523,7 @@ runtime boot operations.
 A poll-mode build contains no unused ISR/vector path for that device. A sealed
 enum branch eliminated by comptime contributes no code or static data.
 
-## 13. Compiler, target, and library boundary
+## 14. Compiler, target, and library boundary
 
 The language/compiler is responsible for:
 

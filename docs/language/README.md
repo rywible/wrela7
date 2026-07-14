@@ -2,7 +2,7 @@
 
 **Status:** design specification, revision 0.1
 
-**Target profile:** sealed, single-core, bootable appliance images
+**Target profile:** sealed, single-core, AArch64 bootable appliance images
 
 wrela is a statically typed, Python-shaped systems language whose compilation
 unit is a machine image. A build closes over the image manifest, every actor and
@@ -28,7 +28,7 @@ request, public effects are visible, and modules and build phases are defined.
 5. [Hardware safety](05-hardware-safety.md) — capabilities, MMIO, DMA, queues,
    interrupts, polling, and reset.
 6. [Comptime and images](06-comptime-and-images.md) — compile-time evaluation,
-   image construction, specialization, phases, and boot.
+   image construction, specialization, phases, tests, and boot.
 7. [Faults and reliability](07-faults-and-reliability.md) — recoverable errors,
    abandonment, supervision, deterministic replay, and deployment consequences.
 8. [Build contract](08-build-contract.md) — required analyses, diagnostics,
@@ -79,7 +79,25 @@ requires a language or target-package revision recorded in the image report.
 - [IEEE 754-2019](https://standards.ieee.org/ieee/754/6210/) for
   binary32/binary64 operations, narrowed by chapter 02's canonical-NaN and
   no-fast-math rules.
-- [UEFI 2.11](https://uefi.org/specs/UEFI/2.11/) for the reference boot target.
+- [UEFI 2.11](https://uefi.org/specs/UEFI/2.11/) for the AArch64 reference target.
+- [AAPCS64 2025Q4](https://github.com/ARM-software/abi-aa/releases/tag/2025Q4)
+  for the AArch64 procedure-call standard, narrowed by the target package's
+  explicit UEFI entry convention.
+- LLVM 22.1.3's pinned
+  [target-triple mapping](https://github.com/llvm/llvm-project/blob/llvmorg-22.1.3/llvm/lib/TargetParser/Triple.cpp#L970-L984)
+  maps the UEFI OS to COFF, while its pinned
+  [AArch64 call lowering](https://github.com/llvm/llvm-project/blob/llvmorg-22.1.3/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp#L8313-L8351)
+  selects AAPCS for non-Windows targets. The direct LLVM backend therefore uses
+  `aarch64-unknown-uefi`; it does not depend on Clang's separate UEFI frontend.
+  The target additionally applies LLVM's `+reserve-x18` feature because UEFI
+  2.11 section 2.3.6.4 requires X18 to remain unused.
+- Microsoft's [PE/COFF format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format)
+  for ARM64 COFF objects and PE32+ images; the checked-in target package pins
+  the accepted header, subsystem, relocation, and entry policy.
+- QEMU's [AArch64 `virt` machine contract](https://www.qemu.org/docs/master/system/arm/virt)
+  as realized by the bundled, digest-pinned QEMU release. The target uses the
+  versioned `virt-10.0` machine and explicit `cortex-a57` CPU rather than moving
+  `virt` or `max` aliases.
 - [Virtio 1.2 Committee Specification 01](https://docs.oasis-open.org/virtio/virtio/v1.2/cs01/virtio-v1.2-cs01.html)
   for the standard virtio transport/queue contracts. Virtio 1.3 is not silently
   included because its published latest stage is a committee-specification

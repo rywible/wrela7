@@ -2,24 +2,38 @@
 members = [
     "crates/wrela-backend",
     "crates/wrela-backend-protocol",
+    "crates/wrela-build-model",
     "crates/wrela-cli",
     "crates/wrela-codegen-llvm",
+    "crates/wrela-compiler",
     "crates/wrela-diagnostics",
     "crates/wrela-driver",
+    "crates/wrela-flow-lower",
+    "crates/wrela-flow-opt",
+    "crates/wrela-flow-wir",
+    "crates/wrela-format",
     "crates/wrela-hir",
     "crates/wrela-hir-lower",
     "crates/wrela-image-report",
     "crates/wrela-link-efi",
     "crates/wrela-lld-sys",
+    "crates/wrela-lint",
+    "crates/wrela-machine-lower",
+    "crates/wrela-machine-wir",
+    "crates/wrela-package",
+    "crates/wrela-package-loader",
+    "crates/wrela-runtime-abi",
     "crates/wrela-sema",
+    "crates/wrela-semantic-wir",
+    "crates/wrela-semantic-lower",
     "crates/wrela-source",
     "crates/wrela-syntax",
     "crates/wrela-target",
+    "crates/wrela-test-model",
+    "crates/wrela-test-protocol",
+    "crates/wrela-test-runner",
     "crates/wrela-toolchain",
-    "crates/wrela-wir",
-    "crates/wrela-wir-codec",
-    "crates/wrela-wir-lower",
-    "crates/wrela-wir-passes",
+    "crates/wrela-flow-wir-codec",
     "xtask",
 ]
 default-members = ["crates/wrela-cli"]
@@ -37,6 +51,16 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 all = "warn"
+
+[profile.dev]
+# Line tables preserve useful backtraces while avoiding the compile/link cost
+# and disk churn of full local-variable debug information.
+debug = "line-tables-only"
+incremental = true
+
+[profile.test]
+debug = "line-tables-only"
+incremental = true
 
 [profile.release]
 codegen-units = 1

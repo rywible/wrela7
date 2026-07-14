@@ -1,0 +1,15 @@
+[package]
+name = "wrela-flow-wir-codec"
+description = "Canonical bounded frontend/backend serialization for FlowWir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
+wrela-flow-wir = { path = "../wrela-flow-wir" }
+
+[lints]
+workspace = true

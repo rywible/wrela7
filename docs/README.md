@@ -10,3 +10,5 @@ Implementation documentation:
 
 - [`toolchain-architecture.md`](toolchain-architecture.md) defines the compiler
   workspace and the self-contained distribution contract.
+- [`crate-contracts.md`](crate-contracts.md) defines every crate's public
+  boundary and the dependency graph enforced by `cargo xtask architecture-check`.

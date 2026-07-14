@@ -12,6 +12,8 @@ name = "wrela"
 path = "src/main.rs"
 
 [dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
+wrela-compiler = { path = "../wrela-compiler" }
 wrela-driver = { path = "../wrela-driver" }
 
 [lints]

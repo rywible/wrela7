@@ -1,0 +1,15 @@
+[package]
+name = "wrela-test-model"
+description = "Compiler and full-image test plan, event, and result contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
+wrela-source = { path = "../wrela-source" }
+
+[lints]
+workspace = true

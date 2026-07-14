@@ -1,0 +1,19 @@
+[package]
+name = "wrela-machine-lower"
+description = "Target layout and runtime lowering from FlowWir to MachineWir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
+wrela-flow-opt = { path = "../wrela-flow-opt" }
+wrela-flow-wir = { path = "../wrela-flow-wir" }
+wrela-machine-wir = { path = "../wrela-machine-wir" }
+wrela-runtime-abi = { path = "../wrela-runtime-abi" }
+wrela-target = { path = "../wrela-target" }
+
+[lints]
+workspace = true

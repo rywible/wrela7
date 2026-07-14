@@ -1,257 +1,279 @@
 # Toolchain architecture
 
-Status: implementation architecture for the revision 0.1 compiler.
+This document describes the installed compiler and distribution. Exact Rust
+crate inputs, outputs, and dependency edges are normative in
+[Compiler crate contracts](crate-contracts.md).
 
-## Product contract
+## 1. Installation model
 
-An installed wrela release is a **toolchain**, not a compiler frontend that asks
-the host to supply missing pieces. A user can unpack or install one supported
-host archive and run `wrela build` without installing Rust, LLVM, LLD, a C++
-compiler, CMake, or Ninja. The toolchain does not find `llvm-config`, `lld`, or
-an LLVM shared library through `PATH` or another global search path.
-
-Self-contained means one atomic directory tree, not necessarily one executable
-file. Keeping private components as separate processes gives better crash
-containment and lets commands such as `wrela check` start without mapping LLVM.
-The public command discovers the installation root relative to its own
-executable. `WRELA_TOOLCHAIN_ROOT` exists only as an explicit development and
-test override.
-
-The initial release layout is:
+Wrela is one atomic, content-addressed toolchain. The public executable never
+searches `PATH` for LLVM, LLD, QEMU, firmware, a runtime, targets, or the
+standard library.
 
 ```text
-wrela-<release>-<host>/
+<root>/
 ├── bin/
-│   └── wrela[.exe]
+│   └── wrela
 ├── libexec/wrela/
-│   └── wrela-backend[.exe]
-└── share/
-    ├── licenses/
-    │   ├── wrela/
-    │   ├── llvm/
-    │   └── ...
-    └── wrela/
-        ├── toolchain.toml
-        ├── std/
-        └── targets/
-            └── x86_64-uefi/
+│   ├── wrela-backend
+│   └── qemu-system-aarch64
+├── share/wrela/
+│   ├── toolchain.toml
+│   ├── std/
+│   ├── licenses/
+│   └── targets/
+│       └── aarch64-qemu-virt-uefi/
+│           ├── target.toml
+│           ├── firmware/
+│           │   ├── QEMU_EFI.fd
+│           │   └── QEMU_VARS.fd
+│           └── runtime/
+│               └── wrela-runtime-aarch64.obj
+└── VERSION
 ```
 
-`share/wrela/toolchain.toml` is generated during packaging. It records a schema
-version, frontend/backend protocol version, release and host triples, LLVM and
-LLD revisions, supported targets, and hashes of shipped components. `wrela
-doctor` validates the manifest and component hashes. A release is installed or
-updated as a whole; mixing a frontend and backend from different releases is an
-error.
+`WRELA_TOOLCHAIN_ROOT` is an explicit development/test override. Production
+discovery derives `<root>` from `<root>/bin/wrela`. Each shipped component and
+target has an exact digest in `toolchain.toml`; the compiler, backend protocol,
+SemanticWir/FlowWir/MachineWir model versions, FlowWir wire format, runtime ABI,
+build-profile/target/report/test-plan/test-report/scenario schemas, test
+event/frame versions, language revision, standard library, target, firmware,
+and emulator compatibility are checked before a build or test starts.
+The driver hashes every declared path and seals a `VerifiedToolchain`; backend
+and test consumers cannot accept discovery paths or a merely decoded manifest.
 
-## Workspace boundaries
+## 2. AArch64-only full-image target
 
-The workspace uses crates to enforce the independently workable layer boundaries
-of the compiler. A layer owns its output model; a separate transformation crate
-owns conversion when keeping that conversion out of the model prevents a
-dependency inversion. Every layer can be exercised with hand-built input
-fixtures without constructing the layers before it.
+Revision 0.1 ships only `aarch64-qemu-virt-uefi`. It emits an ARM64 PE/COFF UEFI
+application with the `aarch64-unknown-uefi` LLVM triple and LLD COFF
+`/machine:arm64`. There is no hosted target and no x86 target.
 
-| Crate | Responsibility | LLVM-linked |
-|---|---|---:|
-| `wrela-cli` | Thin public command, argument handling, exit status | No |
-| `wrela-driver` | Build session and phase orchestration | No |
-| `wrela-source` | Stable file IDs, source text, byte ranges, and spans | No |
-| `wrela-diagnostics` | Structured diagnostics, labels, why-chains, and repair notes | No |
-| `wrela-syntax` | Lexer, recoverable parser, syntax tree, and syntax dumps | No |
-| `wrela-hir` | Pure normalized high-level source model | No |
-| `wrela-hir-lower` | Desugaring and name resolution from syntax to HIR | No |
-| `wrela-sema` | Types, effects, ownership, regions, actors, async, capacity, and hardware proofs | No |
-| `wrela-target` | Validated host-independent target package contract | No |
-| `wrela-wir` | Pure typed whole-image IR model | No |
-| `wrela-wir-lower` | Analyzed-image to WIR lowering | No |
-| `wrela-wir-passes` | WIR verifier, specialization, layout, and semantic optimizations | No |
-| `wrela-wir-codec` | Deterministic versioned WIR serialization | No |
-| `wrela-image-report` | Machine-readable report schema and readable rendering | No |
-| `wrela-codegen-llvm` | Verified WIR to LLVM and COFF through private Inkwell | Yes, feature-gated |
-| `wrela-lld-sys` | Raw unsafe C ABI boundary to the pinned LLD C++ shim | LLD only |
-| `wrela-link-efi` | Safe target-owned COFF-to-UEFI link policy | LLD only |
-| `wrela-backend-protocol` | Versioned private process request/response and artifact contract | No |
-| `wrela-toolchain` | Bundle discovery, target/standard-library lookup, integrity checks | No |
-| `wrela-backend` | Private composition process for codec, verifier, codegen, linker, and report | Transitively |
-| `xtask` | Maintainer-only LLVM build, licensing, packaging, release QA | No |
+The target package contains three separated contracts:
 
-The enforced dependency flow is:
+- semantic: AArch64, 64-bit little-endian pointers, UEFI 2.11, DMA/IOMMU facts,
+  and target-owned MMIO/GIC identities;
+- backend: LLVM/COFF identity, entry/subsystem, safe linker policy, the target
+  runtime object/runtime ABI, and exact GICv3 exception-entry/vector/stack/SIMD
+  policy; its CPU/features are fixed to
+  `cortex-a57,+reserve-x18`, matching QEMU and UEFI's X18 prohibition;
+- runner: a versioned QEMU `virt` machine, `cortex-a57`, deterministic TCG,
+  memory/vCPU count, firmware components, virtio FAT boot medium, and framed
+  PL011 test transport.
+
+The QEMU `virt` machine type is versioned in the target instead of using the
+moving `virt` alias. The QEMU binary and both firmware files are shipped and
+digest-checked, so a developer's installed emulator or firmware cannot alter a
+test.
+
+## 3. Compilation pipeline
 
 ```text
-wrela-source
-    ├──→ wrela-diagnostics
-    └──→ wrela-syntax
-             ↓
-      wrela-hir-lower → wrela-hir
-                              ↓
-                         wrela-sema ← wrela-target
-                              ↓
-                       wrela-wir-lower
-                              ↓
-                         wrela-wir
-                         ├──────────────→ wrela-wir-codec
-                         └──────────────→ wrela-wir-passes
-                                                   ↓
-                                      wrela-codegen-llvm → COFF
-                                                   ↓
-                       wrela-lld-sys ← wrela-link-efi → .efi
+manifest/lock/package provider
+  -> immutable source graph
+  -> lossless typed AST
+  -> resolved normalized HIR
+  -> whole-image semantic fixed point
+  -> SemanticWir
+  -> FlowWir typed SSA
+  -> canonical private FlowWir bytes
+  -> private backend revalidation
+  -> optimized FlowWir
+  -> AArch64 MachineWir
+  -> LLVM AArch64 COFF
+  -> generated object + target runtime object
+  -> LLD ARM64 EFI image
+  -> measured canonical image report
 ```
 
-The data crates (`source`, `hir`, `target`, `wir`, and `image-report`) do not
-depend on the transformation that produces or consumes them. For example,
-`wrela-wir` cannot depend on semantic lowering, verification, serialization, or
-LLVM. This keeps models constructible in unit tests and prevents a backend type
-from leaking upstream.
+### Frontend process boundary
 
-`wrela-sema` is intentionally one crate. Type, effect, ownership, region, actor,
-async, capacity, and hardware analyses are expected to participate in a shared
-fixed point. They begin as internal modules and split only when a real acyclic
-contract emerges. The same rule keeps the lexer and parser together in
-`wrela-syntax` and the individual WIR transformations together in
-`wrela-wir-passes`.
+`wrela-compiler` is the production composition root. It owns package
+acquisition, source input, syntax, HIR, semantic analysis, SemanticWir/FlowWir
+lowering, FlowWir serialization, diagnostics, cache decisions, test-group
+fan-out, and the private backend process lifetime. `wrela-driver` owns only the
+stable public command/event/outcome vocabulary. The composition root writes
+inputs under a private per-build directory and sends only controlled relative
+paths in the backend protocol.
 
-All language-level safety and capacity properties are established and
-re-verified in WIR before LLVM sees the program. Backend IR receives only proven
-alignment, range, aliasing, and reachability facts. This prevents
-backend-specific conveniences from becoming the de facto language semantics.
+The frontend/backend boundary is `ValidatedFlowWir`. The message and FlowWir
+frames have separate exact versions and limits. The backend compares the
+embedded `BuildIdentity` with the request, re-hashes the exact canonical frame
+against the request digest, and independently validates every IR reference and
+invariant before optimization or LLVM initialization.
 
-### Layer contract rules
+### Three named representations
 
-Each boundary follows these rules:
+`SemanticWir` is structured, specialized language semantics: ownership, actors,
+async, regions, complete scope/cleanup plans, hardware transitions, image graph,
+source summary, startup/shutdown order, and proofs are still source-shaped.
 
-1. IDs and owned data cross a layer; Rust references into another layer's
-   private storage do not.
-2. Recoverable frontend stages return a best-effort value plus structured
-   diagnostics, allowing language tooling to continue after errors.
-3. A `VerifiedModule` can be constructed only by `wrela-wir-passes`; LLVM
-   codegen accepts that wrapper instead of arbitrary WIR.
-4. Serialized WIR and backend messages carry explicit format/protocol versions
-   and reject unknown versions rather than guessing compatibility.
-5. Inkwell and LLVM types never appear in a public signature outside
-   `wrela-codegen-llvm`.
-6. Raw LLD declarations and unsafe FFI remain in `wrela-lld-sys`; target flags
-   and safe linker policy remain in `wrela-link-efi`.
-7. The driver is the frontend composition root and the private backend is the
-   backend composition root. Neither is a second home for phase logic.
+`FlowWir` is target-layout-independent typed SSA. Control flow, state machines,
+cleanup, admission, scheduling, logical capacity, checkpoints, hardware effects,
+test-harness emission, source/report facts, and proof IDs are explicit. Ordinary
+optimization stays in FlowWir and produces a sealed `OptimizedFlowWir`; passes
+do not create arbitrary new IR names.
 
-Every layer gets deterministic text or binary dumps, small fixture builders,
-and contract tests runnable with `cargo test -p <crate>`. Checked-in boundary
-fixtures will let syntax, semantic, WIR, LLVM, and linking work proceed without
-waiting for the preceding stage to be implemented.
+`MachineWir` fixes the AArch64 ABI, data layout, stack/frame slots, sections,
+symbols, memory semantics, runtime calls, and every undefined-behavior-bearing
+fact. LLVM performs a mechanical translation of validated MachineWir.
 
-## Build pipeline
+Every transition receives explicit resource policy. Besides arena and
+instruction counts, seals bound aggregate variable-length edges, UTF-8/binary
+payload, recursive depth, diagnostics, optimizer reports, object/map/image
+measurements, and canonical report bytes. The composition root rejects drift
+between frontend/backend FlowWir limits and between semantic/test-plan limits.
 
-```text
-source graph
-    → source database
-    → recoverable syntax
-    → desugared and resolved HIR
-    → type/effect/access/region/actor/hardware analysis
-    → closed-world specialization and capacity analysis
-    → typed WIR
-    → verify and optimize WIR
-    → serialize WIR and launch private backend
-    → decode and re-verify WIR
-    → Inkwell/LLVM code generation
-    → COFF object(s)
-    → embedded LLD COFF driver
-    → PE/COFF .efi + machine-readable image report
-```
+## 4. Runtime boundary
 
-The frontend serializes versioned WIR into a per-build directory and launches
-the backend by its exact path under `libexec/wrela`. The first exchange checks
-the protocol and compiler build identity. Requests and responses use a framed,
-length-delimited format; stdout is not the protocol, so diagnostics and crash
-reports cannot corrupt it. Backend inputs are content-addressed to support
-future incremental reuse while preserving the full-image semantic boundary.
+Most scheduling, actor, state-machine, region, and cleanup behavior is generated
+as ordinary MachineWir. The target runtime object implements only the closed
+compiler-owned `wrela-runtime-abi` surface:
 
-The process boundary is an implementation detail. The toolchain still behaves
-as one product and `wrela build` owns diagnostics, cleanup, and the final report.
+- UEFI image entry/exit and fatal termination;
+- CPU idle and local interrupt mask/restore;
+- proved DMA cache maintenance;
+- deterministic record/replay event transfer; and
+- full-image test event/terminal transfer.
 
-## LLVM and Inkwell
+Source cannot name these intrinsics. Each MachineWir module records its sorted
+requirements. The linker requires exactly one runtime object whose target digest
+and ABI version match the target package. No default or dynamic library is
+allowed.
 
-The initial backend uses Rust with Inkwell over one pinned LLVM 22.1 release.
-Only `wrela-codegen-llvm` depends on Inkwell. Its dependency is exact, disables
-Inkwell's default all-target feature, and enables only
-`llvm22-1-force-static` plus `target-x86`. The feature is off for ordinary
-workspace development and enabled only while building the bundled backend
-against the private LLVM prefix. An unconstrained system LLVM feature is not
-permitted in distribution builds.
+## 5. LLVM and LLD isolation
 
-LLVM and LLD come from the same pinned `llvm-project` source release. Maintainer
-builds enable the `lld` project and only the LLVM targets wrela can emit. The
-revision 0.1 reference target needs X86; AArch64 is added when its UEFI target is
-implemented. Clang, LLDB, MLIR, Polly, examples, tests, and developer tools are
-not release components.
+The public crates build without LLVM. `wrela-codegen-llvm` enables Inkwell only
+through its private `llvm` feature. It builds only LLVM's AArch64 target with
+the statically pinned LLVM/LLD revision. X86, Clang, LLDB, MLIR, Polly, examples,
+tests, and developer tools are not release components.
 
-We start with static LLVM linkage for every host. This gives one uniform model,
-avoids finding a shared LLVM at runtime, and follows LLVM's distribution advice
-for performance. It makes `wrela-backend` large, but the public CLI remains
-small and LLVM is mapped only during code generation. A private shared `libLLVM`
-may later be evaluated for POSIX archive size, but it is not the initial design:
-LLVM's monolithic dylib is not supported on Windows and has a documented
-performance cost.
+Inkwell/LLVM contexts, modules, values, target machines, and error handles stay
+inside `wrela-codegen-llvm`. Raw LLD arguments and native FFI stay inside
+`wrela-link-efi`/`wrela-lld-sys`. The safe linker constructs the complete fixed
+policy: ARM64 machine, EFI subsystem and entry, no default libraries,
+reproducible mode, explicit outputs, generated objects, and one target runtime.
+It requires a deterministic map and a bounded inspector to re-open the emitted
+PE32+ image, verify ARM64/EFI/entry/relocation facts, hash the bytes, and return
+canonical final section/symbol measurements before link success is sealed.
 
-Inkwell does not expose LLD's driver as a stable Rust API. A very small C++ shim
-owned by `wrela-lld-sys` will expose a narrow C ABI and call LLD's supported
-library entry point (`lldMain`) with only the COFF driver linked. This is the one
-intentional C++ island in the project. `wrela-link-efi` is its safe Rust policy
-layer, contains no LLVM dependency, and can be tested from checked-in COFF
-fixtures without code generation.
+LLVM attributes such as `noalias`, `inbounds`, non-null, alignment, and overflow
+flags may be emitted only from proof-bearing MachineWir facts. Backend
+peepholes cannot justify a language-level proof or a hard image bound.
 
-## Producing `.efi`
+## 6. Test architecture
 
-We do need a linker operation, but we do not need a separately installed linker
-or even a separately shipped `lld` executable. LLVM emits one or more COFF
-objects. The backend then invokes the statically linked LLD COFF driver in
-process with the selected target package's entry point, subsystem, section,
-alignment, relocation, and library policy. Its output is the final UEFI PE/COFF
-application.
+There are three user test forms and two execution mechanisms:
 
-Keeping the link step is valuable even for a sealed image: it resolves symbols,
-lays out sections, applies relocations, performs compatible dead stripping and
-identical-code folding, and writes a standards-conforming PE/COFF image. Writing
-our own PE/COFF linker would add a large correctness and reproducibility burden
-without improving the language.
+1. `@test comptime fn` is a pure unit test executed by the same finite compiler
+   evaluator used for comptime.
+2. `@test fn` or `@test async fn` is an integration test linked into a generated
+   full-image harness.
+3. A manifest image test selects a declared `@image` root, a host scenario, a
+   deterministic seed when needed, and finite boot/shutdown/output/event limits.
 
-The target package, not source code or ambient host configuration, owns all LLD
-flags. Distribution tests inspect the resulting PE/COFF headers and boot it in
-UEFI/QEMU. We should also keep the pre-link object and linker response file when
-requested by a developer diagnostics flag.
+Discovery returns a `ValidatedTestPlan` with dense group IDs and fixed-size
+content-addressed monomorphized function keys. The plan retains the exact limit
+policy used to seal it. Each runtime group is compiled independently from its
+declared image root or compiler-generated harness root, but remains bound to
+the same build/target identity. Report sealing rechecks per-event, per-group,
+and whole-report payload limits from that plan.
 
-## Building and packaging the private backend
+Both runtime forms run the emitted AArch64 EFI image under the target's QEMU
+profile. They do not use a hosted standard library, host calls, or a second
+runtime semantics. The compiler and guest emit one stable framed event schema;
+the host rejects sequence gaps, corruption, overflow, missing/duplicate terminal
+events, undeclared tests, and infrastructure failures.
 
-LLVM is not downloaded from a Cargo build script. `cargo xtask llvm` will:
+Before QEMU starts, the executor reverifies its program and hashes the sealed
+EFI artifact, firmware code, and firmware-variable template while copying them
+to distinct private per-run paths. The EFI and code copies are read-only; only
+the variable-store copy is writable. A stale digest/size never launches QEMU,
+and a run cannot mutate the shipped toolchain installation.
 
-1. read `toolchain/llvm.lock.toml`;
-2. download the exact source archive into a content-addressed cache;
-3. verify its cryptographic hash and, in release CI, its upstream attestation;
-4. configure a release LLVM + LLD build with CMake and Ninja;
-5. install the private headers and static libraries into a host-specific prefix;
-6. build `wrela-backend` against only that prefix; and
-7. record the effective CMake configuration and source identities.
+The final test report separates assertion/test outcomes from discovery,
+compile, link, boot, runtime, shutdown, timeout, crash, and protocol failures.
+Reproducibility evidence records image, firmware, emulator, invocation, and
+event-stream digests when those stages occurred; it never fabricates an image
+or invocation identity for a pre-link failure.
 
-Developers therefore need a C++ build toolchain, CMake, and Ninja only when
-building the backend from source. Ordinary frontend development and workspace
-tests do not. End users need none of them.
+## 7. Reproducible package and build inputs
 
-`cargo xtask dist` will construct a clean staging tree, copy the public and
-private binaries, standard library, target packages, generated manifest, and
-all third-party license notices, then test from that tree with `PATH` cleared of
-LLVM tools. It rejects dynamic references outside the operating system's base
-runtime and checks that an absent system LLVM/LLD cannot change output.
+`wrela.toml` declares the package identity, language revision, explicit module
+paths, dependency aliases/requirements, finite build profiles, full images, and
+image-test scenarios. `wrela.lock` fixes the complete package closure by
+identity, locator, manifest digest, source digest, and exact dependency edges.
 
-## Release hosts and targets
+The compiler composition root injects the only package provider and SHA-256
+implementation. The loader rejects undeclared or missing sources/scenarios and produces one
+source-graph digest over canonical lockfile bytes, manifests, and canonical
+source/scenario package-path-digest tuples. Filesystem walks and implicit
+registry/network resolution are forbidden.
 
-Host and emitted target are separate concepts. A host archive contains native
-toolchain executables; its target packages describe machines the compiler can
-emit. The first target is `x86_64-uefi`. The release matrix can grow across
-macOS arm64/x86_64, Linux x86_64/aarch64, and Windows x86_64 without changing
-source semantics.
+`BuildIdentity` binds compiler, language revision, target identity/package,
+standard library, source graph, canonical profile, and a canonical request
+digest covering the selected image, command intent, and test selection. A
+multi-artifact test request additionally keys each output by its canonical
+group/root and FlowWir digest. A cache hit must preserve diagnostics and target
+semantics.
 
-Reproducible releases pin Rust, Cargo dependencies, LLVM/LLD, Inkwell, target
-packages, and standard-library inputs. Unsigned output and the image report must
-be byte-identical for the same declared inputs. Signing is an explicit final
-packaging phase because signatures may intentionally carry external identity or
-timestamp policy.
+## 8. Reports and publication
+
+The image report is built from named phase outputs and final measurements. It
+contains logical topology, capacities, proof why-chains, actor lowering, stack/
+frame/work/checkpoints, hardware/recovery, startup/shutdown, IR/wire/runtime ABI
+versions, optimizer decisions, runtime requirements, sections/symbols,
+target-variable reservations/exclusions, canonical request and FlowWir digests,
+and final image digest.
+
+The backend publishes an EFI artifact and its report atomically only after:
+
+1. backend success;
+2. emitted section/size inspection;
+3. report/artifact build-identity agreement;
+4. SHA-256 computation; and
+5. output-directory policy checks.
+
+A failed or cancelled build may retain a private debug directory by explicit
+policy, but cannot leave a published success artifact.
+
+Test reports pass through a bounded canonical codec and must decode to the exact
+validated report and re-encode byte-for-byte before publication. The composition
+host exposes one sealed atomic-file operation for test reports and formatter
+output. Test reports use create-new semantics; formatting compares the current
+source digest under the replacement lock, so a concurrent edit is never lost.
+Publication receipts must repeat the requested path, byte count, and digest.
+
+## 9. Distribution build
+
+`cargo xtask architecture-check` enforces the exact workspace inventory and
+dependency graph plus the LLVM/QEMU/firmware/AArch64 target-pin consistency.
+Focused `cargo xcheck`, `cargo xtest`, and `cargo xlint` slices exercise one
+producer/consumer boundary (or one exact crate) with only its Cargo dependency
+closure; `cargo xfmt` is the formatting handoff gate. Development/test profiles
+retain line-table backtraces while avoiding full debug-info link and disk cost.
+The dependency allowlist rejects unused speculative edges; notably the public
+driver does not depend on filesystem-aware toolchain discovery. Large codecs,
+formatting, package acquisition, linking, and test execution share explicit
+cancellation, while per-file and aggregate limits remain distinct so focused
+iterations do not inherit whole-workspace allocations.
+The composition root also injects an optional-by-behavior artifact cache: a
+miss is always legal, while a hit is accepted only after build/key/size/digest
+verification and the artifact's normal canonical decoder. Phase-local query
+caches stay behind their phase traits and can reuse the explicit change sets.
+The distribution task will:
+
+1. fetch pinned LLVM/LLD, QEMU, firmware, and other native inputs;
+2. verify cryptographic digests and release attestations;
+3. build only required AArch64/static components;
+4. build public frontend and private backend;
+5. install standard library, target, runtime, firmware, emulator, manifests,
+   licenses, and notices into a staging tree;
+6. validate every installed digest and compatibility version;
+7. run architecture/unit/corruption tests;
+8. compile, inspect, and boot AArch64 conformance/test images with public
+   `PATH` cleared; and
+9. archive the exact tested tree without rearranging it.
+
+Host release artifacts may exist for supported macOS, Linux, and Windows host
+architectures. Host architecture does not add a Wrela target or change source
+semantics; every revision 0.1 artifact still targets the pinned AArch64 machine.

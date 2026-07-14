@@ -136,6 +136,107 @@ or ASCII case folding is rejected on every host.
 The manifest sees only declarations reachable through imports from the module
 containing `@image`. Closed-world linkage does not bypass visibility.
 
+### 2.1 Package manifest and lockfile
+
+Package configuration uses UTF-8 TOML. The root files are named `wrela.toml`
+and `wrela.lock`. Duplicate keys, unknown fields, invalid UTF-8, non-NFC text in
+names/paths, absolute or parent paths, and an unsupported schema are errors;
+implementations do not silently ignore configuration from a newer schema.
+
+`wrela.toml` schema 1 declares exactly:
+
+- `schema = 1` and `language = "0.1-design"`;
+- package `name`, `version`, and one portable relative `source_root`;
+- an explicit, strictly ordered list mapping every module path to one source
+  path beneath that root; directory walking never discovers source implicitly;
+- dependency local alias, nominal package name, and version requirement;
+- one or more finite named build profiles containing comptime, memory,
+  recovery, DMA, record/replay, optimization, and diagnostic policy;
+- full-image entries, each naming an image name, module, `@image` function,
+  target, and profile; and
+- optional full-image test entries, each naming a declared image, host scenario,
+  nonzero boot/shutdown/event/output bounds, and optional deterministic seed.
+
+`maximum_output_bytes` is one aggregate ceiling across all captured emulator
+stdout and stderr, not a separate allowance per stream. Scenario files are
+explicit package inputs: their canonical package/path/digest tuples participate
+in the source-graph and build-request identities.
+
+Every list is stored in the canonical order defined by its stable name or
+identity; a canonical formatter may reorder TOML entries but doing so does not
+change semantics. Revision 0.1 accepts only full-image target entries and only
+`aarch64-qemu-virt-uefi`.
+
+An illustrative shape is:
+
+```toml
+schema = 1
+language = "0.1-design"
+
+[package]
+name = "appliance"
+version = "0.1.0"
+source_root = "src"
+
+[[module]]
+name = "appliance.image"
+path = "appliance/image.wr"
+
+[[dependency]]
+alias = "core"
+package = "wrela-core"
+requirement = "=0.1.0"
+
+[[profile]]
+name = "development"
+mode = "development"
+comptime_steps = 10000000
+comptime_memory_bytes = 67108864
+comptime_call_depth = 256
+static_bytes = 268435456
+peak_bytes = 536870912
+event_log_bytes = 0
+dma_coherent = false
+require_iommu = false
+reset_timeout_ns = 5000000000
+quarantine_bytes = 16777216
+recording = "disabled"
+optimization = "development"
+sealed_deployment = false
+warnings_as_errors = false
+watchdogs = true
+
+[[image]]
+name = "appliance"
+module = "appliance.image"
+entry = "image"
+target = "aarch64-qemu-virt-uefi"
+profile = "development"
+
+[[image_test]]
+name = "boots-and-serves"
+image = "appliance"
+scenario = "fixtures/boots-and-serves.toml"
+boot_timeout_ns = 30000000000
+shutdown_timeout_ns = 5000000000
+maximum_events = 10000
+maximum_output_bytes = 1048576
+deterministic_seed = 1
+```
+
+`wrela.lock` schema 1 is generated canonical TOML. It names the exact root
+identity and strictly orders the complete transitive package closure by
+`(name, version, source_digest)`. Each entry records that identity, an explicit
+workspace/archive/toolchain locator, the canonical manifest digest, and its
+strictly ordered `(alias, exact dependency identity)` edges. An archive locator
+names an explicitly configured provider and opaque key; it is not an implicit
+registry URL. A toolchain locator names a shipped component such as the standard
+library. Every acquired manifest and source is hashed before parsing; a digest,
+identity, alias, dependency, missing/extra source, or canonical-lock mismatch is
+a build error. Package acquisition may use a driver-selected local or network
+provider, but undeclared resolution and ambient registry configuration are not
+part of the build.
+
 ## 3. Declaration forms
 
 The principal declarations are:
@@ -924,6 +1025,7 @@ Built-in revision 0.1 attributes include:
 | `@mmio` | A typed MMIO register layout checked by the target ABI. |
 | `@offset` | A target-ABI field offset inside an MMIO or device layout. |
 | `@layout_assert` | A read-only assertion evaluated after image layout. |
+| `@test` | A compiler-evaluated comptime unit test or full-image runtime integration test, according to function color. |
 | `@suspend_safe` | A scope whose owned state and exit action may remain active across `await`. |
 | `@no_promote` | Reject image-region promotion at the annotated allocation or scope. |
 | `@budget(...)` | Require a build-proven uninterrupted-work or memory bound. |
@@ -933,6 +1035,12 @@ Attributes do not expand arbitrary source text or introduce unhygienic names.
 They attach typed metadata consumed in the fixed build phases. Unknown
 attributes are a compile error unless imported from a tool namespace explicitly
 declared as non-semantic.
+
+`@test` is legal only on a zero-argument `comptime fn`, `fn`, or `async fn`
+whose result is `unit` or `Result[unit, E]`. It is not legal on an `isr fn`,
+method requiring a receiver, generic function without manifest-supplied concrete
+arguments, `@image` function, or function whose test activation/resource bounds
+cannot be proved. Test execution is specified in chapter 06.
 
 Of the built-ins, only `@uninterrupted(bound=...)` may be a statement attribute,
 and it must immediately precede `for`, `while`, or `loop` at the same

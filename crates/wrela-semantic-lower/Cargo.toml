@@ -1,0 +1,15 @@
+[package]
+name = "wrela-semantic-lower"
+description = "Total lowering from successful semantic analysis to SemanticWir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-sema = { path = "../wrela-sema" }
+wrela-semantic-wir = { path = "../wrela-semantic-wir" }
+
+[lints]
+workspace = true

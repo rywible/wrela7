@@ -8,9 +8,9 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
 wrela-diagnostics = { path = "../wrela-diagnostics" }
 wrela-source = { path = "../wrela-source" }
 
 [lints]
 workspace = true
-

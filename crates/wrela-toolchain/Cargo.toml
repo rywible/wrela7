@@ -9,3 +9,6 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+wrela-build-model = { path = "../wrela-build-model" }

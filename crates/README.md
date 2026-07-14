@@ -1,45 +1,44 @@
 # Compiler crates
 
-The workspace is organized around independently runnable layer contracts.
-
-## Frontend
+The workspace is split at sealed, independently testable data contracts.
 
 ```text
-wrela-source
-  → wrela-syntax
-  → wrela-hir-lower → wrela-hir
-  → wrela-sema
-  → wrela-wir-lower → wrela-wir
-  → wrela-wir-passes
+manifest/lock/provider -> package-loader -> source/package graph
+  -> syntax (lossless typed AST)
+  -> hir-lower -> resolved HIR
+  -> sema -> sealed AnalyzedImage
+  -> semantic-lower -> SemanticWir
+  -> flow-lower -> FlowWir
+  -> private FlowWir codec/backend boundary
+  -> flow-opt -> optimized FlowWir
+  -> machine-lower -> AArch64 MachineWir
+  -> LLVM COFF + target runtime -> EFI linker -> .efi + report
 ```
 
-`wrela-diagnostics` and `wrela-target` are shared contracts, not miscellaneous
-utility crates. Semantic subanalyses remain inside `wrela-sema` while they share
-a fixed point.
+`wrela-compiler` is the sole wide composition root. It injects every phase
+trait and bounded host capability into the small public `wrela-driver` API;
+lower crates never depend back on either orchestration implementation state.
 
-## Backend
+Comptime tests execute in semantic analysis. Runtime integration and manifest
+image tests compile through the same pipeline and boot under the target-owned
+QEMU profile; `wrela-test-model`, `wrela-test-protocol`, and
+`wrela-test-runner` own that boundary.
 
-```text
-wrela-wir-codec → wrela-wir-passes → wrela-codegen-llvm → COFF
-                                                    COFF → wrela-link-efi → .efi
-                                                              ↓
-                                                        wrela-lld-sys
-```
+The syntax model is an AST with a lossless token/trivia table. There is no CST
+or LSP crate. `wrela-format` and `wrela-lint` consume the weakest sufficient
+frontend layer.
 
-Inkwell is an optional, exact dependency of `wrela-codegen-llvm` and nowhere
-else. Raw C++/LLD FFI is permitted only in `wrela-lld-sys`. The default workspace
-build activates neither private native dependency.
+Inkwell is private and optional in `wrela-codegen-llvm`. Raw LLD FFI is confined
+to `wrela-lld-sys`. `wrela-runtime-abi` defines the small compiler-owned ABI;
+the digest-checked implementation object is shipped in the AArch64 target.
 
-## Composition
+See [`docs/crate-contracts.md`](../docs/crate-contracts.md) for every crate's
+input/output contract and the exact dependency allowlist enforced by
+`cargo xtask architecture-check`.
 
-- `wrela-driver` composes frontend layers for the public CLI.
-- `wrela-backend` decodes and re-verifies WIR, then composes codegen, linking,
-  and image reporting in a private process.
-- `wrela-backend-protocol` carries versioned process messages without exposing
-  compiler or LLVM data structures.
-- `wrela-toolchain` locates only components in the atomic installation.
-
-Data-model crates must not depend on their producers or consumers. New
-cross-layer dependencies should follow the arrows above and be justified in
-[`docs/toolchain-architecture.md`](../docs/toolchain-architecture.md).
-
+For focused work, use `cargo xcheck <slice-or-crate>`,
+`cargo xtest <slice-or-crate>`, and `cargo xlint <slice-or-crate>`.
+`cargo xtask slices` lists narrow syntax/HIR/semantic/Flow/Machine/artifact
+boundaries as well as end-to-end groups. Phase outputs bind validated data and
+their report together; machine lowering borrows optimized FlowWir, so retaining
+report inputs never clones an image-sized IR.

@@ -1,0 +1,15 @@
+[package]
+name = "wrela-semantic-wir"
+description = "Structured whole-image semantic IR for wrela"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
+wrela-source = { path = "../wrela-source" }
+
+[lints]
+workspace = true
