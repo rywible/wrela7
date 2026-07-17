@@ -150,12 +150,27 @@ implementations do not silently ignore configuration from a newer schema.
 - an explicit, strictly ordered list mapping every module path to one source
   path beneath that root; directory walking never discovers source implicitly;
 - dependency local alias, nominal package name, and version requirement;
+- exactly one direct dependency under the reserved alias `core`; this selects
+  the semantic standard-library package, while its locked toolchain locator
+  selects the package bytes inside the verified standard-library component;
 - one or more finite named build profiles containing comptime, memory,
   recovery, DMA, record/replay, optimization, and diagnostic policy;
 - full-image entries, each naming an image name, module, `@image` function,
   target, and profile; and
 - optional full-image test entries, each naming a declared image, host scenario,
   nonzero boot/shutdown/event/output bounds, and optional deterministic seed.
+
+Every module-path segment, dependency alias, and image `entry` is a
+revision-0.1 source identifier: Unicode 16.0.0 XID start/continue, NFC, not `_`,
+not a language keyword, and free of default-ignorable and bidirectional-format
+controls. Package/version/profile/image/image-test names are nominal manifest
+atoms and do not acquire source-identifier semantics.
+
+`core` is the sole reserved dependency alias in revision 0.1. A custom atomic
+toolchain may provide a differently named or implemented standard-library
+package, but the root still binds it explicitly as `core`; package selection is
+therefore never inferred from a package name or from equality with the
+toolchain component digest.
 
 `maximum_output_bytes` is one aggregate ceiling across all captured emulator
 stdout and stderr, not a separate allowance per stream. Scenario files are
@@ -231,11 +246,19 @@ workspace/archive/toolchain locator, the canonical manifest digest, and its
 strictly ordered `(alias, exact dependency identity)` edges. An archive locator
 names an explicitly configured provider and opaque key; it is not an implicit
 registry URL. A toolchain locator names a shipped component such as the standard
-library. Every acquired manifest and source is hashed before parsing; a digest,
-identity, alias, dependency, missing/extra source, or canonical-lock mismatch is
-a build error. Package acquisition may use a driver-selected local or network
-provider, but undeclared resolution and ambient registry configuration are not
-part of the build.
+library. Every listed package MUST be reachable from the root through those
+edges; isolated packages and disconnected subgraphs, including disconnected
+cycles, are invalid rather than additional lockfile inputs. The exact raw bytes
+of every acquired manifest are hashed before TOML decoding, and every source is
+hashed before source-language parsing. A raw manifest digest is an
+acquisition-integrity artifact, distinct from the lockfile's canonical
+manifest digest: after semantic TOML decoding, the manifest is canonically
+encoded and that canonical digest is checked against the lock. Equivalent
+noncanonical TOML spellings therefore remain valid without weakening the raw
+acquisition boundary. A digest, identity, alias, dependency, missing/extra
+source, or canonical-lock mismatch is a build error. Package acquisition may
+use a driver-selected local or network provider, but undeclared resolution and
+ambient registry configuration are not part of the build.
 
 ## 3. Declaration forms
 
@@ -351,18 +374,22 @@ marked `pub`. Class values do not implicitly copy.
 pub class Cache:
     lines: [CacheLine; 256]
 
-    fn __init__(mut self):
+    init(mut self):
         ...
 ```
 
-`__init__` establishes every field before the instance becomes observable.
+`init` establishes every field before the instance becomes observable. It is a
+dedicated class declaration, not a named function or actor message, and it must
+begin with exactly one `mut self` receiver. Initializers cannot be public,
+generic, attributed, or conditionally declared, and each class declares at most
+one.
 Partial initialization is tracked. A `take` from a field makes that field
 temporarily uninitialized; every normal control-flow path must replace it before
 the containing value is used as a whole or the turn returns.
 
-Construction uses `Type(named_arguments...)` and invokes `__init__`; classes
+Construction uses `Type(named_arguments...)` and invokes `init`; classes
 without an explicit initializer receive a named-field initializer subject to
-field visibility. `__init__` MAY return `Result[unit, E]`. If it returns `Err`,
+field visibility. `init` MAY return `Result[unit, E]`. If it returns `Err`,
 the compiler tears down already-initialized reclaimable fields in reverse field
 initialization order. Every initialized strict-linear field must already be
 protected by a scope, moved into a manifest restart provision, or explicitly
@@ -620,7 +647,11 @@ fs.read_file(ino=7, out=mut output)
 ```
 
 The compiler rejects a missing, extra, or incorrect access marker. `read` is not
-written at call sites.
+written at call sites. An operand introduced by `mut` or `take` MUST be an
+explicit place: a name, a field or index projection rooted in a place, or a
+parenthesized place. Literals, calls, operators, and every other rvalue form are
+rejected by syntax before HIR lowering. An unmarked argument remains an
+ordinary expression; this revision does not add implicit move semantics.
 
 Arguments bind positionally until the first named argument; every later argument
 must be named. A parameter may be supplied exactly once, names are resolved
@@ -636,7 +667,9 @@ parameter types: `view` is reserved for projection results and lexical
 bindings. A caller may pass an existing view to a compatible read parameter,
 and the call cannot extend that view's lifetime.
 
-For a local ownership move outside a call, `take` is an expression:
+For an explicit ownership transfer of a linear local outside a call, `take` is
+an expression. A copyable non-scalar used by assignment or value construction
+instead moves when `copy` is absent, as specified in sections 3.2 and 6:
 
 ```wrela
 next = take current
@@ -893,7 +926,7 @@ From tightest to loosest binding, the relevant operators are:
 4. checked conversion `as Type`;
 5. multiplicative `*`, `/`, `%`, `*%`;
 6. additive `+`, `-`, `+%`, `-%`;
-7. shifts `<<`, `>>`;
+7. shifts `<<`, `<<%`, `>>`;
 8. bitwise `&`, `^`, `|`;
 9. ranges `..` and `..=`;
 10. comparisons, membership, and identity-pattern tests;
@@ -914,6 +947,13 @@ types after explicit conversion; user equality/ordering uses the static
 specialized call `container.contains(item)` through `Contains[Item]` and
 `not in` negates that result; its declared access effects still apply. Pattern
 `is` is built in and does not invoke a user method.
+
+Left shifts never mask or reduce their count: both `left << count` and
+`left <<% count` fail when `count` is negative or is not less than the bit width
+of `left`. The checked `<<` additionally fails when its exact mathematical
+result is not representable in the operand type, so it never discards result
+bits. `<<%` instead wraps the result to that type's bit width. `<<%=` is not an
+assignment operator in revision 0.1.
 
 Except where short-circuiting or assignment is stated below, operands and
 subexpressions are evaluated exactly once from left to right as written. A call
@@ -1025,7 +1065,7 @@ Built-in revision 0.1 attributes include:
 | `@mmio` | A typed MMIO register layout checked by the target ABI. |
 | `@offset` | A target-ABI field offset inside an MMIO or device layout. |
 | `@layout_assert` | A read-only assertion evaluated after image layout. |
-| `@test` | A compiler-evaluated comptime unit test or full-image runtime integration test, according to function color. |
+| `@test` | Declares a test. The bounded source-unit delivery contract covers module-level `comptime fn` tests; the complete revision 0.1 design also reserves full-image runtime forms described in chapter 06. |
 | `@suspend_safe` | A scope whose owned state and exit action may remain active across `await`. |
 | `@no_promote` | Reject image-region promotion at the annotated allocation or scope. |
 | `@budget(...)` | Require a build-proven uninterrupted-work or memory bound. |
@@ -1036,11 +1076,41 @@ They attach typed metadata consumed in the fixed build phases. Unknown
 attributes are a compile error unless imported from a tool namespace explicitly
 declared as non-semantic.
 
-`@test` is legal only on a zero-argument `comptime fn`, `fn`, or `async fn`
-whose result is `unit` or `Result[unit, E]`. It is not legal on an `isr fn`,
-method requiring a receiver, generic function without manifest-supplied concrete
-arguments, `@image` function, or function whose test activation/resource bounds
-cannot be proved. Test execution is specified in chapter 06.
+The complete revision 0.1 declaration contract permits `@test` only on a
+zero-argument `comptime fn`, `fn`, or `async fn` whose result is `unit` or
+`Result[unit, E]`. It is not legal on an `isr fn`, method requiring a receiver,
+generic function without manifest-supplied concrete arguments, `@image`
+function, or function whose test activation/resource bounds cannot be proved.
+
+The bounded source-level unit-test implementation gate is deliberately
+narrower. To satisfy it, the compiler must accept a non-generic, module-level,
+zero-argument `@test comptime fn` returning `unit` from a module declared by the
+root package manifest. Production and test modules both appear in the
+manifest's ordinary ordered module list; there is no implicit test-source scan
+or hidden test-only module graph. Such a test may import and call ordinary
+public production `comptime fn` declarations whose parameters, locals, and
+result use `unit`, `bool`, a fixed-width or target-pointer-width integer, or a
+nominal nongeneric flat `struct` containing only those scalar fields. The
+implemented body subset includes typed or inferred locals and assignment,
+scalar-field projection, complete named construction (or the sole positional
+field of a one-field structure), flat-aggregate move and explicit-copy
+behavior, branch definite initialization, returns, nested direct calls with
+positional or declaration-matched named arguments, exact signed-minimum integer
+literals, integer and boolean operations, comparisons, and `comptime assert` as
+specified in chapter 06. Cross-module field access observes ordinary visibility
+and equal layouts do not erase nominal type identity.
+
+This is not a claim for class construction or values, receiver or associated
+methods, generics, nested or non-scalar aggregates, aggregate equality,
+floating-point values, `Result`/`Ok`/`Err`, non-test/actor assertion
+supervision, or generated runtime-image execution. Selected generated-test
+runtime assertions are implemented through native ABI2 objects, but their
+packaged-QEMU execution remains pending.
+Test execution, effective limits, result classification, and the exact current
+boundary are specified in chapter 06.
+Ordinary semantic float-literal lowering remains separately available to the
+language; bounding its source spelling is not evidence that float values have
+entered this comptime unit-test evaluator subset.
 
 Of the built-ins, only `@uninterrupted(bound=...)` may be a statement attribute,
 and it must immediately precede `for`, `while`, or `loop` at the same
@@ -1111,7 +1181,7 @@ access_mode      = "read" | "mut" | "take" ;
 
 struct_decl      = "struct", IDENT, [ generic_params ], ":", type_suite ;
 class_decl       = "class", IDENT, [ generic_params ],
-                   [ "implements", type_list ], ":", member_suite ;
+                   [ "implements", type_list ], ":", class_member_suite ;
 enum_decl        = "enum", IDENT, [ generic_params ], ":", enum_suite ;
 iface_decl       = "iface", IDENT, [ generic_params ], ":", iface_suite ;
 impl_decl        = "impl", type, "for", type, ":", impl_suite ;
@@ -1126,6 +1196,10 @@ comptime_top_if  = "comptime", "if", expression, ":", top_decl_suite,
                    [ "comptime", "else", ":", top_decl_suite ] ;
 
 field_decl       = { attribute }, IDENT, ":", type, [ "=", expression ] ;
+initializer_decl = "init", "(", "mut", "self",
+                   { ",", initializer_parameter }, [ "," ], ")",
+                   [ "->", type ], ":", suite ;
+initializer_parameter = [ access_mode ], IDENT, ":", type ;
 member_decl      = { attribute, NEWLINE }, [ "pub" ], member_declaration ;
 member_declaration = field_decl | fn_decl | projection_decl | scope_decl
                    | const_decl | comptime_member_if ;
@@ -1147,6 +1221,9 @@ type_suite       = NEWLINE, INDENT,
                    [ NEWLINE ], DEDENT ;
 member_suite     = NEWLINE, INDENT, member_decl,
                    { NEWLINE, member_decl }, [ NEWLINE ], DEDENT ;
+class_member_suite = NEWLINE, INDENT, class_member_decl,
+                     { NEWLINE, class_member_decl }, [ NEWLINE ], DEDENT ;
+class_member_decl = initializer_decl | member_decl ;
 enum_suite       = NEWLINE, INDENT, enum_variant,
                    { NEWLINE, enum_variant }, [ NEWLINE ], DEDENT ;
 iface_suite      = NEWLINE, INDENT, iface_member,
@@ -1244,7 +1321,8 @@ comptime_if      = "comptime", "if", expression, ":", suite,
                    [ "comptime", "else", ":", suite ] ;
 
 arguments        = argument, { ",", argument }, [ "," ] ;
-argument         = [ IDENT, "=" ], [ "mut" | "take" ], expression ;
+argument         = [ IDENT, "=" ],
+                   ( ( "mut" | "take" ), place_expression | expression ) ;
 qualified_name   = IDENT, { ".", IDENT } ;
 
 expression       = closure_expression | or_expression ;
@@ -1266,7 +1344,7 @@ bit_or_expression = bit_xor_expression, { "|", bit_xor_expression } ;
 bit_xor_expression = bit_and_expression, { "^", bit_and_expression } ;
 bit_and_expression = shift_expression, { "&", shift_expression } ;
 shift_expression = additive_expression,
-                   { ( "<<" | ">>" ), additive_expression } ;
+                   { ( "<<" | "<<%" | ">>" ), additive_expression } ;
 additive_expression = multiplicative_expression,
                       { ( "+" | "-" | "+%" | "-%" ),
                         multiplicative_expression } ;
@@ -1293,7 +1371,8 @@ race_expression  = "race", "(", expression, ",", expression,
                    { ",", expression }, [ "," ], ")" ;
 try_send_expression = "try", "send", call_expression ;
 
-place_expression = IDENT, { ".", IDENT | "[", expression, "]" } ;
+place_expression = place_atom, { ".", IDENT | "[", expression, "]" } ;
+place_atom       = IDENT | "(", place_expression, ")" ;
 call_expression = postfix_expression, "(", [ arguments ], ")" ;
 
 literal          = INTEGER_LITERAL | FLOAT_LITERAL | STRING_LITERAL

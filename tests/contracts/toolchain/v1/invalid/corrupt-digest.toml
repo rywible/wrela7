@@ -1,0 +1,26 @@
+schema = 1
+release = "r"
+host = "x86_64-unknown-linux-gnu"
+llvm_project_revision = "r"
+
+[compatibility]
+language = "0.1-design"
+build_profile_encoding = 2
+backend_protocol = 5
+target_package = 1
+semantic_wir = 8
+flow_wir = 10
+flow_wir_wire = 10
+machine_wir = 10
+runtime_abi = 2
+image_report = 11
+test_plan = 2
+test_report = 2
+image_scenario = 1
+test_event = 3
+test_frame = 1
+
+[[standard_library_packages]]
+name = "c"
+version = "0"
+source_digest = "z101010101010101010101010101010101010101010101010101010101010101"

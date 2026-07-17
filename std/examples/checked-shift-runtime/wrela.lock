@@ -1,0 +1,28 @@
+schema = 1
+
+[root]
+name = "checked-shift-runtime"
+version = "0.1.0"
+source_digest = "710f261d371075990ac3fc9723b32043e9d608c1a556bb35eb4ee4a2ae8ba12f"
+
+[[package]]
+name = "checked-shift-runtime"
+version = "0.1.0"
+source_digest = "710f261d371075990ac3fc9723b32043e9d608c1a556bb35eb4ee4a2ae8ba12f"
+manifest_digest = "4e87ba06a6548b3f6f4f3e802756defa86a76fe3dcf9d8b59ef10c1b2f6fd5f9"
+locator = "workspace"
+locator_path = "."
+
+[[package.dependency]]
+alias = "core"
+name = "wrela-core"
+version = "0.1.0"
+source_digest = "5da2bae2f9089643c235c54bf229e67a995f16ce9a0596c24604bd389661afd5"
+
+[[package]]
+name = "wrela-core"
+version = "0.1.0"
+source_digest = "5da2bae2f9089643c235c54bf229e67a995f16ce9a0596c24604bd389661afd5"
+manifest_digest = "7eda3d023a968b8302de6a2d5bea13270be3fbdba58d57ca93d74007a1a65786"
+locator = "toolchain"
+locator_component = "wrela-core-0.1"

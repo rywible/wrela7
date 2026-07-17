@@ -38,7 +38,8 @@ inventory and dependency edges below.
 8. The only serialized compiler IR is `FlowWir`. Its private wire format has
    magic, independent model/wire versions, canonical encoding, finite limits,
    exact consumption, and backend revalidation. External report, manifest,
-   lockfile, target, and test-event schemas are independently versioned.
+   lockfile, target, and test-event boundaries carry independent exact-current
+   schema discriminators so stale or corrupt inputs fail closed.
 9. The frontend and backend independently validate FlowWir. Machine lowering
    is a target/ABI phase; LLVM is not allowed to invent a language proof.
 10. Revision 0.1 has one full-image target:
@@ -70,43 +71,61 @@ inventory and dependency edges below.
 `A -[dev]-> B` means the edge is test-only. Third-party dependencies are
 omitted.
 
+The reviewed external registry contract separately pins `sha2 =0.10.9` with
+default features disabled for `wrela-backend`, `wrela-link-efi`, and `xtask`;
+these owners use it for production artifact/provenance hashing. Any feature,
+kind, optionality, version, or additional external edge drift is rejected by
+`architecture-check`.
+
 <!-- architecture-check: dependency graph begin -->
 ```text
 wrela-backend -> wrela-backend-protocol, wrela-build-model, wrela-codegen-llvm, wrela-flow-opt, wrela-flow-wir, wrela-flow-wir-codec, wrela-image-report, wrela-link-efi, wrela-machine-lower, wrela-target
+wrela-backend -[dev]-> wrela-source
 wrela-backend-protocol -> wrela-build-model
 wrela-build-model -> no workspace dependencies
 wrela-cli -> wrela-build-model, wrela-compiler, wrela-driver
-wrela-codegen-llvm -> wrela-build-model, wrela-machine-wir, wrela-target
-wrela-compiler -> wrela-backend, wrela-build-model, wrela-driver, wrela-flow-lower, wrela-flow-wir-codec, wrela-format, wrela-hir-lower, wrela-image-report, wrela-lint, wrela-package, wrela-package-loader, wrela-sema, wrela-semantic-lower, wrela-syntax, wrela-target, wrela-test-model, wrela-test-runner, wrela-toolchain
+wrela-cli -[dev]-> wrela-package, wrela-package-loader, wrela-test-model, wrela-toolchain
+wrela-codegen-llvm -> wrela-build-model, wrela-machine-wir, wrela-runtime-abi, wrela-target
+wrela-codegen-llvm -[dev]-> wrela-flow-lower, wrela-flow-opt, wrela-machine-lower, wrela-semantic-wir, wrela-source, wrela-test-model, wrela-test-protocol
+wrela-compiler -> wrela-backend, wrela-build-model, wrela-diagnostics, wrela-driver, wrela-flow-lower, wrela-flow-wir-codec, wrela-format, wrela-hir, wrela-hir-lower, wrela-image-report, wrela-lint, wrela-package, wrela-package-loader, wrela-sema, wrela-semantic-lower, wrela-source, wrela-syntax, wrela-target, wrela-test-model, wrela-test-runner, wrela-toolchain
+wrela-compiler -[dev]-> wrela-link-efi
 wrela-diagnostics -> wrela-source
-wrela-driver -> wrela-build-model, wrela-diagnostics, wrela-format, wrela-image-report, wrela-lint, wrela-test-model
+wrela-driver -> wrela-build-model, wrela-diagnostics, wrela-format, wrela-image-report, wrela-lint, wrela-source, wrela-test-model
+wrela-engine -> wrela-build-model, wrela-compiler, wrela-driver, wrela-toolchain
+wrela-engine -[dev]-> wrela-package, wrela-package-loader
 wrela-flow-lower -> wrela-diagnostics, wrela-flow-wir, wrela-semantic-wir
-wrela-flow-opt -> wrela-build-model, wrela-flow-wir
-wrela-flow-wir -> wrela-build-model, wrela-source
-wrela-flow-wir-codec -> wrela-build-model, wrela-flow-wir
+wrela-flow-lower -[dev]-> wrela-build-model, wrela-source, wrela-test-model, wrela-test-protocol
+wrela-flow-opt -> wrela-build-model, wrela-flow-wir, wrela-test-model
+wrela-flow-opt -[dev]-> wrela-flow-lower, wrela-semantic-wir, wrela-source
+wrela-flow-wir -> wrela-build-model, wrela-source, wrela-test-model
+wrela-flow-wir-codec -> wrela-build-model, wrela-flow-wir, wrela-source, wrela-test-model
 wrela-format -> wrela-source, wrela-syntax
 wrela-hir -> wrela-package, wrela-source
 wrela-hir -[dev]-> wrela-build-model
 wrela-hir-lower -> wrela-build-model, wrela-diagnostics, wrela-hir, wrela-package, wrela-source, wrela-syntax
-wrela-image-report -> wrela-build-model
+wrela-image-report -> wrela-build-model, wrela-source, wrela-test-model
 wrela-link-efi -> wrela-build-model, wrela-lld-sys, wrela-target
 wrela-lld-sys -> no workspace dependencies
 wrela-lint -> wrela-diagnostics, wrela-hir, wrela-sema, wrela-syntax
-wrela-machine-lower -> wrela-build-model, wrela-flow-opt, wrela-flow-wir, wrela-machine-wir, wrela-runtime-abi, wrela-target
-wrela-machine-wir -> wrela-build-model, wrela-runtime-abi, wrela-source, wrela-target
+wrela-machine-lower -> wrela-build-model, wrela-flow-opt, wrela-flow-wir, wrela-machine-wir, wrela-runtime-abi, wrela-target, wrela-test-model, wrela-test-protocol
+wrela-machine-lower -[dev]-> wrela-flow-lower, wrela-semantic-wir, wrela-source
+wrela-machine-wir -> wrela-build-model, wrela-runtime-abi, wrela-source, wrela-target, wrela-test-model, wrela-test-protocol
 wrela-package -> wrela-build-model, wrela-source
 wrela-package-loader -> wrela-build-model, wrela-package, wrela-source
 wrela-runtime-abi -> no workspace dependencies
-wrela-sema -> wrela-build-model, wrela-diagnostics, wrela-hir, wrela-source, wrela-target, wrela-test-model
-wrela-semantic-lower -> wrela-sema, wrela-semantic-wir
-wrela-semantic-wir -> wrela-build-model, wrela-source
+wrela-sema -> wrela-build-model, wrela-diagnostics, wrela-hir, wrela-package, wrela-source, wrela-target, wrela-test-model
+wrela-sema -[dev]-> wrela-hir-lower, wrela-syntax
+wrela-semantic-lower -> wrela-hir, wrela-sema, wrela-semantic-wir, wrela-test-model, wrela-test-protocol
+wrela-semantic-lower -[dev]-> wrela-build-model, wrela-hir-lower, wrela-package, wrela-source, wrela-syntax, wrela-target
+wrela-semantic-wir -> wrela-build-model, wrela-source, wrela-test-model
 wrela-source -> wrela-build-model
 wrela-syntax -> wrela-build-model, wrela-diagnostics, wrela-source
 wrela-target -> wrela-build-model, wrela-runtime-abi
 wrela-test-model -> wrela-build-model, wrela-source
-wrela-test-protocol -> wrela-test-model
-wrela-test-runner -> wrela-build-model, wrela-target, wrela-test-model, wrela-toolchain
-wrela-toolchain -> wrela-build-model
+wrela-test-protocol -> wrela-source, wrela-test-model
+wrela-test-runner -> wrela-build-model, wrela-target, wrela-test-model, wrela-test-protocol, wrela-toolchain
+wrela-test-runner -[dev]-> wrela-package, wrela-package-loader
+wrela-toolchain -> wrela-build-model, wrela-package, wrela-package-loader, wrela-target
 xtask -> no workspace dependencies
 ```
 <!-- architecture-check: dependency graph end -->
@@ -142,8 +161,14 @@ full-image artifact -> target-owned QEMU profile -> framed guest events
 all results -> TestReport
 ```
 
-No runtime test function is executed as a host function. Integration and image
-tests boot the same AArch64 UEFI semantics used by production images.
+No runtime test function is executed as a host function. The implemented unit
+route evaluates manifest-declared `@test comptime fn` source against imported
+production declarations and publishes canonical comptime cases. Generated
+runtime harnesses, declared image plans, and selected generated-test runtime
+assertions share the ordinary backend model; those assertions now reach native
+ABI2 objects. Current packaged-QEMU execution and general non-test/actor
+assertion supervision are not complete. Enabled forms must boot the same
+AArch64 UEFI semantics used by production images.
 
 `wrela-compiler` is the sole production composition root. Its wide fan-in is
 intentional and terminal: model and transformation crates never depend back on
@@ -191,6 +216,15 @@ it. It injects phase implementations and bounded host capabilities, while
   nonzero boot, shutdown, event-count, and aggregate-output limits; every
   module source is explicit; locked transitive dependencies bind identity,
   locator, manifest digest, aliases, and content digest.
+- Revision 0.1 source-facing manifest names—every module-path segment,
+  dependency alias, and image entry—use the pinned Unicode 16 XID/NFC
+  identifier rules, reject every language keyword, `_`, and default-ignorable
+  or bidi format control. Package, version, profile, image, and image-test names
+  remain nominal manifest atoms rather than source identifiers.
+- Lockfiles and finished graphs contain exactly the packages reachable from the
+  declared root. Closure checks and cycle checks are iterative and bounded by
+  `MAX_PACKAGES`; project-controlled values retained by manifest diagnostics
+  are truncated to `MAX_MANIFEST_ERROR_VALUE_BYTES` on a UTF-8 boundary.
 - Does not parse TOML, acquire packages, walk a source root, or perform network
   I/O.
 
@@ -320,12 +354,19 @@ it. It injects phase implementations and bounded host capabilities, while
 
 ### `wrela-sema`
 
-- Input: borrowed sealed HIR, semantic target view, validated build
-  configuration, change set/limits/cancellation, and exactly one
+- Input: an exact shared sealed HIR (`Arc<ValidatedProgram>`), the exact
+  `PackageId` selected by the root's reserved `core` dependency, semantic
+  target view, validated build configuration, change set/limits/cancellation,
+  and exactly one
   `AnalysisMode`: production image, test discovery, or compilation of one
   dense group from a `ValidatedTestPlan`. A declared root carries the exact
-  manifest-resolved `DeclarationId`; a generated harness carries an
+  manifest selector name and resolved `DeclarationId`; the selector is not
+  conflated with the runtime `Image(name=...)` value. A generated harness carries an
   `ImageGroupId` and never forges a HIR declaration/body.
+- The analyzer verifies that the selected package is the root graph's `core`
+  edge and resolves compiler-recognized standard declarations by that package
+  ID. It never compares a package source digest with the whole installed
+  standard-library component digest.
 - Partial output: complete type table, monomorphized function instances,
   dense image-wide typed values owned by exact function instances,
   function-qualified expression and statement facts, ownership/loan
@@ -333,11 +374,14 @@ it. It injects phase implementations and bounded host capabilities, while
   protocols and activation/cleanup dependencies, proof records, baked
   artifacts, optional image graph/test plan, comptime test results, and
   deterministic diagnostics. Every function has a fixed-size content key,
-  source/generated origin, semantic role, source provenance, and stack/frame/
-  work bounds. Actor turns, task entries, ISRs, cleanup, image entry, and tests
+  source/generated origin (including source closures), exact function color,
+  semantic role, source provenance, and stack/frame/work bounds. Actor turns,
+  task entries, ISRs, cleanup, image entry, and tests
   are exact graph relations, not conventions inferred by a lowerer.
 - Sealed output: `AnalyzedImage`, created only when no error exists and a closed
-  image graph has been proved.
+  image graph has been proved. It retains the exact request HIR through an Arc
+  clone, never an image-sized model clone, so SemanticWir lowering can consume
+  executable body order while fact provenance remains independently sealed.
 - The seal checks every type/constant/value/function/expression/statement/scope/
   image/proof/test reference, effect bit, canonical set, placement owner, and
   bound. Proof IDs are a deterministic topological order, so cycles and forward
@@ -347,6 +391,17 @@ it. It injects phase implementations and bounded host capabilities, while
   successful discovery/test execution to the exact sealed plan/group/function
   key set. Test counts, scenarios, steps, plan/report bytes, per-group events,
   process output, and execution time are independently bounded.
+- The source-unit evaluator first checks the selected test's complete direct
+  call closure and then executes ordinary resolved HIR declarations. Its active
+  value subset is target scalars plus nominal nongeneric flat structures with
+  scalar fields. Construction, privacy-checked projection, parameters/results,
+  owned-local move and explicit-copy behavior, branch initialization, nested
+  calls, exact target arithmetic/boolean operations, assertions, source-aware
+  stacks, and deterministic selection are bounded, cancellable, and covered by
+  real cross-module source. Generic or nested aggregates, classes/methods,
+  floating point, `Result`, loops, and non-test/actor assertion supervision
+  remain fail-closed follow-on work. Selected generated-test assertions are
+  implemented through native ABI2 objects; packaged-QEMU execution is pending.
 - Partial and successful outcomes share one owned fact database: the private
   result sum cannot pair an unrelated partial database and sealed image or clone
   image-sized facts. Diagnostics are canonicalized before that outcome is
@@ -394,10 +449,36 @@ it. It injects phase implementations and bounded host capabilities, while
   functions, queue limits, region provenance/proofs, frame bounds, and the
   image static/peak memory plan are explicit and cross-checked against the
   analyzed input during sealing.
+- A declared source `@image comptime fn` is retained only as constructor
+  provenance. The sole runtime `ImageEntry` has the explicit
+  `GeneratedImageEntry { constructor }` origin; a source-origin function cannot
+  claim that role, and generated test harnesses remain a distinct origin.
 - Excludes: unresolved names, generics/interfaces, parser nodes, target layout,
   runtime ABI calls, LLVM concepts, and optimization decisions.
-- `ValidatedSemanticWir` establishes model version, dense IDs, all references,
-  function/value ownership, image entry, proof graph, and plan consistency.
+- `ValidatedSemanticWir`'s exact-current schema establishes dense IDs, all references,
+  function/value ownership, image entry, proof graph, and plan consistency. It
+  preserves the analyzer's exact proof-kind vocabulary and every proof source,
+  as well as function instance keys, attached proof IDs, recursive-depth
+  bounds, and the HIR declaration/file bounds used to validate provenance.
+- The current schema retains the exact compiled `FullImageTestGroup`, including its
+  plan identity, generated-harness function keys or declared-image/scenario
+  binding, descriptors, seed, and execution policy. Validation joins generated
+  descriptors to generated function origins and executable bodies and rejects
+  role, function-key, plan, root-image, or scenario substitution.
+- It defines `reachable_declarations` as the number of distinct HIR
+  declaration IDs retained by the closed runtime semantic model (constructor,
+  source-function, scope, type, and brand provenance), not inferred call-graph
+  reachability. The minimum generated image derives the singleton constructor
+  provenance set exactly.
+- It also records each supported source async call as one dense
+  `ActivationPlan`: caller, ordinary async callee, exact activation task-frame region and
+  byte bound, maximum live count, cancellation disposition, capacity proof,
+  and source span. The source operation carries that plan ID, so capacity is
+  tied to an executable call site instead of inferred from an aggregate count.
+- Public model sealing accepts an explicit finite validation policy, polls
+  deterministic cancellation during resource and core passes, caps retained
+  errors, allocates scratch storage fallibly, and walks constants, structured
+  regions, and dependency DAGs iteratively.
 
 ### `wrela-semantic-lower`
 
@@ -409,9 +490,18 @@ it. It injects phase implementations and bounded host capabilities, while
   source-semantic ordering/failure/proof fact explicitly.
 - Limits cover aggregate model edges, retained UTF-8/binary payload, constant
   nesting, structured-region nesting, and ordinary arena/operation counts;
-  these are checked before recursive SemanticWir validation.
-- This conversion is total for valid analyzed input; a missing semantic fact is
-  an internal phase error, not a synthesized fallback.
+  these are checked before the allocation-fallible SemanticWir core validator.
+- The production lowerer accepts the analyzer's minimum generated image,
+  compiler-generated synchronous test groups, and declared-image test groups.
+  Generated groups retain exact descriptors, canonical protocol frames, real
+  test calls, and one terminal test-finish effect; declared groups retain the
+  real selected image root. The additional actor subset admits the real parsed
+  stateless service graph described below: one instance, a non-reentrant turn,
+  a single-slot task, their fixed base regions, and one immediate ordinary
+  async-helper activation per caller. Async tests, richer source-authored
+  executable bodies, actor methods/cross-actor requests, devices/pools, baked
+  artifacts, and every runtime graph outside that closed subset remain explicit
+  unsupported-feature errors; no facts or proofs are fabricated.
 
 ### `wrela-flow-wir`
 
@@ -427,10 +517,34 @@ it. It injects phase implementations and bounded host capabilities, while
   function/proof/plan references, CFG edge and call arity/types, acyclic proof
   dependencies, image entry, plan integrity, and operation operands.
 - Each base function records its exact SemanticWir function provenance and
-  role; generated async/cleanup functions record their semantic owner. Actor
+  role and function color; generated async/cleanup functions record their
+  semantic owner. Actor
   state types, device ISR sets, source/plan summaries, and static/peak memory
   remain explicit. Flow lowering seals all immutable image-plan fields against
   SemanticWir rather than merely comparing counts.
+- The exact-current FlowWir preserves generated image-entry versus generated test-entry
+  provenance, the exact compiled image-test group, and a dense executable test
+  table binding each test ID, global plan ID, monomorphized function key, kind,
+  descriptor, source, timeout, and function. Validation rejects role/origin,
+  plan, function-key, root-image, and scenario substitution or any test table
+  that disagrees with executable operations.
+- It represents one in-flight async call as a strict-linear
+  `Activation { result }` value. `AsyncCall` creates exactly one activation;
+  `Suspend` consumes that activation, names the async state and resume block,
+  and requires the resume block's explicit result parameter even for `unit`.
+  Activations are not scheduler or queue handles and cannot be copied, dropped,
+  returned, or consumed by another operation.
+- It mirrors every SemanticWir activation plan, binds it directly to the
+  producing `AsyncCall`, retains each function's exact attached proof IDs, and
+  closes the base actor/task memory proof over every source-linked activation-frame
+  region. The currently produced subset requires an immediate matching
+  `Suspend`, one live helper activation, a non-reentrant actor turn or
+  single-slot task entry, and `DropCalleeThenPropagate` cancellation. General
+  path-sensitive activations, concurrent task slots, actor methods, and runtime
+  scheduling remain outside this bounded schema vertical.
+- Every region records its closed class, owner, byte capacity, alignment,
+  exact `CapacityBound` proof, and source span. Validation joins those fields
+  rather than allowing report or Machine consumers to infer region provenance.
 
 ### `wrela-flow-lower`
 
@@ -440,6 +554,17 @@ it. It injects phase implementations and bounded host capabilities, while
   non-error diagnostics are bound to that exact SemanticWir and limit policy.
 - Owns: CFG/SSA construction, async state machines, cleanup paths, logical
   scheduler operations, and translation of semantic proofs.
+- For the bounded parsed-actor subset, it canonicalizes one strict-linear
+  activation type per distinct helper result type, gives each semantic plan and
+  call its own activation value, and lowers one plan-bound `AsyncCall` with its
+  immediate matching `Suspend`/resume delivery. It retains the exact
+  source-linked activation task-frame region and unchanged capacity/cleanup/function proof
+  attachments. Its sealer compares these records field by field against
+  SemanticWir and does not infer missing actor capacity.
+- Generated synchronous test groups lower canonical frame globals, explicit
+  test-emission operations, real function calls, a terminal test-finish effect,
+  and the exact FlowWir test table. Declared groups use ordinary image lowering
+  without fabricating function tests.
 - The seal independently bounds all blocks/instructions plus aggregate operand,
   edge, feature/proof, and UTF-8/immediate payload retained in FlowWir.
 - Does not optimize, fix ABI/layout, choose runtime intrinsics, or serialize.
@@ -453,6 +578,17 @@ it. It injects phase implementations and bounded host capabilities, while
   and complete pipeline name/revision/implementation identity.
 - Its sole sealer receives the original `OptimizationRequest`, preventing a
   result from being sealed under a substituted input, profile, or limit set.
+- Canonical pipeline revision 2 implements `none`, `development`,
+  `performance`, and `size`.
+  `none` moves the validated input into the sealed output without an image-sized
+  clone and emits an empty canonical pass/decision report. `development` runs
+  deterministic scalar/control-flow transforms, revalidates function-role and
+  proof links, and retains the exact test table while reporting every pass.
+  `performance` and `size` run those four passes plus proof-linked removal of
+  checks whose exact canonical condition is `Bool(true)`; performance permits
+  its declared growth budget while size permits none. Profile-guided
+  optimization remains an explicit unsupported profile rather than silently
+  selecting another pipeline.
 - Consumer needs met: Machine lowering cannot accidentally consume an
   unverified intermediate pass result; all actor-as-if, check-removal, storage,
   and control-flow decisions remain explainable.
@@ -462,9 +598,15 @@ it. It injects phase implementations and bounded host capabilities, while
   the image plan. The seal requires the actual IR-change bit, changed passes,
   and decision records to agree; optimization level `none` preserves the input
   model exactly.
-- Optimizer limits also bound variable-length body/global edges and immediate/
-  value-name payload, so instruction-count growth is not the sole
-  denial-of-service guard.
+- Optimizer limits bound every variable-length FlowWir edge, all retained
+  UTF-8/immediate payload, report payload, and conservative scan/comparison
+  work, so instruction-count growth is not the sole denial-of-service guard.
+  The `none` and transforming sealers compare the complete model and report
+  through schema-specific, zero-scratch streaming visitors rather than derived
+  whole-model equality. Every retained string/byte payload is compared in
+  bounded chunks with cancellation, and an embedded `FullImageTestGroup` is
+  independently checked against both optimizer and test-plan edge/payload
+  ceilings before comparison.
 
 ### `wrela-flow-wir-codec`
 
@@ -472,8 +614,11 @@ it. It injects phase implementations and bounded host capabilities, while
   `BuildIdentity` and limits, together with cancellation for encoding and
   decoding the potentially image-sized frame.
 - Output: canonical bytes/header or newly `ValidatedFlowWir`.
-- Header binds wire version, FlowWir model version, payload size, and complete
-  build identity. Decoder rejects invalid UTF-8/tags, noncanonical order,
+- The exact-current wire header binds the FlowWir model, SemanticWir
+  provenance, payload size, and complete build identity. Its schema
+  discriminator exists only to reject stale or corrupt input; the decoder
+  accepts one shape and has no legacy reader or migration path. It rejects
+  invalid UTF-8/tags, noncanonical order,
   duplicate/non-dense IDs, overflow, trailing bytes, limit violations, and
   build mismatch before returning a sealed value.
 - Frontend sealing proves the frame decodes to the exact input model and that a
@@ -484,11 +629,20 @@ it. It injects phase implementations and bounded host capabilities, while
 ### `wrela-runtime-abi`
 
 - Input/output model: closed compiler-only runtime intrinsic set, exact scalar
-  signatures, ABI version, and canonical `RuntimeRequirements`.
+  signatures, an exact-current ABI discriminator, and canonical
+  `RuntimeRequirements`.
 - Current surface: image enter/exit/fatal, idle, interrupt mask/restore, DMA
   cache maintenance, record/replay, and test emit/finish.
-- Every intrinsic has a versioned stable COFF symbol spelling as well as an
-  exact scalar signature; MachineWir validates calls against both.
+- Fatal detail uses one closed compiler-owned `RuntimeFatalCode`: arithmetic 1,
+  conversion 2, actor-mailbox-full 3, actor-mailbox-mismatch 4,
+  checked-left-shift-result-loss 5, and invalid-shift-count 6. Machine lowering
+  selects the code; LLVM may implement the check but may not collapse the two
+  shift causes or infer a code from emitted text. The existing Flow
+  function/instruction pair remains the source-site detail.
+- Every intrinsic has one current COFF symbol spelling and one exact scalar
+  signature; MachineWir validates calls against both. The discriminator in the
+  spelling is a fail-closed identity guard, not a promise to retain an older
+  symbol set.
 - The same ABI fixes one always-present, 8-byte-aligned read-only route-table
   symbol: an 8-byte `(count, reserved-zero)` header followed by 16-byte
   `(INTID, reserved-zero, handler-address)` records. Integers are little-endian,
@@ -496,8 +650,10 @@ it. It injects phase implementations and bounded host capabilities, while
   This lets codegen and the target runtime object implement exception dispatch
   independently without an inferred metadata or zero-length-symbol convention.
 - Source cannot name these intrinsics. The target ships one digest-checked
-  AArch64 runtime object implementing this ABI. Adding/changing a signature
-  increments the ABI and target/toolchain compatibility.
+  AArch64 runtime object implementing this ABI. Adding or changing a signature
+  replaces the exact-current interface identity, runtime object, target
+  manifest, and all consumers in the same change; no compatibility shim is
+  retained.
 
 ### `wrela-machine-wir`
 
@@ -518,6 +674,59 @@ it. It injects phase implementations and bounded host capabilities, while
   role. Interrupt records retain both the semantic device ID and target
   binding; Machine lowering cross-checks handler provenance, target route,
   image entry, source span, and proved stack bound before sealing.
+- MachineWir version 5 introduced the exact dense FlowWir test table and
+  compiler-generated test-harness origin. Its closed operation set includes
+  addresses of measured globals and runtime calls, allowing codegen to emit
+  static protocol frames without reconstructing test identity or payloads.
+  Validation requires every listed test function to have the test role, every
+  test runtime call to occur in the generated image-entry harness, every emit
+  payload to resolve to a matching byte-array global, and every nonreturning
+  runtime intrinsic to terminate its block.
+- MachineWir version 6 makes target-runtime activation part of the sealed
+  generated-entry contract. Every ordinary or test image entry has exactly one
+  dominating `ImageEnter(image_handle, system_table)` call, admits the original
+  body only through the zero-status edge, and returns a nonzero `EFI_STATUS`
+  unchanged. Validation rejects omission, duplication, argument reordering,
+  bypass, status remapping, and calls outside the generated UEFI entry. The
+  runtime ABI remains version 1 because the intrinsic and signature were
+  already present; version 6 tightens which MachineWir programs are valid.
+- The active version-7 contract retains the version-6 generated-test rule that
+  consumes every returning
+  `TestEmit` status instead of treating emission as fire-and-forget. The call is
+  the final instruction in its block and its sole `EFI_STATUS` result drives an
+  exact one-case switch: zero alone reaches a parameter-free continuation,
+  while the default reaches an empty single-predecessor block that returns that
+  same status from the UEFI entry. The success block is likewise
+  single-predecessor, so an edge cannot bypass the check. Validation rejects an
+  ignored result, a nonzero success case, a status borrowed from another emit,
+  post-call work in the producer block, a remapped failure return, or an extra
+  predecessor. Runtime-call results, `Switch`, and `Return` were already
+  representable when this rule landed; version 7 retains the narrowed valid
+  generated-harness shape without a compatibility reader.
+- MachineWir version 7 adds the exact downstream consumer for the bounded
+  FlowWir activation subset. One installed stateless actor turn and one
+  single-slot static task each retain their source plan, caller/callee,
+  immediate unit-helper call/resume edge, frame region/layout, maximum-live
+  bound, cancellation disposition, and capacity/cleanup proof authority. The
+  strict-linear Flow token is erased only after those joins: the helper becomes
+  an ordinary private internal call and the suspend becomes its named resume
+  edge. The task entry is invoked exactly once on the successful `ImageEnter`
+  path; the actor turn is emitted but remains `DormantMailbox` and has no
+  invented caller. Proof dependencies are dense, sorted, strict-backward edges,
+  and the unique `ImageClosed` root must close over activation capacities and a
+  `TypeChecked`/`EffectsAllowed` ancestry. This is a compiled startup-task
+  subset, not mailbox admission, recurring scheduling, or cancellation
+  execution.
+- Floating not-equal is explicitly unordered-or-not-equal, matching the source
+  language rule that NaN compares unequal to itself. Version 5 also makes
+  boolean not, integer bitwise not, and floating negation first-class unary
+  operations; floating negation retains the canonical-NaN result contract.
+  The stale ordered-only predicate is not representable. Checked integer
+  add/subtract/multiply/divide/remainder/shift and checked numeric conversions
+  are likewise first-class: each retains its exact signedness or source and
+  destination kinds plus Flow function/instruction failure provenance, and
+  lowers failure to the closed fatal runtime ABI instead of LLVM undefined
+  behavior or a guessed result.
 - `ValidatedMachineWir` establishes all references, layouts, definitions,
   runtime requirements, the unique UEFI entry, the closed set of no-argument
   interrupt handlers, and target/build consistency. Firmware and interrupt
@@ -538,6 +747,31 @@ it. It injects phase implementations and bounded host capabilities, while
   runtime-intrinsic selection, and conversion of Flow proofs into backend facts.
 - Rejects target/build mismatch, overflow, resource excess, unsupported target,
   or any required intrinsic without a target runtime implementation.
+- The revision 0.1 production lowerer accepts the canonical minimum image and
+  the sealed synchronous scalar/control-flow surface after `none` or any
+  canonical revision-2 development/performance/size profile. It preserves the
+  exact Flow function origins,
+  roles, source spans, dense test table, and proof closure while lowering
+  supported scalar immediates, wrapping arithmetic and comparisons, bitcasts,
+  selects, ordinary loads/stores, calls, fences, and control-flow edges. The
+  image entry alone receives the exact AArch64 UEFI two-pointer/`EFI_STATUS`
+  boundary and an implicit `EFI_SUCCESS` value for a unit return.
+- Generated test harnesses receive a measured read-only global for every
+  canonical protocol frame. MachineWir uses explicit global-address values and
+  exact `TestEmit(address, length)` / nonreturning `TestFinish(outcome)` runtime
+  calls, and retains the dense mapping from each test descriptor to its
+  `MachineFunctionRole::Test` body. Static payload placement, exclusive use,
+  runtime-call context, terminal finish, and runtime-symbol requirements are
+  validated before sealing. Lowering allocates two deterministic blocks per
+  emit for the exact-zero continuation and unchanged-status return, meters the
+  added blocks/case/return edges before construction, recanonicalizes dense
+  instruction IDs after expansion, and polls cancellation during every new
+  scan. The separate closed actor slice accepts exactly the version-7
+  one-actor/one-task immediate-unit-helper contract above. Richer aggregates,
+  ownership operations, mailbox/actor-method dispatch, multi-slot or recurring
+  task scheduling, device operations, interrupt functions, and dynamic test
+  payloads fail explicitly with `UnsupportedInput` until their exact lowering
+  exists.
 - Machine limits cover aggregate instruction operands, stack-state lists,
   target/section/symbol/proof text, immediate bytes, and top-level counts before
   target validation walks the candidate.
@@ -569,6 +803,30 @@ it. It injects phase implementations and bounded host capabilities, while
   MachineWir's `UefiAarch64` entry marker maps to LLVM's AAPCS C convention
   after its UEFI-specific signature/visibility checks; Windows ARM64
   conventions are forbidden.
+- For a generated harness, codegen mechanically preserves each sealed
+  `TestEmit` result, exact-zero switch, and unchanged-status return. It cannot
+  erase, merge, or substitute those guards; independent textual and native
+  evidence checks the two-emission fixture before accepting the object.
+- The implemented writable-storage subset is deliberately narrow. Private,
+  dense, exactly covering byte-array globals may use `WritableData` with a
+  typed zero initializer in exact `.data` or in the canonical
+  `.data$wrela$region$N` actor-region namespace; `ZeroFill` uses the same
+  initializer in exact `.bss`. Type and global alignment must be the same power
+  of two, no greater than the target maximum, and the extent must be an alignment
+  multiple. Textual LLVM uses aligned `internal global` zero initializers for
+  both forms. Independent COFF measurement requires writable-data sections to
+  carry their exact raw zero payload, while `.bss` has zero raw bytes and raw
+  pointer but retains its exact logical extent and symbol ranges.
+- Writable/zero-fill traversal, sorting, symbol lookup, and project-sized
+  section scans remain resource-bounded and cancellation-polled. The backend
+  code generator does not infer actor storage. Machine lowering now consumes
+  the sealed actor regions and emits one exact byte-array type, global, private
+  symbol, and writable section per mailbox/root-frame/activation-frame region,
+  retaining capacity-proof and source joins. It can emit the bounded actor-turn,
+  startup-task, immediate-helper functions, and those reservations as native
+  COFF. Nonzero initializers, relocatable data, typed aggregate storage, mailbox
+  dispatch/admission, and recurring runtime consumption remain unsupported
+  producer/runtime work.
 - Each `InterruptHandler` marker maps to an ordinary AAPCS64 body reached only
   from the target runtime's exception trampoline. MachineWir contains the
   always-present, exactly sized runtime-metadata section and table symbol;
@@ -577,11 +835,19 @@ it. It injects phase implementations and bounded host capabilities, while
 - Revision 0.1 always runs LLVM verification and emits neither language
   unwinding nor caller-selected debug policy; adding artifact-affecting debug
   modes requires an explicitly hashed profile/request contract.
+- Independent COFF validation accepts only the two reviewed ARM64 unwind
+  encodings: one full pdata/xdata record with exact relocations, or LLVM's
+  canonical one-relocation packed pdata record with defined flag/register/code
+  extents and empty xdata bookkeeping. Reserved packed flags, nonzero addends,
+  mismatched function extents, or orphan xdata are malformed artifacts.
 
 ### `wrela-lld-sys`
 
-- Input: raw LLD COFF argument vector from `wrela-link-efi` only.
-- Output: success or captured native LLD failure.
+- Input: raw LLD COFF argument vector from `wrela-link-efi` or the sealed
+  distribution smoke driver, with exactly one direct `/out:` path.
+- Output: success only after the emitted PE is re-opened without following
+  links and sealed as the same one-link regular file with private Unix mode
+  `0600`, or a captured native/boundary failure.
 - Owns all workspace unsafe/native FFI. It knows no Wrela model or policy.
 
 ### `wrela-link-efi`
@@ -610,13 +876,46 @@ it. It injects phase implementations and bounded host capabilities, while
 - Object/image inspectors receive cancellation directly. Section overlap and
   symbol ownership use sorted ranges and an indexed section table, never
   pairwise scans.
+- Production wiring uses `CanonicalCoffObjectInspector` and
+  `CanonicalLinkedImageInspector`. The latter implements
+  `LinkedImageInspector::inspect(image, map, provenance_map, inputs, target,
+  ImageInspectLimits, cancellation)` so PE32+, both maps, and the sealed COFF
+  inputs share the exact target and bounded image/map/section/symbol/measurement
+  policy. The linker derives a private `<map>.lldmap` path and requests LLD's
+  contribution map itself; callers cannot inject that path or substitute input
+  provenance. `LinkLimits::argument_bytes`
+  independently caps the aggregate bytes retained for the fixed LLD COFF
+  argument vector before the native boundary is invoked;
+  `LinkLimits::exception_records` is projected exactly into the image inspector
+  and bounds ARM64 pdata/xdata decoding before record retention.
+- The PE32+ inspector validates all 16 data-directory slots and admits only the
+  exact exception, base-relocation, and type-16 reproducibility records emitted
+  by the pinned lane. Imports/IAT/delay imports, exports, TLS, CLR, load config,
+  certificates, resources, bound imports, and global pointers are rejected.
+  Target-fixed optional-header fields, checksum, stack/heap reservations,
+  section allowlist, permissions, raw/virtual ordering, zero padding, absence
+  of overlays, REPRO/timestamp binding, and the one measured LLD retained header
+  page are checked exactly; writable executable sections are impossible.
+- ARM64 exception validation accepts bounded canonical packed or full unwind
+  records, checks sorted nonoverlapping exact function coverage and instruction
+  extents, parses supported xdata opcodes, and rejects language-specific
+  handlers and custom assembly unwind forms until their runtime contract is
+  implemented.
+- Post-link inspection reopens every sealed input COFF, parses its ARM64
+  `ADDR64` sources and exact external definitions, and joins them to canonical
+  LLD input-section contributions. The translated sites must equal the PE
+  `DIR64` base-relocation sites exactly, with no missing, extra, duplicate,
+  overlapping, dead-section, or foreign-object evidence. The artifact exposes
+  a domain-separated digest over the EFI image, contribution map, sealed object
+  identities/sections, and resolved relocation provenance; all native outputs
+  are removed on failure or cancellation.
 
 ### `wrela-image-report`
 
 - Input: build identity; semantic/Flow proof and image facts; optimization
   decisions; MachineWir/runtime facts; final section/symbol/link measurements;
   target-variable exclusions; and artifact digest.
-- Output: sealed schema-versioned `ImageReport`, canonical fixed-order JSON,
+- Output: a sealed exact-current `ImageReport`, canonical fixed-order JSON,
   and stable readable summary. It retains dense proof IDs, structured
   proof-linked optimization decisions, and the pipeline's exact
   name/revision/implementation digest. Construction canonicalizes unordered
@@ -628,6 +927,45 @@ it. It injects phase implementations and bounded host capabilities, while
   both policies and rejects cross-build or cross-image substitution. Fact
   assembly, construction, validation, and canonical JSON encoding receive
   cancellation.
+- The current report schema retains the optional compiled `FullImageTestGroup` verbatim,
+  including its generated-harness or declared-image root, ordered descriptors,
+  typed invocations, scenario identity, seed, and execution policy. Sealing
+  validates the standalone binding and requires its root image name to match
+  the report image; canonical JSON round trips every generated and declared
+  field without reconstruction.
+- That schema is the only accepted report shape. Its tag rejects stale or
+  mismatched artifacts at the trust boundary; there is no legacy reader,
+  migration, adapter, or fallback contract. Its embedded interface facts must
+  be exactly SemanticWir 5, FlowWir 7, Flow wire 7, MachineWir 7, and runtime
+  ABI 1; nonzero stale or future values are rejected rather than tolerated.
+- Schema v10 also projects sealed actor, task, reportable region, and async
+  activation plans into
+  canonical dense-ID-qualified nodes, supervision edges, and capacity/frame/
+  alignment bounds. Every `ProofFact` retains its exact optional bound, source
+  identities, proof dependencies, and why-chain rather than only a category
+  label. Region nodes retain the exact Flow source span; backend
+  assembly authenticates each `RegionPlan.capacity_proof` against the sealed
+  Flow model before projection. Every reportable region carries one canonical
+  capacity-evidence row that joins its exact `RegionPlan.capacity_proof` to the
+  matching capacity `ProofFact`, byte `BoundFact`, and dense region node;
+  independent report validation rejects missing, duplicate, substituted, or
+  category/owner/byte-mismatched links. Every activation carries one canonical
+  evidence row joining its dense plan and activation `TaskFrame` region to the
+  exact caller, ordinary async callee, owner, source span, frame-byte bound,
+  maximum-live value, closed cancellation disposition, capacity proof, and the
+  callee's cleanup proof dependency. Validation requires a one-to-one plan,
+  region, and evidence join; checked `frame_bytes * maximum_live` equality;
+  canonical `.async-activation-frame` naming; and matching Work/Capacity/
+  CleanupAcyclic proof provenance. Actor/task plans currently
+  retain structural plan provenance rather than declaration spans, so the
+  report says `FlowWir.ActorPlan` or `FlowWir.TaskPlan` instead of inventing a
+  source location or proof link.
+- The report retains the exact decoded PE base-relocation directory byte extent,
+  canonical block count, AArch64 `DIR64` entry count, and nonzero
+  domain-separated provenance digest from the sealed link artifact. Independent
+  report validation checks their bounded structural relationship and backend
+  assembly requires byte-for-byte equality with that artifact; individual
+  relocation rows are intentionally not claimed by this report schema.
 - Consumer needs met: the report exposes logical image topology and physical
   lowering, bounds, proof why-chains, actor paths, stack/frame/work/checkpoints,
   hardware/recovery, startup/shutdown, all IR/ABI versions, runtime intrinsics,
@@ -639,12 +977,14 @@ it. It injects phase implementations and bounded host capabilities, while
 
 - Input/output: one bounded framed `BackendRequest` or `BackendResponse` with
   request ID, complete build configuration, controlled relative input/output
-  paths, exact canonical FlowWir digest, artifact/report digests, and typed
-  failure category.
-- Guarantees: magic/version/length, exact consumption, finite text/profile data,
-  profile validation, no parent/absolute paths, and no ambient filesystem
-  authority.
-- This is exact-version internal IPC, not an external SDK compatibility promise.
+  paths, exact canonical FlowWir digest, frontend-verified target-runtime
+  SHA-256 and byte length, artifact/report digests, and typed failure category.
+- Guarantees: magic/exact-current-schema/length, exact consumption, finite
+  text/profile data, profile validation, no parent/absolute paths, and no
+  ambient filesystem authority. The current protocol requires the private backend to re-open and
+  COFF-inspect the runtime object, then match both request digest and length
+  before linking.
+- This is exact-current internal IPC, not a public compatibility surface.
 
 ### `wrela-backend`
 
@@ -667,6 +1007,9 @@ it. It injects phase implementations and bounded host capabilities, while
   target, object, linked artifact, fact limits, and canonical report byte
   ceiling. Runtime symbols and every linked section/symbol measurement must
   match; publication repeats the FlowWir/artifact cross-check.
+- Report assembly copies the validated FlowWir compiled test-group binding
+  exactly into analysis facts; it does not infer group identity from dense IDs,
+  local test tables, harness names, or scenario paths.
 - One `BackendLimits` value keeps codec, optimizer, machine, codegen, link,
   image/map, and canonical report ceilings consistent. Report JSON is bounded
   before publication and rechecked when publication is sealed.
@@ -711,6 +1054,12 @@ it. It injects phase implementations and bounded host capabilities, while
   non-infrastructure completion; case-local duplicate event copies are absent.
   Guest terminal outcomes are a closed runtime-only type and cannot impersonate
   host discovery, compile, link, boot, shutdown, or process-crash failures.
+  Protocol version 3 and report schema 2 add the closed
+  `LanguageFatalCause::{CheckedShiftResultLoss, InvalidShiftCount}` outcome.
+  During an active test either cause has exactly four events: run started, test
+  started, the typed failed test result, and run finished with zero passes and
+  one failure. Inactive, foreign, duplicate, late, or post-terminal fatal
+  evidence cannot be promoted into a valid report.
 - Report sealing independently bounds each encoded event, retained group
   payload plus stderr, and the complete report payload against the sealed plan.
 - `TestReportCodec` owns the canonical external report schema. Publication
@@ -726,13 +1075,24 @@ it. It injects phase implementations and bounded host capabilities, while
 
 ### `wrela-test-protocol`
 
-- Input: one `TestEvent` or one PL011 frame plus protocol limits.
+- Input: one `TestEvent`, one unescaped binary frame, or a dense binary frame
+  stream plus protocol limits. PL011 transport escaping is outside this codec.
 - Output: private `EncodedEvent` sealed from a candidate only after independent
   header inspection and canonical decode/re-encode, or an inbound event returned
   only by `decode_and_verify_event` after the same complete-frame round trip.
-- Guarantees: independent frame/event versions, magic, sequence agreement,
-  bounded lengths, canonical tags/UTF-8, CRC32C, exact consumption, and
-  corruption rejection. This schema is stable external test tooling data.
+- The 32-byte header is exactly the eight-byte `WRELTST\0` magic, little-endian
+  frame-version `u32`, event-version `u32`, sequence `u64`, payload-length
+  `u32`, and payload CRC32C `u32`, followed by the canonical tagged payload.
+- Guarantees: independent frame/event versions, dense zero-based stream
+  sequencing, bounded lengths, canonical tags/UTF-8/spans, CRC32C, exact
+  consumption, and corruption rejection. The checked-in `protocol/v1` fixture
+  drives canonical, corruption, limit, and cancellation coverage without a
+  second fixture-only codec. This schema is stable external test tooling data.
+- Depends on `wrela-source` for canonical assertion-span decoding rather than
+  maintaining a second source-location representation in the protocol layer.
+- Event version 3 gives the two language-fatal causes canonical payload tags 0
+  and 1. Cause tags are semantic protocol data, not host strings, exit-code
+  inference, or a QEMU stderr convention.
 - Encode, header inspection, decode, and canonical round trips receive the
   runner's cancellation callback.
 
@@ -745,28 +1105,69 @@ it. It injects phase implementations and bounded host capabilities, while
 - Output: `VerifiedToolchain`, the only capability accepted by the test runner,
   plus controlled content-addressed paths for frontend, private backend,
   standard library, AArch64 emulator, target package, and doctor checks.
-- Manifest decoding is request-bound: after limit and compatibility validation,
+- Manifest decoding is request-bound: after limit and exact interface-identity validation,
   canonical re-encoding must reproduce the complete supplied manifest bytes
   before component observation can create `VerifiedToolchain`; decode and
   re-encode receive cancellation.
+- Schema 1 carries a nonempty, identity-ordered standard-library package index.
+  Each record reuses `PackageIdentity`, requires one portable direct-child
+  `Toolchain` locator beneath `share/wrela/std`, and pins the canonical package
+  manifest digest. The verified whole-directory digest and index together let
+  consumers reject package identity, locator, or manifest substitutions.
 - Every shipped component and target-relative runtime/firmware file carries a
   nonzero byte count and digest. Consumers resolve only manifest-declared
   target files, never arbitrary children of a trusted directory. `VerifiedPath`
   fields are private and only `VerifiedToolchain` can derive one.
-- Compatibility independently fixes language, build-profile encoding, target
+- The exact interface-identity tuple independently fixes language,
+  build-profile encoding, target
   package, backend protocol, all three IR models, Flow wire, runtime ABI, image
   report, test plan/report/scenario, test event, and test frame versions.
 - Does not search `PATH`. The target digest covers firmware and runtime; the
   emulator is a separately digest-checked shipped component.
+- Linux execution-input schema 1 is a separate path-free acquisition contract.
+  Its fixed-order request names exact nonzero bounded witnesses for the static
+  AArch64 Linux engine, canonical Linux toolchain manifest, Linux backend,
+  Linux `qemu-system-aarch64`, both firmware images, standard-library tree,
+  target tree, runtime object, and an externally produced native-runner
+  authority envelope. The header fixes the Linux-musl host, direct route,
+  target, system-emulator kind, refusal of user-mode emulation, raw-file
+  SHA-256, and canonical-tree digest v1. Missing,
+  duplicated, reordered, aliased, stale, unknown, noncanonical, substituted,
+  zero, and oversized inputs fail closed with cooperative cancellation.
+- The matching receipt cross-binds the request and all observed identities with
+  distinct domain-separated request and receipt identities. It derives the
+  existing `LinuxPayloadAuthority` and hands it to the already-complete local
+  manifest/frontend binding without a second toolchain scan. The receipt has
+  exact `execution_proven=false` and `runner_authority_proven=false`: a digest
+  placed in the native-runner role does not prove native hardware. Only an
+  independently authenticated native-runner or immutable-appliance envelope
+  and its real execution consumer can close those facts. The pure contract does
+  not itself observe or authenticate any underlying file.
+- `LocalToolchainVerification::seal_linux_execution_inputs` is the immediate
+  filesystem consumer. It maps engine, manifest, backend, system QEMU,
+  standard-library, target, both firmware files, and runtime directly from the
+  already-complete verification observations, with no reread or second hash.
+  It observes only one disjoint opaque runner-envelope file through the existing
+  symlink-denying stable bounded reader, rejects zero/one-over, nonregular,
+  replacement, substitution, wrong-host/target, and cancellation, seals the
+  receipt, and rebinds its payload authority to the same verification before
+  returning. Even this accepted receipt authenticates no runner semantics and
+  leaves both runner and execution proof false.
+- In schema 1, the standard-library component and target-package directory use
+  canonical tree digest v1 (`WRELTRE\0`, version 1); executables and declared
+  target files use raw SHA-256. Reinterpreting either requires a schema bump.
 
 ### `wrela-test-runner`
 
-- Input: `ValidatedTestPlan`, compiler-evaluated results, one EFI artifact per
-  full-image group, selected target and `VerifiedToolchain`, private work
-  directory, injected
+- Input: `ValidatedTestPlan`, compiler-evaluated results, and exactly one of a
+  sealed EFI artifact or a phase-accurate pre-execution failure for every image
+  group, plus the selected target, `VerifiedToolchain`, private work directory,
   bounded `ProcessExecutor`, target harness, and cancellation.
 - Output: `ValidatedTestReport` containing compiler and QEMU cases plus
   reproducibility evidence.
+- The production target harness delegates canonical frame validation to
+  `wrela-test-protocol`; it owns only the target's RFC 1055 PL011 transport,
+  verified QEMU invocation, and event-to-report projection.
 - Consumer needs met: orchestration is independently fakeable; target command
   generation and event decoding are separately testable; ambient environment is
   not inherited; the executable, working directory, canonical environment,
@@ -781,9 +1182,27 @@ it. It injects phase implementations and bounded host capabilities, while
   Canonical command and event-stream digests and the summarizer's retained
   event stream are independently compared. Missing emulator or firmware is an
   infrastructure error, never a pass result.
+- The local executor observes serial output incrementally while the guest is
+  live, writes bounded scenario input to the guest serial channel, enforces each
+  step deadline, and issues explicit QMP `qmp_capabilities`/`quit` only for a
+  declared shutdown step over a private command-bound Unix socket. QMP JSON
+  bytes, messages, nesting, greeting, and replies are bounded and unambiguous.
+  It clears the ambient environment, creates a private process-group leader,
+  synchronously terminates and reaps that complete group on cancellation,
+  limit, timeout, protocol error, or success, and reports cleanup failure or
+  unexpected staging/QMP residue. Raw firmware serial segments may interleave
+  with SLIP frames; bytes using the reserved test magic remain strict and
+  corruption is never downgraded to raw output.
+- Compiler/link failures may bypass emulator and firmware resolution only when
+  their exact pre-execution results cover the corresponding plan groups. These
+  results cannot contain guest cases/events or image/command/emulator evidence.
 - `RunnerLimits` independently bounds argument count, environment count,
   aggregate command bytes, and aggregate path bytes. Executor duration cannot
-  exceed the sealed timeout. A private `VerifiedProcessFile` can originate only
+  exceed the sealed timeout. One group-derived `ProtocolLimits` and its exact
+  maximum stream bytes bind command evidence, live serial observation, final
+  decoding, and output collection. Complete prefixes from crash/timeout may be
+  retained; successful execution rejects a truncated reserved frame. A private
+  `VerifiedProcessFile` can originate only
   from a verified toolchain path or sealed image artifact; arbitrary paths
   cannot be smuggled into process staging.
 - The command harness receives a least-authority `ImageExecutionComponents`
@@ -830,6 +1249,19 @@ it. It injects phase implementations and bounded host capabilities, while
   can only be sealed against its exact `InputReadRequest` after normalized-path,
   byte-count, SHA-256, and cancellation checks. Every blocking host operation
   receives cancellation directly.
+- `LocalWorkspaceProvider` binds one existing absolute, canonical,
+  symlink-free workspace root. It supports only locked workspace locators,
+  reads exactly manifest-declared source and scenario paths without directory
+  walking, hashes raw bytes during checked streaming reads before UTF-8
+  interpretation, and revalidates root/file identity plus canonical
+  containment before and after each read. Archive and toolchain locators
+  require separate explicit capabilities and fail closed here.
+- This portable standard-library provider detects observable pathname or file
+  replacement but is not an `openat`-style race-free directory capability. A
+  hostile concurrently mutating filesystem still requires an OS capability or
+  sandbox, or a stronger injected provider. `LocalFrontendService` composes
+  that boundary with the canonical workspace loader and parser and preserves
+  the exact graph-module/FileId mapping.
 - Persistent cache entries are keyed by the complete `BuildIdentity`, artifact
   kind, schema version, and group/root subject digest. Loaded bytes are bounded,
   rehashed, and key-checked before a phase codec may decode them; corruption is
@@ -845,6 +1277,11 @@ it. It injects phase implementations and bounded host capabilities, while
   can only be constructed by hashing the canonical profile and canonical
   image/intent/test-selection request, then cross-checking every build-identity
   digest against the workspace, target, and verified installation.
+- The planner resolves the root graph's reserved direct `core` dependency to
+  one toolchain-located package and retains that `PackageId` in `PlannedBuild`.
+  `BuildIdentity::standard_library` remains the whole verified component
+  digest; semantic phases consume the selected package ID and never conflate
+  those two identities.
 - `PipelineLimits` covers cache/package/parse/HIR/semantic/analysis-fact/format/
   lint/test-plan/test-runner/SemanticWir/FlowWir/wire/backend/target/toolchain
   ceilings. It rejects frontend/backend codec disagreement, frontend/backend
@@ -862,6 +1299,75 @@ it. It injects phase implementations and bounded host capabilities, while
   neither an image-sized byte clone nor an untyped report/encoding join.
 - This is the only wide fan-in crate and no lower layer may depend on it.
 
+### `wrela-engine`
+
+- Input: fixed ordered arguments naming one existing normalized absolute private
+  staging parent, one disjoint verified toolchain root, and exact nonzero
+  launcher/engine/payload SHA-256 identities; stdin is one exact-current engine
+  v1 frame stream with 92-byte headers and bounded payloads.
+- Output: either no stdout and one bounded process error, or a completely
+  encoded canonical response stream whose server hello, events, empty output
+  tree, resource use, request identity, and terminal status pass the independent
+  driver response validator. Source rejection is a successful transport with a
+  rejected terminal status, not a process crash.
+- Owns the Linux-portable executable boundary around
+  `HeadlessCheckExecutor`. It remeasures its running process image, binds that
+  digest to both the request and verified toolchain, reads no workspace from
+  the current directory, performs no `PATH` discovery, and gives the compiler
+  only the request-materialized private tree and verified payload root.
+- The process accepts exactly one request. It validates every complete frame
+  through the shared codec, requires EOF after a sealed request or one
+  request-bound pre-execution cancellation, and encodes the entire response
+  before writing stdout. Corruption, truncation, stale/future versions,
+  sequence gaps, identity substitution, oversized frames, reordered authority
+  arguments, and duplicate/late controls publish no response prefix.
+- The exact-current toolchain schema initially enrolls the running engine bytes
+  as `ComponentKind::Frontend`; the local driver then independently binds those
+  same bytes. Adding a dedicated `Engine` component is an atomic future schema,
+  verifier, payload, and distribution change, not an alias or fallback.
+- This first executable is a process-boundary slice, not yet a claimed Linux
+  payload. Its exact `direct` mode is a thin AArch64-Linux-musl ABI consumer. It
+  refuses every other build before parsing arguments or observing paths; binds
+  byte-count/SHA-256 witnesses for the opaque producer output, producer receipt,
+  request stream, its own static ELF, and a canonical schema-1
+  `LinuxPayloadAuthority` outside both mutable staging and the payload root.
+  That authority fixes the direct route, Linux-musl host, engine protocol, exact
+  canonical toolchain-manifest witness, and exact frontend-engine witness; its
+  domain-separated identity is the request payload identity. `direct` requires
+  request launcher/engine identity and the authority frontend to equal its ELF,
+  validates the request with the shared engine-v1 stream validator, then uses an
+  empty environment to self-spawn the exact `direct-child` mode. The child
+  refuses a non-AArch64-Linux-musl ABI before path observation, cheaply binds
+  authority frontend to its own measured digest and bytes, and passes the
+  authority into the existing single `LocalToolchainVerifier` scan. The local
+  driver binds the already-observed canonical manifest and frontend before
+  compilation; it does not repeat the payload scan. The parent bounds
+  stdin/stdout/stderr, timeout, and an explicit private cancellation file;
+  kills, reaps, and joins on every supervised failure; and independently
+  validates the complete response.
+- The validated response is flushed to the caller before a create-new receipt
+  can be published. Schema-2 publication additionally requires the validated
+  event stream to contain one ordered, non-reused completion of
+  `toolchain-verification`; cancellation or failure before that point publishes
+  neither response nor receipt. The path-free strict decoder reconstructs the
+  canonical payload authority, recomputes its file witness and identity,
+  requires its frontend to equal the receipt engine, and binds protocol,
+  timeout, producer/request/engine/response witnesses, output-tree measurement,
+  terminal outcome, and exact resource use. It is deliberately a candidate
+  with `execution_proven=false`, `payload_authority_proven=true`, and
+  `runner_authority_proven=false`.
+- This direct-mode implementation is development evidence only. The current
+  enrolled ELF predates the authority/direct-child source and no canonical
+  authority file has been produced from an enrolled Linux payload. An
+  AArch64-Linux ABI process could also still be running under user-mode
+  emulation. Real execution evidence therefore still needs a newly enrolled
+  exact ELF plus canonical Linux payload whose frontend equals it and a
+  separately authenticated native runner or appliance envelope. That native
+  execution receipt, immutable appliance execution, persistent vsock transport,
+  concurrent isolation, in-flight protocol cancellation, the thin Darwin
+  launcher, cross-route byte equality, and Darwin-native retirement remain
+  required consumers.
+
 ### `wrela-cli`
 
 - Input: command-line arguments for doctor, check, build, test, lint, and format.
@@ -869,6 +1375,12 @@ it. It injects phase implementations and bounded host capabilities, while
   structured outcomes.
 - Depends on the production `wrela-compiler` composition root to execute a
   command; it never installs compiler services into the public model/API crate.
+- Every source command accepts only the pinned
+  `aarch64-qemu-virt-uefi` target, an explicit bounded profile atom, and the
+  same warnings/result-count diagnostic policy. `test` additionally exposes
+  mutually exclusive `--comptime`, `--integration`, `--images`, and bounded
+  `--name-contains` selection. A sealed failed test report renders normally but
+  exits unsuccessfully.
 - Does not parse manifests, compile, colorize phase-internal state, or search for
   LLVM/QEMU itself.
 
@@ -882,9 +1394,27 @@ it. It injects phase implementations and bounded host capabilities, while
   source-unused workspace edge, untested interface crate, unreviewed
   registry/Git/path dependency, feature-forwarding change, missing native lock,
   inconsistent AArch64 triple/CPU/X18/machine pin, or reintroduced x86 target.
-  Named `check`, `test`, and `lint` boundaries—and any exact crate name—give
-  each vertical the smallest reviewed package set while Cargo supplies its
-  dependency closure. `cargo xfmt` is the formatting handoff gate.
+  `cargo xtask llvm` strictly validates the canonical LLVM lock and exact
+  Inkwell contract; verifies a pinned HTTPS or explicit local archive before
+  hostile-input extraction; stages the hashed CMake contract; builds only
+  static AArch64 LLVM and LLD with fingerprinted explicit tools and bounded
+  jobs; and atomically publishes a full-input-addressed prefix. Its canonical
+  receipt binds the inputs and complete prefix tree. A separate strict
+  `toolchain/llvm.outputs.toml` input-to-tree lock must match before cached
+  `llvm-config` can execute; reuse then rechecks installed LLVM version, target,
+  linkage, and host semantics. `--record-output` is an explicit maintainer-only
+  fresh-build enrollment route, never a fallback for ordinary reuse.
+  `cargo xgate <slice-or-crate>` validates the locked, host-filtered Cargo
+  resolution against reviewed workspace and versioned external/transitive
+  closures, prints the complete slice contract, then runs scoped formatting,
+  all-target checks, unfiltered unit/contract tests, Clippy with warnings
+  denied, and architecture validation under forced offline mode. It rejects
+  arbitrary extra arguments and routes `--full` to an applicable native command
+  rather than silently skipping unavailable LLVM, LLD, QEMU, firmware, or
+  distribution work. `cargo xtask slices` is the authoritative package,
+  boundary, fixture, native requirement, command, closure, and timing-budget
+  inventory. Named `check`, `test`, and `lint` remain lower-level direct
+  commands; `cargo xfmt` remains the whole-workspace formatting handoff gate.
   Distribution work verifies digests, signatures, licenses, target
   firmware/runtime, emulator, and boots conformance images with public `PATH`
   cleared.
@@ -897,6 +1427,6 @@ contract fixtures. Each concrete implementation must add fixtures for valid
 minimum/representative/maximum-bound input and for stale identity, corrupt
 reference, limit, cancellation, and consumer-facing failure cases. Interface
 crates test their sealers even before a concrete producer exists. Cross-crate
-integration may require small versioned interface adjustments, but no consumer
+integration may require small exact-current interface adjustments, but no consumer
 may depend on a producer's private arena, query, filesystem, LLVM, QEMU, linker,
 or toolchain-discovery state.

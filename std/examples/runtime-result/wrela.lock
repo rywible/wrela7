@@ -1,0 +1,28 @@
+schema = 1
+
+[root]
+name = "runtime-result"
+version = "0.1.0"
+source_digest = "d5e9dd1a068d2d7f45b2003dc020fce256872607865daf9aa65b2be0acd9adc0"
+
+[[package]]
+name = "runtime-result"
+version = "0.1.0"
+source_digest = "d5e9dd1a068d2d7f45b2003dc020fce256872607865daf9aa65b2be0acd9adc0"
+manifest_digest = "4aae7e48d102a91f66c03108ce0dc652ac20e78fdb0c5e3479dcbfd3bda855b1"
+locator = "workspace"
+locator_path = "."
+
+[[package.dependency]]
+alias = "core"
+name = "wrela-core"
+version = "0.1.0"
+source_digest = "5da2bae2f9089643c235c54bf229e67a995f16ce9a0596c24604bd389661afd5"
+
+[[package]]
+name = "wrela-core"
+version = "0.1.0"
+source_digest = "5da2bae2f9089643c235c54bf229e67a995f16ce9a0596c24604bd389661afd5"
+manifest_digest = "7eda3d023a968b8302de6a2d5bea13270be3fbdba58d57ca93d74007a1a65786"
+locator = "toolchain"
+locator_component = "wrela-core-0.1"

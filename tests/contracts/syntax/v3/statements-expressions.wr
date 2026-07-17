@@ -1,0 +1,99 @@
+module contracts.statements_expressions
+
+fn complete(a: u64, b: u64, values: Values, actor: Actor):
+    local = 1
+    typed: u64 = 2
+    shadow local = 3
+    left = local
+    right = typed
+    left += 1
+    left -= 1
+    left *= 2
+    left /= 2
+    left %= 2
+    left &= 7
+    left |= 8
+    left ^= 3
+    left <<= 1
+    left >>= 1
+    values.field = left
+    values[left] = right
+    (left, values.field,) = (right, left,)
+    assert left == right, "comparison"
+    comptime assert true, "known"
+    send actor.notify(left)
+    yield left
+    actor.observe(left)
+    pass; actor.observe(right)
+    if left < right:
+        pass
+    elif left in values:
+        pass
+    elif left not in values:
+        pass
+    else:
+        pass
+    match values.state:
+        case _:
+            pass
+        case -1 | -2.5:
+            pass
+        case states.ready(take bind payload):
+            pass
+        case (bind first, take bind second,):
+            pass
+        case [bind head, take bind tail,]:
+            pass
+        case true | false | unit if left == right:
+            pass
+        case bind explicit:
+            pass
+    for take item in take values:
+        if item is states.ready(bind payload):
+            continue
+        else:
+            break
+    while left > 0:
+        left -= 1
+    @uninterrupted(bound=16)
+    loop:
+        break
+    with actor.request(deadline=actor.now()) as request[region active]:
+        actor.use(request)
+    with (values.guard as Guard):
+        pass
+    with |x: u64| x as transform:
+        pass
+    comptime if true:
+        pass
+    comptime else:
+        pass
+    closure = |read x: u64, mut y: u64, take z: u64,| x + y + z
+    async_closure = async |x: u64| x
+    moving_closure = take |x: u64| x
+    async_moving_closure = async take |x: u64| x
+    suite_closure = |x: u64|:
+        return x
+    unary = comptime copy take await -~actor.fetch()? as u64
+    arithmetic = a * b +% 2 -% 3 *% 4 / 2 % 3
+    shifted = arithmetic << 1 >> 1
+    bits = shifted & 255 ^ 3 | 8
+    logic = not false and true or false
+    half_open = 0 .. values.len()
+    inclusive = 0 ..= values.last
+    pattern_test = values.state is not states.failed(bind error)
+    parenthesized = (left)
+    tupled = (left, right,)
+    arrayed = [left, right,]
+    called = actor.call(left, mut values.field, take values.item, named=right, moved=take values.other)
+    parenthesized_place = actor.call(mut (values.field), moved=take (values.item))
+    indexed = called.items[left].field
+    raced = race(actor.first(), actor.second(), actor.third(),)
+    admitted = try send actor.notify(take values.item)
+    formatted = f"escaped {{brace}} {left:08x} {right + 1}"
+    nested = f"outer {f"inner {left}"} tail"
+    closure_formatted = f"closure {|x: u64| x}"
+    return admitted
+
+fn empty_return():
+    return

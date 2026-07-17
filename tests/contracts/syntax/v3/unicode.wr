@@ -1,0 +1,5 @@
+module contracts.unicode
+
+fn résumé(Δelta: u64) -> u64:
+    café = Δelta
+    return café

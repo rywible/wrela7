@@ -12,5 +12,11 @@ wrela-diagnostics = { path = "../wrela-diagnostics" }
 wrela-flow-wir = { path = "../wrela-flow-wir" }
 wrela-semantic-wir = { path = "../wrela-semantic-wir" }
 
+[dev-dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
+wrela-source = { path = "../wrela-source" }
+wrela-test-model = { path = "../wrela-test-model" }
+wrela-test-protocol = { path = "../wrela-test-protocol" }
+
 [lints]
 workspace = true

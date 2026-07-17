@@ -1,0 +1,28 @@
+schema = 1
+
+[root]
+name = "runtime-timeout"
+version = "0.1.0"
+source_digest = "881937f5077d55a1a9022f8b6d04cf4758064ed0ae4938ecf9fa9a830b1d199b"
+
+[[package]]
+name = "runtime-timeout"
+version = "0.1.0"
+source_digest = "881937f5077d55a1a9022f8b6d04cf4758064ed0ae4938ecf9fa9a830b1d199b"
+manifest_digest = "37b2035d0c5c5e78b58486a081cb8222fa2fa5e057237674f2f7d0aa8def8d31"
+locator = "workspace"
+locator_path = "."
+
+[[package.dependency]]
+alias = "core"
+name = "wrela-core"
+version = "0.1.0"
+source_digest = "5da2bae2f9089643c235c54bf229e67a995f16ce9a0596c24604bd389661afd5"
+
+[[package]]
+name = "wrela-core"
+version = "0.1.0"
+source_digest = "5da2bae2f9089643c235c54bf229e67a995f16ce9a0596c24604bd389661afd5"
+manifest_digest = "7eda3d023a968b8302de6a2d5bea13270be3fbdba58d57ca93d74007a1a65786"
+locator = "toolchain"
+locator_component = "wrela-core-0.1"

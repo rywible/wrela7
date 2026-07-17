@@ -13,7 +13,7 @@ use wrela_build_model::{
     RecordingMode, RecoveryPolicy, Sha256Digest, TargetIdentity, ValidatedBuildConfiguration,
 };
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 const MAGIC: &[u8; 8] = b"WRELBEP\0";
@@ -70,6 +70,11 @@ pub struct BackendRequest {
     pub wir: BackendPath,
     /// SHA-256 of the exact canonical FlowWir frame at `wir`.
     pub wir_digest: Sha256Digest,
+    /// Frontend-verified SHA-256 and length of the exact target runtime object.
+    /// The private backend independently reopens and remeasures this file
+    /// before accepting the target or invoking native code.
+    pub target_runtime_digest: Sha256Digest,
+    pub target_runtime_bytes: u64,
     pub target_package: BackendPath,
     pub output: BackendPath,
     pub report: BackendPath,
@@ -124,10 +129,13 @@ pub fn encode_request(
         .build
         .validate()
         .map_err(|error| ProtocolError::InvalidProfile(error.to_string()))?;
+    validate_runtime_evidence(request.target_runtime_digest, request.target_runtime_bytes)?;
     let mut payload = Vec::new();
     push_u64(&mut payload, request.request_id.0);
     encode_configuration(&mut payload, &request.build)?;
     push_digest(&mut payload, request.wir_digest);
+    push_digest(&mut payload, request.target_runtime_digest);
+    push_u64(&mut payload, request.target_runtime_bytes);
     for path in [
         &request.wir,
         &request.target_package,
@@ -144,11 +152,15 @@ pub fn decode_request(bytes: &[u8]) -> Result<BackendRequest, ProtocolError> {
     let request_id = RequestId(reader.u64()?);
     let build = decode_configuration(&mut reader)?;
     let wir_digest = reader.digest()?;
+    let target_runtime_digest = reader.digest()?;
+    let target_runtime_bytes = reader.u64()?;
     let request = BackendRequest {
         request_id,
         build,
         wir: BackendPath::new(reader.string()?)?,
         wir_digest,
+        target_runtime_digest,
+        target_runtime_bytes,
         target_package: BackendPath::new(reader.string()?)?,
         output: BackendPath::new(reader.string()?)?,
         report: BackendPath::new(reader.string()?)?,
@@ -158,7 +170,17 @@ pub fn decode_request(bytes: &[u8]) -> Result<BackendRequest, ProtocolError> {
         .build
         .validate()
         .map_err(|error| ProtocolError::InvalidProfile(error.to_string()))?;
+    validate_runtime_evidence(request.target_runtime_digest, request.target_runtime_bytes)?;
     Ok(request)
+}
+
+fn validate_runtime_evidence(digest: Sha256Digest, bytes: u64) -> Result<(), ProtocolError> {
+    if bytes == 0 || digest.as_bytes().iter().all(|byte| *byte == 0) {
+        return Err(ProtocolError::InvalidTarget(
+            "target runtime digest and byte count must be nonzero".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn encode_response(response: &BackendResponse) -> Result<Vec<u8>, ProtocolError> {
@@ -666,6 +688,8 @@ mod tests {
             },
             wir: BackendPath::new("build/input.wir").expect("path"),
             wir_digest: digest,
+            target_runtime_digest: Sha256Digest::from_bytes([2; 32]),
+            target_runtime_bytes: 4096,
             target_package: BackendPath::new("targets/aarch64-qemu-virt-uefi").expect("path"),
             output: BackendPath::new("build/image.efi").expect("path"),
             report: BackendPath::new("build/image.json").expect("path"),
@@ -682,6 +706,23 @@ mod tests {
         let request = request_fixture();
         let encoded = encode_request(&request, &validated_build(&request)).expect("encode");
         assert_eq!(decode_request(&encoded), Ok(request));
+    }
+
+    #[test]
+    fn request_requires_concrete_target_runtime_evidence() {
+        let mut request = request_fixture();
+        request.target_runtime_bytes = 0;
+        assert!(matches!(
+            encode_request(&request, &validated_build(&request)),
+            Err(ProtocolError::InvalidTarget(_))
+        ));
+
+        request.target_runtime_bytes = 4096;
+        request.target_runtime_digest = Sha256Digest::from_bytes([0; 32]);
+        assert!(matches!(
+            encode_request(&request, &validated_build(&request)),
+            Err(ProtocolError::InvalidTarget(_))
+        ));
     }
 
     #[test]

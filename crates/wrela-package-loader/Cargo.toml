@@ -8,6 +8,8 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+toml = { version = "=0.9.9", default-features = false, features = ["parse", "std"] }
+toml_parser = { version = "=1.0.5", default-features = false, features = ["alloc", "std"] }
 wrela-build-model = { path = "../wrela-build-model" }
 wrela-package = { path = "../wrela-package" }
 wrela-source = { path = "../wrela-source" }

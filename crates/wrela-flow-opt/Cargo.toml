@@ -10,6 +10,12 @@ license.workspace = true
 [dependencies]
 wrela-build-model = { path = "../wrela-build-model" }
 wrela-flow-wir = { path = "../wrela-flow-wir" }
+wrela-test-model = { path = "../wrela-test-model" }
+
+[dev-dependencies]
+wrela-flow-lower = { path = "../wrela-flow-lower" }
+wrela-semantic-wir = { path = "../wrela-semantic-wir" }
+wrela-source = { path = "../wrela-source" }
 
 [lints]
 workspace = true

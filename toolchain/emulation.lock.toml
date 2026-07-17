@@ -1,10 +1,10 @@
 schema = 1
 
 [qemu]
-version = "10.0.11"
-source = "https://download.qemu.org/qemu-10.0.11.tar.xz"
-sha256 = "22e410fe784021c535756350a811ee78ae71356546ff90f5418493448a34b871"
-signature = "https://download.qemu.org/qemu-10.0.11.tar.xz.sig"
+version = "10.1.5"
+source = "https://download.qemu.org/qemu-10.1.5.tar.xz"
+sha256 = "1f1209b4db82e6c4417eaf6e7e0b073563572a042d9fb7492b084ba65a9c0693"
+signature = "https://download.qemu.org/qemu-10.1.5.tar.xz.sig"
 signing_key_fingerprint = "CEACC9E15534EBABB82D3FA03353C9CEF108B584"
 system_targets = ["aarch64-softmmu"]
 machine_contract = "virt-10.0"

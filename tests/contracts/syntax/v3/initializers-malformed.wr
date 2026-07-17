@@ -1,0 +1,20 @@
+module contracts.initializers_malformed
+
+class InvalidShape:
+    @budget(bound=1)
+    pub init(self):
+        pass
+
+class DuplicateInitializers:
+    init(mut self):
+        pass
+    init(mut self):
+        pass
+
+class RemovedInitializer:
+    fn __init__(mut self):
+        pass
+
+struct InvalidOwner:
+    init(mut self):
+        pass

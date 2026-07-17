@@ -1,0 +1,43 @@
+schema = 1
+
+[root]
+name = "appliance"
+version = "0.1.0"
+source_digest = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[package]]
+name = "appliance"
+version = "0.1.0"
+source_digest = "1111111111111111111111111111111111111111111111111111111111111111"
+manifest_digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+locator = "workspace"
+locator_path = "packages/appliance"
+
+[[package.dependency]]
+alias = "core"
+name = "wrela-core"
+version = "0.1.0"
+source_digest = "3333333333333333333333333333333333333333333333333333333333333333"
+
+[[package.dependency]]
+alias = "net"
+name = "network"
+version = "2.3.4"
+source_digest = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[[package]]
+name = "network"
+version = "2.3.4"
+source_digest = "2222222222222222222222222222222222222222222222222222222222222222"
+manifest_digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+locator = "archive"
+locator_provider = "company-cache"
+locator_key = "sha256:network-2.3.4"
+
+[[package]]
+name = "wrela-core"
+version = "0.1.0"
+source_digest = "3333333333333333333333333333333333333333333333333333333333333333"
+manifest_digest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+locator = "toolchain"
+locator_component = "wrela-core-0.1"

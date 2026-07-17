@@ -11,9 +11,14 @@ license.workspace = true
 wrela-build-model = { path = "../wrela-build-model" }
 wrela-diagnostics = { path = "../wrela-diagnostics" }
 wrela-hir = { path = "../wrela-hir" }
+wrela-package = { path = "../wrela-package" }
 wrela-source = { path = "../wrela-source" }
 wrela-target = { path = "../wrela-target" }
 wrela-test-model = { path = "../wrela-test-model" }
+
+[dev-dependencies]
+wrela-hir-lower = { path = "../wrela-hir-lower" }
+wrela-syntax = { path = "../wrela-syntax" }
 
 [lints]
 workspace = true

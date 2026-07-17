@@ -1,0 +1,11 @@
+module contracts.representative
+
+import core.numbers
+from core.values import Value as V, Other
+
+@task(priority=1)
+pub async fn compute(read input: u64, take buffer: Bytes[64]) -> Result[u64, Error]:
+    total: u64 = input + 2 * 3
+    buffer.index = total
+    assert total >= 1, "positive\n"
+    return (service.call(take buffer, value=total)?).field[0] as u64

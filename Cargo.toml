@@ -8,6 +8,7 @@ members = [
     "crates/wrela-compiler",
     "crates/wrela-diagnostics",
     "crates/wrela-driver",
+    "crates/wrela-engine",
     "crates/wrela-flow-lower",
     "crates/wrela-flow-opt",
     "crates/wrela-flow-wir",

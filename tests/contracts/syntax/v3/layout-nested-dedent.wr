@@ -1,0 +1,9 @@
+module contracts.layout_nested_dedent
+
+fn nested():
+    if true:
+        pass
+
+# This line follows a two-level dedent.
+fn after():
+    pass

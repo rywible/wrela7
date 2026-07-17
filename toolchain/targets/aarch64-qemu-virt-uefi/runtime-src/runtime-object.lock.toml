@@ -1,0 +1,12 @@
+schema = 1
+target = "aarch64-unknown-uefi"
+runtime_abi_version = 2
+compiler_identity = "Apple clang version 17.0.0 (clang-1700.6.4.2)"
+compiler_sha256 = "15339439a6be4a9d33d281ec040a7e0092190b1c8d7de5f94d824b50ffae0769"
+builder_sha256 = "18496565074f172b58a76ce8bfea1b0deb1d5d1827764d3bcdfaaa0d1d05b529"
+source_sha256 = "a2222ad923a15540b2017fddb5a7dd51b50f1df62a370d6d618a22d84683c4ed"
+object_sha256 = "530530151e0d0ffa2b2049d0b01dfdb40afe25a5de3f2577fd63447b5d7bb52a"
+object_bytes = 9894
+coff_machine = "arm64"
+relocations = 169
+undefined_symbols = 0

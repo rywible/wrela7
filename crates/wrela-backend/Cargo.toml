@@ -13,6 +13,7 @@ default = []
 bundled-backend = ["wrela-codegen-llvm/llvm", "wrela-link-efi/bundled-lld"]
 
 [dependencies]
+sha2 = { version = "=0.10.9", default-features = false }
 wrela-backend-protocol = { path = "../wrela-backend-protocol" }
 wrela-build-model = { path = "../wrela-build-model" }
 wrela-codegen-llvm = { path = "../wrela-codegen-llvm" }
@@ -23,6 +24,9 @@ wrela-image-report = { path = "../wrela-image-report" }
 wrela-link-efi = { path = "../wrela-link-efi" }
 wrela-machine-lower = { path = "../wrela-machine-lower" }
 wrela-target = { path = "../wrela-target" }
+
+[dev-dependencies]
+wrela-source = { path = "../wrela-source" }
 
 [lints]
 workspace = true

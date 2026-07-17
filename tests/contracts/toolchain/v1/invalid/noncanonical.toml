@@ -1,0 +1,73 @@
+schema=1
+release = "0.1.0"
+host = "aarch64-apple-darwin"
+llvm_project_revision = "llvmorg-22.1.3"
+
+[compatibility]
+language = "0.1-design"
+build_profile_encoding = 2
+backend_protocol = 5
+target_package = 1
+semantic_wir = 8
+flow_wir = 10
+flow_wir_wire = 10
+machine_wir = 10
+runtime_abi = 2
+image_report = 11
+test_plan = 2
+test_report = 2
+image_scenario = 1
+test_event = 3
+test_frame = 1
+
+[[standard_library_packages]]
+name = "wrela-core"
+version = "0.1.0"
+source_digest = "1111111111111111111111111111111111111111111111111111111111111111"
+component = "wrela-core-0.1"
+manifest_digest = "1212121212121212121212121212121212121212121212121212121212121212"
+
+[[components]]
+kind = "frontend"
+path = "bin/wrela"
+digest = "2121212121212121212121212121212121212121212121212121212121212121"
+bytes = 12345
+
+[[components]]
+kind = "backend"
+path = "libexec/wrela/wrela-backend"
+digest = "2222222222222222222222222222222222222222222222222222222222222222"
+bytes = 23456
+
+[[components]]
+kind = "standard_library"
+path = "share/wrela/std"
+digest = "2323232323232323232323232323232323232323232323232323232323232323"
+bytes = 34567
+
+[[components]]
+kind = "aarch64_emulator"
+path = "libexec/wrela/qemu-system-aarch64"
+digest = "2424242424242424242424242424242424242424242424242424242424242424"
+bytes = 45678
+
+[[targets]]
+identity = "aarch64-qemu-virt-uefi"
+path = "share/wrela/targets/aarch64-qemu-virt-uefi"
+digest = "3131313131313131313131313131313131313131313131313131313131313131"
+bytes = 56789
+
+[[targets.files]]
+path = "firmware/QEMU_EFI.fd"
+digest = "3232323232323232323232323232323232323232323232323232323232323232"
+bytes = 67890
+
+[[targets.files]]
+path = "firmware/QEMU_VARS.fd"
+digest = "3333333333333333333333333333333333333333333333333333333333333333"
+bytes = 78901
+
+[[targets.files]]
+path = "runtime/wrela-runtime-aarch64.obj"
+digest = "3434343434343434343434343434343434343434343434343434343434343434"
+bytes = 89012

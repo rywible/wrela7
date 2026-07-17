@@ -3,10 +3,11 @@
 
 #![forbid(unsafe_code)]
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use wrela_diagnostics::{Diagnostic, Severity};
+use wrela_diagnostics::{Diagnostic, Severity, compare_diagnostics};
 use wrela_hir::ValidatedProgram;
 use wrela_sema::AnalyzedImage;
 use wrela_syntax::ParsedFile;
@@ -63,7 +64,11 @@ pub struct LintConfiguration {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LintLimits {
+    pub configuration_entries: u32,
     pub findings: u32,
+    /// Aggregate number of nested diagnostic strings, labels, repairs, and
+    /// replacement records inspected while sealing findings.
+    pub diagnostic_elements: u64,
     pub diagnostic_bytes: u64,
 }
 
@@ -71,13 +76,19 @@ impl LintLimits {
     #[must_use]
     pub const fn standard() -> Self {
         Self {
+            configuration_entries: 65_536,
             findings: 100_000,
+            diagnostic_elements: 1_000_000,
             diagnostic_bytes: 64 * 1024 * 1024,
         }
     }
 
     pub fn validate(self) -> Result<(), LintError> {
-        if self.findings == 0 || self.diagnostic_bytes == 0 {
+        if self.configuration_entries == 0
+            || self.findings == 0
+            || self.diagnostic_elements == 0
+            || self.diagnostic_bytes == 0
+        {
             Err(LintError::InvalidLimits)
         } else {
             Ok(())
@@ -192,12 +203,23 @@ pub fn seal_lint_output(
         return Err(LintError::Cancelled);
     }
     request.limits.validate()?;
-    for name in request.configuration.levels.keys() {
+    if u32::try_from(request.configuration.levels.len()).map_or(true, |entries| {
+        entries > request.limits.configuration_entries
+    }) {
+        return Err(LintError::ResourceLimit {
+            resource: "lint configuration entries",
+            limit: u64::from(request.limits.configuration_entries),
+        });
+    }
+    for (work, name) in request.configuration.levels.keys().enumerate() {
+        poll_cancel(work, is_cancelled)?;
         if request.registry.descriptor(name).is_none() {
             return Err(LintError::UnknownLint(name.clone()));
         }
     }
-    if candidate.findings.len() > request.limits.findings as usize {
+    if u32::try_from(candidate.findings.len())
+        .map_or(true, |findings| findings > request.limits.findings)
+    {
         return Err(LintError::ResourceLimit {
             resource: "lint findings",
             limit: u64::from(request.limits.findings),
@@ -209,7 +231,40 @@ pub fn seal_lint_output(
         LintInput::Semantic(_) => LintLayer::Semantic,
     };
     let mut diagnostic_bytes = 0u64;
-    for finding in &candidate.findings {
+    let mut diagnostic_elements = 0u64;
+    for (work, finding) in candidate.findings.iter().enumerate() {
+        poll_cancel(work, is_cancelled)?;
+        diagnostic_elements = diagnostic_elements
+            .checked_add(diagnostic_element_count(
+                &finding.diagnostic,
+                request.limits.diagnostic_elements,
+                is_cancelled,
+            )?)
+            .filter(|elements| *elements <= request.limits.diagnostic_elements)
+            .ok_or(LintError::ResourceLimit {
+                resource: "lint diagnostic elements",
+                limit: request.limits.diagnostic_elements,
+            })?;
+        let remaining_bytes = request
+            .limits
+            .diagnostic_bytes
+            .checked_sub(diagnostic_bytes)
+            .ok_or(LintError::ResourceLimit {
+                resource: "lint diagnostic bytes",
+                limit: request.limits.diagnostic_bytes,
+            })?;
+        diagnostic_bytes = diagnostic_bytes
+            .checked_add(diagnostic_size(
+                &finding.diagnostic,
+                remaining_bytes,
+                request.limits.diagnostic_bytes,
+                is_cancelled,
+            )?)
+            .filter(|bytes| *bytes <= request.limits.diagnostic_bytes)
+            .ok_or(LintError::ResourceLimit {
+                resource: "lint diagnostic bytes",
+                limit: request.limits.diagnostic_bytes,
+            })?;
         let descriptor = request
             .registry
             .descriptor(&finding.lint)
@@ -235,38 +290,20 @@ pub fn seal_lint_output(
         };
         if finding.level != effective
             || finding.diagnostic.severity != expected_severity
-            || !valid_diagnostic(&finding.diagnostic)
+            || !valid_diagnostic(&finding.diagnostic, is_cancelled)?
         {
             return Err(LintError::InvalidFinding(finding.lint.clone()));
         }
-        diagnostic_bytes = diagnostic_bytes
-            .checked_add(
-                diagnostic_size(&finding.diagnostic).ok_or(LintError::ResourceLimit {
-                    resource: "lint diagnostic bytes",
-                    limit: request.limits.diagnostic_bytes,
-                })?,
-            )
-            .ok_or(LintError::ResourceLimit {
-                resource: "lint diagnostic bytes",
-                limit: request.limits.diagnostic_bytes,
-            })?;
     }
-    if diagnostic_bytes > request.limits.diagnostic_bytes {
-        return Err(LintError::ResourceLimit {
-            resource: "lint diagnostic bytes",
-            limit: request.limits.diagnostic_bytes,
-        });
+    candidate.findings = canonicalize_findings(candidate.findings, is_cancelled)?;
+    let mut denied = false;
+    for (work, finding) in candidate.findings.iter().enumerate() {
+        poll_cancel(work, is_cancelled)?;
+        if work != 0 && candidate.findings[work - 1] == *finding {
+            return Err(LintError::DuplicateFinding);
+        }
+        denied |= finding.level == LintLevel::Deny;
     }
-    candidate
-        .findings
-        .sort_by(|left, right| lint_finding_key(left).cmp(&lint_finding_key(right)));
-    if candidate.findings.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(LintError::DuplicateFinding);
-    }
-    let denied = candidate
-        .findings
-        .iter()
-        .any(|finding| finding.level == LintLevel::Deny);
     if is_cancelled() {
         return Err(LintError::Cancelled);
     }
@@ -276,84 +313,321 @@ pub fn seal_lint_output(
     })
 }
 
-fn lint_finding_key(finding: &LintFinding) -> (&LintName, u32, u32, u32, &str) {
-    (
-        &finding.lint,
-        finding.diagnostic.primary.file.0,
-        finding.diagnostic.primary.range.start,
-        finding.diagnostic.primary.range.end,
-        &finding.diagnostic.message,
-    )
+fn compare_findings(left: &LintFinding, right: &LintFinding) -> Ordering {
+    left.lint
+        .cmp(&right.lint)
+        .then_with(|| left.level.cmp(&right.level))
+        .then_with(|| compare_diagnostics(&left.diagnostic, &right.diagnostic))
 }
 
-fn valid_diagnostic(diagnostic: &Diagnostic) -> bool {
-    let valid_range = |start: u32, end: u32| start <= end;
-    !diagnostic.message.trim().is_empty()
-        && valid_range(diagnostic.primary.range.start, diagnostic.primary.range.end)
-        && diagnostic.code.as_ref().is_none_or(|code| {
-            !code.is_empty()
-                && code
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        })
-        && diagnostic.labels.iter().all(|label| {
-            valid_range(label.span.range.start, label.span.range.end)
-                && !label.message.trim().is_empty()
-        })
-        && diagnostic.related.iter().all(|related| {
-            valid_range(related.span.range.start, related.span.range.end)
-                && !related.message.trim().is_empty()
-        })
-        && diagnostic.repairs.iter().all(|repair| {
-            !repair.message.trim().is_empty()
-                && !repair.edits.is_empty()
-                && repair.edits.windows(2).all(|pair| {
-                    (
-                        pair[0].span.file,
-                        pair[0].span.range.start,
-                        pair[0].span.range.end,
-                    ) < (
-                        pair[1].span.file,
-                        pair[1].span.range.start,
-                        pair[1].span.range.end,
-                    ) && (pair[0].span.file != pair[1].span.file
-                        || pair[0].span.range.end <= pair[1].span.range.start)
-                })
-                && repair
-                    .edits
-                    .iter()
-                    .all(|edit| valid_range(edit.span.range.start, edit.span.range.end))
-        })
+fn canonicalize_findings(
+    findings: Vec<LintFinding>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<LintFinding>, LintError> {
+    const RUN_FINDINGS: usize = 256;
+    if is_cancelled() {
+        return Err(LintError::Cancelled);
+    }
+    if findings.len() <= 1 {
+        return Ok(findings);
+    }
+    if findings.len() <= RUN_FINDINGS {
+        let mut findings = findings;
+        findings.sort_unstable_by(compare_findings);
+        if is_cancelled() {
+            return Err(LintError::Cancelled);
+        }
+        return Ok(findings);
+    }
+
+    let run_count = findings.len().div_ceil(RUN_FINDINGS);
+    let mut runs = Vec::new();
+    runs.try_reserve_exact(run_count)
+        .map_err(|_| LintError::ResourceExhausted("lint finding sort runs"))?;
+    let mut remaining = findings.len();
+    let mut findings = findings.into_iter();
+    loop {
+        if is_cancelled() {
+            return Err(LintError::Cancelled);
+        }
+        let run_capacity = remaining.min(RUN_FINDINGS);
+        let mut run = Vec::new();
+        run.try_reserve_exact(run_capacity)
+            .map_err(|_| LintError::ResourceExhausted("lint finding sort run"))?;
+        for _ in 0..run_capacity {
+            let Some(finding) = findings.next() else {
+                break;
+            };
+            run.push(finding);
+        }
+        if run.is_empty() {
+            break;
+        }
+        remaining = remaining.saturating_sub(run.len());
+        run.sort_unstable_by(compare_findings);
+        runs.push(run);
+    }
+
+    while runs.len() > 1 {
+        if is_cancelled() {
+            return Err(LintError::Cancelled);
+        }
+        let mut merged_runs = Vec::new();
+        merged_runs
+            .try_reserve_exact(runs.len().div_ceil(2))
+            .map_err(|_| LintError::ResourceExhausted("merged lint finding sort runs"))?;
+        let previous_runs = std::mem::take(&mut runs);
+        let mut run_iter = previous_runs.into_iter();
+        while let Some(left) = run_iter.next() {
+            if is_cancelled() {
+                return Err(LintError::Cancelled);
+            }
+            let Some(right) = run_iter.next() else {
+                merged_runs.push(left);
+                break;
+            };
+            merged_runs.push(merge_finding_runs(left, right, is_cancelled)?);
+        }
+        runs = merged_runs;
+    }
+    if is_cancelled() {
+        return Err(LintError::Cancelled);
+    }
+    runs.pop()
+        .ok_or(LintError::ResourceExhausted("canonical lint findings"))
 }
 
-fn diagnostic_size(diagnostic: &Diagnostic) -> Option<u64> {
-    std::iter::once(diagnostic.message.as_str())
-        .chain(diagnostic.code.iter().map(String::as_str))
-        .chain(diagnostic.labels.iter().map(|value| value.message.as_str()))
-        .chain(diagnostic.notes.iter().map(String::as_str))
-        .chain(diagnostic.help.iter().map(String::as_str))
-        .chain(
-            diagnostic
-                .related
-                .iter()
-                .map(|value| value.message.as_str()),
-        )
-        .chain(
-            diagnostic
-                .repairs
-                .iter()
-                .map(|value| value.message.as_str()),
-        )
-        .chain(
-            diagnostic
-                .repairs
-                .iter()
-                .flat_map(|repair| repair.edits.iter())
-                .map(|edit| edit.replacement.as_str()),
-        )
-        .try_fold(0u64, |total, value| {
-            total.checked_add(u64::try_from(value.len()).ok()?)
-        })
+fn merge_finding_runs(
+    left: Vec<LintFinding>,
+    right: Vec<LintFinding>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<LintFinding>, LintError> {
+    let count = left
+        .len()
+        .checked_add(right.len())
+        .ok_or(LintError::ResourceExhausted("merged lint finding sort run"))?;
+    let mut merged = Vec::new();
+    merged
+        .try_reserve_exact(count)
+        .map_err(|_| LintError::ResourceExhausted("merged lint finding sort run"))?;
+    let mut left = left.into_iter().peekable();
+    let mut right = right.into_iter().peekable();
+    while left.peek().is_some() || right.peek().is_some() {
+        if is_cancelled() {
+            return Err(LintError::Cancelled);
+        }
+        let next = match (left.peek(), right.peek()) {
+            (Some(left_value), Some(right_value)) => {
+                if compare_findings(left_value, right_value) != Ordering::Greater {
+                    left.next()
+                } else {
+                    right.next()
+                }
+            }
+            (Some(_), None) => left.next(),
+            (None, Some(_)) => right.next(),
+            (None, None) => None,
+        }
+        .ok_or(LintError::ResourceExhausted("merged lint finding sort run"))?;
+        merged.push(next);
+    }
+    Ok(merged)
+}
+
+fn valid_diagnostic(
+    diagnostic: &Diagnostic,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, LintError> {
+    if !valid_range(diagnostic.primary.range.start, diagnostic.primary.range.end)
+        || !nonblank(&diagnostic.message, is_cancelled)?
+    {
+        return Ok(false);
+    }
+    if let Some(code) = &diagnostic.code {
+        if code.is_empty() {
+            return Ok(false);
+        }
+        for (work, byte) in code.bytes().enumerate() {
+            poll_cancel(work, is_cancelled)?;
+            if !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-') {
+                return Ok(false);
+            }
+        }
+    }
+    for (work, label) in diagnostic.labels.iter().enumerate() {
+        poll_cancel(work, is_cancelled)?;
+        if !valid_range(label.span.range.start, label.span.range.end)
+            || !nonblank(&label.message, is_cancelled)?
+        {
+            return Ok(false);
+        }
+    }
+    for (work, note) in diagnostic.notes.iter().enumerate() {
+        poll_cancel(work, is_cancelled)?;
+        if !nonblank(note, is_cancelled)? {
+            return Ok(false);
+        }
+    }
+    for (work, help) in diagnostic.help.iter().enumerate() {
+        poll_cancel(work, is_cancelled)?;
+        if !nonblank(help, is_cancelled)? {
+            return Ok(false);
+        }
+    }
+    for (work, related) in diagnostic.related.iter().enumerate() {
+        poll_cancel(work, is_cancelled)?;
+        if !valid_range(related.span.range.start, related.span.range.end)
+            || !nonblank(&related.message, is_cancelled)?
+        {
+            return Ok(false);
+        }
+    }
+    for (repair_work, repair) in diagnostic.repairs.iter().enumerate() {
+        poll_cancel(repair_work, is_cancelled)?;
+        if repair.edits.is_empty() || !nonblank(&repair.message, is_cancelled)? {
+            return Ok(false);
+        }
+        for (edit_work, edit) in repair.edits.iter().enumerate() {
+            poll_cancel(edit_work, is_cancelled)?;
+            if !valid_range(edit.span.range.start, edit.span.range.end) {
+                return Ok(false);
+            }
+            if let Some(previous) = edit_work
+                .checked_sub(1)
+                .and_then(|previous| repair.edits.get(previous))
+            {
+                let previous_key = (
+                    previous.span.file,
+                    previous.span.range.start,
+                    previous.span.range.end,
+                );
+                let current_key = (edit.span.file, edit.span.range.start, edit.span.range.end);
+                if previous_key >= current_key
+                    || (previous.span.file == edit.span.file
+                        && previous.span.range.end > edit.span.range.start)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+const fn valid_range(start: u32, end: u32) -> bool {
+    start <= end
+}
+
+fn nonblank(value: &str, is_cancelled: &dyn Fn() -> bool) -> Result<bool, LintError> {
+    for (work, character) in value.chars().enumerate() {
+        poll_cancel(work, is_cancelled)?;
+        if !character.is_whitespace() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn poll_cancel(work: usize, is_cancelled: &dyn Fn() -> bool) -> Result<(), LintError> {
+    if work % 256 == 0 && is_cancelled() {
+        Err(LintError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn diagnostic_element_count(
+    diagnostic: &Diagnostic,
+    limit: u64,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<u64, LintError> {
+    let mut total = 1u64;
+    for length in [
+        usize::from(diagnostic.code.is_some()),
+        diagnostic.labels.len(),
+        diagnostic.notes.len(),
+        diagnostic.help.len(),
+        diagnostic.related.len(),
+        diagnostic.repairs.len(),
+    ] {
+        total = total
+            .checked_add(u64::try_from(length).map_err(|_| LintError::ResourceLimit {
+                resource: "lint diagnostic elements",
+                limit,
+            })?)
+            .filter(|elements| *elements <= limit)
+            .ok_or(LintError::ResourceLimit {
+                resource: "lint diagnostic elements",
+                limit,
+            })?;
+    }
+    for (work, repair) in diagnostic.repairs.iter().enumerate() {
+        poll_cancel(work, is_cancelled)?;
+        total = total
+            .checked_add(u64::try_from(repair.edits.len()).map_err(|_| {
+                LintError::ResourceLimit {
+                    resource: "lint diagnostic elements",
+                    limit,
+                }
+            })?)
+            .filter(|elements| *elements <= limit)
+            .ok_or(LintError::ResourceLimit {
+                resource: "lint diagnostic elements",
+                limit,
+            })?;
+    }
+    Ok(total)
+}
+
+fn diagnostic_size(
+    diagnostic: &Diagnostic,
+    maximum: u64,
+    reported_limit: u64,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<u64, LintError> {
+    let mut bytes = 0u64;
+    let mut work = 0usize;
+    let mut add = |value: &str| -> Result<(), LintError> {
+        poll_cancel(work, is_cancelled)?;
+        work = work.saturating_add(1);
+        bytes = bytes
+            .checked_add(
+                u64::try_from(value.len()).map_err(|_| LintError::ResourceLimit {
+                    resource: "lint diagnostic bytes",
+                    limit: reported_limit,
+                })?,
+            )
+            .filter(|bytes| *bytes <= maximum)
+            .ok_or(LintError::ResourceLimit {
+                resource: "lint diagnostic bytes",
+                limit: reported_limit,
+            })?;
+        Ok(())
+    };
+
+    add(&diagnostic.message)?;
+    if let Some(code) = &diagnostic.code {
+        add(code)?;
+    }
+    for label in &diagnostic.labels {
+        add(&label.message)?;
+    }
+    for note in &diagnostic.notes {
+        add(note)?;
+    }
+    for help in &diagnostic.help {
+        add(help)?;
+    }
+    for related in &diagnostic.related {
+        add(&related.message)?;
+    }
+    for repair in &diagnostic.repairs {
+        add(&repair.message)?;
+        for edit in &repair.edits {
+            add(&edit.replacement)?;
+        }
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,6 +643,7 @@ pub enum LintError {
     InvalidFinding(LintName),
     DuplicateFinding,
     ResourceLimit { resource: &'static str, limit: u64 },
+    ResourceExhausted(&'static str),
     WrongLayer { lint: LintName, expected: LintLayer },
 }
 
@@ -408,6 +683,9 @@ impl fmt::Display for LintError {
             Self::ResourceLimit { resource, limit } => {
                 write!(formatter, "linting exceeded {resource} limit {limit}")
             }
+            Self::ResourceExhausted(resource) => {
+                write!(formatter, "cannot allocate bounded {resource}")
+            }
             Self::WrongLayer { lint, expected } => {
                 write!(
                     formatter,
@@ -423,7 +701,49 @@ impl std::error::Error for LintError {}
 
 #[cfg(test)]
 mod contract_tests {
-    use super::{LintError, LintLimits};
+    use std::cell::Cell;
+
+    use wrela_diagnostics::{Category, Diagnostic, FileId, Severity, Span, TextRange};
+
+    use super::{
+        LintConfiguration, LintDescriptor, LintError, LintFinding, LintInput, LintLayer, LintLevel,
+        LintLimits, LintName, LintOutputCandidate, LintRegistry, LintRequest,
+        canonicalize_findings, seal_lint_output,
+    };
+
+    fn fixture() -> (LintRegistry, LintName) {
+        let name = LintName::new("fixture-lint").expect("lint name");
+        let registry = LintRegistry::new(vec![LintDescriptor {
+            name: name.clone(),
+            layer: LintLayer::Syntax,
+            summary: "fixture lint".to_owned(),
+            default_level: LintLevel::Warn,
+        }])
+        .expect("lint registry");
+        (registry, name)
+    }
+
+    fn finding(name: &LintName, note: &str) -> LintFinding {
+        LintFinding {
+            lint: name.clone(),
+            level: LintLevel::Warn,
+            diagnostic: Diagnostic {
+                category: Category::SYNTAX,
+                code: Some(name.as_str().to_owned()),
+                severity: Severity::Warning,
+                primary: Span {
+                    file: FileId(0),
+                    range: TextRange { start: 1, end: 2 },
+                },
+                message: "fixture finding".to_owned(),
+                labels: Vec::new(),
+                notes: vec![note.to_owned()],
+                help: Vec::new(),
+                related: Vec::new(),
+                repairs: Vec::new(),
+            },
+        }
+    }
 
     #[test]
     fn lint_policy_rejects_zero_capacity() {
@@ -431,5 +751,118 @@ mod contract_tests {
         let mut limits = LintLimits::standard();
         limits.findings = 0;
         assert!(matches!(limits.validate(), Err(LintError::InvalidLimits)));
+
+        let mut limits = LintLimits::standard();
+        limits.configuration_entries = 0;
+        assert!(matches!(limits.validate(), Err(LintError::InvalidLimits)));
+
+        let mut limits = LintLimits::standard();
+        limits.diagnostic_elements = 0;
+        assert!(matches!(limits.validate(), Err(LintError::InvalidLimits)));
+    }
+
+    #[test]
+    fn lint_seal_uses_total_order_and_bounds_nested_diagnostics() {
+        let (registry, name) = fixture();
+        let configuration = LintConfiguration::default();
+        let mut limits = LintLimits::standard();
+        let request = |limits| LintRequest {
+            input: LintInput::Syntax(&[]),
+            registry: &registry,
+            configuration: &configuration,
+            limits,
+        };
+        let output = seal_lint_output(
+            &request(limits),
+            LintOutputCandidate {
+                findings: vec![finding(&name, "z-note"), finding(&name, "a-note")],
+            },
+            &|| false,
+        )
+        .expect("canonical findings");
+        assert_eq!(output.findings()[0].diagnostic.notes, ["a-note"]);
+        assert_eq!(output.findings()[1].diagnostic.notes, ["z-note"]);
+
+        limits.diagnostic_elements = 2;
+        assert!(matches!(
+            seal_lint_output(
+                &request(limits),
+                LintOutputCandidate {
+                    findings: vec![finding(&name, "one-note")],
+                },
+                &|| false,
+            ),
+            Err(LintError::ResourceLimit {
+                resource: "lint diagnostic elements",
+                limit: 2,
+            })
+        ));
+
+        let mut malformed = finding(&name, "valid");
+        malformed.diagnostic.notes[0].clear();
+        assert!(matches!(
+            seal_lint_output(
+                &request(LintLimits::standard()),
+                LintOutputCandidate {
+                    findings: vec![malformed],
+                },
+                &|| false,
+            ),
+            Err(LintError::InvalidFinding(_))
+        ));
+    }
+
+    #[test]
+    fn lint_seal_polls_cancellation_inside_large_diagnostic_text() {
+        let (registry, name) = fixture();
+        let configuration = LintConfiguration::default();
+        let request = LintRequest {
+            input: LintInput::Syntax(&[]),
+            registry: &registry,
+            configuration: &configuration,
+            limits: LintLimits::standard(),
+        };
+        let mut candidate = finding(&name, "valid");
+        candidate.diagnostic.message = " ".repeat(4096);
+        let polls = Cell::new(0u32);
+        assert_eq!(
+            seal_lint_output(
+                &request,
+                LintOutputCandidate {
+                    findings: vec![candidate],
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= 6
+                },
+            ),
+            Err(LintError::Cancelled)
+        );
+        assert!(polls.get() >= 6);
+    }
+
+    #[test]
+    fn project_sized_finding_sort_is_total_and_cancellable() {
+        let (_, name) = fixture();
+        let findings: Vec<_> = (0..600)
+            .rev()
+            .map(|value| finding(&name, &format!("note-{value:04}")))
+            .collect();
+        let sorted = canonicalize_findings(findings.clone(), &|| false)
+            .expect("bounded canonical finding sort");
+        assert_eq!(sorted[0].diagnostic.notes, ["note-0000"]);
+        assert_eq!(sorted[599].diagnostic.notes, ["note-0599"]);
+
+        let polls = Cell::new(0u32);
+        assert_eq!(
+            canonicalize_findings(findings, &|| {
+                let next = polls.get().saturating_add(1);
+                polls.set(next);
+                next >= 4
+            }),
+            Err(LintError::Cancelled)
+        );
+        assert!(polls.get() >= 4);
     }
 }

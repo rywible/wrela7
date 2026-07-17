@@ -18,11 +18,20 @@ manifest/lock/provider -> package-loader -> source/package graph
 `wrela-compiler` is the sole wide composition root. It injects every phase
 trait and bounded host capability into the small public `wrela-driver` API;
 lower crates never depend back on either orchestration implementation state.
+`wrela-engine` is the executable authority boundary around that composition
+root: it accepts only canonical engine-protocol records plus explicit private
+staging/toolchain capabilities and emits only a validated response stream. The
+current crate is a one-request process slice; a reproducible static AArch64
+Linux binary, appliance execution, and thin host launchers remain separate
+distribution consumers.
 
-Comptime tests execute in semantic analysis. Runtime integration and manifest
-image tests compile through the same pipeline and boot under the target-owned
-QEMU profile; `wrela-test-model`, `wrela-test-protocol`, and
-`wrela-test-runner` own that boundary.
+Manifest-declared comptime tests can import and execute the implemented subset
+of ordinary production `comptime fn` declarations during semantic analysis.
+The runtime integration/image route shares the ordinary backend, protocol, and
+target-owned QEMU design. Selected generated-test runtime assertions now reach
+native ABI2 objects, but current packaged-QEMU execution and non-test/actor
+assertion supervision remain open; `wrela-test-model`, `wrela-test-protocol`,
+and `wrela-test-runner` own that execution boundary.
 
 The syntax model is an AST with a lossless token/trivia table. There is no CST
 or LSP crate. `wrela-format` and `wrela-lint` consume the weakest sufficient
@@ -36,9 +45,12 @@ See [`docs/crate-contracts.md`](../docs/crate-contracts.md) for every crate's
 input/output contract and the exact dependency allowlist enforced by
 `cargo xtask architecture-check`.
 
-For focused work, use `cargo xcheck <slice-or-crate>`,
-`cargo xtest <slice-or-crate>`, and `cargo xlint <slice-or-crate>`.
-`cargo xtask slices` lists narrow syntax/HIR/semantic/Flow/Machine/artifact
-boundaries as well as end-to-end groups. Phase outputs bind validated data and
-their report together; machine lowering borrows optimized FlowWir, so retaining
-report inputs never clones an image-sized IR.
+For focused acceptance, use `cargo xgate <slice-or-crate>`. It runs scoped
+formatting, all-target checks, unfiltered tests, Clippy, and architecture/closure
+validation under locked offline Cargo resolution. `cargo xtask slices` is the
+authoritative inventory of packages, resolved closures, boundaries, real
+checked-in fixtures, native requirements, fast/full commands, and timing
+budgets. `cargo xcheck`, `cargo xtest`, and `cargo xlint` remain granular
+diagnostic commands. Phase outputs bind validated data and their report
+together; machine lowering borrows optimized FlowWir, so retaining report
+inputs never clones an image-sized IR.

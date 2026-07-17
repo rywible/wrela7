@@ -8,8 +8,19 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+wrela-hir = { path = "../wrela-hir" }
 wrela-sema = { path = "../wrela-sema" }
 wrela-semantic-wir = { path = "../wrela-semantic-wir" }
+wrela-test-model = { path = "../wrela-test-model" }
+wrela-test-protocol = { path = "../wrela-test-protocol" }
+
+[dev-dependencies]
+wrela-build-model = { path = "../wrela-build-model" }
+wrela-hir-lower = { path = "../wrela-hir-lower" }
+wrela-package = { path = "../wrela-package" }
+wrela-source = { path = "../wrela-source" }
+wrela-syntax = { path = "../wrela-syntax" }
+wrela-target = { path = "../wrela-target" }
 
 [lints]
 workspace = true

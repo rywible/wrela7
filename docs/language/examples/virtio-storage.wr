@@ -97,7 +97,7 @@ pub class BlkDriver[const MODE: DriverMode]:
     pending: InterruptCell[u32]
     irq: Option[IrqCap[BlkQueueVector]]
 
-    fn __init__(mut self,
+    init(mut self,
                 take cap: DeviceCap[VirtioBlock],
                 take control_pool: DmaPool[BlockControl, 256.KiB])
         -> Result[unit, BootError]:
@@ -287,7 +287,7 @@ class CacheFill:
 class BlockCache:
     lines: [CacheLine; CACHE_BLOCKS]
 
-    fn __init__(mut self,
+    init(mut self,
                 take blocks: [iso[BlockPayloads] DmaBlock; CACHE_BLOCKS]):
         self.lines = blocks.map_take(CacheLine.invalid)
 
@@ -407,7 +407,7 @@ class ExtentFs:
     cache: BlockCache
     next_free_lba: u64
 
-    fn __init__(mut self,
+    init(mut self,
                 disk: Actor[BlkDriver[BLOCK_MODE]],
                 take blocks: [iso[BlockPayloads] DmaBlock; CACHE_BLOCKS]):
         self.disk = disk
@@ -535,7 +535,7 @@ class ExtentFs:
 pub class Storage:
     fs: ExtentFs
 
-    fn __init__(mut self,
+    init(mut self,
                 disk: Actor[BlkDriver[BLOCK_MODE]],
                 take blocks: [iso[BlockPayloads] DmaBlock; CACHE_BLOCKS]):
         self.fs = ExtentFs(disk=disk, blocks=take blocks)
@@ -564,7 +564,7 @@ pub class Notes:
     console: Actor[Console]
     buffers: IsoPool[AppBuffers, Bytes, 2]
 
-    fn __init__(mut self,
+    init(mut self,
                 storage: Actor[Storage],
                 console: Actor[Console],
                 take buffers: IsoPool[AppBuffers, Bytes, 2]):

@@ -1,0 +1,8 @@
+module contracts.layout
+
+fn layout():
+    value = service.call(
+        1,
+        2,
+    ); pass
+    return value

@@ -16,5 +16,11 @@ wrela-build-model = { path = "../wrela-build-model" }
 wrela-compiler = { path = "../wrela-compiler" }
 wrela-driver = { path = "../wrela-driver" }
 
+[dev-dependencies]
+wrela-package = { path = "../wrela-package" }
+wrela-package-loader = { path = "../wrela-package-loader" }
+wrela-test-model = { path = "../wrela-test-model" }
+wrela-toolchain = { path = "../wrela-toolchain" }
+
 [lints]
 workspace = true

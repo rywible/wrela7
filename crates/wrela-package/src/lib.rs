@@ -5,9 +5,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
+use unicode_ident::{is_xid_continue, is_xid_start};
 use unicode_normalization::UnicodeNormalization;
 use wrela_build_model::{BuildProfile, LanguageRevision, Sha256Digest};
 use wrela_source::{FileId, MAX_SOURCE_PATH_BYTES};
@@ -15,10 +16,108 @@ use wrela_source::{FileId, MAX_SOURCE_PATH_BYTES};
 pub const MAX_PACKAGES: usize = 1_000_000;
 pub const MAX_MODULES: usize = 1_000_000;
 pub const MAX_DEPENDENCIES_PER_PACKAGE: usize = 65_536;
+/// Maximum UTF-8 bytes retained from any project-controlled value in a
+/// [`ManifestError`], including the truncation marker.
+pub const MAX_MANIFEST_ERROR_VALUE_BYTES: usize = 256;
 /// Current TOML manifest schema.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// Current canonical lockfile schema.
 pub const LOCKFILE_SCHEMA_VERSION: u32 = 1;
+
+/// Return whether `value` is exactly a revision 0.1 source identifier.
+///
+/// This is the shared compiler boundary for source-facing names outside the
+/// scanner. It applies the pinned Unicode 16 XID tables, NFC, keyword,
+/// wildcard, default-ignorable, bidi-control, and byte-length rules.
+#[must_use]
+pub fn is_valid_source_identifier(value: &str) -> bool {
+    validate_source_identifier(value).is_ok()
+}
+
+// Keep this list identical to revision 0.1's lexical keyword table.
+const REVISION_0_1_KEYWORDS: &[&str] = &[
+    "module",
+    "pub",
+    "import",
+    "from",
+    "as",
+    "const",
+    "brand",
+    "fn",
+    "async",
+    "isr",
+    "comptime",
+    "struct",
+    "class",
+    "enum",
+    "iface",
+    "impl",
+    "for",
+    "projection",
+    "scope",
+    "implements",
+    "region",
+    "view",
+    "mut",
+    "iso",
+    "read",
+    "take",
+    "self",
+    "if",
+    "elif",
+    "else",
+    "match",
+    "case",
+    "bind",
+    "in",
+    "not",
+    "while",
+    "loop",
+    "with",
+    "enter",
+    "abort",
+    "exit",
+    "shadow",
+    "return",
+    "break",
+    "continue",
+    "pass",
+    "assert",
+    "send",
+    "try",
+    "yield",
+    "await",
+    "copy",
+    "race",
+    "true",
+    "false",
+    "unit",
+    "or",
+    "and",
+    "is",
+];
+
+// Revision 0.1's fixed Unicode 16 default-ignorable and bidi-format-control
+// exclusions. These ranges intentionally mirror the source lexer contract.
+const FORBIDDEN_IDENTIFIER_CODE_POINT_RANGES: &[(u32, u32)] = &[
+    (0x00ad, 0x00ad),
+    (0x034f, 0x034f),
+    (0x061c, 0x061c),
+    (0x115f, 0x1160),
+    (0x17b4, 0x17b5),
+    (0x180b, 0x180f),
+    (0x200b, 0x200f),
+    (0x202a, 0x202e),
+    (0x2060, 0x206f),
+    (0x3164, 0x3164),
+    (0xfe00, 0xfe0f),
+    (0xfeff, 0xfeff),
+    (0xffa0, 0xffa0),
+    (0xfff0, 0xfff8),
+    (0x1bca0, 0x1bca3),
+    (0x1d173, 0x1d17a),
+    (0xe0000, 0xe0fff),
+];
 
 /// Exact source location understood only by a driver-injected package source
 /// provider. Locators are data: this crate never dereferences them.
@@ -126,19 +225,19 @@ impl PackageManifest {
             let expected = module.module.expected_source_path();
             if module.source_path != expected {
                 return Err(ManifestError::ModuleSourceMismatch {
-                    module: module.module.clone(),
-                    expected,
-                    actual: module.source_path.clone(),
+                    module: bounded_manifest_error_value(&module.module.dotted()),
+                    expected: bounded_manifest_error_value(&expected),
+                    actual: bounded_manifest_error_value(&module.source_path),
                 });
             }
             if !exact_source_paths.insert(module.source_path.clone()) {
                 return Err(ManifestError::DuplicateModuleSource(
-                    module.source_path.clone(),
+                    bounded_manifest_error_value(&module.source_path),
                 ));
             }
             if !portable_source_paths.insert(module.source_path.to_ascii_lowercase()) {
                 return Err(ManifestError::PortableSourceCollision(
-                    module.source_path.clone(),
+                    bounded_manifest_error_value(&module.source_path),
                 ));
             }
             let qualified_bytes = qualified_source_path_length(
@@ -149,7 +248,7 @@ impl PackageManifest {
             );
             if qualified_bytes > MAX_SOURCE_PATH_BYTES {
                 return Err(ManifestError::QualifiedSourcePathTooLong {
-                    module: module.module.clone(),
+                    module: bounded_manifest_error_value(&module.module.dotted()),
                     bytes: qualified_bytes,
                     limit: MAX_SOURCE_PATH_BYTES,
                 });
@@ -158,14 +257,15 @@ impl PackageManifest {
         for dependency in &self.dependencies {
             if exact_requirement_version(&dependency.requirement).is_none() {
                 return Err(ManifestError::InvalidDependencyRequirement(
-                    dependency.alias.as_str().to_owned(),
+                    bounded_manifest_error_value(dependency.alias.as_str()),
                 ));
             }
         }
         for profile in &self.profiles {
-            profile
-                .validate()
-                .map_err(|error| ManifestError::InvalidProfile(error.to_string()))?;
+            validate_declared_atom(&profile.name, "profile name")?;
+            profile.validate().map_err(|error| {
+                ManifestError::InvalidProfile(bounded_manifest_error_value(&error.to_string()))
+            })?;
         }
         let module_names: BTreeSet<_> = self.modules.iter().map(|module| &module.module).collect();
         let profile_names: BTreeSet<_> = self
@@ -180,21 +280,23 @@ impl PackageManifest {
             .collect();
         for image in &self.images {
             validate_declared_atom(&image.name, "image name")?;
-            validate_declared_atom(&image.entry, "image entry")?;
+            validate_manifest_source_identifier(&image.entry, "image entry")?;
             validate_declared_atom(&image.profile, "profile name")?;
             if image.target != wrela_build_model::TargetIdentity::aarch64_qemu_virt_uefi() {
                 return Err(ManifestError::UnsupportedImageTarget {
-                    image: image.name.clone(),
-                    target: image.target.clone(),
+                    image: bounded_manifest_error_value(&image.name),
+                    target: bounded_manifest_error_value(image.target.as_str()),
                 });
             }
             if !module_names.contains(&image.module) {
-                return Err(ManifestError::UnknownImageModule(image.name.clone()));
+                return Err(ManifestError::UnknownImageModule(
+                    bounded_manifest_error_value(&image.name),
+                ));
             }
             if !profile_names.contains(image.profile.as_str()) {
                 return Err(ManifestError::UnknownImageProfile {
-                    image: image.name.clone(),
-                    profile: image.profile.clone(),
+                    image: bounded_manifest_error_value(&image.name),
+                    profile: bounded_manifest_error_value(&image.profile),
                 });
             }
         }
@@ -206,10 +308,14 @@ impl PackageManifest {
                 || test.maximum_events == 0
                 || test.maximum_output_bytes == 0
             {
-                return Err(ManifestError::InvalidTestLimits(test.name.clone()));
+                return Err(ManifestError::InvalidTestLimits(
+                    bounded_manifest_error_value(&test.name),
+                ));
             }
             if !image_names.contains(test.image.as_str()) {
-                return Err(ManifestError::UnknownTestImage(test.image.clone()));
+                return Err(ManifestError::UnknownTestImage(
+                    bounded_manifest_error_value(&test.image),
+                ));
             }
         }
         Ok(())
@@ -247,6 +353,12 @@ impl Lockfile {
         if self.schema != LOCKFILE_SCHEMA_VERSION {
             return Err(ManifestError::UnsupportedLockfileSchema(self.schema));
         }
+        if self.packages.len() > MAX_PACKAGES {
+            return Err(ManifestError::TooManyLockedPackages {
+                count: self.packages.len(),
+                limit: MAX_PACKAGES,
+            });
+        }
         if !self
             .packages
             .windows(2)
@@ -254,13 +366,14 @@ impl Lockfile {
         {
             return Err(ManifestError::NonCanonicalOrder("locked package"));
         }
-        if self
+        let root_index = if let Ok(index) = self
             .packages
             .binary_search_by(|package| package.identity.cmp(&self.root))
-            .is_err()
         {
+            index
+        } else {
             return Err(ManifestError::MissingRootPackage);
-        }
+        };
         for package in &self.packages {
             validate_locator(&package.locator)?;
             if !package
@@ -277,11 +390,32 @@ impl Lockfile {
                     .is_err()
                 {
                     return Err(ManifestError::MissingLockedDependency {
-                        package: Box::new(package.identity.clone()),
-                        dependency: Box::new(dependency.identity.clone()),
+                        package: bounded_package_identity(&package.identity),
+                        dependency: bounded_package_identity(&dependency.identity),
                     });
                 }
             }
+        }
+        let mut reachable = vec![false; self.packages.len()];
+        let mut pending = VecDeque::with_capacity(self.packages.len());
+        reachable[root_index] = true;
+        pending.push_back(root_index);
+        while let Some(package_index) = pending.pop_front() {
+            for dependency in &self.packages[package_index].dependencies {
+                let dependency_index = self
+                    .packages
+                    .binary_search_by(|candidate| candidate.identity.cmp(&dependency.identity))
+                    .expect("locked dependency existence was validated above");
+                if !reachable[dependency_index] {
+                    reachable[dependency_index] = true;
+                    pending.push_back(dependency_index);
+                }
+            }
+        }
+        if let Some(unreachable_index) = reachable.iter().position(|reachable| !reachable) {
+            return Err(ManifestError::UnreachableLockedPackage {
+                package: bounded_package_identity(&self.packages[unreachable_index].identity),
+            });
         }
         Ok(())
     }
@@ -349,7 +483,7 @@ pub struct DependencyAlias(String);
 impl DependencyAlias {
     pub fn new(value: impl Into<String>) -> Result<Self, GraphError> {
         let value = value.into();
-        validate_name_component(&value).map_err(GraphError::InvalidDependencyAlias)?;
+        validate_source_identifier(&value).map_err(GraphError::InvalidDependencyAlias)?;
         Ok(Self(value))
     }
 
@@ -378,7 +512,7 @@ impl ModulePath {
             return Err(GraphError::EmptyModulePath);
         }
         for segment in &segments {
-            validate_name_component(segment).map_err(GraphError::InvalidModuleSegment)?;
+            validate_source_identifier(segment).map_err(GraphError::InvalidModuleSegment)?;
         }
         Ok(Self(segments))
     }
@@ -655,6 +789,7 @@ impl PackageGraphBuilder {
 
     pub fn finish(self) -> Result<PackageGraph, GraphError> {
         reject_dependency_cycles(&self.packages)?;
+        reject_unreachable_packages(&self.packages, self.root)?;
 
         // Root is always zero. Every other identity is ordered by its complete
         // nominal identity, including the source digest, not discovery order.
@@ -758,6 +893,30 @@ fn reject_dependency_cycles(packages: &[PendingPackage]) -> Result<(), GraphErro
     Ok(())
 }
 
+fn reject_unreachable_packages(
+    packages: &[PendingPackage],
+    root: PackageHandle,
+) -> Result<(), GraphError> {
+    debug_assert!(packages.len() <= MAX_PACKAGES);
+    let mut reachable = vec![false; packages.len()];
+    let mut pending = VecDeque::with_capacity(packages.len());
+    reachable[root.0 as usize] = true;
+    pending.push_back(root.0 as usize);
+    while let Some(package_index) = pending.pop_front() {
+        for dependency in &packages[package_index].dependencies {
+            let dependency_index = dependency.package.0 as usize;
+            if !reachable[dependency_index] {
+                reachable[dependency_index] = true;
+                pending.push_back(dependency_index);
+            }
+        }
+    }
+    if let Some(index) = reachable.iter().position(|reachable| !reachable) {
+        return Err(GraphError::UnreachablePackage(PackageHandle(index as u32)));
+    }
+    Ok(())
+}
+
 fn require_strict_order(
     values: impl IntoIterator<Item = String>,
     kind: &'static str,
@@ -785,9 +944,21 @@ fn validate_source_path(path: &str) -> Result<(), ManifestError> {
             .split('/')
             .any(|component| component.is_empty() || matches!(component, "." | ".."))
     {
-        return Err(ManifestError::InvalidSourcePath(path.to_owned()));
+        return Err(ManifestError::InvalidSourcePath(
+            bounded_manifest_error_value(path),
+        ));
     }
     Ok(())
+}
+
+fn validate_manifest_source_identifier(
+    value: &str,
+    kind: &'static str,
+) -> Result<(), ManifestError> {
+    validate_source_identifier(value).map_err(|_| ManifestError::InvalidSourceIdentifier {
+        kind,
+        value: bounded_manifest_error_value(value),
+    })
 }
 
 fn validate_declared_atom(value: &str, kind: &'static str) -> Result<(), ManifestError> {
@@ -800,14 +971,43 @@ fn validate_declared_atom(value: &str, kind: &'static str) -> Result<(), Manifes
     {
         return Err(ManifestError::InvalidAtom {
             kind,
-            value: value.to_owned(),
+            value: bounded_manifest_error_value(value),
         });
     }
     Ok(())
 }
 
+fn bounded_package_identity(identity: &PackageIdentity) -> String {
+    bounded_manifest_error_value(&format!(
+        "{}@{}",
+        identity.name.as_str(),
+        identity.version.as_str()
+    ))
+}
+
+fn bounded_manifest_error_value(value: &str) -> String {
+    if value.len() <= MAX_MANIFEST_ERROR_VALUE_BYTES {
+        return value.to_owned();
+    }
+    const TRUNCATION_MARKER: &str = "…";
+    let mut end = MAX_MANIFEST_ERROR_VALUE_BYTES - TRUNCATION_MARKER.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(MAX_MANIFEST_ERROR_VALUE_BYTES);
+    bounded.push_str(&value[..end]);
+    bounded.push_str(TRUNCATION_MARKER);
+    bounded
+}
+
 fn validate_locator(locator: &PackageLocator) -> Result<(), ManifestError> {
     match locator {
+        // `.` is the sole canonical spelling for the package at the workspace
+        // capability root (the ordinary public-CLI layout where `wrela.toml`
+        // and `wrela.lock` are siblings). It is handled as a marker, never as
+        // a path component. All other workspace locators use the portable
+        // relative-path contract and continue to reject dot components.
+        PackageLocator::Workspace { path } if path == "." => Ok(()),
         PackageLocator::Workspace { path } => validate_source_path(path),
         PackageLocator::Archive { provider, key } => {
             validate_declared_atom(provider, "package provider")?;
@@ -828,19 +1028,27 @@ pub enum ManifestError {
     InvalidDependencyRequirement(String),
     TooManyModules,
     TooManyDependencies,
+    TooManyLockedPackages {
+        count: usize,
+        limit: usize,
+    },
     ModuleSourceMismatch {
-        module: ModulePath,
+        module: String,
         expected: String,
         actual: String,
     },
     DuplicateModuleSource(String),
     PortableSourceCollision(String),
     QualifiedSourcePathTooLong {
-        module: ModulePath,
+        module: String,
         bytes: usize,
         limit: usize,
     },
     InvalidProfile(String),
+    InvalidSourceIdentifier {
+        kind: &'static str,
+        value: String,
+    },
     InvalidAtom {
         kind: &'static str,
         value: String,
@@ -852,14 +1060,17 @@ pub enum ManifestError {
     },
     UnsupportedImageTarget {
         image: String,
-        target: wrela_build_model::TargetIdentity,
+        target: String,
     },
     InvalidTestLimits(String),
     UnknownTestImage(String),
     MissingRootPackage,
     MissingLockedDependency {
-        package: Box<PackageIdentity>,
-        dependency: Box<PackageIdentity>,
+        package: String,
+        dependency: String,
+    },
+    UnreachableLockedPackage {
+        package: String,
     },
 }
 
@@ -876,12 +1087,17 @@ impl fmt::Display for ManifestError {
                 write!(formatter, "{kind} entries are not strictly ordered")
             }
             Self::InvalidSourcePath(path) => {
-                write!(formatter, "invalid manifest source path {path:?}")
+                write!(
+                    formatter,
+                    "invalid manifest source path {:?}",
+                    bounded_manifest_error_value(path)
+                )
             }
             Self::InvalidDependencyRequirement(alias) => {
                 write!(
                     formatter,
-                    "dependency {alias} must use one exact revision 0.1 requirement (=version)"
+                    "dependency {} must use one exact revision 0.1 requirement (=version)",
+                    bounded_manifest_error_value(alias)
                 )
             }
             Self::TooManyModules => write!(
@@ -892,23 +1108,34 @@ impl fmt::Display for ManifestError {
                 formatter,
                 "manifest exceeds the dependency-count limit of {MAX_DEPENDENCIES_PER_PACKAGE}"
             ),
+            Self::TooManyLockedPackages { count, limit } => write!(
+                formatter,
+                "lockfile contains {count} packages; limit is {limit}"
+            ),
             Self::ModuleSourceMismatch {
                 module,
                 expected,
                 actual,
             } => write!(
                 formatter,
-                "module {} must use source path {expected:?}, not {actual:?}",
-                module.dotted()
+                "module {} must use source path {:?}, not {:?}",
+                bounded_manifest_error_value(module),
+                bounded_manifest_error_value(expected),
+                bounded_manifest_error_value(actual)
             ),
             Self::DuplicateModuleSource(path) => {
                 write!(
                     formatter,
-                    "source path {path:?} is assigned to multiple modules"
+                    "source path {:?} is assigned to multiple modules",
+                    bounded_manifest_error_value(path)
                 )
             }
             Self::PortableSourceCollision(path) => {
-                write!(formatter, "module source path collides portably: {path:?}")
+                write!(
+                    formatter,
+                    "module source path collides portably: {:?}",
+                    bounded_manifest_error_value(path)
+                )
             }
             Self::QualifiedSourcePathTooLong {
                 module,
@@ -917,27 +1144,57 @@ impl fmt::Display for ManifestError {
             } => write!(
                 formatter,
                 "qualified source path for module {} is {bytes} bytes; limit is {limit}",
-                module.dotted()
+                bounded_manifest_error_value(module)
             ),
-            Self::InvalidProfile(message) => write!(formatter, "invalid build profile: {message}"),
-            Self::InvalidAtom { kind, value } => write!(formatter, "invalid {kind} {value:?}"),
+            Self::InvalidProfile(message) => write!(
+                formatter,
+                "invalid build profile: {}",
+                bounded_manifest_error_value(message)
+            ),
+            Self::InvalidSourceIdentifier { kind, value } => {
+                write!(
+                    formatter,
+                    "invalid source identifier for {kind}: {:?}",
+                    bounded_manifest_error_value(value)
+                )
+            }
+            Self::InvalidAtom { kind, value } => write!(
+                formatter,
+                "invalid {kind} {:?}",
+                bounded_manifest_error_value(value)
+            ),
             Self::UnknownImageModule(image) => {
-                write!(formatter, "image {image} refers to an undeclared module")
+                write!(
+                    formatter,
+                    "image {} refers to an undeclared module",
+                    bounded_manifest_error_value(image)
+                )
             }
             Self::UnknownImageProfile { image, profile } => write!(
                 formatter,
-                "image {image} refers to unknown build profile {profile}"
+                "image {} refers to unknown build profile {}",
+                bounded_manifest_error_value(image),
+                bounded_manifest_error_value(profile)
             ),
             Self::UnsupportedImageTarget { image, target } => write!(
                 formatter,
-                "image {image} selects unsupported revision 0.1 target {}",
-                target.as_str()
+                "image {} selects unsupported revision 0.1 target {}",
+                bounded_manifest_error_value(image),
+                bounded_manifest_error_value(target)
             ),
             Self::InvalidTestLimits(test) => {
-                write!(formatter, "image test {test} has an invalid zero limit")
+                write!(
+                    formatter,
+                    "image test {} has an invalid zero limit",
+                    bounded_manifest_error_value(test)
+                )
             }
             Self::UnknownTestImage(image) => {
-                write!(formatter, "image test refers to unknown image {image}")
+                write!(
+                    formatter,
+                    "image test refers to unknown image {}",
+                    bounded_manifest_error_value(image)
+                )
             }
             Self::MissingRootPackage => {
                 formatter.write_str("lockfile does not contain its root package")
@@ -947,11 +1204,14 @@ impl fmt::Display for ManifestError {
                 dependency,
             } => write!(
                 formatter,
-                "locked package {}@{} refers to missing dependency {}@{}",
-                package.name.as_str(),
-                package.version.as_str(),
-                dependency.name.as_str(),
-                dependency.version.as_str(),
+                "locked package {} refers to missing dependency {}",
+                bounded_manifest_error_value(package),
+                bounded_manifest_error_value(dependency)
+            ),
+            Self::UnreachableLockedPackage { package } => write!(
+                formatter,
+                "locked package {} is not reachable from the root package",
+                bounded_manifest_error_value(package)
             ),
         }
     }
@@ -988,6 +1248,7 @@ pub enum GraphError {
     },
     DuplicateModuleSource(FileId),
     DependencyCycle(PackageHandle),
+    UnreachablePackage(PackageHandle),
     TooManyDependencies(PackageHandle),
     GraphTooLarge,
 }
@@ -1052,6 +1313,11 @@ impl fmt::Display for GraphError {
                     id.0
                 )
             }
+            Self::UnreachablePackage(id) => write!(
+                formatter,
+                "package {} is not reachable from the root package",
+                id.0
+            ),
             Self::TooManyDependencies(id) => write!(
                 formatter,
                 "package {} exceeds the dependency-count limit of {}",
@@ -1068,6 +1334,55 @@ impl std::error::Error for GraphError {}
 
 fn validate_name_component(value: &str) -> Result<(), String> {
     validate_atom(value, false)
+}
+
+fn validate_source_identifier(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("value is empty".to_owned());
+    }
+    if value.len() > 255 {
+        return Err("value exceeds 255 UTF-8 bytes".to_owned());
+    }
+    if value == "_" {
+        return Err("the wildcard spelling `_` is not an identifier".to_owned());
+    }
+    if value.chars().nfc().ne(value.chars()) {
+        return Err("value is not in Unicode NFC".to_owned());
+    }
+    if REVISION_0_1_KEYWORDS.contains(&value) {
+        return Err("value is a reserved revision 0.1 keyword".to_owned());
+    }
+    if let Some(character) = value
+        .chars()
+        .find(|character| is_forbidden_identifier_character(*character))
+    {
+        return Err(format!(
+            "forbidden default-ignorable or bidi format control U+{:04X}",
+            character as u32
+        ));
+    }
+    let mut characters = value.chars();
+    let first = characters.next().expect("nonempty identifier");
+    if !is_xid_start(first) {
+        return Err(format!(
+            "first character U+{:04X} is not Unicode 16 XID_Start",
+            first as u32
+        ));
+    }
+    if let Some(character) = characters.find(|character| !is_xid_continue(*character)) {
+        return Err(format!(
+            "character U+{:04X} is not Unicode 16 XID_Continue",
+            character as u32
+        ));
+    }
+    Ok(())
+}
+
+fn is_forbidden_identifier_character(character: char) -> bool {
+    let value = character as u32;
+    FORBIDDEN_IDENTIFIER_CODE_POINT_RANGES
+        .iter()
+        .any(|(start, end)| (*start..=*end).contains(&value))
 }
 
 fn validate_version(value: &str) -> Result<(), String> {
@@ -1097,12 +1412,16 @@ fn validate_atom(value: &str, allow_dot: bool) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use wrela_build_model::Sha256Digest;
+    use wrela_build_model::{BuildProfile, LanguageRevision, Sha256Digest, TargetIdentity};
     use wrela_source::FileId;
 
     use super::{
-        DependencyAlias, GraphError, ModulePath, PackageGraphBuilder, PackageIdentity, PackageName,
-        PackageVersion,
+        DependencyAlias, FORBIDDEN_IDENTIFIER_CODE_POINT_RANGES, GraphError, ImageDeclaration,
+        ImageTestDeclaration, LOCKFILE_SCHEMA_VERSION, LockedDependency, LockedPackage, Lockfile,
+        MANIFEST_SCHEMA_VERSION, MAX_MANIFEST_ERROR_VALUE_BYTES, ManifestError, ManifestModule,
+        ModulePath, PackageGraphBuilder, PackageIdentity, PackageLocator, PackageManifest,
+        PackageName, PackageVersion, REVISION_0_1_KEYWORDS, bounded_manifest_error_value,
+        validate_declared_atom, validate_source_identifier, validate_source_path,
     };
 
     fn identity(name: &str) -> PackageIdentity {
@@ -1110,6 +1429,53 @@ mod tests {
             name: PackageName::new(name).expect("package name"),
             version: PackageVersion::new("1").expect("version"),
             source_digest: Sha256Digest::from_bytes([name.len() as u8; 32]),
+        }
+    }
+
+    fn manifest_with_image_entry(entry: &str) -> PackageManifest {
+        let module = ModulePath::new(["app".to_owned()]).expect("module path");
+        PackageManifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            language: LanguageRevision::Design0_1,
+            name: PackageName::new("root").expect("package name"),
+            version: PackageVersion::new("1.0.0").expect("package version"),
+            source_root: "src".to_owned(),
+            modules: vec![ManifestModule {
+                module: module.clone(),
+                source_path: "app.wr".to_owned(),
+            }],
+            dependencies: Vec::new(),
+            profiles: vec![BuildProfile::development()],
+            images: vec![ImageDeclaration {
+                name: "boot-image".to_owned(),
+                module,
+                entry: entry.to_owned(),
+                target: TargetIdentity::aarch64_qemu_virt_uefi(),
+                profile: "development".to_owned(),
+            }],
+            image_tests: Vec::new(),
+        }
+    }
+
+    fn locked_package(
+        identity: PackageIdentity,
+        dependencies: Vec<LockedDependency>,
+    ) -> LockedPackage {
+        let path = format!("packages/{}", identity.name.as_str());
+        LockedPackage {
+            identity,
+            locator: PackageLocator::Workspace { path },
+            dependencies,
+            manifest_digest: Sha256Digest::from_bytes([0x42; 32]),
+        }
+    }
+
+    fn lockfile(root: PackageIdentity, mut packages: Vec<LockedPackage>) -> Lockfile {
+        packages.sort_by(|left, right| left.identity.cmp(&right.identity));
+        Lockfile {
+            schema: LOCKFILE_SCHEMA_VERSION,
+            root,
+            packages,
         }
     }
 
@@ -1228,7 +1594,7 @@ mod tests {
     }
 
     #[test]
-    fn dependency_cycles_are_rejected_without_recursive_walks() {
+    fn disconnected_dependency_cycles_preserve_cycle_errors() {
         let mut builder = PackageGraphBuilder::new(identity("root"));
         let alpha = builder.add_package(identity("alpha")).expect("alpha");
         let beta = builder.add_package(identity("beta")).expect("beta");
@@ -1246,6 +1612,242 @@ mod tests {
                 alpha,
             )
             .expect("beta to alpha");
-        assert!(builder.finish().is_err());
+        assert!(matches!(
+            builder.finish(),
+            Err(GraphError::DependencyCycle(handle)) if handle == alpha
+        ));
+    }
+
+    #[test]
+    fn graph_rejects_an_isolated_package() {
+        let mut builder = PackageGraphBuilder::new(identity("root"));
+        let isolated = builder
+            .add_package(identity("isolated"))
+            .expect("isolated package");
+        assert!(matches!(
+            builder.finish(),
+            Err(GraphError::UnreachablePackage(handle)) if handle == isolated
+        ));
+    }
+
+    #[test]
+    fn lockfile_rejects_an_isolated_package() {
+        let root = identity("root");
+        let isolated = identity("isolated");
+        let lockfile = lockfile(
+            root.clone(),
+            vec![
+                locked_package(root, Vec::new()),
+                locked_package(isolated, Vec::new()),
+            ],
+        );
+        assert!(matches!(
+            lockfile.validate(),
+            Err(ManifestError::UnreachableLockedPackage { package })
+                if package == "isolated@1"
+        ));
+    }
+
+    #[test]
+    fn lockfile_rejects_a_disconnected_dependency_cycle() {
+        let root = identity("root");
+        let alpha = identity("alpha");
+        let beta = identity("beta");
+        let lockfile = lockfile(
+            root.clone(),
+            vec![
+                locked_package(root, Vec::new()),
+                locked_package(
+                    alpha.clone(),
+                    vec![LockedDependency {
+                        alias: DependencyAlias::new("beta").expect("beta alias"),
+                        identity: beta.clone(),
+                    }],
+                ),
+                locked_package(
+                    beta,
+                    vec![LockedDependency {
+                        alias: DependencyAlias::new("alpha").expect("alpha alias"),
+                        identity: alpha,
+                    }],
+                ),
+            ],
+        );
+        assert!(matches!(
+            lockfile.validate(),
+            Err(ManifestError::UnreachableLockedPackage { package })
+                if package == "alpha@1"
+        ));
+    }
+
+    #[test]
+    fn every_revision_keyword_is_rejected_in_source_facing_manifest_names() {
+        assert_eq!(REVISION_0_1_KEYWORDS.len(), 59);
+        for keyword in REVISION_0_1_KEYWORDS {
+            assert!(
+                DependencyAlias::new((*keyword).to_owned()).is_err(),
+                "dependency alias accepted keyword {keyword:?}"
+            );
+            assert!(
+                ModulePath::new([(*keyword).to_owned()]).is_err(),
+                "module segment accepted keyword {keyword:?}"
+            );
+            assert!(matches!(
+                manifest_with_image_entry(keyword).validate(),
+                Err(ManifestError::InvalidSourceIdentifier {
+                    kind: "image entry",
+                    value,
+                }) if value == *keyword
+            ));
+        }
+    }
+
+    #[test]
+    fn every_forbidden_identifier_code_point_is_rejected() {
+        for &(start, end) in FORBIDDEN_IDENTIFIER_CODE_POINT_RANGES {
+            for value in start..=end {
+                let character = char::from_u32(value).expect("Unicode scalar range");
+                let spelling = format!("a{character}b");
+                assert!(
+                    validate_source_identifier(&spelling).is_err(),
+                    "identifier accepted U+{value:04X}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_identifier_rules_apply_at_all_manifest_boundaries() {
+        for invalid in [
+            "_",
+            "_hidden",
+            "9start",
+            "bad-name",
+            "de\u{301}composed",
+            "a\u{200b}b",
+            "for",
+        ] {
+            assert!(DependencyAlias::new(invalid.to_owned()).is_err());
+            assert!(ModulePath::new([invalid.to_owned()]).is_err());
+            assert!(matches!(
+                manifest_with_image_entry(invalid).validate(),
+                Err(ManifestError::InvalidSourceIdentifier {
+                    kind: "image entry",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn unicode_16_nfc_source_identifiers_are_accepted() {
+        assert_eq!(unicode_normalization::UNICODE_VERSION, (16, 0, 0));
+        // U+1C89 entered XID_Start in Unicode 16.0.0, so this case also guards
+        // the revision's pinned property-table version rather than only ASCII.
+        for identifier in ["Delta", "Δelta", "café", "变量", "a_1", "\u{1c89}name"] {
+            DependencyAlias::new(identifier.to_owned()).expect("dependency alias");
+            ModulePath::new([identifier.to_owned()]).expect("module path");
+            manifest_with_image_entry(identifier)
+                .validate()
+                .expect("image entry");
+        }
+    }
+
+    #[test]
+    fn nominal_manifest_names_remain_non_source_atoms() {
+        PackageName::new("for-package").expect("nominal package name");
+        PackageName::new("for").expect("keyword package name");
+        validate_declared_atom("for-profile", "profile name").expect("profile atom");
+        validate_declared_atom("for-image", "image name").expect("image atom");
+        validate_declared_atom("for-test", "image test name").expect("test atom");
+
+        let mut manifest = manifest_with_image_entry("start");
+        manifest.profiles[0].name = "for-profile".to_owned();
+        manifest.images[0].name = "for-image".to_owned();
+        manifest.images[0].profile = "for-profile".to_owned();
+        manifest.image_tests.push(ImageTestDeclaration {
+            name: "for-test".to_owned(),
+            image: "for-image".to_owned(),
+            scenario: "tests/for-test.toml".to_owned(),
+            boot_timeout_ns: 1,
+            shutdown_timeout_ns: 1,
+            maximum_events: 1,
+            maximum_output_bytes: 1,
+            deterministic_seed: None,
+        });
+        manifest.validate().expect("nominal manifest atoms");
+    }
+
+    #[test]
+    fn manifest_error_values_are_bounded_on_utf8_boundaries() {
+        let long_ascii = "x".repeat(8_192);
+        let invalid_path = format!("/{long_ascii}");
+        let path_error = validate_source_path(&invalid_path).expect_err("invalid path");
+        let ManifestError::InvalidSourcePath(path) = path_error else {
+            panic!("unexpected source path error");
+        };
+        assert!(path.len() <= MAX_MANIFEST_ERROR_VALUE_BYTES);
+        assert!(path.ends_with('…'));
+
+        let atom_error =
+            validate_declared_atom(&long_ascii, "image name").expect_err("oversized manifest atom");
+        let ManifestError::InvalidAtom { value, .. } = atom_error else {
+            panic!("unexpected manifest atom error");
+        };
+        assert!(value.len() <= MAX_MANIFEST_ERROR_VALUE_BYTES);
+        assert!(value.ends_with('…'));
+
+        let multibyte = bounded_manifest_error_value(&"é".repeat(8_192));
+        assert!(multibyte.len() <= MAX_MANIFEST_ERROR_VALUE_BYTES);
+        assert!(multibyte.ends_with('…'));
+
+        let rendered = ManifestError::UnknownTestImage(long_ascii).to_string();
+        assert!(rendered.len() <= MAX_MANIFEST_ERROR_VALUE_BYTES + 48);
+        assert!(rendered.ends_with('…'));
+    }
+
+    #[test]
+    fn manifest_profile_names_must_be_unicode_nfc() {
+        let mut profile = BuildProfile::development();
+        profile.name = "de\u{301}velopment".to_owned();
+        let manifest = PackageManifest {
+            schema: MANIFEST_SCHEMA_VERSION,
+            language: LanguageRevision::Design0_1,
+            name: PackageName::new("root").expect("package name"),
+            version: PackageVersion::new("1.0.0").expect("package version"),
+            source_root: "src".to_owned(),
+            modules: Vec::new(),
+            dependencies: Vec::new(),
+            profiles: vec![profile],
+            images: Vec::new(),
+            image_tests: Vec::new(),
+        };
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::InvalidAtom {
+                kind: "profile name",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn workspace_root_has_one_exact_locator_spelling() {
+        let root = identity("root");
+        let mut package = locked_package(root.clone(), Vec::new());
+        package.locator = PackageLocator::Workspace {
+            path: ".".to_owned(),
+        };
+        lockfile(root.clone(), vec![package])
+            .validate()
+            .expect("exact workspace-root locator");
+
+        for path in ["", "..", "./child", "child/.", "child/../other"] {
+            let mut package = locked_package(root.clone(), Vec::new());
+            package.locator = PackageLocator::Workspace {
+                path: path.to_owned(),
+            };
+            assert!(lockfile(root.clone(), vec![package]).validate().is_err());
+        }
     }
 }

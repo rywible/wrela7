@@ -14,6 +14,13 @@ wrela-flow-wir = { path = "../wrela-flow-wir" }
 wrela-machine-wir = { path = "../wrela-machine-wir" }
 wrela-runtime-abi = { path = "../wrela-runtime-abi" }
 wrela-target = { path = "../wrela-target" }
+wrela-test-model = { path = "../wrela-test-model" }
+wrela-test-protocol = { path = "../wrela-test-protocol" }
+
+[dev-dependencies]
+wrela-flow-lower = { path = "../wrela-flow-lower" }
+wrela-semantic-wir = { path = "../wrela-semantic-wir" }
+wrela-source = { path = "../wrela-source" }
 
 [lints]
 workspace = true

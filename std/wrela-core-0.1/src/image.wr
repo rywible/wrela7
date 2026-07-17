@@ -1,0 +1,8 @@
+module image
+
+pub struct Image:
+    pub name: String
+    pub target: Target
+
+pub enum Target:
+    aarch64_qemu_virt_uefi

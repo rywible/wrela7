@@ -1,0 +1,4 @@
+schema = 1
+name = "aarch64-qemu-virt-uefi"
+[backend]
+llvm_features = ["+reserve-x18", "+sve"]

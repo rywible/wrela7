@@ -1,7 +1,8 @@
 [alias]
-xtask = "run --package xtask --"
-xarch = "run --package xtask -- architecture-check"
-xcheck = "run --package xtask -- check"
-xtest = "run --package xtask -- test"
-xlint = "run --package xtask -- lint"
+xtask = "run --locked --offline --package xtask --"
+xarch = "run --locked --offline --package xtask -- architecture-check"
+xcheck = "run --locked --offline --package xtask -- check"
+xtest = "run --locked --offline --package xtask -- test"
+xlint = "run --locked --offline --package xtask -- lint"
+xgate = "run --locked --offline --package xtask -- gate"
 xfmt = "fmt --all -- --check"

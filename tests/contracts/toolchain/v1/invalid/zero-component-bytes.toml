@@ -1,0 +1,73 @@
+schema = 1
+release = "r"
+host = "x86_64-unknown-linux-gnu"
+llvm_project_revision = "r"
+
+[compatibility]
+language = "0.1-design"
+build_profile_encoding = 2
+backend_protocol = 5
+target_package = 1
+semantic_wir = 8
+flow_wir = 10
+flow_wir_wire = 10
+machine_wir = 10
+runtime_abi = 2
+image_report = 11
+test_plan = 2
+test_report = 2
+image_scenario = 1
+test_event = 3
+test_frame = 1
+
+[[standard_library_packages]]
+name = "c"
+version = "0"
+source_digest = "0101010101010101010101010101010101010101010101010101010101010101"
+component = "c"
+manifest_digest = "0202020202020202020202020202020202020202020202020202020202020202"
+
+[[components]]
+kind = "frontend"
+path = "bin/wrela"
+digest = "0303030303030303030303030303030303030303030303030303030303030303"
+bytes = 0
+
+[[components]]
+kind = "backend"
+path = "libexec/wrela/wrela-backend"
+digest = "0404040404040404040404040404040404040404040404040404040404040404"
+bytes = 1
+
+[[components]]
+kind = "standard_library"
+path = "share/wrela/std"
+digest = "0505050505050505050505050505050505050505050505050505050505050505"
+bytes = 1
+
+[[components]]
+kind = "aarch64_emulator"
+path = "libexec/wrela/qemu-system-aarch64"
+digest = "0606060606060606060606060606060606060606060606060606060606060606"
+bytes = 1
+
+[[targets]]
+identity = "aarch64-qemu-virt-uefi"
+path = "share/wrela/targets/aarch64-qemu-virt-uefi"
+digest = "0707070707070707070707070707070707070707070707070707070707070707"
+bytes = 1
+
+[[targets.files]]
+path = "firmware/QEMU_EFI.fd"
+digest = "0808080808080808080808080808080808080808080808080808080808080808"
+bytes = 1
+
+[[targets.files]]
+path = "firmware/QEMU_VARS.fd"
+digest = "0909090909090909090909090909090909090909090909090909090909090909"
+bytes = 1
+
+[[targets.files]]
+path = "runtime/wrela-runtime-aarch64.obj"
+digest = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+bytes = 1

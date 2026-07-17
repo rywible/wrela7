@@ -15,6 +15,7 @@ llvm = ["dep:inkwell"]
 [dependencies]
 wrela-build-model = { path = "../wrela-build-model" }
 wrela-machine-wir = { path = "../wrela-machine-wir" }
+wrela-runtime-abi = { path = "../wrela-runtime-abi" }
 wrela-target = { path = "../wrela-target" }
 
 [dependencies.inkwell]
@@ -22,6 +23,15 @@ version = "=0.9.0"
 optional = true
 default-features = false
 features = ["llvm22-1-force-static", "target-aarch64"]
+
+[dev-dependencies]
+wrela-flow-lower = { path = "../wrela-flow-lower" }
+wrela-flow-opt = { path = "../wrela-flow-opt" }
+wrela-machine-lower = { path = "../wrela-machine-lower" }
+wrela-semantic-wir = { path = "../wrela-semantic-wir" }
+wrela-source = { path = "../wrela-source" }
+wrela-test-model = { path = "../wrela-test-model" }
+wrela-test-protocol = { path = "../wrela-test-protocol" }
 
 [lints]
 workspace = true

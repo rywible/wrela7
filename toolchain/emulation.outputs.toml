@@ -1,0 +1,14 @@
+schema = 1
+emulation_lock_sha256 = "420210f14ef95e10448996ba06c3a62242304ac4e0c03453fe59a8fcdbbd5d86"
+native_input_sha256 = "1d126075a4feb7e6778f63ecf51557c9b1901cd3b83dee28bbcc53567832d71b"
+qemu_version = "10.1.5"
+host = "aarch64-apple-darwin"
+bundle_tree_sha256 = "b654622277aae1175b2bd58f82092d4e939d63722c30a77227c3957b3f828f54"
+bundle_files = 6
+bundle_bytes = 166762675
+qemu_sha256 = "c5df7919a0853f1fd525803a157d49c8f2edd4120888b6ba4d04a0998eaa602e"
+qemu_bytes = 32482992
+firmware_code_sha256 = "47765fe344818cbc464b1c14ae658fb4b854f5c2ceffa982411731eb4865594d"
+firmware_code_bytes = 67108864
+firmware_variables_sha256 = "b3b855c5a80310168051164986855692d1bdb06e67619856177965cd87c6774f"
+firmware_variables_bytes = 67108864

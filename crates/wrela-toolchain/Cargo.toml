@@ -12,3 +12,6 @@ workspace = true
 
 [dependencies]
 wrela-build-model = { path = "../wrela-build-model" }
+wrela-package = { path = "../wrela-package" }
+wrela-package-loader = { path = "../wrela-package-loader" }
+wrela-target = { path = "../wrela-target" }

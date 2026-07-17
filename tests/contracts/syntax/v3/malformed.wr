@@ -1,0 +1,8 @@
+module contracts.malformed
+
+fn malformed(a: u64):
+  first = a < 2 < 3
+    second = "unterminated
+    if a:
+        pass
+    return first

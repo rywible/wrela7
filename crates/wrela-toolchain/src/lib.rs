@@ -7,9 +7,96 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use wrela_build_model::{LanguageRevision, Sha256Digest, TargetIdentity};
+use wrela_package::{PackageIdentity, PackageLocator};
+
+mod codec;
+mod linux_execution_inputs;
+mod linux_payload;
+mod local;
+
+pub use codec::CanonicalToolchainManifestCodec;
+pub use linux_execution_inputs::{
+    LINUX_EXECUTION_INPUT_EMULATOR, LINUX_EXECUTION_INPUT_FILE_DIGEST, LINUX_EXECUTION_INPUT_HOST,
+    LINUX_EXECUTION_INPUT_RECEIPT_SCHEMA, LINUX_EXECUTION_INPUT_ROUTE,
+    LINUX_EXECUTION_INPUT_RUNNER, LINUX_EXECUTION_INPUT_SCHEMA, LINUX_EXECUTION_INPUT_TARGET,
+    LINUX_EXECUTION_INPUT_TREE_DIGEST, LINUX_EXECUTION_INPUT_USER_MODE_EMULATION,
+    LinuxExecutionInput, LinuxExecutionInputError, LinuxExecutionInputKind,
+    LinuxExecutionInputReceipt, LinuxExecutionInputRequest,
+    MAX_LINUX_EXECUTION_INPUT_RECEIPT_BYTES, MAX_LINUX_EXECUTION_INPUT_REQUEST_BYTES,
+    MAX_LINUX_NATIVE_RUNNER_AUTHORITY_BYTES,
+};
+pub use linux_payload::{
+    LINUX_PAYLOAD_AUTHORITY_SCHEMA, LINUX_PAYLOAD_ENGINE_PROTOCOL, LINUX_PAYLOAD_HOST,
+    LINUX_PAYLOAD_ROUTE, LinuxPayloadAuthority, LinuxPayloadAuthorityError,
+    LinuxPayloadFileWitness, MAX_LINUX_FRONTEND_ENGINE_BYTES, MAX_LINUX_PAYLOAD_AUTHORITY_BYTES,
+};
+pub use local::{
+    LocalToolchainVerification, LocalToolchainVerificationError, LocalToolchainVerificationLimits,
+    LocalToolchainVerifier,
+};
 
 const ROOT_OVERRIDE: &str = "WRELA_TOOLCHAIN_ROOT";
 pub const TOOLCHAIN_MANIFEST_SCHEMA: u32 = 1;
+pub const REQUIRED_LLVM_PROJECT_REVISION: &str = "llvmorg-22.1.3";
+/// Maximum package records committed by one revision-0.1 standard-library
+/// component. The byte codec can select a smaller request-local limit.
+pub const MAX_STANDARD_LIBRARY_PACKAGES: usize = 4096;
+
+/// Exact Rust host triple admitted by a local revision-0.1 installation.
+/// Unsupported build targets return `None` rather than guessing from a
+/// manifest-controlled string.
+#[must_use]
+pub const fn current_host_identity() -> Option<&'static str> {
+    if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        Some("aarch64-apple-darwin")
+    } else if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
+        Some("x86_64-apple-darwin")
+    } else if cfg!(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_env = "gnu"
+    )) {
+        Some("aarch64-unknown-linux-gnu")
+    } else if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_env = "gnu"
+    )) {
+        Some("x86_64-unknown-linux-gnu")
+    } else if cfg!(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_env = "musl"
+    )) {
+        Some("aarch64-unknown-linux-musl")
+    } else if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        target_env = "musl"
+    )) {
+        Some("x86_64-unknown-linux-musl")
+    } else if cfg!(all(
+        target_arch = "aarch64",
+        target_os = "windows",
+        target_env = "msvc"
+    )) {
+        Some("aarch64-pc-windows-msvc")
+    } else if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "windows",
+        target_env = "msvc"
+    )) {
+        Some("x86_64-pc-windows-msvc")
+    } else if cfg!(all(
+        target_arch = "x86_64",
+        target_os = "windows",
+        target_env = "gnu"
+    )) {
+        Some("x86_64-pc-windows-gnu")
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolchainDecodeLimits {
@@ -18,6 +105,7 @@ pub struct ToolchainDecodeLimits {
     pub components: u32,
     pub targets: u32,
     pub target_files: u32,
+    pub standard_library_packages: u32,
 }
 
 impl ToolchainDecodeLimits {
@@ -29,15 +117,24 @@ impl ToolchainDecodeLimits {
             components: 1024,
             targets: 1024,
             target_files: 16_384,
+            standard_library_packages: 4096,
         }
     }
 
     pub fn validate(self) -> Result<(), ToolchainDecodeError> {
+        let hard = Self::standard();
         if self.bytes == 0
             || self.string_bytes == 0
             || self.components == 0
             || self.targets == 0
             || self.target_files == 0
+            || self.standard_library_packages == 0
+            || self.bytes > hard.bytes
+            || self.string_bytes > hard.string_bytes
+            || self.components > hard.components
+            || self.targets > hard.targets
+            || self.target_files > hard.target_files
+            || self.standard_library_packages > hard.standard_library_packages
         {
             Err(ToolchainDecodeError::InvalidLimits)
         } else {
@@ -115,6 +212,7 @@ pub enum ToolchainDecodeError {
     TooLarge { limit: u64, actual: u64 },
     InvalidUtf8,
     Malformed { byte_offset: usize, message: String },
+    MissingField(String),
     DuplicateKey(String),
     UnknownField(String),
     NonCanonical,
@@ -141,6 +239,9 @@ impl fmt::Display for ToolchainDecodeError {
                 formatter,
                 "malformed toolchain manifest at byte {byte_offset}: {message}"
             ),
+            Self::MissingField(field) => {
+                write!(formatter, "toolchain manifest is missing field {field}")
+            }
             Self::DuplicateKey(key) => write!(formatter, "duplicate toolchain key {key}"),
             Self::UnknownField(field) => write!(formatter, "unknown toolchain field {field}"),
             Self::NonCanonical => formatter.write_str(
@@ -188,18 +289,18 @@ impl ToolchainCompatibility {
         Self {
             language: LanguageRevision::Design0_1,
             build_profile_encoding: 2,
-            backend_protocol: 4,
+            backend_protocol: 5,
             target_package: 1,
-            semantic_wir: 1,
-            flow_wir: 1,
-            flow_wir_wire: 1,
-            machine_wir: 1,
-            runtime_abi: 1,
-            image_report: 5,
-            test_plan: 1,
-            test_report: 1,
+            semantic_wir: 8,
+            flow_wir: 10,
+            flow_wir_wire: 10,
+            machine_wir: 10,
+            runtime_abi: 2,
+            image_report: 11,
+            test_plan: 2,
+            test_report: 2,
             image_scenario: 1,
-            test_event: 2,
+            test_event: 3,
             test_frame: 1,
         }
     }
@@ -261,6 +362,17 @@ pub struct ShippedTarget {
     pub files: Vec<ShippedTargetFile>,
 }
 
+/// One package declared inside the content-verified standard-library
+/// component. Identity and canonical manifest bytes are independently pinned;
+/// the locator is retained as [`PackageLocator`] so consumers compare the
+/// loaded package without reconstructing a second locator representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShippedStandardLibraryPackage {
+    pub identity: PackageIdentity,
+    pub locator: PackageLocator,
+    pub manifest_digest: Sha256Digest,
+}
+
 /// Decoded, immutable `share/wrela/toolchain.toml` contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolchainManifest {
@@ -270,18 +382,34 @@ pub struct ToolchainManifest {
     /// LLVM and LLD are built from this one pinned llvm-project revision.
     pub llvm_project_revision: String,
     pub compatibility: ToolchainCompatibility,
+    /// Nonempty, strictly identity- and component-ordered package index for
+    /// the exact standard-library component committed by this manifest.
+    pub standard_library_packages: Vec<ShippedStandardLibraryPackage>,
     /// Strictly sorted by `(kind, path)` and duplicate-free.
     pub components: Vec<ShippedComponent>,
     /// Strictly sorted by target identity and duplicate-free.
     pub targets: Vec<ShippedTarget>,
 }
 
-/// Digests observed by the driver after hashing every declared installation
-/// path. The vectors use the manifest's exact canonical order.
+/// Read-only measurements produced by the crate-owned filesystem verifier
+/// after hashing every declared installation path. Private fields prevent a
+/// caller from turning manifest claims into verification evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedInstallation {
-    pub components: Vec<ShippedComponent>,
-    pub targets: Vec<ShippedTarget>,
+    components: Vec<ShippedComponent>,
+    targets: Vec<ShippedTarget>,
+}
+
+impl ObservedInstallation {
+    #[must_use]
+    pub fn components(&self) -> &[ShippedComponent] {
+        &self.components
+    }
+
+    #[must_use]
+    pub fn targets(&self) -> &[ShippedTarget] {
+        &self.targets
+    }
 }
 
 /// One content-verified path from an atomic toolchain installation.
@@ -394,6 +522,27 @@ impl VerifiedToolchain {
         self.component(ComponentKind::StandardLibrary)
     }
 
+    /// Canonical package index committed by the verified standard-library
+    /// component.
+    #[must_use]
+    pub fn standard_library_packages(&self) -> &[ShippedStandardLibraryPackage] {
+        &self.manifest.standard_library_packages
+    }
+
+    /// Look up one exact shipped package identity without accepting a name-
+    /// only or version-only substitution.
+    #[must_use]
+    pub fn standard_library_package(
+        &self,
+        identity: &PackageIdentity,
+    ) -> Option<&ShippedStandardLibraryPackage> {
+        self.manifest
+            .standard_library_packages
+            .binary_search_by(|package| package.identity.cmp(identity))
+            .ok()
+            .map(|index| &self.manifest.standard_library_packages[index])
+    }
+
     pub fn aarch64_emulator(&self) -> Result<VerifiedPath, ManifestError> {
         self.component(ComponentKind::Aarch64Emulator)
     }
@@ -419,6 +568,20 @@ impl ToolchainManifest {
                 installed: self.compatibility.clone(),
                 required: required.clone(),
             });
+        }
+        if self.standard_library_packages.is_empty()
+            || self.standard_library_packages.len() > MAX_STANDARD_LIBRARY_PACKAGES
+            || !self
+                .standard_library_packages
+                .windows(2)
+                .all(|pair| pair[0].identity < pair[1].identity)
+            || standard_library_components_are_duplicated(&self.standard_library_packages)
+            || self
+                .standard_library_packages
+                .iter()
+                .any(|package| !valid_standard_library_package(package))
+        {
+            return Err(ManifestError::InvalidStandardLibraryPackages);
         }
         if self.components.len() != 4 {
             return Err(ManifestError::MissingOrDuplicateComponent);
@@ -446,8 +609,18 @@ impl ToolchainManifest {
                 return Err(ManifestError::MissingOrDuplicateComponent);
             }
         }
-        if self.components.iter().any(|component| component.bytes == 0) {
+        if self
+            .components
+            .iter()
+            .any(|component| component.bytes == 0 || !digest_is_nonzero(component.digest))
+        {
             return Err(ManifestError::InvalidComponentMeasurement);
+        }
+        let windows_host = self.host.split('-').any(|component| component == "windows");
+        if self.components.iter().any(|component| {
+            component.path.as_str() != expected_component_path(component.kind, windows_host)
+        }) {
+            return Err(ManifestError::UnexpectedComponentLayout);
         }
         if self.targets.len() != 1
             || self.targets[0].identity != TargetIdentity::aarch64_qemu_virt_uefi()
@@ -463,12 +636,22 @@ impl ToolchainManifest {
         }
         if self.targets.iter().any(|target| {
             target.bytes == 0
-                || target.files.is_empty()
+                || !digest_is_nonzero(target.digest)
+                || target.path.as_str() != "share/wrela/targets/aarch64-qemu-virt-uefi"
+                || target.files.len() != REQUIRED_TARGET_FILES.len()
                 || !target
                     .files
                     .windows(2)
                     .all(|pair| pair[0].path < pair[1].path)
-                || target.files.iter().any(|file| file.bytes == 0)
+                || target
+                    .files
+                    .iter()
+                    .any(|file| file.bytes == 0 || !digest_is_nonzero(file.digest))
+                || target
+                    .files
+                    .iter()
+                    .zip(REQUIRED_TARGET_FILES)
+                    .any(|(file, required)| file.path.as_str() != required)
         }) {
             return Err(ManifestError::InvalidTargetFiles);
         }
@@ -491,12 +674,14 @@ pub enum ManifestError {
         required: ToolchainCompatibility,
     },
     MissingOrDuplicateComponent,
+    InvalidStandardLibraryPackages,
     NonCanonicalComponents,
     MissingOrUnexpectedTarget,
     NonCanonicalTargets,
     MissingTarget(TargetIdentity),
     MissingTargetFile(String),
     InvalidComponentMeasurement,
+    UnexpectedComponentLayout,
     InvalidTargetFiles,
     ObservedInstallationMismatch,
 }
@@ -520,6 +705,9 @@ impl fmt::Display for ManifestError {
             Self::MissingOrDuplicateComponent => formatter.write_str(
                 "toolchain must contain exactly one frontend, backend, standard library, and AArch64 emulator",
             ),
+            Self::InvalidStandardLibraryPackages => formatter.write_str(
+                "toolchain standard-library package index is empty, invalid, duplicated, or noncanonical",
+            ),
             Self::NonCanonicalComponents => {
                 formatter.write_str("toolchain components are not strictly sorted")
             }
@@ -542,6 +730,9 @@ impl fmt::Display for ManifestError {
             Self::InvalidComponentMeasurement => {
                 formatter.write_str("toolchain component has a zero byte measurement")
             }
+            Self::UnexpectedComponentLayout => formatter.write_str(
+                "toolchain components do not use the fixed revision 0.1 installation layout",
+            ),
             Self::InvalidTargetFiles => formatter.write_str(
                 "toolchain target files are empty, zero-sized, duplicated, or noncanonical",
             ),
@@ -587,6 +778,83 @@ fn validate_relative_path(value: &str) -> Result<(), ManifestError> {
     Ok(())
 }
 
+fn toolchain_locator_component(locator: &PackageLocator) -> Option<&str> {
+    match locator {
+        PackageLocator::Toolchain { component } => Some(component),
+        PackageLocator::Workspace { .. } | PackageLocator::Archive { .. } => None,
+    }
+}
+
+fn valid_standard_library_package(package: &ShippedStandardLibraryPackage) -> bool {
+    let Some(component) = toolchain_locator_component(&package.locator) else {
+        return false;
+    };
+    validate_standard_library_component(component).is_ok()
+        && digest_is_nonzero(package.identity.source_digest)
+        && digest_is_nonzero(package.manifest_digest)
+}
+
+fn validate_standard_library_component(value: &str) -> Result<(), ManifestError> {
+    const MAX_BYTES: usize = 255;
+    if value.is_empty()
+        || value.len() > MAX_BYTES
+        || matches!(value, "." | "..")
+        || value.ends_with('.')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || is_windows_reserved_component(value)
+    {
+        return Err(ManifestError::InvalidComponentPath(value.to_owned()));
+    }
+    Ok(())
+}
+
+fn is_windows_reserved_component(value: &str) -> bool {
+    let basename = value.split('.').next().unwrap_or(value);
+    if ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|reserved| basename.eq_ignore_ascii_case(reserved))
+    {
+        return true;
+    }
+    let bytes = basename.as_bytes();
+    bytes.len() == 4
+        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
+        && matches!(bytes[3], b'1'..=b'9')
+}
+
+fn standard_library_components_are_duplicated(packages: &[ShippedStandardLibraryPackage]) -> bool {
+    packages.iter().enumerate().any(|(index, package)| {
+        let component = toolchain_locator_component(&package.locator);
+        packages[index + 1..]
+            .iter()
+            .any(|candidate| toolchain_locator_component(&candidate.locator) == component)
+    })
+}
+
+fn digest_is_nonzero(digest: Sha256Digest) -> bool {
+    digest.as_bytes().iter().any(|byte| *byte != 0)
+}
+
+const REQUIRED_TARGET_FILES: [&str; 3] = [
+    "firmware/QEMU_EFI.fd",
+    "firmware/QEMU_VARS.fd",
+    "runtime/wrela-runtime-aarch64.obj",
+];
+
+const fn expected_component_path(kind: ComponentKind, windows_host: bool) -> &'static str {
+    match (kind, windows_host) {
+        (ComponentKind::Frontend, false) => "bin/wrela",
+        (ComponentKind::Frontend, true) => "bin/wrela.exe",
+        (ComponentKind::Backend, false) => "libexec/wrela/wrela-backend",
+        (ComponentKind::Backend, true) => "libexec/wrela/wrela-backend.exe",
+        (ComponentKind::StandardLibrary, _) => "share/wrela/std",
+        (ComponentKind::Aarch64Emulator, false) => "libexec/wrela/qemu-system-aarch64",
+        (ComponentKind::Aarch64Emulator, true) => "libexec/wrela/qemu-system-aarch64.exe",
+    }
+}
+
 /// Filesystem layout of one atomic wrela toolchain installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Toolchain {
@@ -594,10 +862,9 @@ pub struct Toolchain {
 }
 
 impl Toolchain {
-    /// Seal a compatible, content-verified installation for consumers. Hashing
-    /// itself remains a driver capability; this method checks its complete,
-    /// canonical evidence against the decoded manifest.
-    pub fn verify(
+    /// Private seal used only after this crate's concrete observer has hashed
+    /// and revalidated the complete installation.
+    pub(crate) fn verify(
         self,
         manifest: ToolchainManifest,
         required: &ToolchainCompatibility,
@@ -798,12 +1065,14 @@ mod tests {
     use std::path::Path;
 
     use wrela_build_model::{Sha256Digest, TargetIdentity};
+    use wrela_package::{PackageIdentity, PackageLocator, PackageName, PackageVersion};
 
     use super::{
-        ComponentKind, ComponentPath, ObservedInstallation, ShippedComponent, ShippedTarget,
-        ShippedTargetFile, TOOLCHAIN_MANIFEST_SCHEMA, Toolchain, ToolchainCompatibility,
-        ToolchainDecodeError, ToolchainDecodeLimits, ToolchainDecodeRequest, ToolchainManifest,
-        ToolchainManifestCodec, decode_and_verify_toolchain_manifest,
+        ComponentKind, ComponentPath, ObservedInstallation, ShippedComponent,
+        ShippedStandardLibraryPackage, ShippedTarget, ShippedTargetFile, TOOLCHAIN_MANIFEST_SCHEMA,
+        Toolchain, ToolchainCompatibility, ToolchainDecodeError, ToolchainDecodeLimits,
+        ToolchainDecodeRequest, ToolchainManifest, ToolchainManifestCodec,
+        decode_and_verify_toolchain_manifest,
     };
 
     fn fixture_manifest() -> (ToolchainManifest, ToolchainCompatibility, Sha256Digest) {
@@ -815,6 +1084,17 @@ mod tests {
             host: "aarch64-apple-darwin".to_owned(),
             llvm_project_revision: "llvmorg-22.1.0".to_owned(),
             compatibility: compatibility.clone(),
+            standard_library_packages: vec![ShippedStandardLibraryPackage {
+                identity: PackageIdentity {
+                    name: PackageName::new("wrela-core").expect("standard-library name"),
+                    version: PackageVersion::new("0.1.0").expect("standard-library version"),
+                    source_digest: digest,
+                },
+                locator: PackageLocator::Toolchain {
+                    component: "wrela-core-0.1".to_owned(),
+                },
+                manifest_digest: digest,
+            }],
             components: vec![
                 ShippedComponent {
                     kind: ComponentKind::Frontend,
@@ -944,10 +1224,20 @@ mod tests {
         assert!(ComponentPath::new("../bin/wrela").is_err());
 
         let incompatible = ToolchainCompatibility {
-            backend_protocol: 5,
-            ..compatibility
+            backend_protocol: 4,
+            ..compatibility.clone()
         };
         assert!(manifest.validate(&incompatible).is_err());
+        for machine_wir in [9, 11] {
+            let incompatible = ToolchainCompatibility {
+                machine_wir,
+                ..compatibility.clone()
+            };
+            assert!(
+                manifest.validate(&incompatible).is_err(),
+                "MachineWir {machine_wir} must not cross the exact v10 distribution boundary"
+            );
+        }
     }
 
     #[test]

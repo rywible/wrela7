@@ -1,0 +1,28 @@
+schema = 1
+
+[root]
+name = "stdlib-time-scalar-conformance"
+version = "0.1.0"
+source_digest = "6c180a164207a3ba0c4fba76ed0f17f0389f14a424d5926492dff56614b68ae0"
+
+[[package]]
+name = "stdlib-time-scalar-conformance"
+version = "0.1.0"
+source_digest = "6c180a164207a3ba0c4fba76ed0f17f0389f14a424d5926492dff56614b68ae0"
+manifest_digest = "02e78b2088cdb5756c2a8db800664800648b2a35eb553fc99d9b108283e41f7f"
+locator = "workspace"
+locator_path = "."
+
+[[package.dependency]]
+alias = "core"
+name = "wrela-core"
+version = "0.1.0"
+source_digest = "5da2bae2f9089643c235c54bf229e67a995f16ce9a0596c24604bd389661afd5"
+
+[[package]]
+name = "wrela-core"
+version = "0.1.0"
+source_digest = "5da2bae2f9089643c235c54bf229e67a995f16ce9a0596c24604bd389661afd5"
+manifest_digest = "7eda3d023a968b8302de6a2d5bea13270be3fbdba58d57ca93d74007a1a65786"
+locator = "toolchain"
+locator_component = "wrela-core-0.1"

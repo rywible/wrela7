@@ -1,0 +1,8 @@
+module contracts.layout_dedent
+
+fn first():
+    pass
+
+# Blank and comment-only lines remain trivia after the closing pair.
+fn second():
+    return unit

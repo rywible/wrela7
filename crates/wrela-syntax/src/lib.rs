@@ -10,8 +10,12 @@
 use std::fmt;
 
 use wrela_build_model::Sha256Digest;
-use wrela_diagnostics::{Diagnostic, WithDiagnostics};
+use wrela_diagnostics::{Diagnostic, DiagnosticSortError, canonicalize_diagnostics};
 use wrela_source::{FileId, SourceDatabase, SourceFile, Span, TextRange};
+
+mod parser;
+
+pub use parser::{CANCELLATION_POLL_INTERVAL, UNICODE_DATA_VERSION, WrelaSyntaxParser};
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -27,6 +31,10 @@ id_type!(TriviaId);
 /// Hard implementation ceiling that keeps parser and validator recursion below
 /// the process stack budget even when a caller supplies custom limits.
 pub const MAX_PARSE_NESTING_DEPTH: u32 = 1024;
+
+/// Exact source-syntax contract. Revision 3 makes exclusive call operands
+/// syntax-level places while retaining `init` as the sole class initializer.
+pub const SYNTAX_CONTRACT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TokenRange {
@@ -52,6 +60,7 @@ pub enum Keyword {
     Const,
     Brand,
     Fn,
+    Init,
     Async,
     Isr,
     Comptime,
@@ -135,6 +144,7 @@ pub enum Operator {
     BitOr,
     BitXor,
     ShiftLeft,
+    ShiftLeftModular,
     ShiftRight,
     Equal,
     NotEqual,
@@ -168,7 +178,10 @@ pub enum TokenKind {
     StringLiteral,
     ByteStringLiteral,
     CharacterLiteral,
-    InterpolatedString,
+    InterpolatedStringStart,
+    InterpolatedStringText,
+    InterpolationFormat,
+    InterpolatedStringEnd,
     Keyword(Keyword),
     Punctuation(Punctuation),
     Operator(Operator),
@@ -352,6 +365,14 @@ pub struct FunctionDeclaration {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct InitializerDeclaration {
+    pub meta: NodeMeta,
+    pub parameters: Vec<Parameter>,
+    pub return_type: Option<TypeExpression>,
+    pub body: Suite,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum GenericParameter {
     Type {
         meta: NodeMeta,
@@ -408,6 +429,7 @@ pub struct MemberDeclaration {
 pub enum MemberKind {
     Field(FieldDeclaration),
     Function(FunctionDeclaration),
+    Initializer(InitializerDeclaration),
     Projection(ProjectionDeclaration),
     Scope(ScopeDeclaration),
     Constant(ConstantDeclaration),
@@ -761,6 +783,7 @@ pub enum BinaryOperator {
     BitXor,
     BitAnd,
     ShiftLeft,
+    ShiftLeftModular,
     ShiftRight,
 }
 
@@ -786,8 +809,28 @@ pub struct ComparisonTail {
 pub struct Argument {
     pub meta: NodeMeta,
     pub name: Option<Identifier>,
-    pub access: AccessMode,
-    pub value: Expression,
+    pub value: ArgumentValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExclusiveAccess {
+    Mutate,
+    Take,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArgumentValue {
+    Value(Expression),
+    Exclusive {
+        access: ExclusiveAccess,
+        place: Expression,
+    },
+    /// Recovery-only form after `syntax-access-place`; it cannot lower as a
+    /// value or an exclusive place.
+    InvalidExclusive {
+        access: ExclusiveAccess,
+        expression: Expression,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -799,6 +842,8 @@ pub enum InterpolationPart {
     Value {
         expression: Expression,
         format: Option<String>,
+        /// Exact format-spec bytes, excluding `:` and `}`.
+        format_span: Option<Span>,
     },
 }
 
@@ -808,6 +853,10 @@ pub struct Literal {
     pub kind: LiteralKind,
     /// Exact source spelling, retained independently of decoded value.
     pub spelling: String,
+    /// Syntax-owned decoding of the literal. Numeric spellings remain exact
+    /// until contextual type checking; malformed recovered literals are
+    /// represented explicitly instead of carrying a fabricated value.
+    pub value: LiteralValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -819,6 +868,18 @@ pub enum LiteralKind {
     Character,
     Boolean,
     Unit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiteralValue {
+    IntegerSpelling,
+    FloatSpelling,
+    Text(String),
+    Bytes(Vec<u8>),
+    Character(char),
+    Boolean(bool),
+    Unit,
+    Invalid,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -979,6 +1040,7 @@ impl ParsedFile {
 pub struct ParseOutput {
     parsed: ParsedFile,
     diagnostics: Vec<Diagnostic>,
+    usage: ParseUsage,
 }
 
 impl ParseOutput {
@@ -992,9 +1054,183 @@ impl ParseOutput {
         &self.diagnostics
     }
 
+    /// Exact command-budget usage remeasured while this output was sealed.
+    #[must_use]
+    pub const fn usage(&self) -> ParseUsage {
+        self.usage
+    }
+
     #[must_use]
     pub fn into_parts(self) -> (ParsedFile, Vec<Diagnostic>) {
         (self.parsed, self.diagnostics)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FragmentKind {
+    Type,
+    Expression,
+}
+
+#[derive(Debug)]
+pub struct FragmentParseRequest<'a> {
+    pub sources: &'a SourceDatabase,
+    pub parsed: &'a ParsedFile,
+    pub argument: &'a BracketArgument,
+    pub kind: FragmentKind,
+    pub limits: ParseLimits,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SyntaxFragment {
+    Type(TypeExpression),
+    Expression(Expression),
+}
+
+/// A validated contextual parse of one unclassified generic argument. The
+/// wrapper metadata covers the requested token range exactly; child node IDs
+/// are dense together with that wrapper.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedFragment {
+    file: FileId,
+    source_digest: Sha256Digest,
+    meta: NodeMeta,
+    fragment: SyntaxFragment,
+}
+
+impl ParsedFragment {
+    #[must_use]
+    pub fn file(&self) -> FileId {
+        self.file
+    }
+
+    #[must_use]
+    pub fn source_digest(&self) -> Sha256Digest {
+        self.source_digest
+    }
+
+    #[must_use]
+    pub fn meta(&self) -> NodeMeta {
+        self.meta
+    }
+
+    #[must_use]
+    pub fn fragment(&self) -> &SyntaxFragment {
+        &self.fragment
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FragmentParseOutput {
+    parsed: ParsedFragment,
+    diagnostics: Vec<Diagnostic>,
+    usage: ParseUsage,
+}
+
+impl FragmentParseOutput {
+    #[must_use]
+    pub fn parsed(&self) -> &ParsedFragment {
+        &self.parsed
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    /// Exact resource usage remeasured while this fragment was sealed.
+    #[must_use]
+    pub const fn usage(&self) -> ParseUsage {
+        self.usage
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (ParsedFragment, Vec<Diagnostic>) {
+        (self.parsed, self.diagnostics)
+    }
+}
+
+/// Exact retained parser resources measured by the syntax sealer.
+///
+/// Nesting depth remains a per-file safety ceiling and is therefore not an
+/// additive command resource.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParseUsage {
+    tokens: u32,
+    ast_nodes: u32,
+    literal_bytes: u64,
+    diagnostics: u32,
+    diagnostic_bytes: u64,
+}
+
+impl ParseUsage {
+    pub const ZERO: Self = Self {
+        tokens: 0,
+        ast_nodes: 0,
+        literal_bytes: 0,
+        diagnostics: 0,
+        diagnostic_bytes: 0,
+    };
+
+    #[must_use]
+    pub const fn tokens(self) -> u32 {
+        self.tokens
+    }
+
+    #[must_use]
+    pub const fn ast_nodes(self) -> u32 {
+        self.ast_nodes
+    }
+
+    #[must_use]
+    pub const fn literal_bytes(self) -> u64 {
+        self.literal_bytes
+    }
+
+    #[must_use]
+    pub const fn diagnostics(self) -> u32 {
+        self.diagnostics
+    }
+
+    #[must_use]
+    pub const fn diagnostic_bytes(self) -> u64 {
+        self.diagnostic_bytes
+    }
+
+    /// Add one sealed output while enforcing the original command limits.
+    pub fn checked_add(self, other: Self, limits: ParseLimits) -> Result<Self, ParseFailure> {
+        let tokens = checked_usage_add_u32(self.tokens, other.tokens, limits.tokens, "tokens")?;
+        let ast_nodes = checked_usage_add_u32(
+            self.ast_nodes,
+            other.ast_nodes,
+            limits.ast_nodes,
+            "AST nodes",
+        )?;
+        let literal_bytes = checked_usage_add_u64(
+            self.literal_bytes,
+            other.literal_bytes,
+            limits.literal_bytes,
+            "literal bytes",
+        )?;
+        let diagnostics = checked_usage_add_u32(
+            self.diagnostics,
+            other.diagnostics,
+            limits.diagnostics,
+            "diagnostics",
+        )?;
+        let diagnostic_bytes = checked_usage_add_u64(
+            self.diagnostic_bytes,
+            other.diagnostic_bytes,
+            limits.diagnostic_bytes,
+            "diagnostic bytes",
+        )?;
+        Ok(Self {
+            tokens,
+            ast_nodes,
+            literal_bytes,
+            diagnostics,
+            diagnostic_bytes,
+        })
     }
 }
 
@@ -1025,9 +1261,6 @@ impl ParseLimits {
         if self.tokens == 0
             || self.ast_nodes == 0
             || self.nesting_depth == 0
-            || self.literal_bytes == 0
-            || self.diagnostics == 0
-            || self.diagnostic_bytes == 0
             || self.nesting_depth > MAX_PARSE_NESTING_DEPTH
         {
             Err(ParseFailure::InvalidLimits)
@@ -1035,6 +1268,92 @@ impl ParseLimits {
             Ok(())
         }
     }
+
+    /// Subtract one sealed output from a command budget exactly.
+    ///
+    /// The returned budget may have zero additive capacity. That is valid for
+    /// literal and diagnostic resources; a caller must reject another file
+    /// before parsing if no token or AST-node capacity remains.
+    pub fn remaining_after(self, usage: ParseUsage) -> Result<Self, ParseFailure> {
+        Ok(Self {
+            tokens: checked_usage_sub_u32(self.tokens, usage.tokens, "tokens")?,
+            ast_nodes: checked_usage_sub_u32(self.ast_nodes, usage.ast_nodes, "AST nodes")?,
+            nesting_depth: self.nesting_depth,
+            literal_bytes: checked_usage_sub_u64(
+                self.literal_bytes,
+                usage.literal_bytes,
+                "literal bytes",
+            )?,
+            diagnostics: checked_usage_sub_u32(self.diagnostics, usage.diagnostics, "diagnostics")?,
+            diagnostic_bytes: checked_usage_sub_u64(
+                self.diagnostic_bytes,
+                usage.diagnostic_bytes,
+                "diagnostic bytes",
+            )?,
+        })
+    }
+}
+
+fn checked_usage_add_u32(
+    current: u32,
+    added: u32,
+    limit: u32,
+    resource: &'static str,
+) -> Result<u32, ParseFailure> {
+    let next = current
+        .checked_add(added)
+        .ok_or(ParseFailure::ResourceLimit {
+            resource,
+            limit: u64::from(limit),
+        })?;
+    if next > limit {
+        return Err(ParseFailure::ResourceLimit {
+            resource,
+            limit: u64::from(limit),
+        });
+    }
+    Ok(next)
+}
+
+fn checked_usage_add_u64(
+    current: u64,
+    added: u64,
+    limit: u64,
+    resource: &'static str,
+) -> Result<u64, ParseFailure> {
+    let next = current
+        .checked_add(added)
+        .ok_or(ParseFailure::ResourceLimit { resource, limit })?;
+    if next > limit {
+        return Err(ParseFailure::ResourceLimit { resource, limit });
+    }
+    Ok(next)
+}
+
+fn checked_usage_sub_u32(
+    remaining: u32,
+    used: u32,
+    resource: &'static str,
+) -> Result<u32, ParseFailure> {
+    remaining
+        .checked_sub(used)
+        .ok_or(ParseFailure::ResourceLimit {
+            resource,
+            limit: u64::from(remaining),
+        })
+}
+
+fn checked_usage_sub_u64(
+    remaining: u64,
+    used: u64,
+    resource: &'static str,
+) -> Result<u64, ParseFailure> {
+    remaining
+        .checked_sub(used)
+        .ok_or(ParseFailure::ResourceLimit {
+            resource,
+            limit: remaining,
+        })
 }
 
 #[derive(Debug)]
@@ -1062,20 +1381,21 @@ pub fn seal_parse_output(
     if candidate.file != request.file || candidate.source_digest != source.digest() {
         return Err(ParseFailure::StaleOutput(request.file));
     }
-    validate_lexical_table(
+    let (tokens, literal_bytes) = validate_lexical_table(
         &candidate.lexical,
         source,
         candidate.recovery_complete,
         request.limits,
     )?;
-    let node_ranges = validate_ast(
+    let (node_ranges, ast_nodes) = validate_ast(
         &candidate.ast,
         &candidate.lexical,
         source,
         candidate.recovery_complete,
         request.limits,
     )?;
-    let diagnostics = validate_parse_diagnostics(diagnostics, source, request.limits)?;
+    let (diagnostics, diagnostic_count, diagnostic_bytes) =
+        validate_parse_diagnostics(diagnostics, source, request.limits, is_cancelled)?;
     if is_cancelled() {
         return Err(ParseFailure::Cancelled);
     }
@@ -1089,6 +1409,13 @@ pub fn seal_parse_output(
             node_ranges,
         },
         diagnostics,
+        usage: ParseUsage {
+            tokens,
+            ast_nodes,
+            literal_bytes,
+            diagnostics: diagnostic_count,
+            diagnostic_bytes,
+        },
     })
 }
 
@@ -1097,7 +1424,7 @@ fn validate_lexical_table(
     source: &SourceFile,
     recovery_complete: bool,
     limits: ParseLimits,
-) -> Result<(), ParseFailure> {
+) -> Result<(u32, u64), ParseFailure> {
     if lexical.tokens.is_empty() || lexical.tokens.len() > limits.tokens as usize {
         return Err(ParseFailure::ResourceLimit {
             resource: "tokens",
@@ -1139,7 +1466,10 @@ fn validate_lexical_table(
                 | TokenKind::StringLiteral
                 | TokenKind::ByteStringLiteral
                 | TokenKind::CharacterLiteral
-                | TokenKind::InterpolatedString
+                | TokenKind::InterpolatedStringStart
+                | TokenKind::InterpolatedStringText
+                | TokenKind::InterpolationFormat
+                | TokenKind::InterpolatedStringEnd
                 | TokenKind::Error
         );
         if carries_spelling != token.spelling.is_some() {
@@ -1160,7 +1490,10 @@ fn validate_lexical_table(
                     | TokenKind::StringLiteral
                     | TokenKind::ByteStringLiteral
                     | TokenKind::CharacterLiteral
-                    | TokenKind::InterpolatedString
+                    | TokenKind::InterpolatedStringStart
+                    | TokenKind::InterpolatedStringText
+                    | TokenKind::InterpolationFormat
+                    | TokenKind::InterpolatedStringEnd
             ) {
                 literal_bytes = literal_bytes
                     .checked_add(u64::try_from(spelling.len()).map_err(|_| {
@@ -1175,13 +1508,18 @@ fn validate_lexical_table(
             }
         }
     }
-    if literal_bytes > limits.literal_bytes
-        || lexical
-            .tokens
-            .iter()
-            .filter(|token| token.kind == TokenKind::EndOfFile)
-            .count()
-            != 1
+    if literal_bytes > limits.literal_bytes {
+        return Err(ParseFailure::ResourceLimit {
+            resource: "literal bytes",
+            limit: limits.literal_bytes,
+        });
+    }
+    if lexical
+        .tokens
+        .iter()
+        .filter(|token| token.kind == TokenKind::EndOfFile)
+        .count()
+        != 1
         || lexical.tokens.last().map(|token| token.kind) != Some(TokenKind::EndOfFile)
         || lexical.trivia.iter().enumerate().any(|(index, trivia)| {
             trivia.id.0 as usize != index
@@ -1244,7 +1582,11 @@ fn validate_lexical_table(
             "lossless lexical table does not cover its declared source prefix".to_owned(),
         ));
     }
-    Ok(())
+    let tokens = u32::try_from(lexical.tokens.len()).map_err(|_| ParseFailure::ResourceLimit {
+        resource: "tokens",
+        limit: u64::from(limits.tokens),
+    })?;
+    Ok((tokens, literal_bytes))
 }
 
 fn validate_ast(
@@ -1253,24 +1595,16 @@ fn validate_ast(
     source: &SourceFile,
     recovery_complete: bool,
     limits: ParseLimits,
-) -> Result<Vec<TextRange>, ParseFailure> {
-    let seen_len = usize::try_from(limits.ast_nodes).map_err(|_| ParseFailure::InvalidLimits)?;
+) -> Result<(Vec<TextRange>, u32), ParseFailure> {
     let mut validator = AstValidator {
         source,
         lexical,
         limits,
-        seen: vec![false; seen_len],
         nodes: 0,
-        maximum_id: 0,
         ranges: Vec::new(),
     };
     validator.file(ast, 1, None)?;
-    if validator.nodes == 0
-        || validator.maximum_id.checked_add(1) != Some(validator.nodes)
-        || validator.seen[..validator.nodes as usize]
-            .iter()
-            .any(|seen| !seen)
-    {
+    if !sort_and_validate_dense_ast_ids(&mut validator.ranges, validator.nodes) {
         return Err(ParseFailure::InternalInvariant(
             "AST IDs are not a dense zero-based set".to_owned(),
         ));
@@ -1290,22 +1624,194 @@ fn validate_ast(
             "file AST does not exactly cover its parsed source prefix".to_owned(),
         ));
     }
-    validator.ranges.sort_by_key(|(id, _)| *id);
-    Ok(validator
-        .ranges
-        .into_iter()
-        .map(|(_, range)| range)
-        .collect())
+    let nodes = validator.nodes;
+    let mut node_ranges = Vec::new();
+    node_ranges
+        .try_reserve_exact(validator.ranges.len())
+        .map_err(|_| ParseFailure::ResourceLimit {
+            resource: "AST node ranges",
+            limit: u64::from(limits.ast_nodes),
+        })?;
+    node_ranges.extend(validator.ranges.into_iter().map(|(_, range)| range));
+    Ok((node_ranges, nodes))
+}
+
+fn seal_fragment_output(
+    request: &FragmentParseRequest<'_>,
+    meta: NodeMeta,
+    fragment: SyntaxFragment,
+    diagnostics: Vec<Diagnostic>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<FragmentParseOutput, ParseFailure> {
+    if is_cancelled() {
+        return Err(ParseFailure::Cancelled);
+    }
+    request.limits.validate()?;
+    let source = request
+        .sources
+        .get(request.parsed.file)
+        .ok_or(ParseFailure::UnknownSource(request.parsed.file))?;
+    if request.parsed.source_digest != source.digest() {
+        return Err(ParseFailure::StaleOutput(request.parsed.file));
+    }
+    let (argument_meta, tokens) = match request.argument {
+        BracketArgument::UnclassifiedTypeOrExpression { meta, tokens } => (*meta, *tokens),
+        BracketArgument::BoundedCapacity { meta, .. } => {
+            return Err(ParseFailure::InvalidFragmentRange {
+                first: meta.tokens.first.0,
+                end: meta.tokens.end.0,
+            });
+        }
+        BracketArgument::Error(error) => {
+            return Err(ParseFailure::InvalidFragmentRange {
+                first: error.meta.tokens.first.0,
+                end: error.meta.tokens.end.0,
+            });
+        }
+    };
+    let token_count = request.parsed.lexical.tokens.len();
+    let count = tokens.end.0.checked_sub(tokens.first.0);
+    if count.is_some_and(|value| value > request.limits.tokens) {
+        return Err(ParseFailure::ResourceLimit {
+            resource: "fragment tokens",
+            limit: u64::from(request.limits.tokens),
+        });
+    }
+    if tokens.first.0 >= tokens.end.0
+        || tokens.end.0 as usize >= token_count
+        || count.is_none()
+        || argument_meta.tokens != tokens
+        || !valid_span(source, argument_meta.span)
+    {
+        return Err(ParseFailure::InvalidFragmentRange {
+            first: tokens.first.0,
+            end: tokens.end.0,
+        });
+    }
+    let fragment_tokens = count.ok_or(ParseFailure::InvalidFragmentRange {
+        first: tokens.first.0,
+        end: tokens.end.0,
+    })?;
+    let first = &request.parsed.lexical.tokens[tokens.first.0 as usize];
+    let last = &request.parsed.lexical.tokens[tokens.end.0 as usize - 1];
+    if argument_meta.span.range.start != first.span.range.start
+        || argument_meta.span.range.end != last.span.range.end
+        || meta.id != AstId(0)
+        || meta.span != argument_meta.span
+        || meta.tokens != tokens
+    {
+        return Err(ParseFailure::InvalidFragmentRange {
+            first: tokens.first.0,
+            end: tokens.end.0,
+        });
+    }
+
+    let mut validator = AstValidator {
+        source,
+        lexical: &request.parsed.lexical,
+        limits: request.limits,
+        nodes: 0,
+        ranges: Vec::new(),
+    };
+    let parent = validator.meta(meta, 1, None)?;
+    match &fragment {
+        SyntaxFragment::Type(value) => validator.ty(value, 2, parent)?,
+        SyntaxFragment::Expression(value) => validator.expression(value, 2, parent)?,
+    }
+    if !sort_and_validate_dense_ast_ids(&mut validator.ranges, validator.nodes) {
+        return Err(ParseFailure::InternalInvariant(
+            "fragment AST IDs are not a dense zero-based set".to_owned(),
+        ));
+    }
+    let ast_nodes = validator.nodes;
+    let literal_bytes = literal_bytes_in_token_range(
+        &request.parsed.lexical,
+        tokens.first.0 as usize,
+        tokens.end.0 as usize,
+        request.limits.literal_bytes,
+    )?;
+    let (diagnostics, diagnostic_count, diagnostic_bytes) =
+        validate_parse_diagnostics(diagnostics, source, request.limits, is_cancelled)?;
+    if is_cancelled() {
+        return Err(ParseFailure::Cancelled);
+    }
+    Ok(FragmentParseOutput {
+        parsed: ParsedFragment {
+            file: request.parsed.file,
+            source_digest: request.parsed.source_digest,
+            meta,
+            fragment,
+        },
+        diagnostics,
+        usage: ParseUsage {
+            tokens: fragment_tokens,
+            ast_nodes,
+            literal_bytes,
+            diagnostics: diagnostic_count,
+            diagnostic_bytes,
+        },
+    })
+}
+
+fn literal_bytes_in_token_range(
+    lexical: &LosslessLexicalTable,
+    start: usize,
+    end: usize,
+    limit: u64,
+) -> Result<u64, ParseFailure> {
+    let mut literal_bytes = 0u64;
+    for token in &lexical.tokens[start..end] {
+        if matches!(
+            token.kind,
+            TokenKind::IntegerLiteral
+                | TokenKind::FloatLiteral
+                | TokenKind::StringLiteral
+                | TokenKind::ByteStringLiteral
+                | TokenKind::CharacterLiteral
+                | TokenKind::InterpolatedStringStart
+                | TokenKind::InterpolatedStringText
+                | TokenKind::InterpolationFormat
+                | TokenKind::InterpolatedStringEnd
+        ) {
+            let bytes = token.spelling.as_ref().map_or(0usize, String::len);
+            literal_bytes = literal_bytes
+                .checked_add(
+                    u64::try_from(bytes).map_err(|_| ParseFailure::ResourceLimit {
+                        resource: "literal bytes",
+                        limit,
+                    })?,
+                )
+                .ok_or(ParseFailure::ResourceLimit {
+                    resource: "literal bytes",
+                    limit,
+                })?;
+        }
+    }
+    if literal_bytes > limit {
+        return Err(ParseFailure::ResourceLimit {
+            resource: "literal bytes",
+            limit,
+        });
+    }
+    Ok(literal_bytes)
 }
 
 struct AstValidator<'a> {
     source: &'a SourceFile,
     lexical: &'a LosslessLexicalTable,
     limits: ParseLimits,
-    seen: Vec<bool>,
     nodes: u32,
-    maximum_id: u32,
     ranges: Vec<(u32, TextRange)>,
+}
+
+fn sort_and_validate_dense_ast_ids(ranges: &mut [(u32, TextRange)], nodes: u32) -> bool {
+    ranges.sort_unstable_by_key(|(id, _)| *id);
+    nodes != 0
+        && usize::try_from(nodes) == Ok(ranges.len())
+        && ranges
+            .iter()
+            .enumerate()
+            .all(|(expected, (id, _))| usize::try_from(*id) == Ok(expected))
 }
 
 impl AstValidator<'_> {
@@ -1321,11 +1827,16 @@ impl AstValidator<'_> {
                 limit: u64::from(self.limits.nesting_depth),
             });
         }
-        let id = meta.id.0 as usize;
-        if id >= self.seen.len() || self.seen[id] {
+        if meta.id.0 >= self.limits.ast_nodes {
             return Err(ParseFailure::InternalInvariant(
-                "AST node ID is duplicated or outside its limit".to_owned(),
+                "AST node ID is outside its limit".to_owned(),
             ));
+        }
+        if self.nodes >= self.limits.ast_nodes {
+            return Err(ParseFailure::ResourceLimit {
+                resource: "AST nodes",
+                limit: u64::from(self.limits.ast_nodes),
+            });
         }
         if !valid_span(self.source, meta.span)
             || meta.tokens.first.0 > meta.tokens.end.0
@@ -1342,9 +1853,15 @@ impl AstValidator<'_> {
                 || meta.tokens.first.0 < parent.tokens.first.0
                 || meta.tokens.end.0 > parent.tokens.end.0)
         {
-            return Err(ParseFailure::InternalInvariant(
-                "AST child escapes its parent span or token interval".to_owned(),
-            ));
+            return Err(ParseFailure::InternalInvariant(format!(
+                "AST child {} ({:?}, {:?}) escapes parent {} ({:?}, {:?})",
+                meta.id.0,
+                meta.span.range,
+                meta.tokens,
+                parent.id.0,
+                parent.span.range,
+                parent.tokens
+            )));
         }
         if meta.tokens.first.0 < meta.tokens.end.0 {
             let first = &self.lexical.tokens[meta.tokens.first.0 as usize];
@@ -1357,7 +1874,6 @@ impl AstValidator<'_> {
                 ));
             }
         }
-        self.seen[id] = true;
         self.nodes = self
             .nodes
             .checked_add(1)
@@ -1365,7 +1881,12 @@ impl AstValidator<'_> {
                 resource: "AST nodes",
                 limit: u64::from(self.limits.ast_nodes),
             })?;
-        self.maximum_id = self.maximum_id.max(meta.id.0);
+        self.ranges
+            .try_reserve(1)
+            .map_err(|_| ParseFailure::ResourceLimit {
+                resource: "AST node ranges",
+                limit: u64::from(self.limits.ast_nodes),
+            })?;
         self.ranges.push((meta.id.0, meta.span.range));
         Ok(meta)
     }
@@ -1463,11 +1984,6 @@ impl AstValidator<'_> {
             }
             ImportItems::Names { module, names, .. } => {
                 self.qualified(module, depth + 1, parent)?;
-                if names.is_empty() {
-                    return Err(ParseFailure::InternalInvariant(
-                        "from-import has no names".to_owned(),
-                    ));
-                }
                 for name in names {
                     let name_parent = self.meta(name.meta, depth + 1, Some(parent))?;
                     self.identifier(&name.name, depth + 2, name_parent)?;
@@ -1626,6 +2142,22 @@ impl AstValidator<'_> {
         Ok(())
     }
 
+    fn initializer(
+        &mut self,
+        value: &InitializerDeclaration,
+        depth: u32,
+        parent: NodeMeta,
+    ) -> Result<(), ParseFailure> {
+        let parent = self.meta(value.meta, depth, Some(parent))?;
+        for parameter in &value.parameters {
+            self.parameter(parameter, depth + 1, parent)?;
+        }
+        if let Some(ty) = &value.return_type {
+            self.ty(ty, depth + 1, parent)?;
+        }
+        self.suite(&value.body, depth + 1, parent)
+    }
+
     fn type_declaration(
         &mut self,
         value: &TypeDeclaration,
@@ -1657,6 +2189,7 @@ impl AstValidator<'_> {
         match &value.kind {
             MemberKind::Field(value) => self.field(value, depth + 1, parent),
             MemberKind::Function(value) => self.function(value, depth + 1, parent),
+            MemberKind::Initializer(value) => self.initializer(value, depth + 1, parent),
             MemberKind::Projection(value) => self.projection(value, depth + 1, parent),
             MemberKind::Scope(value) => self.scope(value, depth + 1, parent),
             MemberKind::Constant(value) => self.constant(value, depth + 1, parent),
@@ -2024,6 +2557,11 @@ impl AstValidator<'_> {
                 self.expression(right, depth + 1, parent)
             }
             ExpressionKind::Comparison { first, tails } => {
+                if tails.len() > 1 {
+                    return Err(ParseFailure::InternalInvariant(
+                        "comparison expressions cannot chain".to_owned(),
+                    ));
+                }
                 self.expression(first, depth + 1, parent)?;
                 for tail in tails {
                     self.expression(&tail.right, depth + 1, parent)?;
@@ -2053,7 +2591,19 @@ impl AstValidator<'_> {
                     if let Some(name) = &argument.name {
                         self.identifier(name, depth + 2, argument_parent)?;
                     }
-                    self.expression(&argument.value, depth + 2, argument_parent)?;
+                    let value = match &argument.value {
+                        ArgumentValue::Value(value) => value,
+                        ArgumentValue::Exclusive { place, .. } => {
+                            if !is_place_expression(place) {
+                                return Err(ParseFailure::InternalInvariant(
+                                    "exclusive call argument is not a place".to_owned(),
+                                ));
+                            }
+                            place
+                        }
+                        ArgumentValue::InvalidExclusive { expression, .. } => expression,
+                    };
+                    self.expression(value, depth + 2, argument_parent)?;
                 }
                 Ok(())
             }
@@ -2082,8 +2632,24 @@ impl AstValidator<'_> {
                                 ));
                             }
                         }
-                        InterpolationPart::Value { expression, .. } => {
+                        InterpolationPart::Value {
+                            expression,
+                            format,
+                            format_span,
+                        } => {
                             self.expression(expression, depth + 1, parent)?;
+                            if format.is_some() != format_span.is_some()
+                                || format_span.is_some_and(|span| {
+                                    !valid_span(self.source, span)
+                                        || span.range.start < parent.span.range.start
+                                        || span.range.end > parent.span.range.end
+                                        || span.range.start == span.range.end
+                                })
+                            {
+                                return Err(ParseFailure::InternalInvariant(
+                                    "interpolation format and exact span disagree".to_owned(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -2108,6 +2674,33 @@ impl AstValidator<'_> {
         if self.source.slice(meta.span.range) != Some(value.spelling.as_str()) {
             return Err(ParseFailure::InternalInvariant(
                 "literal spelling differs from its source interval".to_owned(),
+            ));
+        }
+        let kind_matches_value = matches!(
+            (&value.kind, &value.value),
+            (_, LiteralValue::Invalid)
+                | (LiteralKind::Integer, LiteralValue::IntegerSpelling)
+                | (LiteralKind::Float, LiteralValue::FloatSpelling)
+                | (LiteralKind::String, LiteralValue::Text(_))
+                | (LiteralKind::ByteString, LiteralValue::Bytes(_))
+                | (LiteralKind::Character, LiteralValue::Character(_))
+                | (LiteralKind::Boolean, LiteralValue::Boolean(_))
+                | (LiteralKind::Unit, LiteralValue::Unit)
+        );
+        if !kind_matches_value {
+            return Err(ParseFailure::InternalInvariant(
+                "literal kind and decoded value disagree".to_owned(),
+            ));
+        }
+        let expected = parser::decode_literal_spelling(
+            value.kind,
+            &value.spelling,
+            self.limits.literal_bytes,
+            &mut || Ok(()),
+        )?;
+        if value.value != expected {
+            return Err(ParseFailure::InternalInvariant(
+                "literal decoded value differs from its exact spelling".to_owned(),
             ));
         }
         Ok(())
@@ -2245,11 +2838,23 @@ impl AstValidator<'_> {
     }
 }
 
+fn is_place_expression(expression: &Expression) -> bool {
+    match &expression.kind {
+        ExpressionKind::Name(_) => true,
+        ExpressionKind::Field { base, .. } | ExpressionKind::Index { base, .. } => {
+            is_place_expression(base)
+        }
+        ExpressionKind::Parenthesized(inner) => is_place_expression(inner),
+        _ => false,
+    }
+}
+
 fn validate_parse_diagnostics(
     diagnostics: Vec<Diagnostic>,
     source: &SourceFile,
     limits: ParseLimits,
-) -> Result<Vec<Diagnostic>, ParseFailure> {
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(Vec<Diagnostic>, u32, u64), ParseFailure> {
     if diagnostics.len() > limits.diagnostics as usize {
         return Err(ParseFailure::ResourceLimit {
             resource: "diagnostics",
@@ -2258,6 +2863,9 @@ fn validate_parse_diagnostics(
     }
     let mut bytes = 0u64;
     for diagnostic in &diagnostics {
+        if is_cancelled() {
+            return Err(ParseFailure::Cancelled);
+        }
         if diagnostic.message.trim().is_empty()
             || !valid_span(source, diagnostic.primary)
             || diagnostic.code.as_ref().is_some_and(|code| {
@@ -2315,6 +2923,9 @@ fn validate_parse_diagnostics(
                     .map(|edit| edit.replacement.as_str()),
             )
         {
+            if is_cancelled() {
+                return Err(ParseFailure::Cancelled);
+            }
             bytes = bytes
                 .checked_add(u64::try_from(value.len()).map_err(|_| {
                     ParseFailure::InternalInvariant(
@@ -2333,12 +2944,19 @@ fn validate_parse_diagnostics(
             limit: limits.diagnostic_bytes,
         });
     }
-    let mut output = WithDiagnostics {
-        value: (),
-        diagnostics,
-    };
-    output.sort_diagnostics();
-    Ok(output.diagnostics)
+    let diagnostics =
+        canonicalize_diagnostics(diagnostics, is_cancelled).map_err(|error| match error {
+            DiagnosticSortError::Cancelled => ParseFailure::Cancelled,
+            DiagnosticSortError::Allocation => ParseFailure::ResourceLimit {
+                resource: "diagnostics",
+                limit: u64::from(limits.diagnostics),
+            },
+        })?;
+    let count = u32::try_from(diagnostics.len()).map_err(|_| ParseFailure::ResourceLimit {
+        resource: "diagnostics",
+        limit: u64::from(limits.diagnostics),
+    })?;
+    Ok((diagnostics, count, bytes))
 }
 
 fn valid_span(source: &SourceFile, span: Span) -> bool {
@@ -2353,6 +2971,14 @@ pub trait SyntaxParser {
         request: ParseRequest<'_>,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<ParseOutput, ParseFailure>;
+
+    /// Reparse an intentionally unclassified generic argument after name
+    /// resolution determines whether its parameter expects a type or value.
+    fn parse_fragment(
+        &self,
+        request: FragmentParseRequest<'_>,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<FragmentParseOutput, ParseFailure>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2361,6 +2987,7 @@ pub enum ParseFailure {
     StaleOutput(FileId),
     Cancelled,
     InvalidLimits,
+    InvalidFragmentRange { first: u32, end: u32 },
     ResourceLimit { resource: &'static str, limit: u64 },
     InternalInvariant(String),
 }
@@ -2377,7 +3004,12 @@ impl fmt::Display for ParseFailure {
                 )
             }
             Self::Cancelled => formatter.write_str("parsing was cancelled"),
-            Self::InvalidLimits => formatter.write_str("parser limits must be nonzero"),
+            Self::InvalidLimits => formatter.write_str(
+                "parser token, AST-node, and nesting-depth limits must be nonzero and valid",
+            ),
+            Self::InvalidFragmentRange { first, end } => {
+                write!(formatter, "fragment token range {first}..{end} is invalid")
+            }
             Self::ResourceLimit { resource, limit } => {
                 write!(formatter, "parser exceeded {resource} limit {limit}")
             }
@@ -2403,5 +3035,13 @@ mod contract_tests {
             limits.validate(),
             Err(ParseFailure::InvalidLimits)
         ));
+
+        let mut zero_additive = ParseLimits::standard();
+        zero_additive.literal_bytes = 0;
+        zero_additive.diagnostics = 0;
+        zero_additive.diagnostic_bytes = 0;
+        zero_additive
+            .validate()
+            .expect("zero literal and diagnostic budgets are valid");
     }
 }

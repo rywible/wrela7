@@ -9,10 +9,15 @@
 
 use std::fmt;
 
-use wrela_build_model::BuildIdentity;
-use wrela_source::Span;
+use wrela_build_model::{BuildIdentity, Sha256Digest};
+pub use wrela_source::Span;
+pub use wrela_test_model::{
+    FullImageTestGroup, FunctionKey, ImageGroupId, ImageRoot, ImageTest, ImageTestInvocation,
+    TestDescriptor, TestId as ModelTestId, TestKind as ModelTestKind,
+};
 
-pub const SEMANTIC_WIR_VERSION: u32 = 1;
+pub const SEMANTIC_WIR_VERSION: u32 = 8;
+pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -30,6 +35,7 @@ id_type!(TaskId);
 id_type!(DeviceId);
 id_type!(PoolId);
 id_type!(RegionId);
+id_type!(ActivationId);
 id_type!(ScopeId);
 id_type!(ProofId);
 id_type!(TestId);
@@ -91,18 +97,48 @@ pub enum Linearity {
 pub enum TypeKind {
     Primitive(PrimitiveType),
     Tuple(Vec<TypeId>),
-    Array { element: TypeId, length: u64 },
-    Struct { fields: Vec<FieldType> },
-    Enum { variants: Vec<VariantType> },
+    Array {
+        element: TypeId,
+        length: u64,
+    },
+    Struct {
+        fields: Vec<FieldType>,
+    },
+    Enum {
+        variants: Vec<VariantType>,
+    },
     Function(FunctionType),
-    Iso { pool: PoolId, payload: TypeId },
-    ActorHandle { actor_type: TypeId },
-    Receipt { payload: TypeId, error: TypeId },
-    DmaPayload { pool: PoolId, payload: TypeId },
-    DmaShared { pool: PoolId, layout: TypeId },
-    Mmio { layout: TypeId },
-    Validated { format: TypeId, payload: TypeId },
-    OpaqueTarget { name: String },
+    Iso {
+        pool: PoolId,
+        payload: TypeId,
+    },
+    ActorHandle {
+        actor_type: TypeId,
+    },
+    /// Strict-linear compiler-created token for one proved mailbox slot.
+    Reservation,
+    Receipt {
+        payload: TypeId,
+        error: TypeId,
+    },
+    DmaPayload {
+        pool: PoolId,
+        payload: TypeId,
+    },
+    DmaShared {
+        pool: PoolId,
+        layout: TypeId,
+    },
+    Mmio {
+        layout: TypeId,
+    },
+    Validated {
+        format: TypeId,
+        payload: TypeId,
+    },
+    OpaqueTarget {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +325,12 @@ pub enum SemanticOperation {
         ty: TypeId,
         fields: Vec<ValueId>,
     },
+    /// Construct one closed enum variant from its exact positional payload.
+    ConstructEnum {
+        ty: TypeId,
+        variant: u32,
+        payload: ValueId,
+    },
     Project {
         base: ValueId,
         field: u32,
@@ -319,6 +361,11 @@ pub enum SemanticOperation {
     Call {
         function: FunctionId,
         arguments: Vec<Argument>,
+        /// Exact static activation plan for an asynchronous call. Synchronous
+        /// calls carry `None`; asynchronous calls must carry `Some` and are
+        /// independently cross-checked against the containing function and
+        /// source location.
+        activation: Option<ActivationId>,
     },
     ActorReserve {
         actor: ActorId,
@@ -328,6 +375,12 @@ pub enum SemanticOperation {
     ActorCommit {
         reservation: ValueId,
         arguments: Vec<Argument>,
+    },
+    /// Dequeue the next message for an actor turn. Unit messages produce no
+    /// value; the concrete method identity prevents dispatch substitution.
+    MailboxReceive {
+        actor: ActorId,
+        method: FunctionId,
     },
     ActorSend {
         message: ValueId,
@@ -421,6 +474,12 @@ pub enum SemanticOperation {
         condition: ValueId,
         proof: Option<ProofId>,
     },
+    /// Fail the active selected test if `condition` is false. The descriptor
+    /// is exact declared-source provenance and is never user-supplied wire.
+    Assert {
+        condition: ValueId,
+        failure: AssertionFailureDescriptor,
+    },
     RecordEvent {
         kind: u32,
         payload: ValueId,
@@ -431,6 +490,13 @@ pub enum SemanticOperation {
     TestFinish {
         outcome: ValueId,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertionFailureDescriptor {
+    pub expression: String,
+    pub message: Option<String>,
+    pub source: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,7 +558,15 @@ pub struct SemanticRegion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionOrigin {
     Source,
-    GeneratedTestHarness { group: u32 },
+    /// Runtime entry synthesized from the declared source `@image` comptime
+    /// constructor. The constructor declaration is provenance only and is not
+    /// emitted as runtime code.
+    GeneratedImageEntry {
+        constructor: u32,
+    },
+    GeneratedTestHarness {
+        group: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,6 +583,8 @@ pub enum FunctionRole {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticFunction {
     pub id: FunctionId,
+    /// Stable monomorphized-instance identity assigned by semantic analysis.
+    pub instance_key: Sha256Digest,
     pub name: String,
     pub origin: FunctionOrigin,
     pub role: FunctionRole,
@@ -518,10 +594,13 @@ pub struct SemanticFunction {
     pub values: Vec<SemanticValue>,
     pub body: SemanticRegion,
     pub effects: EffectSet,
+    /// Proofs attached to this exact function instance by semantic analysis.
+    pub proofs: Vec<ProofId>,
     pub source: Option<Span>,
     pub stack_bound: u64,
     pub frame_bound: u64,
     pub uninterrupted_bound: Option<u64>,
+    pub recursive_depth_bound: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -533,7 +612,7 @@ pub struct Global {
     pub owner: ImageOwner,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ImageOwner {
     Runtime,
     Actor(ActorId),
@@ -601,6 +680,33 @@ pub struct RegionRecord {
     pub source: Span,
 }
 
+/// Cancellation behavior proved for one statically admitted async call site.
+///
+/// The current actor slice supports only immediate awaits of scalar helpers,
+/// so cancellation destroys the complete callee frame before propagating to
+/// the retained caller activation. More dispositions require a schema bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationCancellation {
+    DropCalleeThenPropagate,
+}
+
+/// Exact, source-aware storage admission for one asynchronous call site.
+/// Every record owns one activation-linked `RegionClass::TaskFrame` region and
+/// one capacity proof. `RegionClass::Call` remains reserved for synchronous
+/// temporaries that cannot survive suspension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationPlan {
+    pub id: ActivationId,
+    pub caller: FunctionId,
+    pub callee: FunctionId,
+    pub region: RegionId,
+    pub frame_bytes: u64,
+    pub maximum_live: u32,
+    pub cancellation: ActivationCancellation,
+    pub capacity_proof: ProofId,
+    pub source: Span,
+}
+
 /// Lowered contract for one `with` activation site. Helper functions contain
 /// the specialized non-suspending abort/exit bodies. Dependencies form the
 /// proved cleanup DAG used by Flow lowering during every abnormal exit.
@@ -621,21 +727,26 @@ pub struct ScopePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProofKind {
     TypeChecked,
+    EffectsAllowed,
     DefiniteInitialization,
+    Ownership,
     AccessExclusive,
     ViewDoesNotEscape,
     RegionBound,
     CapacityBound,
     WaitGraphAcyclic,
     CleanupAcyclic,
-    IsrEffectSafe,
+    WorkBound,
+    StackBound,
+    IsrSafe,
     DmaTransition,
     MmioPartition,
     DeviceValueValidated,
-    WorkBound,
-    StackBound,
+    WireLayout,
     ReceiptLineage,
     ActorAsIf,
+    SupervisionComplete,
+    ImageClosed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -644,7 +755,10 @@ pub struct ProofRecord {
     pub kind: ProofKind,
     pub subject: String,
     pub bound: Option<u64>,
-    pub source: Option<Span>,
+    /// Every source location retained by semantic analysis, in its original
+    /// canonical order. Proofs may span declarations or files and must not be
+    /// collapsed to an arbitrary representative location.
+    pub sources: Vec<Span>,
     pub depends_on: Vec<ProofId>,
     pub explanation: Vec<String>,
 }
@@ -652,6 +766,9 @@ pub struct ProofRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestEntry {
     pub id: TestId,
+    /// Global ID assigned by the sealed test plan and emitted by the guest
+    /// protocol. `id` remains the dense image-local table identity.
+    pub plan_id: u32,
     pub name: String,
     pub function: FunctionId,
     pub kind: TestKind,
@@ -668,6 +785,14 @@ pub enum TestKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceSummary {
+    /// Dense HIR arena bounds retained so source provenance can be validated
+    /// without treating a reachability count as a declaration ID bound.
+    pub hir_files: u32,
+    pub hir_declarations: u32,
+    /// Number of distinct HIR declaration IDs retained by the closed runtime
+    /// semantic model, including image-constructor provenance and every source
+    /// function, scope, type, and brand origin. This is provenance reachability,
+    /// not an inferred source call-graph metric.
     pub reachable_declarations: u64,
     pub monomorphized_instantiations: u64,
     pub resolved_interface_calls: u64,
@@ -687,9 +812,14 @@ pub struct SemanticWir {
     pub devices: Vec<DeviceInstance>,
     pub pools: Vec<PoolInstance>,
     pub regions: Vec<RegionRecord>,
+    pub activations: Vec<ActivationPlan>,
     pub scopes: Vec<ScopePlan>,
     pub proofs: Vec<ProofRecord>,
     pub tests: Vec<TestEntry>,
+    /// Exact group selected from the sealed test plan for this compilation.
+    /// This is `None` for ordinary image builds and preserves the complete
+    /// plan-scoped identity for both generated and declared test images.
+    pub compiled_test_group: Option<FullImageTestGroup>,
     pub startup_order: Vec<ImageOwner>,
     pub shutdown_order: Vec<ImageOwner>,
     pub image_entry: FunctionId,
@@ -697,13 +827,91 @@ pub struct SemanticWir {
     pub peak_bytes: u64,
 }
 
+/// Finite policy for independently validating an untrusted SemanticWir model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidationLimits {
+    /// Maximum records in any one dense arena.
+    pub arena_records: u64,
+    /// Maximum aggregate vector elements and recursively visited model nodes.
+    pub model_edges: u64,
+    /// Maximum aggregate retained UTF-8 and byte-string payload.
+    pub payload_bytes: u64,
+    /// Conservative upper bound for validation work.
+    pub validation_work: u64,
+    /// Maximum constant and structured-region nesting.
+    pub nesting: u32,
+    /// Maximum number of validation errors retained in memory.
+    pub errors: u32,
+}
+
+impl ValidationLimits {
+    #[must_use]
+    pub const fn standard() -> Self {
+        Self {
+            arena_records: 256_000_000,
+            model_edges: 1_000_000_000,
+            payload_bytes: 4 * 1024 * 1024 * 1024,
+            validation_work: 1_100_000_000_000,
+            nesting: 1024,
+            errors: 100_000,
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        self.arena_records > 0
+            && self.arena_records <= u64::from(u32::MAX)
+            && self.model_edges > 0
+            && self.payload_bytes > 0
+            && self.validation_work > 0
+            && self.nesting > 0
+            && self.nesting <= 1024
+            && self.errors > 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationFailure {
+    InvalidLimits,
+    Cancelled,
+    ResourceLimit { resource: &'static str, limit: u64 },
+    Invalid(ValidationErrors),
+}
+
 impl SemanticWir {
     pub fn validate(self) -> Result<ValidatedSemanticWir, ValidationErrors> {
-        let errors = validate_module(&self);
+        match self.validate_with_limits(ValidationLimits::standard(), &|| false) {
+            Ok(wir) => Ok(wir),
+            Err(ValidationFailure::Invalid(errors)) => Err(errors),
+            Err(ValidationFailure::InvalidLimits) => {
+                Err(ValidationErrors(vec![ValidationError::InvalidLimits]))
+            }
+            Err(ValidationFailure::Cancelled) => {
+                Err(ValidationErrors(vec![ValidationError::Cancelled]))
+            }
+            Err(ValidationFailure::ResourceLimit { resource, limit }) => {
+                Err(ValidationErrors(vec![ValidationError::ResourceLimit {
+                    resource,
+                    limit,
+                }]))
+            }
+        }
+    }
+
+    /// Validate under an explicit finite resource policy and cancellation hook.
+    pub fn validate_with_limits(
+        self,
+        limits: ValidationLimits,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<ValidatedSemanticWir, ValidationFailure> {
+        if !limits.is_valid() {
+            return Err(ValidationFailure::InvalidLimits);
+        }
+        validate_model_resources(&self, limits, is_cancelled)?;
+        let errors = validate_module(&self, limits.errors, is_cancelled)?;
         if errors.is_empty() {
             Ok(ValidatedSemanticWir(self))
         } else {
-            Err(ValidationErrors(errors))
+            Err(ValidationFailure::Invalid(ValidationErrors(errors)))
         }
     }
 }
@@ -723,8 +931,611 @@ impl ValidatedSemanticWir {
     }
 }
 
-fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
+struct ResourceMeter<'a> {
+    limits: ValidationLimits,
+    edges: u64,
+    payload_bytes: u64,
+    is_cancelled: &'a dyn Fn() -> bool,
+}
+
+impl<'a> ResourceMeter<'a> {
+    fn new(limits: ValidationLimits, is_cancelled: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            limits,
+            edges: 0,
+            payload_bytes: 0,
+            is_cancelled,
+        }
+    }
+
+    fn poll(&self) -> Result<(), ValidationFailure> {
+        if (self.is_cancelled)() {
+            Err(ValidationFailure::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn arena(&mut self, resource: &'static str, length: usize) -> Result<(), ValidationFailure> {
+        self.poll()?;
+        let length = u64::try_from(length).map_err(|_| ValidationFailure::ResourceLimit {
+            resource,
+            limit: self.limits.arena_records,
+        })?;
+        if length > self.limits.arena_records {
+            return Err(ValidationFailure::ResourceLimit {
+                resource,
+                limit: self.limits.arena_records,
+            });
+        }
+        self.edges(length)
+    }
+
+    fn edge_slice<T>(&mut self, values: &[T]) -> Result<(), ValidationFailure> {
+        let length = u64::try_from(values.len()).map_err(|_| ValidationFailure::ResourceLimit {
+            resource: "model edges",
+            limit: self.limits.model_edges,
+        })?;
+        self.edges(length)
+    }
+
+    fn edges(&mut self, amount: u64) -> Result<(), ValidationFailure> {
+        self.poll()?;
+        self.edges = self
+            .edges
+            .checked_add(amount)
+            .ok_or(ValidationFailure::ResourceLimit {
+                resource: "model edges",
+                limit: self.limits.model_edges,
+            })?;
+        if self.edges > self.limits.model_edges {
+            return Err(ValidationFailure::ResourceLimit {
+                resource: "model edges",
+                limit: self.limits.model_edges,
+            });
+        }
+        Ok(())
+    }
+
+    fn payload(&mut self, length: usize) -> Result<(), ValidationFailure> {
+        self.poll()?;
+        let length = u64::try_from(length).map_err(|_| ValidationFailure::ResourceLimit {
+            resource: "payload bytes",
+            limit: self.limits.payload_bytes,
+        })?;
+        self.payload_bytes =
+            self.payload_bytes
+                .checked_add(length)
+                .ok_or(ValidationFailure::ResourceLimit {
+                    resource: "payload bytes",
+                    limit: self.limits.payload_bytes,
+                })?;
+        if self.payload_bytes > self.limits.payload_bytes {
+            return Err(ValidationFailure::ResourceLimit {
+                resource: "payload bytes",
+                limit: self.limits.payload_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    fn text(&mut self, value: &str) -> Result<(), ValidationFailure> {
+        self.payload(value.len())
+    }
+
+    fn depth(&self, depth: u32) -> Result<(), ValidationFailure> {
+        self.poll()?;
+        if depth > self.limits.nesting {
+            Err(ValidationFailure::ResourceLimit {
+                resource: "model nesting",
+                limit: u64::from(self.limits.nesting),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn finish(&self) -> Result<(), ValidationFailure> {
+        self.poll()?;
+        let multiplier = u64::from(self.limits.nesting).checked_add(64).ok_or(
+            ValidationFailure::ResourceLimit {
+                resource: "validation work",
+                limit: self.limits.validation_work,
+            },
+        )?;
+        let work = self
+            .edges
+            .checked_mul(multiplier)
+            .ok_or(ValidationFailure::ResourceLimit {
+                resource: "validation work",
+                limit: self.limits.validation_work,
+            })?;
+        if work > self.limits.validation_work {
+            Err(ValidationFailure::ResourceLimit {
+                resource: "validation work",
+                limit: self.limits.validation_work,
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn try_push_scratch<T>(values: &mut Vec<T>, value: T, limit: u64) -> Result<(), ValidationFailure> {
+    if u64::try_from(values.len()).map_or(true, |length| length >= limit) {
+        return Err(ValidationFailure::ResourceLimit {
+            resource: "validation scratch entries",
+            limit,
+        });
+    }
+    values
+        .try_reserve(1)
+        .map_err(|_| ValidationFailure::ResourceLimit {
+            resource: "validation scratch entries",
+            limit,
+        })?;
+    values.push(value);
+    Ok(())
+}
+
+fn validate_model_resources(
+    module: &SemanticWir,
+    limits: ValidationLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), ValidationFailure> {
+    let mut meter = ResourceMeter::new(limits, is_cancelled);
+    meter.text(&module.name)?;
+    meter.arena("types", module.types.len())?;
+    meter.arena("globals", module.globals.len())?;
+    meter.arena("functions", module.functions.len())?;
+    meter.arena("actors", module.actors.len())?;
+    meter.arena("tasks", module.tasks.len())?;
+    meter.arena("devices", module.devices.len())?;
+    meter.arena("pools", module.pools.len())?;
+    meter.arena("regions", module.regions.len())?;
+    meter.arena("activations", module.activations.len())?;
+    meter.arena("scopes", module.scopes.len())?;
+    meter.arena("proofs", module.proofs.len())?;
+    meter.arena("tests", module.tests.len())?;
+    if let Some(group) = &module.compiled_test_group {
+        meter.edge_slice(&group.tests)?;
+        meter.text(&group.name)?;
+        match &group.root {
+            wrela_test_model::ImageRoot::GeneratedHarness { harness_name } => {
+                meter.text(harness_name)?;
+            }
+            wrela_test_model::ImageRoot::Declared { image_name, .. } => {
+                meter.text(image_name)?;
+            }
+        }
+        for test in &group.tests {
+            meter.text(&test.descriptor.name)?;
+        }
+    }
+    meter.edge_slice(&module.startup_order)?;
+    meter.edge_slice(&module.shutdown_order)?;
+
+    for ty in &module.types {
+        meter.poll()?;
+        meter.text(&ty.source_name)?;
+        match &ty.kind {
+            TypeKind::Tuple(items) => meter.edge_slice(items)?,
+            TypeKind::Struct { fields } => {
+                meter.edge_slice(fields)?;
+                for field in fields {
+                    meter.text(&field.name)?;
+                }
+            }
+            TypeKind::Enum { variants } => {
+                meter.edge_slice(variants)?;
+                for variant in variants {
+                    meter.text(&variant.name)?;
+                    meter.edge_slice(&variant.fields)?;
+                    for field in &variant.fields {
+                        meter.text(&field.name)?;
+                    }
+                }
+            }
+            TypeKind::Function(function) => meter.edge_slice(&function.parameters)?,
+            TypeKind::OpaqueTarget { name } => meter.text(name)?,
+            TypeKind::Primitive(_)
+            | TypeKind::Array { .. }
+            | TypeKind::Iso { .. }
+            | TypeKind::ActorHandle { .. }
+            | TypeKind::Reservation
+            | TypeKind::Receipt { .. }
+            | TypeKind::DmaPayload { .. }
+            | TypeKind::DmaShared { .. }
+            | TypeKind::Mmio { .. }
+            | TypeKind::Validated { .. } => {}
+        }
+    }
+
+    let mut constants = Vec::new();
+    for global in &module.globals {
+        meter.poll()?;
+        meter.text(&global.name)?;
+        try_push_scratch(
+            &mut constants,
+            (&global.initializer, 1_u32),
+            limits.model_edges,
+        )?;
+    }
+    for function in &module.functions {
+        meter.poll()?;
+        meter.text(&function.name)?;
+        meter.edge_slice(&function.parameters)?;
+        meter.arena("function values", function.values.len())?;
+        meter.edge_slice(&function.proofs)?;
+        for value in &function.values {
+            meter.poll()?;
+            if let Some(name) = &value.name {
+                meter.text(name)?;
+            }
+        }
+        let mut regions = Vec::new();
+        try_push_scratch(&mut regions, (&function.body, 1_u32), limits.model_edges)?;
+        while let Some((region, depth)) = regions.pop() {
+            meter.depth(depth)?;
+            meter.edges(1)?;
+            meter.edge_slice(&region.parameters)?;
+            meter.edge_slice(&region.statements)?;
+            for statement in &region.statements {
+                meter.poll()?;
+                match statement {
+                    SemanticStatement::Let(statement) => {
+                        meter.edge_slice(&statement.results)?;
+                        match &statement.operation {
+                            SemanticOperation::Constant(value) => try_push_scratch(
+                                &mut constants,
+                                (value, 1_u32),
+                                limits.model_edges,
+                            )?,
+                            SemanticOperation::Aggregate { fields, .. } => {
+                                meter.edge_slice(fields)?
+                            }
+                            SemanticOperation::ConstructEnum { .. } => {}
+                            SemanticOperation::Call { arguments, .. }
+                            | SemanticOperation::ActorCommit { arguments, .. }
+                            | SemanticOperation::SpawnTask { arguments, .. } => {
+                                meter.edge_slice(arguments)?
+                            }
+                            SemanticOperation::Select { awaitables }
+                            | SemanticOperation::Race { awaitables }
+                            | SemanticOperation::QueuePublish {
+                                payloads: awaitables,
+                                ..
+                            } => meter.edge_slice(awaitables)?,
+                            SemanticOperation::Unary { .. }
+                            | SemanticOperation::Binary { .. }
+                            | SemanticOperation::Convert { .. }
+                            | SemanticOperation::Project { .. }
+                            | SemanticOperation::Index { .. }
+                            | SemanticOperation::BeginAccess { .. }
+                            | SemanticOperation::EndAccess { .. }
+                            | SemanticOperation::Move { .. }
+                            | SemanticOperation::Copy { .. }
+                            | SemanticOperation::Drop { .. }
+                            | SemanticOperation::ActorReserve { .. }
+                            | SemanticOperation::MailboxReceive { .. }
+                            | SemanticOperation::ActorSend { .. }
+                            | SemanticOperation::ActorTrySend { .. }
+                            | SemanticOperation::Await { .. }
+                            | SemanticOperation::Cancel { .. }
+                            | SemanticOperation::Checkpoint { .. }
+                            | SemanticOperation::Allocate { .. }
+                            | SemanticOperation::ResetRegion { .. }
+                            | SemanticOperation::Promote { .. }
+                            | SemanticOperation::EnterScope { .. }
+                            | SemanticOperation::CommitScope { .. }
+                            | SemanticOperation::AbortScope { .. }
+                            | SemanticOperation::ExitScope { .. }
+                            | SemanticOperation::DmaTransition { .. }
+                            | SemanticOperation::MmioRead { .. }
+                            | SemanticOperation::MmioWrite { .. }
+                            | SemanticOperation::InterruptPublish { .. }
+                            | SemanticOperation::QueueReserve { .. }
+                            | SemanticOperation::Check { .. }
+                            | SemanticOperation::RecordEvent { .. }
+                            | SemanticOperation::TestEmit { .. }
+                            | SemanticOperation::TestFinish { .. } => {}
+                            SemanticOperation::Assert { failure, .. } => {
+                                meter.text(&failure.expression)?;
+                                if let Some(message) = &failure.message {
+                                    meter.text(message)?;
+                                }
+                            }
+                        }
+                    }
+                    SemanticStatement::If {
+                        then_region,
+                        else_region,
+                        results,
+                        ..
+                    } => {
+                        meter.edge_slice(results)?;
+                        let next =
+                            depth
+                                .checked_add(1)
+                                .ok_or(ValidationFailure::ResourceLimit {
+                                    resource: "model nesting",
+                                    limit: u64::from(limits.nesting),
+                                })?;
+                        try_push_scratch(&mut regions, (then_region, next), limits.model_edges)?;
+                        try_push_scratch(&mut regions, (else_region, next), limits.model_edges)?;
+                    }
+                    SemanticStatement::Match { arms, results, .. } => {
+                        meter.edge_slice(arms)?;
+                        meter.edge_slice(results)?;
+                        let next =
+                            depth
+                                .checked_add(1)
+                                .ok_or(ValidationFailure::ResourceLimit {
+                                    resource: "model nesting",
+                                    limit: u64::from(limits.nesting),
+                                })?;
+                        for arm in arms {
+                            meter.edge_slice(&arm.bindings)?;
+                            try_push_scratch(&mut regions, (&arm.body, next), limits.model_edges)?;
+                        }
+                    }
+                    SemanticStatement::Loop { body, carried, .. } => {
+                        meter.edge_slice(carried)?;
+                        let next =
+                            depth
+                                .checked_add(1)
+                                .ok_or(ValidationFailure::ResourceLimit {
+                                    resource: "model nesting",
+                                    limit: u64::from(limits.nesting),
+                                })?;
+                        try_push_scratch(&mut regions, (body, next), limits.model_edges)?;
+                    }
+                    SemanticStatement::Return(values)
+                    | SemanticStatement::Yield(values)
+                    | SemanticStatement::Break(values)
+                    | SemanticStatement::Continue(values) => meter.edge_slice(values)?,
+                    SemanticStatement::Unreachable => {}
+                }
+            }
+        }
+    }
+
+    while let Some((constant, depth)) = constants.pop() {
+        meter.depth(depth)?;
+        meter.edges(1)?;
+        match constant {
+            Constant::Bytes(bytes) => meter.payload(bytes.len())?,
+            Constant::String(value) => meter.text(value)?,
+            Constant::Enum { fields, .. } | Constant::Aggregate(fields) => {
+                meter.edge_slice(fields)?;
+                let next = depth
+                    .checked_add(1)
+                    .ok_or(ValidationFailure::ResourceLimit {
+                        resource: "model nesting",
+                        limit: u64::from(limits.nesting),
+                    })?;
+                for field in fields {
+                    try_push_scratch(&mut constants, (field, next), limits.model_edges)?;
+                }
+            }
+            Constant::Unit
+            | Constant::Bool(_)
+            | Constant::Unsigned { .. }
+            | Constant::Signed { .. }
+            | Constant::Float32(_)
+            | Constant::Float64(_)
+            | Constant::Char(_)
+            | Constant::Zeroed(_) => {}
+        }
+    }
+
+    for actor in &module.actors {
+        meter.text(&actor.name)?;
+        meter.edge_slice(&actor.message_types)?;
+        meter.edge_slice(&actor.turn_functions)?;
+    }
+    for task in &module.tasks {
+        meter.text(&task.name)?;
+    }
+    for device in &module.devices {
+        meter.text(&device.name)?;
+        meter.text(&device.target_binding)?;
+        meter.edge_slice(&device.required_features)?;
+        meter.edge_slice(&device.optional_features)?;
+        meter.edge_slice(&device.interrupt_functions)?;
+        for feature in device
+            .required_features
+            .iter()
+            .chain(&device.optional_features)
+        {
+            meter.text(feature)?;
+        }
+    }
+    for pool in &module.pools {
+        meter.text(&pool.name)?;
+        meter.edge_slice(&pool.reachable_devices)?;
+    }
+    for region in &module.regions {
+        meter.text(&region.name)?;
+    }
+    for _activation in &module.activations {
+        meter.poll()?;
+    }
+    for scope in &module.scopes {
+        meter.text(&scope.name)?;
+        meter.edge_slice(&scope.dependencies)?;
+    }
+    for proof in &module.proofs {
+        meter.text(&proof.subject)?;
+        meter.edge_slice(&proof.sources)?;
+        meter.edge_slice(&proof.depends_on)?;
+        meter.edge_slice(&proof.explanation)?;
+        for line in &proof.explanation {
+            meter.text(line)?;
+        }
+    }
+    for test in &module.tests {
+        meter.text(&test.name)?;
+    }
+    meter.finish()
+}
+
+struct ValidationErrorSink<'a> {
+    errors: Vec<ValidationError>,
+    limit: u32,
+    truncated: bool,
+    allocation_failed: bool,
+    is_cancelled: &'a dyn Fn() -> bool,
+    cancelled: bool,
+}
+
+impl<'a> ValidationErrorSink<'a> {
+    fn new(limit: u32, is_cancelled: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            errors: Vec::new(),
+            limit,
+            truncated: false,
+            allocation_failed: false,
+            is_cancelled,
+            cancelled: false,
+        }
+    }
+
+    fn poll(&mut self) -> bool {
+        if !self.cancelled && (self.is_cancelled)() {
+            self.cancelled = true;
+        }
+        self.cancelled
+    }
+
+    fn push(&mut self, error: ValidationError) {
+        if self.poll() {
+            return;
+        }
+        if self.errors.len() >= self.limit as usize {
+            self.truncated = true;
+            return;
+        }
+        if self.errors.try_reserve(1).is_err() {
+            self.allocation_failed = true;
+            return;
+        }
+        self.errors.push(error);
+    }
+
+    fn scratch_allocation_failed(&mut self) {
+        self.allocation_failed = true;
+    }
+
+    fn finish(mut self) -> Result<Vec<ValidationError>, ValidationFailure> {
+        if self.cancelled || (self.is_cancelled)() {
+            return Err(ValidationFailure::Cancelled);
+        }
+        if self.allocation_failed {
+            return Err(ValidationFailure::ResourceLimit {
+                resource: "validation scratch memory",
+                limit: self.limit.into(),
+            });
+        }
+        if self.truncated {
+            let marker = ValidationError::TooManyErrors { limit: self.limit };
+            if let Some(last) = self.errors.last_mut() {
+                *last = marker;
+            } else if self.errors.try_reserve(1).is_ok() {
+                self.errors.push(marker);
+            } else {
+                return Err(ValidationFailure::ResourceLimit {
+                    resource: "validation error storage",
+                    limit: self.limit.into(),
+                });
+            }
+        }
+        Ok(self.errors)
+    }
+}
+
+fn sort_validation_scratch<T: Copy + Ord>(
+    values: &mut [T],
+    errors: &mut ValidationErrorSink<'_>,
+) -> bool {
+    let Some(first) = values.first().copied() else {
+        return !errors.poll();
+    };
+    let mut buffer = Vec::new();
+    if buffer.try_reserve_exact(values.len()).is_err() {
+        errors.scratch_allocation_failed();
+        return false;
+    }
+    buffer.resize(values.len(), first);
+    let mut width = 1_usize;
+    let mut source_is_values = true;
+    while width < values.len() {
+        let completed = if source_is_values {
+            merge_validation_sort_pass(values, &mut buffer, width, errors)
+        } else {
+            merge_validation_sort_pass(&buffer, values, width, errors)
+        };
+        if !completed {
+            return false;
+        }
+        source_is_values = !source_is_values;
+        width = match width.checked_mul(2) {
+            Some(next) => next,
+            None => values.len(),
+        };
+    }
+    if !source_is_values {
+        for (destination, source) in values.iter_mut().zip(buffer) {
+            if errors.poll() {
+                return false;
+            }
+            *destination = source;
+        }
+    }
+    true
+}
+
+fn merge_validation_sort_pass<T: Copy + Ord>(
+    source: &[T],
+    destination: &mut [T],
+    width: usize,
+    errors: &mut ValidationErrorSink<'_>,
+) -> bool {
+    let mut start = 0_usize;
+    while start < source.len() {
+        let middle = match start.checked_add(width) {
+            Some(value) => value.min(source.len()),
+            None => source.len(),
+        };
+        let end = match middle.checked_add(width) {
+            Some(value) => value.min(source.len()),
+            None => source.len(),
+        };
+        let (mut left, mut right) = (start, middle);
+        for output in &mut destination[start..end] {
+            if errors.poll() {
+                return false;
+            }
+            let take_left = right >= end || left < middle && source[left] <= source[right];
+            if take_left {
+                *output = source[left];
+                left += 1;
+            } else {
+                *output = source[right];
+                right += 1;
+            }
+        }
+        start = end;
+    }
+    true
+}
+
+fn validate_module(
+    module: &SemanticWir,
+    error_limit: u32,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<ValidationError>, ValidationFailure> {
+    let mut errors = ValidationErrorSink::new(error_limit, is_cancelled);
     if module.version != SEMANTIC_WIR_VERSION {
         errors.push(ValidationError::UnsupportedVersion(module.version));
     }
@@ -772,6 +1583,11 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
         &mut errors,
     );
     check_dense(
+        "activation",
+        module.activations.iter().map(|item| item.id.0),
+        &mut errors,
+    );
+    check_dense(
         "scope",
         module.scopes.iter().map(|item| item.id.0),
         &mut errors,
@@ -788,42 +1604,68 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
     );
 
     for ty in &module.types {
+        if errors.poll() {
+            break;
+        }
         validate_type(module, ty, &mut errors);
     }
     for global in &module.globals {
+        if errors.poll() {
+            break;
+        }
         require_id("global type", global.ty.0, module.types.len(), &mut errors);
         validate_constant(module, &global.initializer, &mut errors);
         validate_owner(module, global.owner, &mut errors);
     }
-    for function in &module.functions {
-        validate_function(module, function, &mut errors);
-    }
-    let mut actor_turns = vec![Vec::new(); module.actors.len()];
-    let mut device_interrupts = vec![Vec::new(); module.devices.len()];
-    for function in &module.functions {
-        match function.role {
-            FunctionRole::ActorTurn(actor) => {
-                if let Some(turns) = actor_turns.get_mut(actor.0 as usize) {
-                    turns.push(function.id);
-                }
+    let mut instance_keys = Vec::new();
+    if instance_keys
+        .try_reserve_exact(module.functions.len())
+        .is_err()
+    {
+        errors.scratch_allocation_failed();
+    } else {
+        for function in &module.functions {
+            if errors.poll() {
+                break;
             }
-            FunctionRole::Isr(device) => {
-                if let Some(interrupts) = device_interrupts.get_mut(device.0 as usize) {
-                    interrupts.push(function.id);
+            instance_keys.push((function.instance_key, function.id));
+        }
+        if sort_validation_scratch(&mut instance_keys, &mut errors) {
+            let mut prior = None;
+            for (key, function) in &instance_keys {
+                if errors.poll() {
+                    break;
                 }
+                if prior == Some(*key) {
+                    errors.push(ValidationError::InvalidRecord {
+                        kind: "function instance key",
+                        id: function.0,
+                    });
+                }
+                prior = Some(*key);
             }
-            FunctionRole::Ordinary
-            | FunctionRole::TaskEntry(_)
-            | FunctionRole::Cleanup
-            | FunctionRole::ImageEntry
-            | FunctionRole::Test => {}
         }
     }
+    for function in &module.functions {
+        if errors.poll() {
+            break;
+        }
+        validate_function(module, function, &mut errors);
+    }
     for actor in &module.actors {
+        if errors.poll() {
+            break;
+        }
         require_id("actor type", actor.ty.0, module.types.len(), &mut errors);
         for ty in &actor.message_types {
             require_id("actor message type", ty.0, module.types.len(), &mut errors);
         }
+        require_canonical_ids(
+            "actor message types",
+            actor.id.0,
+            actor.message_types.iter().map(|id| id.0),
+            &mut errors,
+        );
         for function in &actor.turn_functions {
             require_id(
                 "actor turn function",
@@ -831,6 +1673,16 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
                 module.functions.len(),
                 &mut errors,
             );
+            if module
+                .functions
+                .get(function.0 as usize)
+                .is_some_and(|function| function.role != FunctionRole::ActorTurn(actor.id))
+            {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "actor turn role",
+                    id: actor.id.0,
+                });
+            }
         }
         require_canonical_ids(
             "actor turn functions",
@@ -838,15 +1690,6 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
             actor.turn_functions.iter().map(|id| id.0),
             &mut errors,
         );
-        if actor_turns
-            .get(actor.id.0 as usize)
-            .is_none_or(|turns| actor.turn_functions != *turns)
-        {
-            errors.push(ValidationError::InvalidRecord {
-                kind: "actor turn set",
-                id: actor.id.0,
-            });
-        }
         if let Some(supervisor) = actor.supervisor {
             require_id(
                 "actor supervisor",
@@ -857,6 +1700,9 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
         }
     }
     for task in &module.tasks {
+        if errors.poll() {
+            break;
+        }
         require_id(
             "task entry",
             task.entry.0,
@@ -883,6 +1729,9 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
         }
     }
     for device in &module.devices {
+        if errors.poll() {
+            break;
+        }
         if device.name.trim().is_empty()
             || device.target_binding.trim().is_empty()
             || device.reset_timeout_ns == 0
@@ -912,6 +1761,16 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
                 module.functions.len(),
                 &mut errors,
             );
+            if module
+                .functions
+                .get(function.0 as usize)
+                .is_some_and(|function| function.role != FunctionRole::Isr(device.id))
+            {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "device interrupt role",
+                    id: device.id.0,
+                });
+            }
         }
         require_canonical_ids(
             "device interrupt functions",
@@ -919,17 +1778,44 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
             device.interrupt_functions.iter().map(|id| id.0),
             &mut errors,
         );
-        if device_interrupts
-            .get(device.id.0 as usize)
-            .is_none_or(|interrupts| device.interrupt_functions != *interrupts)
-        {
+    }
+    for function in &module.functions {
+        if errors.poll() {
+            break;
+        }
+        let listed = match function.role {
+            FunctionRole::ActorTurn(actor) => module
+                .actors
+                .get(actor.0 as usize)
+                .is_some_and(|record| record.turn_functions.binary_search(&function.id).is_ok()),
+            FunctionRole::Isr(device) => {
+                module.devices.get(device.0 as usize).is_some_and(|record| {
+                    record
+                        .interrupt_functions
+                        .binary_search(&function.id)
+                        .is_ok()
+                })
+            }
+            FunctionRole::TaskEntry(task) => module
+                .tasks
+                .get(task.0 as usize)
+                .is_some_and(|record| record.entry == function.id),
+            FunctionRole::Ordinary
+            | FunctionRole::Cleanup
+            | FunctionRole::ImageEntry
+            | FunctionRole::Test => true,
+        };
+        if !listed {
             errors.push(ValidationError::InvalidRecord {
-                kind: "device interrupt set",
-                id: device.id.0,
+                kind: "function role graph relation",
+                id: function.id.0,
             });
         }
     }
     for pool in &module.pools {
+        if errors.poll() {
+            break;
+        }
         require_id(
             "pool payload",
             pool.payload.0,
@@ -947,6 +1833,9 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
         );
     }
     for region in &module.regions {
+        if errors.poll() {
+            break;
+        }
         validate_owner(module, region.owner, &mut errors);
         require_id(
             "region proof",
@@ -957,6 +1846,7 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
         if region.name.trim().is_empty()
             || region.capacity_bytes == 0
             || !region.alignment.is_power_of_two()
+            || !valid_span(module, region.source)
         {
             errors.push(ValidationError::InvalidRecord {
                 kind: "region",
@@ -967,7 +1857,12 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
             require_id("region pool", pool.0, module.pools.len(), &mut errors);
         }
     }
+    validate_activation_plans(module, &mut errors);
+    validate_actor_capacity_contract(module, &mut errors);
     for scope in &module.scopes {
+        if errors.poll() {
+            break;
+        }
         require_id(
             "scope state type",
             scope.state_type.0,
@@ -1028,20 +1923,49 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
             scope.dependencies.iter().map(|id| id.0),
             &mut errors,
         );
+        if !valid_span(module, scope.source) {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "scope source",
+                id: scope.id.0,
+            });
+        }
     }
     validate_acyclic(
         "scope dependency",
         module.scopes.len(),
-        |index| {
-            module.scopes[index]
-                .dependencies
-                .iter()
-                .map(|id| id.0)
-                .collect()
-        },
+        |index| module.scopes[index].dependencies.as_slice(),
+        |id| id.0,
         &mut errors,
     );
     for proof in &module.proofs {
+        if errors.poll() {
+            break;
+        }
+        let mut invalid = proof.subject.trim().is_empty() || proof.explanation.is_empty();
+        for line in &proof.explanation {
+            if errors.poll() {
+                break;
+            }
+            invalid |= line.trim().is_empty();
+        }
+        for source in &proof.sources {
+            if errors.poll() {
+                break;
+            }
+            invalid |= !valid_span(module, *source);
+        }
+        for dependency in &proof.depends_on {
+            if errors.poll() {
+                break;
+            }
+            invalid |= dependency.0 >= proof.id.0;
+        }
+        if invalid {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "proof",
+                id: proof.id.0,
+            });
+        }
         for dependency in &proof.depends_on {
             require_id(
                 "proof dependency",
@@ -1060,23 +1984,21 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
     validate_acyclic(
         "proof dependency",
         module.proofs.len(),
-        |index| {
-            module.proofs[index]
-                .depends_on
-                .iter()
-                .map(|id| id.0)
-                .collect()
-        },
+        |index| module.proofs[index].depends_on.as_slice(),
+        |id| id.0,
         &mut errors,
     );
     for test in &module.tests {
+        if errors.poll() {
+            break;
+        }
         require_id(
             "test function",
             test.function.0,
             module.functions.len(),
             &mut errors,
         );
-        if test.name.trim().is_empty() || test.timeout_ns == 0 {
+        if test.name.trim().is_empty() || test.timeout_ns == 0 || !valid_span(module, test.source) {
             errors.push(ValidationError::InvalidRecord {
                 kind: "test",
                 id: test.id.0,
@@ -1093,40 +2015,82 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
             });
         }
     }
-    let role_tests: std::collections::BTreeSet<_> = module
-        .functions
-        .iter()
-        .filter(|function| function.role == FunctionRole::Test)
-        .map(|function| function.id)
-        .collect();
-    let listed_tests: std::collections::BTreeSet<_> =
-        module.tests.iter().map(|test| test.function).collect();
-    if role_tests != listed_tests || listed_tests.len() != module.tests.len() {
+    let mut listed_tests = Vec::new();
+    if listed_tests.try_reserve_exact(module.tests.len()).is_err() {
+        errors.scratch_allocation_failed();
+    } else {
+        for test in &module.tests {
+            if errors.poll() {
+                break;
+            }
+            listed_tests.push(test.function);
+        }
+        if sort_validation_scratch(&mut listed_tests, &mut errors) {
+            let mut prior = None;
+            for function in &listed_tests {
+                if errors.poll() {
+                    break;
+                }
+                if prior == Some(*function) {
+                    errors.push(ValidationError::InvalidRecord {
+                        kind: "test function set",
+                        id: 0,
+                    });
+                }
+                prior = Some(*function);
+            }
+        }
+        let mut missing_test = false;
+        for function in &module.functions {
+            if errors.poll() {
+                break;
+            }
+            missing_test |= function.role == FunctionRole::Test
+                && listed_tests.binary_search(&function.id).is_err();
+        }
+        if missing_test {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "test function set",
+                id: 0,
+            });
+        }
+    }
+    if !compiled_test_group_matches(module) {
         errors.push(ValidationError::InvalidRecord {
-            kind: "test function set",
-            id: 0,
+            kind: "compiled test-group binding",
+            id: module
+                .compiled_test_group
+                .as_ref()
+                .map_or(0, |group| group.id.0),
         });
     }
-    for owner in &module.startup_order {
-        validate_owner(module, *owner, &mut errors);
-    }
-    for owner in &module.shutdown_order {
-        validate_owner(module, *owner, &mut errors);
-    }
+    validate_image_order(module, &module.startup_order, "startup order", &mut errors);
+    validate_image_order(
+        module,
+        &module.shutdown_order,
+        "shutdown order",
+        &mut errors,
+    );
     if module.image_entry.0 as usize >= module.functions.len() {
         errors.push(ValidationError::UnknownImageEntry(module.image_entry));
-    } else if module.functions[module.image_entry.0 as usize].role != FunctionRole::ImageEntry
-        || module
-            .functions
-            .iter()
-            .filter(|function| function.role == FunctionRole::ImageEntry)
-            .count()
-            != 1
-    {
-        errors.push(ValidationError::InvalidRecord {
-            kind: "image entry role",
-            id: module.image_entry.0,
-        });
+    } else {
+        let mut image_entries = 0_u64;
+        for function in &module.functions {
+            if errors.poll() {
+                break;
+            }
+            if function.role == FunctionRole::ImageEntry {
+                image_entries = image_entries.saturating_add(1);
+            }
+        }
+        if module.functions[module.image_entry.0 as usize].role != FunctionRole::ImageEntry
+            || image_entries != 1
+        {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "image entry role",
+                id: module.image_entry.0,
+            });
+        }
     }
     if module.peak_bytes < module.static_bytes {
         errors.push(ValidationError::InvalidRecord {
@@ -1134,14 +2098,90 @@ fn validate_module(module: &SemanticWir) -> Vec<ValidationError> {
             id: 0,
         });
     }
-    errors
+    if module.source_summary.reachable_declarations
+        > u64::from(module.source_summary.hir_declarations)
+        || module.source_summary.monomorphized_instantiations
+            != u64::try_from(module.functions.len()).unwrap_or(u64::MAX)
+    {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "source summary",
+            id: 0,
+        });
+    }
+    errors.finish()
 }
 
-fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut Vec<ValidationError>) {
+fn compiled_test_group_matches(module: &SemanticWir) -> bool {
+    let entry = module.functions.get(module.image_entry.0 as usize);
+    let Some(group) = &module.compiled_test_group else {
+        return module.tests.is_empty()
+            && !matches!(
+                entry.map(|function| function.origin),
+                Some(FunctionOrigin::GeneratedTestHarness { .. })
+            );
+    };
+    if group.validate_compiled_binding().is_err() {
+        return false;
+    }
+    match &group.root {
+        wrela_test_model::ImageRoot::GeneratedHarness { harness_name } => {
+            if module.name != *harness_name
+                || !matches!(
+                    entry.map(|function| function.origin),
+                    Some(FunctionOrigin::GeneratedTestHarness { group: actual })
+                        if actual == group.id.0
+                )
+                || module.tests.len() != group.tests.len()
+            {
+                return false;
+            }
+            module
+                .tests
+                .iter()
+                .zip(&group.tests)
+                .all(|(local, planned)| {
+                    let wrela_test_model::ImageTestInvocation::GeneratedFunction { function_key } =
+                        planned.invocation
+                    else {
+                        return false;
+                    };
+                    local.plan_id == planned.descriptor.id.0
+                        && local.name == planned.descriptor.name
+                        && local.kind == TestKind::Integration
+                        && planned.descriptor.kind == wrela_test_model::TestKind::IntegrationImage
+                        && Some(local.source) == planned.descriptor.source
+                        && local.timeout_ns == planned.descriptor.timeout_ns
+                        && module
+                            .functions
+                            .get(local.function.0 as usize)
+                            .is_some_and(|function| function.instance_key == function_key.0)
+                })
+        }
+        wrela_test_model::ImageRoot::Declared { image_name, .. } => {
+            module.name == *image_name
+                && module.tests.is_empty()
+                && matches!(
+                    entry.map(|function| function.origin),
+                    Some(FunctionOrigin::GeneratedImageEntry { .. })
+                )
+        }
+    }
+}
+
+fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut ValidationErrorSink<'_>) {
+    if errors.poll() {
+        return;
+    }
     macro_rules! use_type {
         ($id:expr) => {
             require_id("type reference", ($id).0, module.types.len(), errors)
         };
+    }
+    if ty.source.is_some_and(|source| !valid_span(module, source)) {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "type source",
+            id: ty.id.0,
+        });
     }
     match &ty.kind {
         TypeKind::Primitive(_) | TypeKind::OpaqueTarget { .. } => {}
@@ -1160,6 +2200,51 @@ fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut Vec<Validat
             for field in variants.iter().flat_map(|variant| &variant.fields) {
                 use_type!(field.ty);
             }
+            let payload = variants
+                .first()
+                .and_then(|variant| match variant.fields.as_slice() {
+                    [field] => Some(field.ty),
+                    _ => None,
+                });
+            let canonical = !variants.is_empty()
+                && variants.len() <= 256
+                && ty.linearity == Linearity::ExplicitCopy
+                && payload.is_some_and(|payload| {
+                    module.types.get(payload.0 as usize).is_some_and(|record| {
+                        record.linearity == Linearity::CopyScalar
+                            && matches!(
+                                record.kind,
+                                TypeKind::Primitive(
+                                    PrimitiveType::Bool
+                                        | PrimitiveType::I8
+                                        | PrimitiveType::I16
+                                        | PrimitiveType::I32
+                                        | PrimitiveType::I64
+                                        | PrimitiveType::I128
+                                        | PrimitiveType::U8
+                                        | PrimitiveType::U16
+                                        | PrimitiveType::U32
+                                        | PrimitiveType::U64
+                                        | PrimitiveType::U128
+                                        | PrimitiveType::F32
+                                        | PrimitiveType::F64
+                                )
+                            )
+                    }) && variants.iter().enumerate().all(|(index, variant)| {
+                        !variant.name.is_empty()
+                            && !variants[..index]
+                                .iter()
+                                .any(|prior| prior.name == variant.name)
+                            && matches!(variant.fields.as_slice(), [field]
+                            if field.ty == payload && field.name.is_empty() && field.public)
+                    })
+                });
+            if !canonical {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "closed enum type",
+                    id: ty.id.0,
+                });
+            }
         }
         TypeKind::Function(function) => {
             for parameter in &function.parameters {
@@ -1172,6 +2257,7 @@ fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut Vec<Validat
             use_type!(*payload);
         }
         TypeKind::ActorHandle { actor_type } => use_type!(*actor_type),
+        TypeKind::Reservation => {}
         TypeKind::Receipt { payload, error } => {
             use_type!(*payload);
             use_type!(*error);
@@ -1188,27 +2274,49 @@ fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut Vec<Validat
     }
 }
 
-fn validate_constant(module: &SemanticWir, constant: &Constant, errors: &mut Vec<ValidationError>) {
-    match constant {
-        Constant::Enum { fields, .. } | Constant::Aggregate(fields) => {
-            for field in fields {
-                validate_constant(module, field, errors);
-            }
+fn validate_constant(
+    module: &SemanticWir,
+    constant: &Constant,
+    errors: &mut ValidationErrorSink<'_>,
+) {
+    let mut work = Vec::new();
+    if work.try_reserve(1).is_err() {
+        errors.scratch_allocation_failed();
+        return;
+    }
+    work.push(constant);
+    while let Some(constant) = work.pop() {
+        if errors.poll() {
+            return;
         }
-        Constant::Zeroed(ty) => require_id("constant type", ty.0, module.types.len(), errors),
-        Constant::Unit
-        | Constant::Bool(_)
-        | Constant::Unsigned { .. }
-        | Constant::Signed { .. }
-        | Constant::Float32(_)
-        | Constant::Float64(_)
-        | Constant::Char(_)
-        | Constant::Bytes(_)
-        | Constant::String(_) => {}
+        match constant {
+            Constant::Enum { fields, .. } | Constant::Aggregate(fields) => {
+                if work.try_reserve(fields.len()).is_err() {
+                    errors.scratch_allocation_failed();
+                    return;
+                }
+                work.extend(fields);
+            }
+            Constant::Zeroed(ty) => {
+                require_id("constant type", ty.0, module.types.len(), errors);
+            }
+            Constant::Unit
+            | Constant::Bool(_)
+            | Constant::Unsigned { .. }
+            | Constant::Signed { .. }
+            | Constant::Float32(_)
+            | Constant::Float64(_)
+            | Constant::Char(_)
+            | Constant::Bytes(_)
+            | Constant::String(_) => {}
+        }
     }
 }
 
-fn validate_owner(module: &SemanticWir, owner: ImageOwner, errors: &mut Vec<ValidationError>) {
+fn validate_owner(module: &SemanticWir, owner: ImageOwner, errors: &mut ValidationErrorSink<'_>) {
+    if errors.poll() {
+        return;
+    }
     match owner {
         ImageOwner::Runtime | ImageOwner::BakedArtifact(_) => {}
         ImageOwner::Actor(id) => require_id("owner actor", id.0, module.actors.len(), errors),
@@ -1218,13 +2326,625 @@ fn validate_owner(module: &SemanticWir, owner: ImageOwner, errors: &mut Vec<Vali
     }
 }
 
+fn validate_image_order(
+    module: &SemanticWir,
+    order: &[ImageOwner],
+    kind: &'static str,
+    errors: &mut ValidationErrorSink<'_>,
+) {
+    let expected = 1_usize
+        .checked_add(module.actors.len())
+        .and_then(|count| count.checked_add(module.tasks.len()))
+        .and_then(|count| count.checked_add(module.devices.len()))
+        .and_then(|count| count.checked_add(module.pools.len()));
+    let mut seen = Vec::new();
+    if seen.try_reserve_exact(order.len()).is_err() {
+        errors.scratch_allocation_failed();
+        return;
+    }
+    let mut valid = expected == Some(order.len());
+    for owner in order {
+        if errors.poll() {
+            return;
+        }
+        validate_owner(module, *owner, errors);
+        valid &= !matches!(*owner, ImageOwner::BakedArtifact(_));
+        seen.push(*owner);
+    }
+    if !sort_validation_scratch(&mut seen, errors) {
+        return;
+    }
+    let mut prior = None;
+    let mut has_runtime = false;
+    for owner in &seen {
+        if errors.poll() {
+            return;
+        }
+        valid &= prior != Some(*owner);
+        has_runtime |= *owner == ImageOwner::Runtime;
+        prior = Some(*owner);
+    }
+    valid &= has_runtime;
+    if !valid {
+        errors.push(ValidationError::InvalidRecord { kind, id: 0 });
+    }
+}
+
+fn validate_activation_plans(module: &SemanticWir, errors: &mut ValidationErrorSink<'_>) {
+    let mut uses = Vec::new();
+    if uses.try_reserve_exact(module.activations.len()).is_err() {
+        errors.scratch_allocation_failed();
+        return;
+    }
+    uses.resize(module.activations.len(), 0_u32);
+
+    let mut prior_key = None;
+    for plan in &module.activations {
+        if errors.poll() {
+            return;
+        }
+        require_id(
+            "activation caller",
+            plan.caller.0,
+            module.functions.len(),
+            errors,
+        );
+        require_id(
+            "activation callee",
+            plan.callee.0,
+            module.functions.len(),
+            errors,
+        );
+        require_id(
+            "activation region",
+            plan.region.0,
+            module.regions.len(),
+            errors,
+        );
+        require_id(
+            "activation capacity proof",
+            plan.capacity_proof.0,
+            module.proofs.len(),
+            errors,
+        );
+        let key = (
+            plan.caller.0,
+            plan.source.file.0,
+            plan.source.range.start,
+            plan.source.range.end,
+            plan.callee.0,
+        );
+        let canonical = prior_key.is_none_or(|prior| prior < key);
+        prior_key = Some(key);
+        let caller = module.functions.get(plan.caller.0 as usize);
+        let callee = module.functions.get(plan.callee.0 as usize);
+        let owner = caller.and_then(|function| match function.role {
+            FunctionRole::ActorTurn(actor) => Some(ImageOwner::Actor(actor)),
+            FunctionRole::TaskEntry(task)
+                if module
+                    .tasks
+                    .get(task.0 as usize)
+                    .is_some_and(|task| task.slots == 1) =>
+            {
+                Some(ImageOwner::Task(task))
+            }
+            FunctionRole::TaskEntry(_) => None,
+            FunctionRole::Ordinary
+            | FunctionRole::Isr(_)
+            | FunctionRole::Cleanup
+            | FunctionRole::ImageEntry
+            | FunctionRole::Test => None,
+        });
+        let region = module.regions.get(plan.region.0 as usize);
+        let proof = module.proofs.get(plan.capacity_proof.0 as usize);
+        let Some(region_name_matches) =
+            caller.zip(region).map_or(Some(false), |(caller, region)| {
+                polled_joined_name_matches(
+                    &region.name,
+                    &caller.name,
+                    ".async-activation-frame",
+                    errors,
+                )
+            })
+        else {
+            return;
+        };
+        let mut cleanup_proofs = callee
+            .into_iter()
+            .flat_map(|callee| callee.proofs.iter())
+            .filter(|proof| {
+                module
+                    .proofs
+                    .get(proof.0 as usize)
+                    .is_some_and(|record| record.kind == ProofKind::CleanupAcyclic)
+            });
+        let cleanup_proof = cleanup_proofs.next().copied();
+        let unique_cleanup = cleanup_proofs.next().is_none();
+        let capacity_bytes = plan.frame_bytes.checked_mul(u64::from(plan.maximum_live));
+        if !canonical
+            || plan.frame_bytes == 0
+            || plan.maximum_live != 1
+            || !valid_span(module, plan.source)
+            || caller.is_none_or(|function| {
+                function.color != FunctionColor::Async
+                    || function.proofs.binary_search(&plan.capacity_proof).is_err()
+            })
+            || callee.is_none_or(|function| {
+                function.color != FunctionColor::Async
+                    || function.role != FunctionRole::Ordinary
+                    || function.frame_bound.max(1) != plan.frame_bytes
+            })
+            || owner.is_none()
+            || region.is_none_or(|region| {
+                region.id != plan.region
+                    || !region_name_matches
+                    || region.class != RegionClass::TaskFrame
+                    || Some(region.capacity_bytes) != capacity_bytes
+                    || region.alignment != 8
+                    || Some(region.owner) != owner
+                    || region.proof != plan.capacity_proof
+                    || region.source != plan.source
+            })
+            || proof.is_none_or(|proof| {
+                proof.id != plan.capacity_proof
+                    || proof.kind != ProofKind::CapacityBound
+                    || proof.bound != Some(u64::from(plan.maximum_live))
+                    || proof.sources.as_slice() != [plan.source]
+                    || cleanup_proof.is_none()
+                    || !unique_cleanup
+                    || proof.depends_on.as_slice() != cleanup_proof.as_slice()
+            })
+        {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "activation plan",
+                id: plan.id.0,
+            });
+        }
+    }
+
+    for function in &module.functions {
+        if errors.poll() {
+            return;
+        }
+        let mut regions = Vec::new();
+        if regions.try_reserve(1).is_err() {
+            errors.scratch_allocation_failed();
+            return;
+        }
+        regions.push(&function.body);
+        while let Some(region) = regions.pop() {
+            for statement in &region.statements {
+                if errors.poll() {
+                    return;
+                }
+                match statement {
+                    SemanticStatement::Let(LetStatement {
+                        operation:
+                            SemanticOperation::Call {
+                                function: callee,
+                                activation,
+                                ..
+                            },
+                        source,
+                        ..
+                    }) => {
+                        let is_async = module
+                            .functions
+                            .get(callee.0 as usize)
+                            .is_some_and(|callee| callee.color == FunctionColor::Async);
+                        let valid = match (*activation, *source, is_async) {
+                            (Some(id), Some(source), true) => {
+                                module.activations.get(id.0 as usize).is_some_and(|plan| {
+                                    plan.id == id
+                                        && plan.caller == function.id
+                                        && plan.callee == *callee
+                                        && plan.source == source
+                                        && uses.get_mut(id.0 as usize).is_some_and(|count| {
+                                            *count = count.saturating_add(1);
+                                            true
+                                        })
+                                })
+                            }
+                            (None, _, false) => true,
+                            _ => false,
+                        };
+                        if !valid {
+                            errors.push(ValidationError::InvalidRecord {
+                                kind: "activation call binding",
+                                id: function.id.0,
+                            });
+                        }
+                    }
+                    SemanticStatement::If {
+                        then_region,
+                        else_region,
+                        ..
+                    } => {
+                        if regions.try_reserve(2).is_err() {
+                            errors.scratch_allocation_failed();
+                            return;
+                        }
+                        regions.push(else_region);
+                        regions.push(then_region);
+                    }
+                    SemanticStatement::Match { arms, .. } => {
+                        if regions.try_reserve(arms.len()).is_err() {
+                            errors.scratch_allocation_failed();
+                            return;
+                        }
+                        for arm in arms.iter().rev() {
+                            regions.push(&arm.body);
+                        }
+                    }
+                    SemanticStatement::Loop { body, .. } => {
+                        if regions.try_reserve(1).is_err() {
+                            errors.scratch_allocation_failed();
+                            return;
+                        }
+                        regions.push(body);
+                    }
+                    SemanticStatement::Let(_)
+                    | SemanticStatement::Return(_)
+                    | SemanticStatement::Yield(_)
+                    | SemanticStatement::Break(_)
+                    | SemanticStatement::Continue(_)
+                    | SemanticStatement::Unreachable => {}
+                }
+            }
+        }
+    }
+    for (index, uses) in uses.into_iter().enumerate() {
+        if uses != 1 {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "activation plan use",
+                id: u32::try_from(index).unwrap_or(u32::MAX),
+            });
+        }
+    }
+}
+
+fn polled_joined_name_matches(
+    joined: &str,
+    base: &str,
+    suffix: &str,
+    errors: &mut ValidationErrorSink<'_>,
+) -> Option<bool> {
+    let Some(prefix_bytes) = joined.len().checked_sub(suffix.len()) else {
+        return Some(false);
+    };
+    if prefix_bytes != base.len() {
+        return Some(false);
+    }
+    let (prefix, actual_suffix) = joined.as_bytes().split_at(prefix_bytes);
+    if actual_suffix != suffix.as_bytes() {
+        return Some(false);
+    }
+    for (actual, expected) in prefix.chunks(4096).zip(base.as_bytes().chunks(4096)) {
+        if errors.poll() {
+            return None;
+        }
+        if actual != expected {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut ValidationErrorSink<'_>) {
+    if module.actors.is_empty() {
+        if !module.tasks.is_empty() || !module.activations.is_empty() {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "actor capacity closure",
+                id: 0,
+            });
+        }
+        return;
+    }
+    let base_region_count = module
+        .actors
+        .len()
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(module.tasks.len()));
+    let expected_regions =
+        base_region_count.and_then(|count| count.checked_add(module.activations.len()));
+    let mut base_bytes = Some(0_u64);
+    let mut valid = expected_regions == Some(module.regions.len());
+    for (index, actor) in module.actors.iter().enumerate() {
+        if errors.poll() {
+            return;
+        }
+        let mailbox_index = index.checked_mul(2);
+        let turn_index = mailbox_index.and_then(|index| index.checked_add(1));
+        let mailbox = mailbox_index.and_then(|index| module.regions.get(index));
+        let turn = turn_index.and_then(|index| module.regions.get(index));
+        let mailbox_bytes = u64::from(actor.mailbox_capacity).checked_mul(16);
+        let mut turn_bytes = 1_u64;
+        for function in &actor.turn_functions {
+            if errors.poll() {
+                return;
+            }
+            let Some(function) = module.functions.get(function.0 as usize) else {
+                valid = false;
+                continue;
+            };
+            turn_bytes = turn_bytes.max(function.frame_bound.max(1));
+        }
+        let Some(mailbox_name_matches) = mailbox.map_or(Some(false), |region| {
+            polled_joined_name_matches(&region.name, &actor.name, ".mailbox", errors)
+        }) else {
+            return;
+        };
+        let Some(turn_name_matches) = turn.map_or(Some(false), |region| {
+            polled_joined_name_matches(&region.name, &actor.name, ".turn-frame", errors)
+        }) else {
+            return;
+        };
+        valid &= mailbox_bytes.is_some()
+            && mailbox.is_some_and(|region| {
+                mailbox_index
+                    .and_then(|index| u32::try_from(index).ok())
+                    .is_some_and(|index| region.id == RegionId(index))
+                    && mailbox_name_matches
+                    && region.class == RegionClass::Image
+                    && Some(region.capacity_bytes) == mailbox_bytes
+                    && region.alignment == 8
+                    && region.owner == ImageOwner::Actor(actor.id)
+                    && module
+                        .proofs
+                        .get(region.proof.0 as usize)
+                        .is_some_and(|proof| {
+                            proof.id == region.proof
+                                && proof.kind == ProofKind::CapacityBound
+                                && proof.bound == Some(u64::from(actor.mailbox_capacity))
+                                && proof.sources.len() == 1
+                                && proof.sources[0].file == region.source.file
+                                && proof.sources[0].range.start >= region.source.range.start
+                                && proof.sources[0].range.end <= region.source.range.end
+                        })
+            })
+            && turn.is_some_and(|region| {
+                turn_index
+                    .and_then(|index| u32::try_from(index).ok())
+                    .is_some_and(|index| region.id == RegionId(index))
+                    && turn_name_matches
+                    && region.class == RegionClass::TaskFrame
+                    && region.capacity_bytes == turn_bytes
+                    && region.alignment == 8
+                    && region.owner == ImageOwner::Actor(actor.id)
+                    && module
+                        .proofs
+                        .get(region.proof.0 as usize)
+                        .is_some_and(|proof| {
+                            proof.id == region.proof
+                                && proof.kind == ProofKind::CapacityBound
+                                && proof.bound == Some(1)
+                                && proof.sources.as_slice() == [region.source]
+                        })
+            });
+        base_bytes = base_bytes
+            .and_then(|bytes| mailbox_bytes.and_then(|mailbox| bytes.checked_add(mailbox)))
+            .and_then(|bytes| bytes.checked_add(turn_bytes));
+        valid &= base_bytes.is_some();
+    }
+    let task_start = module.actors.len().checked_mul(2);
+    for (index, task) in module.tasks.iter().enumerate() {
+        if errors.poll() {
+            return;
+        }
+        let frame = module
+            .functions
+            .get(task.entry.0 as usize)
+            .map(|function| function.frame_bound.max(1));
+        let bytes = frame.and_then(|frame| frame.checked_mul(u64::from(task.slots)));
+        let region_index = task_start.and_then(|start| start.checked_add(index));
+        let region = region_index.and_then(|index| module.regions.get(index));
+        let Some(region_name_matches) = region.map_or(Some(false), |region| {
+            polled_joined_name_matches(&region.name, &task.name, ".frame", errors)
+        }) else {
+            return;
+        };
+        valid &= bytes.is_some()
+            && region.is_some_and(|region| {
+                region_index
+                    .and_then(|index| u32::try_from(index).ok())
+                    .is_some_and(|index| region.id == RegionId(index))
+                    && region_name_matches
+                    && region.class == RegionClass::TaskFrame
+                    && Some(region.capacity_bytes) == bytes
+                    && region.alignment == 8
+                    && region.owner == ImageOwner::Task(task.id)
+                    && module
+                        .proofs
+                        .get(region.proof.0 as usize)
+                        .is_some_and(|proof| {
+                            proof.id == region.proof
+                                && proof.kind == ProofKind::CapacityBound
+                                && proof.bound == Some(u64::from(task.slots))
+                                && proof.sources.as_slice() == [region.source]
+                        })
+            });
+        base_bytes = base_bytes.and_then(|total| bytes.and_then(|bytes| total.checked_add(bytes)));
+        valid &= base_bytes.is_some();
+    }
+    let mut activation_bytes = Some(0_u64);
+    for (index, plan) in module.activations.iter().enumerate() {
+        if errors.poll() {
+            return;
+        }
+        let expected_region = base_region_count
+            .and_then(|start| start.checked_add(index))
+            .and_then(|index| u32::try_from(index).ok())
+            .map(RegionId);
+        valid &= expected_region == Some(plan.region);
+        let bytes = plan.frame_bytes.checked_mul(u64::from(plan.maximum_live));
+        activation_bytes =
+            activation_bytes.and_then(|total| bytes.and_then(|bytes| total.checked_add(bytes)));
+        valid &= activation_bytes.is_some();
+    }
+    let total = base_bytes
+        .and_then(|base| activation_bytes.and_then(|activation| base.checked_add(activation)));
+    valid &= total == Some(module.static_bytes) && total == Some(module.peak_bytes);
+    let mut wait_proof = None;
+    let mut final_proof = None;
+    for proof in &module.proofs {
+        if errors.poll() {
+            return;
+        }
+        match proof.kind {
+            ProofKind::WaitGraphAcyclic => {
+                valid &= wait_proof.is_none();
+                wait_proof = Some(proof.id);
+            }
+            ProofKind::ImageClosed => {
+                valid &= final_proof.is_none();
+                final_proof = Some(proof);
+            }
+            _ => {}
+        }
+    }
+    valid &= module
+        .proofs
+        .first()
+        .is_some_and(|proof| proof.id == ProofId(0) && proof.kind == ProofKind::TypeChecked)
+        && module
+            .proofs
+            .get(1)
+            .is_some_and(|proof| proof.id == ProofId(1) && proof.kind == ProofKind::EffectsAllowed)
+        && wait_proof.is_some();
+    let Some(final_proof) = final_proof else {
+        valid = false;
+        if !valid {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "actor capacity closure",
+                id: 0,
+            });
+        }
+        return;
+    };
+    valid &= final_proof.bound == total;
+    let base_proof = if module.activations.is_empty() {
+        Some(final_proof)
+    } else {
+        valid &= final_proof.depends_on.len() == module.activations.len().saturating_add(1);
+        final_proof
+            .depends_on
+            .first()
+            .and_then(|id| module.proofs.get(id.0 as usize))
+            .filter(|proof| proof.kind == ProofKind::CapacityBound && proof.bound == base_bytes)
+    };
+    valid &= base_proof.is_some();
+    if let (Some(base_proof), Some(wait_proof), Some(base_region_count)) =
+        (base_proof, wait_proof, base_region_count)
+    {
+        let Some(expected_dependencies) = base_region_count.checked_add(3) else {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "actor capacity closure",
+                id: 0,
+            });
+            return;
+        };
+        let mut expected = Vec::new();
+        if expected.try_reserve_exact(expected_dependencies).is_err() {
+            errors.scratch_allocation_failed();
+            return;
+        }
+        expected.extend([ProofId(0), ProofId(1), wait_proof]);
+        for region in module.regions.iter().take(base_region_count) {
+            if errors.poll() {
+                return;
+            }
+            expected.push(region.proof);
+        }
+        if !sort_validation_scratch(&mut expected, errors) {
+            return;
+        }
+        valid &= expected.len() == base_proof.depends_on.len();
+        for (expected, actual) in expected.iter().zip(&base_proof.depends_on) {
+            if errors.poll() {
+                return;
+            }
+            valid &= expected == actual;
+        }
+        if let Some(entry) = module.functions.get(module.image_entry.0 as usize) {
+            valid &= entry.proofs.binary_search(&final_proof.id).is_ok()
+                && entry.proofs.binary_search(&base_proof.id).is_ok()
+                && entry.proofs.binary_search(&wait_proof).is_ok();
+            for region in module.regions.iter().take(base_region_count) {
+                if errors.poll() {
+                    return;
+                }
+                valid &= entry.proofs.binary_search(&region.proof).is_ok();
+            }
+        } else {
+            valid = false;
+        }
+        let expected_sources = module.actors.len().checked_add(1);
+        valid &= expected_sources == Some(base_proof.sources.len());
+        if let Some(root_source) = module
+            .proofs
+            .first()
+            .and_then(|proof| proof.sources.first())
+        {
+            valid &= base_proof.sources.first() == Some(root_source);
+        } else {
+            valid = false;
+        }
+        for index in 0..module.actors.len() {
+            if errors.poll() {
+                return;
+            }
+            let expected = index
+                .checked_mul(2)
+                .and_then(|region| module.regions.get(region))
+                .map(|region| region.source);
+            valid &= base_proof.sources.get(index.saturating_add(1)).copied() == expected;
+        }
+    } else {
+        valid = false;
+    }
+    if !module.activations.is_empty() {
+        for (index, plan) in module.activations.iter().enumerate() {
+            if errors.poll() {
+                return;
+            }
+            valid &= final_proof
+                .depends_on
+                .get(index.saturating_add(1))
+                .is_some_and(|dependency| *dependency == plan.capacity_proof)
+                && final_proof.sources.get(index).copied() == Some(plan.source);
+        }
+        valid &= final_proof.sources.len() == module.activations.len();
+    }
+    if !valid {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "actor capacity closure",
+            id: 0,
+        });
+    }
+}
+
+fn valid_span(module: &SemanticWir, span: Span) -> bool {
+    span.file.0 < module.source_summary.hir_files && span.range.start <= span.range.end
+}
+
 fn validate_function(
     module: &SemanticWir,
     function: &SemanticFunction,
-    errors: &mut Vec<ValidationError>,
+    errors: &mut ValidationErrorSink<'_>,
 ) {
+    if errors.poll() {
+        return;
+    }
     let valid_origin = match function.origin {
-        FunctionOrigin::Source => function.source.is_some(),
+        FunctionOrigin::Source => {
+            function.source.is_some() && function.role != FunctionRole::ImageEntry
+        }
+        FunctionOrigin::GeneratedImageEntry { constructor } => {
+            function.source.is_none()
+                && function.role == FunctionRole::ImageEntry
+                && constructor < module.source_summary.hir_declarations
+                && module.source_summary.reachable_declarations > 0
+        }
         FunctionOrigin::GeneratedTestHarness { .. } => {
             function.source.is_none() && function.role == FunctionRole::ImageEntry
         }
@@ -1238,10 +2958,27 @@ fn validate_function(
         | FunctionRole::ImageEntry
         | FunctionRole::Test => true,
     };
+    let valid_color_role = match (function.color, function.role) {
+        (FunctionColor::Isr, FunctionRole::Isr(_)) => true,
+        (FunctionColor::Isr, _) | (_, FunctionRole::Isr(_)) => false,
+        (FunctionColor::Sync, FunctionRole::ImageEntry) => true,
+        (FunctionColor::Async, FunctionRole::ImageEntry) => false,
+        (FunctionColor::Sync | FunctionColor::Async, _) => true,
+    };
     if function.name.trim().is_empty()
+        || function
+            .instance_key
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
         || !function.effects.is_valid()
         || !valid_origin
         || !valid_role
+        || !valid_color_role
+        || function
+            .source
+            .is_some_and(|source| !valid_span(module, source))
+        || function.recursive_depth_bound == Some(0)
     {
         errors.push(ValidationError::InvalidRecord {
             kind: "function",
@@ -1261,11 +2998,37 @@ fn validate_function(
     );
     for value in &function.values {
         require_id("value type", value.ty.0, module.types.len(), errors);
+        if value
+            .origin
+            .is_some_and(|source| !valid_span(module, source))
+        {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "value source",
+                id: value.id.0,
+            });
+        }
     }
+    for proof in &function.proofs {
+        require_id("function proof", proof.0, module.proofs.len(), errors);
+    }
+    require_canonical_ids(
+        "function proofs",
+        function.id.0,
+        function.proofs.iter().map(|proof| proof.0),
+        errors,
+    );
     if function.body.parameters != function.parameters {
         errors.push(ValidationError::RootParameterMismatch(function.id));
     }
-    let mut definitions = vec![0u8; function.values.len()];
+    let mut definitions = Vec::new();
+    if definitions
+        .try_reserve_exact(function.values.len())
+        .is_err()
+    {
+        errors.scratch_allocation_failed();
+        return;
+    }
+    definitions.resize(function.values.len(), 0_u8);
     for parameter in &function.parameters {
         define_value(function.id, *parameter, &mut definitions, errors);
     }
@@ -1278,6 +3041,9 @@ fn validate_function(
         errors,
     );
     for (index, count) in definitions.into_iter().enumerate() {
+        if errors.poll() {
+            return;
+        }
         if count != 1 {
             errors.push(ValidationError::ValueDefinitionCount {
                 function: function.id,
@@ -1294,70 +3060,122 @@ fn validate_region(
     region: &SemanticRegion,
     is_root: bool,
     definitions: &mut [u8],
-    errors: &mut Vec<ValidationError>,
+    errors: &mut ValidationErrorSink<'_>,
 ) {
-    if !is_root {
-        for parameter in &region.parameters {
-            define_value(function.id, *parameter, definitions, errors);
-        }
+    let mut regions = Vec::new();
+    if regions.try_reserve(1).is_err() {
+        errors.scratch_allocation_failed();
+        return;
     }
-    for statement in &region.statements {
-        match statement {
-            SemanticStatement::Let(statement) => {
-                for result in &statement.results {
-                    define_value(function.id, *result, definitions, errors);
-                }
-                validate_operation(module, function, &statement.operation, errors);
+    regions.push((region, is_root));
+    while let Some((region, is_root)) = regions.pop() {
+        if errors.poll() {
+            return;
+        }
+        if !is_root {
+            for parameter in &region.parameters {
+                define_value(function.id, *parameter, definitions, errors);
             }
-            SemanticStatement::If {
-                condition,
-                then_region,
-                else_region,
-                results,
-                ..
-            } => {
-                use_value(function, *condition, errors);
-                for result in results {
-                    define_value(function.id, *result, definitions, errors);
-                }
-                validate_region(module, function, then_region, false, definitions, errors);
-                validate_region(module, function, else_region, false, definitions, errors);
+        }
+        for statement in &region.statements {
+            if errors.poll() {
+                return;
             }
-            SemanticStatement::Match {
-                scrutinee,
-                arms,
-                results,
-                ..
-            } => {
-                use_value(function, *scrutinee, errors);
-                for result in results {
-                    define_value(function.id, *result, definitions, errors);
-                }
-                for arm in arms {
-                    for binding in &arm.bindings {
-                        define_value(function.id, *binding, definitions, errors);
+            let source = match statement {
+                SemanticStatement::Let(statement) => statement.source,
+                SemanticStatement::If { source, .. }
+                | SemanticStatement::Match { source, .. }
+                | SemanticStatement::Loop { source, .. } => *source,
+                SemanticStatement::Return(_)
+                | SemanticStatement::Yield(_)
+                | SemanticStatement::Break(_)
+                | SemanticStatement::Continue(_)
+                | SemanticStatement::Unreachable => None,
+            };
+            if source.is_some_and(|source| !valid_span(module, source)) {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "statement source",
+                    id: function.id.0,
+                });
+            }
+            match statement {
+                SemanticStatement::Let(statement) => {
+                    for result in &statement.results {
+                        define_value(function.id, *result, definitions, errors);
                     }
-                    if let Some(guard) = arm.guard {
-                        use_value(function, guard, errors);
+                    validate_operation(
+                        module,
+                        function,
+                        &statement.results,
+                        &statement.operation,
+                        errors,
+                    );
+                }
+                SemanticStatement::If {
+                    condition,
+                    then_region,
+                    else_region,
+                    results,
+                    ..
+                } => {
+                    use_value(function, *condition, errors);
+                    for result in results {
+                        define_value(function.id, *result, definitions, errors);
                     }
-                    validate_region(module, function, &arm.body, false, definitions, errors);
+                    if regions.try_reserve(2).is_err() {
+                        errors.scratch_allocation_failed();
+                        return;
+                    }
+                    regions.push((else_region, false));
+                    regions.push((then_region, false));
                 }
-            }
-            SemanticStatement::Loop { body, carried, .. } => {
-                for value in carried {
-                    use_value(function, *value, errors);
+                SemanticStatement::Match {
+                    scrutinee,
+                    arms,
+                    results,
+                    ..
+                } => {
+                    use_value(function, *scrutinee, errors);
+                    for result in results {
+                        define_value(function.id, *result, definitions, errors);
+                    }
+                    if regions.try_reserve(arms.len()).is_err() {
+                        errors.scratch_allocation_failed();
+                        return;
+                    }
+                    for arm in arms.iter().rev() {
+                        if arm.body.parameters != arm.bindings {
+                            errors.push(ValidationError::InvalidRecord {
+                                kind: "match arm bracket",
+                                id: function.id.0,
+                            });
+                        }
+                        if let Some(guard) = arm.guard {
+                            use_value(function, guard, errors);
+                        }
+                        regions.push((&arm.body, false));
+                    }
                 }
-                validate_region(module, function, body, false, definitions, errors);
-            }
-            SemanticStatement::Return(values)
-            | SemanticStatement::Yield(values)
-            | SemanticStatement::Break(values)
-            | SemanticStatement::Continue(values) => {
-                for value in values {
-                    use_value(function, *value, errors);
+                SemanticStatement::Loop { body, carried, .. } => {
+                    for value in carried {
+                        use_value(function, *value, errors);
+                    }
+                    if regions.try_reserve(1).is_err() {
+                        errors.scratch_allocation_failed();
+                        return;
+                    }
+                    regions.push((body, false));
                 }
+                SemanticStatement::Return(values)
+                | SemanticStatement::Yield(values)
+                | SemanticStatement::Break(values)
+                | SemanticStatement::Continue(values) => {
+                    for value in values {
+                        use_value(function, *value, errors);
+                    }
+                }
+                SemanticStatement::Unreachable => {}
             }
-            SemanticStatement::Unreachable => {}
         }
     }
 }
@@ -1365,8 +3183,9 @@ fn validate_region(
 fn validate_operation(
     module: &SemanticWir,
     function: &SemanticFunction,
+    results: &[ValueId],
     operation: &SemanticOperation,
-    errors: &mut Vec<ValidationError>,
+    errors: &mut ValidationErrorSink<'_>,
 ) {
     macro_rules! value {
         ($id:expr) => {
@@ -1399,6 +3218,29 @@ fn validate_operation(
                 value!(*field);
             }
         }
+        SemanticOperation::ConstructEnum {
+            ty,
+            variant,
+            payload,
+        } => {
+            require_id("enum type", ty.0, module.types.len(), errors);
+            value!(*payload);
+            if !module.types.get(ty.0 as usize).is_some_and(|record| {
+                matches!(&record.kind, TypeKind::Enum { variants }
+                    if variants.get(*variant as usize).is_some_and(|item| {
+                        matches!(item.fields.as_slice(), [field]
+                            if function.values.get(payload.0 as usize)
+                                .is_some_and(|value| value.ty == field.ty))
+                    }))
+                    && matches!(results, [result]
+                        if function.values.get(result.0 as usize).is_some_and(|value| value.ty == *ty))
+            }) {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "enum construction",
+                    id: ty.0,
+                });
+            }
+        }
         SemanticOperation::Project { base, .. } => value!(*base),
         SemanticOperation::Index { base, index, proof } => {
             value!(*base);
@@ -1422,11 +3264,35 @@ fn validate_operation(
         }
         | SemanticOperation::TestEmit { payload: operand }
         | SemanticOperation::TestFinish { outcome: operand } => value!(*operand),
+        SemanticOperation::Assert { condition, failure } => {
+            value!(*condition);
+            if failure.expression.chars().all(char::is_whitespace)
+                || failure.expression.len() > ASSERTION_EXPRESSION_BYTES_MAX
+                || failure.message.as_ref().is_some_and(|message| {
+                    message.chars().all(char::is_whitespace)
+                        || message.len() > ASSERTION_EXPRESSION_BYTES_MAX
+                })
+                || failure.source.range.start > failure.source.range.end
+            {
+                errors.push(ValidationError::InvalidAssertionDescriptor {
+                    function: function.id,
+                });
+            }
+        }
         SemanticOperation::Call {
             function: callee,
             arguments,
+            activation,
         } => {
             require_id("callee", callee.0, module.functions.len(), errors);
+            if let Some(activation) = activation {
+                require_id(
+                    "call activation",
+                    activation.0,
+                    module.activations.len(),
+                    errors,
+                );
+            }
             for item in arguments {
                 argument!(item);
             }
@@ -1453,6 +3319,20 @@ fn validate_operation(
             for item in arguments {
                 argument!(item);
             }
+        }
+        SemanticOperation::MailboxReceive { actor, method } => {
+            require_id(
+                "mailbox receive actor",
+                actor.0,
+                module.actors.len(),
+                errors,
+            );
+            require_id(
+                "mailbox receive method",
+                method.0,
+                module.functions.len(),
+                errors,
+            );
         }
         SemanticOperation::SpawnTask {
             task,
@@ -1586,7 +3466,10 @@ fn validate_operation(
     }
 }
 
-fn use_value(function: &SemanticFunction, value: ValueId, errors: &mut Vec<ValidationError>) {
+fn use_value(function: &SemanticFunction, value: ValueId, errors: &mut ValidationErrorSink<'_>) {
+    if errors.poll() {
+        return;
+    }
     if value.0 as usize >= function.values.len() {
         errors.push(ValidationError::UnknownValue {
             function: function.id,
@@ -1599,8 +3482,11 @@ fn define_value(
     function: FunctionId,
     value: ValueId,
     definitions: &mut [u8],
-    errors: &mut Vec<ValidationError>,
+    errors: &mut ValidationErrorSink<'_>,
 ) {
+    if errors.poll() {
+        return;
+    }
     let Some(count) = definitions.get_mut(value.0 as usize) else {
         errors.push(ValidationError::UnknownValue { function, value });
         return;
@@ -1608,7 +3494,10 @@ fn define_value(
     *count = count.saturating_add(1);
 }
 
-fn require_id(kind: &'static str, id: u32, length: usize, errors: &mut Vec<ValidationError>) {
+fn require_id(kind: &'static str, id: u32, length: usize, errors: &mut ValidationErrorSink<'_>) {
+    if errors.poll() {
+        return;
+    }
     if id as usize >= length {
         errors.push(ValidationError::UnknownReference { kind, id });
     }
@@ -1618,55 +3507,89 @@ fn require_canonical_ids(
     kind: &'static str,
     owner: u32,
     ids: impl IntoIterator<Item = u32>,
-    errors: &mut Vec<ValidationError>,
+    errors: &mut ValidationErrorSink<'_>,
 ) {
-    let ids: Vec<_> = ids.into_iter().collect();
-    if !ids.windows(2).all(|pair| pair[0] < pair[1]) {
-        errors.push(ValidationError::NonCanonicalReferences { kind, owner });
+    let mut previous = None;
+    for id in ids {
+        if errors.poll() {
+            return;
+        }
+        if previous.is_some_and(|previous| previous >= id) {
+            errors.push(ValidationError::NonCanonicalReferences { kind, owner });
+            return;
+        }
+        previous = Some(id);
     }
 }
 
-fn validate_acyclic(
+fn validate_acyclic<'a, T: 'a>(
     kind: &'static str,
     node_count: usize,
-    edges: impl Fn(usize) -> Vec<u32>,
-    errors: &mut Vec<ValidationError>,
+    edges: impl Fn(usize) -> &'a [T],
+    edge_id: impl Fn(&T) -> u32,
+    errors: &mut ValidationErrorSink<'_>,
 ) {
-    fn visit(
-        node: usize,
-        node_count: usize,
-        edges: &impl Fn(usize) -> Vec<u32>,
-        colors: &mut [u8],
-    ) -> bool {
-        if colors[node] == 1 {
-            return false;
-        }
-        if colors[node] == 2 {
-            return true;
-        }
-        colors[node] = 1;
-        for edge in edges(node) {
-            let edge = edge as usize;
-            if edge < node_count && !visit(edge, node_count, edges, colors) {
-                return false;
-            }
-        }
-        colors[node] = 2;
-        true
+    let mut colors = Vec::new();
+    if colors.try_reserve_exact(node_count).is_err() {
+        errors.scratch_allocation_failed();
+        return;
     }
-
-    let mut colors = vec![0; node_count];
-    if (0..node_count).any(|node| !visit(node, node_count, &edges, &mut colors)) {
-        errors.push(ValidationError::CyclicReferences(kind));
+    colors.resize(node_count, 0_u8);
+    let mut work = Vec::new();
+    for root in 0..node_count {
+        if errors.poll() {
+            return;
+        }
+        if colors[root] != 0 {
+            continue;
+        }
+        colors[root] = 1;
+        if work.try_reserve(1).is_err() {
+            errors.scratch_allocation_failed();
+            return;
+        }
+        work.push((root, 0_usize));
+        while let Some((node, next_edge)) = work.pop() {
+            if errors.poll() {
+                return;
+            }
+            let adjacent = edges(node);
+            let Some(edge) = adjacent.get(next_edge) else {
+                colors[node] = 2;
+                continue;
+            };
+            if work.try_reserve(1).is_err() {
+                errors.scratch_allocation_failed();
+                return;
+            }
+            work.push((node, next_edge + 1));
+            let edge = edge_id(edge) as usize;
+            if edge >= node_count || colors[edge] == 2 {
+                continue;
+            }
+            if colors[edge] == 1 {
+                errors.push(ValidationError::CyclicReferences(kind));
+                return;
+            }
+            colors[edge] = 1;
+            if work.try_reserve(1).is_err() {
+                errors.scratch_allocation_failed();
+                return;
+            }
+            work.push((edge, 0));
+        }
     }
 }
 
 fn check_dense(
     kind: &'static str,
     ids: impl IntoIterator<Item = u32>,
-    errors: &mut Vec<ValidationError>,
+    errors: &mut ValidationErrorSink<'_>,
 ) {
     for (expected, actual) in ids.into_iter().enumerate() {
+        if errors.poll() {
+            return;
+        }
         if actual as usize != expected {
             errors.push(ValidationError::NonDenseId {
                 kind,
@@ -1679,6 +3602,15 @@ fn check_dense(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    InvalidLimits,
+    Cancelled,
+    ResourceLimit {
+        resource: &'static str,
+        limit: u64,
+    },
+    TooManyErrors {
+        limit: u32,
+    },
     UnsupportedVersion(u32),
     MissingImageName,
     NonDenseId {
@@ -1693,6 +3625,9 @@ pub enum ValidationError {
     UnknownValue {
         function: FunctionId,
         value: ValueId,
+    },
+    InvalidAssertionDescriptor {
+        function: FunctionId,
     },
     RootParameterMismatch(FunctionId),
     ValueDefinitionCount {
@@ -1718,6 +3653,17 @@ pub struct ValidationErrors(pub Vec<ValidationError>);
 impl fmt::Display for ValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidLimits => formatter.write_str("invalid SemanticWir validation limits"),
+            Self::Cancelled => formatter.write_str("SemanticWir validation cancelled"),
+            Self::ResourceLimit { resource, limit } => {
+                write!(formatter, "SemanticWir {resource} exceeds limit {limit}")
+            }
+            Self::TooManyErrors { limit } => {
+                write!(
+                    formatter,
+                    "SemanticWir validation exceeded error limit {limit}"
+                )
+            }
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported SemanticWir version {version}")
             }
@@ -1735,6 +3681,11 @@ impl fmt::Display for ValidationError {
                 formatter,
                 "function {} references unknown value {}",
                 function.0, value.0
+            ),
+            Self::InvalidAssertionDescriptor { function } => write!(
+                formatter,
+                "function {} has an invalid runtime assertion descriptor",
+                function.0
             ),
             Self::RootParameterMismatch(function) => write!(
                 formatter,
@@ -1779,18 +3730,31 @@ impl fmt::Display for ValidationErrors {
 
 impl std::error::Error for ValidationErrors {}
 
+impl fmt::Display for ValidationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLimits => formatter.write_str("invalid SemanticWir validation limits"),
+            Self::Cancelled => formatter.write_str("SemanticWir validation cancelled"),
+            Self::ResourceLimit { resource, limit } => {
+                write!(formatter, "SemanticWir {resource} exceeds limit {limit}")
+            }
+            Self::Invalid(errors) => errors.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ValidationFailure {}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
     use wrela_build_model::{BuildIdentity, LanguageRevision, Sha256Digest, TargetIdentity};
     use wrela_source::{FileId, TextRange};
 
     fn fixture() -> SemanticWir {
         let digest = Sha256Digest::from_bytes([2; 32]);
-        let source = Span {
-            file: FileId(0),
-            range: TextRange { start: 0, end: 0 },
-        };
         SemanticWir {
             version: SEMANTIC_WIR_VERSION,
             name: "image".to_owned(),
@@ -1805,6 +3769,8 @@ mod tests {
                 profile: digest,
             },
             source_summary: SourceSummary {
+                hir_files: 1,
+                hir_declarations: 1,
                 reachable_declarations: 1,
                 monomorphized_instantiations: 1,
                 resolved_interface_calls: 0,
@@ -1819,8 +3785,9 @@ mod tests {
             globals: Vec::new(),
             functions: vec![SemanticFunction {
                 id: FunctionId(0),
+                instance_key: digest,
                 name: "entry".to_owned(),
-                origin: FunctionOrigin::Source,
+                origin: FunctionOrigin::GeneratedImageEntry { constructor: 0 },
                 role: FunctionRole::ImageEntry,
                 color: FunctionColor::Sync,
                 parameters: Vec::new(),
@@ -1831,37 +3798,687 @@ mod tests {
                     statements: vec![SemanticStatement::Return(Vec::new())],
                 },
                 effects: EffectSet(0),
-                source: Some(source),
+                proofs: Vec::new(),
+                source: None,
                 stack_bound: 0,
                 frame_bound: 0,
                 uninterrupted_bound: None,
+                recursive_depth_bound: Some(1),
             }],
             actors: Vec::new(),
             tasks: Vec::new(),
             devices: Vec::new(),
             pools: Vec::new(),
             regions: Vec::new(),
+            activations: Vec::new(),
             scopes: Vec::new(),
             proofs: Vec::new(),
             tests: Vec::new(),
-            startup_order: Vec::new(),
-            shutdown_order: Vec::new(),
+            compiled_test_group: None,
+            startup_order: vec![ImageOwner::Runtime],
+            shutdown_order: vec![ImageOwner::Runtime],
             image_entry: FunctionId(0),
             static_bytes: 0,
             peak_bytes: 0,
         }
     }
 
+    fn span(file: u32) -> Span {
+        Span {
+            file: FileId(file),
+            range: TextRange { start: 0, end: 0 },
+        }
+    }
+
+    fn source_function(id: u32, key_byte: u8) -> SemanticFunction {
+        SemanticFunction {
+            id: FunctionId(id),
+            instance_key: Sha256Digest::from_bytes([key_byte; 32]),
+            name: format!("source-{id}"),
+            origin: FunctionOrigin::Source,
+            role: FunctionRole::Ordinary,
+            color: FunctionColor::Sync,
+            parameters: Vec::new(),
+            result: TypeId(0),
+            values: Vec::new(),
+            body: SemanticRegion {
+                parameters: Vec::new(),
+                statements: vec![SemanticStatement::Return(Vec::new())],
+            },
+            effects: EffectSet(0),
+            proofs: Vec::new(),
+            source: Some(span(0)),
+            stack_bound: 0,
+            frame_bound: 0,
+            uninterrupted_bound: None,
+            recursive_depth_bound: Some(1),
+        }
+    }
+
+    fn closed_enum_fixture(variants: usize) -> SemanticWir {
+        let mut module = fixture();
+        module.types.push(TypeRecord {
+            id: TypeId(1),
+            source_name: "u8".to_owned(),
+            kind: TypeKind::Primitive(PrimitiveType::U8),
+            linearity: Linearity::CopyScalar,
+            source: None,
+        });
+        module.types.push(TypeRecord {
+            id: TypeId(2),
+            source_name: "LocalResult".to_owned(),
+            kind: TypeKind::Enum {
+                variants: (0..variants)
+                    .map(|index| VariantType {
+                        name: format!("V{index}"),
+                        fields: vec![FieldType {
+                            name: String::new(),
+                            ty: TypeId(1),
+                            public: true,
+                        }],
+                    })
+                    .collect(),
+            },
+            linearity: Linearity::ExplicitCopy,
+            source: None,
+        });
+        let mut function = source_function(1, 3);
+        function.result = TypeId(2);
+        function.parameters = vec![ValueId(0)];
+        function.values = vec![
+            SemanticValue {
+                id: ValueId(0),
+                ty: TypeId(1),
+                origin: Some(span(0)),
+                name: Some("payload".to_owned()),
+            },
+            SemanticValue {
+                id: ValueId(1),
+                ty: TypeId(2),
+                origin: Some(span(0)),
+                name: Some("result".to_owned()),
+            },
+        ];
+        function.body = SemanticRegion {
+            parameters: vec![ValueId(0)],
+            statements: vec![
+                SemanticStatement::Let(LetStatement {
+                    results: vec![ValueId(1)],
+                    operation: SemanticOperation::ConstructEnum {
+                        ty: TypeId(2),
+                        variant: u32::try_from(variants.saturating_sub(1).min(255))
+                            .expect("bounded variant"),
+                        payload: ValueId(0),
+                    },
+                    source: Some(span(0)),
+                }),
+                SemanticStatement::Return(vec![ValueId(1)]),
+            ],
+        };
+        module.functions.push(function);
+        module.source_summary.hir_declarations = 2;
+        module.source_summary.reachable_declarations = 2;
+        module.source_summary.monomorphized_instantiations = 2;
+        module
+    }
+
+    fn async_actor_fixture() -> SemanticWir {
+        let mut module = fixture();
+        let source = Span {
+            file: FileId(0),
+            range: TextRange { start: 10, end: 20 },
+        };
+        module.source_summary.hir_declarations = 3;
+        module.source_summary.reachable_declarations = 3;
+        module.source_summary.monomorphized_instantiations = 3;
+        module.functions[0].proofs =
+            vec![ProofId(3), ProofId(4), ProofId(5), ProofId(6), ProofId(8)];
+        let mut caller = source_function(1, 3);
+        caller.name = "actor-turn".to_owned();
+        caller.role = FunctionRole::ActorTurn(ActorId(0));
+        caller.color = FunctionColor::Async;
+        caller.effects = EffectSet(EffectSet::ACTOR_CALL | EffectSet::SUSPEND);
+        caller.values = vec![
+            SemanticValue {
+                id: ValueId(0),
+                ty: TypeId(0),
+                origin: Some(source),
+                name: None,
+            },
+            SemanticValue {
+                id: ValueId(1),
+                ty: TypeId(0),
+                origin: Some(source),
+                name: None,
+            },
+        ];
+        caller.body.statements = vec![
+            SemanticStatement::Let(LetStatement {
+                results: vec![ValueId(0)],
+                operation: SemanticOperation::Call {
+                    function: FunctionId(2),
+                    arguments: Vec::new(),
+                    activation: Some(ActivationId(0)),
+                },
+                source: Some(source),
+            }),
+            SemanticStatement::Let(LetStatement {
+                results: vec![ValueId(1)],
+                operation: SemanticOperation::Await {
+                    awaitable: ValueId(0),
+                },
+                source: Some(source),
+            }),
+            SemanticStatement::Return(Vec::new()),
+        ];
+        caller.stack_bound = 8;
+        caller.frame_bound = 8;
+        caller.proofs = vec![ProofId(7)];
+        let mut callee = source_function(2, 4);
+        callee.name = "async-helper".to_owned();
+        callee.color = FunctionColor::Async;
+        callee.effects = EffectSet(EffectSet::SUSPEND);
+        callee.stack_bound = 8;
+        callee.frame_bound = 8;
+        callee.proofs = vec![ProofId(2)];
+        module.functions.extend([caller, callee]);
+        module.actors = vec![ActorInstance {
+            id: ActorId(0),
+            name: "actor".to_owned(),
+            ty: TypeId(0),
+            priority: 1,
+            mailbox_capacity: 1,
+            message_types: Vec::new(),
+            turn_functions: vec![FunctionId(1)],
+            supervisor: None,
+        }];
+        let proof = |id, kind, subject: &str, sources, depends_on, bound| ProofRecord {
+            id: ProofId(id),
+            kind,
+            subject: subject.to_owned(),
+            bound,
+            sources,
+            depends_on,
+            explanation: vec![format!("proof {id} is sealed")],
+        };
+        module.proofs = vec![
+            proof(
+                0,
+                ProofKind::TypeChecked,
+                "actor image types",
+                vec![source],
+                Vec::new(),
+                None,
+            ),
+            proof(
+                1,
+                ProofKind::EffectsAllowed,
+                "actor image effects",
+                vec![source],
+                vec![ProofId(0)],
+                None,
+            ),
+            proof(
+                2,
+                ProofKind::CleanupAcyclic,
+                "helper cleanup",
+                vec![source],
+                Vec::new(),
+                Some(0),
+            ),
+            proof(
+                3,
+                ProofKind::CapacityBound,
+                "mailbox capacity",
+                vec![source],
+                Vec::new(),
+                Some(1),
+            ),
+            proof(
+                4,
+                ProofKind::CapacityBound,
+                "turn capacity",
+                vec![source],
+                Vec::new(),
+                Some(1),
+            ),
+            proof(
+                5,
+                ProofKind::WaitGraphAcyclic,
+                "closed wait graph",
+                vec![source],
+                vec![ProofId(1)],
+                Some(1),
+            ),
+            proof(
+                6,
+                ProofKind::CapacityBound,
+                "base actor allocation",
+                vec![source, source],
+                vec![ProofId(0), ProofId(1), ProofId(3), ProofId(4), ProofId(5)],
+                Some(24),
+            ),
+            proof(
+                7,
+                ProofKind::CapacityBound,
+                "call activation",
+                vec![source],
+                vec![ProofId(2)],
+                Some(1),
+            ),
+            proof(
+                8,
+                ProofKind::ImageClosed,
+                "closed actor image",
+                vec![source],
+                vec![ProofId(6), ProofId(7)],
+                Some(32),
+            ),
+        ];
+        module.regions = vec![
+            RegionRecord {
+                id: RegionId(0),
+                name: "actor.mailbox".to_owned(),
+                class: RegionClass::Image,
+                capacity_bytes: 16,
+                alignment: 8,
+                owner: ImageOwner::Actor(ActorId(0)),
+                proof: ProofId(3),
+                source,
+            },
+            RegionRecord {
+                id: RegionId(1),
+                name: "actor.turn-frame".to_owned(),
+                class: RegionClass::TaskFrame,
+                capacity_bytes: 8,
+                alignment: 8,
+                owner: ImageOwner::Actor(ActorId(0)),
+                proof: ProofId(4),
+                source,
+            },
+            RegionRecord {
+                id: RegionId(2),
+                name: "actor-turn.async-activation-frame".to_owned(),
+                class: RegionClass::TaskFrame,
+                capacity_bytes: 8,
+                alignment: 8,
+                owner: ImageOwner::Actor(ActorId(0)),
+                proof: ProofId(7),
+                source,
+            },
+        ];
+        module.activations = vec![ActivationPlan {
+            id: ActivationId(0),
+            caller: FunctionId(1),
+            callee: FunctionId(2),
+            region: RegionId(2),
+            frame_bytes: 8,
+            maximum_live: 1,
+            cancellation: ActivationCancellation::DropCalleeThenPropagate,
+            capacity_proof: ProofId(7),
+            source,
+        }];
+        module.startup_order = vec![ImageOwner::Runtime, ImageOwner::Actor(ActorId(0))];
+        module.shutdown_order = vec![ImageOwner::Actor(ActorId(0)), ImageOwner::Runtime];
+        module.static_bytes = 32;
+        module.peak_bytes = 32;
+        module
+    }
+
     #[test]
-    fn seals_exact_source_and_generated_entry_contracts() {
+    fn v6_actor_activation_capacity_contract_rejects_substitution_and_overflow() {
+        async_actor_fixture()
+            .validate()
+            .expect("valid source-level actor activation contract");
+
+        let mut missing_caller_attachment = async_actor_fixture();
+        missing_caller_attachment.functions[1].proofs.clear();
+        assert!(missing_caller_attachment.validate().is_err());
+
+        let mut substituted_source = async_actor_fixture();
+        substituted_source.activations[0].source.range.start += 1;
+        assert!(substituted_source.validate().is_err());
+
+        let mut substituted_base_source = async_actor_fixture();
+        substituted_base_source.proofs[6].sources[1].range.start += 1;
+        assert!(substituted_base_source.validate().is_err());
+
+        let mut omitted_cleanup = async_actor_fixture();
+        omitted_cleanup.functions[2].proofs.clear();
+        assert!(omitted_cleanup.validate().is_err());
+
+        let mut over_live = async_actor_fixture();
+        over_live.activations[0].maximum_live = 2;
+        over_live.regions[2].capacity_bytes = 16;
+        over_live.proofs[7].bound = Some(2);
+        over_live.proofs[8].bound = Some(40);
+        over_live.static_bytes = 40;
+        over_live.peak_bytes = 40;
+        assert!(over_live.validate().is_err());
+
+        let mut renamed_region = async_actor_fixture();
+        renamed_region.regions[2].name = "forged.async-activation-frame".to_owned();
+        assert!(renamed_region.validate().is_err());
+
+        let mut overflow = async_actor_fixture();
+        overflow.functions[2].frame_bound = u64::MAX;
+        overflow.activations[0].frame_bytes = u64::MAX;
+        overflow.regions[2].capacity_bytes = u64::MAX;
+        assert!(overflow.validate().is_err());
+
+        let mut orphan_role = async_actor_fixture();
+        orphan_role.actors[0].turn_functions.clear();
+        assert!(orphan_role.validate().is_err());
+
+        let mut long_name = async_actor_fixture();
+        long_name.actors[0].name = "a".repeat(32 * 1024);
+        long_name.regions[0].name = format!("{}.mailbox", long_name.actors[0].name);
+        long_name.regions[1].name = format!("{}.turn-frame", long_name.actors[0].name);
+        let polls = Cell::new(0_u32);
+        let cancellation = || {
+            let next = polls.get() + 1;
+            polls.set(next);
+            next > 5
+        };
+        let mut errors = ValidationErrorSink::new(100, &cancellation);
+        validate_actor_capacity_contract(&long_name, &mut errors);
+        assert_eq!(errors.finish(), Err(ValidationFailure::Cancelled));
+        assert!(polls.get() > 5);
+    }
+
+    #[test]
+    fn seals_exact_generated_image_entry_contract() {
         fixture().validate().expect("valid SemanticWir");
 
         let mut forged = fixture();
-        forged.functions[0].origin = FunctionOrigin::GeneratedTestHarness { group: 0 };
+        forged.functions[0].origin = FunctionOrigin::Source;
         assert!(forged.validate().is_err());
+
+        let mut stale_constructor = fixture();
+        stale_constructor.functions[0].origin =
+            FunctionOrigin::GeneratedImageEntry { constructor: 1 };
+        assert!(stale_constructor.validate().is_err());
+
+        let mut runtime_source = fixture();
+        runtime_source.functions[0].source = Some(Span {
+            file: FileId(0),
+            range: TextRange { start: 0, end: 0 },
+        });
+        assert!(runtime_source.validate().is_err());
+
+        let mut wrong_role = fixture();
+        wrong_role.functions[0].role = FunctionRole::Ordinary;
+        assert!(wrong_role.validate().is_err());
+
+        let mut harness = fixture();
+        harness.functions[0].origin = FunctionOrigin::GeneratedTestHarness { group: 0 };
+        assert!(harness.validate().is_err());
+
+        let mut source = fixture();
+        source.functions[0].origin = FunctionOrigin::Source;
+        source.functions[0].role = FunctionRole::Ordinary;
+        source.functions[0].source = Some(Span {
+            file: FileId(0),
+            range: TextRange { start: 0, end: 0 },
+        });
+        assert!(source.validate().is_err());
 
         let mut invalid_effect = fixture();
         invalid_effect.functions[0].effects = EffectSet(1 << 63);
         assert!(invalid_effect.validate().is_err());
+    }
+
+    #[test]
+    fn v6_rejects_color_key_proof_order_and_span_substitution() {
+        let mut v5 = fixture();
+        v5.version = 5;
+        let errors = v5.validate().expect_err("SemanticWir v5 is stale").0;
+        assert!(errors.contains(&ValidationError::UnsupportedVersion(5)));
+
+        let mut async_entry = fixture();
+        async_entry.functions[0].color = FunctionColor::Async;
+        assert!(async_entry.validate().is_err());
+
+        let mut zero_key = fixture();
+        zero_key.functions[0].instance_key = Sha256Digest::from_bytes([0; 32]);
+        assert!(zero_key.validate().is_err());
+
+        let mut duplicate_key = fixture();
+        let mut duplicate = source_function(1, 3);
+        duplicate.instance_key = duplicate_key.functions[0].instance_key;
+        duplicate_key.functions.push(duplicate);
+        duplicate_key.source_summary.monomorphized_instantiations = 2;
+        let errors = duplicate_key
+            .validate()
+            .expect_err("duplicate instance key")
+            .0;
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidRecord {
+                kind: "function instance key",
+                id: 1
+            }
+        )));
+
+        let mut forward_proof = fixture();
+        forward_proof.proofs = vec![
+            ProofRecord {
+                id: ProofId(0),
+                kind: ProofKind::TypeChecked,
+                subject: "first".to_owned(),
+                bound: None,
+                sources: Vec::new(),
+                depends_on: vec![ProofId(1)],
+                explanation: vec!["first proof".to_owned()],
+            },
+            ProofRecord {
+                id: ProofId(1),
+                kind: ProofKind::EffectsAllowed,
+                subject: "second".to_owned(),
+                bound: None,
+                sources: Vec::new(),
+                depends_on: Vec::new(),
+                explanation: vec!["second proof".to_owned()],
+            },
+        ];
+        assert!(forward_proof.validate().is_err());
+
+        let mut invalid_type_span = fixture();
+        invalid_type_span.types[0].source = Some(span(1));
+        assert!(invalid_type_span.validate().is_err());
+
+        let mut invalid_function_span = fixture();
+        let mut function = source_function(1, 3);
+        function.source = Some(span(1));
+        invalid_function_span.functions.push(function);
+        invalid_function_span
+            .source_summary
+            .monomorphized_instantiations = 2;
+        assert!(invalid_function_span.validate().is_err());
+
+        let mut invalid_value_span = fixture();
+        let mut function = source_function(1, 3);
+        function.parameters.push(ValueId(0));
+        function.body.parameters.push(ValueId(0));
+        function.values.push(SemanticValue {
+            id: ValueId(0),
+            ty: TypeId(0),
+            origin: Some(span(1)),
+            name: None,
+        });
+        invalid_value_span.functions.push(function);
+        invalid_value_span
+            .source_summary
+            .monomorphized_instantiations = 2;
+        assert!(invalid_value_span.validate().is_err());
+
+        let mut invalid_statement_span = fixture();
+        invalid_statement_span.functions[0].body.statements.insert(
+            0,
+            SemanticStatement::Let(LetStatement {
+                results: Vec::new(),
+                operation: SemanticOperation::Constant(Constant::Unit),
+                source: Some(span(1)),
+            }),
+        );
+        assert!(invalid_statement_span.validate().is_err());
+
+        let mut missing_runtime_order = fixture();
+        missing_runtime_order.startup_order.clear();
+        assert!(missing_runtime_order.validate().is_err());
+    }
+
+    #[test]
+    fn explicit_validation_policy_bounds_work_errors_and_cancellation() {
+        let mut limits = ValidationLimits::standard();
+        limits.payload_bytes = 1;
+        assert!(matches!(
+            fixture().validate_with_limits(limits, &|| false),
+            Err(ValidationFailure::ResourceLimit {
+                resource: "payload bytes",
+                limit: 1
+            })
+        ));
+
+        let insufficient_work = ValidationLimits {
+            validation_work: 1,
+            ..ValidationLimits::standard()
+        };
+        assert!(matches!(
+            fixture().validate_with_limits(insufficient_work, &|| false),
+            Err(ValidationFailure::ResourceLimit {
+                resource: "validation work",
+                limit: 1
+            })
+        ));
+
+        let mut nested = Constant::Unit;
+        for _ in 0..9 {
+            nested = Constant::Aggregate(vec![nested]);
+        }
+        let mut deep_constant = fixture();
+        deep_constant.globals.push(Global {
+            id: GlobalId(0),
+            name: "deep".to_owned(),
+            ty: TypeId(0),
+            initializer: nested,
+            owner: ImageOwner::Runtime,
+        });
+        let shallow = ValidationLimits {
+            nesting: 8,
+            ..ValidationLimits::standard()
+        };
+        assert!(matches!(
+            deep_constant.validate_with_limits(shallow, &|| false),
+            Err(ValidationFailure::ResourceLimit {
+                resource: "model nesting",
+                limit: 8
+            })
+        ));
+
+        assert_eq!(
+            fixture().validate_with_limits(ValidationLimits::standard(), &|| true),
+            Err(ValidationFailure::Cancelled)
+        );
+
+        let mut malformed = fixture();
+        malformed.version = 0;
+        malformed.name.clear();
+        malformed.source_summary.reachable_declarations = 2;
+        malformed.peak_bytes = 0;
+        malformed.static_bytes = 1;
+        let bounded_errors = ValidationLimits {
+            errors: 2,
+            ..ValidationLimits::standard()
+        };
+        let Err(ValidationFailure::Invalid(ValidationErrors(errors))) =
+            malformed.validate_with_limits(bounded_errors, &|| false)
+        else {
+            panic!("malformed model must fail");
+        };
+        assert_eq!(errors.len(), 2);
+        assert_eq!(
+            errors.last(),
+            Some(&ValidationError::TooManyErrors { limit: 2 })
+        );
+
+        let calls = Cell::new(0_u64);
+        validate_model_resources(&fixture(), ValidationLimits::standard(), &|| {
+            calls.set(calls.get() + 1);
+            false
+        })
+        .expect("resource preflight");
+        let preflight_calls = calls.get();
+        calls.set(0);
+        let result = fixture().validate_with_limits(ValidationLimits::standard(), &|| {
+            let next = calls.get() + 1;
+            calls.set(next);
+            next > preflight_calls + 3
+        });
+        assert_eq!(result, Err(ValidationFailure::Cancelled));
+        assert!(calls.get() > preflight_calls);
+    }
+
+    #[test]
+    fn closed_enum_accepts_exact_bounds_and_rejects_type_and_constructor_substitution() {
+        closed_enum_fixture(1).validate().expect("one-variant enum");
+        closed_enum_fixture(256)
+            .validate()
+            .expect("256-variant enum");
+        assert!(closed_enum_fixture(0).validate().is_err());
+        assert!(closed_enum_fixture(257).validate().is_err());
+
+        let mut blank = closed_enum_fixture(2);
+        let TypeKind::Enum { variants } = &mut blank.types[2].kind else {
+            unreachable!();
+        };
+        variants[0].name.clear();
+        assert!(blank.validate().is_err());
+
+        let mut duplicate = closed_enum_fixture(2);
+        let TypeKind::Enum { variants } = &mut duplicate.types[2].kind else {
+            unreachable!();
+        };
+        variants[1].name = variants[0].name.clone();
+        assert!(duplicate.validate().is_err());
+
+        let mut private_payload = closed_enum_fixture(2);
+        let TypeKind::Enum { variants } = &mut private_payload.types[2].kind else {
+            unreachable!();
+        };
+        variants[0].fields[0].public = false;
+        assert!(private_payload.validate().is_err());
+
+        let mut wrong_payload = closed_enum_fixture(2);
+        wrong_payload.functions[1].values[0].ty = TypeId(0);
+        assert!(wrong_payload.validate().is_err());
+
+        let mut wrong_variant = closed_enum_fixture(2);
+        let SemanticStatement::Let(statement) = &mut wrong_variant.functions[1].body.statements[0]
+        else {
+            unreachable!();
+        };
+        let SemanticOperation::ConstructEnum { variant, .. } = &mut statement.operation else {
+            unreachable!();
+        };
+        *variant = 2;
+        assert!(wrong_variant.validate().is_err());
+    }
+
+    #[test]
+    fn deep_proof_dag_is_validated_iteratively() {
+        let mut wir = fixture();
+        for id in 0..4_096_u32 {
+            wir.proofs.push(ProofRecord {
+                id: ProofId(id),
+                kind: ProofKind::TypeChecked,
+                subject: format!("proof-{id}"),
+                bound: None,
+                sources: Vec::new(),
+                depends_on: id.checked_sub(1).map(ProofId).into_iter().collect(),
+                explanation: vec!["validated".to_owned()],
+            });
+        }
+        wir.validate().expect("deep prior-only proof DAG");
     }
 }

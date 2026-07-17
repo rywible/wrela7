@@ -13,6 +13,7 @@ wrela-diagnostics = { path = "../wrela-diagnostics" }
 wrela-format = { path = "../wrela-format" }
 wrela-image-report = { path = "../wrela-image-report" }
 wrela-lint = { path = "../wrela-lint" }
+wrela-source = { path = "../wrela-source" }
 wrela-test-model = { path = "../wrela-test-model" }
 
 [lints]

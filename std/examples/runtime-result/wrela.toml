@@ -1,0 +1,42 @@
+schema = 1
+language = "0.1-design"
+
+[package]
+name = "runtime-result"
+version = "0.1.0"
+source_root = "src"
+
+[[module]]
+name = "runtime_result.image"
+path = "runtime_result/image.wr"
+
+[[dependency]]
+alias = "core"
+package = "wrela-core"
+requirement = "=0.1.0"
+
+[[profile]]
+name = "development"
+mode = "development"
+comptime_steps = 4096
+comptime_memory_bytes = 1048576
+comptime_call_depth = 64
+static_bytes = 1048576
+peak_bytes = 1048576
+event_log_bytes = 0
+dma_coherent = false
+require_iommu = false
+reset_timeout_ns = 1
+quarantine_bytes = 0
+recording = "disabled"
+optimization = "none"
+sealed_deployment = false
+warnings_as_errors = false
+watchdogs = false
+
+[[image]]
+name = "runtime-result"
+module = "runtime_result.image"
+entry = "boot"
+target = "aarch64-qemu-virt-uefi"
+profile = "development"

@@ -1,0 +1,51 @@
+module checked_shift.image
+
+from core.image import Image, Target
+
+@image
+pub comptime fn boot() -> Image:
+    return Image(name="checked-shift-runtime", target=Target.aarch64_qemu_virt_uefi)
+
+@test
+fn modular_shift_passes():
+    left: u8 = 192
+    count: u8 = 2
+    value: u8 = modular_u8(left=left, count=count)
+    assert value == 0, "modular shift must wrap to zero"
+    assert_shift_value(value=value)
+    consume_u8(value=value)
+    return
+
+@test
+fn runtime_assertion_fails():
+    assert false, "intentional runtime assertion failure"
+    return
+
+@test
+fn checked_shift_result_loss():
+    left: u8 = 128
+    count: u8 = 1
+    value: u8 = checked_u8(left=left, count=count)
+    consume_u8(value=value)
+    return
+
+@test
+fn invalid_shift_count():
+    left: u8 = 1
+    count: u8 = 8
+    value: u8 = checked_u8(left=left, count=count)
+    consume_u8(value=value)
+    return
+
+fn checked_u8(left: u8, count: u8) -> u8:
+    return left << count
+
+fn modular_u8(left: u8, count: u8) -> u8:
+    return left <<% count
+
+fn assert_shift_value(value: u8):
+    assert value == 0, "helper must observe wrapped value"
+    return
+
+fn consume_u8(value: u8) -> u8:
+    return value

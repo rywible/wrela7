@@ -6,6 +6,10 @@
 
 #![forbid(unsafe_code)]
 
+mod harness;
+mod local;
+mod sha256;
+
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -13,10 +17,20 @@ use std::path::{Path, PathBuf};
 use wrela_build_model::{BuildIdentity, Sha256Digest};
 use wrela_target::TargetPackage;
 use wrela_test_model::{
-    FullImageTestGroup, ImageGroupId, ImageGroupResult, ImageRoot, ImageScenario, TestCaseResult,
-    TestEvent, TestModelError, TestReport, ValidatedTestPlan, ValidatedTestReport,
+    FailurePhase, FullImageTestGroup, ImageGroupId, ImageGroupResult, ImageRoot, ImageScenario,
+    TestCaseResult, TestEvent, TestModelError, TestOutcome, TestReport, ValidatedTestPlan,
+    ValidatedTestReport,
 };
+use wrela_test_protocol::ProtocolLimits;
 use wrela_toolchain::{VerifiedPath, VerifiedToolchain};
+
+pub use harness::CanonicalImageHarness;
+pub use local::LocalProcessExecutor;
+
+/// Conservative cross-Unix pathname ceiling for the private QMP socket.
+/// Darwin's `sockaddr_un.sun_path` is 104 bytes and requires a trailing NUL,
+/// so at most 103 encoded pathname bytes may cross the sealed process boundary.
+pub const MAX_QMP_UNIX_PATH_BYTES: usize = 103;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunnerLimits {
@@ -127,6 +141,10 @@ pub fn seal_image_artifact(
 pub struct RunRequest<'a> {
     pub plan: &'a ValidatedTestPlan,
     pub artifacts: &'a [ImageArtifact],
+    /// Exact compile/link failures produced before a runnable image existed.
+    /// Their groups must be disjoint from `artifacts`; together the two sets
+    /// must cover every planned image group exactly once.
+    pub preexecution_results: &'a [ImageGroupResult],
     /// Compiler-evaluated unit results produced by semantic analysis.
     pub comptime_results: &'a [TestCaseResult],
     pub target: &'a TargetPackage,
@@ -144,13 +162,28 @@ pub struct ProcessSpecification {
     /// inherited by an executor.
     pub environment: Vec<(OsString, OsString)>,
     pub timeout_ns: u64,
+    /// Exact frame/string/event policy used by both live serial observation
+    /// and the final canonical protocol decode.
+    pub protocol_limits: ProtocolLimits,
     /// Aggregate child stdout and stderr ceiling. The executor must terminate
     /// collection before either allocation or their sum can exceed it.
     pub maximum_output_bytes: u64,
+    /// Optional private, command-bound control channel used only by an
+    /// explicit `request-shutdown` scenario step. The harness declares the
+    /// endpoint and matching emulator arguments; the executor may not invent
+    /// or discover a monitor channel.
+    pub shutdown_control: Option<ProcessShutdownControl>,
     /// Exact EFI and firmware sources that the executor must hash while copying
     /// into private per-run destinations before launch. Arguments may reference
     /// only the materialized destinations, never the installation templates.
     pub inputs: Vec<ProcessInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessShutdownControl {
+    /// QEMU Machine Protocol server on a private Unix-domain socket. The
+    /// executor negotiates QMP and issues the canonical `quit` command.
+    QmpUnix { path: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +366,115 @@ impl TestRunner<'_> {
         if installed_target.digest() != request.target.semantic().content_digest() {
             return Err(RunError::TargetPackageDigestMismatch);
         }
+        let frontend = request
+            .toolchain
+            .component(wrela_toolchain::ComponentKind::Frontend)
+            .map_err(|error| RunError::Toolchain(error.to_string()))?;
+        let standard_library = request
+            .toolchain
+            .standard_library()
+            .map_err(|error| RunError::Toolchain(error.to_string()))?;
+        if request.toolchain.manifest().compatibility.language != plan.build.language {
+            return Err(RunError::ToolchainLanguageMismatch);
+        }
+        if frontend.digest() != plan.build.compiler {
+            return Err(RunError::CompilerDigestMismatch);
+        }
+        if standard_library.digest() != plan.build.standard_library {
+            return Err(RunError::StandardLibraryDigestMismatch);
+        }
+        enum GroupInput<'a> {
+            Artifact(&'a ImageArtifact),
+            Preexecution(&'a ImageGroupResult),
+        }
+        let mut groups = try_runner_vec(plan.image_groups.len(), "group index")?;
+        groups.resize_with(plan.image_groups.len(), || None::<GroupInput<'_>>);
+        let mut artifact_paths = try_runner_vec(request.artifacts.len(), "artifact paths")?;
+        let mut invalid_groups = false;
+        for artifact in request.artifacts {
+            let Some(slot) = groups.get_mut(artifact.group().0 as usize) else {
+                invalid_groups = true;
+                continue;
+            };
+            if slot.is_some()
+                || !normal_absolute_path(artifact.path())
+                || artifact.build() != &plan.build
+            {
+                invalid_groups = true;
+                continue;
+            }
+            *slot = Some(GroupInput::Artifact(artifact));
+            artifact_paths.push(artifact.path());
+        }
+        for result in request.preexecution_results {
+            let Some(group) = plan.image_groups.get(result.group.0 as usize) else {
+                invalid_groups = true;
+                continue;
+            };
+            let Some(slot) = groups.get_mut(result.group.0 as usize) else {
+                invalid_groups = true;
+                continue;
+            };
+            if group.id != result.group
+                || slot.is_some()
+                || !valid_preexecution_result(result, group, plan)
+            {
+                invalid_groups = true;
+                continue;
+            }
+            *slot = Some(GroupInput::Preexecution(result));
+        }
+        artifact_paths.sort_unstable();
+        if request
+            .artifacts
+            .len()
+            .checked_add(request.preexecution_results.len())
+            != Some(plan.image_groups.len())
+            || invalid_groups
+            || groups.iter().any(Option::is_none)
+            || artifact_paths.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(RunError::ArtifactSetMismatch);
+        }
+        if request.comptime_results.len() != plan.unit_tests.len()
+            || !request
+                .comptime_results
+                .iter()
+                .zip(&plan.unit_tests)
+                .all(|(result, planned)| result.descriptor == planned.descriptor)
+        {
+            return Err(RunError::InvalidReport(TestModelError::ResultSetMismatch(
+                "comptime".to_owned(),
+            )));
+        }
+        let mut unit = try_runner_vec(request.comptime_results.len(), "comptime results")?;
+        unit.extend_from_slice(request.comptime_results);
+        let mut images = try_runner_vec(plan.image_groups.len(), "image results")?;
+        if request.artifacts.is_empty() {
+            for (index, group) in plan.image_groups.iter().enumerate() {
+                let Some(GroupInput::Preexecution(result)) =
+                    groups.get(index).and_then(Option::as_ref)
+                else {
+                    return Err(RunError::MissingArtifact(group.name.clone()));
+                };
+                images.push((*result).clone());
+            }
+            return seal_report(
+                TestReport {
+                    schema: wrela_test_model::TEST_REPORT_SCHEMA,
+                    build: plan.build.clone(),
+                    started_unix_ns: None,
+                    duration_ns: None,
+                    unit,
+                    images,
+                },
+                request.plan,
+                is_cancelled,
+            );
+        }
+
+        // Emulator and firmware are execution capabilities, so resolve them
+        // only when at least one group produced a runnable image.
         let emulator = request
             .toolchain
             .aarch64_emulator()
@@ -354,64 +496,21 @@ impl TestRunner<'_> {
             firmware_code,
             firmware_variables,
         };
-        let frontend = request
-            .toolchain
-            .component(wrela_toolchain::ComponentKind::Frontend)
-            .map_err(|error| RunError::Toolchain(error.to_string()))?;
-        let standard_library = request
-            .toolchain
-            .standard_library()
-            .map_err(|error| RunError::Toolchain(error.to_string()))?;
-        if request.toolchain.manifest().compatibility.language != plan.build.language {
-            return Err(RunError::ToolchainLanguageMismatch);
-        }
-        if frontend.digest() != plan.build.compiler {
-            return Err(RunError::CompilerDigestMismatch);
-        }
-        if standard_library.digest() != plan.build.standard_library {
-            return Err(RunError::StandardLibraryDigestMismatch);
-        }
-        let planned_groups: std::collections::BTreeSet<_> =
-            plan.image_groups.iter().map(|group| group.id).collect();
-        let artifact_groups: std::collections::BTreeSet<_> =
-            request.artifacts.iter().map(ImageArtifact::group).collect();
-        let artifact_paths: std::collections::BTreeSet<_> =
-            request.artifacts.iter().map(ImageArtifact::path).collect();
-        let artifacts_by_group: std::collections::BTreeMap<_, _> = request
-            .artifacts
-            .iter()
-            .map(|artifact| (artifact.group(), artifact))
-            .collect();
-        if request.artifacts.len() != plan.image_groups.len()
-            || artifact_groups != planned_groups
-            || artifact_paths.len() != request.artifacts.len()
-            || artifacts_by_group.len() != request.artifacts.len()
-            || request.artifacts.iter().any(|artifact| {
-                !normal_absolute_path(artifact.path()) || artifact.build() != &plan.build
-            })
-        {
-            return Err(RunError::ArtifactSetMismatch);
-        }
-        if request.comptime_results.len() != plan.unit_tests.len()
-            || !request
-                .comptime_results
-                .iter()
-                .zip(&plan.unit_tests)
-                .all(|(result, planned)| result.descriptor == planned.descriptor)
-        {
-            return Err(RunError::InvalidReport(TestModelError::ResultSetMismatch(
-                "comptime".to_owned(),
-            )));
-        }
-        let mut images = Vec::with_capacity(plan.image_groups.len());
-        for group in &plan.image_groups {
+        for (index, group) in plan.image_groups.iter().enumerate() {
             if is_cancelled() {
                 return Err(RunError::Cancelled);
             }
-            let artifact = artifacts_by_group
-                .get(&group.id)
-                .copied()
+            let supplied = groups
+                .get(index)
+                .and_then(Option::as_ref)
                 .ok_or_else(|| RunError::MissingArtifact(group.name.clone()))?;
+            if let GroupInput::Preexecution(result) = supplied {
+                images.push((*result).clone());
+                continue;
+            }
+            let GroupInput::Artifact(artifact) = supplied else {
+                return Err(RunError::ArtifactSetMismatch);
+            };
             let scenario = match &group.root {
                 ImageRoot::GeneratedHarness { .. } => None,
                 ImageRoot::Declared { scenario, .. } => plan
@@ -433,18 +532,25 @@ impl TestRunner<'_> {
                 },
                 is_cancelled,
             )?;
+            let execution_policy = protocol_execution_policy(group)?;
             let expected_timeout = group
                 .execution_timeout_ns(scenario)
                 .ok_or_else(|| RunError::InvalidInvocation("timeout budget overflow".to_owned()))?;
             if command.program != emulator
                 || command.timeout_ns != expected_timeout
-                || command.maximum_output_bytes != group.maximum_output_bytes
+                || command.protocol_limits != execution_policy.limits
+                || command.maximum_output_bytes != execution_policy.maximum_output_bytes
                 || !safe_working_directory(request.working_directory, &command.current_directory)
                 || !valid_process_inputs(
                     request.working_directory,
                     &command.inputs,
                     artifact,
                     &execution_components,
+                )
+                || !valid_shutdown_control(
+                    request.working_directory,
+                    &command.shutdown_control,
+                    scenario,
                 )
                 || !command
                     .environment
@@ -476,13 +582,14 @@ impl TestRunner<'_> {
                 .checked_add(output.stderr.len())
                 .and_then(|bytes| u64::try_from(bytes).ok())
                 .ok_or(RunError::OutputLimitExceeded(group.name.clone()))?;
-            if output_bytes > group.maximum_output_bytes {
+            if output_bytes > execution_policy.maximum_output_bytes {
                 return Err(RunError::OutputLimitExceeded(group.name.clone()));
             }
             let events = self.harness.decode_events(group, &output, is_cancelled)?;
             if events.len() > group.maximum_events as usize {
                 return Err(RunError::EventLimitExceeded(group.name.clone()));
             }
+            validate_decoded_group_prefix(group, &events, is_cancelled)?;
             let result = self.harness.summarize(
                 ImageSummaryRequest {
                     group,
@@ -496,7 +603,8 @@ impl TestRunner<'_> {
             )?;
             let command_digest = self.harness.command_digest(&command, is_cancelled)?;
             let event_stream_digest = self.harness.event_stream_digest(&events, is_cancelled)?;
-            if result.evidence.image_digest != Some(artifact.digest())
+            if result.group != group.id
+                || result.evidence.image_digest != Some(artifact.digest())
                 || result.evidence.target_digest != plan.build.target_package
                 || result.evidence.emulator_digest != Some(emulator.digest())
                 || result.evidence.scenario_digest != scenario.map(|item| item.digest)
@@ -513,13 +621,158 @@ impl TestRunner<'_> {
             build: plan.build.clone(),
             started_unix_ns: None,
             duration_ns: None,
-            unit: request.comptime_results.to_vec(),
+            unit,
             images,
         };
-        report
-            .seal_against(request.plan)
-            .map_err(RunError::InvalidReport)
+        seal_report(report, request.plan, is_cancelled)
     }
+}
+
+fn try_runner_vec<T>(capacity: usize, resource: &'static str) -> Result<Vec<T>, RunError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(capacity)
+        .map_err(|_| RunError::ResourceExhausted(resource))?;
+    Ok(output)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProtocolExecutionPolicy {
+    pub(crate) limits: ProtocolLimits,
+    pub(crate) maximum_output_bytes: u64,
+}
+
+pub(crate) fn protocol_execution_policy(
+    group: &FullImageTestGroup,
+) -> Result<ProtocolExecutionPolicy, RunError> {
+    let limits = ProtocolLimits {
+        events: group.maximum_events,
+        ..ProtocolLimits::standard()
+    };
+    let protocol_stream_bytes = limits
+        .maximum_stream_bytes()
+        .map_err(|error| RunError::Protocol(error.to_string()))?;
+    let maximum_output_bytes = group.maximum_output_bytes.min(protocol_stream_bytes);
+    if maximum_output_bytes == 0 {
+        return Err(RunError::Protocol(
+            "protocol execution output limit must be nonzero".to_owned(),
+        ));
+    }
+    Ok(ProtocolExecutionPolicy {
+        limits,
+        maximum_output_bytes,
+    })
+}
+
+fn validate_decoded_group_prefix(
+    group: &FullImageTestGroup,
+    events: &[TestEvent],
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), RunError> {
+    if is_cancelled() {
+        return Err(RunError::Cancelled);
+    }
+    if events.is_empty() {
+        return Ok(());
+    }
+    let first_test = group.tests.first().map(|test| test.descriptor.id.0);
+    let is_planned = |test: wrela_test_model::TestId| {
+        let Some(first_test) = first_test else {
+            return false;
+        };
+        test.0
+            .checked_sub(first_test)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .and_then(|index| group.tests.get(index))
+            .is_some_and(|planned| planned.descriptor.id == test)
+    };
+    let planned_count = u32::try_from(group.tests.len()).map_err(|_| {
+        RunError::UnexpectedTestEvent("planned test count does not fit the protocol".to_owned())
+    })?;
+    for (index, event) in events.iter().enumerate() {
+        if index & 1023 == 0 && is_cancelled() {
+            return Err(RunError::Cancelled);
+        }
+        match &event.kind {
+            wrela_test_model::TestEventKind::RunStarted { test_count } => {
+                if index != 0 || *test_count != planned_count {
+                    return Err(RunError::UnexpectedTestEvent(format!(
+                        "RunStarted count {test_count} differs from selected group count {planned_count}"
+                    )));
+                }
+            }
+            wrela_test_model::TestEventKind::TestStarted { test }
+            | wrela_test_model::TestEventKind::AssertionFailed { test, .. }
+            | wrela_test_model::TestEventKind::TestFinished { test, .. } => {
+                if !is_planned(*test) {
+                    return Err(RunError::UnexpectedTestEvent(format!(
+                        "event references test id {} outside the selected group",
+                        test.0
+                    )));
+                }
+            }
+            wrela_test_model::TestEventKind::Log {
+                test: Some(test), ..
+            } => {
+                if !is_planned(*test) {
+                    return Err(RunError::UnexpectedTestEvent(format!(
+                        "log references test id {} outside the selected group",
+                        test.0
+                    )));
+                }
+            }
+            wrela_test_model::TestEventKind::Log { test: None, .. }
+            | wrela_test_model::TestEventKind::Heartbeat { .. }
+            | wrela_test_model::TestEventKind::RunFinished { .. } => {}
+        }
+    }
+    if is_cancelled() {
+        return Err(RunError::Cancelled);
+    }
+    Ok(())
+}
+
+fn seal_report(
+    report: TestReport,
+    plan: &ValidatedTestPlan,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<ValidatedTestReport, RunError> {
+    report
+        .seal_against_with_cancellation(plan, is_cancelled)
+        .map_err(RunError::InvalidReport)
+}
+
+fn valid_preexecution_result(
+    result: &ImageGroupResult,
+    group: &FullImageTestGroup,
+    plan: &wrela_test_model::TestPlan,
+) -> bool {
+    let expected_scenario = match group.root {
+        ImageRoot::GeneratedHarness { .. } => None,
+        ImageRoot::Declared { scenario, .. } => plan
+            .scenarios
+            .get(scenario.0 as usize)
+            .map(|item| item.digest),
+    };
+    matches!(
+        result.infrastructure_failure,
+        Some(TestOutcome::Failed {
+            phase: FailurePhase::Discovery | FailurePhase::Compile | FailurePhase::Link,
+            ..
+        }) | Some(TestOutcome::TimedOut {
+            phase: FailurePhase::Discovery | FailurePhase::Compile | FailurePhase::Link,
+            ..
+        })
+    ) && result.cases.is_empty()
+        && result.events.is_empty()
+        && result.evidence.image_digest.is_none()
+        && result.evidence.target_digest == plan.build.target_package
+        && result.evidence.emulator_digest.is_none()
+        && result.evidence.scenario_digest == expected_scenario
+        && result.evidence.command_digest.is_none()
+        && result.evidence.event_stream_digest.is_none()
+        && result.evidence.exit_code.is_none()
+        && result.evidence.stderr.len() as u64 <= group.maximum_output_bytes
 }
 
 fn valid_process_shape(command: &ProcessSpecification, limits: RunnerLimits) -> bool {
@@ -530,6 +783,14 @@ fn valid_process_shape(command: &ProcessSpecification, limits: RunnerLimits) -> 
     }
     let path_bytes = [command.program.path(), &command.current_directory]
         .into_iter()
+        .chain(
+            command
+                .shutdown_control
+                .iter()
+                .map(|control| match control {
+                    ProcessShutdownControl::QmpUnix { path } => path.as_path(),
+                }),
+        )
         .chain(
             command
                 .inputs
@@ -563,6 +824,38 @@ fn valid_process_shape(command: &ProcessSpecification, limits: RunnerLimits) -> 
             .all(|argument| !argument.as_encoded_bytes().contains(&0))
 }
 
+fn valid_shutdown_control(
+    working_directory: &Path,
+    control: &Option<ProcessShutdownControl>,
+    scenario: Option<&ImageScenario>,
+) -> bool {
+    let required = scenario.is_some_and(|scenario| {
+        scenario.steps.iter().any(|step| {
+            matches!(
+                step,
+                wrela_test_model::ImageScenarioStep::RequestShutdown { .. }
+            )
+        })
+    });
+    match (required, control) {
+        (false, None) => true,
+        (true, Some(ProcessShutdownControl::QmpUnix { path })) => {
+            private_child(working_directory, path)
+                && path.file_name().and_then(|name| name.to_str()) == Some("qmp.sock")
+                && valid_qmp_unix_path(path)
+        }
+        (false, Some(_)) | (true, None) => false,
+    }
+}
+
+/// Returns whether an absolute QMP Unix-socket pathname fits the sealed
+/// cross-Unix kernel boundary and contains no embedded NUL byte.
+#[must_use]
+pub fn valid_qmp_unix_path(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    normal_absolute_path(path) && bytes.len() <= MAX_QMP_UNIX_PATH_BYTES && !bytes.contains(&0)
+}
+
 fn valid_process_inputs(
     working_directory: &Path,
     inputs: &[ProcessInput],
@@ -588,8 +881,6 @@ fn valid_exact_process_inputs(
     inputs: &[ProcessInput],
     expected: &[(VerifiedProcessFile, bool)],
 ) -> bool {
-    let source_paths: std::collections::BTreeSet<_> =
-        inputs.iter().map(|input| input.source.path()).collect();
     if inputs.len() != expected.len()
         || !inputs
             .windows(2)
@@ -600,7 +891,11 @@ fn valid_exact_process_inputs(
                 || !private_child(working_directory, &input.destination)
                 || input.source.path() == input.destination
         })
-        || source_paths.len() != inputs.len()
+        || inputs.iter().enumerate().any(|(index, input)| {
+            inputs[..index]
+                .iter()
+                .any(|prior| prior.source.path() == input.source.path())
+        })
     {
         return false;
     }
@@ -624,24 +919,56 @@ fn safe_working_directory(root: &Path, candidate: &Path) -> bool {
 }
 
 fn normal_absolute_path(path: &Path) -> bool {
-    let normalized: PathBuf = path.components().collect();
-    path.is_absolute()
-        && !path.as_os_str().is_empty()
-        && normalized.as_os_str() == path.as_os_str()
-        && !path.components().any(|component| {
+    if !path.is_absolute() || path.as_os_str().is_empty() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let bytes = path.as_os_str().as_encoded_bytes();
+        bytes.first() == Some(&b'/')
+            && (bytes.len() == 1 || bytes.last() != Some(&b'/'))
+            && bytes
+                .split(|byte| *byte == b'/')
+                .enumerate()
+                .all(|(index, component)| {
+                    (index == 0 && component.is_empty())
+                        || (!component.is_empty() && component != b"." && component != b"..")
+                })
+    }
+    #[cfg(not(unix))]
+    {
+        !path.components().any(|component| {
             matches!(
                 component,
                 std::path::Component::ParentDir | std::path::Component::CurDir
             )
         })
+    }
 }
 
 #[derive(Debug)]
 pub enum ExecuteError {
+    InvalidSpecification(&'static str),
+    Verification {
+        path: PathBuf,
+        reason: &'static str,
+    },
+    Stage {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+    Cleanup {
+        path: PathBuf,
+        error: std::io::Error,
+    },
     Spawn(std::io::Error),
     Wait(std::io::Error),
+    Scenario(String),
     Cancelled,
-    OutputLimit { stream: &'static str, limit: u64 },
+    OutputLimit {
+        stream: &'static str,
+        limit: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -661,10 +988,12 @@ pub enum RunError {
     MissingEmulator,
     MissingFirmware,
     InvalidInvocation(String),
+    ResourceExhausted(&'static str),
     OutputLimitExceeded(String),
     EventLimitExceeded(String),
     Execute(ExecuteError),
     GuestProtocol(TestModelError),
+    Protocol(String),
     MissingTerminalEvent,
     DuplicateTerminalEvent,
     EventSequence { expected: u64, actual: u64 },
@@ -707,6 +1036,9 @@ impl fmt::Display for RunError {
             Self::InvalidInvocation(message) => {
                 write!(formatter, "invalid emulator invocation: {message}")
             }
+            Self::ResourceExhausted(resource) => {
+                write!(formatter, "cannot allocate bounded test-runner {resource}")
+            }
             Self::OutputLimitExceeded(group) => {
                 write!(formatter, "image group {group:?} exceeded its output limit")
             }
@@ -715,6 +1047,7 @@ impl fmt::Display for RunError {
             }
             Self::Execute(error) => write!(formatter, "emulator execution failed: {error:?}"),
             Self::GuestProtocol(error) => error.fmt(formatter),
+            Self::Protocol(message) => write!(formatter, "invalid guest test protocol: {message}"),
             Self::MissingTerminalEvent => {
                 formatter.write_str("guest test stream ended without RunFinished")
             }
@@ -745,11 +1078,30 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        ImageArtifact, ProcessInput, VerifiedProcessFile, safe_working_directory,
-        valid_exact_process_inputs,
+        ImageArtifact, MAX_QMP_UNIX_PATH_BYTES, ProcessInput, VerifiedProcessFile,
+        protocol_execution_policy, safe_working_directory, seal_report, valid_exact_process_inputs,
+        valid_preexecution_result, valid_qmp_unix_path, validate_decoded_group_prefix,
     };
     use wrela_build_model::{BuildIdentity, LanguageRevision, Sha256Digest, TargetIdentity};
-    use wrela_test_model::ImageGroupId;
+    use wrela_test_model::{
+        FailurePhase, FullImageTestGroup, FunctionKey, ImageExecutionEvidence, ImageGroupId,
+        ImageGroupResult, ImageRoot, ImageTest, ImageTestInvocation, TEST_PLAN_SCHEMA,
+        TEST_PROTOCOL_VERSION, TEST_REPORT_SCHEMA, TestDescriptor, TestEvent, TestEventKind,
+        TestId, TestKind, TestOutcome, TestPlan, TestPlanLimits, TestReport,
+    };
+
+    fn build_identity(digest: Sha256Digest) -> BuildIdentity {
+        BuildIdentity {
+            compiler: digest,
+            language: LanguageRevision::Design0_1,
+            target: TargetIdentity::aarch64_qemu_virt_uefi(),
+            target_package: digest,
+            standard_library: digest,
+            source_graph: digest,
+            request: digest,
+            profile: digest,
+        }
+    }
 
     #[test]
     fn emulator_working_directories_cannot_escape_or_alias() {
@@ -766,6 +1118,32 @@ mod tests {
             Path::new("/private/./wrela/tests"),
             Path::new("/private/wrela/tests/group")
         ));
+        assert!(!safe_working_directory(
+            Path::new("/private//wrela/tests"),
+            Path::new("/private/wrela/tests/group")
+        ));
+        assert!(!safe_working_directory(
+            Path::new("/private/wrela/tests/"),
+            Path::new("/private/wrela/tests/group")
+        ));
+    }
+
+    #[test]
+    fn qmp_unix_path_contract_accepts_103_and_rejects_104_bytes() {
+        let exact = PathBuf::from(format!(
+            "/{}/qmp.sock",
+            "a".repeat(MAX_QMP_UNIX_PATH_BYTES - 10)
+        ));
+        let over = PathBuf::from(format!(
+            "/{}/qmp.sock",
+            "a".repeat(MAX_QMP_UNIX_PATH_BYTES - 9)
+        ));
+        assert_eq!(exact.as_os_str().as_encoded_bytes().len(), 103);
+        assert_eq!(over.as_os_str().as_encoded_bytes().len(), 104);
+        assert!(valid_qmp_unix_path(&exact));
+        assert!(!valid_qmp_unix_path(&over));
+        assert!(!valid_qmp_unix_path(Path::new("/private/qmp\0.sock")));
+        assert!(!valid_qmp_unix_path(Path::new("relative/qmp.sock")));
     }
 
     #[test]
@@ -781,16 +1159,7 @@ mod tests {
             digest,
             bytes: 128,
             group: ImageGroupId(0),
-            build: BuildIdentity {
-                compiler: digest,
-                language: LanguageRevision::Design0_1,
-                target: TargetIdentity::aarch64_qemu_virt_uefi(),
-                target_package: digest,
-                standard_library: digest,
-                source_graph: digest,
-                request: digest,
-                profile: digest,
-            },
+            build: build_identity(digest),
         };
         let firmware_code = verified("/toolchain/firmware/code.fd", 3);
         let firmware_variables = verified("/toolchain/firmware/vars.fd", 4);
@@ -825,5 +1194,166 @@ mod tests {
             .expect("writable variables")
             .writable = false;
         assert!(!valid_exact_process_inputs(root, &inputs, &expected));
+    }
+
+    #[test]
+    fn preexecution_results_are_limited_to_unrun_compile_and_link_failures() {
+        let digest = Sha256Digest::from_bytes([9; 32]);
+        let group = FullImageTestGroup {
+            id: ImageGroupId(0),
+            name: "integration".to_owned(),
+            root: ImageRoot::GeneratedHarness {
+                harness_name: "generated".to_owned(),
+            },
+            tests: Vec::new(),
+            deterministic_seed: None,
+            boot_timeout_ns: 1,
+            shutdown_timeout_ns: 1,
+            maximum_events: 1,
+            maximum_output_bytes: 16,
+        };
+        let plan = TestPlan {
+            schema: TEST_PLAN_SCHEMA,
+            build: build_identity(digest),
+            target: TargetIdentity::aarch64_qemu_virt_uefi(),
+            scenarios: Vec::new(),
+            unit_tests: Vec::new(),
+            image_groups: vec![group.clone()],
+        };
+        let mut result = ImageGroupResult {
+            group: group.id,
+            cases: Vec::new(),
+            events: Vec::new(),
+            evidence: ImageExecutionEvidence {
+                image_digest: None,
+                target_digest: digest,
+                emulator_digest: None,
+                scenario_digest: None,
+                command_digest: None,
+                event_stream_digest: None,
+                exit_code: None,
+                stderr: Vec::new(),
+            },
+            infrastructure_failure: Some(TestOutcome::Failed {
+                phase: FailurePhase::Compile,
+                message: "compile failed".to_owned(),
+            }),
+        };
+        assert!(valid_preexecution_result(&result, &group, &plan));
+        result.infrastructure_failure = Some(TestOutcome::Failed {
+            phase: FailurePhase::Runtime,
+            message: "runtime failed".to_owned(),
+        });
+        assert!(!valid_preexecution_result(&result, &group, &plan));
+        result.infrastructure_failure = Some(TestOutcome::Failed {
+            phase: FailurePhase::Link,
+            message: "link failed".to_owned(),
+        });
+        result.evidence.image_digest = Some(digest);
+        assert!(!valid_preexecution_result(&result, &group, &plan));
+    }
+
+    #[test]
+    fn report_sealing_preserves_plan_policy_and_cancellation() {
+        let digest = Sha256Digest::from_bytes([0x41; 32]);
+        let mut plan_limits = TestPlanLimits::standard();
+        plan_limits.report_bytes = 1;
+        let plan = TestPlan {
+            schema: TEST_PLAN_SCHEMA,
+            build: build_identity(digest),
+            target: TargetIdentity::aarch64_qemu_virt_uefi(),
+            scenarios: Vec::new(),
+            unit_tests: Vec::new(),
+            image_groups: Vec::new(),
+        }
+        .seal_with_limits(plan_limits)
+        .expect("empty plan seals under an explicit retained policy");
+        assert_eq!(plan.limits(), plan_limits);
+        let report = TestReport {
+            schema: TEST_REPORT_SCHEMA,
+            build: plan.as_plan().build.clone(),
+            started_unix_ns: None,
+            duration_ns: None,
+            unit: Vec::new(),
+            images: Vec::new(),
+        };
+        assert!(matches!(
+            seal_report(report, &plan, &|| true),
+            Err(super::RunError::InvalidReport(
+                wrela_test_model::TestModelError::Cancelled
+            ))
+        ));
+    }
+
+    #[test]
+    fn decoded_lifecycle_is_bound_to_the_selected_compiled_group() {
+        let digest = Sha256Digest::from_bytes([0x51; 32]);
+        let group = FullImageTestGroup {
+            id: ImageGroupId(0),
+            name: "selected".to_owned(),
+            root: ImageRoot::GeneratedHarness {
+                harness_name: "generated".to_owned(),
+            },
+            tests: vec![ImageTest {
+                descriptor: TestDescriptor {
+                    id: TestId(7),
+                    name: "selected test".to_owned(),
+                    kind: TestKind::IntegrationImage,
+                    source: None,
+                    timeout_ns: 1,
+                },
+                invocation: ImageTestInvocation::GeneratedFunction {
+                    function_key: FunctionKey(digest),
+                },
+                assertions: Vec::new(),
+            }],
+            deterministic_seed: None,
+            boot_timeout_ns: 1,
+            shutdown_timeout_ns: 1,
+            maximum_events: 4,
+            maximum_output_bytes: 1024,
+        };
+        let stale_count = [TestEvent {
+            protocol: TEST_PROTOCOL_VERSION,
+            sequence: 0,
+            kind: TestEventKind::RunStarted { test_count: 2 },
+        }];
+        assert!(matches!(
+            validate_decoded_group_prefix(&group, &stale_count, &|| false),
+            Err(super::RunError::UnexpectedTestEvent(_))
+        ));
+
+        let foreign_test = [
+            TestEvent {
+                protocol: TEST_PROTOCOL_VERSION,
+                sequence: 0,
+                kind: TestEventKind::RunStarted { test_count: 1 },
+            },
+            TestEvent {
+                protocol: TEST_PROTOCOL_VERSION,
+                sequence: 1,
+                kind: TestEventKind::TestStarted { test: TestId(8) },
+            },
+        ];
+        assert!(matches!(
+            validate_decoded_group_prefix(&group, &foreign_test, &|| false),
+            Err(super::RunError::UnexpectedTestEvent(_))
+        ));
+        assert!(matches!(
+            validate_decoded_group_prefix(&group, &[], &|| true),
+            Err(super::RunError::Cancelled)
+        ));
+
+        let mut protocol_capped = group;
+        protocol_capped.maximum_events = 1;
+        protocol_capped.maximum_output_bytes = u64::MAX;
+        let policy = protocol_execution_policy(&protocol_capped).expect("bounded protocol policy");
+        assert_eq!(
+            policy.maximum_output_bytes,
+            policy
+                .limits
+                .maximum_stream_bytes()
+                .expect("maximum protocol stream")
+        );
     }
 }

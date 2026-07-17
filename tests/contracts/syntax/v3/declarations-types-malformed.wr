@@ -1,0 +1,36 @@
+module contracts.declarations_types_malformed
+
+type Alias = u64
+data Packet
+actor Worker
+
+struct Broken[const N, region, T:]:
+    @budget(bound=1) pub wrong_order: u64
+    empty_arguments: Name[]
+    missing_array_separator: [u8 4]
+    grouped_type: (u8)
+    missing_iso_brackets: iso u8
+    missing_function_arrow: fn(u8) u8
+
+iface Invalid:
+    @budget(bound=1)
+    field: u64
+
+impl Reader[u64] for Broken:
+    field: u64
+    pub fn visible_member():
+        pass
+
+projection invalid_carrier() -> u64 from source:
+    pass
+
+projection missing_source() -> view u64 from:
+    pass
+
+scope missing_binding() -> unit:
+    enter unit
+    exit:
+        pass
+
+comptime if true:
+    nonsense

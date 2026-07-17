@@ -1,0 +1,96 @@
+module contracts.declarations_types
+
+const LIMIT: usize = 64
+brand PacketPool
+
+struct Empty:
+    pass
+
+struct Packet[T: Serializable, const N: usize, region R,]:
+    pub @offset(0) @wire(version=1) bytes: [u8; N + 1]
+    bounded: Bytes[..N]
+    pair: (T, unit,)
+    callback: fn(read Bytes, mut T, take Packet[T, N, R],) -> Result[T, Error]
+    async_callback: async fn(T,) -> unit
+    borrowed: view T
+    borrowed_mut: mut view T
+    owned: iso[PacketPool] T
+
+@service
+class Service[T] implements Reader[T], core.Closeable,:
+    state: iso[PacketPool] State
+
+    init(mut self, state: iso[PacketPool] State):
+        self.state = take state
+
+    pub fn run[U, const M: usize, region Q](read self, input: (U, bool,), take payload: Bytes[..M]) -> Result[unit, Error]:
+        pass
+
+    @budget(bound=1)
+    async fn poll(read self) -> unit:
+        pass
+
+    const INITIAL: u64 = 0
+
+    projection state_view(read self) -> view State from self:
+        yield self.state
+
+    comptime if true:
+        enabled: bool = true
+    comptime else:
+        disabled: bool
+
+enum Outcome[T]:
+    empty
+    marker()
+    value(T,)
+    pair(T, u64,)
+    named(code: u32, payload: T,)
+
+iface Reader[T]:
+    @budget(bound=1)
+    fn fetch(read self, key: u64) -> Result[T, Error]
+
+    async fn poll(read self) -> unit
+    isr fn interrupt(self)
+    comptime fn default_value() -> T
+    projection inspect(read self) -> Option[(view T, mut view T,)] from self
+
+impl Reader[u64] for Service[u64]:
+    @budget(bound=1)
+    fn fetch(read self, key: u64) -> Result[u64, Error]:
+        return key
+
+    projection inspect(read self) -> Result[view State, Missing] from self:
+        yield self.state
+
+projection locate[T](mut buffer: Buffer[T], index: usize,)
+    -> Result[Option[view T], Missing] from buffer, index:
+    yield buffer.items[index]
+
+@suspend_safe
+scope replace(mut owner: Owner, index: usize) -> Replacement:
+    prepared = owner.begin(index)
+    enter prepared
+    abort:
+        owner.rollback()
+    exit replacement:
+        owner.finish(mut replacement)
+
+fn synchronous(value: u64)
+    -> u64:
+    return value
+
+async fn asynchronous() -> unit:
+    pass
+
+isr fn interrupt(self):
+    pass
+
+comptime fn capacity[const N: usize]() -> usize:
+    return N
+
+comptime if true:
+    const FEATURE: bool = true
+comptime else:
+    brand DisabledPool

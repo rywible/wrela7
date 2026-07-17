@@ -1,0 +1,26 @@
+module contracts.statements_expressions_malformed
+
+fn malformed(value: u64, actor: Actor):
+    pass; if true:
+        pass
+    if true:; pass
+        pass
+    match value:
+        case -name:
+            pass
+        case (bind item):
+            pass
+        case [take,]:
+            pass
+    send value
+    bad_race = race(value)
+    bad_send = try send value
+    bad_args = actor.call(named=value, value)
+    bad_mut_literal = actor.call(mut 1)
+    bad_take_call = actor.call(take actor.fetch())
+    bad_mut_binary = actor.call(mut value + 1)
+    bad_closure = |item| item
+    bad_format = f"{value:}"
+    bad_ascii = f"{value:é}"
+    bad_open = f"{value"
+    return value

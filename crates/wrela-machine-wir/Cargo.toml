@@ -12,6 +12,8 @@ wrela-build-model = { path = "../wrela-build-model" }
 wrela-runtime-abi = { path = "../wrela-runtime-abi" }
 wrela-source = { path = "../wrela-source" }
 wrela-target = { path = "../wrela-target" }
+wrela-test-model = { path = "../wrela-test-model" }
+wrela-test-protocol = { path = "../wrela-test-protocol" }
 
 [lints]
 workspace = true

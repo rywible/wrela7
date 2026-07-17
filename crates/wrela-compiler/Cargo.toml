@@ -10,10 +10,12 @@ license.workspace = true
 [dependencies]
 wrela-backend = { path = "../wrela-backend" }
 wrela-build-model = { path = "../wrela-build-model" }
+wrela-diagnostics = { path = "../wrela-diagnostics" }
 wrela-driver = { path = "../wrela-driver" }
 wrela-flow-lower = { path = "../wrela-flow-lower" }
 wrela-flow-wir-codec = { path = "../wrela-flow-wir-codec" }
 wrela-format = { path = "../wrela-format" }
+wrela-hir = { path = "../wrela-hir" }
 wrela-hir-lower = { path = "../wrela-hir-lower" }
 wrela-image-report = { path = "../wrela-image-report" }
 wrela-lint = { path = "../wrela-lint" }
@@ -21,11 +23,15 @@ wrela-package-loader = { path = "../wrela-package-loader" }
 wrela-package = { path = "../wrela-package" }
 wrela-sema = { path = "../wrela-sema" }
 wrela-semantic-lower = { path = "../wrela-semantic-lower" }
+wrela-source = { path = "../wrela-source" }
 wrela-syntax = { path = "../wrela-syntax" }
 wrela-target = { path = "../wrela-target" }
 wrela-test-model = { path = "../wrela-test-model" }
 wrela-test-runner = { path = "../wrela-test-runner" }
 wrela-toolchain = { path = "../wrela-toolchain" }
+
+[dev-dependencies]
+wrela-link-efi = { path = "../wrela-link-efi" }
 
 [lints]
 workspace = true

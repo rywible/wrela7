@@ -1,0 +1,55 @@
+schema = 1
+name = "aarch64-qemu-virt-uefi"
+[semantic]
+architecture = "aarch64"
+pointer_width = 64
+endianness = "little"
+uefi_revision = "2.11"
+coherent_dma = false
+iommu_available = false
+[semantic.interrupts]
+controller = "gic-v3"
+nested_preemption = false
+[semantic.platform]
+machine = "qemu-virt"
+virtio_mmio_base = 0x0a000000
+virtio_mmio_size = 0x200
+virtio_mmio_gic_spi = 16
+virtio_mmio_gic_intid = 48
+[backend]
+llvm_triple = "aarch64-unknown-uefi"
+llvm_data_layout = "e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32"
+llvm_cpu = "cortex-a57"
+llvm_features = ["+reserve-x18"]
+coff_machine = "arm64"
+object_format = "coff"
+image_format = "pe-coff"
+subsystem = "efi_application"
+entry = "wrela_image_entry"
+runtime_object = "runtime/wrela-runtime-aarch64.obj"
+runtime_abi_version = 2
+[backend.interrupts]
+controller = "gic-v3"
+vector_table_alignment = 2048
+stack_alignment = 16
+nested_preemption = false
+saves_simd = false
+cpu_irq_masked_during_handler = true
+eoi_deactivates = true
+spurious_global_id_minimum = 1020
+[backend.link]
+driver = "lld-coff"
+dynamic_linking = false
+default_libraries = false
+relocations = true
+[runner]
+emulator = "qemu-system-aarch64"
+machine = "virt-10.0,gic-version=3,secure=off"
+cpu = "cortex-a57"
+accelerator = "tcg,thread=single"
+memory_mib = 512
+virtual_cpus = 1
+firmware_code = "firmware/QEMU_EFI.fd"
+firmware_variables_template = "firmware/QEMU_VARS.fd"
+boot = "virtio-block-fat"
+test_transport = "pl011-framed"

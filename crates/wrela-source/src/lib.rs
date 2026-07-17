@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use unicode_normalization::UnicodeNormalization;
-use wrela_build_model::Sha256Digest;
+pub use wrela_build_model::Sha256Digest;
 
 /// Maximum UTF-8 size of a canonical compilation-wide source path.
 ///
@@ -137,7 +137,13 @@ impl SourceDatabase {
     pub fn add(&mut self, input: SourceInput) -> Result<FileId, SourceError> {
         let SourceInput { path, text, digest } = input;
         validate_source_path(&path)?;
-        let portable_path = path.to_ascii_lowercase();
+        let mut portable_path = String::new();
+        portable_path
+            .try_reserve_exact(path.len())
+            .map_err(|_| SourceError::ResourceExhausted("portable source path"))?;
+        for character in path.chars() {
+            portable_path.push(character.to_ascii_lowercase());
+        }
         if self.portable_paths.contains(&portable_path) {
             return Err(SourceError::PortablePathCollision(path));
         }
@@ -159,7 +165,20 @@ impl SourceDatabase {
                 .try_into()
                 .map_err(|_| SourceError::TooManyFiles)?,
         );
-        let mut line_starts = vec![0];
+        let line_start_count = text
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            .checked_add(1)
+            .ok_or(SourceError::TooManyLines)?;
+        if line_start_count > u32::MAX as usize {
+            return Err(SourceError::TooManyLines);
+        }
+        let mut line_starts = Vec::new();
+        line_starts
+            .try_reserve_exact(line_start_count)
+            .map_err(|_| SourceError::ResourceExhausted("source line index"))?;
+        line_starts.push(0);
         for (index, byte) in text.bytes().enumerate() {
             if byte == b'\n' {
                 let next = index + 1;
@@ -168,6 +187,9 @@ impl SourceDatabase {
                 }
             }
         }
+        self.files
+            .try_reserve(1)
+            .map_err(|_| SourceError::ResourceExhausted("source file table"))?;
         self.portable_paths.insert(portable_path);
         self.files.push(SourceFile {
             id,
@@ -213,6 +235,8 @@ pub enum SourceError {
     NonCanonicalPathOrder { previous: String, next: String },
     FileTooLarge(usize),
     TooManyFiles,
+    TooManyLines,
+    ResourceExhausted(&'static str),
 }
 
 impl fmt::Display for SourceError {
@@ -239,6 +263,10 @@ impl fmt::Display for SourceError {
                 )
             }
             Self::TooManyFiles => formatter.write_str("source database exceeds 32-bit file IDs"),
+            Self::TooManyLines => formatter.write_str("source file exceeds 32-bit line IDs"),
+            Self::ResourceExhausted(resource) => {
+                write!(formatter, "cannot allocate bounded {resource}")
+            }
         }
     }
 }
@@ -254,7 +282,7 @@ fn validate_source_path(value: &str) -> Result<(), SourceError> {
             "path exceeds {MAX_SOURCE_PATH_BYTES} UTF-8 bytes"
         )));
     }
-    if value.nfc().collect::<String>() != value {
+    if !value.nfc().eq(value.chars()) {
         return Err(SourceError::InvalidPath(
             "path is not in Unicode NFC".to_owned(),
         ));

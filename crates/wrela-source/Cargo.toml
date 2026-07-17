@@ -11,5 +11,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-unicode-normalization = "0.1.25"
+unicode-normalization = "=0.1.24"
 wrela-build-model = { path = "../wrela-build-model" }

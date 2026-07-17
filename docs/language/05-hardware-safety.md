@@ -29,7 +29,7 @@ pub class BlkDriver:
     irq_regs: Mmio[VirtioIrqMmio]
     queue: VirtQueue[128]
 
-    fn __init__(mut self, take cap: DeviceCap[VirtioBlock],
+    init(mut self, take cap: DeviceCap[VirtioBlock],
                 take pool: DmaPool[BlockDma, 256.KiB]):
         claimed = VirtioBlock.claim(take cap)
         self.irq_regs = claimed.map_partition(VirtioIrqMmio)

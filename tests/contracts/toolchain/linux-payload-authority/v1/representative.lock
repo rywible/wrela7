@@ -1,0 +1,8 @@
+schema=1
+route=linux-arm64-direct
+host=aarch64-unknown-linux-musl
+engine_protocol=1
+toolchain_manifest_sha256=1348324275e8ac58548ad2e467f9b1788d779e435ce19ab26145bf6528089d2a
+toolchain_manifest_bytes=1914
+frontend_engine_sha256=2121212121212121212121212121212121212121212121212121212121212121
+frontend_engine_bytes=12345

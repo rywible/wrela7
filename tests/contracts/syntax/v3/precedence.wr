@@ -1,0 +1,6 @@
+module contracts.precedence
+
+fn precedence(a: u64, b: u64, c: u64) -> bool:
+    value = not a + b * c << 2 & 7 ^ 1 | 8 .. 10 < 11 and true or false
+    converted = (await service.load()?).field[0] as u64
+    return value

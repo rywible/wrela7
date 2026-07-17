@@ -19,6 +19,9 @@ pub struct FormatOptions {
     pub maximum_line_width: u16,
     pub line_ending: LineEnding,
     pub trailing_newline: bool,
+    /// Maximum number of canonical, non-overlapping edits a formatter may
+    /// return for one file.
+    pub maximum_edits: u32,
     /// Aggregate ceiling for the complete formatted file and replacement text.
     pub maximum_output_bytes: u64,
 }
@@ -30,6 +33,7 @@ impl Default for FormatOptions {
             maximum_line_width: 100,
             line_ending: LineEnding::Lf,
             trailing_newline: true,
+            maximum_edits: 1_000_000,
             maximum_output_bytes: 256 * 1024 * 1024,
         }
     }
@@ -50,6 +54,11 @@ impl FormatOptions {
         if self.maximum_output_bytes == 0 {
             return Err(FormatError::InvalidOptions(
                 "maximum output bytes must be nonzero",
+            ));
+        }
+        if self.maximum_edits == 0 {
+            return Err(FormatError::InvalidOptions(
+                "maximum edit count must be nonzero",
             ));
         }
         Ok(())
@@ -126,6 +135,8 @@ pub fn seal_format_output(
     candidate: FormatOutputCandidate,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<FormatOutput, FormatError> {
+    const CANCELLATION_INTERVAL: usize = 256;
+
     if is_cancelled() {
         return Err(FormatError::Cancelled);
     }
@@ -164,18 +175,31 @@ pub fn seal_format_output(
         });
     }
     if request.range.is_none() {
-        validate_line_policy(&candidate.formatted, request.options)?;
+        validate_line_policy(&candidate.formatted, request.options, is_cancelled)?;
+    }
+    if u32::try_from(candidate.edits.len())
+        .map_or(true, |edits| edits > request.options.maximum_edits)
+    {
+        return Err(FormatError::TooManyEdits {
+            limit: request.options.maximum_edits,
+        });
     }
 
     let mut replacement_bytes = 0u64;
     let mut previous_end = 0u32;
-    for edit in &candidate.edits {
+    for (work, edit) in candidate.edits.iter().enumerate() {
+        if work % CANCELLATION_INTERVAL == 0 && is_cancelled() {
+            return Err(FormatError::Cancelled);
+        }
+        let original = request
+            .source
+            .slice(edit.range)
+            .ok_or(FormatError::InvalidEdits)?;
         if edit.file != request.source.id()
-            || request.source.slice(edit.range).is_none()
             || edit.range.start < effective_range.start
             || edit.range.end > effective_range.end
             || edit.range.start < previous_end
-            || request.source.slice(edit.range) == Some(edit.replacement.as_str())
+            || equal_text(original, &edit.replacement, is_cancelled)?
         {
             return Err(FormatError::InvalidEdits);
         }
@@ -190,7 +214,7 @@ pub fn seal_format_output(
                 limit: request.options.maximum_output_bytes,
             })?;
         if request.range.is_some() {
-            validate_line_endings(&edit.replacement, request.options.line_ending)?;
+            validate_line_endings(&edit.replacement, request.options.line_ending, is_cancelled)?;
         }
     }
     if replacement_bytes > request.options.maximum_output_bytes {
@@ -198,9 +222,15 @@ pub fn seal_format_output(
             limit: request.options.maximum_output_bytes,
         });
     }
-    let reconstructed = apply_edits(request.source, &candidate.edits, formatted_bytes)?;
-    let changed = candidate.formatted != request.source.text();
-    if reconstructed != candidate.formatted
+    let reconstructed = apply_edits(
+        request.source,
+        &candidate.edits,
+        formatted_bytes,
+        is_cancelled,
+    )?;
+    let reconstructed_matches = equal_text(&reconstructed, &candidate.formatted, is_cancelled)?;
+    let changed = !equal_text(&candidate.formatted, request.source.text(), is_cancelled)?;
+    if !reconstructed_matches
         || candidate.changed != changed
         || candidate.edits.is_empty() == changed
     {
@@ -220,25 +250,63 @@ fn apply_edits(
     source: &SourceFile,
     edits: &[TextEdit],
     output_bytes: u64,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<String, FormatError> {
+    const CANCELLATION_INTERVAL: usize = 256;
+
     let capacity = usize::try_from(output_bytes).map_err(|_| FormatError::OutputTooLarge {
         limit: output_bytes,
     })?;
-    let mut output = String::with_capacity(capacity);
+    let mut reconstructed_bytes = source.text().len();
+    for (work, edit) in edits.iter().enumerate() {
+        if work % CANCELLATION_INTERVAL == 0 && is_cancelled() {
+            return Err(FormatError::Cancelled);
+        }
+        let removed = (edit.range.end - edit.range.start) as usize;
+        reconstructed_bytes = reconstructed_bytes
+            .checked_sub(removed)
+            .and_then(|bytes| bytes.checked_add(edit.replacement.len()))
+            .ok_or(FormatError::InconsistentOutput)?;
+    }
+    if reconstructed_bytes != capacity {
+        return Err(FormatError::InconsistentOutput);
+    }
+
+    let mut output = String::new();
+    output
+        .try_reserve_exact(capacity)
+        .map_err(|_| FormatError::ResourceExhausted("reconstructed format output"))?;
     let mut cursor = 0usize;
-    for edit in edits {
+    for (work, edit) in edits.iter().enumerate() {
+        if work % CANCELLATION_INTERVAL == 0 && is_cancelled() {
+            return Err(FormatError::Cancelled);
+        }
         let start = edit.range.start as usize;
         let end = edit.range.end as usize;
-        output.push_str(&source.text()[cursor..start]);
+        output.push_str(
+            source
+                .text()
+                .get(cursor..start)
+                .ok_or(FormatError::InvalidEdits)?,
+        );
         output.push_str(&edit.replacement);
         cursor = end;
     }
-    output.push_str(&source.text()[cursor..]);
+    output.push_str(
+        source
+            .text()
+            .get(cursor..)
+            .ok_or(FormatError::InvalidEdits)?,
+    );
     Ok(output)
 }
 
-fn validate_line_policy(formatted: &str, options: &FormatOptions) -> Result<(), FormatError> {
-    validate_line_endings(formatted, options.line_ending)?;
+fn validate_line_policy(
+    formatted: &str,
+    options: &FormatOptions,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), FormatError> {
+    validate_line_endings(formatted, options.line_ending, is_cancelled)?;
     let newline = match options.line_ending {
         LineEnding::Lf => "\n",
         LineEnding::CrLf => "\r\n",
@@ -249,24 +317,65 @@ fn validate_line_policy(formatted: &str, options: &FormatOptions) -> Result<(), 
     Ok(())
 }
 
-fn validate_line_endings(formatted: &str, line_ending: LineEnding) -> Result<(), FormatError> {
+fn validate_line_endings(
+    formatted: &str,
+    line_ending: LineEnding,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), FormatError> {
     match line_ending {
         LineEnding::Lf => {
-            if formatted.as_bytes().contains(&b'\r') {
-                return Err(FormatError::InconsistentOutput);
+            for (work, byte) in formatted.bytes().enumerate() {
+                poll_text_work(work, is_cancelled)?;
+                if byte == b'\r' {
+                    return Err(FormatError::InconsistentOutput);
+                }
             }
         }
         LineEnding::CrLf => {
             let bytes = formatted.as_bytes();
-            if bytes.iter().enumerate().any(|(index, byte)| {
-                (*byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r'))
+            for (index, byte) in bytes.iter().enumerate() {
+                poll_text_work(index, is_cancelled)?;
+                if (*byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r'))
                     || (*byte == b'\r' && (index + 1 == bytes.len() || bytes[index + 1] != b'\n'))
-            }) {
-                return Err(FormatError::InconsistentOutput);
+                {
+                    return Err(FormatError::InconsistentOutput);
+                }
             }
         }
     }
     Ok(())
+}
+
+fn equal_text(
+    left: &str,
+    right: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, FormatError> {
+    const COMPARISON_CHUNK: usize = 64 * 1024;
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left
+        .as_bytes()
+        .chunks(COMPARISON_CHUNK)
+        .zip(right.as_bytes().chunks(COMPARISON_CHUNK))
+    {
+        if is_cancelled() {
+            return Err(FormatError::Cancelled);
+        }
+        if left != right {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn poll_text_work(work: usize, is_cancelled: &dyn Fn() -> bool) -> Result<(), FormatError> {
+    if work % 4096 == 0 && is_cancelled() {
+        Err(FormatError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,8 +388,10 @@ pub enum FormatError {
     WrongEffectiveRange,
     InvalidEdits,
     InconsistentOutput,
-    MalformedLosslessAst(String),
+    MalformedLosslessAst(&'static str),
+    TooManyEdits { limit: u32 },
     OutputTooLarge { limit: u64 },
+    ResourceExhausted(&'static str),
 }
 
 impl fmt::Display for FormatError {
@@ -311,8 +422,14 @@ impl fmt::Display for FormatError {
             Self::MalformedLosslessAst(reason) => {
                 write!(formatter, "cannot format malformed lossless AST: {reason}")
             }
+            Self::TooManyEdits { limit } => {
+                write!(formatter, "formatter output exceeds {limit} edits")
+            }
             Self::OutputTooLarge { limit } => {
                 write!(formatter, "formatted output exceeds {limit} bytes")
+            }
+            Self::ResourceExhausted(resource) => {
+                write!(formatter, "cannot allocate bounded {resource}")
             }
         }
     }
@@ -322,7 +439,42 @@ impl std::error::Error for FormatError {}
 
 #[cfg(test)]
 mod contract_tests {
-    use super::{FormatError, FormatOptions};
+    use std::cell::Cell;
+
+    use wrela_source::{Sha256Digest, SourceDatabase, SourceInput, TextRange};
+    use wrela_syntax::{ParseLimits, ParseRequest, SyntaxParser, WrelaSyntaxParser};
+
+    use super::{
+        FormatError, FormatOptions, FormatOutputCandidate, FormatRequest, TextEdit,
+        seal_format_output,
+    };
+
+    fn parsed_source(text: &str) -> (SourceDatabase, wrela_syntax::ParsedFile) {
+        let mut sources = SourceDatabase::default();
+        let file = sources
+            .add(SourceInput {
+                path: "app.wr".to_owned(),
+                text: text.to_owned(),
+                digest: Sha256Digest::from_bytes([0x41; 32]),
+            })
+            .expect("canonical source");
+        let (parsed, diagnostics) = WrelaSyntaxParser::new()
+            .parse(
+                ParseRequest {
+                    sources: &sources,
+                    file,
+                    limits: ParseLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("bounded parse")
+            .into_parts();
+        assert!(
+            diagnostics.is_empty(),
+            "fixture must parse without recovery"
+        );
+        (sources, parsed)
+    }
 
     #[test]
     fn formatter_policy_rejects_zero_output_capacity() {
@@ -337,5 +489,109 @@ mod contract_tests {
             options.validate(),
             Err(FormatError::InvalidOptions(_))
         ));
+
+        let options = FormatOptions {
+            maximum_edits: 0,
+            ..FormatOptions::default()
+        };
+        assert!(matches!(
+            options.validate(),
+            Err(FormatError::InvalidOptions(_))
+        ));
+    }
+
+    #[test]
+    fn formatter_seal_bounds_edit_count_and_rejects_length_substitution() {
+        let (sources, parsed) = parsed_source("module app\n");
+        let source = sources.get(parsed.file()).expect("parsed source");
+        let options = FormatOptions {
+            maximum_edits: 1,
+            ..FormatOptions::default()
+        };
+        let request = FormatRequest {
+            parsed: &parsed,
+            source,
+            options: &options,
+            range: None,
+        };
+        let edit = TextEdit {
+            file: source.id(),
+            range: TextRange { start: 7, end: 10 },
+            replacement: "core".to_owned(),
+        };
+        assert!(matches!(
+            seal_format_output(
+                &request,
+                FormatOutputCandidate {
+                    edits: vec![edit.clone(), edit.clone()],
+                    formatted: source.text().to_owned(),
+                    changed: false,
+                    effective_range: source.full_span().range,
+                },
+                &|| false,
+            ),
+            Err(FormatError::TooManyEdits { limit: 1 })
+        ));
+
+        let mut substituted = edit.clone();
+        substituted.replacement = "longer".to_owned();
+        assert!(matches!(
+            seal_format_output(
+                &request,
+                FormatOutputCandidate {
+                    edits: vec![substituted],
+                    formatted: "module core\n".to_owned(),
+                    changed: true,
+                    effective_range: source.full_span().range,
+                },
+                &|| false,
+            ),
+            Err(FormatError::InconsistentOutput)
+        ));
+
+        let output = seal_format_output(
+            &request,
+            FormatOutputCandidate {
+                edits: vec![edit],
+                formatted: "module core\n".to_owned(),
+                changed: true,
+                effective_range: source.full_span().range,
+            },
+            &|| false,
+        )
+        .expect("exact edit reconstruction");
+        assert_eq!(output.formatted(), "module core\n");
+    }
+
+    #[test]
+    fn formatter_seal_polls_inside_project_sized_text() {
+        let (sources, parsed) = parsed_source("module app\n");
+        let source = sources.get(parsed.file()).expect("parsed source");
+        let options = FormatOptions::default();
+        let request = FormatRequest {
+            parsed: &parsed,
+            source,
+            options: &options,
+            range: None,
+        };
+        let polls = Cell::new(0u32);
+        assert_eq!(
+            seal_format_output(
+                &request,
+                FormatOutputCandidate {
+                    edits: Vec::new(),
+                    formatted: "a".repeat(8192),
+                    changed: true,
+                    effective_range: source.full_span().range,
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= 3
+                },
+            ),
+            Err(FormatError::Cancelled)
+        );
+        assert!(polls.get() >= 3);
     }
 }

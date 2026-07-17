@@ -9,6 +9,8 @@ license.workspace = true
 
 [dependencies]
 wrela-build-model = { path = "../wrela-build-model" }
+wrela-source = { path = "../wrela-source" }
+wrela-test-model = { path = "../wrela-test-model" }
 
 [dev-dependencies]
 serde_json = "1"

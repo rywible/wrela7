@@ -1,0 +1,9 @@
+engine-protocol=1
+frame-magic-hex=5752454c454e4700
+frame-header-bytes=92
+tree-encoding=1
+tree-magic-hex=5752454c4e545200
+empty-output-tree-digest=2481f7db8dd5431fc33f5dba8948e6323643b8edda3e0485b70d7de11aa95476
+empty-output-records=0
+empty-output-content-bytes=0
+empty-output-path-bytes=0

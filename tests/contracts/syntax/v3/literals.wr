@@ -1,0 +1,16 @@
+module contracts.literals
+
+fn literals():
+    decimal = 1_234
+    hexadecimal = 0xCA_FE
+    octal = 0o7_5
+    binary = 0b10_01
+    fraction = 12.5e-2
+    exponent = 1e10
+    text = "slash\\ quote\" apostrophe\' newline\n return\r tab\t zero\0 scalar\u{1F642}"
+    bytes = b"A\x42\\\"\'\n\r\t\0"
+    scalar = '\u{1F642}'
+    interpolated = f"escaped {{brace}}"
+    truth = true
+    nothing = unit
+    return nothing

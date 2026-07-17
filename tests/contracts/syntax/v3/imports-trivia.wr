@@ -1,0 +1,12 @@
+# Leading comments remain lossless.
+module contracts.imports  # module comment
+
+pub import platform.clock as clock
+from platform.types import (
+    Tick,
+    Duration as Span,
+)
+from platform.empty import ()
+
+fn ready():
+    pass  # trailing comment

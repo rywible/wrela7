@@ -1,0 +1,4 @@
+schema = 1
+name = "aarch64-qemu-virt-uefi"
+[semantic]
+architecture = "x86_64"

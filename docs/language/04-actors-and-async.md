@@ -732,3 +732,39 @@ already the `N = 1` case of a future per-core scheduler:
 A future multi-core revision may change mailbox transport and actor placement.
 It may not retroactively weaken the revision 0.1 guarantee that actor messages
 share no mutable state.
+
+## 16. Current implementation boundary
+
+The implemented messaging surface is deliberately narrow but executable. A
+manifest-installed `@service` with a one-message mailbox may give its startup
+`@task` one statement of this form:
+
+```wrela
+send self.ping()
+```
+
+`ping` must be a public, non-reentrant, async turn on that same actor, take no
+payload arguments, and return unit. The compiler creates a strict-linear
+reservation, proves the one-message capacity bound, commits the method tag with
+release ordering, and conditionally dispatches the turn after startup. The
+dispatch observes the tag with acquire ordering. An empty mailbox skips the
+turn; a matching receive clears the slot with release ordering so its capacity
+is reclaimed. A full slot or mismatched tag reaches the source-aware fatal path.
+All validators independently join the reservation, commit, mailbox storage,
+capacity proof, actor, target method, startup task, receive, and dispatch.
+
+This path is preserved through parsed source, semantic analysis, SemanticWir,
+FlowWir, canonical encoding, MachineWir, LLVM IR, and deterministic AArch64
+COFF emission. Its bounded scans poll cancellation, and exact/one-under
+validation, storage, instruction, and mailbox limits are tested. Unsupported
+receiver, producer, target, payload, and capacity shapes are rejected with
+stable source diagnostics rather than silently lowered.
+
+This is not general actor messaging or a recurring actor executor. Cross-actor
+handles, payload-bearing messages, multiple queued messages, recurring task or
+mailbox scheduling, supervision execution, actor class/method generalization,
+and actor assertion supervision remain explicit follow-on work. Selected
+generated-test assertions reaching native ABI2 objects do not close this actor
+boundary. Until those
+surfaces are implemented, documentation and reports must describe this feature
+as the bounded startup self-send vertical.

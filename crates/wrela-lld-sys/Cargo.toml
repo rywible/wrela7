@@ -1,6 +1,7 @@
 [package]
 name = "wrela-lld-sys"
 description = "Private raw ABI boundary to the pinned bundled LLD COFF driver"
+build = "build.rs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,4 +15,3 @@ bundled-lld = []
 
 [lints]
 workspace = true
-

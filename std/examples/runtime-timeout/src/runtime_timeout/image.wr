@@ -1,0 +1,21 @@
+module runtime_timeout.image
+
+from core.image import Image, Target
+
+@image
+pub comptime fn boot() -> Image:
+    return Image(name="runtime-timeout", target=Target.aarch64_qemu_virt_uefi)
+
+@test
+fn checked_arithmetic_fatal_times_out():
+    maximum: u8 = 255
+    one: u8 = 1
+    value: u8 = checked_add(left=maximum, right=one)
+    consume_u8(value=value)
+    return
+
+fn checked_add(left: u8, right: u8) -> u8:
+    return left + right
+
+fn consume_u8(value: u8) -> u8:
+    return value

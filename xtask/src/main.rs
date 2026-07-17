@@ -2,93 +2,169 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Instant;
+
+mod dist;
+mod linux_engine;
+mod llvm;
+mod qemu;
 
 const HELP: &str = "\
 xtask commands:
-  architecture-check  enforce crate dependency contracts
+  architecture-check [--root <absolute-workspace>]  enforce crate dependency contracts
   slices              list focused development slices
   check <slice|crate> [...]  cargo check --all-targets for one boundary
   test <slice|crate> [...]   cargo test for one boundary
   lint <slice|crate>         clippy -D warnings for one boundary
-  llvm                fetch, verify, and build pinned LLVM/LLD (next milestone)
-  dist                assemble and validate an atomic toolchain bundle (next milestone)
+  gate <slice|crate> [--full]  complete locked, offline focused gate
+  llvm [options]      fetch, verify, and build pinned LLVM/LLD
+  linux-engine [--plan|--record-output|--offline]  build the static AArch64 Linux engine
+  qemu [options]      authenticate and build pinned QEMU/firmware
+  cargo-vendor [options]  acquire or exactly re-enroll the Cargo dependency closure
+  dist [options]      assemble and validate an atomic toolchain bundle
 ";
+const MACOS_DEPLOYMENT_TARGET: &str = "13.0";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullRoute {
+    None,
+    ArtifactNative,
+    BackendNative,
+    Distribution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoStep {
+    label: &'static str,
+    arguments: Vec<String>,
+}
 
 struct DevelopmentSlice {
     name: &'static str,
-    description: &'static str,
+    purpose: &'static str,
     packages: &'static [&'static str],
+    upstream: &'static [&'static str],
+    downstream: &'static [&'static str],
+    fixture_families: &'static [&'static str],
+    native_requirements: &'static [&'static str],
+    full_route: FullRoute,
+    fast_budget_seconds: u64,
 }
 
 const DEVELOPMENT_SLICES: &[DevelopmentSlice] = &[
     DevelopmentSlice {
         name: "input",
-        description: "build identity, source, package graph, and package loading",
+        purpose: "build identity, source, package graph, and package loading",
         packages: &[
             "wrela-build-model",
             "wrela-source",
             "wrela-package",
             "wrela-package-loader",
         ],
+        upstream: &[],
+        downstream: &["syntax"],
+        fixture_families: &["package/v1"],
+        native_requirements: &[],
+        full_route: FullRoute::None,
+        fast_budget_seconds: 45,
     },
     DevelopmentSlice {
         name: "syntax",
-        description: "lossless parsing and AST-only formatting",
+        purpose: "lossless parsing and AST-only formatting",
         packages: &["wrela-syntax", "wrela-format"],
+        upstream: &["input"],
+        downstream: &["hir"],
+        fixture_families: &["syntax/v3"],
+        native_requirements: &[],
+        full_route: FullRoute::None,
+        fast_budget_seconds: 45,
     },
     DevelopmentSlice {
         name: "hir",
-        description: "normalized HIR model and package-wide name lowering",
+        purpose: "normalized HIR model and package-wide name lowering",
         packages: &["wrela-hir", "wrela-hir-lower"],
+        upstream: &["syntax"],
+        downstream: &["semantic"],
+        fixture_families: &["syntax/v3"],
+        native_requirements: &[],
+        full_route: FullRoute::None,
+        fast_budget_seconds: 60,
     },
     DevelopmentSlice {
         name: "semantic",
-        description: "whole-image analysis, semantic linting, and SemanticWir",
+        purpose: "whole-image analysis, semantic linting, and SemanticWir",
         packages: &[
             "wrela-sema",
             "wrela-lint",
             "wrela-semantic-wir",
             "wrela-semantic-lower",
         ],
+        upstream: &["hir"],
+        downstream: &["flow"],
+        fixture_families: &["protocol/v1", "syntax/v3", "target/v1"],
+        native_requirements: &[],
+        full_route: FullRoute::None,
+        fast_budget_seconds: 90,
     },
     DevelopmentSlice {
         name: "flow",
-        description: "FlowWir lowering, optimization, and canonical codec",
+        purpose: "FlowWir lowering, optimization, and canonical codec",
         packages: &[
             "wrela-flow-wir",
             "wrela-flow-lower",
             "wrela-flow-opt",
             "wrela-flow-wir-codec",
         ],
+        upstream: &["semantic"],
+        downstream: &["machine", "backend"],
+        fixture_families: &["protocol/v1"],
+        native_requirements: &[],
+        full_route: FullRoute::None,
+        fast_budget_seconds: 60,
     },
     DevelopmentSlice {
         name: "machine",
-        description: "runtime ABI, AArch64 target binding, and MachineWir lowering",
+        purpose: "runtime ABI, AArch64 target binding, and MachineWir lowering",
         packages: &[
             "wrela-runtime-abi",
             "wrela-target",
             "wrela-machine-wir",
             "wrela-machine-lower",
         ],
+        upstream: &["flow"],
+        downstream: &["artifact", "backend"],
+        fixture_families: &["protocol/v1", "target/v1"],
+        native_requirements: &[],
+        full_route: FullRoute::None,
+        fast_budget_seconds: 60,
     },
     DevelopmentSlice {
         name: "artifact",
-        description: "AArch64 COFF emission, EFI link inspection, and report assembly",
+        purpose: "AArch64 COFF emission, EFI link inspection, and report assembly",
         packages: &[
             "wrela-codegen-llvm",
             "wrela-lld-sys",
             "wrela-link-efi",
             "wrela-image-report",
         ],
+        upstream: &["machine"],
+        downstream: &["backend", "testing"],
+        fixture_families: &["protocol/v1", "target/v1"],
+        native_requirements: &[
+            "pinned LLVM 22 AArch64 static libraries",
+            "bundled LLD COFF driver",
+        ],
+        full_route: FullRoute::ArtifactNative,
+        fast_budget_seconds: 90,
     },
     DevelopmentSlice {
         name: "frontend",
-        description: "input through sealed semantic analysis and SemanticWir",
+        purpose: "input through sealed semantic analysis and SemanticWir",
         packages: &[
             "wrela-build-model",
             "wrela-source",
@@ -106,10 +182,16 @@ const DEVELOPMENT_SLICES: &[DevelopmentSlice] = &[
             "wrela-semantic-wir",
             "wrela-semantic-lower",
         ],
+        upstream: &["input"],
+        downstream: &["ir", "cli"],
+        fixture_families: &["package/v1", "protocol/v1", "syntax/v3", "target/v1"],
+        native_requirements: &[],
+        full_route: FullRoute::None,
+        fast_budget_seconds: 120,
     },
     DevelopmentSlice {
         name: "ir",
-        description: "three named IRs, lowering, optimization, codec, target, and runtime ABI",
+        purpose: "three named IRs, lowering, optimization, codec, target, and runtime ABI",
         packages: &[
             "wrela-semantic-wir",
             "wrela-semantic-lower",
@@ -122,10 +204,16 @@ const DEVELOPMENT_SLICES: &[DevelopmentSlice] = &[
             "wrela-machine-wir",
             "wrela-machine-lower",
         ],
+        upstream: &["frontend"],
+        downstream: &["backend"],
+        fixture_families: &["protocol/v1", "syntax/v3", "target/v1"],
+        native_requirements: &[],
+        full_route: FullRoute::None,
+        fast_budget_seconds: 120,
     },
     DevelopmentSlice {
         name: "backend",
-        description: "backend protocol through COFF, EFI linking, and image report",
+        purpose: "backend protocol through COFF, EFI linking, and image report",
         packages: &[
             "wrela-backend-protocol",
             "wrela-codegen-llvm",
@@ -134,10 +222,19 @@ const DEVELOPMENT_SLICES: &[DevelopmentSlice] = &[
             "wrela-image-report",
             "wrela-backend",
         ],
+        upstream: &["flow", "machine", "artifact"],
+        downstream: &["cli"],
+        fixture_families: &["protocol/v1", "target/v1"],
+        native_requirements: &[
+            "pinned LLVM 22 AArch64 static libraries",
+            "bundled LLD COFF driver",
+        ],
+        full_route: FullRoute::BackendNative,
+        fast_budget_seconds: 120,
     },
     DevelopmentSlice {
         name: "testing",
-        description: "test plan/protocol, verified toolchain, and full-image runner",
+        purpose: "test plan/protocol, verified toolchain, and full-image runner",
         packages: &[
             "wrela-test-model",
             "wrela-test-protocol",
@@ -145,16 +242,66 @@ const DEVELOPMENT_SLICES: &[DevelopmentSlice] = &[
             "wrela-toolchain",
             "wrela-test-runner",
         ],
+        upstream: &["artifact"],
+        downstream: &["cli"],
+        fixture_families: &[
+            "package/v1",
+            "protocol/v1",
+            "target/v1",
+            "toolchain/linux-payload-authority/v1",
+            "toolchain/v1",
+        ],
+        native_requirements: &[
+            "installed target and runtime object",
+            "pinned QEMU aarch64-system emulator",
+            "pinned EDK2 firmware",
+        ],
+        full_route: FullRoute::Distribution,
+        fast_budget_seconds: 90,
     },
     DevelopmentSlice {
         name: "cli",
-        description: "public driver and CLI surface",
-        packages: &["wrela-driver", "wrela-compiler", "wrela-cli"],
+        purpose: "public driver, CLI surface, and sealed headless engine process",
+        packages: &[
+            "wrela-driver",
+            "wrela-compiler",
+            "wrela-cli",
+            "wrela-engine",
+        ],
+        upstream: &["frontend", "backend", "testing"],
+        downstream: &[],
+        fixture_families: &[
+            "package/v1",
+            "protocol/v1",
+            "syntax/v3",
+            "target/v1",
+            "toolchain/linux-payload-authority/v1",
+            "toolchain/v1",
+        ],
+        native_requirements: &[
+            "self-contained LLVM/LLD backend",
+            "installed target, runtime, QEMU, and firmware",
+        ],
+        full_route: FullRoute::Distribution,
+        fast_budget_seconds: 180,
     },
     DevelopmentSlice {
         name: "all",
-        description: "entire workspace",
+        purpose: "entire workspace",
         packages: &[],
+        upstream: &[],
+        downstream: &[],
+        fixture_families: &[
+            "package/v1",
+            "protocol/v1",
+            "syntax/v3",
+            "target/v1",
+            "toolchain/linux-payload-authority/v1",
+            "toolchain/v1",
+        ],
+        native_requirements: &["complete self-contained distribution toolchain"],
+        full_route: FullRoute::Distribution,
+        fast_budget_seconds: 300,
     },
 ];
 
@@ -175,10 +322,71 @@ struct ExternalDependencyContract {
     features: &'static [&'static str],
 }
 
+struct ReviewedExternalPackage {
+    name: &'static str,
+    version: &'static str,
+    dependencies: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateRequest {
+    target: String,
+    full: bool,
+}
+
+#[derive(Debug, Clone)]
+struct GateTarget {
+    name: String,
+    purpose: String,
+    packages: Vec<String>,
+    upstream: Vec<String>,
+    downstream: Vec<String>,
+    fixture_families: Vec<String>,
+    native_requirements: Vec<String>,
+    full_route: FullRoute,
+    fast_budget_seconds: u64,
+    all_workspace: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateClosure {
+    workspace: BTreeSet<String>,
+    external: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct ResolvedPackage {
+    name: String,
+    version: String,
+    workspace: bool,
+}
+
+#[derive(Debug)]
+struct ResolvedDependency {
+    package_id: String,
+    kinds: BTreeSet<DependencySection>,
+}
+
+#[derive(Debug)]
+struct ResolvedMetadata {
+    packages: BTreeMap<String, ResolvedPackage>,
+    workspace_ids_by_name: BTreeMap<String, String>,
+    dependencies: BTreeMap<String, Vec<ResolvedDependency>>,
+}
+
 type FeatureContract = (&'static str, &'static [&'static str]);
 type CrateFeatureContract = (&'static str, &'static [FeatureContract]);
 
 const EXTERNAL_DEPENDENCIES: &[ExternalDependencyContract] = &[
+    ExternalDependencyContract {
+        owner: "wrela-backend",
+        name: "sha2",
+        kind: DependencySection::Normal,
+        requirement: "=0.10.9",
+        optional: false,
+        default_features: false,
+        features: &[],
+    },
     ExternalDependencyContract {
         owner: "wrela-codegen-llvm",
         name: "inkwell",
@@ -198,10 +406,10 @@ const EXTERNAL_DEPENDENCIES: &[ExternalDependencyContract] = &[
         features: &[],
     },
     ExternalDependencyContract {
-        owner: "wrela-hir",
-        name: "unicode-normalization",
+        owner: "wrela-package",
+        name: "unicode-ident",
         kind: DependencySection::Normal,
-        requirement: "^0.1.25",
+        requirement: "=1.0.18",
         optional: false,
         default_features: true,
         features: &[],
@@ -210,7 +418,7 @@ const EXTERNAL_DEPENDENCIES: &[ExternalDependencyContract] = &[
         owner: "wrela-package",
         name: "unicode-normalization",
         kind: DependencySection::Normal,
-        requirement: "^0.1.25",
+        requirement: "=0.1.24",
         optional: false,
         default_features: true,
         features: &[],
@@ -219,9 +427,54 @@ const EXTERNAL_DEPENDENCIES: &[ExternalDependencyContract] = &[
         owner: "wrela-source",
         name: "unicode-normalization",
         kind: DependencySection::Normal,
-        requirement: "^0.1.25",
+        requirement: "=0.1.24",
         optional: false,
         default_features: true,
+        features: &[],
+    },
+    ExternalDependencyContract {
+        owner: "wrela-package-loader",
+        name: "toml",
+        kind: DependencySection::Normal,
+        requirement: "=0.9.9",
+        optional: false,
+        default_features: false,
+        features: &["parse", "std"],
+    },
+    ExternalDependencyContract {
+        owner: "wrela-package-loader",
+        name: "toml_parser",
+        kind: DependencySection::Normal,
+        requirement: "=1.0.5",
+        optional: false,
+        default_features: false,
+        features: &["alloc", "std"],
+    },
+    ExternalDependencyContract {
+        owner: "wrela-syntax",
+        name: "unicode-ident",
+        kind: DependencySection::Normal,
+        requirement: "=1.0.18",
+        optional: false,
+        default_features: true,
+        features: &[],
+    },
+    ExternalDependencyContract {
+        owner: "wrela-syntax",
+        name: "unicode-normalization",
+        kind: DependencySection::Normal,
+        requirement: "=0.1.24",
+        optional: false,
+        default_features: true,
+        features: &[],
+    },
+    ExternalDependencyContract {
+        owner: "wrela-link-efi",
+        name: "sha2",
+        kind: DependencySection::Normal,
+        requirement: "=0.10.9",
+        optional: false,
+        default_features: false,
         features: &[],
     },
     ExternalDependencyContract {
@@ -232,6 +485,171 @@ const EXTERNAL_DEPENDENCIES: &[ExternalDependencyContract] = &[
         optional: false,
         default_features: true,
         features: &[],
+    },
+    ExternalDependencyContract {
+        owner: "xtask",
+        name: "sha2",
+        kind: DependencySection::Normal,
+        requirement: "=0.10.9",
+        optional: false,
+        default_features: false,
+        features: &[],
+    },
+];
+
+// This is the reviewed fast-gate transitive registry closure. Optional native
+// dependencies are deliberately absent and are exercised only by `--full`.
+const REVIEWED_EXTERNAL_PACKAGES: &[ReviewedExternalPackage] = &[
+    ReviewedExternalPackage {
+        name: "block-buffer",
+        version: "0.10.4",
+        dependencies: &["generic-array"],
+    },
+    ReviewedExternalPackage {
+        name: "cfg-if",
+        version: "1.0.4",
+        dependencies: &[],
+    },
+    ReviewedExternalPackage {
+        name: "cpufeatures",
+        version: "0.2.17",
+        dependencies: &["libc"],
+    },
+    ReviewedExternalPackage {
+        name: "crypto-common",
+        version: "0.1.7",
+        dependencies: &["generic-array", "typenum"],
+    },
+    ReviewedExternalPackage {
+        name: "digest",
+        version: "0.10.7",
+        dependencies: &["block-buffer", "crypto-common"],
+    },
+    ReviewedExternalPackage {
+        name: "equivalent",
+        version: "1.0.2",
+        dependencies: &[],
+    },
+    ReviewedExternalPackage {
+        name: "hashbrown",
+        version: "0.17.1",
+        dependencies: &[],
+    },
+    ReviewedExternalPackage {
+        name: "generic-array",
+        version: "0.14.7",
+        dependencies: &["typenum", "version_check"],
+    },
+    ReviewedExternalPackage {
+        name: "indexmap",
+        version: "2.14.0",
+        dependencies: &["equivalent", "hashbrown"],
+    },
+    ReviewedExternalPackage {
+        name: "itoa",
+        version: "1.0.18",
+        dependencies: &[],
+    },
+    ReviewedExternalPackage {
+        name: "memchr",
+        version: "2.8.3",
+        dependencies: &[],
+    },
+    ReviewedExternalPackage {
+        name: "libc",
+        version: "0.2.186",
+        dependencies: &[],
+    },
+    ReviewedExternalPackage {
+        name: "serde_core",
+        version: "1.0.228",
+        dependencies: &[],
+    },
+    ReviewedExternalPackage {
+        name: "serde_json",
+        version: "1.0.150",
+        dependencies: &["itoa", "memchr", "serde_core", "zmij"],
+    },
+    ReviewedExternalPackage {
+        name: "serde_spanned",
+        version: "1.1.1",
+        dependencies: &["serde_core"],
+    },
+    ReviewedExternalPackage {
+        name: "sha2",
+        version: "0.10.9",
+        dependencies: &["cfg-if", "cpufeatures", "digest"],
+    },
+    ReviewedExternalPackage {
+        name: "tinyvec",
+        version: "1.12.0",
+        dependencies: &["tinyvec_macros"],
+    },
+    ReviewedExternalPackage {
+        name: "tinyvec_macros",
+        version: "0.1.1",
+        dependencies: &[],
+    },
+    ReviewedExternalPackage {
+        name: "typenum",
+        version: "1.20.1",
+        dependencies: &[],
+    },
+    // Cargo requirements intentionally omit semver build metadata because
+    // Cargo warns that it is ignored. These reviewed resolved versions retain
+    // the exact TOML-spec-bearing package identity from Cargo.lock.
+    ReviewedExternalPackage {
+        name: "toml",
+        version: "0.9.9+spec-1.0.0",
+        dependencies: &[
+            "indexmap",
+            "serde_core",
+            "serde_spanned",
+            "toml_datetime",
+            "toml_parser",
+            "toml_writer",
+            "winnow",
+        ],
+    },
+    ReviewedExternalPackage {
+        name: "toml_datetime",
+        version: "0.7.5+spec-1.1.0",
+        dependencies: &["serde_core"],
+    },
+    ReviewedExternalPackage {
+        name: "toml_parser",
+        version: "1.0.5+spec-1.0.0",
+        dependencies: &["winnow"],
+    },
+    ReviewedExternalPackage {
+        name: "toml_writer",
+        version: "1.1.2+spec-1.1.0",
+        dependencies: &[],
+    },
+    ReviewedExternalPackage {
+        name: "unicode-ident",
+        version: "1.0.18",
+        dependencies: &[],
+    },
+    ReviewedExternalPackage {
+        name: "unicode-normalization",
+        version: "0.1.24",
+        dependencies: &["tinyvec"],
+    },
+    ReviewedExternalPackage {
+        name: "version_check",
+        version: "0.9.5",
+        dependencies: &[],
+    },
+    ReviewedExternalPackage {
+        name: "winnow",
+        version: "0.7.15",
+        dependencies: &[],
+    },
+    ReviewedExternalPackage {
+        name: "zmij",
+        version: "1.0.23",
+        dependencies: &[],
     },
 ];
 
@@ -276,7 +694,7 @@ const CONTRACTS: &[CrateContract] = &[
             "wrela-machine-lower",
             "wrela-target",
         ],
-        dev: &[],
+        dev: &["wrela-source"],
     },
     CrateContract {
         name: "wrela-backend-protocol",
@@ -294,13 +712,31 @@ const CONTRACTS: &[CrateContract] = &[
         name: "wrela-cli",
         directory: "crates/wrela-cli",
         normal: &["wrela-build-model", "wrela-compiler", "wrela-driver"],
-        dev: &[],
+        dev: &[
+            "wrela-package",
+            "wrela-package-loader",
+            "wrela-test-model",
+            "wrela-toolchain",
+        ],
     },
     CrateContract {
         name: "wrela-codegen-llvm",
         directory: "crates/wrela-codegen-llvm",
-        normal: &["wrela-build-model", "wrela-machine-wir", "wrela-target"],
-        dev: &[],
+        normal: &[
+            "wrela-build-model",
+            "wrela-machine-wir",
+            "wrela-runtime-abi",
+            "wrela-target",
+        ],
+        dev: &[
+            "wrela-flow-lower",
+            "wrela-flow-opt",
+            "wrela-machine-lower",
+            "wrela-semantic-wir",
+            "wrela-source",
+            "wrela-test-model",
+            "wrela-test-protocol",
+        ],
     },
     CrateContract {
         name: "wrela-compiler",
@@ -308,10 +744,12 @@ const CONTRACTS: &[CrateContract] = &[
         normal: &[
             "wrela-backend",
             "wrela-build-model",
+            "wrela-diagnostics",
             "wrela-driver",
             "wrela-flow-lower",
             "wrela-flow-wir-codec",
             "wrela-format",
+            "wrela-hir",
             "wrela-hir-lower",
             "wrela-image-report",
             "wrela-lint",
@@ -319,13 +757,14 @@ const CONTRACTS: &[CrateContract] = &[
             "wrela-package-loader",
             "wrela-sema",
             "wrela-semantic-lower",
+            "wrela-source",
             "wrela-syntax",
             "wrela-target",
             "wrela-test-model",
             "wrela-test-runner",
             "wrela-toolchain",
         ],
-        dev: &[],
+        dev: &["wrela-link-efi"],
     },
     CrateContract {
         name: "wrela-diagnostics",
@@ -342,32 +781,54 @@ const CONTRACTS: &[CrateContract] = &[
             "wrela-format",
             "wrela-image-report",
             "wrela-lint",
+            "wrela-source",
             "wrela-test-model",
         ],
         dev: &[],
     },
     CrateContract {
+        name: "wrela-engine",
+        directory: "crates/wrela-engine",
+        normal: &[
+            "wrela-build-model",
+            "wrela-compiler",
+            "wrela-driver",
+            "wrela-toolchain",
+        ],
+        dev: &["wrela-package", "wrela-package-loader"],
+    },
+    CrateContract {
         name: "wrela-flow-lower",
         directory: "crates/wrela-flow-lower",
         normal: &["wrela-diagnostics", "wrela-flow-wir", "wrela-semantic-wir"],
-        dev: &[],
+        dev: &[
+            "wrela-build-model",
+            "wrela-source",
+            "wrela-test-model",
+            "wrela-test-protocol",
+        ],
     },
     CrateContract {
         name: "wrela-flow-opt",
         directory: "crates/wrela-flow-opt",
-        normal: &["wrela-build-model", "wrela-flow-wir"],
-        dev: &[],
+        normal: &["wrela-build-model", "wrela-flow-wir", "wrela-test-model"],
+        dev: &["wrela-flow-lower", "wrela-semantic-wir", "wrela-source"],
     },
     CrateContract {
         name: "wrela-flow-wir",
         directory: "crates/wrela-flow-wir",
-        normal: &["wrela-build-model", "wrela-source"],
+        normal: &["wrela-build-model", "wrela-source", "wrela-test-model"],
         dev: &[],
     },
     CrateContract {
         name: "wrela-flow-wir-codec",
         directory: "crates/wrela-flow-wir-codec",
-        normal: &["wrela-build-model", "wrela-flow-wir"],
+        normal: &[
+            "wrela-build-model",
+            "wrela-flow-wir",
+            "wrela-source",
+            "wrela-test-model",
+        ],
         dev: &[],
     },
     CrateContract {
@@ -398,7 +859,7 @@ const CONTRACTS: &[CrateContract] = &[
     CrateContract {
         name: "wrela-image-report",
         directory: "crates/wrela-image-report",
-        normal: &["wrela-build-model"],
+        normal: &["wrela-build-model", "wrela-source", "wrela-test-model"],
         dev: &[],
     },
     CrateContract {
@@ -434,8 +895,10 @@ const CONTRACTS: &[CrateContract] = &[
             "wrela-machine-wir",
             "wrela-runtime-abi",
             "wrela-target",
+            "wrela-test-model",
+            "wrela-test-protocol",
         ],
-        dev: &[],
+        dev: &["wrela-flow-lower", "wrela-semantic-wir", "wrela-source"],
     },
     CrateContract {
         name: "wrela-machine-wir",
@@ -445,6 +908,8 @@ const CONTRACTS: &[CrateContract] = &[
             "wrela-runtime-abi",
             "wrela-source",
             "wrela-target",
+            "wrela-test-model",
+            "wrela-test-protocol",
         ],
         dev: &[],
     },
@@ -473,22 +938,36 @@ const CONTRACTS: &[CrateContract] = &[
             "wrela-build-model",
             "wrela-diagnostics",
             "wrela-hir",
+            "wrela-package",
             "wrela-source",
             "wrela-target",
             "wrela-test-model",
         ],
-        dev: &[],
+        dev: &["wrela-hir-lower", "wrela-syntax"],
     },
     CrateContract {
         name: "wrela-semantic-lower",
         directory: "crates/wrela-semantic-lower",
-        normal: &["wrela-sema", "wrela-semantic-wir"],
-        dev: &[],
+        normal: &[
+            "wrela-hir",
+            "wrela-sema",
+            "wrela-semantic-wir",
+            "wrela-test-model",
+            "wrela-test-protocol",
+        ],
+        dev: &[
+            "wrela-build-model",
+            "wrela-hir-lower",
+            "wrela-package",
+            "wrela-source",
+            "wrela-syntax",
+            "wrela-target",
+        ],
     },
     CrateContract {
         name: "wrela-semantic-wir",
         directory: "crates/wrela-semantic-wir",
-        normal: &["wrela-build-model", "wrela-source"],
+        normal: &["wrela-build-model", "wrela-source", "wrela-test-model"],
         dev: &[],
     },
     CrateContract {
@@ -518,7 +997,7 @@ const CONTRACTS: &[CrateContract] = &[
     CrateContract {
         name: "wrela-test-protocol",
         directory: "crates/wrela-test-protocol",
-        normal: &["wrela-test-model"],
+        normal: &["wrela-source", "wrela-test-model"],
         dev: &[],
     },
     CrateContract {
@@ -528,14 +1007,20 @@ const CONTRACTS: &[CrateContract] = &[
             "wrela-build-model",
             "wrela-target",
             "wrela-test-model",
+            "wrela-test-protocol",
             "wrela-toolchain",
         ],
-        dev: &[],
+        dev: &["wrela-package", "wrela-package-loader"],
     },
     CrateContract {
         name: "wrela-toolchain",
         directory: "crates/wrela-toolchain",
-        normal: &["wrela-build-model"],
+        normal: &[
+            "wrela-build-model",
+            "wrela-package",
+            "wrela-package-loader",
+            "wrela-target",
+        ],
         dev: &[],
     },
     CrateContract {
@@ -553,12 +1038,16 @@ fn main() -> ExitCode {
             print!("{HELP}");
             ExitCode::SUCCESS
         }
-        Some("slices") => {
-            print_slices();
-            ExitCode::SUCCESS
-        }
+        Some("slices") => match workspace_root().and_then(|root| print_slices(&root)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Some("architecture-check") => {
-            match workspace_root().and_then(|root| check_architecture(&root)) {
+            let remaining = arguments.collect::<Vec<_>>();
+            match architecture_root(&remaining).and_then(|root| check_architecture(&root)) {
                 Ok(()) => {
                     println!("crate architecture matches the declared contracts");
                     ExitCode::SUCCESS
@@ -572,7 +1061,7 @@ fn main() -> ExitCode {
         Some(command @ ("check" | "test" | "lint")) => {
             let Some(slice) = arguments.next() else {
                 eprintln!("error: xtask {command} requires a slice\n");
-                print_slices();
+                print_slice_names();
                 return ExitCode::from(2);
             };
             let extra: Vec<_> = arguments.collect();
@@ -586,9 +1075,71 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some(command @ ("llvm" | "dist")) => {
-            eprintln!("error: xtask command `{command}` is scaffolded but not implemented");
-            ExitCode::FAILURE
+        Some("gate") => {
+            let request = match parse_gate_arguments(arguments.collect()) {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            match workspace_root().and_then(|root| run_gate(&root, &request)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("llvm") => {
+            let arguments: Vec<_> = arguments.collect();
+            match workspace_root().and_then(|root| llvm::run(&root, &arguments)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("linux-engine") => {
+            let arguments: Vec<_> = arguments.collect();
+            match workspace_root().and_then(|root| linux_engine::run(&root, &arguments)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("qemu") => {
+            let arguments: Vec<_> = arguments.collect();
+            match workspace_root().and_then(|root| qemu::run(&root, &arguments)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("cargo-vendor") => {
+            let arguments: Vec<_> = arguments.collect();
+            match workspace_root().and_then(|root| dist::run_cargo_vendor(&root, &arguments)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("dist") => {
+            let arguments: Vec<_> = arguments.collect();
+            match workspace_root().and_then(|root| dist::run(&root, &arguments)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Some(command) => {
             eprintln!("error: unknown xtask command `{command}`\n\n{HELP}");
@@ -597,10 +1148,824 @@ fn main() -> ExitCode {
     }
 }
 
-fn print_slices() {
-    println!("development slices:");
+fn print_slice_names() {
+    eprintln!("development slices:");
     for slice in DEVELOPMENT_SLICES {
-        println!("  {:<10} {}", slice.name, slice.description);
+        eprintln!("  {:<10} {}", slice.name, slice.purpose);
+    }
+}
+
+fn print_slices(root: &Path) -> Result<(), String> {
+    validate_development_slice_metadata()?;
+    validate_fixture_inventory(root)?;
+    let metadata = resolved_cargo_metadata(root, None)?;
+    eprintln!("authoritative development slice inventory:");
+    for slice in DEVELOPMENT_SLICES {
+        let target = gate_target(slice.name)?;
+        let closure = validate_gate_closure(&target, &metadata)?;
+        eprintln!();
+        print_gate_metadata(&target, &closure);
+    }
+    Ok(())
+}
+
+fn parse_gate_arguments(arguments: Vec<String>) -> Result<GateRequest, String> {
+    match arguments.as_slice() {
+        [target] if target != "--full" => Ok(GateRequest {
+            target: target.clone(),
+            full: false,
+        }),
+        [target, full] if target != "--full" && full == "--full" => Ok(GateRequest {
+            target: target.clone(),
+            full: true,
+        }),
+        [] => Err("xtask gate requires exactly one slice or workspace crate".to_owned()),
+        _ => Err(
+            "usage: cargo xgate <slice-or-exact-workspace-crate> [--full]; test filters and other extra arguments are forbidden"
+                .to_owned(),
+        ),
+    }
+}
+
+fn gate_target(name: &str) -> Result<GateTarget, String> {
+    if let Some(slice) = DEVELOPMENT_SLICES.iter().find(|slice| slice.name == name) {
+        let all_workspace = slice.name == "all";
+        let packages = if all_workspace {
+            CONTRACTS
+                .iter()
+                .map(|contract| contract.name.to_owned())
+                .collect()
+        } else {
+            slice
+                .packages
+                .iter()
+                .map(|package| (*package).to_owned())
+                .collect()
+        };
+        return Ok(GateTarget {
+            name: slice.name.to_owned(),
+            purpose: slice.purpose.to_owned(),
+            packages,
+            upstream: slice
+                .upstream
+                .iter()
+                .map(|boundary| (*boundary).to_owned())
+                .collect(),
+            downstream: slice
+                .downstream
+                .iter()
+                .map(|boundary| (*boundary).to_owned())
+                .collect(),
+            fixture_families: slice
+                .fixture_families
+                .iter()
+                .map(|fixture| (*fixture).to_owned())
+                .collect(),
+            native_requirements: slice
+                .native_requirements
+                .iter()
+                .map(|requirement| (*requirement).to_owned())
+                .collect(),
+            full_route: slice.full_route,
+            fast_budget_seconds: slice.fast_budget_seconds,
+            all_workspace,
+        });
+    }
+
+    let contract = CONTRACTS
+        .iter()
+        .find(|contract| contract.name == name)
+        .ok_or_else(|| {
+            format!(
+                "unknown development slice or exact workspace crate {name:?}; run `cargo xtask slices`"
+            )
+        })?;
+    let upstream: BTreeSet<_> = contract
+        .normal
+        .iter()
+        .chain(contract.dev)
+        .map(|dependency| (*dependency).to_owned())
+        .collect();
+    let downstream: BTreeSet<_> = CONTRACTS
+        .iter()
+        .filter(|candidate| {
+            candidate.normal.contains(&contract.name) || candidate.dev.contains(&contract.name)
+        })
+        .map(|candidate| candidate.name.to_owned())
+        .collect();
+    let (full_route, native_requirements, fast_budget_seconds) = exact_crate_full_profile(name);
+    let mut target = GateTarget {
+        name: name.to_owned(),
+        purpose: format!("exact workspace crate at {}", contract.directory),
+        packages: vec![name.to_owned()],
+        upstream: upstream.into_iter().collect(),
+        downstream: downstream.into_iter().collect(),
+        fixture_families: Vec::new(),
+        native_requirements: native_requirements
+            .iter()
+            .map(|requirement| (*requirement).to_owned())
+            .collect(),
+        full_route,
+        fast_budget_seconds,
+        all_workspace: false,
+    };
+    let workspace = expected_workspace_closure(&target.packages)?;
+    target.fixture_families = reviewed_fixture_families(&workspace).into_iter().collect();
+    Ok(target)
+}
+
+fn exact_crate_full_profile(name: &str) -> (FullRoute, &'static [&'static str], u64) {
+    match name {
+        "wrela-codegen-llvm" | "wrela-lld-sys" | "wrela-link-efi" => (
+            FullRoute::ArtifactNative,
+            &[
+                "pinned LLVM 22 AArch64 static libraries",
+                "bundled LLD COFF driver",
+            ],
+            90,
+        ),
+        "wrela-backend" => (
+            FullRoute::BackendNative,
+            &[
+                "pinned LLVM 22 AArch64 static libraries",
+                "bundled LLD COFF driver",
+            ],
+            120,
+        ),
+        "wrela-compiler" | "wrela-cli" | "wrela-engine" | "wrela-test-runner"
+        | "wrela-toolchain" | "xtask" => (
+            FullRoute::Distribution,
+            &["complete self-contained distribution toolchain"],
+            180,
+        ),
+        _ => (FullRoute::None, &[], 60),
+    }
+}
+
+fn validate_development_slice_metadata() -> Result<(), String> {
+    let workspace_names: BTreeSet<_> = CONTRACTS.iter().map(|contract| contract.name).collect();
+    let slice_names: BTreeSet<_> = DEVELOPMENT_SLICES.iter().map(|slice| slice.name).collect();
+    if slice_names.len() != DEVELOPMENT_SLICES.len() {
+        return Err("development slice names must be unique".to_owned());
+    }
+    if !slice_names.contains("all") {
+        return Err("development slice inventory must include all".to_owned());
+    }
+    for slice in DEVELOPMENT_SLICES {
+        if slice.name.trim().is_empty()
+            || slice.purpose.trim().is_empty()
+            || slice.fast_budget_seconds == 0
+        {
+            return Err(format!(
+                "development slice {} has incomplete purpose or timing metadata",
+                slice.name
+            ));
+        }
+        let packages: BTreeSet<_> = slice.packages.iter().copied().collect();
+        if packages.len() != slice.packages.len()
+            || (slice.name == "all" && !packages.is_empty())
+            || (slice.name != "all" && packages.is_empty())
+            || packages
+                .iter()
+                .any(|package| !workspace_names.contains(package))
+        {
+            return Err(format!(
+                "development slice {} has duplicate, empty, or unknown package entries",
+                slice.name
+            ));
+        }
+        for (kind, boundaries) in [
+            ("upstream", slice.upstream),
+            ("downstream", slice.downstream),
+        ] {
+            let unique: BTreeSet<_> = boundaries.iter().copied().collect();
+            if unique.len() != boundaries.len()
+                || boundaries
+                    .iter()
+                    .any(|boundary| *boundary == slice.name || !slice_names.contains(boundary))
+            {
+                return Err(format!(
+                    "development slice {} has duplicate, self, or unknown {kind} boundaries",
+                    slice.name
+                ));
+            }
+        }
+        let fixtures: BTreeSet<_> = slice.fixture_families.iter().copied().collect();
+        if fixtures.len() != slice.fixture_families.len()
+            || slice
+                .fixture_families
+                .iter()
+                .any(|fixture| fixture.trim().is_empty())
+        {
+            return Err(format!(
+                "development slice {} has invalid fixture metadata",
+                slice.name
+            ));
+        }
+        if (slice.full_route == FullRoute::None) != slice.native_requirements.is_empty() {
+            return Err(format!(
+                "development slice {} has inconsistent native/full metadata",
+                slice.name
+            ));
+        }
+    }
+
+    let reviewed_by_name: BTreeMap<_, _> = REVIEWED_EXTERNAL_PACKAGES
+        .iter()
+        .map(|package| (package.name, package))
+        .collect();
+    if reviewed_by_name.len() != REVIEWED_EXTERNAL_PACKAGES.len() {
+        return Err("reviewed external package names must be unique".to_owned());
+    }
+    for package in REVIEWED_EXTERNAL_PACKAGES {
+        if package.name.trim().is_empty()
+            || package.version.trim().is_empty()
+            || package.dependencies.iter().any(|dependency| {
+                *dependency == package.name || !reviewed_by_name.contains_key(dependency)
+            })
+        {
+            return Err(format!(
+                "reviewed external package {} has incomplete or unknown dependency metadata",
+                package.name
+            ));
+        }
+    }
+    for dependency in EXTERNAL_DEPENDENCIES
+        .iter()
+        .filter(|dependency| !dependency.optional)
+    {
+        if !reviewed_by_name.contains_key(dependency.name) {
+            return Err(format!(
+                "non-optional external dependency {}/{} has no reviewed transitive package entry",
+                dependency.owner, dependency.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fixture_inventory(root: &Path) -> Result<(), String> {
+    let declared: BTreeSet<_> = DEVELOPMENT_SLICES
+        .iter()
+        .flat_map(|slice| slice.fixture_families.iter().copied())
+        .collect();
+    let fixture_root = root.join("tests/contracts");
+    for family in &declared {
+        let path = fixture_root.join(family);
+        if !path.is_dir() || !directory_contains_file(&path)? {
+            return Err(format!(
+                "declared fixture family {family} has no checked-in fixture files"
+            ));
+        }
+    }
+    let mut files = Vec::new();
+    collect_files(&fixture_root, &mut files)?;
+    for file in files {
+        let relative = file
+            .strip_prefix(&fixture_root)
+            .map_err(|_| format!("fixture {} escaped fixture root", file.display()))?;
+        if relative.file_name().is_some_and(|name| name == "README.md") {
+            continue;
+        }
+        if !declared
+            .iter()
+            .any(|family| relative.starts_with(Path::new(family)))
+        {
+            return Err(format!(
+                "checked-in fixture {} has no declared gate fixture family",
+                relative.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn directory_contains_file(directory: &Path) -> Result<bool, String> {
+    let mut files = Vec::new();
+    collect_files(directory, &mut files)?;
+    Ok(files
+        .iter()
+        .any(|path| path.file_name().is_some_and(|name| name != "README.md")))
+}
+
+fn collect_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
+    let mut directories = VecDeque::from([directory.to_owned()]);
+    while let Some(current) = directories.pop_front() {
+        for entry in fs::read_dir(&current)
+            .map_err(|error| format!("cannot read {}: {error}", current.display()))?
+        {
+            let entry =
+                entry.map_err(|error| format!("cannot inspect {}: {error}", current.display()))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            if kind.is_symlink() {
+                return Err(format!(
+                    "fixture inventory forbids symbolic link {}",
+                    path.display()
+                ));
+            }
+            if kind.is_dir() {
+                directories.push_back(path);
+            } else if kind.is_file() {
+                output.push(path);
+            } else {
+                return Err(format!(
+                    "fixture inventory contains unsupported entry {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expected_workspace_closure(roots: &[String]) -> Result<BTreeSet<String>, String> {
+    let contracts: BTreeMap<_, _> = CONTRACTS
+        .iter()
+        .map(|contract| (contract.name, contract))
+        .collect();
+    let mut workspace = BTreeSet::new();
+    let mut queue: VecDeque<_> = roots.iter().cloned().collect();
+    while let Some(name) = queue.pop_front() {
+        if !workspace.insert(name.clone()) {
+            continue;
+        }
+        let contract = contracts
+            .get(name.as_str())
+            .ok_or_else(|| format!("gate root or dependency {name} lacks a crate contract"))?;
+        // Every reviewed workspace package in the closure is passed to Cargo as
+        // a selected package, so its all-target/test dev edges are reviewed too.
+        for dependency in contract.normal.iter().chain(contract.dev) {
+            queue.push_back((*dependency).to_owned());
+        }
+    }
+    Ok(workspace)
+}
+
+fn reviewed_fixture_families(workspace: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut fixtures = BTreeSet::new();
+    if workspace.contains("wrela-package-loader") {
+        fixtures.insert("package/v1".to_owned());
+    }
+    if workspace.contains("wrela-syntax") {
+        fixtures.insert("syntax/v3".to_owned());
+    }
+    if workspace.contains("wrela-target") {
+        fixtures.insert("target/v1".to_owned());
+    }
+    if workspace.contains("wrela-test-protocol") {
+        fixtures.insert("protocol/v1".to_owned());
+    }
+    if workspace.contains("wrela-toolchain") {
+        fixtures.insert("toolchain/linux-payload-authority/v1".to_owned());
+        fixtures.insert("toolchain/v1".to_owned());
+    }
+    fixtures
+}
+
+fn expected_gate_closure(target: &GateTarget) -> Result<GateClosure, String> {
+    let workspace = expected_workspace_closure(&target.packages)?;
+
+    let reviewed_by_name: BTreeMap<_, _> = REVIEWED_EXTERNAL_PACKAGES
+        .iter()
+        .map(|package| (package.name, package))
+        .collect();
+    let mut external_names = BTreeSet::new();
+    let mut external_queue = VecDeque::new();
+    for dependency in EXTERNAL_DEPENDENCIES {
+        if dependency.optional || !workspace.contains(dependency.owner) {
+            continue;
+        }
+        external_queue.push_back(dependency.name);
+    }
+    while let Some(name) = external_queue.pop_front() {
+        if !external_names.insert(name) {
+            continue;
+        }
+        let package = reviewed_by_name
+            .get(name)
+            .ok_or_else(|| format!("external package {name} lacks reviewed closure metadata"))?;
+        external_queue.extend(package.dependencies.iter().copied());
+    }
+    let mut external = BTreeSet::new();
+    for name in external_names {
+        let package = reviewed_by_name
+            .get(name)
+            .ok_or_else(|| format!("external package {name} disappeared from reviewed metadata"))?;
+        external.insert(format!("{}@{}", package.name, package.version));
+    }
+    Ok(GateClosure {
+        workspace,
+        external,
+    })
+}
+
+fn actual_gate_closure(
+    target: &GateTarget,
+    metadata: &ResolvedMetadata,
+) -> Result<GateClosure, String> {
+    let mut root_ids = BTreeSet::new();
+    for package in &target.packages {
+        root_ids.insert(
+            metadata
+                .workspace_ids_by_name
+                .get(package)
+                .cloned()
+                .ok_or_else(|| format!("cargo metadata omitted gate root {package}"))?,
+        );
+    }
+    let mut visited = BTreeSet::new();
+    let mut queue: VecDeque<_> = root_ids.iter().cloned().collect();
+    while let Some(package_id) = queue.pop_front() {
+        if !visited.insert(package_id.clone()) {
+            continue;
+        }
+        let include_dev = metadata
+            .packages
+            .get(&package_id)
+            .is_some_and(|package| package.workspace);
+        for dependency in metadata.dependencies.get(&package_id).into_iter().flatten() {
+            if dependency.kinds.contains(&DependencySection::Normal)
+                || dependency.kinds.contains(&DependencySection::Build)
+                || (include_dev && dependency.kinds.contains(&DependencySection::Development))
+            {
+                queue.push_back(dependency.package_id.clone());
+            }
+        }
+    }
+
+    let mut workspace = BTreeSet::new();
+    let mut external = BTreeSet::new();
+    for package_id in visited {
+        let package = metadata
+            .packages
+            .get(&package_id)
+            .ok_or_else(|| format!("cargo resolve references unknown package {package_id}"))?;
+        if package.workspace {
+            workspace.insert(package.name.clone());
+        } else {
+            external.insert(format!("{}@{}", package.name, package.version));
+        }
+    }
+    Ok(GateClosure {
+        workspace,
+        external,
+    })
+}
+
+fn compare_gate_closure(
+    target_name: &str,
+    expected: &GateClosure,
+    actual: &GateClosure,
+) -> Result<(), String> {
+    if expected == actual {
+        return Ok(());
+    }
+    let missing_workspace: Vec<_> = expected
+        .workspace
+        .difference(&actual.workspace)
+        .cloned()
+        .collect();
+    let unexpected_workspace: Vec<_> = actual
+        .workspace
+        .difference(&expected.workspace)
+        .cloned()
+        .collect();
+    let missing_external: Vec<_> = expected
+        .external
+        .difference(&actual.external)
+        .cloned()
+        .collect();
+    let unexpected_external: Vec<_> = actual
+        .external
+        .difference(&expected.external)
+        .cloned()
+        .collect();
+    Err(format!(
+        "gate closure drift for {target_name}\n  missing workspace: {missing_workspace:?}\n  unexpected workspace: {unexpected_workspace:?}\n  missing external: {missing_external:?}\n  unexpected external: {unexpected_external:?}"
+    ))
+}
+
+fn validate_gate_closure(
+    target: &GateTarget,
+    metadata: &ResolvedMetadata,
+) -> Result<GateClosure, String> {
+    let expected = expected_gate_closure(target)?;
+    let expected_fixtures = reviewed_fixture_families(&expected.workspace);
+    let declared_fixtures: BTreeSet<_> = target.fixture_families.iter().cloned().collect();
+    if expected_fixtures != declared_fixtures {
+        return Err(format!(
+            "gate fixture metadata drift for {}\n  expected from reviewed closure: {expected_fixtures:?}\n  declared: {declared_fixtures:?}",
+            target.name
+        ));
+    }
+    let actual = actual_gate_closure(target, metadata)?;
+    compare_gate_closure(&target.name, &expected, &actual)?;
+    Ok(actual)
+}
+
+fn print_gate_metadata(target: &GateTarget, closure: &GateClosure) {
+    eprintln!("gate target: {}", target.name);
+    eprintln!("  purpose: {}", target.purpose);
+    eprintln!("  selected roots: {}", target.packages.join(", "));
+    eprintln!(
+        "  reviewed workspace closure ({}): {}",
+        closure.workspace.len(),
+        join_set(&closure.workspace)
+    );
+    eprintln!(
+        "  reviewed external closure ({}): {}",
+        closure.external.len(),
+        join_set(&closure.external)
+    );
+    eprintln!("  immediate upstream: {}", join_list(&target.upstream));
+    eprintln!("  immediate downstream: {}", join_list(&target.downstream));
+    if target.fixture_families.is_empty() {
+        eprintln!("  fixture families: none checked in for this gate target");
+    } else {
+        eprintln!("  fixture families: {}", target.fixture_families.join(", "));
+    }
+    eprintln!(
+        "  native requirements: {}",
+        join_list(&target.native_requirements)
+    );
+    eprintln!("  fast command: cargo xgate {}", target.name);
+    if target.full_route == FullRoute::None {
+        eprintln!(
+            "  full command: cargo xgate {} --full (no additional check applies after fast)",
+            target.name
+        );
+    } else {
+        eprintln!("  full command: cargo xgate {} --full", target.name);
+    }
+    eprintln!(
+        "  full route: {}",
+        full_route_description(target.full_route)
+    );
+    eprintln!("  fast timing budget: {}s", target.fast_budget_seconds);
+}
+
+fn join_set(values: &BTreeSet<String>) -> String {
+    if values.is_empty() {
+        "none".to_owned()
+    } else {
+        values.iter().cloned().collect::<Vec<_>>().join(", ")
+    }
+}
+
+fn join_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_owned()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn full_route_description(route: FullRoute) -> &'static str {
+    match route {
+        FullRoute::None => "none; the fast gate is complete for this non-native target",
+        FullRoute::ArtifactNative => {
+            "cargo xtask llvm, then feature-enabled LLVM/LLD artifact check"
+        }
+        FullRoute::BackendNative => "cargo xtask llvm, then feature-enabled bundled backend check",
+        FullRoute::Distribution => "cargo xtask dist (native/distribution integration)",
+    }
+}
+
+fn run_gate(root: &Path, request: &GateRequest) -> Result<(), String> {
+    let started = Instant::now();
+    validate_development_slice_metadata()?;
+    let target = gate_target(&request.target)?;
+    let metadata = resolved_cargo_metadata(root, None)?;
+    let closure = validate_gate_closure(&target, &metadata)?;
+    print_gate_metadata(&target, &closure);
+
+    let mut format_arguments = vec![
+        "--locked".to_owned(),
+        "--offline".to_owned(),
+        "fmt".to_owned(),
+    ];
+    append_package_selection(
+        &mut format_arguments,
+        &target,
+        &closure,
+        "--all",
+        "--package",
+    );
+    format_arguments.extend(["--".to_owned(), "--check".to_owned()]);
+    run_cargo(root, "scoped rustfmt", &format_arguments)?;
+
+    let mut check_arguments = vec![
+        "check".to_owned(),
+        "--all-targets".to_owned(),
+        "--locked".to_owned(),
+        "--offline".to_owned(),
+    ];
+    append_package_selection(
+        &mut check_arguments,
+        &target,
+        &closure,
+        "--workspace",
+        "--package",
+    );
+    run_cargo(root, "cargo check --all-targets", &check_arguments)?;
+
+    let mut test_arguments = vec![
+        "test".to_owned(),
+        "--no-fail-fast".to_owned(),
+        "--locked".to_owned(),
+        "--offline".to_owned(),
+    ];
+    append_package_selection(
+        &mut test_arguments,
+        &target,
+        &closure,
+        "--workspace",
+        "--package",
+    );
+    run_cargo(root, "unfiltered unit and contract tests", &test_arguments)?;
+
+    let mut lint_arguments = vec![
+        "clippy".to_owned(),
+        "--all-targets".to_owned(),
+        "--no-deps".to_owned(),
+        "--locked".to_owned(),
+        "--offline".to_owned(),
+    ];
+    append_package_selection(
+        &mut lint_arguments,
+        &target,
+        &closure,
+        "--workspace",
+        "--package",
+    );
+    lint_arguments.extend(["--".to_owned(), "-D".to_owned(), "warnings".to_owned()]);
+    run_cargo(root, "Clippy with warnings denied", &lint_arguments)?;
+
+    eprintln!("gate step architecture: validating reviewed contracts and closures");
+    check_architecture(root)?;
+
+    let fast_elapsed = started.elapsed();
+    println!(
+        "fast gate {} completed in {:.3}s (budget {}s)",
+        target.name,
+        fast_elapsed.as_secs_f64(),
+        target.fast_budget_seconds
+    );
+    if fast_elapsed.as_secs_f64() > target.fast_budget_seconds as f64 {
+        return Err(format!(
+            "fast gate {} exceeded its {}s timing budget ({:.3}s)",
+            target.name,
+            target.fast_budget_seconds,
+            fast_elapsed.as_secs_f64()
+        ));
+    }
+
+    if request.full {
+        run_full_route(root, &target)?;
+    }
+    Ok(())
+}
+
+fn append_package_selection(
+    arguments: &mut Vec<String>,
+    target: &GateTarget,
+    closure: &GateClosure,
+    all_flag: &str,
+    package_flag: &str,
+) {
+    if target.all_workspace {
+        arguments.push(all_flag.to_owned());
+    } else {
+        for package in &closure.workspace {
+            arguments.extend([package_flag.to_owned(), package.clone()]);
+        }
+    }
+}
+
+fn run_cargo(root: &Path, label: &str, arguments: &[String]) -> Result<(), String> {
+    run_cargo_with_native_environment(root, label, arguments, None)
+}
+
+fn run_cargo_with_native_environment(
+    root: &Path,
+    label: &str,
+    arguments: &[String],
+    native: Option<&llvm::VerifiedNativeEnvironment>,
+) -> Result<(), String> {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    eprintln!("gate step {label}: cargo {}", arguments.join(" "));
+    let mut command = Command::new(cargo);
+    command.args(arguments).current_dir(root);
+    configure_cargo_gate_environment(&mut command, native)?;
+    let status = command
+        .status()
+        .map_err(|error| format!("cannot execute cargo for {label}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{label} failed with {status}"))
+    }
+}
+
+fn configure_cargo_gate_environment(
+    command: &mut Command,
+    native: Option<&llvm::VerifiedNativeEnvironment>,
+) -> Result<(), String> {
+    if native.is_some() && !cfg!(target_os = "macos") {
+        return Err(
+            "the current authenticated native route is a Darwin bootstrap only; the authoritative Linux engine is not implemented"
+                .to_owned(),
+        );
+    }
+    command.env("CARGO_NET_OFFLINE", "true");
+    if let Some(native) = native {
+        command
+            .env("LLVM_SYS_221_PREFIX", &native.prefix)
+            .env("WRELA_LLVM_PREFIX", &native.prefix)
+            .env("WRELA_LLVM_CXX", &native.cxx)
+            .env("WRELA_LLVM_AR", &native.ar)
+            .env("WRELA_LLVM_SYSROOT", &native.sysroot)
+            .env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
+    }
+    Ok(())
+}
+
+fn run_full_route(root: &Path, target: &GateTarget) -> Result<(), String> {
+    let steps = full_route_steps(target.full_route);
+    if steps.is_empty() {
+        println!(
+            "full gate {} has no additional native or process check; fast evidence is complete",
+            target.name
+        );
+        return Ok(());
+    }
+    let mut native = None;
+    for step in steps {
+        run_cargo_with_native_environment(root, step.label, &step.arguments, native.as_ref())?;
+        if step.label == "cargo xtask llvm" {
+            native = Some(llvm::verified_environment_for_full_route(root)?);
+        }
+    }
+    Ok(())
+}
+
+fn full_route_steps(route: FullRoute) -> Vec<CargoStep> {
+    let native_task = |command: &'static str| CargoStep {
+        label: if command == "llvm" {
+            "cargo xtask llvm"
+        } else {
+            "cargo xtask dist"
+        },
+        arguments: vec![
+            "run".to_owned(),
+            "--locked".to_owned(),
+            "--offline".to_owned(),
+            "--package".to_owned(),
+            "xtask".to_owned(),
+            "--".to_owned(),
+            command.to_owned(),
+        ],
+    };
+    match route {
+        FullRoute::None => Vec::new(),
+        FullRoute::ArtifactNative => vec![
+            native_task("llvm"),
+            CargoStep {
+                label: "feature-enabled LLVM/LLD artifact check",
+                arguments: vec![
+                    "check".to_owned(),
+                    "--all-targets".to_owned(),
+                    "--locked".to_owned(),
+                    "--offline".to_owned(),
+                    "--package".to_owned(),
+                    "wrela-codegen-llvm".to_owned(),
+                    "--package".to_owned(),
+                    "wrela-link-efi".to_owned(),
+                    "--features".to_owned(),
+                    "wrela-codegen-llvm/llvm,wrela-link-efi/bundled-lld".to_owned(),
+                ],
+            },
+        ],
+        FullRoute::BackendNative => vec![
+            native_task("llvm"),
+            CargoStep {
+                label: "feature-enabled bundled backend check",
+                arguments: vec![
+                    "check".to_owned(),
+                    "--all-targets".to_owned(),
+                    "--locked".to_owned(),
+                    "--offline".to_owned(),
+                    "--package".to_owned(),
+                    "wrela-backend".to_owned(),
+                    "--features".to_owned(),
+                    "bundled-backend".to_owned(),
+                ],
+            },
+        ],
+        FullRoute::Distribution => vec![native_task("dist")],
     }
 }
 
@@ -630,13 +1995,19 @@ fn run_development_slice(
     command.current_dir(root);
     match operation {
         "check" => {
-            command.args(["check", "--all-targets", "--locked"]);
+            command.args(["check", "--all-targets", "--locked", "--offline"]);
         }
         "test" => {
-            command.args(["test", "--no-fail-fast", "--locked"]);
+            command.args(["test", "--no-fail-fast", "--locked", "--offline"]);
         }
         "lint" => {
-            command.args(["clippy", "--all-targets", "--no-deps", "--locked"]);
+            command.args([
+                "clippy",
+                "--all-targets",
+                "--no-deps",
+                "--locked",
+                "--offline",
+            ]);
         }
         _ => return Err(format!("unsupported development operation {operation}")),
     }
@@ -655,6 +2026,7 @@ fn run_development_slice(
     }
     eprintln!("running {operation} for {slice_name}");
     let status = command
+        .env("CARGO_NET_OFFLINE", "true")
         .status()
         .map_err(|error| format!("cannot execute cargo {operation}: {error}"))?;
     if status.success() {
@@ -673,31 +2045,73 @@ fn workspace_root() -> Result<PathBuf, String> {
         .ok_or_else(|| "xtask manifest has no workspace parent".to_owned())
 }
 
-fn check_architecture(root: &Path) -> Result<(), String> {
-    let workspace_names: BTreeSet<_> = CONTRACTS.iter().map(|contract| contract.name).collect();
-    let mut slice_names = BTreeSet::new();
-    for slice in DEVELOPMENT_SLICES {
-        if !slice_names.insert(slice.name) {
-            return Err(format!("duplicate development slice {}", slice.name));
+fn architecture_root(arguments: &[String]) -> Result<PathBuf, String> {
+    match arguments {
+        [] => workspace_root(),
+        [option, value] if option == "--root" => {
+            let selected = PathBuf::from(value);
+            if !selected.is_absolute() {
+                return Err("architecture-check --root must be absolute".to_owned());
+            }
+            let canonical = fs::canonicalize(&selected).map_err(|error| {
+                format!(
+                    "cannot canonicalize architecture-check root {}: {error}",
+                    selected.display()
+                )
+            })?;
+            if canonical != selected || !canonical.is_dir() {
+                return Err("architecture-check --root must be a canonical directory".to_owned());
+            }
+            Ok(canonical)
         }
-        let packages: BTreeSet<_> = slice.packages.iter().copied().collect();
-        if packages.len() != slice.packages.len()
-            || (slice.name != "all" && packages.is_empty())
-            || packages
-                .iter()
-                .any(|package| !workspace_names.contains(package))
-        {
-            return Err(format!(
-                "development slice {} has duplicate, empty, or unknown package entries",
-                slice.name
-            ));
-        }
+        _ => Err("architecture-check accepts only --root <absolute-workspace>".to_owned()),
     }
+}
+
+struct ArchitectureCommandTools<'a> {
+    cargo: &'a Path,
+    rustc: &'a Path,
+    rustdoc: &'a Path,
+    cargo_home: &'a Path,
+    current_directory: &'a Path,
+}
+
+pub(crate) fn check_architecture(root: &Path) -> Result<(), String> {
+    check_architecture_inner(root, None)
+}
+
+pub(crate) fn check_architecture_with_tools(
+    root: &Path,
+    cargo: &Path,
+    rustc: &Path,
+    rustdoc: &Path,
+    cargo_home: &Path,
+    current_directory: &Path,
+) -> Result<(), String> {
+    check_architecture_inner(
+        root,
+        Some(&ArchitectureCommandTools {
+            cargo,
+            rustc,
+            rustdoc,
+            cargo_home,
+            current_directory,
+        }),
+    )
+}
+
+fn check_architecture_inner(
+    root: &Path,
+    tools: Option<&ArchitectureCommandTools<'_>>,
+) -> Result<(), String> {
+    validate_development_slice_metadata()?;
+    validate_fixture_inventory(root)?;
+    let workspace_names: BTreeSet<_> = CONTRACTS.iter().map(|contract| contract.name).collect();
     let expected_members: BTreeSet<_> = CONTRACTS
         .iter()
         .map(|contract| contract.directory.to_owned())
         .collect();
-    let metadata = cargo_metadata(root)?;
+    let metadata = cargo_metadata(root, tools)?;
     let packages = metadata
         .get("packages")
         .and_then(serde_json::Value::as_array)
@@ -808,6 +2222,19 @@ fn check_architecture(root: &Path) -> Result<(), String> {
     }
     check_external_dependencies(packages, &workspace_names)?;
     check_toolchain_contracts(root)?;
+    validate_gate_inventory_against_metadata(root, tools)?;
+    Ok(())
+}
+
+fn validate_gate_inventory_against_metadata(
+    root: &Path,
+    tools: Option<&ArchitectureCommandTools<'_>>,
+) -> Result<(), String> {
+    let metadata = resolved_cargo_metadata(root, tools)?;
+    for slice in DEVELOPMENT_SLICES {
+        let target = gate_target(slice.name)?;
+        validate_gate_closure(&target, &metadata)?;
+    }
     Ok(())
 }
 
@@ -938,11 +2365,28 @@ fn check_documented_contract_inventory(
     Ok(())
 }
 
-fn cargo_metadata(root: &Path) -> Result<serde_json::Value, String> {
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = Command::new(cargo)
-        .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
-        .current_dir(root)
+fn cargo_metadata(
+    root: &Path,
+    tools: Option<&ArchitectureCommandTools<'_>>,
+) -> Result<serde_json::Value, String> {
+    let cargo = tools.map_or_else(
+        || env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
+        |tools| tools.cargo.as_os_str().to_owned(),
+    );
+    let mut command = Command::new(cargo);
+    command
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--locked",
+            "--offline",
+            "--manifest-path",
+        ])
+        .arg(root.join("Cargo.toml"));
+    configure_architecture_command(&mut command, root, tools);
+    let output = command
         .output()
         .map_err(|error| format!("cannot execute cargo metadata: {error}"))?;
     if !output.status.success() {
@@ -953,6 +2397,201 @@ fn cargo_metadata(root: &Path) -> Result<serde_json::Value, String> {
     }
     serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("cannot decode cargo metadata: {error}"))
+}
+
+fn resolved_cargo_metadata(
+    root: &Path,
+    tools: Option<&ArchitectureCommandTools<'_>>,
+) -> Result<ResolvedMetadata, String> {
+    let host = rustc_host_triple(root, tools)?;
+    let cargo = tools.map_or_else(
+        || env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
+        |tools| tools.cargo.as_os_str().to_owned(),
+    );
+    let mut command = Command::new(cargo);
+    command
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--offline",
+            "--manifest-path",
+        ])
+        .arg(root.join("Cargo.toml"))
+        .args(["--filter-platform"])
+        .arg(&host);
+    configure_architecture_command(&mut command, root, tools);
+    let output = command
+        .output()
+        .map_err(|error| format!("cannot execute resolved cargo metadata: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "resolved cargo metadata failed for host {host}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("cannot decode resolved cargo metadata: {error}"))?;
+    decode_resolved_metadata(&value)
+}
+
+fn rustc_host_triple(
+    root: &Path,
+    tools: Option<&ArchitectureCommandTools<'_>>,
+) -> Result<String, String> {
+    let rustc = tools.map_or_else(
+        || env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
+        |tools| tools.rustc.as_os_str().to_owned(),
+    );
+    let mut command = Command::new(rustc);
+    command.arg("-vV");
+    configure_architecture_command(&mut command, root, tools);
+    let output = command
+        .output()
+        .map_err(|error| format!("cannot query rustc host triple: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "rustc host query failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(str::to_owned)
+        .ok_or_else(|| "rustc -vV omitted its host triple".to_owned())
+}
+
+fn configure_architecture_command(
+    command: &mut Command,
+    root: &Path,
+    tools: Option<&ArchitectureCommandTools<'_>>,
+) {
+    if let Some(tools) = tools {
+        command
+            .current_dir(tools.current_directory)
+            .env_clear()
+            .env("CARGO_HOME", tools.cargo_home)
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("HOME", tools.current_directory)
+            .env("LC_ALL", "C")
+            .env("PATH", "/wrela/no-ambient-path")
+            .env("RUSTC", tools.rustc)
+            .env("RUSTDOC", tools.rustdoc)
+            .env("TZ", "UTC");
+    } else {
+        command.current_dir(root).env("CARGO_NET_OFFLINE", "true");
+    }
+}
+
+fn decode_resolved_metadata(value: &serde_json::Value) -> Result<ResolvedMetadata, String> {
+    let workspace_ids: BTreeSet<_> = value
+        .get("workspace_members")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "resolved cargo metadata omitted workspace_members".to_owned())?
+        .iter()
+        .map(|id| {
+            id.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "resolved cargo metadata has a non-string workspace ID".to_owned())
+        })
+        .collect::<Result<_, String>>()?;
+    let package_values = value
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "resolved cargo metadata omitted packages".to_owned())?;
+    let mut packages = BTreeMap::new();
+    let mut workspace_ids_by_name = BTreeMap::new();
+    for package in package_values {
+        let id = metadata_string(package, "id")?.to_owned();
+        let name = metadata_string(package, "name")?.to_owned();
+        let version = metadata_string(package, "version")?.to_owned();
+        let workspace = workspace_ids.contains(&id);
+        if workspace
+            && workspace_ids_by_name
+                .insert(name.clone(), id.clone())
+                .is_some()
+        {
+            return Err(format!(
+                "resolved cargo metadata contains duplicate workspace package {name}"
+            ));
+        }
+        if packages
+            .insert(
+                id.clone(),
+                ResolvedPackage {
+                    name,
+                    version,
+                    workspace,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "resolved cargo metadata contains duplicate package ID {id}"
+            ));
+        }
+    }
+    if workspace_ids_by_name.len() != workspace_ids.len() {
+        return Err("resolved cargo metadata omitted a workspace package record".to_owned());
+    }
+
+    let node_values = value
+        .get("resolve")
+        .and_then(|resolve| resolve.get("nodes"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "resolved cargo metadata omitted resolve.nodes".to_owned())?;
+    let mut dependencies = BTreeMap::new();
+    for node in node_values {
+        let id = metadata_string(node, "id")?.to_owned();
+        let dependency_values = node
+            .get("deps")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("cargo resolve node {id} omitted deps"))?;
+        let mut resolved = Vec::new();
+        for dependency in dependency_values {
+            let package_id = metadata_string(dependency, "pkg")?.to_owned();
+            if !packages.contains_key(&package_id) {
+                return Err(format!(
+                    "cargo resolve node {id} references unknown package {package_id}"
+                ));
+            }
+            let kind_values = dependency
+                .get("dep_kinds")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    format!("cargo resolve dependency {id} -> {package_id} omitted dep_kinds")
+                })?;
+            let mut kinds = BTreeSet::new();
+            if kind_values.is_empty() {
+                kinds.insert(DependencySection::Normal);
+            }
+            for kind in kind_values {
+                let section = match kind.get("kind") {
+                    None | Some(serde_json::Value::Null) => DependencySection::Normal,
+                    Some(value) if value.as_str() == Some("normal") => DependencySection::Normal,
+                    Some(value) if value.as_str() == Some("dev") => DependencySection::Development,
+                    Some(value) if value.as_str() == Some("build") => DependencySection::Build,
+                    Some(value) => {
+                        return Err(format!(
+                            "cargo resolve dependency {id} -> {package_id} has unknown kind {value}"
+                        ));
+                    }
+                };
+                kinds.insert(section);
+            }
+            resolved.push(ResolvedDependency { package_id, kinds });
+        }
+        if dependencies.insert(id.clone(), resolved).is_some() {
+            return Err(format!("cargo resolve contains duplicate node {id}"));
+        }
+    }
+    Ok(ResolvedMetadata {
+        packages,
+        workspace_ids_by_name,
+        dependencies,
+    })
 }
 
 fn metadata_string<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str, String> {
@@ -1172,14 +2811,37 @@ fn check_toolchain_contracts(root: &Path) -> Result<(), String> {
             "toolchain/llvm.lock.toml",
             &[
                 "version = \"22.1.3\"",
+                "tag = \"llvmorg-22.1.3\"",
                 "projects = [\"lld\"]",
                 "targets = [\"AArch64\"]",
             ],
         ),
         (
+            "toolchain/linux-engine.lock.toml",
+            &[
+                "channel = \"1.95.0\"",
+                "host = \"aarch64-apple-darwin\"",
+                "target = \"aarch64-unknown-linux-musl\"",
+                "target_archive_sha256 = \"f6710416ed9a7d5cf2a15efa761eb79a1deeb43f9961bbe05cc97bec4ef9064a\"",
+                "target_tree_sha256 = \"2abe3013ed2be1f3af94f4177b98b5ef9ab5b8449aebbf979348a049554cc3fe\"",
+                "rust_sysroot_tree_sha256 = \"fdeae0ef57277b65c8604e059b5631596a31a9ec510c6009d831fac062867504\"",
+                "xz_liblzma_sha256 = \"701b6dd5c9cf5864ae39121d6b7218a2ed6a24f36d82cb8d79947cb220c0e2cc\"",
+                "package = \"wrela-engine\"",
+                "profile = \"dist\"",
+            ],
+        ),
+        (
+            "crates/wrela-toolchain/src/lib.rs",
+            &["REQUIRED_LLVM_PROJECT_REVISION: &str = \"llvmorg-22.1.3\""],
+        ),
+        (
+            "crates/wrela-codegen-llvm/src/lib.rs",
+            &["PINNED_LLVM_VERSION: (u32, u32, u32) = (22, 1, 3)"],
+        ),
+        (
             "toolchain/emulation.lock.toml",
             &[
-                "version = \"10.0.11\"",
+                "version = \"10.1.5\"",
                 "system_targets = [\"aarch64-softmmu\"]",
                 "machine_contract = \"virt-10.0\"",
                 "cpu_contract = \"cortex-a57\"",
@@ -1341,7 +3003,7 @@ struct DependencySets {
     build: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DependencySection {
     Normal,
     Development,
@@ -1367,7 +3029,305 @@ fn compare_set(
 
 #[cfg(test)]
 mod tests {
-    use super::{check_architecture, workspace_root};
+    use std::collections::BTreeSet;
+    use std::ffi::OsStr;
+    use std::process::Command;
+
+    use super::{
+        DEVELOPMENT_SLICES, EXTERNAL_DEPENDENCIES, FullRoute, GateClosure, GateRequest,
+        MACOS_DEPLOYMENT_TARGET, PathBuf, REVIEWED_EXTERNAL_PACKAGES, architecture_root,
+        check_architecture, compare_gate_closure, configure_cargo_gate_environment,
+        expected_gate_closure, full_route_steps, gate_target, llvm, parse_gate_arguments,
+        validate_development_slice_metadata, workspace_root,
+    };
+
+    fn strings(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn environment_value(command: &Command, name: &str) -> Option<String> {
+        command
+            .get_envs()
+            .find(|(candidate, _)| candidate == &OsStr::new(name))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn authenticated_native_gate_environment_is_explicitly_darwin_bootstrap_only() {
+        let mut ordinary = Command::new("cargo");
+        configure_cargo_gate_environment(&mut ordinary, None).expect("ordinary gate environment");
+        assert_eq!(
+            environment_value(&ordinary, "CARGO_NET_OFFLINE").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            environment_value(&ordinary, "MACOSX_DEPLOYMENT_TARGET"),
+            None
+        );
+
+        let native = llvm::VerifiedNativeEnvironment {
+            prefix: PathBuf::from("/authenticated/llvm"),
+            cxx: PathBuf::from("/authenticated/clang++"),
+            ar: PathBuf::from("/authenticated/ar"),
+            sysroot: PathBuf::from("/authenticated/MacOSX.sdk"),
+        };
+        let mut focused_native = Command::new("cargo");
+        let configured = configure_cargo_gate_environment(&mut focused_native, Some(&native));
+        if cfg!(target_os = "macos") {
+            configured
+                .as_ref()
+                .expect("Darwin bootstrap native gate environment");
+            assert_eq!(
+                environment_value(&focused_native, "WRELA_LLVM_PREFIX").as_deref(),
+                Some("/authenticated/llvm")
+            );
+            assert_eq!(
+                environment_value(&focused_native, "WRELA_LLVM_CXX").as_deref(),
+                Some("/authenticated/clang++")
+            );
+            assert_eq!(
+                environment_value(&focused_native, "WRELA_LLVM_AR").as_deref(),
+                Some("/authenticated/ar")
+            );
+            assert_eq!(
+                environment_value(&focused_native, "WRELA_LLVM_SYSROOT").as_deref(),
+                Some("/authenticated/MacOSX.sdk")
+            );
+            assert_eq!(
+                environment_value(&focused_native, "MACOSX_DEPLOYMENT_TARGET").as_deref(),
+                Some(MACOS_DEPLOYMENT_TARGET)
+            );
+        } else {
+            assert_eq!(
+                configured,
+                Err(
+                    "the current authenticated native route is a Darwin bootstrap only; the authoritative Linux engine is not implemented"
+                        .to_owned(),
+                )
+            );
+            for name in [
+                "LLVM_SYS_221_PREFIX",
+                "WRELA_LLVM_PREFIX",
+                "WRELA_LLVM_CXX",
+                "WRELA_LLVM_AR",
+                "WRELA_LLVM_SYSROOT",
+                "MACOSX_DEPLOYMENT_TARGET",
+                "CARGO_NET_OFFLINE",
+            ] {
+                assert_eq!(environment_value(&focused_native, name), None);
+            }
+        }
+    }
+
+    #[test]
+    fn slice_metadata_is_complete_and_coherent() {
+        validate_development_slice_metadata().expect("complete slice metadata");
+        let names: BTreeSet<_> = DEVELOPMENT_SLICES.iter().map(|slice| slice.name).collect();
+        for required in [
+            "input", "syntax", "hir", "semantic", "flow", "machine", "artifact", "backend",
+            "testing", "cli",
+        ] {
+            assert!(
+                names.contains(required),
+                "missing required slice {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_closures_are_transitive_and_scoped() {
+        let syntax = gate_target("syntax").expect("syntax target");
+        let syntax_closure = expected_gate_closure(&syntax).expect("syntax closure");
+        assert_eq!(
+            syntax_closure.workspace,
+            strings(&[
+                "wrela-build-model",
+                "wrela-diagnostics",
+                "wrela-format",
+                "wrela-source",
+                "wrela-syntax",
+            ])
+        );
+        assert_eq!(
+            syntax_closure.external,
+            strings(&[
+                "tinyvec@1.12.0",
+                "tinyvec_macros@0.1.1",
+                "unicode-ident@1.0.18",
+                "unicode-normalization@0.1.24",
+            ])
+        );
+
+        let cli =
+            expected_gate_closure(&gate_target("cli").expect("cli target")).expect("cli closure");
+        assert!(cli.workspace.contains("wrela-backend"));
+        assert!(cli.workspace.contains("wrela-test-protocol"));
+        assert!(!cli.workspace.contains("xtask"));
+        assert!(cli.external.contains("serde_json@1.0.150"));
+
+        let all =
+            expected_gate_closure(&gate_target("all").expect("all target")).expect("all closure");
+        assert!(all.workspace.contains("wrela-test-protocol"));
+        assert!(all.workspace.contains("xtask"));
+        assert!(all.external.contains("serde_json@1.0.150"));
+    }
+
+    #[test]
+    fn toml_parser_requirements_and_spec_versions_are_exact() {
+        let toml = EXTERNAL_DEPENDENCIES
+            .iter()
+            .find(|dependency| {
+                dependency.owner == "wrela-package-loader" && dependency.name == "toml"
+            })
+            .expect("direct toml dependency contract");
+        assert_eq!(toml.requirement, "=0.9.9");
+        assert!(!toml.default_features);
+        assert_eq!(toml.features, ["parse", "std"]);
+
+        let parser = EXTERNAL_DEPENDENCIES
+            .iter()
+            .find(|dependency| {
+                dependency.owner == "wrela-package-loader" && dependency.name == "toml_parser"
+            })
+            .expect("direct toml_parser dependency contract");
+        assert_eq!(parser.requirement, "=1.0.5");
+        assert!(!parser.default_features);
+        assert_eq!(parser.features, ["alloc", "std"]);
+
+        for (name, version) in [
+            ("equivalent", "1.0.2"),
+            ("hashbrown", "0.17.1"),
+            ("indexmap", "2.14.0"),
+            ("serde_core", "1.0.228"),
+            ("serde_spanned", "1.1.1"),
+            ("toml", "0.9.9+spec-1.0.0"),
+            ("toml_datetime", "0.7.5+spec-1.1.0"),
+            ("toml_parser", "1.0.5+spec-1.0.0"),
+            ("toml_writer", "1.1.2+spec-1.1.0"),
+            ("winnow", "0.7.15"),
+        ] {
+            assert_eq!(
+                REVIEWED_EXTERNAL_PACKAGES
+                    .iter()
+                    .find(|package| package.name == name)
+                    .map(|package| package.version),
+                Some(version),
+                "resolved {name} package identity must retain its spec metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn closure_drift_is_rejected_precisely() {
+        let expected = expected_gate_closure(&gate_target("syntax").expect("syntax target"))
+            .expect("syntax closure");
+        let mut actual = expected.clone();
+        actual.workspace.insert("wrela-backend".to_owned());
+        actual.external.remove("unicode-ident@1.0.18");
+        let error = compare_gate_closure("syntax", &expected, &actual)
+            .expect_err("closure drift must fail");
+        assert!(error.contains("unexpected workspace: [\"wrela-backend\"]"));
+        assert!(error.contains("missing external: [\"unicode-ident@1.0.18\"]"));
+
+        compare_gate_closure(
+            "empty",
+            &GateClosure {
+                workspace: BTreeSet::new(),
+                external: BTreeSet::new(),
+            },
+            &GateClosure {
+                workspace: BTreeSet::new(),
+                external: BTreeSet::new(),
+            },
+        )
+        .expect("identical closure");
+    }
+
+    #[test]
+    fn gate_arguments_reject_filters_and_arbitrary_extras() {
+        assert_eq!(
+            parse_gate_arguments(vec!["syntax".to_owned()]).expect("fast gate"),
+            GateRequest {
+                target: "syntax".to_owned(),
+                full: false,
+            }
+        );
+        assert_eq!(
+            parse_gate_arguments(vec!["syntax".to_owned(), "--full".to_owned()])
+                .expect("full gate"),
+            GateRequest {
+                target: "syntax".to_owned(),
+                full: true,
+            }
+        );
+        for invalid in [
+            vec![],
+            vec!["--full"],
+            vec!["syntax", "parser_filter"],
+            vec!["syntax", "--", "parser_filter"],
+            vec!["syntax", "--full", "--full"],
+        ] {
+            assert!(
+                parse_gate_arguments(invalid.into_iter().map(str::to_owned).collect()).is_err(),
+                "accepted invalid gate arguments"
+            );
+        }
+    }
+
+    #[test]
+    fn full_routes_are_explicit_without_executing_native_work() {
+        assert_eq!(
+            gate_target("syntax").expect("syntax target").full_route,
+            FullRoute::None
+        );
+        assert_eq!(
+            gate_target("artifact").expect("artifact target").full_route,
+            FullRoute::ArtifactNative
+        );
+        assert_eq!(
+            gate_target("wrela-backend")
+                .expect("backend crate")
+                .full_route,
+            FullRoute::BackendNative
+        );
+        assert_eq!(
+            gate_target("testing").expect("testing target").full_route,
+            FullRoute::Distribution
+        );
+
+        let artifact_steps = full_route_steps(FullRoute::ArtifactNative);
+        assert_eq!(artifact_steps.len(), 2);
+        assert_eq!(
+            artifact_steps[0].arguments.last().map(String::as_str),
+            Some("llvm")
+        );
+        assert!(
+            artifact_steps[1]
+                .arguments
+                .contains(&"wrela-codegen-llvm/llvm,wrela-link-efi/bundled-lld".to_owned())
+        );
+
+        let distribution_steps = full_route_steps(FullRoute::Distribution);
+        assert_eq!(distribution_steps.len(), 1);
+        assert_eq!(
+            distribution_steps[0].arguments.last().map(String::as_str),
+            Some("dist")
+        );
+        assert!(full_route_steps(FullRoute::None).is_empty());
+    }
+
+    #[test]
+    fn architecture_root_accepts_only_an_explicit_canonical_workspace() {
+        let root = workspace_root().expect("workspace root");
+        assert_eq!(
+            architecture_root(&["--root".to_owned(), root.display().to_string()])
+                .expect("explicit workspace"),
+            root
+        );
+        assert!(architecture_root(&["--root".to_owned(), "relative".to_owned()]).is_err());
+        assert!(architecture_root(&["unexpected".to_owned()]).is_err());
+    }
 
     #[test]
     fn workspace_matches_dependency_contracts() {

@@ -183,6 +183,70 @@ Record mode records every observed value, and replay supplies the recorded
 sequence. Wall time is a separate optional capability and is not used for
 scheduling, deadlines, or restart intensity.
 
+Implementation status: the checked-in `core.time` module publicly implements a
+bounded function-based subset. `Duration` is a nominal flat structure with a
+private u64 nanosecond field. Runtime callers can import `ns`, `us`, `ms`,
+`seconds`, `minutes`, `hours`, `days`, `weeks`, `as_nanoseconds`, `add`,
+`subtract`, `scale`, `less_than`, `less_than_or_equal`, `greater_than`,
+`greater_than_or_equal`, `min`, `max`, and `clamp`; comptime callers import the
+explicitly suffixed equivalents. The comptime constructors enforce exact u64
+nanosecond thresholds, including minute `307445734`, hour `5124095`, day
+`213503`, and week `30500`. Runtime unit conversion, addition, subtraction, and
+scaling use checked target arithmetic; subtraction underflow abandons rather
+than wrapping. `subtract_comptime` instead emits a source-aware failed
+assertion before evaluating an underflowing operation. Ordering is the unsigned
+total order of the private nanosecond scalar. `min`, `max`, and `clamp` use
+scalar locals and branches and reconstruct the selected value through `ns` or
+`ns_comptime`. `clamp(value, lower, upper)` requires `lower <= upper`: its
+runtime form preflights that invariant with checked target subtraction and
+abandons on inversion, while its comptime form emits a source-aware failed
+assertion before arithmetic. Runtime copy-expression lowering is not part of
+this surface.
+
+A canonical manifest-declared workspace imports those installed functions
+directly and proves genuine source evaluation, exact and max-plus-one overflow
+diagnostics with imported-call stacks, exact-zero subtraction, source-aware
+underflow rejection, equality/order edges, nested clamp/subtraction helpers,
+name filtering, deterministic reruns, exact/over step, memory, and call-depth
+quotas, deterministic cancellation, and unsupported-operation classification.
+A prior-tuple selected runtime source reached SemanticWir, FlowWir, canonical wire v9,
+backend revalidation, and MachineWir v9 with exact comparison, branch, checked
+arithmetic, projection, and call topology assertions. Machine lowering preserves
+nominal provenance while selecting an exact 8-byte, 8-aligned u64-backed
+representation. The authenticated native lane emits the same prepared model as
+deterministic independently validated ARM64 COFF after FlowWir and MachineWir
+agree on the exact 70-edge fully qualified harness/test/core call multiset. This
+compiles and lowers the selected source `@test fn`; it does not execute that test
+in a booted runtime image.
+
+This is not the complete normative surface above. Runtime and comptime names
+are currently distinct, the field remains private, and operator/method
+presentation, recoverable `Result`-returning checked forms, units larger than a
+week, `Instant`, `now`, runtime copy lowering, non-test/actor assertion
+supervision, and executed current-tuple runtime-image tests remain follow-on
+work. Selected generated-test assertions reach native ABI2 objects; packaged
+QEMU execution is pending.
+
+The current nongeneric substrate admits a local closed enum with 1–256
+explicit variants, one shared positional copy-scalar payload, and exhaustive
+unguarded constructor-only matching. It lowers through SemanticWir 8,
+FlowWir/wire 10 and MachineWir 10 with a canonical `{u8,payload}` contract.
+Authenticated native emission for this checked-in source remains pending.
+The checked-in `core.result` module now declares that generic library shape,
+but runtime execution is deliberately limited to `Result[S,S]` for one
+supported copy scalar `S`. Sema authenticates the exact core declaration,
+retains and interns `[Type(S),Type(S)]`, requires contextual constructors, and
+then erases the specialization metadata into the existing canonical enum
+representation. Unequal, nonscalar, wrong-arity, forged non-core, and
+context-free forms are rejected. Postfix `?` is implemented only when its
+operand is an owned rvalue of that exact `Result[S,S]` specialization and the
+enclosing function returns the identical type. `Ok` yields its payload; `Err`
+reconstructs the exact error and takes the ordinary early-return path. Named
+places remain rejected until their move and cleanup semantics are implemented.
+This does not yet implement general `Result[T,E]`, `From` conversion, `Option`,
+or recoverable library APIs; recoverable checked conversions remain
+unimplemented.
+
 ## 6. Tasks, wake, and task failure
 
 Every local or nursery-installed async activation resolves once with:
@@ -330,7 +394,7 @@ their surface declarations.
   allocation.
 - `device[D]` produces a proof-only `DeviceDecl[D]`; `driver[A]`,
   `service[A]`, and `app[A]` each produce one proof-only `ActorDecl[A]`.
-  Their constructor arguments must exactly match `A.__init__` after generated
+  Their constructor arguments must exactly match `A.init` after generated
   capabilities/handles are substituted.
 - `ActorDecl[A].handle()` is legal only as a constructor field/dependency in the
   same image and only when chapter 01's role graph permits that edge. In

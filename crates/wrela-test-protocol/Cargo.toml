@@ -8,6 +8,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+wrela-source = { path = "../wrela-source" }
 wrela-test-model = { path = "../wrela-test-model" }
 
 [lints]

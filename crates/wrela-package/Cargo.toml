@@ -8,7 +8,8 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-unicode-normalization = "0.1.25"
+unicode-ident = "=1.0.18"
+unicode-normalization = "=0.1.24"
 wrela-build-model = { path = "../wrela-build-model" }
 wrela-source = { path = "../wrela-source" }
 

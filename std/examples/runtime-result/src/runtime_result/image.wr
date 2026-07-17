@@ -1,0 +1,72 @@
+module runtime_result.image
+
+from core.image import Image, Target
+from core.result import Result
+
+@image
+pub comptime fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+fn unwrap_or_zero(value: Result[u8, u8]) -> u8:
+    match value:
+        case Result.Ok(bind payload):
+            return payload
+        case Result.Err(bind code):
+            return 0
+
+fn unwrap_bool_or_false(value: Result[bool, bool]) -> bool:
+    match value:
+        case Result.Ok(bind payload):
+            return payload
+        case Result.Err(bind code):
+            return false
+
+fn try_ok_source() -> Result[u8, u8]:
+    return Result.Ok(42)
+
+fn propagate_try_ok() -> Result[u8, u8]:
+    payload: u8 = try_ok_source()?
+    return Result.Ok(payload)
+
+fn try_err_source() -> Result[u8, u8]:
+    return Result.Err(7)
+
+fn propagate_try_err() -> Result[u8, u8]:
+    payload: u8 = try_err_source()?
+    return Result.Ok(payload)
+
+@test
+fn result_ok_match_returns_payload():
+    first: Result[u8, u8] = Result.Ok(42)
+    repeated: Result[u8, u8] = Result.Err(7)
+    value: u8 = unwrap_or_zero(value=first)
+    fallback: u8 = unwrap_or_zero(value=repeated)
+    assert value == 42, "Ok payload must survive exhaustive match"
+    assert fallback == 0, "repeated Result[u8, u8] must reuse the same specialization"
+    return
+
+@test
+fn result_bool_match_returns_payload():
+    value: Result[bool, bool] = Result.Ok(true)
+    assert unwrap_bool_or_false(value=value), "bool Result payload must survive exhaustive match"
+    return
+
+@test
+fn result_try_ok_yields_payload():
+    match propagate_try_ok():
+        case Result.Ok(bind payload):
+            assert payload == 42, "postfix question must yield the Ok payload"
+            return
+        case Result.Err(bind error):
+            assert false, "Ok propagation unexpectedly returned Err"
+            return
+
+@test
+fn result_try_err_propagates_exact_error():
+    match propagate_try_err():
+        case Result.Ok(bind payload):
+            assert false, "Err propagation unexpectedly returned Ok"
+            return
+        case Result.Err(bind error):
+            assert error == 7, "postfix question must preserve the exact error"
+            return
