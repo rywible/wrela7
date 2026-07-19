@@ -51,7 +51,7 @@ and versioned boundary fixtures are described in
 | 1.4 | Typed image graph, actor roles/wiring, capabilities, pools, IRQs, supervision and stable value handles. | Image/build models exist; general graph execution absent. | partial — req-03,08,09 |
 | 1.5.1 | Owned fields, exclusive `mut`, initialized `take`, projection-only lexical views, explicit aggregate copy, legal actor payloads. | Scalar/flat aggregate/move fragments only. | partial — req-05 |
 | 1.5.2 | Exactly-one bounded region, frame-safe suspension, linear cleanup, deterministic acyclic cleanup dependencies. | Representational models only; no general cleanup runtime. | gap — req-05 |
-| 1.5.3 | Actor ownership/non-reentrancy, acyclic unified wait graph, finite activations, checkpoints, irrevocable admitted takes. | One-way actor vertical exists: `actor_flow_vertical.rs`, `actor_one_way_send_vertical.rs`; recurring scheduler/wait graph absent. | partial — req-03,04,07 |
+| 1.5.3 | Actor ownership/non-reentrancy, acyclic unified wait graph, finite activations, checkpoints, irrevocable admitted takes. | One-way actor vertical exists: `actor_flow_vertical.rs`, `actor_one_way_send_vertical.rs`; cross-actor unit send: `actor_cross_send_vertical.rs`; recurring scheduler/wait graph absent. | partial — req-03,04,07 |
 | 1.5.4 | Manifest capabilities, exclusive ISR, DMA/control-memory ownership, untrusted checks and quiescent cancellation. | Target types/tables are modeled; no complete virtio execution. | gap — req-08 |
 | 1.5.5 | Closed dispatch, deterministic bounded comptime, value errors vs abandonment, restart after teardown. | Bounded comptime vertical exists; other clauses incomplete. | partial — req-09,10 |
 | 1.6 | Enforce safety claim while accurately documenting compiler/runtime/firmware/device TCB; no general unsafe/FFI. | Architecture boundaries documented; full enforcement follows feature rows. | partial — req-18 |
@@ -98,9 +98,9 @@ and versioned boundary fixtures are described in
 
 | Spec | Contract inventory | Layers/evidence | Status / delivery owner |
 |---|---|---|---|
-| 4.1–4.2 | Actor roots/typed handles and legal fixed-layout payloads; handles remain image-wired. | Initial actor call/send source-to-native verticals. | partial — req-03 |
+| 4.1–4.2 | Actor roots/typed handles and legal fixed-layout payloads; handles remain image-wired. | Image-wired typed handles and unit payloads: `actor_flow_vertical.rs`, `actor_one_way_send_vertical.rs`, `actor_cross_send_vertical.rs`. Typed call payloads remain absent. | partial — req-03 |
 | 4.3, 4.3.1 | Non-reentrant turns and concrete unified wait graph including resources/producers; driver handlers never self-wait. | General recurring turns and wait graph absent. | gap — req-03,07 |
-| 4.3.2 | One-way `send`/`try send`, reserve-before-evaluation, arm-sensitive ownership, restart capacity/FIFO. | `actor_one_way_send_vertical.rs` and diagnostics test cover a bounded first slice. | partial — req-03,07 |
+| 4.3.2 | One-way `send`/`try send`, reserve-before-evaluation, arm-sensitive ownership, restart capacity/FIFO. | Bounded first slice of self-send: `actor_one_way_send_vertical.rs` and diagnostics test. Cross-actor unit send: `actor_cross_send_vertical.rs`. Typed payloads, replies, recurrence absent. | partial — req-03,07 |
 | 4.3.3–4.3.4 | Observable admission/FIFO/turn/replay semantics and exactly-once typed replies/peer failures/take outcomes. | Initial actor flow model; no recurring failure/runtime proof. | partial — req-03,07,10 |
 | 4.4 | Derived finite mailbox/turn bounds and logical-vs-physical reporting. | Build models only. | gap — req-03,09 |
 | 4.5–4.5.1 | Ahead-of-time bounded async machines, static tasks, explicit exits, recursion/frame/stack bounds. | General async lowering absent. | gap — req-04 |
@@ -110,7 +110,7 @@ and versioned boundary fixtures are described in
 | 4.12–4.12.3 | Fresh request lineage, atomic child registration, cancellation cleanup, permit backpressure and sealed race/select. | Not implemented. | gap — req-07 |
 | 4.13–4.14 | Device receipt throughput accounting and IRQ/poll idle behavior. | Not implemented end to end. | gap — req-07,08 |
 | 4.15 | Single-core APIs remain future-multicore-compatible without providing multicore semantics. | Design constraint; multicore itself is excluded. | partial — req-18 |
-| 4.16 | Narrow implemented actor-flow boundary is accurately documented and unsupported paths fail closed. | `actor_flow_vertical.rs`; native emission documented in section. | partial — req-03 (must expand) |
+| 4.16 | Narrow implemented actor-flow boundary is accurately documented and unsupported paths fail closed. | Self-send and cross-actor unit send: `actor_flow_vertical.rs`, `actor_cross_send_vertical.rs`; native emission documented in section. | partial — req-03 (must expand) |
 
 ## Chapter 05 — Hardware safety
 
@@ -192,7 +192,7 @@ and versioned boundary fixtures are described in
 |---|---|---|---|
 | 10.1 | Alternative implementations preserve exact typed effects/bounds/events/diagnostics with no hidden behavior. | Architecture policy; complete library absent. | partial — req-11 |
 | 10.2 | General Option/Result payload ownership, projection carriers, `?`, unique From and mut Option take. | Restricted `Result[S,S]` only; `runtime_result_vertical.rs`, `std/core/result.wr`. | partial — req-06 |
-| 10.3 | Image-wired Actor/Static and exactly-once typed calls/admission/peer failure/ownership-conditioned outcomes. | Initial actor send/call vertical only. | partial — req-03,07,11 |
+| 10.3 | Image-wired Actor/Static and exactly-once typed calls/admission/peer failure/ownership-conditioned outcomes. | Unit send across actors: `actor_cross_send_vertical.rs`. Typed payloads, replies, peer failure, ownership-conditioned outcomes absent. | partial — req-03,07,11 |
 | 10.4 | Completion, transfer/IO receipts, receipt handoff and request lineage implement strict exactly-once recovery. | Not implemented end to end. | gap — req-07,11 |
 | 10.5 | Complete Duration/Instant/now semantics including record/replay and checked APIs. | Function-based Duration subset: `stdlib_time_scalar.rs`, `stdlib_time_runtime_vertical.rs`, `std/core/time.wr`; section documents missing surfaces. | partial — req-11 |
 | 10.6 | Static task identities, explicit AsyncExit, idempotent wake and supervised TaskFailed. | Not implemented generally. | gap — req-04,11 |

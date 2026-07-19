@@ -11,7 +11,7 @@ and must not be reported as a successful appliance boot.
 |---|---|---|
 | Sealed AArch64 UEFI image | `std/examples/minimal-image`; compiler and real-QEMU smoke gates | Boots only the supported scalar/minimum-image subset. |
 | Actor activation and bounded mailbox | `crates/wrela-compiler/tests/actor_flow_vertical.rs` | One closed actor/task graph; no app-to-service request path. |
-| One-way actor turn dispatch | `crates/wrela-compiler/tests/actor_one_way_send_vertical.rs` | One startup-produced unit message; no typed payload or reply. |
+| One-way actor turn dispatch | `crates/wrela-compiler/tests/actor_one_way_send_vertical.rs`, `crates/wrela-compiler/tests/actor_cross_send_vertical.rs` | Self-send and cross-actor unit message; no typed payload or reply. |
 | Recurring native mailbox drain | `crates/wrela-codegen-llvm/src/ir.rs` and its mailbox tests | Drains admitted messages, but no general ready scheduler or FIFO mailbox set. |
 | Target virtio transport location | `wrela-target` target package and `wrela-test-runner` QEMU arguments | The boot medium occupies the first virtio-block MMIO transport; source cannot yet claim/map it. |
 | IRQ route and ISR proof boundary | `wrela-machine-wir` interrupt route fixture | Machine contract only; no source MMIO/IRQ declaration or driver lowering. |
