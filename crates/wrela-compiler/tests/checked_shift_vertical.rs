@@ -81,10 +81,7 @@ fn expected_runtime_assertions(selector: &str) -> Vec<(&'static str, Option<&'st
             ("value == 0", Some("modular shift must wrap to zero")),
             ("value == 0", Some("helper must observe wrapped value")),
         ],
-        "runtime_assertion_fails" => vec![(
-            "false",
-            Some("intentional runtime assertion failure"),
-        )],
+        "runtime_assertion_fails" => vec![("false", Some("intentional runtime assertion failure"))],
         "checked_shift_result_loss" | "invalid_shift_count" => Vec::new(),
         _ => panic!("unknown checked-shift selector {selector}"),
     }
@@ -450,9 +447,7 @@ fn source_checked_and_modular_left_shifts_reach_distinct_semantic_and_flow_opera
         ),
     ];
 
-    for (case_index, (selector, shift, expected_fatal)) in
-        cases.into_iter().enumerate()
-    {
+    for (case_index, (selector, shift, expected_fatal)) in cases.into_iter().enumerate() {
         let discovery = analyzer
             .analyze(
                 AnalysisRequest {
@@ -793,11 +788,9 @@ fn source_checked_and_modular_left_shifts_reach_distinct_semantic_and_flow_opera
                         .expect("MachineWir assertion source"),
                     failure.expression
                 );
-                for (global_id, text) in std::iter::once((
-                    failure.expression_global,
-                    failure.expression.as_str(),
-                ))
-                .chain(failure.message_global.zip(failure.message.as_deref()))
+                for (global_id, text) in
+                    std::iter::once((failure.expression_global, failure.expression.as_str()))
+                        .chain(failure.message_global.zip(failure.message.as_deref()))
                 {
                     let global = machine
                         .globals

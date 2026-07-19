@@ -43,33 +43,24 @@ from core.image import Image, Target
 
 @image
 pub comptime fn boot() -> Image:
-    return Image(name="elif-image", target=Target.aarch64_qemu_virt_uefi)
+    return Image(name="bounded-while-image", target=Target.aarch64_qemu_virt_uefi)
 
 @test
-fn elif_runtime():
-    first: bool = false_value()
-    second: bool = false_value()
-    third: bool = true_value()
-    joined: u32 = 7
-    if first:
-        joined = 11
-    elif second:
-        joined = 13
-    elif third:
-        joined = 17
-    else:
-        joined = 19
-    consume(value=joined)
+fn bounded_while_runtime():
+    index: u32 = 0
+    total: u32 = 0
+    while index < 8:
+        index += 1
+        if index == 2:
+            continue
+        if index == 7:
+            break
+        total += index
+    consume(value=total)
     return
 
 fn consume(value: u32) -> u32:
     return value
-
-fn false_value() -> bool:
-    return false
-
-fn true_value() -> bool:
-    return true
 "#;
 
 fn identity(name: &str, digest: Sha256Digest) -> PackageIdentity {
@@ -85,7 +76,7 @@ fn never_cancelled() -> bool {
 }
 
 #[test]
-fn source_elif_reaches_nested_semantic_and_flow_ssa_joins() {
+fn source_bounded_while_reaches_semantic_flow_machine_back_edges() {
     let source_graph_digest = Sha256Digest::from_bytes([0x71; 32]);
     let core_package_digest = Sha256Digest::from_bytes([0x72; 32]);
     let target_digest = Sha256Digest::from_bytes([0x73; 32]);
@@ -124,7 +115,7 @@ fn source_elif_reaches_nested_semantic_and_flow_ssa_joins() {
         .collect::<Vec<_>>();
 
     let mut graph = PackageGraphBuilder::new(identity(
-        "elif-application",
+        "bounded-while-application",
         Sha256Digest::from_bytes([0x76; 32]),
     ));
     let core = graph
@@ -183,7 +174,15 @@ fn source_elif_reaches_nested_semantic_and_flow_ssa_joins() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(hir_ifs, [1, 1, 1]);
+    assert_eq!(hir_ifs, [1, 1]);
+    assert_eq!(
+        hir_program
+            .statements
+            .iter()
+            .filter(|statement| matches!(statement.kind, StatementKind::While { .. }))
+            .count(),
+        1
+    );
     let image_entry = *hir_program
         .image_candidates
         .first()
@@ -223,7 +222,7 @@ fn source_elif_reaches_nested_semantic_and_flow_ssa_joins() {
                 target: target.semantic(),
                 build: &build,
                 mode: AnalysisMode::DiscoverTests {
-                    image_name: "elif-image",
+                    image_name: "bounded-while-image",
                     image_entry,
                     declared_image_tests: &[],
                     source_selection: TestDiscoverySelection::All,
@@ -233,7 +232,7 @@ fn source_elif_reaches_nested_semantic_and_flow_ssa_joins() {
             },
             &never_cancelled,
         )
-        .expect("test discovery accepts normalized elif HIR");
+        .expect("test discovery accepts normalized bounded while HIR");
     assert!(
         discovery.diagnostics().is_empty(),
         "discovery diagnostics: {:?}",
@@ -262,7 +261,7 @@ fn source_elif_reaches_nested_semantic_and_flow_ssa_joins() {
             },
             &never_cancelled,
         )
-        .expect("runtime elif test reaches semantic facts");
+        .expect("runtime bounded while test reaches semantic facts");
     assert!(
         compilation.diagnostics().is_empty(),
         "compilation diagnostics: {:?}",
@@ -280,11 +279,22 @@ fn source_elif_reaches_nested_semantic_and_flow_ssa_joins() {
             },
             &never_cancelled,
         )
-        .expect("normalized elif lowers to SemanticWir");
+        .expect("normalized bounded while lowers to SemanticWir");
     let semantic_debug = format!("{:?}", semantic_output.wir().as_wir());
+    assert_eq!(semantic_debug.matches("Loop {").count(), 1);
     assert_eq!(semantic_debug.matches("If {").count(), 3);
+    assert!(semantic_debug.contains("uninterrupted_bound: Some(8)"));
 
     let (semantic_wir, _) = semantic_output.into_parts();
+    let first_flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("first cold bounded while lowering");
     let flow_output = CanonicalFlowLowerer::new()
         .lower(
             FlowLowerRequest {
@@ -293,26 +303,34 @@ fn source_elif_reaches_nested_semantic_and_flow_ssa_joins() {
             },
             &never_cancelled,
         )
-        .expect("nested SemanticWir elif chain lowers to FlowWir");
+        .expect("nested SemanticWir bounded while chain lowers to FlowWir");
+    assert_eq!(
+        first_flow.wir().as_wir(),
+        flow_output.wir().as_wir(),
+        "repeated cold loop lowering must be deterministic"
+    );
     assert!(
         flow_output.diagnostics().is_empty(),
         "Flow diagnostics: {:?}",
         flow_output.diagnostics()
     );
-    let join_blocks = flow_output
-        .wir()
-        .as_wir()
+    let flow = flow_output.wir().as_wir();
+    let source_blocks = flow
         .functions
         .iter()
         .flat_map(|function| &function.blocks)
-        .filter(|block| !block.parameters.is_empty())
         .collect::<Vec<_>>();
-    assert_eq!(
-        join_blocks.len(),
-        3,
-        "one scalar SSA join per source clause"
+    assert!(
+        format!("{source_blocks:?}").matches("Jump {").count() >= 4,
+        "loop jumps and back edge"
     );
-    assert!(join_blocks.iter().all(|block| block.parameters.len() == 1));
+    assert!(
+        source_blocks
+            .iter()
+            .filter(|block| !block.parameters.is_empty())
+            .count()
+            >= 2
+    );
 
     let (flow_wir, _, _) = flow_output.into_parts();
     let encoded = encode_and_verify(
@@ -323,10 +341,10 @@ fn source_elif_reaches_nested_semantic_and_flow_ssa_joins() {
         },
         &never_cancelled,
     )
-    .expect("elif FlowWir canonical frame");
+    .expect("bounded while FlowWir canonical frame");
     let prepared =
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
-            .expect("elif MachineWir preparation");
+            .expect("bounded while MachineWir preparation");
     let source_blocks = prepared
         .machine()
         .wir()
@@ -347,30 +365,30 @@ fn source_elif_reaches_nested_semantic_and_flow_ssa_joins() {
             .filter(|block| matches!(block.terminator, MachineTerminator::Branch { .. }))
             .count(),
         3,
-        "all three elif conditions must remain executable machine branches"
+        "all three bounded while conditions must remain executable machine branches"
     );
     assert_eq!(
         source_blocks
             .iter()
             .filter(|block| !block.parameters.is_empty())
             .count(),
-        3,
-        "all three scalar joins must survive ABI lowering"
+        2,
+        "loop header and exit carried values survive ABI lowering"
     );
 
     match emit_prepared_object(&prepared, &target, &never_cancelled) {
         Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
-        Err(error) => panic!("elif native object emission failed: {error}"),
+        Err(error) => panic!("bounded while native object emission failed: {error}"),
         Ok(_) if !llvm_backend_available() => {
             panic!("native object emitted while LLVM reports unavailable")
         }
         Ok(first) => {
             let second = emit_prepared_object(&prepared, &target, &never_cancelled)
-                .expect("repeat elif native object emission");
+                .expect("repeat bounded while native object emission");
             assert_eq!(
                 first.bytes(),
                 second.bytes(),
-                "identical elif MachineWir must emit byte-identical ARM64 COFF"
+                "identical bounded while MachineWir must emit byte-identical ARM64 COFF"
             );
         }
     }

@@ -530,7 +530,35 @@ fn discover_actor_dispatch(
                             check_cancelled(is_cancelled)?;
                             function_has_permit |= listed == proof;
                         }
-                        if task_actor != Some(*actor)
+                        let cross_actor = input.actors.len() == 2
+                            && task_actor == Some(flow::ActorId(1))
+                            && *actor == flow::ActorId(0)
+                            && matches!(
+                                index.checked_sub(1).and_then(|prior| block.instructions.get(prior)),
+                                Some(flow::Instruction {
+                                    results,
+                                    operation: flow::FlowOperation::ActorCapability {
+                                        actor: capability_actor,
+                                        proof: wiring_proof,
+                                    },
+                                    ..
+                                }) if *capability_actor == *actor
+                                    && matches!(results.as_slice(), [capability]
+                                        if function.values.get(capability.0 as usize).is_some_and(|value| {
+                                            input.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                                                ty.kind == flow::FlowTypeKind::ActorHandle(*actor)
+                                                    && ty.copyable
+                                                    && !ty.strict_linear
+                                            })
+                                        }))
+                                    && input.proofs.get(wiring_proof.0 as usize).is_some_and(|proof| {
+                                        proof.kind == flow::ProofKind::ActorAsIf
+                                            && proof.bound == Some(1)
+                                            && proof.sources.len() == 1
+                                            && proof.depends_on.is_empty()
+                                    })
+                            );
+                        if (task_actor != Some(*actor) && !cross_actor)
                             || target.is_none()
                             || !state_matches
                             || permit_record.is_none_or(|permit| {
@@ -1223,15 +1251,61 @@ fn lower_activation_subset(
     if !has_surface {
         return Ok(Vec::new());
     }
-    let [actor] = input.actors.as_slice() else {
-        return Err(unsupported(
-            "actor activation images with exactly one installed actor",
-        ));
+    let (actor, app) = match input.actors.as_slice() {
+        [actor] => (actor, None),
+        [service, app]
+            if service.id == flow::ActorId(0)
+                && app.id == flow::ActorId(1)
+                && dispatch.is_some_and(|dispatch| dispatch.actor == service.id) =>
+        {
+            (service, Some(app))
+        }
+        _ => {
+            return Err(unsupported(
+                "actor activation images outside the exact one-actor or image-wired two-actor plan",
+            ));
+        }
     };
     let [task] = input.tasks.as_slice() else {
         return Err(unsupported(
             "actor activation images with exactly one static task",
         ));
+    };
+    let plan_order_matches = if let Some(app) = app {
+        app.mailbox_capacity == 1
+            && app.message_types.is_empty()
+            && app.turn_functions.is_empty()
+            && app.supervisor.is_none()
+            && task.supervisor == Some(app.id)
+            && input.startup_order.as_slice()
+                == [
+                    flow::PlanOwner::Runtime,
+                    flow::PlanOwner::Actor(actor.id),
+                    flow::PlanOwner::Actor(app.id),
+                    flow::PlanOwner::Task(task.id),
+                ]
+            && input.shutdown_order.as_slice()
+                == [
+                    flow::PlanOwner::Task(task.id),
+                    flow::PlanOwner::Actor(app.id),
+                    flow::PlanOwner::Actor(actor.id),
+                    flow::PlanOwner::Runtime,
+                ]
+    } else {
+        task.supervisor
+            .is_none_or(|supervisor| supervisor == actor.id)
+            && input.startup_order.as_slice()
+                == [
+                    flow::PlanOwner::Runtime,
+                    flow::PlanOwner::Actor(actor.id),
+                    flow::PlanOwner::Task(task.id),
+                ]
+            && input.shutdown_order.as_slice()
+                == [
+                    flow::PlanOwner::Task(task.id),
+                    flow::PlanOwner::Actor(actor.id),
+                    flow::PlanOwner::Runtime,
+                ]
     };
     if input.activations.len() != 2
         || actor.id != flow::ActorId(0)
@@ -1241,21 +1315,7 @@ fn lower_activation_subset(
         || actor.supervisor.is_some()
         || task.id != flow::TaskId(0)
         || task.slots != 1
-        || task
-            .supervisor
-            .is_some_and(|supervisor| supervisor != actor.id)
-        || input.startup_order.as_slice()
-            != [
-                flow::PlanOwner::Runtime,
-                flow::PlanOwner::Actor(actor.id),
-                flow::PlanOwner::Task(task.id),
-            ]
-        || input.shutdown_order.as_slice()
-            != [
-                flow::PlanOwner::Task(task.id),
-                flow::PlanOwner::Actor(actor.id),
-                flow::PlanOwner::Runtime,
-            ]
+        || !plan_order_matches
         || input.static_bytes == 0
         || input.static_bytes != input.peak_bytes
     {
@@ -1362,28 +1422,78 @@ fn lower_activation_subset(
                 MachineActivationSchedule::StartupOnce,
                 Some(dispatch),
             ) if dispatch.producer == caller.id => {
-                matches!(entry.instructions.as_slice(), [reserve, commit, candidate]
-                if candidate.id == call.id
-                    && matches!(
-                        (&reserve.operation, reserve.results.as_slice()),
+                let message = if app.is_some() {
+                    let [capability, reserve, commit, candidate] = entry.instructions.as_slice()
+                    else {
+                        return Err(unsupported(
+                            "an image-wired startup activation message shape",
+                        ));
+                    };
+                    matches!(
+                        (&capability.operation, capability.results.as_slice()),
                         (
-                            flow::FlowOperation::ActorReserve {
-                                actor,
-                                method,
-                                proof,
-                            },
-                            [reservation],
+                            flow::FlowOperation::ActorCapability { actor, proof },
+                            [handle],
                         ) if *actor == dispatch.actor
-                            && *method == dispatch.method
-                            && *proof == dispatch.permit
-                            && commit.results.is_empty()
-                            && matches!(&commit.operation,
-                                flow::FlowOperation::ActorCommit {
-                                    reservation: committed,
-                                    arguments,
-                                } if committed == reservation && arguments.is_empty())
-                            && reserve.source == commit.source
-                    ))
+                            && caller.values.get(handle.0 as usize).is_some_and(|value| {
+                                input.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                                    ty.kind == flow::FlowTypeKind::ActorHandle(*actor)
+                                        && ty.copyable
+                                        && !ty.strict_linear
+                                })
+                            })
+                            && input.proofs.get(proof.0 as usize).is_some_and(|proof| {
+                                proof.kind == flow::ProofKind::ActorAsIf
+                                    && proof.bound == Some(1)
+                                    && proof.sources.len() == 1
+                                    && proof.depends_on.is_empty()
+                            })
+                    ) && candidate.id == call.id
+                        && matches!(
+                            (&reserve.operation, reserve.results.as_slice()),
+                            (
+                                flow::FlowOperation::ActorReserve {
+                                    actor,
+                                    method,
+                                    proof,
+                                },
+                                [reservation],
+                            ) if *actor == dispatch.actor
+                                && *method == dispatch.method
+                                && *proof == dispatch.permit
+                                && commit.results.is_empty()
+                                && matches!(&commit.operation,
+                                    flow::FlowOperation::ActorCommit {
+                                        reservation: committed,
+                                        arguments,
+                                    } if committed == reservation && arguments.is_empty())
+                                && reserve.source == commit.source
+                        )
+                } else {
+                    matches!(entry.instructions.as_slice(), [reserve, commit, candidate]
+                    if candidate.id == call.id
+                        && matches!(
+                            (&reserve.operation, reserve.results.as_slice()),
+                            (
+                                flow::FlowOperation::ActorReserve {
+                                    actor,
+                                    method,
+                                    proof,
+                                },
+                                [reservation],
+                            ) if *actor == dispatch.actor
+                                && *method == dispatch.method
+                                && *proof == dispatch.permit
+                                && commit.results.is_empty()
+                                && matches!(&commit.operation,
+                                    flow::FlowOperation::ActorCommit {
+                                        reservation: committed,
+                                        arguments,
+                                    } if committed == reservation && arguments.is_empty())
+                                && reserve.source == commit.source
+                        ))
+                };
+                message
             }
             (MachineActivationOwner::Task { .. }, MachineActivationSchedule::StartupOnce, None) => {
                 entry.instructions.len() == 1
@@ -1559,20 +1669,31 @@ fn lower_region_storage(
     let byte_type = storage_byte_type.ok_or(unsupported(
         "actor region storage without its canonical byte type",
     ))?;
-    let [actor] = input.actors.as_slice() else {
-        return Err(unsupported("actor region storage without one actor"));
+    let (actor, app) = match input.actors.as_slice() {
+        [actor] => (actor, None),
+        [service, app]
+            if service.id == flow::ActorId(0)
+                && app.id == flow::ActorId(1)
+                && app.turn_functions.is_empty() =>
+        {
+            (service, Some(app))
+        }
+        _ => {
+            return Err(unsupported(
+                "actor region storage outside the exact actor plan",
+            ));
+        }
     };
     let [task] = input.tasks.as_slice() else {
         return Err(unsupported("actor region storage without one task"));
     };
-    let expected_regions =
-        activations
-            .len()
-            .checked_add(3)
-            .ok_or(MachineLowerError::ResourceLimit {
-                resource: "MachineWir region storage",
-                limit: u64::from(limits.globals),
-            })?;
+    let static_region_count = if app.is_some() { 4 } else { 3 };
+    let expected_regions = activations.len().checked_add(static_region_count).ok_or(
+        MachineLowerError::ResourceLimit {
+            resource: "MachineWir region storage",
+            limit: u64::from(limits.globals),
+        },
+    )?;
     if input.regions.len() != expected_regions {
         return Err(unsupported(
             "the complete actor mailbox, root-frame, and activation-frame region set",
@@ -1685,7 +1806,31 @@ fn lower_region_storage(
                     ".turn-frame",
                 )
             }
-            2 => {
+            2 if app.is_some() => {
+                let app = app.expect("guarded image-wired app");
+                let expected_bytes = u64::from(app.mailbox_capacity)
+                    .checked_mul(ACTOR_MAILBOX_SCALAR_SLOT_BYTES)
+                    .ok_or(MachineLowerError::LayoutOverflow {
+                        subject: "client actor mailbox storage".to_owned(),
+                    })?;
+                if region.class != flow::RegionClass::Image
+                    || region.owner != flow::PlanOwner::Actor(app.id)
+                    || region.capacity_bytes != expected_bytes
+                    || region.alignment != 8
+                {
+                    return Err(unsupported("the fixed client actor mailbox region"));
+                }
+                (
+                    MachineRegionStorageKind::ActorMailbox {
+                        actor: app.id.0,
+                        mailbox_capacity: app.mailbox_capacity,
+                    },
+                    u64::from(app.mailbox_capacity),
+                    ACTOR_MAILBOX_SCALAR_SLOT_BYTES,
+                    ".mailbox",
+                )
+            }
+            index if index == static_region_count - 1 => {
                 let frame_bytes = task.frame_bytes_bound.max(1);
                 let expected_bytes = frame_bytes.checked_mul(u64::from(task.slots)).ok_or(
                     MachineLowerError::LayoutOverflow {
@@ -1711,7 +1856,7 @@ fn lower_region_storage(
                 )
             }
             _ => {
-                let activation_index = index - 3;
+                let activation_index = index - static_region_count;
                 let activation = activations.get(activation_index).ok_or(unsupported(
                     "an actor activation-frame region without a plan",
                 ))?;
@@ -2406,6 +2551,7 @@ fn require_supported_type(
         flow::FlowTypeKind::Array { .. } | flow::FlowTypeKind::Function { .. } => Ok(()),
         flow::FlowTypeKind::Activation { .. } if activation_subset => Ok(()),
         flow::FlowTypeKind::Reservation if actor_dispatch => Ok(()),
+        flow::FlowTypeKind::ActorHandle(_) if actor_dispatch => Ok(()),
         flow::FlowTypeKind::Struct { ref fields } if activation_subset && fields.is_empty() => {
             Ok(())
         }
@@ -3714,7 +3860,8 @@ fn validate_supported_operation(
             ValueMapping::DenseShift(0),
         )
         .map(|_| ()),
-        flow::FlowOperation::Immediate(
+        flow::FlowOperation::ActorCapability { .. }
+        | flow::FlowOperation::Immediate(
             flow::Immediate::Bool(_)
             | flow::Immediate::Integer { .. }
             | flow::Immediate::Float32(_)
@@ -4287,6 +4434,7 @@ fn lower_type_kind(
             8,
             8,
         )),
+        flow::FlowTypeKind::ActorHandle(_) => Ok((MachineTypeKind::Integer { bits: 64 }, 8, 8)),
         flow::FlowTypeKind::Reservation => Ok((
             MachineTypeKind::Pointer {
                 address_space: 0,
@@ -5875,6 +6023,26 @@ fn lower_operation(
                 arguments: map_values(arguments, mapping, limits.model_edges, is_cancelled)?,
                 convention: CallingConvention::Internal,
             }
+        }
+        flow::FlowOperation::ActorCapability { actor, proof } => {
+            let result = require_single_result(instruction)?;
+            if input
+                .types
+                .get(flow_value_type(function, result)?.0 as usize)
+                .is_none_or(|ty| ty.kind != flow::FlowTypeKind::ActorHandle(*actor))
+                || input.proofs.get(proof.0 as usize).is_none_or(|record| {
+                    record.kind != flow::ProofKind::ActorAsIf
+                        || record.bound != Some(1)
+                        || record.sources.len() != 1
+                        || !record.depends_on.is_empty()
+                })
+            {
+                return Err(unsupported("a substituted image-wired actor capability"));
+            }
+            MachineOperation::Immediate(MachineImmediate::Integer {
+                ty: value_type(function, result)?,
+                bytes_le: u64::from(actor.0).to_le_bytes().to_vec(),
+            })
         }
         flow::FlowOperation::ActorReserve {
             actor,

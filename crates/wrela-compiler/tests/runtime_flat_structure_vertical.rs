@@ -72,17 +72,21 @@ pub fn milliseconds(value: u64) -> RuntimeDurationRepresentation:
 pub fn seconds(value: u64) -> RuntimeDurationRepresentation:
     return nanoseconds(value=value * 1000000000)
 
+pub fn copied(value: RuntimeDurationRepresentation) -> RuntimeDurationRepresentation:
+    return copy value
+
 pub fn as_nanoseconds(value: RuntimeDurationRepresentation) -> u64:
     return value.nanoseconds
 "#;
 
 const TEST_SOURCE: &str = r#"module app.duration_test
 
-from app.duration import as_nanoseconds, microseconds, milliseconds, nanoseconds, seconds
+from app.duration import as_nanoseconds, copied, microseconds, milliseconds, nanoseconds, seconds
 
 @test
 fn imported_duration_constructors_reach_flow():
     nanos: u64 = as_nanoseconds(value=nanoseconds(value=42))
+    copied_nanos: u64 = as_nanoseconds(value=copied(value=nanoseconds(value=42)))
     micros: u64 = as_nanoseconds(value=microseconds(value=42))
     millis: u64 = as_nanoseconds(value=milliseconds(value=42))
     secs: u64 = as_nanoseconds(value=seconds(value=42))
@@ -432,6 +436,7 @@ fn real_imported_duration_shape_reaches_flow_and_v10_roundtrips_exactly() {
     assert_eq!(fields[0].name, "nanoseconds");
     assert!(fields[0].public);
     let mut semantic_aggregates = 0;
+    let mut semantic_copies = 0;
     let mut semantic_projects = 0;
     let mut semantic_checked_multiplies = 0;
     let mut semantic_calls = 0;
@@ -446,6 +451,10 @@ fn real_imported_duration_shape_reaches_flow_and_v10_roundtrips_exactly() {
                     assert_eq!(fields.len(), 1);
                     assert_eq!(statement.results.len(), 1);
                     semantic_aggregates += 1;
+                }
+                SemanticOperation::Copy { .. } => {
+                    assert_eq!(statement.results.len(), 1);
+                    semantic_copies += 1;
                 }
                 SemanticOperation::Project { field, access, .. } => {
                     assert_eq!(*field, 0);
@@ -467,6 +476,7 @@ fn real_imported_duration_shape_reaches_flow_and_v10_roundtrips_exactly() {
         }
     }
     assert_eq!(semantic_aggregates, 1);
+    assert_eq!(semantic_copies, 1);
     assert_eq!(semantic_projects, 1);
     assert_eq!(semantic_checked_multiplies, 3);
     assert!(semantic_calls >= 8);
@@ -493,6 +503,7 @@ fn real_imported_duration_shape_reaches_flow_and_v10_roundtrips_exactly() {
     };
     assert_eq!(fields.len(), 1);
     let mut flow_aggregates = 0;
+    let mut flow_copies = 0;
     let mut flow_projects = 0;
     let mut flow_checked_multiplies = 0;
     let mut flow_calls = 0;
@@ -505,6 +516,10 @@ fn real_imported_duration_shape_reaches_flow_and_v10_roundtrips_exactly() {
                         assert_eq!(fields.len(), 1);
                         assert_eq!(instruction.results.len(), 1);
                         flow_aggregates += 1;
+                    }
+                    FlowOperation::Copy { .. } => {
+                        assert_eq!(instruction.results.len(), 1);
+                        flow_copies += 1;
                     }
                     FlowOperation::ExtractField { field, .. } => {
                         assert_eq!(*field, 0);
@@ -522,6 +537,7 @@ fn real_imported_duration_shape_reaches_flow_and_v10_roundtrips_exactly() {
         }
     }
     assert_eq!(flow_aggregates, 1);
+    assert_eq!(flow_copies, 1);
     assert_eq!(flow_projects, 1);
     assert_eq!(flow_checked_multiplies, 3);
     assert!(flow_calls >= 8);
@@ -598,7 +614,7 @@ fn real_imported_duration_shape_reaches_flow_and_v10_roundtrips_exactly() {
             }
         }
     }
-    assert_eq!(machine_bitcasts, 2);
+    assert_eq!(machine_bitcasts, 3);
     assert_eq!(machine_checked_multiplies, 3);
     assert!(machine_calls >= 8);
 }
@@ -802,16 +818,16 @@ fn local_result_constructor_and_exhaustive_match_reach_machine_switch() {
 fn structure_lowering_honors_exact_operation_bounds_and_late_cancellation() {
     let fixture = fixture(DURATION_SOURCE, TEST_SOURCE);
     let mut exact_lookup_limits = AnalysisLimits::standard();
-    exact_lookup_limits.runtime_aggregate_lookup_work = 101;
+    exact_lookup_limits.runtime_aggregate_lookup_work = 126;
     let exact_lookup = compile(&fixture, exact_lookup_limits, &never_cancelled)
         .expect("exact runtime aggregate lookup-work bound");
     assert!(exact_lookup.diagnostics().is_empty());
-    exact_lookup_limits.runtime_aggregate_lookup_work = 100;
+    exact_lookup_limits.runtime_aggregate_lookup_work = 125;
     assert!(matches!(
         compile(&fixture, exact_lookup_limits, &never_cancelled),
         Err(AnalysisFailure::ResourceLimit {
             resource: "runtime type and aggregate lookup work",
-            limit: 100,
+            limit: 125,
         })
     ));
 

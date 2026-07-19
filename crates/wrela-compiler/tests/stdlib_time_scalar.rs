@@ -189,8 +189,8 @@ fn checked_in_time_scalar_workspace_is_canonical_and_exact_bounds_pass() {
     let workspace = load_checked_in_workspace();
     assert_eq!(workspace.canonical_lockfile(), WORKSPACE_LOCKFILE);
     assert_eq!(workspace.graph().packages().len(), 2);
-    assert_eq!(workspace.graph().modules().len(), 4);
-    assert_eq!(workspace.sources().len(), 4);
+    assert_eq!(workspace.graph().modules().len(), 5);
+    assert_eq!(workspace.sources().len(), 5);
     assert_eq!(workspace.lockfile().root, root_identity);
     let fixture = loaded_source_fixture(workspace, root_identity, manifest.profiles[0].clone());
     let first = analyze(&fixture, TestDiscoverySelection::Comptime);
@@ -558,9 +558,9 @@ fn installed_duration_arithmetic_has_exact_resources_and_cancellation() {
                 phase: FailurePhase::Comptime,
                 message: format!(
                     "comptime test exceeded comptime evaluator bytes limit 895 [source {}; comptime calls <- {} <- {}]",
-                    source_span_nth(3, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 1,),
+                    source_span_nth(4, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 1,),
                     source_span(
-                        3,
+                        4,
                         CORE_TIME_SOURCE,
                         b"ns_comptime(value.nanoseconds * factor)",
                     ),
@@ -724,8 +724,8 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
                 phase: FailurePhase::Comptime,
                 message: format!(
                     "comptime test exceeded comptime evaluator bytes limit 1343 [source {}; comptime calls <- {} <- {}]",
-                    source_span_nth(3, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 1),
-                    source_span_nth(3, CORE_TIME_SOURCE, b"ns_comptime(selected)", 2),
+                    source_span_nth(4, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 1),
+                    source_span_nth(4, CORE_TIME_SOURCE, b"ns_comptime(selected)", 2),
                     source_span(
                         0,
                         PASSING_TEST_SOURCE,
@@ -761,7 +761,7 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
     let over_depth =
         loaded_source_fixture(load_checked_in_workspace(), root_identity, over_profile);
     let helper_call = source_span(
-        3,
+        4,
         CORE_TIME_SOURCE,
         b"ns_comptime(left.nanoseconds - right.nanoseconds)",
     );
@@ -841,9 +841,9 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
                 phase: FailurePhase::Comptime,
                 message: format!(
                     "comptime test exceeded comptime evaluator bytes limit 1567 [source {}; comptime calls <- {} <- {}]",
-                    source_span_nth(3, CORE_TIME_SOURCE, b"left", 29),
+                    source_span_nth(4, CORE_TIME_SOURCE, b"left", 29),
                     source_span(
-                        3,
+                        4,
                         CORE_TIME_SOURCE,
                         b"less_than_comptime(left=left, right=right)",
                     ),
@@ -880,7 +880,7 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
     let over_depth =
         loaded_source_fixture(load_checked_in_workspace(), root_identity, over_profile);
     let helper_call = source_span(
-        3,
+        4,
         CORE_TIME_SOURCE,
         b"less_than_comptime(left=right, right=left)",
     );
@@ -1735,6 +1735,7 @@ fn load_checked_in_workspace() -> LoadedWorkspace {
                 manifest_bytes: CORE_MANIFEST.to_vec(),
                 sources: vec![
                     source_input("image.wr", CORE_IMAGE_SOURCE),
+                    source_input("result.wr", CORE_RESULT_SOURCE),
                     source_input("time.wr", CORE_TIME_SOURCE),
                 ],
                 scenarios: Vec::new(),

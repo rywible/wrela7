@@ -2073,8 +2073,7 @@ fn inspect_source_test(
             })?;
         }
     }
-    let work_bound = u64::try_from(runtime_statements.len())
-        .ok()
+    let work_bound = runtime_body_work_bound(program, body_id)
         .and_then(|count| count.checked_add(1))
         .ok_or_else(|| test_resource_failure(request))?;
     let mut assertions = Vec::new();
@@ -2164,6 +2163,186 @@ enum RuntimeShapeFailure {
     Unsupported(Span),
     UnsupportedAssertion(Span),
     Failure(AnalysisFailure),
+}
+
+fn body_assigns_local(
+    program: &wrela_hir::Program,
+    body: BodyId,
+    local: wrela_hir::LocalId,
+) -> Option<bool> {
+    let body = program.body(body)?;
+    for statement in &body.statements {
+        match &program.statement(*statement)?.kind {
+            StatementKind::Assign { targets, .. }
+                if targets.iter().any(|target| {
+                    target.projections.is_empty() && target.root == Definition::Local(local)
+                }) =>
+            {
+                return Some(true);
+            }
+            StatementKind::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches {
+                    if body_assigns_local(program, *body, local)? {
+                        return Some(true);
+                    }
+                }
+                if else_body
+                    .is_some_and(|body| body_assigns_local(program, body, local).unwrap_or(true))
+                {
+                    return Some(true);
+                }
+            }
+            StatementKind::While { body, .. } if body_assigns_local(program, *body, local)? => {
+                return Some(true);
+            }
+            StatementKind::Match { arms, .. } => {
+                for arm in arms {
+                    if body_assigns_local(program, arm.body, local)? {
+                        return Some(true);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(false)
+}
+
+fn bounded_while_shape(
+    program: &wrela_hir::Program,
+    condition: ExpressionId,
+    body: BodyId,
+) -> Option<u64> {
+    let expression = program.expression(condition)?;
+    let ExpressionKind::Compare {
+        left,
+        operator: wrela_hir::ComparisonOperator::Less,
+        right,
+    } = expression.kind
+    else {
+        return None;
+    };
+    let ExpressionKind::Reference(Definition::Local(induction)) = program.expression(left)?.kind
+    else {
+        return None;
+    };
+    let ExpressionKind::Literal(Literal::Integer(ref spelling)) = program.expression(right)?.kind
+    else {
+        return None;
+    };
+    let bound = spelling.replace('_', "").parse::<u64>().ok()?;
+    let local = program.locals.get(induction.0 as usize)?;
+    if !matches!(
+        local.ty.as_ref()?.kind,
+        wrela_hir::TypeExpressionKind::Named {
+            definition: Definition::Builtin(
+                wrela_hir::Builtin::U8
+                    | wrela_hir::Builtin::U16
+                    | wrela_hir::Builtin::U32
+                    | wrela_hir::Builtin::U64
+                    | wrela_hir::Builtin::U128
+                    | wrela_hir::Builtin::Usize
+            ),
+            ref arguments,
+        } if arguments.is_empty()
+    ) {
+        return None;
+    }
+    let body = program.body(body)?;
+    let first = program.statement(*body.statements.first()?)?;
+    let StatementKind::Assign {
+        targets,
+        operator: AssignmentOperator::Add,
+        value,
+    } = &first.kind
+    else {
+        return None;
+    };
+    let [target] = targets.as_slice() else {
+        return None;
+    };
+    if target.root != Definition::Local(induction) || !target.projections.is_empty() {
+        return None;
+    }
+    if !matches!(
+        &program.expression(*value)?.kind,
+        ExpressionKind::Literal(Literal::Integer(one))
+            if one.replace('_', "").parse::<u64>().ok() == Some(1)
+    ) {
+        return None;
+    }
+    for statement in body.statements.iter().skip(1) {
+        match &program.statement(*statement)?.kind {
+            StatementKind::Assign { targets, .. }
+                if targets.iter().any(|target| {
+                    target.projections.is_empty() && target.root == Definition::Local(induction)
+                }) =>
+            {
+                return None;
+            }
+            StatementKind::If {
+                branches,
+                else_body,
+            } => {
+                for (_, body) in branches {
+                    if body_assigns_local(program, *body, induction)? {
+                        return None;
+                    }
+                }
+                if let Some(body) = else_body {
+                    if body_assigns_local(program, *body, induction)? {
+                        return None;
+                    }
+                }
+            }
+            StatementKind::While { body, .. } if body_assigns_local(program, *body, induction)? => {
+                return None;
+            }
+            StatementKind::Match { arms, .. } => {
+                for arm in arms {
+                    if body_assigns_local(program, arm.body, induction)? {
+                        return None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(bound)
+}
+
+fn runtime_body_work_bound(program: &wrela_hir::Program, body: BodyId) -> Option<u64> {
+    let body = program.body(body)?;
+    body.statements.iter().try_fold(0u64, |total, id| {
+        let statement = program.statement(*id)?;
+        let work = match &statement.kind {
+            StatementKind::If {
+                branches,
+                else_body,
+            } => {
+                let branches = branches.iter().try_fold(0u64, |sum, (_, body)| {
+                    sum.checked_add(runtime_body_work_bound(program, *body)?)
+                })?;
+                branches
+                    .checked_add(
+                        else_body
+                            .and_then(|body| runtime_body_work_bound(program, body))
+                            .unwrap_or(0),
+                    )?
+                    .checked_add(1)?
+            }
+            StatementKind::While { condition, body } => {
+                bounded_while_shape(program, *condition, *body)?
+                    .checked_mul(runtime_body_work_bound(program, *body)?.checked_add(1)?)?
+                    .checked_add(1)?
+            }
+            _ => 1,
+        };
+        total.checked_add(work)
+    })
 }
 
 fn inspect_runtime_body_shape(
@@ -2321,11 +2500,30 @@ fn inspect_runtime_body_shape(
                 StatementKind::Assert { .. } => {
                     return Err(RuntimeShapeFailure::UnsupportedAssertion(statement.source));
                 }
-                StatementKind::Break
-                | StatementKind::Continue
-                | StatementKind::Yield(_)
+                StatementKind::While { condition, body } => {
+                    let bound = bounded_while_shape(program, *condition, *body)
+                        .ok_or(RuntimeShapeFailure::Unsupported(statement.source))?;
+                    if bound == 0 {
+                        return Err(RuntimeShapeFailure::Unsupported(statement.source));
+                    }
+                    inspect_runtime_expression_shape(
+                        request,
+                        *condition,
+                        color,
+                        callees,
+                        is_cancelled,
+                    )?;
+                    reserve_runtime_shape(
+                        &mut bodies,
+                        1,
+                        request.limits.fact_edges,
+                        "runtime body scratch",
+                    )?;
+                    bodies.push(*body);
+                }
+                StatementKind::Break | StatementKind::Continue => {}
+                StatementKind::Yield(_)
                 | StatementKind::For { .. }
-                | StatementKind::While { .. }
                 | StatementKind::Loop { .. }
                 | StatementKind::With { .. }
                 | StatementKind::ComptimeIf { .. }
@@ -2455,7 +2653,8 @@ fn inspect_runtime_expression_shape(
                 operator:
                     wrela_hir::UnaryOperator::Negate
                     | wrela_hir::UnaryOperator::BitNot
-                    | wrela_hir::UnaryOperator::BoolNot,
+                    | wrela_hir::UnaryOperator::BoolNot
+                    | wrela_hir::UnaryOperator::Copy,
                 operand,
             }
             | ExpressionKind::Cast { value: operand, .. } => {
@@ -3940,6 +4139,147 @@ fn analyze_runtime_body(
                     is_cancelled,
                 )?;
             }
+            StatementKind::While { condition, body } => {
+                let bound = bounded_while_shape(request.hir.as_program(), *condition, *body)
+                    .ok_or_else(|| {
+                        runtime_type_diagnostic(
+                            request,
+                            statement.source,
+                            "semantic-sync-while-bound-unproved",
+                            "synchronous while-loop bound is not proved",
+                            "the supported loop requires `local < integer` and a first-body `local += 1` induction step",
+                            "use the canonical finite induction form or remove the synchronous loop",
+                        )
+                    })?;
+                let mut exits = copy_binding_map(locals, request.limits.values)?;
+                for (index, slot) in locals.iter_mut().enumerate() {
+                    let Some(current) = *slot else { continue };
+                    let RuntimeBindingOrigin::Local(local) = current.origin else {
+                        continue;
+                    };
+                    let ty = partial
+                        .values
+                        .get(current.value.0 as usize)
+                        .filter(|value| value.function == function)
+                        .map(|value| value.ty)
+                        .ok_or(AnalysisFailure::RequestMismatch)?;
+                    let local_record = request
+                        .hir
+                        .as_program()
+                        .locals
+                        .get(index)
+                        .filter(|record| record.id == local)
+                        .ok_or(AnalysisFailure::RequestMismatch)?;
+                    let header = append_semantic_value(
+                        request,
+                        partial,
+                        function,
+                        ty,
+                        (
+                            SemanticValueOrigin::Local(local),
+                            Some(local_record.source),
+                            Some(local_record.name.as_str()),
+                        ),
+                        is_cancelled,
+                    )?;
+                    definitions.push(LocalDefinition {
+                        local,
+                        value: header,
+                    });
+                    *slot = Some(RuntimeBinding {
+                        value: header,
+                        ..current
+                    });
+                }
+                for (index, slot) in exits.iter_mut().enumerate() {
+                    let Some(current) = *slot else { continue };
+                    let RuntimeBindingOrigin::Local(local) = current.origin else {
+                        continue;
+                    };
+                    let ty = partial.values[current.value.0 as usize].ty;
+                    let local_record = &request.hir.as_program().locals[index];
+                    let exit = append_semantic_value(
+                        request,
+                        partial,
+                        function,
+                        ty,
+                        (
+                            SemanticValueOrigin::Local(local),
+                            Some(local_record.source),
+                            Some(local_record.name.as_str()),
+                        ),
+                        is_cancelled,
+                    )?;
+                    definitions.push(LocalDefinition { local, value: exit });
+                    *slot = Some(RuntimeBinding {
+                        value: exit,
+                        ..current
+                    });
+                }
+                let bool_ty = ensure_primitive_type(
+                    request,
+                    partial,
+                    PrimitiveSemanticType::Bool,
+                    &mut *aggregate_work,
+                    is_cancelled,
+                )?;
+                let condition = analyze_runtime_expression(
+                    request,
+                    partial,
+                    function,
+                    *condition,
+                    RuntimeExpressionRequest {
+                        expected: Some(bool_ty),
+                        desired_result: None,
+                        access: AccessMode::Value,
+                    },
+                    &mut RuntimeState {
+                        locals: &mut *locals,
+                        parameters: &mut *parameters,
+                        aggregate_work: &mut *aggregate_work,
+                        allow_assertions,
+                    },
+                    is_cancelled,
+                )?;
+                let loop_fact_start = partial.statements.len();
+                analyze_runtime_body(
+                    request,
+                    partial,
+                    function,
+                    *body,
+                    locals,
+                    parameters,
+                    allow_assertions,
+                    &mut *aggregate_work,
+                    is_cancelled,
+                )?;
+                statement_effects = condition.effects;
+                for nested in partial
+                    .statements
+                    .get(loop_fact_start..)
+                    .ok_or(AnalysisFailure::RequestMismatch)?
+                {
+                    statement_effects.0 |= nested.effects.0;
+                }
+                let body_work = u64::try_from(
+                    request
+                        .hir
+                        .as_program()
+                        .body(*body)
+                        .ok_or(AnalysisFailure::RequestMismatch)?
+                        .statements
+                        .len(),
+                )
+                .map_err(|_| fact_resource(request, "synchronous while work bound"))?;
+                let _proven_work =
+                    bound
+                        .checked_mul(body_work.checked_add(1).ok_or_else(|| {
+                            fact_resource(request, "synchronous while work bound")
+                        })?)
+                        .ok_or_else(|| fact_resource(request, "synchronous while work bound"))?;
+                locals.clone_from_slice(&exits);
+            }
+            StatementKind::Break | StatementKind::Continue => {}
             StatementKind::Match { scrutinee, arms } => {
                 statement_effects = analyze_closed_enum_match(
                     request,
@@ -4474,7 +4814,8 @@ fn analyze_runtime_expression(
             operator:
                 operator @ (wrela_hir::UnaryOperator::Negate
                 | wrela_hir::UnaryOperator::BitNot
-                | wrela_hir::UnaryOperator::BoolNot),
+                | wrela_hir::UnaryOperator::BoolNot
+                | wrela_hir::UnaryOperator::Copy),
             operand,
         } => analyze_scalar_unary(
             request,
@@ -4823,24 +5164,13 @@ fn analyze_actor_send_expression(
         .map(|proof| proof.id)
         .next()
         .ok_or(AnalysisFailure::RequestMismatch)?;
-    let (callee, base) = match request
+    let callee = match request
         .hir
         .as_program()
         .expression(expression_id)
         .map(|expression| &expression.kind)
     {
-        Some(ExpressionKind::Call { callee, .. }) => {
-            let base = match request
-                .hir
-                .as_program()
-                .expression(*callee)
-                .map(|expression| &expression.kind)
-            {
-                Some(ExpressionKind::Field { base, .. }) => *base,
-                _ => return Err(AnalysisFailure::RequestMismatch.into()),
-            };
-            (*callee, base)
-        }
+        Some(ExpressionKind::Call { callee, .. }) => *callee,
         _ => return Err(AnalysisFailure::RequestMismatch.into()),
     };
     let receiver_ty = partial
@@ -4853,7 +5183,7 @@ fn analyze_actor_send_expression(
         request,
         partial,
         function,
-        base,
+        resolved.receiver,
         RuntimeExpressionRequest {
             expected: Some(receiver_ty),
             desired_result: None,
@@ -4862,6 +5192,44 @@ fn analyze_actor_send_expression(
         state,
         is_cancelled,
     )?;
+    if let Some(handle) = resolved.handle {
+        let handle_source = request
+            .hir
+            .as_program()
+            .expression(handle)
+            .map(|expression| expression.source)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let handle_class = partial
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.actors.get(resolved.actor.0 as usize))
+            .map(|actor| actor.class)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let handle_ty = ensure_actor_handle_type(request, partial, handle_class)?;
+        let handle_value = expression_result(
+            request,
+            partial,
+            function,
+            (handle, handle_source),
+            handle_ty,
+            None,
+            is_cancelled,
+        )?;
+        append_expression_fact(
+            request,
+            partial,
+            RuntimeExpressionFact {
+                function,
+                expression: handle,
+                ty: handle_ty,
+                result: Some(handle_value),
+                resolution: ExpressionResolution::Field { index: 0 },
+                effects: EffectSet(0),
+                ownership_before: OwnershipState::Owned,
+                ownership_after: OwnershipState::Owned,
+            },
+        )?;
+    }
     let target = partial
         .functions
         .get(resolved.method.0 as usize)
@@ -5055,26 +5423,22 @@ fn analyze_scalar_unary(
         state,
         is_cancelled,
     )?;
-    let scalar = runtime_scalar_type(partial, operand.ty).ok_or_else(|| {
-        runtime_type_diagnostic(
-            request,
-            unary.source,
-            "semantic-unary-operand",
-            "unary operator requires a primitive scalar operand",
-            "the operand type has no built-in scalar unary meaning",
-            "use bool, a fixed-width integer, a target-width integer, f32, or f64",
-        )
-    })?;
+    let scalar = runtime_scalar_type(partial, operand.ty);
     let valid = match unary.operator {
         wrela_hir::UnaryOperator::Negate => matches!(
             scalar,
-            RuntimeScalarType::Integer { signed: true, .. } | RuntimeScalarType::Float { .. }
+            Some(RuntimeScalarType::Integer { signed: true, .. } | RuntimeScalarType::Float { .. })
         ),
-        wrela_hir::UnaryOperator::BitNot => matches!(scalar, RuntimeScalarType::Integer { .. }),
-        wrela_hir::UnaryOperator::BoolNot => scalar == RuntimeScalarType::Bool,
+        wrela_hir::UnaryOperator::BitNot => {
+            matches!(scalar, Some(RuntimeScalarType::Integer { .. }))
+        }
+        wrela_hir::UnaryOperator::BoolNot => scalar == Some(RuntimeScalarType::Bool),
+        wrela_hir::UnaryOperator::Copy => partial
+            .types
+            .get(operand.ty.0 as usize)
+            .is_some_and(|ty| ty.linearity == Linearity::ExplicitCopy),
         wrela_hir::UnaryOperator::Await
         | wrela_hir::UnaryOperator::Take
-        | wrela_hir::UnaryOperator::Copy
         | wrela_hir::UnaryOperator::Comptime => false,
     };
     if !valid {
@@ -6839,8 +7203,7 @@ fn ensure_ordinary_source_function(
         sources: vec![declaration_record.source],
         depends_on: vec![type_proof],
         bound: Some(
-            u64::try_from(body_statements.len())
-                .ok()
+            runtime_body_work_bound(request.hir.as_program(), body)
                 .and_then(|count| count.checked_add(1))
                 .ok_or_else(|| fact_resource(request, "ordinary source work bound"))?,
         ),
@@ -6952,8 +7315,7 @@ fn ensure_ordinary_source_function(
         .functions
         .try_reserve(1)
         .map_err(|_| fact_resource(request, "ordinary source functions"))?;
-    let work_bound = u64::try_from(body_statements.len())
-        .ok()
+    let work_bound = runtime_body_work_bound(request.hir.as_program(), body)
         .and_then(|count| count.checked_add(1))
         .ok_or_else(|| fact_resource(request, "ordinary source work bound"))?;
     partial.functions.push(FunctionInstance {
@@ -8580,6 +8942,8 @@ struct EvaluatedActor {
     name_start: u64,
     name_len: u64,
     mailbox_capacity: u32,
+    dependency: Option<u32>,
+    wiring_source: Option<Span>,
     source: Span,
     mailbox_source: Span,
 }
@@ -8614,6 +8978,14 @@ enum ComptimeValue {
     ActorClass {
         declaration: DeclarationId,
         kind: EvaluatedActorKind,
+    },
+    InstalledActor {
+        actor: u32,
+        class: DeclarationId,
+    },
+    ActorHandle {
+        actor: u32,
+        class: DeclarationId,
     },
     /// Flat, nominal comptime-only structure value. Field values are stored in
     /// source declaration order and are restricted by the closure checker to
@@ -8670,6 +9042,8 @@ impl ComptimeValue {
             | Self::TargetType
             | Self::ImageConstructor
             | Self::ActorClass { .. }
+            | Self::InstalledActor { .. }
+            | Self::ActorHandle { .. }
             | Self::Image(_) => None,
         }
     }
@@ -9405,6 +9779,19 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                         expression.source,
                         depth + 1,
                     )
+                } else if let Some((actor, class)) =
+                    self.actor_handle_target(*callee, expression.source)?
+                {
+                    if !arguments.is_empty() {
+                        Err(self.diagnostic_category(
+                            Category::ACTOR,
+                            expression.source,
+                            "semantic-actor-handle-shape",
+                            "an image-wired actor handle takes no runtime arguments",
+                        ))
+                    } else {
+                        Ok(ComptimeValue::ActorHandle { actor, class })
+                    }
                 } else if let Some(declaration) = self.direct_function_callee(*callee)? {
                     self.evaluate_user_call(declaration, arguments, expression.source, depth + 1)
                 } else if let Some(declaration) = self.direct_structure_callee(*callee)? {
@@ -10320,6 +10707,8 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             | ComptimeValue::TargetType
             | ComptimeValue::ImageConstructor
             | ComptimeValue::ActorClass { .. }
+            | ComptimeValue::InstalledActor { .. }
+            | ComptimeValue::ActorHandle { .. }
             | ComptimeValue::Unit => 0,
         };
         self.retain(payload)?;
@@ -10366,6 +10755,14 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             ComptimeValue::ActorClass { declaration, kind } => ComptimeValue::ActorClass {
                 declaration: *declaration,
                 kind: *kind,
+            },
+            ComptimeValue::InstalledActor { actor, class } => ComptimeValue::InstalledActor {
+                actor: *actor,
+                class: *class,
+            },
+            ComptimeValue::ActorHandle { actor, class } => ComptimeValue::ActorHandle {
+                actor: *actor,
+                class: *class,
             },
             ComptimeValue::Unit => ComptimeValue::Unit,
         })
@@ -11128,6 +11525,37 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
         EvaluatedActorKind::from_install_method(name.as_str()).map(|kind| (*image, kind))
     }
 
+    fn actor_handle_target(
+        &mut self,
+        callee: ExpressionId,
+        source: Span,
+    ) -> Result<Option<(u32, DeclarationId)>, EvaluationFailure> {
+        let Some(ExpressionKind::Field { base, name }) = self
+            .program
+            .expression(callee)
+            .map(|expression| &expression.kind)
+        else {
+            return Ok(None);
+        };
+        if name.as_str() != "handle" {
+            return Ok(None);
+        }
+        let Some(ExpressionKind::Reference(Definition::Local(local))) = self
+            .program
+            .expression(*base)
+            .map(|expression| &expression.kind)
+        else {
+            return Ok(None);
+        };
+        match self.load_local(*local, source)? {
+            ComptimeValue::InstalledActor { actor, class } => Ok(Some((actor, class))),
+            value => {
+                self.dispose_temporary_value(value, source)?;
+                Ok(None)
+            }
+        }
+    }
+
     fn actor_class_kind(&self, declaration: DeclarationId) -> Option<EvaluatedActorKind> {
         let declaration = self.program.declaration(declaration)?;
         if !matches!(declaration.kind, DeclarationKind::Class(_)) {
@@ -11159,12 +11587,14 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
         source: Span,
         depth: u32,
     ) -> Result<ComptimeValue, EvaluationFailure> {
-        if arguments.len() != 2 {
+        if arguments.len() != 2
+            && !(install_kind == EvaluatedActorKind::App && arguments.len() == 3)
+        {
             return Err(self.diagnostic_category(
                 Category::ACTOR,
                 source,
                 "semantic-actor-install-shape",
-                "actor installation requires one actor class and one `mailbox` capacity",
+                "actor installation requires one actor class, at most one image-wired service handle, and one `mailbox` capacity",
             ));
         }
         let class_argument = &arguments[0];
@@ -11203,7 +11633,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 "driver installation requires coherent target device and authority facts",
             ));
         }
-        let mailbox_argument = &arguments[1];
+        let mailbox_argument = arguments.last().ok_or_else(|| self.unsupported(source))?;
         if mailbox_argument.name.as_ref().map(wrela_hir::Name::as_str) != Some("mailbox")
             || mailbox_argument.access() != wrela_hir::AccessMode::Value
         {
@@ -11259,6 +11689,97 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 "the installed actor class is missing from HIR",
             )
         })?;
+        let dependency = if arguments.len() == 3 {
+            let DeclarationKind::Class(actor_class) = &declaration.kind else {
+                return Err(self.unsupported(class_argument.source));
+            };
+            let [field] = actor_class.fields.as_slice() else {
+                return Err(self.diagnostic_category(
+                    Category::ACTOR,
+                    class_argument.source,
+                    "semantic-actor-wiring-field",
+                    "the exact cross-actor subset requires one Actor[Service] field on the app",
+                ));
+            };
+            let TypeExpressionKind::Named {
+                definition: Definition::Builtin(Builtin::Actor),
+                arguments: handle_arguments,
+            } = &field.ty.kind
+            else {
+                return Err(self.diagnostic_category(
+                    Category::ACTOR,
+                    field.ty.source,
+                    "semantic-actor-wiring-field",
+                    "the app wiring field must have type Actor[Service]",
+                ));
+            };
+            let [handle_argument] = handle_arguments.as_slice() else {
+                return Err(self.unsupported(field.ty.source));
+            };
+            let wrela_hir::GenericArgumentKind::Type(TypeExpression {
+                kind:
+                    TypeExpressionKind::Named {
+                        definition: Definition::Declaration(target),
+                        arguments: target_arguments,
+                    },
+                ..
+            }) = &handle_argument.kind
+            else {
+                return Err(self.unsupported(handle_argument.source));
+            };
+            if !target_arguments.is_empty() {
+                return Err(self.unsupported(handle_argument.source));
+            }
+            let wiring_argument = &arguments[1];
+            if wiring_argument.name.as_ref().map(wrela_hir::Name::as_str)
+                != Some(field.name.as_str())
+            {
+                return Err(self.diagnostic_category(
+                    Category::ACTOR,
+                    wiring_argument.source,
+                    "semantic-actor-wiring-name",
+                    "the image-wired handle argument must name the app Actor field",
+                ));
+            }
+            let wiring_expression = wiring_argument
+                .expression()
+                .ok_or_else(|| self.unsupported(wiring_argument.source))?;
+            let wiring_value = self.evaluate_expression(wiring_expression, None, depth)?;
+            let ComptimeValue::ActorHandle {
+                actor: target_actor,
+                class: target_class,
+            } = wiring_value
+            else {
+                return Err(self.diagnostic_category(
+                    Category::ACTOR,
+                    wiring_argument.source,
+                    "semantic-actor-wiring-handle",
+                    "the app dependency must be the unique handle minted by a prior service installation",
+                ));
+            };
+            if target_class != target.declaration {
+                return Err(self.diagnostic_category(
+                    Category::ACTOR,
+                    wiring_argument.source,
+                    "semantic-actor-wiring-target",
+                    "the installed service handle does not match the app Actor field type",
+                ));
+            }
+            Some((target_actor, wiring_argument.source))
+        } else {
+            let DeclarationKind::Class(actor_class) = &declaration.kind else {
+                return Err(self.unsupported(class_argument.source));
+            };
+            if !actor_class.fields.is_empty() {
+                return Err(self.diagnostic_category(
+                    Category::ACTOR,
+                    actor_class.fields[0].source,
+                    "semantic-actor-wiring-missing",
+                    "an actor handle field requires one matching image installation argument",
+                ));
+            }
+            None
+        };
         let actor_name = declaration
             .name
             .as_ref()
@@ -11275,6 +11796,24 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 "actor installation must target an initialized local Image value",
             ));
         };
+        if let Some((target, wiring_source)) = dependency {
+            if install_kind != EvaluatedActorKind::App
+                || current_image.actors.len() != 1
+                || current_image
+                    .actors
+                    .get(target as usize)
+                    .is_none_or(|actor| {
+                        actor.kind != EvaluatedActorKind::Service || actor.dependency.is_some()
+                    })
+            {
+                return Err(self.diagnostic_category(
+                    Category::ACTOR,
+                    wiring_source,
+                    "semantic-actor-wiring-shape",
+                    "the cross-actor subset requires exactly one prior stateless service and one dependent app",
+                ));
+            }
+        }
         if let Some(previous) = current_image
             .actors
             .iter()
@@ -11327,21 +11866,30 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
         }
         let (name_start, actor_name_len) =
             self.append_precharged_image_name(image, &actor_name, declaration.source)?;
+        let image_node_limit = self.request.limits.image_nodes;
         let Some(ComptimeValue::Image(current)) = self.local_mut(image) else {
             return Err(EvaluationFailure::Analysis(
                 AnalysisFailure::RequestMismatch,
             ));
         };
+        let actor = u32::try_from(current.actors.len()).map_err(|_| {
+            EvaluationFailure::Analysis(AnalysisFailure::ResourceLimit {
+                resource: "image actor nodes",
+                limit: u64::from(image_node_limit),
+            })
+        })?;
         current.actors.push(EvaluatedActor {
             class,
             kind: install_kind,
             name_start,
             name_len: actor_name_len,
             mailbox_capacity,
+            dependency: dependency.map(|(actor, _)| actor),
+            wiring_source: dependency.map(|(_, source)| source),
             source,
             mailbox_source,
         });
-        Ok(ComptimeValue::Unit)
+        Ok(ComptimeValue::InstalledActor { actor, class })
     }
 
     fn standard_declaration_name(
@@ -11447,6 +11995,8 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             | ComptimeValue::TargetType
             | ComptimeValue::ImageConstructor
             | ComptimeValue::ActorClass { .. }
+            | ComptimeValue::InstalledActor { .. }
+            | ComptimeValue::ActorHandle { .. }
             | ComptimeValue::Unit => Ok(0),
         }
     }
@@ -12263,6 +12813,31 @@ fn inspect_actor_plans(
         .into());
     }
     let program = request.hir.as_program();
+    if actors.iter().any(|actor| actor.dependency.is_some())
+        && !matches!(
+            actors.as_slice(),
+            [service, client]
+                if service.kind == EvaluatedActorKind::Service
+                    && service.dependency.is_none()
+                    && service.mailbox_capacity == 1
+                    && client.kind == EvaluatedActorKind::App
+                    && client.dependency == Some(0)
+                    && client.mailbox_capacity == 1
+        )
+    {
+        let source = actors
+            .iter()
+            .find_map(|actor| actor.wiring_source)
+            .or_else(|| actors.last().map(|actor| actor.source))
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        return Err(actor_runtime_diagnostic(
+            Category::ACTOR,
+            source,
+            "semantic-actor-wiring-shape",
+            "cross-actor wiring admits exactly one service and one dependent app with unit mailboxes",
+            "install the service first, pass its unique handle to one app, and use mailbox=1 for both actors",
+        ));
+    }
     let mut plans = Vec::new();
     plans
         .try_reserve_exact(actors.len())
@@ -12297,13 +12872,13 @@ fn inspect_actor_plans(
                 "remove generic and interface specialization from the installed actor class",
             ));
         }
-        if !class.fields.is_empty() {
+        if !class.fields.is_empty() && actor.dependency.is_none() {
             return Err(actor_runtime_diagnostic(
                 Category::ACTOR,
                 class.fields[0].source,
                 "semantic-actor-state-not-supported",
-                "actor field initialization is not coherent in the current image-construction slice",
-                "use a stateless actor until typed image wiring and actor-state initialization are lowered",
+                "actor field initialization is outside the exact image-wired handle subset",
+                "use a stateless actor or the single Actor[Service] field on the installed app",
             ));
         }
         let mut actor_attribute = None;
@@ -12617,6 +13192,8 @@ fn actor_runtime_diagnostic(
 #[derive(Debug, Clone, Copy)]
 struct ResolvedActorSend {
     actor: ActorId,
+    receiver: ExpressionId,
+    handle: Option<ExpressionId>,
     method: FunctionInstanceId,
     mailbox_proof: ProofId,
     source: Span,
@@ -12667,14 +13244,37 @@ fn resolve_self_actor_send(
     let base_expression = program
         .expression(*base)
         .ok_or(AnalysisFailure::RequestMismatch)?;
-    let ExpressionKind::Reference(Definition::Parameter(receiver)) = base_expression.kind else {
-        return Err(actor_runtime_diagnostic(
-            Category::ACTOR,
-            base_expression.source,
-            "semantic-actor-send-receiver",
-            "the implemented one-way send subset requires the image-wired self actor",
-            "send from a static @task with `send self.method()`",
-        ));
+    let (receiver_expression, receiver, dependency_name, handle) = match &base_expression.kind {
+        ExpressionKind::Reference(Definition::Parameter(receiver)) => {
+            (*base, *receiver, None, None)
+        }
+        ExpressionKind::Field {
+            base: receiver_expression,
+            name,
+        } => {
+            let receiver = program
+                .expression(*receiver_expression)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            let ExpressionKind::Reference(Definition::Parameter(receiver)) = receiver.kind else {
+                return Err(actor_runtime_diagnostic(
+                    Category::ACTOR,
+                    base_expression.source,
+                    "semantic-actor-send-receiver",
+                    "one-way send cannot use an escaped or substituted actor handle",
+                    "send only through the app's image-wired Actor[Service] field",
+                ));
+            };
+            (*receiver_expression, receiver, Some(name), Some(*base))
+        }
+        _ => {
+            return Err(actor_runtime_diagnostic(
+                Category::ACTOR,
+                base_expression.source,
+                "semantic-actor-send-receiver",
+                "one-way send cannot use an escaped or substituted actor handle",
+                "send from a startup task through self or the app's image-wired Actor[Service] field",
+            ));
+        }
     };
     let caller_record = partial
         .functions
@@ -12701,12 +13301,91 @@ fn resolve_self_actor_send(
         .graph
         .as_ref()
         .ok_or(AnalysisFailure::RequestMismatch)?;
-    let actor = graph
+    let source_actor = graph
         .tasks
         .get(task_id.0 as usize)
         .filter(|task| task.id == task_id)
         .and_then(|task| task.supervisor)
         .ok_or(AnalysisFailure::RequestMismatch)?;
+    let source_actor_record = graph
+        .actors
+        .get(source_actor.0 as usize)
+        .filter(|record| record.id == source_actor)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let actor = if let Some(dependency_name) = dependency_name {
+        if graph.actors.len() != 2 || source_actor != ActorId(1) {
+            return Err(actor_runtime_diagnostic(
+                Category::ACTOR,
+                base_expression.source,
+                "semantic-actor-send-receiver",
+                "cross-actor send requires the unique image-wired app-to-service edge",
+                "install exactly one service and one app, then send through the app Actor field",
+            ));
+        }
+        let source_class = partial
+            .types
+            .get(source_actor_record.class.0 as usize)
+            .and_then(|ty| match ty.kind {
+                SemanticTypeKind::Class { declaration, .. } => Some(declaration),
+                _ => None,
+            })
+            .and_then(|declaration| program.declaration(declaration))
+            .and_then(|declaration| match &declaration.kind {
+                DeclarationKind::Class(class) => Some(class),
+                _ => None,
+            })
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let field = source_class
+            .fields
+            .iter()
+            .find(|field| &field.name == dependency_name)
+            .ok_or_else(|| {
+                actor_runtime_diagnostic(
+                    Category::ACTOR,
+                    base_expression.source,
+                    "semantic-actor-send-receiver",
+                    "the selected actor handle is not the image-wired dependency field",
+                    "send through the app's single Actor[Service] field",
+                )
+            })?;
+        let TypeExpressionKind::Named {
+            definition: Definition::Builtin(Builtin::Actor),
+            arguments,
+        } = &field.ty.kind
+        else {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        };
+        let [argument] = arguments.as_slice() else {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        };
+        let wrela_hir::GenericArgumentKind::Type(TypeExpression {
+            kind:
+                TypeExpressionKind::Named {
+                    definition: Definition::Declaration(target),
+                    arguments,
+                },
+            ..
+        }) = &argument.kind
+        else {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        };
+        if !arguments.is_empty() {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        }
+        graph
+            .actors
+            .iter()
+            .find(|candidate| {
+                partial.types.get(candidate.class.0 as usize).is_some_and(|ty| {
+                    matches!(ty.kind, SemanticTypeKind::Class { declaration, .. } if declaration == target.declaration)
+                })
+            })
+            .map(|candidate| candidate.id)
+            .filter(|target| *target == ActorId(0))
+            .ok_or(AnalysisFailure::RequestMismatch)?
+    } else {
+        source_actor
+    };
     let actor_record = graph
         .actors
         .get(actor.0 as usize)
@@ -12769,10 +13448,42 @@ fn resolve_self_actor_send(
     }
     Ok(ResolvedActorSend {
         actor,
+        receiver: receiver_expression,
+        handle,
         method,
         mailbox_proof: mailbox_proof.ok_or(AnalysisFailure::RequestMismatch)?,
         source: call.source,
     })
+}
+
+fn ensure_actor_handle_type(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    class: SemanticTypeId,
+) -> Result<SemanticTypeId, AnalysisFailure> {
+    if let Some(existing) = partial
+        .types
+        .iter()
+        .find(|ty| ty.kind == SemanticTypeKind::Actor { class })
+    {
+        return Ok(existing.id);
+    }
+    if partial.types.len() >= request.limits.types as usize {
+        return Err(fact_resource(request, "actor handle type"));
+    }
+    let id = SemanticTypeId(
+        u32::try_from(partial.types.len())
+            .map_err(|_| fact_resource(request, "actor handle type"))?,
+    );
+    partial.types.push(SemanticType {
+        id,
+        kind: SemanticTypeKind::Actor { class },
+        linearity: Linearity::ExplicitCopy,
+        size_upper_bound: Some(8),
+        alignment_lower_bound: 8,
+        source: None,
+    });
+    Ok(id)
 }
 
 fn ensure_actor_reservation_type(
@@ -13113,6 +13824,39 @@ fn populate_actor_image(
     graph.tasks = task_nodes;
     append_actor_regions_and_capacity_proofs(request, partial, &plans, &mut graph, is_cancelled)?;
     partial.graph = Some(graph);
+    if let [service, client] = plans.as_slice()
+        && client.evaluated.dependency == Some(service.id.0)
+    {
+        let source = client
+            .evaluated
+            .wiring_source
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if partial.proofs.len() >= request.limits.proofs as usize {
+            return Err(fact_resource(request, "actor dependency proof").into());
+        }
+        let id = ProofId(
+            u32::try_from(partial.proofs.len())
+                .map_err(|_| fact_resource(request, "actor dependency proof"))?,
+        );
+        partial.proofs.push(Proof {
+            id,
+            kind: ProofKind::ActorAsIf,
+            subject: bounded_actor_text(
+                request,
+                "image-wired dependency: ",
+                " -> ",
+                "service",
+                is_cancelled,
+            )?,
+            sources: vec![source],
+            depends_on: Vec::new(),
+            bound: Some(1),
+            explanation: vec![
+                "the image mints one immutable typed app-to-service handle; it cannot escape or be substituted"
+                    .to_owned(),
+            ],
+        });
+    }
     prepare_actor_sends(request, partial, &plans, is_cancelled)?;
 
     for plan in &plans {
@@ -13606,7 +14350,13 @@ fn append_actor_regions_and_capacity_proofs(
     let region_count = graph
         .actors
         .len()
-        .checked_mul(2)
+        .checked_add(
+            graph
+                .actors
+                .iter()
+                .filter(|actor| !actor.turn_functions.is_empty())
+                .count(),
+        )
         .and_then(|count| count.checked_add(graph.tasks.len()))
         .ok_or_else(|| fact_resource(request, "image capacity regions"))?;
     if region_count > request.limits.image_nodes as usize {
@@ -13652,37 +14402,39 @@ fn append_actor_regions_and_capacity_proofs(
         static_bytes = static_bytes
             .checked_add(mailbox_bytes)
             .ok_or_else(|| fact_resource(request, "image static bytes"))?;
-        let turn_frame_bytes = actor
-            .turn_functions
-            .iter()
-            .filter_map(|function| partial.functions.get(function.0 as usize))
-            .map(|function| function.frame_bytes_bound.max(1))
-            .max()
-            .unwrap_or(1);
-        let turn_proof = append_capacity_proof(
-            request,
-            partial,
-            bounded_actor_text(request, "actor turn slot: ", "", &actor.name, is_cancelled)?,
-            vec![plan.evaluated.source],
-            1,
-            "non-reentrant actor scheduling admits exactly one active external turn and retains that fixed frame across suspension",
-        )?;
-        graph.regions.push(Region {
-            id: RegionId(
-                u32::try_from(graph.regions.len())
-                    .map_err(|_| fact_resource(request, "image capacity regions"))?,
-            ),
-            name: bounded_actor_text(request, &actor.name, ".", "turn-frame", is_cancelled)?,
-            class: RegionClass::TaskFrame,
-            capacity_bytes: turn_frame_bytes,
-            alignment: 8,
-            owner: ImageOwner::Actor(actor.id),
-            proof: turn_proof,
-            source: plan.evaluated.source,
-        });
-        static_bytes = static_bytes
-            .checked_add(turn_frame_bytes)
-            .ok_or_else(|| fact_resource(request, "image static bytes"))?;
+        if !actor.turn_functions.is_empty() {
+            let turn_frame_bytes = actor
+                .turn_functions
+                .iter()
+                .filter_map(|function| partial.functions.get(function.0 as usize))
+                .map(|function| function.frame_bytes_bound.max(1))
+                .max()
+                .unwrap_or(1);
+            let turn_proof = append_capacity_proof(
+                request,
+                partial,
+                bounded_actor_text(request, "actor turn slot: ", "", &actor.name, is_cancelled)?,
+                vec![plan.evaluated.source],
+                1,
+                "non-reentrant actor scheduling admits exactly one active external turn and retains that fixed frame across suspension",
+            )?;
+            graph.regions.push(Region {
+                id: RegionId(
+                    u32::try_from(graph.regions.len())
+                        .map_err(|_| fact_resource(request, "image capacity regions"))?,
+                ),
+                name: bounded_actor_text(request, &actor.name, ".", "turn-frame", is_cancelled)?,
+                class: RegionClass::TaskFrame,
+                capacity_bytes: turn_frame_bytes,
+                alignment: 8,
+                owner: ImageOwner::Actor(actor.id),
+                proof: turn_proof,
+                source: plan.evaluated.source,
+            });
+            static_bytes = static_bytes
+                .checked_add(turn_frame_bytes)
+                .ok_or_else(|| fact_resource(request, "image static bytes"))?;
+        }
     }
     for task in &graph.tasks {
         check_cancelled(is_cancelled)?;
@@ -18421,6 +19173,8 @@ comptime fn cleanup_fixture():
                     name_start,
                     name_len,
                     mailbox_capacity: 1,
+                    dependency: None,
+                    wiring_source: None,
                     source,
                     mailbox_source: source,
                 });

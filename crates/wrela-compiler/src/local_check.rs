@@ -1019,8 +1019,7 @@ mod tests {
 
     const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.toml");
     const CORE_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/image.wr");
-    const CORE_RESULT_SOURCE: &[u8] =
-        include_bytes!("../../../std/wrela-core-0.1/src/result.wr");
+    const CORE_RESULT_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/result.wr");
     const CORE_TIME_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/time.wr");
     const APPLICATION_MANIFEST: &[u8] =
         include_bytes!("../../../std/examples/minimal-image/wrela.toml");

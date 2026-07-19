@@ -4,8 +4,7 @@ use wrela_build_model::{BuildIdentity, Sha256Digest};
 use wrela_source::{FileId, Span, TextRange};
 use wrela_test_model::{
     FullImageTestGroup, FunctionKey, ImageGroupId, ImageRoot, ImageTest, ImageTestInvocation,
-    PlannedAssertionDescriptor,
-    ScenarioId, TestDescriptor, TestId, TestKind,
+    PlannedAssertionDescriptor, ScenarioId, TestDescriptor, TestId, TestKind,
 };
 
 use crate::{
@@ -1590,7 +1589,7 @@ mod tests {
             deterministic_seed: Some(5),
             boot_timeout_ns: 11,
             shutdown_timeout_ns: 12,
-            maximum_events: 4,
+            maximum_events: 5,
             maximum_output_bytes: 13,
         };
         let declared = wrela_test_model::FullImageTestGroup {

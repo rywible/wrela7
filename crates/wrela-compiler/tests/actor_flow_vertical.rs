@@ -514,12 +514,73 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
     let prepared =
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
             .expect("real parsed actor source reaches sealed MachineWir v10");
+    let optimized_wait = prepared
+        .optimized()
+        .wir()
+        .as_wir()
+        .proofs
+        .iter()
+        .find(|proof| proof.id == wait.id)
+        .expect("optimized wait-graph proof");
+    assert_eq!(optimized_wait.kind, flow::ProofKind::WaitGraphAcyclic);
     let machine = prepared.machine().wir().as_wir();
     assert_eq!(machine.version, 10);
     assert_eq!(machine.activations.len(), 2);
     assert_eq!(machine.region_storage.len(), flow.regions.len());
     assert_eq!(machine.region_storage.len(), 5);
     assert_eq!(machine.globals.len(), 5);
+    let machine_closed = machine
+        .proofs
+        .iter()
+        .find(|proof| proof.kind == BackendProofKind::ImageClosed)
+        .expect("MachineWir activation-aware image closure");
+    assert_eq!(machine_closed.source_proofs.as_slice(), [flow_closed.id.0]);
+    assert_eq!(machine_closed.bound, flow_closed.bound);
+    assert_eq!(
+        machine_closed.depends_on.len(),
+        flow_closed.depends_on.len()
+    );
+    assert_eq!(machine_closed.sources, flow_closed.sources);
+    assert!(
+        machine.functions[machine.image_entry.0 as usize]
+            .proofs
+            .contains(&machine_closed.id)
+    );
+    let mut detached_image_closure = machine.clone();
+    detached_image_closure.functions[machine.image_entry.0 as usize]
+        .proofs
+        .retain(|proof| *proof != machine_closed.id);
+    let errors = detached_image_closure
+        .validate_for_target(&target)
+        .expect_err("image entry cannot detach the closed static allocation proof");
+    assert!(errors.0.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidRecord {
+            kind: "region storage image bound",
+            ..
+        }
+    )));
+    let machine_wait = machine
+        .proofs
+        .iter()
+        .find(|proof| proof.kind == BackendProofKind::WaitGraphAcyclic)
+        .expect("MachineWir wait-graph proof");
+    assert_eq!(machine_wait.source_proofs.as_slice(), [wait.id.0]);
+    assert_eq!(machine_wait.bound, wait.bound);
+    assert_eq!(machine_wait.depends_on.len(), wait.depends_on.len());
+    assert_eq!(machine_wait.sources, wait.sources);
+    let mut substituted_wait_proof = machine.clone();
+    substituted_wait_proof.proofs[machine_wait.id.0 as usize].kind = BackendProofKind::Ownership;
+    let errors = substituted_wait_proof
+        .validate_for_target(&target)
+        .expect_err("actor wait proof kind cannot be substituted after machine lowering");
+    assert!(errors.0.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidRecord {
+            kind: "actor wait proof",
+            ..
+        }
+    )));
     let mut reserved_region_bytes = 0u64;
     for (storage, flow_region) in machine.region_storage.iter().zip(&flow.regions) {
         assert_eq!(storage.id.0, flow_region.id.0);

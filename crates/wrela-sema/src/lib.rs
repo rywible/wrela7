@@ -2344,6 +2344,47 @@ fn validate_exact_body_local_value_flow(
                 }
                 EffectSet(condition_effects.0 | then_effects.0 | else_effects.0)
             }
+            wrela_hir::StatementKind::While { condition, body } => {
+                if fact.definitions.len() % 2 != 0 {
+                    return Err(invalid("loop carried definitions are not paired"));
+                }
+                let arity = fact.definitions.len() / 2;
+                for definition in &fact.definitions[..arity] {
+                    let slot = locals
+                        .get_mut(definition.local.0 as usize)
+                        .ok_or_else(|| invalid("loop carried local is invalid"))?;
+                    if slot.is_none() {
+                        return Err(invalid("loop carries an uninitialized local"));
+                    }
+                    *slot = Some(definition.value);
+                }
+                validate_exact_expression_local_values(
+                    analysis,
+                    program,
+                    function.id,
+                    *condition,
+                    locals,
+                    is_cancelled,
+                )?;
+                let condition_effects = exact_child_expression(analysis, function.id, *condition)
+                    .ok_or_else(|| invalid("while condition fact is missing"))?
+                    .effects;
+                let mut body_locals = copy_exact_local_values(locals)?;
+                let body_effects = validate_exact_body_local_value_flow(
+                    analysis,
+                    program,
+                    function,
+                    *body,
+                    &mut body_locals,
+                    depth + 1,
+                    is_cancelled,
+                )?;
+                for definition in &fact.definitions[arity..] {
+                    locals[definition.local.0 as usize] = Some(definition.value);
+                }
+                EffectSet(condition_effects.0 | body_effects.0)
+            }
+            wrela_hir::StatementKind::Break | wrela_hir::StatementKind::Continue => EffectSet(0),
             wrela_hir::StatementKind::Match { scrutinee, arms } => {
                 validate_exact_expression_local_values(
                     analysis,
@@ -2572,6 +2613,21 @@ fn collect_source_body_closure(
                         pending_bodies.push(*otherwise);
                     }
                 }
+                wrela_hir::StatementKind::While { condition, body } => {
+                    reserve_validation_scratch(
+                        &mut pending_expressions,
+                        1,
+                        program.expressions.len() as u64,
+                    )?;
+                    pending_expressions.push(*condition);
+                    reserve_validation_scratch(
+                        &mut pending_bodies,
+                        1,
+                        program.bodies.len() as u64,
+                    )?;
+                    pending_bodies.push(*body);
+                }
+                wrela_hir::StatementKind::Break | wrela_hir::StatementKind::Continue => {}
                 wrela_hir::StatementKind::Match { scrutinee, arms } => {
                     reserve_validation_scratch(
                         &mut pending_expressions,
@@ -2889,6 +2945,7 @@ fn validate_exact_expression_fact(
             Some(_),
         ) if exact_flat_field_matches(
             analysis,
+            program,
             function.id,
             *base,
             name,
@@ -3398,6 +3455,7 @@ fn exact_flat_constructor_matches(
 
 fn exact_flat_field_matches(
     analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
     function: FunctionInstanceId,
     base: ExpressionId,
     name: &wrela_hir::Name,
@@ -3414,23 +3472,70 @@ fn exact_flat_field_matches(
     else {
         return Ok(false);
     };
-    let Some(SemanticTypeKind::Structure {
-        arguments, fields, ..
-    }) = analysis
-        .types
-        .get(base_fact.ty.0 as usize)
-        .map(|record| &record.kind)
-    else {
+    let Some(base_type) = analysis.types.get(base_fact.ty.0 as usize) else {
         return Ok(false);
     };
-    if !arguments.is_empty() {
-        return Ok(false);
+    match &base_type.kind {
+        SemanticTypeKind::Structure {
+            arguments, fields, ..
+        } => {
+            if !arguments.is_empty() {
+                return Ok(false);
+            }
+            let Some(field) = fields.get(index as usize) else {
+                return Ok(false);
+            };
+            check_analysis_cancelled(is_cancelled)?;
+            Ok(field.name == name.as_str() && field.ty == result)
+        }
+        SemanticTypeKind::Class {
+            declaration,
+            arguments,
+            fields,
+        } if arguments.is_empty() && fields.is_empty() && index == 0 => {
+            let Some(wrela_hir::Declaration {
+                kind: wrela_hir::DeclarationKind::Class(class),
+                ..
+            }) = program.declaration(*declaration)
+            else {
+                return Ok(false);
+            };
+            let [field] = class.fields.as_slice() else {
+                return Ok(false);
+            };
+            let wrela_hir::TypeExpressionKind::Named {
+                definition: wrela_hir::Definition::Builtin(wrela_hir::Builtin::Actor),
+                arguments,
+            } = &field.ty.kind
+            else {
+                return Ok(false);
+            };
+            let [argument] = arguments.as_slice() else {
+                return Ok(false);
+            };
+            let wrela_hir::GenericArgumentKind::Type(wrela_hir::TypeExpression {
+                kind:
+                    wrela_hir::TypeExpressionKind::Named {
+                        definition: wrela_hir::Definition::Declaration(target),
+                        arguments,
+                    },
+                ..
+            }) = &argument.kind
+            else {
+                return Ok(false);
+            };
+            Ok(arguments.is_empty()
+                && field.name == *name
+                && analysis.types.get(result.0 as usize).is_some_and(|ty| {
+                    matches!(ty.kind, SemanticTypeKind::Actor { class }
+                    if analysis.types.get(class.0 as usize).is_some_and(|class| {
+                        matches!(class.kind, SemanticTypeKind::Class { declaration, .. }
+                            if declaration == target.declaration)
+                    }))
+                }))
+        }
+        _ => Ok(false),
     }
-    let Some(field) = fields.get(index as usize) else {
-        return Ok(false);
-    };
-    check_analysis_cancelled(is_cancelled)?;
-    Ok(field.name == name.as_str() && field.ty == result)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3556,7 +3661,11 @@ fn exact_scalar_unary_matches(
             wrela_hir::UnaryOperator::BoolNot,
             Some(ExactScalarType::Bool)
         )
-    )
+    ) || operator == wrela_hir::UnaryOperator::Copy
+        && analysis
+            .types
+            .get(fact.ty.0 as usize)
+            .is_some_and(|ty| ty.linearity == Linearity::ExplicitCopy)
 }
 
 fn exact_scalar_binary_matches(
@@ -4105,7 +4214,7 @@ fn validate_exact_statement_fact(
                 return Err(invalid("enum match omits a constructor variant"));
             }
         }
-        wrela_hir::StatementKind::If { .. } => {
+        wrela_hir::StatementKind::If { .. } | wrela_hir::StatementKind::While { .. } => {
             for definition in &fact.definitions {
                 check_analysis_cancelled(is_cancelled)?;
                 let local_record = program
@@ -4319,7 +4428,7 @@ fn exact_actor_method_reference_matches(
     let FunctionRole::TaskEntry(task) = caller_record.role else {
         return false;
     };
-    let Some(actor) = graph
+    let Some(source_actor) = graph
         .tasks
         .get(task.0 as usize)
         .filter(|record| record.id == task)
@@ -4360,13 +4469,26 @@ fn exact_actor_method_reference_matches(
             } if parameters.is_empty() && *result == SemanticTypeId(0)
         )
     });
+    let target_actor = match target_record.role {
+        FunctionRole::ActorTurn(actor) => actor,
+        _ => return false,
+    };
+    let cross_actor_handle = graph.actors.len() == 2
+        && source_actor == ActorId(1)
+        && target_actor == ActorId(0)
+        && matches!(
+            base_fact.resolution,
+            ExpressionResolution::Field { index: 0 }
+        )
+        && base_fact.result.is_some();
     target_name_matches
-        && base_is_receiver
-        && matches!(base_fact.resolution, ExpressionResolution::Value(_))
-        && base_fact.result.is_none()
+        && ((base_is_receiver
+            && source_actor == target_actor
+            && matches!(base_fact.resolution, ExpressionResolution::Value(_))
+            && base_fact.result.is_none())
+            || cross_actor_handle)
         && base_fact.effects == EffectSet(0)
         && target_record.id == target
-        && target_record.role == FunctionRole::ActorTurn(actor)
         && target_record.color == FunctionColor::Async
         && target_record.parameters.len() == 1
         && target_record.result == SemanticTypeId(0)
@@ -4401,12 +4523,16 @@ fn exact_actor_request_matches(
     let FunctionRole::TaskEntry(task) = producer.role else {
         return false;
     };
-    if graph
+    let Some(source_actor) = graph
         .tasks
         .get(task.0 as usize)
         .filter(|record| record.id == task)
         .and_then(|record| record.supervisor)
-        != Some(actor)
+    else {
+        return false;
+    };
+    if source_actor != actor
+        && !(graph.actors.len() == 2 && source_actor == ActorId(1) && actor == ActorId(0))
     {
         return false;
     }
@@ -4441,10 +4567,24 @@ fn exact_actor_request_matches(
     let Some(base_source) = program.expression(*base) else {
         return false;
     };
-    let wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Parameter(receiver)) =
-        base_source.kind
-    else {
-        return false;
+    let receiver = match &base_source.kind {
+        wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Parameter(receiver)) => {
+            *receiver
+        }
+        wrela_hir::ExpressionKind::Field { base, .. }
+            if source_actor == ActorId(1) && actor == ActorId(0) =>
+        {
+            let Some(wrela_hir::Expression {
+                kind:
+                    wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Parameter(receiver)),
+                ..
+            }) = program.expression(*base)
+            else {
+                return false;
+            };
+            *receiver
+        }
+        _ => return false,
     };
     if producer
         .parameters
@@ -4460,8 +4600,17 @@ fn exact_actor_request_matches(
     let Some(callee_fact) = exact_child_expression(analysis, caller, callee) else {
         return false;
     };
-    if !matches!(base_fact.resolution, ExpressionResolution::Value(_))
-        || base_fact.result.is_some()
+    let base_matches = (source_actor == actor
+        && matches!(base_fact.resolution, ExpressionResolution::Value(_))
+        && base_fact.result.is_none())
+        || (source_actor == ActorId(1)
+            && actor == ActorId(0)
+            && matches!(
+                base_fact.resolution,
+                ExpressionResolution::Field { index: 0 }
+            )
+            && base_fact.result.is_some());
+    if !base_matches
         || base_fact.effects != EffectSet(0)
         || callee_fact.resolution != ExpressionResolution::Function(method)
         || callee_fact.result.is_some()
@@ -5307,10 +5456,23 @@ fn valid_statement_fact(
     (fact.function.0 as usize) < analysis.functions.len()
         && fact.statement.0 < analysis.hir.statements
         && fact.effects.is_valid()
-        && fact
+        && (fact
             .definitions
             .windows(2)
             .all(|pair| pair[0].local < pair[1].local)
+            || (fact.definitions.len() % 2 == 0 && {
+                let arity = fact.definitions.len() / 2;
+                fact.definitions[..arity]
+                    .windows(2)
+                    .all(|pair| pair[0].local < pair[1].local)
+                    && fact.definitions[arity..]
+                        .windows(2)
+                        .all(|pair| pair[0].local < pair[1].local)
+                    && fact.definitions[..arity]
+                        .iter()
+                        .zip(&fact.definitions[arity..])
+                        .all(|(header, exit)| header.local == exit.local)
+            }))
         && fact
             .definitions
             .iter()

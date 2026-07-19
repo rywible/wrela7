@@ -1452,6 +1452,11 @@ fn encode_operation(writer: &mut Writer<'_>, value: &FlowOperation) -> Result<()
             writer.u8(51)?;
             writer.u32(value.0)
         }
+        FlowOperation::ActorCapability { actor, proof } => {
+            writer.u8(52)?;
+            writer.u32(actor.0)?;
+            writer.u32(proof.0)
+        }
     }
 }
 
@@ -2579,6 +2584,10 @@ impl Reader<'_> {
             },
             51 => FlowOperation::EnumPayload {
                 value: ValueId(self.u32()?),
+            },
+            52 => FlowOperation::ActorCapability {
+                actor: ActorId(self.u32()?),
+                proof: ProofId(self.u32()?),
             },
             tag => return Err(invalid_tag("FlowOperation", tag)),
         })
@@ -4916,12 +4925,12 @@ mod tests {
                 .expect("closed enum operation consumes exactly");
         }
 
-        let mut reader = Reader::new(&[52], 0, CodecLimits::standard(), &not_cancelled);
+        let mut reader = Reader::new(&[53], 0, CodecLimits::standard(), &not_cancelled);
         assert_eq!(
             reader.operation(),
             Err(CodecError::InvalidEnumTag {
                 kind: "FlowOperation",
-                tag: 52,
+                tag: 53,
             })
         );
     }

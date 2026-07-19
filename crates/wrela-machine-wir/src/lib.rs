@@ -535,9 +535,10 @@ pub enum MachineOperation {
         method: FunctionId,
         failure: ScalarFailureProvenance,
     },
-    /// Acquire the mailbox tag after startup and invoke the sealed actor turn
-    /// only when a message is present. An empty slot falls through without a
-    /// call; the turn's `MailboxReceive` authenticates the exact method tag.
+    /// Deterministically drain admitted unit messages through exact internal
+    /// calls until the mailbox is empty. Each turn's `MailboxReceive` authenticates
+    /// the exact method tag and releases the slot before the next scan, permitting
+    /// a completed turn to publish recurring work without recursive re-entry.
     MailboxDispatch {
         mailbox: GlobalId,
         actor: u32,
@@ -2299,6 +2300,7 @@ fn validate_module(
     validate_activations(module, &mut errors);
     validate_region_storage(module, &mut errors);
     validate_actor_message_contract(module, &mut errors);
+    validate_actor_wait_proof(module, &mut errors);
     validate_tests(module, &mut errors);
     validate_interrupt_entries(module, target, &mut errors);
     validate_interrupt_metadata(module, &mut errors);
@@ -2804,6 +2806,40 @@ struct ActorDispatchRecord {
     method: FunctionId,
 }
 
+fn validate_actor_wait_proof(module: &MachineWir, errors: &mut ValidationContext<'_>) {
+    let has_actor = module
+        .functions
+        .iter()
+        .any(|function| matches!(function.role, MachineFunctionRole::ActorTurn(_)))
+        || module
+            .region_storage
+            .iter()
+            .any(|storage| matches!(storage.kind, MachineRegionStorageKind::ActorMailbox { .. }));
+    if !has_actor {
+        return;
+    }
+    let mut wait_proof = None;
+    for proof in &module.proofs {
+        if !errors.poll() {
+            return;
+        }
+        if proof.kind == BackendProofKind::WaitGraphAcyclic
+            && wait_proof.replace(proof.id).is_some()
+        {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "actor wait proof",
+                id: proof.id.0,
+            });
+        }
+    }
+    if wait_proof.is_none() {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "actor wait proof",
+            id: 0,
+        });
+    }
+}
+
 fn validate_actor_message_contract(module: &MachineWir, errors: &mut ValidationContext<'_>) {
     let startup_success = module
         .functions
@@ -3120,8 +3156,16 @@ fn validate_actor_message_contract(module: &MachineWir, errors: &mut ValidationC
         if activation.caller == reserve.function
             && activation.schedule == MachineActivationSchedule::StartupOnce
             && matches!(activation.owner,
-                MachineActivationOwner::Task { supervisor: Some(actor), .. }
-                    if actor == reserve.actor)
+            MachineActivationOwner::Task { supervisor: Some(actor), .. }
+                if actor == reserve.actor
+                    || (reserve.actor == 0
+                        && actor == 1
+                        && module.region_storage.iter().any(|storage| {
+                            storage.kind == (MachineRegionStorageKind::ActorMailbox {
+                                actor: 1,
+                                mailbox_capacity: 1,
+                            })
+                        })))
         {
             task_activation_count = task_activation_count.saturating_add(1);
         }
@@ -3258,7 +3302,21 @@ fn validate_activations(module: &MachineWir, errors: &mut ValidationContext<'_>)
                 },
                 MachineFunctionRole::TaskEntry(role_task),
                 MachineActivationSchedule::StartupOnce,
-            ) => task == role_task && slots == 1 && supervisor.is_none_or(|actor| actor == 0),
+            ) => {
+                task == role_task
+                    && slots == 1
+                    && supervisor.is_none_or(|actor| {
+                        actor == 0
+                            || (actor == 1
+                                && module.region_storage.iter().any(|storage| {
+                                    storage.kind
+                                        == (MachineRegionStorageKind::ActorMailbox {
+                                            actor: 1,
+                                            mailbox_capacity: 1,
+                                        })
+                                }))
+                    })
+            }
             _ => false,
         };
         let proof_matches = caller.proofs.contains(&activation.capacity_proof)
@@ -3337,7 +3395,19 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
         return;
     }
 
-    let expected = module.activations.len().checked_add(3);
+    let cross_actor = module.activations.iter().any(|activation| {
+        matches!(
+            activation.owner,
+            MachineActivationOwner::Task {
+                supervisor: Some(1),
+                ..
+            }
+        ) && activation.schedule == MachineActivationSchedule::StartupOnce
+    });
+    let expected = module
+        .activations
+        .len()
+        .checked_add(if cross_actor { 4 } else { 3 });
     if expected != Some(module.region_storage.len()) {
         errors.push(ValidationError::InvalidRecord {
             kind: "region storage set",
@@ -3504,11 +3574,12 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                 mailbox_capacity,
             } => {
                 mailbox_count = mailbox_count.saturating_add(1);
-                storage.id.0 == 0
+                storage.id.0 == if actor == 0 { 0 } else { 2 }
+                    && (!cross_actor || matches!(actor, 0 | 1))
                     && storage.capacity_units == u64::from(mailbox_capacity)
                     && storage.bytes_per_unit == 16
                     && text_ends_with(&storage.name, ".mailbox", errors)
-                    && module.activations.iter().any(|activation| {
+                    && (module.activations.iter().any(|activation| {
                         matches!(
                             activation.schedule,
                             MachineActivationSchedule::DormantMailbox
@@ -3518,7 +3589,7 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                                 actor,
                                 mailbox_capacity,
                             })
-                    })
+                    }) || (cross_actor && actor == 1 && mailbox_capacity == 1))
             }
             MachineRegionStorageKind::ActorTurnFrame { actor, function } => {
                 actor_frame_count = actor_frame_count.saturating_add(1);
@@ -3546,7 +3617,7 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                 slots,
             } => {
                 task_frame_count = task_frame_count.saturating_add(1);
-                storage.id.0 == 2
+                storage.id.0 == if cross_actor { 3 } else { 2 }
                     && slots == 1
                     && storage.capacity_units == u64::from(slots)
                     && storage.bytes_per_unit == storage.capacity_bytes
@@ -3596,7 +3667,10 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
         }
     }
 
-    if mailbox_count != 1 || actor_frame_count != 1 || task_frame_count != 1 {
+    if mailbox_count != if cross_actor { 2 } else { 1 }
+        || actor_frame_count != 1
+        || task_frame_count != 1
+    {
         errors.push(ValidationError::InvalidRecord {
             kind: "region storage owner set",
             id: 0,
@@ -3626,7 +3700,13 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
         .proofs
         .last()
         .filter(|proof| proof.kind == BackendProofKind::ImageClosed);
-    if image_closed.and_then(|proof| proof.bound) != total_bytes {
+    let entry_references_closure = image_closed.is_some_and(|proof| {
+        module
+            .functions
+            .get(module.image_entry.0 as usize)
+            .is_some_and(|entry| entry.proofs.contains(&proof.id))
+    });
+    if image_closed.and_then(|proof| proof.bound) != total_bytes || !entry_references_closure {
         errors.push(ValidationError::InvalidRecord {
             kind: "region storage image bound",
             id: 0,
@@ -6212,12 +6292,23 @@ fn validate_interrupt_entries(
                     .types
                     .get(handler.result.0 as usize)
                     .is_some_and(|ty| matches!(ty.kind, MachineTypeKind::Void));
+                let isr_safe_proofs = handler
+                    .proofs
+                    .iter()
+                    .filter(|proof| {
+                        module
+                            .proofs
+                            .get(proof.0 as usize)
+                            .is_some_and(|proof| proof.kind == BackendProofKind::IsrSafe)
+                    })
+                    .count();
                 handler.linkage == Linkage::Private
                     && handler.convention == CallingConvention::InterruptHandler
                     && handler.role == MachineFunctionRole::Isr(interrupt.device)
                     && handler.parameters.is_empty()
                     && void_result
                     && private_symbol
+                    && isr_safe_proofs == 1
             });
         if !unique_route || !valid_handler {
             errors.push(ValidationError::InvalidInterruptEntry(interrupt.id));
@@ -8065,6 +8156,17 @@ mod tests {
             visibility: SymbolVisibility::Private,
             definition: SymbolDefinition::Function(FunctionId(1)),
         });
+        let isr_safe_proof = ProofId(module.proofs.len() as u32);
+        module.proofs.push(BackendProof {
+            id: isr_safe_proof,
+            source_proofs: vec![0],
+            kind: BackendProofKind::IsrSafe,
+            depends_on: Vec::new(),
+            bound: Some(0),
+            sources: Vec::new(),
+            statement: "virtio-mmio-0 interrupt closure is ISR-safe".to_owned(),
+            source: None,
+        });
         module.functions.push(MachineFunction {
             id: FunctionId(1),
             flow_function: 1,
@@ -8079,7 +8181,7 @@ mod tests {
             convention: CallingConvention::InterruptHandler,
             parameters: Vec::new(),
             result: MachineTypeId(0),
-            proofs: Vec::new(),
+            proofs: vec![isr_safe_proof],
             values: Vec::new(),
             stack_slots: Vec::new(),
             blocks: vec![MachineBlock {
@@ -8108,7 +8210,18 @@ mod tests {
         module
             .clone()
             .validate_for_target(&target)
-            .expect("valid target-owned interrupt route");
+            .expect("valid target-owned interrupt route with sealed ISR-safety proof");
+
+        let mut missing_isr_proof = module.clone();
+        missing_isr_proof.functions[1].proofs.clear();
+        let errors = missing_isr_proof
+            .validate_for_target(&target)
+            .expect_err("interrupt handler without an ISR-safety proof must fail");
+        assert!(
+            errors
+                .0
+                .contains(&ValidationError::InvalidInterruptEntry(InterruptEntryId(0)))
+        );
 
         module.interrupts[0].global_id = 49;
         let errors = module

@@ -445,6 +445,16 @@ fn supported_actor_image<'a>(
                         ty.linearity,
                         semantic::Linearity::Reclaimable | semantic::Linearity::Strict
                     ) => {}
+            semantic::TypeKind::ActorHandle { actor_type }
+                if ty.linearity == semantic::Linearity::ExplicitCopy
+                    && ty.source.is_none()
+                    && input.types.get(actor_type.0 as usize).is_some()
+                    && input
+                        .actors
+                        .iter()
+                        .filter(|actor| actor.ty == *actor_type)
+                        .count()
+                        == 1 => {}
             semantic::TypeKind::Reservation
                 if ty.linearity == semantic::Linearity::Strict && ty.source.is_none() => {}
             semantic::TypeKind::Function(function) => {
@@ -524,7 +534,13 @@ fn validate_actor_plan_contract(
     let expected_regions = input
         .actors
         .len()
-        .checked_mul(2)
+        .checked_add(
+            input
+                .actors
+                .iter()
+                .filter(|actor| !actor.turn_functions.is_empty())
+                .count(),
+        )
         .and_then(|count| count.checked_add(input.tasks.len()))
         .and_then(|count| count.checked_add(input.activations.len()))
         .ok_or(LowerError::ResourceLimit {
@@ -548,12 +564,19 @@ fn validate_actor_plan_contract(
                 })
         };
     let mut static_bytes = 0_u64;
-    for (index, actor) in input.actors.iter().enumerate() {
+    let mut region_cursor = 0usize;
+    for actor in &input.actors {
         check_cancelled(is_cancelled)?;
         let mailbox = input
             .regions
-            .get(index * 2)
+            .get(region_cursor)
             .ok_or(unsupported("actor mailbox region identity"))?;
+        region_cursor = region_cursor
+            .checked_add(1)
+            .ok_or(LowerError::ResourceLimit {
+                resource: "actor region identity",
+                limit: limits.model_edges,
+            })?;
         let mailbox_bytes =
             u64::from(actor.mailbox_capacity)
                 .checked_mul(16)
@@ -561,58 +584,65 @@ fn validate_actor_plan_contract(
                     resource: "actor mailbox bytes",
                     limit: limits.model_edges,
                 })?;
-        let mut turn_frame_bytes = 1_u64;
-        for function in &actor.turn_functions {
-            check_cancelled(is_cancelled)?;
-            let function = input
-                .functions
-                .get(function.0 as usize)
-                .ok_or(unsupported("actor turn-frame function identity"))?;
-            turn_frame_bytes = turn_frame_bytes.max(function.frame_bound.max(1));
-        }
-        let turn = input
-            .regions
-            .get(index * 2 + 1)
-            .ok_or(unsupported("actor turn-frame region identity"))?;
         let mailbox_name_matches =
             polled_joined_name_matches(&mailbox.name, &actor.name, ".mailbox", is_cancelled)?;
-        let turn_name_matches =
-            polled_joined_name_matches(&turn.name, &actor.name, ".turn-frame", is_cancelled)?;
         if !mailbox_name_matches
             || mailbox.class != semantic::RegionClass::Image
             || mailbox.capacity_bytes != mailbox_bytes
             || mailbox.alignment != 8
             || mailbox.owner != semantic::ImageOwner::Actor(actor.id)
-            // The mailbox proof points at the `mailbox=` argument while the
-            // region retains the enclosing actor installation span.
             || !capacity_proof_matches(mailbox, u64::from(actor.mailbox_capacity), false)
-            || !turn_name_matches
-            || turn.class != semantic::RegionClass::TaskFrame
-            || turn.capacity_bytes != turn_frame_bytes
-            || turn.alignment != 8
-            || turn.owner != semantic::ImageOwner::Actor(actor.id)
-            || !capacity_proof_matches(turn, 1, true)
         {
-            return Err(unsupported(
-                "noncanonical actor mailbox/frame capacity plan",
-            ));
+            return Err(unsupported("noncanonical actor mailbox capacity plan"));
         }
-        static_bytes = static_bytes
-            .checked_add(mailbox_bytes)
-            .and_then(|total| total.checked_add(turn_frame_bytes))
-            .ok_or(LowerError::ResourceLimit {
-                resource: "actor static bytes",
-                limit: limits.model_edges,
-            })?;
+        static_bytes =
+            static_bytes
+                .checked_add(mailbox_bytes)
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "actor static bytes",
+                    limit: limits.model_edges,
+                })?;
+        if !actor.turn_functions.is_empty() {
+            let turn = input
+                .regions
+                .get(region_cursor)
+                .ok_or(unsupported("actor turn-frame region identity"))?;
+            region_cursor = region_cursor
+                .checked_add(1)
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "actor region identity",
+                    limit: limits.model_edges,
+                })?;
+            let mut turn_frame_bytes = 1_u64;
+            for function in &actor.turn_functions {
+                check_cancelled(is_cancelled)?;
+                let function = input
+                    .functions
+                    .get(function.0 as usize)
+                    .ok_or(unsupported("actor turn-frame function identity"))?;
+                turn_frame_bytes = turn_frame_bytes.max(function.frame_bound.max(1));
+            }
+            let turn_name_matches =
+                polled_joined_name_matches(&turn.name, &actor.name, ".turn-frame", is_cancelled)?;
+            if !turn_name_matches
+                || turn.class != semantic::RegionClass::TaskFrame
+                || turn.capacity_bytes != turn_frame_bytes
+                || turn.alignment != 8
+                || turn.owner != semantic::ImageOwner::Actor(actor.id)
+                || !capacity_proof_matches(turn, 1, true)
+            {
+                return Err(unsupported("noncanonical actor turn-frame capacity plan"));
+            }
+            static_bytes =
+                static_bytes
+                    .checked_add(turn_frame_bytes)
+                    .ok_or(LowerError::ResourceLimit {
+                        resource: "actor static bytes",
+                        limit: limits.model_edges,
+                    })?;
+        }
     }
-    let task_region_start = input
-        .actors
-        .len()
-        .checked_mul(2)
-        .ok_or(LowerError::ResourceLimit {
-            resource: "actor task-region identity",
-            limit: limits.model_edges,
-        })?;
+    let task_region_start = region_cursor;
     for (index, task) in input.tasks.iter().enumerate() {
         check_cancelled(is_cancelled)?;
         let function = input
@@ -850,11 +880,21 @@ fn validate_actor_source_function(
                 && ty.linearity == semantic::Linearity::Strict
                 && ty.source.is_none()
         });
-        if scalar_primitive(input, value.ty).is_none() && !is_parameter && !is_reservation {
+        let is_capability = input.types.get(value.ty.0 as usize).is_some_and(|ty| {
+            matches!(ty.kind, semantic::TypeKind::ActorHandle { .. })
+                && ty.linearity == semantic::Linearity::ExplicitCopy
+                && ty.source.is_none()
+        });
+        if scalar_primitive(input, value.ty).is_none()
+            && !is_parameter
+            && !is_reservation
+            && !is_capability
+        {
             return Err(unsupported("non-scalar actor temporaries"));
         }
     }
 
+    let mut actor_capabilities = 0_u32;
     let mut actor_reserves = 0_u32;
     let mut mailbox_receives = 0_u32;
     let mut regions = try_vec(1, "actor source region validation", limits.model_edges)?;
@@ -1006,6 +1046,76 @@ fn validate_actor_source_function(
                             return Err(unsupported("actor scalar call results"));
                         }
                     }
+                    semantic::SemanticOperation::ActorCapability {
+                        actor,
+                        wiring_proof,
+                    } => {
+                        actor_capabilities =
+                            actor_capabilities
+                                .checked_add(1)
+                                .ok_or(LowerError::ResourceLimit {
+                                    resource: "image-wired actor capabilities",
+                                    limit: limits.model_edges,
+                                })?;
+                        let [capability] = statement.results.as_slice() else {
+                            return Err(unsupported("actor capability result arity"));
+                        };
+                        let target = input
+                            .actors
+                            .get(actor.0 as usize)
+                            .filter(|target| target.id == *actor)
+                            .ok_or(unsupported("actor capability target"))?;
+                        let capability_type = scalar_value_type(function, *capability)
+                            .and_then(|ty| input.types.get(ty.0 as usize));
+                        let source_actor = match function.role {
+                            semantic::FunctionRole::TaskEntry(task) => input
+                                .tasks
+                                .get(task.0 as usize)
+                                .filter(|record| record.id == task)
+                                .and_then(|record| record.supervisor),
+                            _ => None,
+                        };
+                        let proof_matches =
+                            input
+                                .proofs
+                                .get(wiring_proof.0 as usize)
+                                .is_some_and(|proof| {
+                                    proof.id == *wiring_proof
+                                        && proof.kind == semantic::ProofKind::ActorAsIf
+                                        && proof.bound == Some(1)
+                                        && proof.sources.len() == 1
+                                        && proof.depends_on.is_empty()
+                                });
+                        let reserve_matches = matches!(
+                            region.statements.get(index + 1),
+                            Some(semantic::SemanticStatement::Let(
+                                semantic::LetStatement {
+                                    operation: semantic::SemanticOperation::ActorReserve {
+                                        actor: reserve_actor,
+                                        ..
+                                    },
+                                    ..
+                                }
+                            )) if reserve_actor == actor
+                        );
+                        if input.actors.len() != 2
+                            || source_actor != Some(semantic::ActorId(1))
+                            || *actor != semantic::ActorId(0)
+                            || !capability_type.is_some_and(|ty| {
+                                ty.kind
+                                    == semantic::TypeKind::ActorHandle {
+                                        actor_type: target.ty,
+                                    }
+                                    && ty.linearity == semantic::Linearity::ExplicitCopy
+                                    && ty.source.is_none()
+                            })
+                            || !proof_matches
+                            || !reserve_matches
+                            || !is_root
+                        {
+                            return Err(unsupported("noncanonical image-wired actor capability"));
+                        }
+                    }
                     semantic::SemanticOperation::ActorReserve {
                         actor,
                         method,
@@ -1091,8 +1201,23 @@ fn validate_actor_source_function(
                                 && arguments.is_empty()
                                 && *source == statement.source
                         );
+                        let cross_actor = input.actors.len() == 2
+                            && caller_actor == Some(semantic::ActorId(1))
+                            && *actor == semantic::ActorId(0)
+                            && matches!(
+                                index.checked_sub(1).and_then(|prior| region.statements.get(prior)),
+                                Some(semantic::SemanticStatement::Let(
+                                    semantic::LetStatement {
+                                        operation: semantic::SemanticOperation::ActorCapability {
+                                            actor: capability_actor,
+                                            ..
+                                        },
+                                        ..
+                                    }
+                                )) if capability_actor == actor
+                            );
                         if reservation_type.source.is_some()
-                            || caller_actor != Some(*actor)
+                            || (caller_actor != Some(*actor) && !cross_actor)
                             || !target_matches
                             || !permit_matches
                             || !function.proofs.contains(permit_proof)
@@ -1255,7 +1380,15 @@ fn validate_actor_source_function(
                 )
             })
         });
-    if actor_reserves != u32::from(expects_send) || mailbox_receives != u32::from(expects_receive) {
+    let expects_capability = expects_send
+        && input.actors.len() == 2
+        && matches!(function.role, semantic::FunctionRole::TaskEntry(task)
+            if input.tasks.get(task.0 as usize).and_then(|task| task.supervisor)
+                == Some(semantic::ActorId(1)));
+    if actor_capabilities != u32::from(expects_capability)
+        || actor_reserves != u32::from(expects_send)
+        || mailbox_receives != u32::from(expects_receive)
+    {
         return Err(unsupported("one-way actor operation census"));
     }
     Ok(())
@@ -1923,6 +2056,8 @@ enum ScalarRegionContract<'a> {
     },
     Fallthrough,
     Yield(&'a [semantic::ValueId]),
+    LoopBody(usize),
+    LoopBranch(usize),
 }
 
 fn validate_scalar_source_function(
@@ -1976,9 +2111,10 @@ fn validate_scalar_source_function(
             ScalarRegionContract::Root => region.parameters == function.parameters,
             ScalarRegionContract::MatchArm(bindings) => region.parameters == bindings,
             ScalarRegionContract::ResultMatchArm { bindings, .. } => region.parameters == bindings,
-            ScalarRegionContract::Fallthrough | ScalarRegionContract::Yield(_) => {
-                region.parameters.is_empty()
-            }
+            ScalarRegionContract::Fallthrough
+            | ScalarRegionContract::Yield(_)
+            | ScalarRegionContract::LoopBranch(_) => region.parameters.is_empty(),
+            ScalarRegionContract::LoopBody(arity) => region.parameters.len() == arity,
         };
         if depth > limits.region_depth || !parameters_match {
             return Err(unsupported("scalar source region parameters or depth"));
@@ -2218,7 +2354,13 @@ fn validate_scalar_source_function(
                         limit: u64::from(limits.region_depth),
                     })?;
                     let branch_contract = if results.is_empty() {
-                        ScalarRegionContract::Fallthrough
+                        match contract {
+                            ScalarRegionContract::LoopBody(arity)
+                            | ScalarRegionContract::LoopBranch(arity) => {
+                                ScalarRegionContract::LoopBranch(arity)
+                            }
+                            _ => ScalarRegionContract::Fallthrough,
+                        }
                     } else {
                         ScalarRegionContract::Yield(results)
                     };
@@ -2302,6 +2444,49 @@ fn validate_scalar_source_function(
                     }
                     terminated = terminal;
                 }
+                semantic::SemanticStatement::Loop {
+                    body,
+                    carried,
+                    uninterrupted_bound,
+                    ..
+                } => {
+                    let Some(bound) = uninterrupted_bound.filter(|bound| *bound > 0) else {
+                        return Err(unsupported("synchronous loop uninterrupted-work proof"));
+                    };
+                    let arity = body.parameters.len();
+                    if carried.len() != arity.saturating_mul(3)
+                        || bound > function.uninterrupted_bound.unwrap_or(0)
+                    {
+                        return Err(unsupported("scalar loop carried-value contract"));
+                    }
+                    for index in 0..arity {
+                        let ty = scalar_value_type(function, carried[index]);
+                        if ty != scalar_value_type(function, carried[arity + index])
+                            || ty != scalar_value_type(function, carried[2 * arity + index])
+                        {
+                            return Err(unsupported("scalar loop carried-value type"));
+                        }
+                    }
+                    let next = depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                        resource: "source region depth",
+                        limit: u64::from(limits.region_depth),
+                    })?;
+                    push_bounded(
+                        &mut regions,
+                        (body, ScalarRegionContract::LoopBody(arity), next),
+                        "source region validation",
+                        limits.model_edges,
+                    )?;
+                }
+                semantic::SemanticStatement::Break(values)
+                | semantic::SemanticStatement::Continue(values)
+                    if matches!(contract, ScalarRegionContract::LoopBody(arity) | ScalarRegionContract::LoopBranch(arity) if values.len() == arity) =>
+                {
+                    if index + 1 != region.statements.len() {
+                        return Err(unsupported("scalar loop control position"));
+                    }
+                    terminated = true;
+                }
                 semantic::SemanticStatement::Return(values)
                     if matches!(
                         contract,
@@ -2357,7 +2542,6 @@ fn validate_scalar_source_function(
                 }
                 semantic::SemanticStatement::Return(_)
                 | semantic::SemanticStatement::Unreachable
-                | semantic::SemanticStatement::Loop { .. }
                 | semantic::SemanticStatement::Yield(_)
                 | semantic::SemanticStatement::Break(_)
                 | semantic::SemanticStatement::Continue(_) => {
@@ -2382,7 +2566,9 @@ fn validate_scalar_source_function(
             | ScalarRegionContract::MatchArm(_)
             | ScalarRegionContract::ResultMatchArm { .. }
             | ScalarRegionContract::Fallthrough
-            | ScalarRegionContract::Yield(_) => {}
+            | ScalarRegionContract::Yield(_)
+            | ScalarRegionContract::LoopBody(_)
+            | ScalarRegionContract::LoopBranch(_) => {}
         }
     }
     Ok(())
@@ -2934,6 +3120,7 @@ fn preflight_input(
                             | semantic::SemanticOperation::Move { .. }
                             | semantic::SemanticOperation::Copy { .. }
                             | semantic::SemanticOperation::Drop { .. }
+                            | semantic::SemanticOperation::ActorCapability { .. }
                             | semantic::SemanticOperation::ActorReserve { .. }
                             | semantic::SemanticOperation::MailboxReceive { .. }
                             | semantic::SemanticOperation::ActorSend { .. }
@@ -3052,6 +3239,13 @@ fn preflight_input(
                         }
                     }
                     semantic::SemanticStatement::Loop { body, carried, .. } => {
+                        blocks = blocks
+                            .checked_add(2)
+                            .filter(|blocks| *blocks <= limits.blocks)
+                            .ok_or(LowerError::ResourceLimit {
+                                resource: "FlowWir blocks",
+                                limit: limits.blocks,
+                            })?;
                         add_bounded(
                             &mut edges,
                             carried.len(),
@@ -3395,6 +3589,7 @@ fn lower_generated_type(
 
 fn lower_actor_type(
     ty: &semantic::TypeRecord,
+    actors: &[semantic::ActorInstance],
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<flow::FlowType, LowerError> {
@@ -3440,6 +3635,14 @@ fn lower_actor_type(
                 parameters,
                 result: flow::TypeId(function.result.0),
             }
+        }
+        semantic::TypeKind::ActorHandle { actor_type } => {
+            let mut targets = actors.iter().filter(|actor| actor.ty == *actor_type);
+            let target = targets
+                .next()
+                .filter(|_| targets.next().is_none())
+                .ok_or_else(|| unsupported("ambiguous image-wired actor capability target"))?;
+            flow::FlowTypeKind::ActorHandle(flow::ActorId(target.id.0))
         }
         semantic::TypeKind::Reservation => flow::FlowTypeKind::Reservation,
         _ => return Err(unsupported("actor type changed after shape validation")),
@@ -3760,6 +3963,7 @@ fn measure_actor_flow_output_resources(
             semantic::TypeKind::Struct { fields } => meter.edges(fields),
             semantic::TypeKind::Primitive(_)
             | semantic::TypeKind::Array { .. }
+            | semantic::TypeKind::ActorHandle { .. }
             | semantic::TypeKind::Reservation => {}
             _ => return Err(unsupported("actor type changed after shape validation")),
         }
@@ -3850,6 +4054,7 @@ fn measure_actor_flow_output_resources(
                             | semantic::SemanticOperation::Binary { .. }
                             | semantic::SemanticOperation::Unary { .. }
                             | semantic::SemanticOperation::Convert { .. }
+                            | semantic::SemanticOperation::ActorCapability { .. }
                             | semantic::SemanticOperation::ActorReserve { .. }
                             | semantic::SemanticOperation::MailboxReceive { .. } => {}
                             _ => {
@@ -3957,7 +4162,7 @@ fn lower_actor_image(
     validate_actor_flow_output_resources(input, limits, is_cancelled)?;
     let mut types = try_vec(input.types.len(), "FlowWir actor types", limits.model_edges)?;
     for ty in &input.types {
-        types.push(lower_actor_type(ty, limits, is_cancelled)?);
+        types.push(lower_actor_type(ty, &input.actors, limits, is_cancelled)?);
     }
     let activation_types = append_activation_types(input, &mut types, limits, is_cancelled)?;
     let proofs = lower_proofs(input, limits, is_cancelled)?;
@@ -4305,6 +4510,15 @@ enum RegionExit {
     Root,
     Jump(flow::BlockId),
     Yield(flow::BlockId),
+    Loop {
+        header: flow::BlockId,
+        exit: flow::BlockId,
+    },
+    LoopBranch {
+        merge: flow::BlockId,
+        header: flow::BlockId,
+        exit: flow::BlockId,
+    },
 }
 
 struct RegionWork<'a> {
@@ -4474,7 +4688,24 @@ fn lower_generated_function(
                 } => {
                     let then_block = allocate_pending_block(&mut pending_blocks, *source, limits)?;
                     let else_block = allocate_pending_block(&mut pending_blocks, *source, limits)?;
-                    let merge_block = allocate_pending_block(&mut pending_blocks, *source, limits)?;
+                    let region_terminates = |region: &semantic::SemanticRegion| {
+                        matches!(
+                            region.statements.last(),
+                            Some(
+                                semantic::SemanticStatement::Return(_)
+                                    | semantic::SemanticStatement::Break(_)
+                                    | semantic::SemanticStatement::Continue(_)
+                                    | semantic::SemanticStatement::Unreachable
+                            )
+                        )
+                    };
+                    let terminal_branches =
+                        region_terminates(then_region) && region_terminates(else_region);
+                    let merge_block = if terminal_branches {
+                        then_block
+                    } else {
+                        allocate_pending_block(&mut pending_blocks, *source, limits)?
+                    };
                     let mut merge_parameters = try_vec(
                         results.len(),
                         "FlowWir block parameters",
@@ -4496,29 +4727,42 @@ fn lower_generated_function(
                             resource: "source region depth",
                             limit: u64::from(limits.region_depth),
                         })?;
-                    push_bounded(
-                        &mut work,
-                        RegionWork {
-                            region: item.region,
-                            next_statement: item.next_statement + 1,
-                            block: merge_block,
-                            exit: item.exit,
-                            depth: item.depth,
-                        },
-                        "scalar region work",
-                        limits.model_edges,
-                    )?;
+                    if !terminal_branches {
+                        push_bounded(
+                            &mut work,
+                            RegionWork {
+                                region: item.region,
+                                next_statement: item.next_statement + 1,
+                                block: merge_block,
+                                exit: item.exit,
+                                depth: item.depth,
+                            },
+                            "scalar region work",
+                            limits.model_edges,
+                        )?;
+                    }
+                    let branch_exit = if results.is_empty() {
+                        match item.exit {
+                            RegionExit::Loop { header, exit }
+                            | RegionExit::LoopBranch { header, exit, .. } => {
+                                RegionExit::LoopBranch {
+                                    merge: merge_block,
+                                    header,
+                                    exit,
+                                }
+                            }
+                            _ => RegionExit::Jump(merge_block),
+                        }
+                    } else {
+                        RegionExit::Yield(merge_block)
+                    };
                     push_bounded(
                         &mut work,
                         RegionWork {
                             region: else_region,
                             next_statement: 0,
                             block: else_block,
-                            exit: if results.is_empty() {
-                                RegionExit::Jump(merge_block)
-                            } else {
-                                RegionExit::Yield(merge_block)
-                            },
+                            exit: branch_exit,
                             depth: next_depth,
                         },
                         "scalar region work",
@@ -4530,11 +4774,7 @@ fn lower_generated_function(
                             region: then_region,
                             next_statement: 0,
                             block: then_block,
-                            exit: if results.is_empty() {
-                                RegionExit::Jump(merge_block)
-                            } else {
-                                RegionExit::Yield(merge_block)
-                            },
+                            exit: branch_exit,
                             depth: next_depth,
                         },
                         "scalar region work",
@@ -4717,6 +4957,90 @@ fn lower_generated_function(
                     deferred = true;
                     break;
                 }
+                semantic::SemanticStatement::Loop {
+                    body,
+                    carried,
+                    uninterrupted_bound,
+                    source,
+                } => {
+                    if uninterrupted_bound.is_none_or(|bound| bound == 0) {
+                        return Err(unsupported("synchronous loop uninterrupted-work proof"));
+                    }
+                    let arity = body.parameters.len();
+                    if carried.len() != arity.saturating_mul(3) {
+                        return Err(unsupported("scalar loop carried-value contract"));
+                    }
+                    let header = allocate_pending_block(&mut pending_blocks, *source, limits)?;
+                    let exit = allocate_pending_block(&mut pending_blocks, *source, limits)?;
+                    pending_block_mut(&mut pending_blocks, header)?.parameters = body
+                        .parameters
+                        .iter()
+                        .map(|value| flow::ValueId(value.0))
+                        .collect();
+                    pending_block_mut(&mut pending_blocks, exit)?.parameters = carried[2 * arity..]
+                        .iter()
+                        .map(|value| flow::ValueId(value.0))
+                        .collect();
+                    pending_block_mut(&mut pending_blocks, item.block)?.terminator =
+                        Some(flow::Terminator::Jump {
+                            target: header,
+                            arguments: carried[..arity]
+                                .iter()
+                                .map(|value| flow::ValueId(value.0))
+                                .collect(),
+                        });
+                    let next_depth =
+                        item.depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                            resource: "source region depth",
+                            limit: u64::from(limits.region_depth),
+                        })?;
+                    push_bounded(
+                        &mut work,
+                        RegionWork {
+                            region: item.region,
+                            next_statement: item.next_statement + 1,
+                            block: exit,
+                            exit: item.exit,
+                            depth: item.depth,
+                        },
+                        "scalar region work",
+                        limits.model_edges,
+                    )?;
+                    push_bounded(
+                        &mut work,
+                        RegionWork {
+                            region: body,
+                            next_statement: 0,
+                            block: header,
+                            exit: RegionExit::Loop { header, exit },
+                            depth: next_depth,
+                        },
+                        "scalar region work",
+                        limits.model_edges,
+                    )?;
+                    deferred = true;
+                    break;
+                }
+                semantic::SemanticStatement::Break(values)
+                | semantic::SemanticStatement::Continue(values) => {
+                    let (header, exit) = match item.exit {
+                        RegionExit::Loop { header, exit }
+                        | RegionExit::LoopBranch { header, exit, .. } => (header, exit),
+                        _ => return Err(unsupported("scalar loop control destination")),
+                    };
+                    let target = if matches!(statement, semantic::SemanticStatement::Break(_)) {
+                        exit
+                    } else {
+                        header
+                    };
+                    pending_block_mut(&mut pending_blocks, item.block)?.terminator =
+                        Some(flow::Terminator::Jump {
+                            target,
+                            arguments: values.iter().map(|value| flow::ValueId(value.0)).collect(),
+                        });
+                    item.next_statement += 1;
+                    break;
+                }
                 semantic::SemanticStatement::Yield(values) => {
                     let RegionExit::Yield(target) = item.exit else {
                         return Err(unsupported("scalar branch yield destination"));
@@ -4747,13 +5071,6 @@ fn lower_generated_function(
                     item.next_statement += 1;
                     break;
                 }
-                semantic::SemanticStatement::Loop { .. }
-                | semantic::SemanticStatement::Break(_)
-                | semantic::SemanticStatement::Continue(_) => {
-                    return Err(unsupported(
-                        "generated test body changed after shape validation",
-                    ));
-                }
             }
         }
         if deferred {
@@ -4774,6 +5091,19 @@ fn lower_generated_function(
                 RegionExit::Yield(_) => {
                     return Err(unsupported("scalar branch yield terminator"));
                 }
+                RegionExit::Loop { header, .. } => Some(flow::Terminator::Jump {
+                    target: header,
+                    arguments: item
+                        .region
+                        .parameters
+                        .iter()
+                        .map(|value| flow::ValueId(value.0))
+                        .collect(),
+                }),
+                RegionExit::LoopBranch { merge, .. } => Some(flow::Terminator::Jump {
+                    target: merge,
+                    arguments: Vec::new(),
+                }),
             };
         }
     }
@@ -5031,6 +5361,13 @@ fn lower_generated_operation(
                 })
             }
         }
+        semantic::SemanticOperation::ActorCapability {
+            actor,
+            wiring_proof,
+        } => Ok(flow::FlowOperation::ActorCapability {
+            actor: flow::ActorId(actor.0),
+            proof: flow::ProofId(wiring_proof.0),
+        }),
         semantic::SemanticOperation::ActorReserve {
             actor,
             method,
@@ -5551,6 +5888,7 @@ fn validate_model_resources(
                     | FlowOperation::Drop { .. }
                     | FlowOperation::Allocate { .. }
                     | FlowOperation::RegionReset { .. }
+                    | FlowOperation::ActorCapability { .. }
                     | FlowOperation::ActorReserve { .. }
                     | FlowOperation::ActorCommit { .. }
                     | FlowOperation::ActorReject { .. }
@@ -6118,6 +6456,9 @@ fn actor_flow_type_kind_matches(
             flow::FlowTypeKind::Activation { result: expected },
             flow::FlowTypeKind::Activation { result: output },
         ) => expected == output,
+        (flow::FlowTypeKind::ActorHandle(expected), flow::FlowTypeKind::ActorHandle(output)) => {
+            expected == output
+        }
         (flow::FlowTypeKind::Reservation, flow::FlowTypeKind::Reservation) => true,
         _ => false,
     })
@@ -6207,6 +6548,16 @@ fn actor_flow_operation_matches(
                 && expected_plan == output_plan
                 && polled_slices_equal(expected_arguments, output_arguments, is_cancelled)?
         }
+        (
+            flow::FlowOperation::ActorCapability {
+                actor: expected_actor,
+                proof: expected_proof,
+            },
+            flow::FlowOperation::ActorCapability {
+                actor: output_actor,
+                proof: output_proof,
+            },
+        ) => expected_actor == output_actor && expected_proof == output_proof,
         (
             flow::FlowOperation::ActorReserve {
                 actor: expected_actor,
@@ -11549,6 +11900,96 @@ mod contract_tests {
             Err(LowerError::Cancelled)
         ));
         assert_eq!(polls.get(), cancel_at);
+    }
+
+    #[test]
+    fn scalar_loop_requires_a_bound_covered_by_the_function_proof() {
+        let mut module = scalar_generated_fixture().into_wir();
+        let function = &mut module.functions[0];
+        function.values.truncate(3);
+        function.values.extend([
+            scalar_source_value(3, 2, "loop_header", span(0, 350, 351)),
+            scalar_source_value(4, 2, "loop_exit", span(0, 350, 351)),
+        ]);
+        function.body.statements.truncate(3);
+        function.body.statements.extend([
+            semantic::SemanticStatement::Loop {
+                body: semantic::SemanticRegion {
+                    parameters: vec![semantic::ValueId(3)],
+                    statements: vec![semantic::SemanticStatement::Break(vec![semantic::ValueId(
+                        3,
+                    )])],
+                },
+                carried: vec![
+                    semantic::ValueId(1),
+                    semantic::ValueId(3),
+                    semantic::ValueId(4),
+                ],
+                uninterrupted_bound: Some(5),
+                source: Some(span(0, 350, 351)),
+            },
+            semantic::SemanticStatement::Return(Vec::new()),
+        ]);
+        let valid = module
+            .clone()
+            .validate()
+            .expect("canonical scalar loop fixture");
+        CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: valid,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("bounded scalar loop lowers");
+
+        let semantic::SemanticStatement::Loop {
+            uninterrupted_bound,
+            ..
+        } = &mut module.functions[0].body.statements[3]
+        else {
+            unreachable!();
+        };
+        *uninterrupted_bound = None;
+        let mut insufficient_proof = module.clone();
+        let semantic::SemanticStatement::Loop {
+            uninterrupted_bound,
+            ..
+        } = &mut insufficient_proof.functions[0].body.statements[3]
+        else {
+            unreachable!();
+        };
+        *uninterrupted_bound = Some(5);
+        insufficient_proof.functions[0].uninterrupted_bound = Some(4);
+        let insufficient_proof = insufficient_proof
+            .validate()
+            .expect("proof mutation preserves structural SemanticWir validity");
+        assert!(
+            CanonicalFlowLowerer::new()
+                .lower(
+                    LowerRequest {
+                        input: insufficient_proof,
+                        limits: LoweringLimits::standard(),
+                    },
+                    &|| false,
+                )
+                .is_err()
+        );
+
+        let missing = module.validate().expect("bound is a proof-layer contract");
+        assert!(matches!(
+            CanonicalFlowLowerer::new().lower(
+                LowerRequest {
+                    input: missing,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
+            Err(LowerError::UnsupportedInput {
+                feature: "synchronous loop uninterrupted-work proof"
+            })
+        ));
     }
 
     #[test]

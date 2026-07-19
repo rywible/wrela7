@@ -1,6 +1,8 @@
 # Corrected end-to-end design example for revision 0.1.
 #
 # This is aspirational source for the standard APIs named by the specification.
+# Executable coverage and the next required vertical slices are tracked in
+# virtio-storage-status.md; this file is not currently a successful boot claim.
 # It demonstrates the required ownership and scheduling shape; transport helper
 # implementations are intentionally in the standard library rather than
 # reimplementing memory ordering with freestanding fences here.

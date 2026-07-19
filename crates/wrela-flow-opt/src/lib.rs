@@ -1708,6 +1708,7 @@ fn scan_operation(
         | FlowOperation::Drop { .. }
         | FlowOperation::Allocate { .. }
         | FlowOperation::RegionReset { .. }
+        | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
         | FlowOperation::ActorCommit { .. }
         | FlowOperation::ActorReject { .. }

@@ -367,6 +367,13 @@ pub enum SemanticOperation {
         /// source location.
         activation: Option<ActivationId>,
     },
+    /// Materialize one immutable image-wired actor capability. The proof binds
+    /// the capability to the exact installed target; source code cannot store
+    /// or return this compiler-created value.
+    ActorCapability {
+        actor: ActorId,
+        wiring_proof: ProofId,
+    },
     ActorReserve {
         actor: ActorId,
         method: FunctionId,
@@ -1216,6 +1223,7 @@ fn validate_model_resources(
                             | SemanticOperation::Move { .. }
                             | SemanticOperation::Copy { .. }
                             | SemanticOperation::Drop { .. }
+                            | SemanticOperation::ActorCapability { .. }
                             | SemanticOperation::ActorReserve { .. }
                             | SemanticOperation::MailboxReceive { .. }
                             | SemanticOperation::ActorSend { .. }
@@ -2643,22 +2651,33 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
     let base_region_count = module
         .actors
         .len()
-        .checked_mul(2)
+        .checked_add(
+            module
+                .actors
+                .iter()
+                .filter(|actor| !actor.turn_functions.is_empty())
+                .count(),
+        )
         .and_then(|count| count.checked_add(module.tasks.len()));
     let expected_regions =
         base_region_count.and_then(|count| count.checked_add(module.activations.len()));
     let mut base_bytes = Some(0_u64);
     let mut valid = expected_regions == Some(module.regions.len());
-    for (index, actor) in module.actors.iter().enumerate() {
+    let mut region_cursor = 0usize;
+    for actor in &module.actors {
         if errors.poll() {
             return;
         }
-        let mailbox_index = index.checked_mul(2);
-        let turn_index = mailbox_index.and_then(|index| index.checked_add(1));
+        let mailbox_index = Some(region_cursor);
+        region_cursor = region_cursor.saturating_add(1);
+        let turn_index = (!actor.turn_functions.is_empty()).then_some(region_cursor);
+        if turn_index.is_some() {
+            region_cursor = region_cursor.saturating_add(1);
+        }
         let mailbox = mailbox_index.and_then(|index| module.regions.get(index));
         let turn = turn_index.and_then(|index| module.regions.get(index));
         let mailbox_bytes = u64::from(actor.mailbox_capacity).checked_mul(16);
-        let mut turn_bytes = 1_u64;
+        let mut turn_bytes = u64::from(!actor.turn_functions.is_empty());
         for function in &actor.turn_functions {
             if errors.poll() {
                 return;
@@ -2702,31 +2721,32 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
                                 && proof.sources[0].range.end <= region.source.range.end
                         })
             })
-            && turn.is_some_and(|region| {
-                turn_index
-                    .and_then(|index| u32::try_from(index).ok())
-                    .is_some_and(|index| region.id == RegionId(index))
-                    && turn_name_matches
-                    && region.class == RegionClass::TaskFrame
-                    && region.capacity_bytes == turn_bytes
-                    && region.alignment == 8
-                    && region.owner == ImageOwner::Actor(actor.id)
-                    && module
-                        .proofs
-                        .get(region.proof.0 as usize)
-                        .is_some_and(|proof| {
-                            proof.id == region.proof
-                                && proof.kind == ProofKind::CapacityBound
-                                && proof.bound == Some(1)
-                                && proof.sources.as_slice() == [region.source]
-                        })
-            });
+            && (actor.turn_functions.is_empty()
+                || turn.is_some_and(|region| {
+                    turn_index
+                        .and_then(|index| u32::try_from(index).ok())
+                        .is_some_and(|index| region.id == RegionId(index))
+                        && turn_name_matches
+                        && region.class == RegionClass::TaskFrame
+                        && region.capacity_bytes == turn_bytes
+                        && region.alignment == 8
+                        && region.owner == ImageOwner::Actor(actor.id)
+                        && module
+                            .proofs
+                            .get(region.proof.0 as usize)
+                            .is_some_and(|proof| {
+                                proof.id == region.proof
+                                    && proof.kind == ProofKind::CapacityBound
+                                    && proof.bound == Some(1)
+                                    && proof.sources.as_slice() == [region.source]
+                            })
+                }));
         base_bytes = base_bytes
             .and_then(|bytes| mailbox_bytes.and_then(|mailbox| bytes.checked_add(mailbox)))
             .and_then(|bytes| bytes.checked_add(turn_bytes));
         valid &= base_bytes.is_some();
     }
-    let task_start = module.actors.len().checked_mul(2);
+    let task_start = Some(region_cursor);
     for (index, task) in module.tasks.iter().enumerate() {
         if errors.poll() {
             return;
@@ -3157,8 +3177,30 @@ fn validate_region(
                     }
                 }
                 SemanticStatement::Loop { body, carried, .. } => {
-                    for value in carried {
-                        use_value(function, *value, errors);
+                    let arity = body.parameters.len();
+                    let valid_carried = carried.len() == arity.saturating_mul(3)
+                        && body.parameters == carried[arity..2 * arity]
+                        && (0..arity).all(|index| {
+                            let ty = |value: ValueId| {
+                                function.values.get(value.0 as usize).map(|value| value.ty)
+                            };
+                            let initial = ty(carried[index]);
+                            initial.is_some()
+                                && initial == ty(carried[arity + index])
+                                && initial == ty(carried[2 * arity + index])
+                        });
+                    if !valid_carried {
+                        errors.push(ValidationError::InvalidRecord {
+                            kind: "loop carried bracket",
+                            id: function.id.0,
+                        });
+                    } else {
+                        for value in &carried[..arity] {
+                            use_value(function, *value, errors);
+                        }
+                        for value in &carried[2 * arity..] {
+                            define_value(function.id, *value, definitions, errors);
+                        }
                     }
                     if regions.try_reserve(1).is_err() {
                         errors.scratch_allocation_failed();
@@ -3295,6 +3337,45 @@ fn validate_operation(
             }
             for item in arguments {
                 argument!(item);
+            }
+        }
+        SemanticOperation::ActorCapability {
+            actor,
+            wiring_proof,
+        } => {
+            require_id(
+                "actor capability target",
+                actor.0,
+                module.actors.len(),
+                errors,
+            );
+            require_id(
+                "actor capability wiring proof",
+                wiring_proof.0,
+                module.proofs.len(),
+                errors,
+            );
+            let valid = matches!(results, [result]
+            if module.actors.get(actor.0 as usize).is_some_and(|target| {
+                function.values.get(result.0 as usize).is_some_and(|value| {
+                    module.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                        ty.linearity == Linearity::ExplicitCopy
+                            && matches!(ty.kind, TypeKind::ActorHandle { actor_type }
+                                if actor_type == target.ty)
+                    })
+                })
+            })
+            && module.proofs.get(wiring_proof.0 as usize).is_some_and(|proof| {
+                proof.kind == ProofKind::ActorAsIf
+                    && proof.bound == Some(1)
+                    && proof.sources.len() == 1
+                    && proof.depends_on.is_empty()
+            }));
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "actor capability",
+                    id: actor.0,
+                });
             }
         }
         SemanticOperation::ActorReserve {
@@ -4463,6 +4544,47 @@ mod tests {
         };
         *variant = 2;
         assert!(wrong_variant.validate().is_err());
+    }
+
+    #[test]
+    fn loop_carried_values_have_distinct_entry_header_and_exit_definitions() {
+        let mut wir = fixture();
+        let function = &mut wir.functions[0];
+        function.parameters = vec![ValueId(0)];
+        function.values = (0..3)
+            .map(|id| SemanticValue {
+                id: ValueId(id),
+                ty: TypeId(0),
+                origin: None,
+                name: None,
+            })
+            .collect();
+        function.body.parameters = vec![ValueId(0)];
+        function.body.statements = vec![
+            SemanticStatement::Loop {
+                body: SemanticRegion {
+                    parameters: vec![ValueId(1)],
+                    statements: vec![SemanticStatement::Continue(vec![ValueId(1)])],
+                },
+                carried: vec![ValueId(0), ValueId(1), ValueId(2)],
+                uninterrupted_bound: Some(1),
+                source: None,
+            },
+            SemanticStatement::Return(vec![ValueId(2)]),
+        ];
+        wir.clone()
+            .validate()
+            .expect("canonical cyclic SSA loop bracket");
+
+        let SemanticStatement::Loop { carried, .. } = &mut wir.functions[0].body.statements[0]
+        else {
+            unreachable!();
+        };
+        carried[1] = ValueId(0);
+        assert!(
+            wir.validate().is_err(),
+            "header must be the loop body's unique parameter definition"
+        );
     }
 
     #[test]

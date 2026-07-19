@@ -129,7 +129,7 @@ fn frozen_minimal_image_lockfile_matches_the_derived_current_identity_exactly() 
     assert_eq!(derived, APPLICATION_LOCKFILE);
     assert_eq!(
         digest(&derived).to_hex(),
-        "a7d65ccf83709ab43535506f14689dc77f2b9c6abce7fe816f6a8839b52aedcf"
+        "2003f707b3eb8689b2371750998bc7d37b9959bc02be760a72159f285ff314c2"
     );
 }
 

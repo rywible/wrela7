@@ -524,6 +524,19 @@ fn validate_actor_source_type(
             }
             return Ok(());
         }
+        sema::SemanticTypeKind::Actor { class } => {
+            if (class.0 as usize) >= facts.types.len()
+                || ty.linearity != sema::Linearity::ExplicitCopy
+                || ty.size_upper_bound != Some(8)
+                || ty.alignment_lower_bound != 8
+                || ty.source.is_some()
+            {
+                return Err(unsupported(
+                    "noncanonical image-wired actor capability type",
+                ));
+            }
+            return Ok(());
+        }
         sema::SemanticTypeKind::Reservation => {
             if ty.linearity != sema::Linearity::StrictLinear
                 || ty.size_upper_bound != Some(8)
@@ -554,7 +567,13 @@ fn validate_actor_graph_contract(
     let expected_regions = graph
         .actors
         .len()
-        .checked_mul(2)
+        .checked_add(
+            graph
+                .actors
+                .iter()
+                .filter(|actor| !actor.turn_functions.is_empty())
+                .count(),
+        )
         .and_then(|count| count.checked_add(graph.tasks.len()))
         .ok_or(LowerError::ResourceLimit {
             resource: "actor graph regions",
@@ -580,6 +599,7 @@ fn validate_actor_graph_contract(
         return Err(unsupported("noncanonical actor startup or shutdown order"));
     }
     let mut static_bytes = 0u64;
+    let mut region_cursor = 0usize;
     for (index, actor) in graph.actors.iter().enumerate() {
         check_cancelled(is_cancelled)?;
         if actor.id.0 as usize != index
@@ -623,12 +643,15 @@ fn validate_actor_graph_contract(
         }
         let mailbox = graph
             .regions
-            .get(index * 2)
+            .get(region_cursor)
             .ok_or_else(|| unsupported("missing actor mailbox region"))?;
-        let turn = graph
-            .regions
-            .get(index * 2 + 1)
-            .ok_or_else(|| unsupported("missing actor turn-frame region"))?;
+        let mailbox_id = region_cursor;
+        region_cursor = region_cursor
+            .checked_add(1)
+            .ok_or(LowerError::ResourceLimit {
+                resource: "actor region identity",
+                limit: limits.model_edges,
+            })?;
         let mailbox_bytes =
             u64::from(actor.mailbox_capacity)
                 .checked_mul(16)
@@ -636,20 +659,9 @@ fn validate_actor_graph_contract(
                     resource: "actor mailbox bytes",
                     limit: limits.payload_bytes,
                 })?;
-        let mut turn_bytes = 1_u64;
-        for function in &actor.turn_functions {
-            check_cancelled(is_cancelled)?;
-            let function = facts
-                .functions
-                .get(function.0 as usize)
-                .ok_or_else(|| unsupported("actor turn frame identity"))?;
-            turn_bytes = turn_bytes.max(function.frame_bytes_bound.max(1));
-        }
         let mailbox_name_matches =
             joined_name_matches(&mailbox.name, &actor.name, ".mailbox", is_cancelled)?;
-        let turn_name_matches =
-            joined_name_matches(&turn.name, &actor.name, ".turn-frame", is_cancelled)?;
-        if mailbox.id.0 as usize != index * 2
+        if mailbox.id.0 as usize != mailbox_id
             || mailbox.class != sema::RegionClass::Image
             || mailbox.owner != sema::ImageOwner::Actor(actor.id)
             || mailbox.capacity_bytes != mailbox_bytes
@@ -657,33 +669,60 @@ fn validate_actor_graph_contract(
             || mailbox.source != actor.source
             || !mailbox_name_matches
             || !capacity_proof_matches(facts, mailbox.proof, u64::from(actor.mailbox_capacity))
-            || turn.id.0 as usize != index * 2 + 1
-            || turn.class != sema::RegionClass::TaskFrame
-            || turn.owner != sema::ImageOwner::Actor(actor.id)
-            || turn.capacity_bytes != turn_bytes
-            || turn.alignment != 8
-            || turn.source != actor.source
-            || !turn_name_matches
-            || !capacity_proof_matches(facts, turn.proof, 1)
         {
             return Err(unsupported("actor capacity proof or region substitution"));
         }
-        static_bytes = static_bytes
-            .checked_add(mailbox_bytes)
-            .and_then(|bytes| bytes.checked_add(turn_bytes))
-            .ok_or(LowerError::ResourceLimit {
-                resource: "actor static bytes",
-                limit: limits.payload_bytes,
-            })?;
+        static_bytes =
+            static_bytes
+                .checked_add(mailbox_bytes)
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "actor static bytes",
+                    limit: limits.payload_bytes,
+                })?;
+        if !actor.turn_functions.is_empty() {
+            let turn = graph
+                .regions
+                .get(region_cursor)
+                .ok_or_else(|| unsupported("missing actor turn-frame region"))?;
+            let turn_id = region_cursor;
+            region_cursor = region_cursor
+                .checked_add(1)
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "actor region identity",
+                    limit: limits.model_edges,
+                })?;
+            let mut turn_bytes = 1_u64;
+            for function in &actor.turn_functions {
+                check_cancelled(is_cancelled)?;
+                let function = facts
+                    .functions
+                    .get(function.0 as usize)
+                    .ok_or_else(|| unsupported("actor turn frame identity"))?;
+                turn_bytes = turn_bytes.max(function.frame_bytes_bound.max(1));
+            }
+            let turn_name_matches =
+                joined_name_matches(&turn.name, &actor.name, ".turn-frame", is_cancelled)?;
+            if turn.id.0 as usize != turn_id
+                || turn.class != sema::RegionClass::TaskFrame
+                || turn.owner != sema::ImageOwner::Actor(actor.id)
+                || turn.capacity_bytes != turn_bytes
+                || turn.alignment != 8
+                || turn.source != actor.source
+                || !turn_name_matches
+                || !capacity_proof_matches(facts, turn.proof, 1)
+            {
+                return Err(unsupported("actor capacity proof or region substitution"));
+            }
+            static_bytes =
+                static_bytes
+                    .checked_add(turn_bytes)
+                    .ok_or(LowerError::ResourceLimit {
+                        resource: "actor static bytes",
+                        limit: limits.payload_bytes,
+                    })?;
+        }
     }
-    let task_region_start = graph
-        .actors
-        .len()
-        .checked_mul(2)
-        .ok_or(LowerError::ResourceLimit {
-            resource: "task region identity",
-            limit: limits.model_edges,
-        })?;
+    let task_region_start = region_cursor;
     for (index, task) in graph.tasks.iter().enumerate() {
         check_cancelled(is_cancelled)?;
         let entry = facts
@@ -1241,7 +1280,22 @@ fn validate_actor_wait_contract(
                 resource: "one-way actor admission counts",
                 limit: limits.model_edges,
             })?;
-            if owner != actor
+            let cross_actor = graph.actors.len() == 2
+                && owner == sema::ActorId(1)
+                && actor == sema::ActorId(0)
+                && facts
+                    .proofs
+                    .iter()
+                    .filter(|proof| proof.kind == sema::ProofKind::ActorAsIf)
+                    .count()
+                    == 1
+                && facts.proofs.iter().any(|proof| {
+                    proof.kind == sema::ProofKind::ActorAsIf
+                        && proof.bound == Some(1)
+                        && proof.sources.len() == 1
+                        && proof.depends_on.is_empty()
+                });
+            if (owner != actor && !cross_actor)
                 || *count != 1
                 || fact.effects.0 != sema::EffectSet::ACTOR
                 || fact.ownership_before != sema::OwnershipState::Owned
@@ -2402,6 +2456,23 @@ fn lower_actor_types(
                         parameters: lowered,
                         result: wir::TypeId(result.0),
                     }),
+                )
+            }
+            sema::SemanticTypeKind::Actor { class } => {
+                let _actor = facts
+                    .graph
+                    .as_ref()
+                    .and_then(|graph| {
+                        let mut actors = graph.actors.iter().filter(|actor| actor.class == *class);
+                        let actor = actors.next()?;
+                        actors.next().is_none().then_some(actor.id)
+                    })
+                    .ok_or_else(|| unsupported("ambiguous image-wired actor capability type"))?;
+                (
+                    copy_text("__wrela_actor_capability", limits.payload_bytes)?,
+                    wir::TypeKind::ActorHandle {
+                        actor_type: wir::TypeId(class.0),
+                    },
                 )
             }
             sema::SemanticTypeKind::Reservation => (
@@ -4258,6 +4329,12 @@ enum SourceStatementPlan {
         scrutinee: wrela_hir::ExpressionId,
         arms: Vec<wrela_hir::MatchArm>,
     },
+    While {
+        condition: wrela_hir::ExpressionId,
+        body: wrela_hir::BodyId,
+    },
+    Break,
+    Continue,
 }
 
 enum SourceExpressionPlan {
@@ -4514,6 +4591,14 @@ impl SourceFunctionLowerer<'_> {
                             arms: copied,
                         }
                     }
+                    wrela_hir::StatementKind::While { condition, body } => {
+                        SourceStatementPlan::While {
+                            condition: *condition,
+                            body: *body,
+                        }
+                    }
+                    wrela_hir::StatementKind::Break => SourceStatementPlan::Break,
+                    wrela_hir::StatementKind::Continue => SourceStatementPlan::Continue,
                     _ => {
                         return Err(unsupported(
                             "ordinary source operations outside scalar bodies",
@@ -4555,6 +4640,14 @@ impl SourceFunctionLowerer<'_> {
                         effects.0 |= self.body_statement_effects(arm.body)?.0;
                     }
                     effects
+                }
+                SourceStatementPlan::While { condition, body } => {
+                    let mut effects = self.expression_fact(*condition)?.effects;
+                    effects.0 |= self.body_statement_effects(*body)?.0;
+                    effects
+                }
+                SourceStatementPlan::Break | SourceStatementPlan::Continue => {
+                    sema::EffectSet::default()
                 }
             };
             let statement_definitions = {
@@ -5017,6 +5110,163 @@ impl SourceFunctionLowerer<'_> {
                         },
                     )?;
                 }
+                SourceStatementPlan::While { condition, body } => {
+                    let before = local_state.copy(self.limits)?;
+                    if statement_definitions.len() % 2 != 0 {
+                        return Err(self.fact_mismatch("loop carried local state"));
+                    }
+                    let arity = statement_definitions.len() / 2;
+                    let mut headers = try_vec(
+                        arity,
+                        "SemanticWir loop header values",
+                        self.limits.model_edges,
+                    )?;
+                    let mut exits = try_vec(
+                        arity,
+                        "SemanticWir loop exit values",
+                        self.limits.model_edges,
+                    )?;
+                    let mut carried = try_vec(
+                        arity.saturating_mul(3),
+                        "SemanticWir loop carried values",
+                        self.limits.model_edges,
+                    )?;
+                    for original in before.values.iter().copied().flatten() {
+                        carried.push(self.value_map.get(original)?);
+                    }
+                    let mut header_state = before.copy(self.limits)?;
+                    for definition in &statement_definitions[..arity] {
+                        headers.push(self.value_map.get(definition.value)?);
+                        header_state.set(definition.local, definition.value)?;
+                    }
+                    for definition in &statement_definitions[arity..] {
+                        exits.push(self.value_map.get(definition.value)?);
+                        local_state.set(definition.local, definition.value)?;
+                    }
+                    if carried.len() != arity {
+                        return Err(self.fact_mismatch("loop carried local state"));
+                    }
+                    carried.extend_from_slice(&headers);
+                    carried.extend_from_slice(&exits);
+                    let mut header_statements = Vec::new();
+                    let condition_fact = self.expression_fact(condition)?;
+                    if !matches!(
+                        self.input
+                            .facts()
+                            .types
+                            .get(condition_fact.ty.0 as usize)
+                            .map(|ty| &ty.kind),
+                        Some(sema::SemanticTypeKind::Bool)
+                    ) {
+                        return Err(self.fact_mismatch("while condition type"));
+                    }
+                    let LoweredExpression::Value(condition_value) = self.lower_expression(
+                        condition,
+                        sema::AccessMode::Value,
+                        &mut header_statements,
+                    )?
+                    else {
+                        return Err(self.fact_mismatch("while condition value"));
+                    };
+                    let mut body_state = header_state.copy(self.limits)?;
+                    let mut then_region = self.lower_body(body, depth + 2, &mut body_state)?;
+                    if !matches!(
+                        then_region.statements.last(),
+                        Some(
+                            wir::SemanticStatement::Break(_)
+                                | wir::SemanticStatement::Continue(_)
+                                | wir::SemanticStatement::Return(_)
+                        )
+                    ) {
+                        let values = body_state
+                            .values
+                            .iter()
+                            .copied()
+                            .flatten()
+                            .map(|value| self.value_map.get(value))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        self.push_statement(
+                            &mut then_region.statements,
+                            wir::SemanticStatement::Continue(values),
+                        )?;
+                    }
+                    let false_values = header_state
+                        .values
+                        .iter()
+                        .copied()
+                        .flatten()
+                        .map(|value| self.value_map.get(value))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let else_region = wir::SemanticRegion {
+                        parameters: Vec::new(),
+                        statements: vec![wir::SemanticStatement::Break(false_values)],
+                    };
+                    self.push_statement(
+                        &mut header_statements,
+                        wir::SemanticStatement::If {
+                            condition: condition_value,
+                            then_region,
+                            else_region,
+                            results: Vec::new(),
+                            source: Some(statement_source),
+                        },
+                    )?;
+                    let bound = self
+                        .input
+                        .hir()
+                        .as_program()
+                        .expression(condition)
+                        .and_then(|expression| match &expression.kind {
+                            wrela_hir::ExpressionKind::Compare {
+                                right,
+                                operator: wrela_hir::ComparisonOperator::Less,
+                                ..
+                            } => self.input.hir().as_program().expression(*right),
+                            _ => None,
+                        })
+                        .and_then(|expression| match &expression.kind {
+                            wrela_hir::ExpressionKind::Literal(wrela_hir::Literal::Integer(
+                                value,
+                            )) => value.replace('_', "").parse::<u64>().ok(),
+                            _ => None,
+                        })
+                        .ok_or_else(|| self.fact_mismatch("synchronous while bound"))?;
+                    self.push_statement(
+                        &mut statements,
+                        wir::SemanticStatement::Loop {
+                            body: wir::SemanticRegion {
+                                parameters: headers,
+                                statements: header_statements,
+                            },
+                            carried,
+                            uninterrupted_bound: Some(bound),
+                            source: Some(statement_source),
+                        },
+                    )?;
+                }
+                SourceStatementPlan::Break | SourceStatementPlan::Continue => {
+                    if !statement_definitions.is_empty() {
+                        return Err(self.fact_mismatch("loop control definitions"));
+                    }
+                    let values = local_state
+                        .values
+                        .iter()
+                        .copied()
+                        .flatten()
+                        .map(|value| self.value_map.get(value))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.push_statement(
+                        &mut statements,
+                        match statement {
+                            SourceStatementPlan::Break => wir::SemanticStatement::Break(values),
+                            SourceStatementPlan::Continue => {
+                                wir::SemanticStatement::Continue(values)
+                            }
+                            _ => unreachable!(),
+                        },
+                    )?;
+                    returned = true;
+                }
                 SourceStatementPlan::Match { scrutinee, arms } => {
                     let scrutinee_fact = self.expression_fact(scrutinee)?;
                     let (declaration, variant_count, payload_ty) = self
@@ -5423,7 +5673,8 @@ impl SourceFunctionLowerer<'_> {
                         operator:
                             operator @ (wrela_hir::UnaryOperator::Negate
                             | wrela_hir::UnaryOperator::BitNot
-                            | wrela_hir::UnaryOperator::BoolNot),
+                            | wrela_hir::UnaryOperator::BoolNot
+                            | wrela_hir::UnaryOperator::Copy),
                         operand,
                     },
                     sema::ExpressionResolution::Value(value),
@@ -5832,7 +6083,33 @@ impl SourceFunctionLowerer<'_> {
             .proofs
             .get(permit.0 as usize)
             .ok_or_else(|| self.fact_mismatch("one-way admission proof"))?;
-        if owner != actor
+        let wiring_proof = self
+            .input
+            .facts()
+            .proofs
+            .iter()
+            .find(|proof| proof.kind == sema::ProofKind::ActorAsIf)
+            .map(|proof| proof.id);
+        let cross_actor = graph.actors.len() == 2
+            && owner == sema::ActorId(1)
+            && actor == sema::ActorId(0)
+            && wiring_proof.is_some()
+            && self
+                .input
+                .facts()
+                .proofs
+                .iter()
+                .filter(|proof| proof.kind == sema::ProofKind::ActorAsIf)
+                .count()
+                == 1;
+        let base_is_wired_handle = cross_actor
+            && matches!(
+                base_fact.resolution,
+                sema::ExpressionResolution::Field { index: 0 }
+            )
+            && base_fact.result.is_some();
+        let capability_value = base_fact.result;
+        if (owner != actor && !cross_actor)
             || target.role != sema::FunctionRole::ActorTurn(actor)
             || target.parameters.len() != 1
             || target.result != sema::SemanticTypeId(0)
@@ -5851,15 +6128,45 @@ impl SourceFunctionLowerer<'_> {
             )
             || callee_fact.effects.0 != 0
             || callee_fact.result.is_some()
-            || !matches!(base_fact.resolution, sema::ExpressionResolution::Value(_))
+            || (!base_is_wired_handle
+                && !matches!(base_fact.resolution, sema::ExpressionResolution::Value(_)))
             || base_fact.effects.0 != 0
-            || base_fact.result.is_some()
+            || (!base_is_wired_handle && base_fact.result.is_some())
         {
             return Err(self.fact_mismatch("one-way send semantic contract"));
+        }
+        if base_is_wired_handle {
+            let receiver = self
+                .input
+                .hir()
+                .as_program()
+                .expression(base)
+                .and_then(|expression| match expression.kind {
+                    wrela_hir::ExpressionKind::Field { base, .. } => Some(base),
+                    _ => None,
+                })
+                .ok_or_else(|| self.fact_mismatch("image-wired actor handle receiver"))?;
+            self.push_seen_expression(receiver)?;
         }
         self.push_seen_expression(base)?;
         self.push_seen_expression(*callee)?;
         self.push_seen_expression(expression_id)?;
+        if base_is_wired_handle {
+            let capability = capability_value
+                .ok_or_else(|| self.fact_mismatch("image-wired actor capability value"))?;
+            let capability = self.value_map.get(capability)?;
+            let wiring_proof = wiring_proof
+                .ok_or_else(|| self.fact_mismatch("image-wired actor capability proof"))?;
+            self.push_let(
+                statements,
+                capability,
+                wir::SemanticOperation::ActorCapability {
+                    actor: wir::ActorId(actor.0),
+                    wiring_proof: wir::ProofId(wiring_proof.0),
+                },
+                Some(expression.source),
+            )?;
+        }
         let reservation = self.value_map.get(reservation)?;
         self.push_let(
             statements,
@@ -5890,6 +6197,31 @@ impl SourceFunctionLowerer<'_> {
         let operand_fact = self.expression_fact(unary.operand)?;
         if operand_fact.ty != unary.ty || operand_fact.effects != unary.effects {
             return Err(self.fact_mismatch("scalar unary operand facts"));
+        }
+        if unary.operator == wrela_hir::UnaryOperator::Copy {
+            if !self
+                .input
+                .facts()
+                .types
+                .get(unary.ty.0 as usize)
+                .is_some_and(|ty| ty.linearity == sema::Linearity::ExplicitCopy)
+            {
+                return Err(self.fact_mismatch("explicit-copy unary type"));
+            }
+            let LoweredExpression::Value(operand) =
+                self.lower_expression(unary.operand, sema::AccessMode::Value, statements)?
+            else {
+                return Err(self.fact_mismatch("explicit-copy unary operand value"));
+            };
+            let result =
+                self.lowered_expression_result(unary.expression, unary.result, unary.ty, source)?;
+            self.push_let(
+                statements,
+                result,
+                wir::SemanticOperation::Copy { value: operand },
+                Some(source),
+            )?;
+            return Ok(LoweredExpression::Value(result));
         }
         let kind = source_scalar_kind(self.input.facts(), unary.ty)
             .ok_or_else(|| self.fact_mismatch("scalar unary type"))?;
@@ -9045,6 +9377,7 @@ fn measure_model_resources(
                             | SemanticOperation::Move { .. }
                             | SemanticOperation::Copy { .. }
                             | SemanticOperation::Drop { .. }
+                            | SemanticOperation::ActorCapability { .. }
                             | SemanticOperation::ActorReserve { .. }
                             | SemanticOperation::MailboxReceive { .. }
                             | SemanticOperation::ActorSend { .. }
@@ -9629,6 +9962,10 @@ fn actor_type_kind_matches(
                 && left.result == right.result
                 && cancellable_slices_equal(&left.parameters, &right.parameters, is_cancelled)?
         }
+        (
+            wir::TypeKind::ActorHandle { actor_type: left },
+            wir::TypeKind::ActorHandle { actor_type: right },
+        ) => left == right,
         (wir::TypeKind::Reservation, wir::TypeKind::Reservation) => true,
         _ => false,
     })
@@ -9823,6 +10160,16 @@ fn actor_operations_match(
                 activation: rp,
             },
         ) => lf == rf && lp == rp && cancellable_slices_equal(la, ra, is_cancelled)?,
+        (
+            wir::SemanticOperation::ActorCapability {
+                actor: la,
+                wiring_proof: lp,
+            },
+            wir::SemanticOperation::ActorCapability {
+                actor: ra,
+                wiring_proof: rp,
+            },
+        ) => la == ra && lp == rp,
         (
             wir::SemanticOperation::ActorReserve {
                 actor: la,

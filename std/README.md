@@ -38,11 +38,15 @@ returns it from an enclosing function with the identical `Result[S, S]` type.
 Named-place `?` is rejected until its move and cleanup contract is implemented.
 
 This is development substrate for the recoverable spine, not general generic
-execution. Unequal or nonscalar payloads, wrong generic arity, forged non-core
+execution. Checked-in verticals independently specialize `Result[u8, u8]`,
+`Result[bool, bool]`, and `Result[u64, u64]`; the u64 case proves the exact
+16-byte, 8-aligned `{u8 tag, u64 payload}` target layout and, when the enrolled
+LLVM backend is available, emits byte-identical independently inspected ARM64
+COFF twice. Unequal or nonscalar payloads, wrong generic arity, forged non-core
 generic enums, and context-free constructors fail with stable diagnostics.
 General `Result[T, E]`, error conversion, `Option`, recoverable
-standard-library operations, native COFF evidence for this specialization,
-and packaged-QEMU execution remain open.
+standard-library operations, EFI/QEMU execution, and installed-distribution
+coverage remain open.
 
 ## Implemented flat-duration surface
 
@@ -77,7 +81,7 @@ at exactly 2,793 steps, 1,344 bytes, and depth 3 and fails at
 remains classified as `semantic-comptime-operation-not-implemented`.
 
 A runtime test imports the same installed module and carries its reachable
-ordinary functions through SemanticWir, FlowWir, canonical Flow wire v7,
+ordinary functions through SemanticWir, FlowWir, canonical Flow wire v10,
 backend revalidation, and MachineWir. The ordering helpers use the implemented
 scalar projection/comparison/local/branch subset and reconstruct their selected
 result through `ns`; this does not claim runtime copy-expression lowering. With
@@ -88,9 +92,14 @@ subtracts, twenty-two construction/projection/scalar-copy bitcasts, and the
 exact 70-edge fully qualified harness/test/core call multiset before emitting
 byte-identical independently validated ARM64 COFF twice. The source `@test fn`
 is compiled as the selected test group; this fixture does not boot an image or
-execute the test under the runtime runner.
+execute the test under the runtime runner. A separate ignored
+`stdlib_time_real_qemu` gate builds the manifest-declared installed-source
+workspace and executes it with an explicitly enrolled toolchain; its ordinary
+failure path remains non-ignored and verifies bounded path-free diagnostics.
+The repository does not treat an absent enrollment environment variable as
+QEMU evidence.
 
-MachineWir v7 now consumes the supported one-field u64 representation as an
+MachineWir v10 now consumes the supported one-field u64 representation as an
 exact 8-byte, 8-aligned scalar-backed ABI value with explicit construction and
 projection bitcasts. Runtime unit multiplication is checked and retains the
 compiler's closed fatal-failure path; runtime `add` and `scale` likewise use

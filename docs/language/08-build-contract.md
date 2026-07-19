@@ -438,7 +438,10 @@ A conforming toolchain test suite includes, at minimum:
 
 The corrected virtio appliance in
 [`examples/virtio-storage.wr`](examples/virtio-storage.wr) is a required
-integration-shape test once the corresponding standard-library APIs exist.
+integration-shape test once the corresponding standard-library APIs exist. Its
+[implementation status](examples/virtio-storage-status.md) distinguishes the
+retained executable foundations from aspirational source and records the next
+vertical slices; the worked source alone is not boot or device-I/O evidence.
 
 ## 9. Performance claims
 

@@ -711,6 +711,7 @@ fn fold_operation(
         | FlowOperation::AsyncCall { .. }
         | FlowOperation::Allocate { .. }
         | FlowOperation::RegionReset { .. }
+        | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
         | FlowOperation::ActorCommit { .. }
         | FlowOperation::ActorReject { .. }
@@ -2150,6 +2151,7 @@ fn map_operation_values(
     match operation {
         FlowOperation::Immediate(_)
         | FlowOperation::RegionReset { .. }
+        | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
         | FlowOperation::MailboxReceive { .. }
         | FlowOperation::TaskAcquireSlot { .. }
@@ -2656,6 +2658,7 @@ fn for_each_operation_value(
     match operation {
         FlowOperation::Immediate(_)
         | FlowOperation::RegionReset { .. }
+        | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
         | FlowOperation::MailboxReceive { .. }
         | FlowOperation::TaskAcquireSlot { .. }

@@ -2497,7 +2497,11 @@ fn render_mailbox_dispatch(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), CodegenError> {
     let symbol = actor_mailbox_symbol(machine, mailbox)?;
-    ir.push("  %t")?;
+    ir.push("  br label %i")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_scan\ni")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_scan:\n  %t")?;
     ir.number(u128::from(instruction))?;
     ir.push("_mailbox_tag = load atomic i64, ptr @")?;
     ir.push_cancellable(symbol, is_cancelled)?;
@@ -2528,7 +2532,7 @@ fn render_mailbox_dispatch(
     )?;
     ir.push("  br label %i")?;
     ir.number(u128::from(instruction))?;
-    ir.push("_ok\ni")?;
+    ir.push("_scan\ni")?;
     ir.number(u128::from(instruction))?;
     ir.push("_ok:\n")
 }

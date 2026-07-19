@@ -39,9 +39,11 @@ request, public effects are visible, and modules and build phases are defined.
 10. [Standard library contracts](10-standard-library-contracts.md) — normative
     contracts for errors, actors, time, tasks, collections, formatting, queues,
     and other load-bearing runtime types.
-11. [Worked virtio appliance](examples/virtio-storage.wr) — an illustrative,
-   corrected block-driver/filesystem/app slice.
-12. [Design decisions](design-decisions.md) — non-normative reconciliation of
+11. [Conformance inventory](conformance-inventory.md) — non-normative,
+    chapter-by-chapter implementation, evidence, gap, and exclusion tracking.
+12. [Worked virtio appliance](examples/virtio-storage.wr) — an illustrative,
+    corrected block-driver/filesystem/app slice.
+13. [Design decisions](design-decisions.md) — non-normative reconciliation of
     the source discussions and explicit exclusions.
 
 ## Authority and notation

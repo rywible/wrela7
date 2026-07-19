@@ -760,11 +760,22 @@ validation, storage, instruction, and mailbox limits are tested. Unsupported
 receiver, producer, target, payload, and capacity shapes are rejected with
 stable source diagnostics rather than silently lowered.
 
-This is not general actor messaging or a recurring actor executor. Cross-actor
+The same corridor admits exactly one image-wired cross-actor edge: one stateless
+`@app` startup task may receive an immutable `Actor[Service]` field from
+`service.handle()` at image installation and issue one unit send to that exact
+stateless `@service`. Both mailboxes have capacity one. The client owns startup
+and admission; the service owns the target mailbox, receive, turn, and dispatch.
+The capability remains tied to the installed service actor and cannot be
+returned, stored in runtime state, substituted with the client actor, or used as
+an unconstrained runtime actor ID. Canonical FlowWir preserves the target and
+wiring proof, while MachineWir preserves the exact target through its sealed
+capability materialization and mailbox operations.
+
+This is not general actor messaging or a recurring actor executor. Mobile actor
 handles, payload-bearing messages, multiple queued messages, recurring task or
 mailbox scheduling, supervision execution, actor class/method generalization,
 and actor assertion supervision remain explicit follow-on work. Selected
 generated-test assertions reaching native ABI2 objects do not close this actor
-boundary. Until those
-surfaces are implemented, documentation and reports must describe this feature
-as the bounded startup self-send vertical.
+boundary. Until those surfaces are implemented, documentation and reports must
+describe this feature as the bounded startup self-send or exact two-actor unit
+cross-send vertical.

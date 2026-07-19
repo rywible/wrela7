@@ -3051,10 +3051,21 @@ fn json_compiled_test_group(
             }
             output.push_str("{\"source\":{");
             json_number(output, "file", u64::from(assertion.source.file.0), false);
-            json_number(output, "start", u64::from(assertion.source.range.start), true);
+            json_number(
+                output,
+                "start",
+                u64::from(assertion.source.range.start),
+                true,
+            );
             json_number(output, "end", u64::from(assertion.source.range.end), true);
             output.push('}');
-            json_string(output, "expression", &assertion.expression, true, is_cancelled)?;
+            json_string(
+                output,
+                "expression",
+                &assertion.expression,
+                true,
+                is_cancelled,
+            )?;
             output.push_str(",\"message\":");
             if let Some(message) = &assertion.message {
                 push_json_string(output, message);

@@ -5798,6 +5798,20 @@ fn assemble_installation(
         &target.join("firmware/QEMU_VARS.fd"),
     )?;
 
+    let appliance = installation.join("share/wrela/examples/virtio-storage");
+    copy_exact_tree_file(
+        root,
+        &plan.source,
+        "docs/language/examples/virtio-storage.wr",
+        &appliance.join("virtio-storage.wr"),
+    )?;
+    copy_exact_tree_file(
+        root,
+        &plan.source,
+        "docs/language/examples/virtio-storage-status.md",
+        &appliance.join("STATUS.md"),
+    )?;
+
     let licenses = installation.join("share/wrela/licenses");
     copy_exact_measured_tree(
         &plan.native.prefix.join("share/wrela/licenses"),
@@ -8300,11 +8314,14 @@ fn validate_installation_tree(installation: &Path) -> Result<(), String> {
         format!("share/wrela/std/{CORE_COMPONENT}/src/image.wr"),
         format!("share/wrela/std/{CORE_COMPONENT}/src/result.wr"),
         format!("share/wrela/std/{CORE_COMPONENT}/src/time.wr"),
+        "share/wrela/examples/virtio-storage/virtio-storage.wr".to_owned(),
+        "share/wrela/examples/virtio-storage/STATUS.md".to_owned(),
         format!("share/wrela/targets/{TARGET_IDENTITY}/target.toml"),
     ] {
         required_record(&tree, &required)?;
     }
     validate_installed_core_inventory(installation)?;
+    validate_installed_appliance_inventory(installation)?;
     inspect_macho_dependencies(&installation.join("bin").join(executable_name("wrela")))?;
     inspect_macho_dependencies(
         &installation
@@ -8316,6 +8333,19 @@ fn validate_installation_tree(installation: &Path) -> Result<(), String> {
             .join("libexec/wrela")
             .join(executable_name("qemu-system-aarch64")),
     )?;
+    Ok(())
+}
+
+fn validate_installed_appliance_inventory(installation: &Path) -> Result<(), String> {
+    let appliance = exact_directory(
+        &installation.join("share/wrela/examples/virtio-storage"),
+        "installed virtio-storage example",
+    )?;
+    if bounded_directory_names(&appliance, 3, "installed virtio-storage inventory")?
+        != ["STATUS.md", "virtio-storage.wr"]
+    {
+        return Err("installed virtio-storage example inventory is not exact-current".to_owned());
+    }
     Ok(())
 }
 
@@ -12502,6 +12532,33 @@ mod tests {
         write_new_bytes(&core.join("src/legacy.wr"), b"module legacy\n", false)
             .expect("unexpected legacy source");
         assert!(validate_installed_core_inventory(&directory.root).is_err());
+    }
+
+    #[test]
+    fn installed_virtio_storage_inventory_is_exact_current() {
+        let directory = TestDirectory::new("installed-virtio-storage-inventory");
+        let appliance = directory.root.join("share/wrela/examples/virtio-storage");
+        write_new_bytes(
+            &appliance.join("virtio-storage.wr"),
+            include_bytes!("../../docs/language/examples/virtio-storage.wr"),
+            false,
+        )
+        .expect("installed appliance source fixture");
+        write_new_bytes(
+            &appliance.join("STATUS.md"),
+            include_bytes!("../../docs/language/examples/virtio-storage-status.md"),
+            false,
+        )
+        .expect("installed appliance status fixture");
+        validate_installed_appliance_inventory(&directory.root)
+            .expect("exact current appliance inventory");
+        write_new_bytes(
+            &appliance.join("undeclared.wr"),
+            b"module undeclared\n",
+            false,
+        )
+        .expect("unexpected appliance source");
+        assert!(validate_installed_appliance_inventory(&directory.root).is_err());
     }
 
     #[test]

@@ -293,6 +293,11 @@ pub enum FlowOperation {
     RegionReset {
         region: RegionId,
     },
+    /// Immutable image-wired capability for one exact installed actor.
+    ActorCapability {
+        actor: ActorId,
+        proof: ProofId,
+    },
     ActorReserve {
         actor: ActorId,
         method: FunctionId,
@@ -1287,6 +1292,7 @@ fn meter_operation(
         | FlowOperation::Drop { .. }
         | FlowOperation::Allocate { .. }
         | FlowOperation::RegionReset { .. }
+        | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
         | FlowOperation::ActorReject { .. }
         | FlowOperation::MailboxReceive { .. }
@@ -2749,22 +2755,33 @@ fn validate_actor_capacity_contract(module: &FlowWir, errors: &mut ValidationCon
     let base_region_count = module
         .actors
         .len()
-        .checked_mul(2)
+        .checked_add(
+            module
+                .actors
+                .iter()
+                .filter(|actor| !actor.turn_functions.is_empty())
+                .count(),
+        )
         .and_then(|count| count.checked_add(module.tasks.len()));
     let expected_regions =
         base_region_count.and_then(|count| count.checked_add(module.activations.len()));
     let mut base_bytes = Some(0_u64);
     let mut valid = expected_regions == Some(module.regions.len());
-    for (index, actor) in module.actors.iter().enumerate() {
+    let mut region_cursor = 0usize;
+    for actor in &module.actors {
         if !errors.poll() {
             return;
         }
-        let mailbox_index = index.checked_mul(2);
-        let turn_index = mailbox_index.and_then(|index| index.checked_add(1));
+        let mailbox_index = Some(region_cursor);
+        region_cursor = region_cursor.saturating_add(1);
+        let turn_index = (!actor.turn_functions.is_empty()).then_some(region_cursor);
+        if turn_index.is_some() {
+            region_cursor = region_cursor.saturating_add(1);
+        }
         let mailbox = mailbox_index.and_then(|index| module.regions.get(index));
         let turn = turn_index.and_then(|index| module.regions.get(index));
         let mailbox_bytes = u64::from(actor.mailbox_capacity).checked_mul(16);
-        let mut turn_bytes = 1_u64;
+        let mut turn_bytes = u64::from(!actor.turn_functions.is_empty());
         for function in &actor.turn_functions {
             if !errors.poll() {
                 return;
@@ -2808,31 +2825,32 @@ fn validate_actor_capacity_contract(module: &FlowWir, errors: &mut ValidationCon
                                 && proof.sources[0].range.end <= region.source.range.end
                         })
             })
-            && turn.is_some_and(|region| {
-                turn_index
-                    .and_then(|index| u32::try_from(index).ok())
-                    .is_some_and(|index| region.id == RegionId(index))
-                    && turn_name_matches
-                    && region.class == RegionClass::TaskFrame
-                    && region.capacity_bytes == turn_bytes
-                    && region.alignment == 8
-                    && region.owner == PlanOwner::Actor(actor.id)
-                    && module
-                        .proofs
-                        .get(region.capacity_proof.0 as usize)
-                        .is_some_and(|proof| {
-                            proof.id == region.capacity_proof
-                                && proof.kind == ProofKind::CapacityBound
-                                && proof.bound == Some(1)
-                                && proof.sources.as_slice() == [region.source]
-                        })
-            });
+            && (actor.turn_functions.is_empty()
+                || turn.is_some_and(|region| {
+                    turn_index
+                        .and_then(|index| u32::try_from(index).ok())
+                        .is_some_and(|index| region.id == RegionId(index))
+                        && turn_name_matches
+                        && region.class == RegionClass::TaskFrame
+                        && region.capacity_bytes == turn_bytes
+                        && region.alignment == 8
+                        && region.owner == PlanOwner::Actor(actor.id)
+                        && module
+                            .proofs
+                            .get(region.capacity_proof.0 as usize)
+                            .is_some_and(|proof| {
+                                proof.id == region.capacity_proof
+                                    && proof.kind == ProofKind::CapacityBound
+                                    && proof.bound == Some(1)
+                                    && proof.sources.as_slice() == [region.source]
+                            })
+                }));
         base_bytes = base_bytes
             .and_then(|bytes| mailbox_bytes.and_then(|mailbox| bytes.checked_add(mailbox)))
             .and_then(|bytes| bytes.checked_add(turn_bytes));
         valid &= base_bytes.is_some();
     }
-    let task_start = module.actors.len().checked_mul(2);
+    let task_start = Some(region_cursor);
     for (index, task) in module.tasks.iter().enumerate() {
         if !errors.poll() {
             return;
@@ -3075,6 +3093,14 @@ fn is_reservation_value(module: &FlowWir, function: &FlowFunction, value: ValueI
         .is_some_and(|ty| matches!(ty.kind, FlowTypeKind::Reservation))
 }
 
+fn is_actor_capability_value(module: &FlowWir, function: &FlowFunction, value: ValueId) -> bool {
+    function
+        .values
+        .get(value.0 as usize)
+        .and_then(|value| module.types.get(value.ty.0 as usize))
+        .is_some_and(|ty| matches!(ty.kind, FlowTypeKind::ActorHandle(_)))
+}
+
 fn actor_mailbox_proof(
     module: &FlowWir,
     actor: ActorId,
@@ -3268,9 +3294,37 @@ fn validate_actor_message_contract(module: &FlowWir, errors: &mut ValidationCont
                             *count = count.saturating_add(1);
                             *count
                         });
+                        let cross_actor = module.actors.len() == 2
+                            && task_actor == Some(ActorId(1))
+                            && *actor == ActorId(0)
+                            && matches!(
+                                index.checked_sub(1).and_then(|prior| block.instructions.get(prior)),
+                                Some(Instruction {
+                                    results,
+                                    operation: FlowOperation::ActorCapability {
+                                        actor: capability_actor,
+                                        proof: wiring_proof,
+                                    },
+                                    ..
+                                }) if *capability_actor == *actor
+                                    && matches!(results.as_slice(), [capability]
+                                        if function.values.get(capability.0 as usize).is_some_and(|value| {
+                                            module.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                                                ty.kind == FlowTypeKind::ActorHandle(*actor)
+                                                    && ty.copyable
+                                                    && !ty.strict_linear
+                                            })
+                                        }))
+                                    && module.proofs.get(wiring_proof.0 as usize).is_some_and(|proof| {
+                                        proof.kind == ProofKind::ActorAsIf
+                                            && proof.bound == Some(1)
+                                            && proof.sources.len() == 1
+                                            && proof.depends_on.is_empty()
+                                    })
+                            );
                         if result
                             .is_none_or(|result| !is_reservation_value(module, function, result))
-                            || task_actor != Some(*actor)
+                            || (task_actor != Some(*actor) && !cross_actor)
                             || target.is_none()
                             || !state_parameter_matches
                             || !permit_matches
@@ -3342,7 +3396,8 @@ fn validate_actor_message_contract(module: &FlowWir, errors: &mut ValidationCont
                             if !cancelled && !errors.poll() {
                                 cancelled = true;
                             } else if escaped.is_none()
-                                && is_reservation_value(module, function, value)
+                                && (is_reservation_value(module, function, value)
+                                    || is_actor_capability_value(module, function, value))
                             {
                                 escaped = Some(value);
                             }
@@ -3365,7 +3420,10 @@ fn validate_actor_message_contract(module: &FlowWir, errors: &mut ValidationCont
             for_each_flow_terminator_value(&block.terminator, |value| {
                 if !cancelled && !errors.poll() {
                     cancelled = true;
-                } else if escaped.is_none() && is_reservation_value(module, function, value) {
+                } else if escaped.is_none()
+                    && (is_reservation_value(module, function, value)
+                        || is_actor_capability_value(module, function, value))
+                {
                     escaped = Some(value);
                 }
             });
@@ -4182,6 +4240,7 @@ fn for_each_flow_operation_value(operation: &FlowOperation, mut visit: impl FnMu
     match operation {
         FlowOperation::Immediate(_)
         | FlowOperation::RegionReset { .. }
+        | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
         | FlowOperation::MailboxReceive { .. }
         | FlowOperation::TaskAcquireSlot { .. }
@@ -4838,6 +4897,30 @@ fn validate_operation(
         }
         FlowOperation::RegionReset { region } => {
             require_id("reset region", region.0, module.regions.len(), errors)
+        }
+        FlowOperation::ActorCapability { actor, proof: p } => {
+            require_id("actor capability", actor.0, module.actors.len(), errors);
+            proof!(*p);
+            let valid = matches!(instruction.results.as_slice(), [result]
+            if function.values.get(result.0 as usize).is_some_and(|value| {
+                module.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                    ty.kind == FlowTypeKind::ActorHandle(*actor)
+                        && ty.copyable
+                        && !ty.strict_linear
+                })
+            })
+            && module.proofs.get(p.0 as usize).is_some_and(|proof| {
+                proof.kind == ProofKind::ActorAsIf
+                    && proof.bound == Some(1)
+                    && proof.sources.len() == 1
+                    && proof.depends_on.is_empty()
+            }));
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "actor capability",
+                    id: instruction.id.0,
+                });
+            }
         }
         FlowOperation::ActorReserve {
             actor, proof: p, ..

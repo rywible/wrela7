@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use wrela_backend::{
     CodegenError, emit_prepared_object, llvm_backend_available,
-    machine_wir::{MachineFunctionOrigin, MachineOperation, MachineTerminator, MachineTypeKind},
+    machine_wir::{
+        MachineFunctionOrigin, MachineOperation, MachineTerminator, MachineTypeKind,
+        ValidationError,
+    },
     prepare_canonical_frame_for_codegen,
 };
 use wrela_build_model::{
@@ -24,7 +27,7 @@ use wrela_hir_lower::{
     CanonicalHirLowerer, ChangeSet as HirChangeSet, HirLowerer, LowerRequest as HirLowerRequest,
     LoweringLimits as HirLoweringLimits,
 };
-use wrela_link_efi::{CanonicalCoffObjectInspector, CoffObjectInspector, LinkLimits};
+use wrela_link_efi::{CanonicalCoffObjectInspector, CoffInspectError, CoffObjectInspector};
 use wrela_package::{
     DependencyAlias, ModulePath, PackageGraphBuilder, PackageIdentity, PackageLocator,
 };
@@ -229,8 +232,8 @@ fn try_source_fixture_with_forged_result(
     let core_file = add_source(&mut sources, "core/image.wr", CORE_IMAGE_SOURCE);
     let core_result_file = add_source(&mut sources, "core/result.wr", CORE_RESULT_SOURCE);
     let application_file = add_source(&mut sources, "runtime_result/image.wr", application_source);
-    let forged_result_file = forged_result_source
-        .map(|source| add_source(&mut sources, "result.wr", source));
+    let forged_result_file =
+        forged_result_source.map(|source| add_source(&mut sources, "result.wr", source));
     let mut graph = PackageGraphBuilder::new(root.clone());
     let core = graph.add_package(core_identity).expect("core package node");
     graph
@@ -338,10 +341,7 @@ fn try_source_fixture_with_forged_result(
     })
 }
 
-fn analyze_selected(
-    fixture: &SourceFixture,
-    selector: &str,
-) -> wrela_sema::AnalyzedImage {
+fn analyze_selected(fixture: &SourceFixture, selector: &str) -> wrela_sema::AnalyzedImage {
     let analyzer = CanonicalSemanticAnalyzer::new();
     let changes = AnalysisChangeSet {
         previous_source_graph: None,
@@ -465,9 +465,9 @@ fn compile_selected(
             payload.kind,
             SemaTypeKind::Integer {
                 signed: false,
-                bits: 8,
+                bits,
                 pointer_sized: false,
-            }
+            } if bits == if selector == "result_u64_match_returns_payload" { 64 } else { 8 }
         ));
     }
     CanonicalSemanticLowerer::new()
@@ -546,8 +546,19 @@ fn inspect_native_object(bytes: &[u8], expected_digest: Sha256Digest) {
         .expect("create runtime-result object");
     file.write_all(bytes).expect("write runtime-result object");
     file.sync_all().expect("sync runtime-result object");
-    let measured = CanonicalCoffObjectInspector::new()
-        .inspect(&path, LinkLimits::standard().object_bytes, &never_cancelled)
+    let inspector = CanonicalCoffObjectInspector::new();
+    let exact_bytes = bytes.len() as u64;
+    assert!(matches!(
+        inspector.inspect(&path, exact_bytes - 1, &never_cancelled),
+        Err(CoffInspectError::TooLarge { limit, actual })
+            if limit == exact_bytes - 1 && actual == exact_bytes
+    ));
+    assert!(matches!(
+        inspector.inspect(&path, exact_bytes, &|| true),
+        Err(CoffInspectError::Cancelled)
+    ));
+    let measured = inspector
+        .inspect(&path, exact_bytes, &never_cancelled)
         .expect("independent runtime-result COFF inspection");
     assert_eq!(measured.bytes, bytes.len() as u64);
     assert_eq!(measured.digest, expected_digest);
@@ -719,6 +730,135 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
                 assert_eq!(digest, HASHER.sha256(second.bytes()));
                 inspect_native_object(first.bytes(), digest);
             }
+        }
+    }
+}
+
+#[test]
+fn runtime_result_specializes_u64_payload_with_deterministic_machine_layout() {
+    let mut source = APPLICATION_SOURCE.to_owned();
+    source.push_str(
+        r#"
+fn unwrap_u64_or_zero(value: Result[u64, u64]) -> u64:
+    match value:
+        case Result.Ok(bind payload):
+            return payload
+        case Result.Err(bind code):
+            return 0
+
+@test
+fn result_u64_match_returns_payload():
+    value: Result[u64, u64] = Result.Ok(42)
+    assert unwrap_u64_or_zero(value=value) == 42, "u64 Result payload must survive exhaustive match"
+    return
+"#,
+    );
+    let fixture = source_fixture_for(&source, false);
+    let semantic = compile_selected(&fixture, "result_u64_match_returns_payload");
+    let repeated_semantic = compile_selected(&fixture, "result_u64_match_returns_payload");
+    assert_eq!(semantic.as_wir(), repeated_semantic.as_wir());
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("u64 runtime-result FlowWir");
+    let repeated_flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: repeated_semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("repeated u64 runtime-result FlowWir");
+    let (flow_wir, _, _) = flow.into_parts();
+    let (repeated_flow_wir, _, _) = repeated_flow.into_parts();
+    assert_eq!(flow_wir, repeated_flow_wir);
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("u64 runtime-result canonical FlowWir frame");
+    let repeated_encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &repeated_flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("repeated u64 runtime-result canonical FlowWir frame");
+    assert_eq!(encoded.bytes(), repeated_encoded.bytes());
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("u64 runtime-result MachineWir preparation");
+    let repeated_prepared = prepare_canonical_frame_for_codegen(
+        repeated_encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("repeated u64 runtime-result MachineWir preparation");
+    assert_eq!(
+        prepared.machine().wir().as_wir(),
+        repeated_prepared.machine().wir().as_wir()
+    );
+    let machine = prepared.machine().wir().as_wir();
+    let result = machine
+        .types
+        .iter()
+        .find(|ty| matches!(ty.kind, MachineTypeKind::TaggedEnum { variants: 2, .. }))
+        .expect("specialized u64 Result machine type");
+    let MachineTypeKind::TaggedEnum { tag, payload, .. } = result.kind else {
+        unreachable!()
+    };
+    assert_eq!(
+        machine.types[tag.0 as usize].kind,
+        MachineTypeKind::Integer { bits: 8 }
+    );
+    assert_eq!(
+        machine.types[payload.0 as usize].kind,
+        MachineTypeKind::Integer { bits: 64 }
+    );
+    assert_eq!((result.size, result.alignment), (16, 8));
+
+    let mut invalid_layout = machine.clone();
+    invalid_layout.types[result.id.0 as usize].alignment = 4;
+    let errors = invalid_layout
+        .validate_for_target(&fixture.target)
+        .expect_err("u64 Result alignment mutation must fail closed");
+    assert!(errors.0.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidRecord {
+            kind: "tagged enum type",
+            id,
+        } if *id == result.id.0
+    )));
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("u64 runtime-result native object emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second =
+                emit_prepared_object(&repeated_prepared, &fixture.target, &never_cancelled)
+                    .expect("independently repeated u64 runtime-result native object emission");
+            assert_eq!(first.bytes(), second.bytes());
+            inspect_native_object(first.bytes(), HASHER.sha256(first.bytes()));
         }
     }
 }

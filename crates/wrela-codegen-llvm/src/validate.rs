@@ -857,8 +857,16 @@ fn validate_actor_message_table(
         if activation.caller == producer
             && activation.schedule == MachineActivationSchedule::StartupOnce
             && matches!(activation.owner,
-                MachineActivationOwner::Task { supervisor: Some(supervisor), .. }
-                    if supervisor == actor)
+            MachineActivationOwner::Task { supervisor: Some(supervisor), .. }
+                if supervisor == actor
+                    || (actor == 0
+                        && supervisor == 1
+                        && machine.region_storage.iter().any(|storage| {
+                            storage.kind == (MachineRegionStorageKind::ActorMailbox {
+                                actor: 1,
+                                mailbox_capacity: 1,
+                            })
+                        })))
         {
             task_activation = task_activation.saturating_add(1);
         }
@@ -927,7 +935,20 @@ fn validate_activation_table(
                 },
                 MachineFunctionRole::TaskEntry(role),
                 MachineActivationSchedule::StartupOnce,
-            ) => task == role && supervisor.is_none_or(|actor| actor == 0),
+            ) => {
+                task == role
+                    && supervisor.is_none_or(|actor| {
+                        actor == 0
+                            || (actor == 1
+                                && machine.region_storage.iter().any(|storage| {
+                                    storage.kind
+                                        == (MachineRegionStorageKind::ActorMailbox {
+                                            actor: 1,
+                                            mailbox_capacity: 1,
+                                        })
+                                }))
+                    })
+            }
             _ => false,
         };
         let capacity = machine.proofs.get(activation.capacity_proof.0 as usize);
@@ -964,6 +985,44 @@ fn validate_activation_table(
                 }
                 MachineActivationSchedule::StartupOnce => {
                     entry.instructions.len() == 1
+                        || matches!(entry.instructions.as_slice(), [capability, reserve, commit, _]
+                        if matches!(
+                            (&capability.operation, capability.results.as_slice()),
+                            (
+                                MachineOperation::Immediate(MachineImmediate::Integer {
+                                    ty,
+                                    bytes_le,
+                                }),
+                                [handle],
+                            ) if bytes_le.as_slice() == 0_u64.to_le_bytes()
+                                && caller.values.get(handle.0 as usize).is_some_and(|value| value.ty == *ty)
+                                && machine.types.get(ty.0 as usize).is_some_and(|ty| {
+                                    ty.source_name.as_deref() == Some("__wrela_actor_capability")
+                                        && ty.kind == MachineTypeKind::Integer { bits: 64 }
+                                        && ty.size == 8
+                                        && ty.alignment == 8
+                                })
+                        ) && matches!(
+                            (&reserve.operation, reserve.results.as_slice()),
+                            (
+                                MachineOperation::ActorReserve {
+                                    mailbox,
+                                    actor: 0,
+                                    method,
+                                    ..
+                                },
+                                [reservation],
+                            ) if commit.results.is_empty()
+                                && matches!(&commit.operation,
+                                    MachineOperation::ActorCommit {
+                                        reservation: committed,
+                                        mailbox: commit_mailbox,
+                                        actor: 0,
+                                        method: commit_method,
+                                    } if committed == reservation
+                                        && commit_mailbox == mailbox
+                                        && commit_method == method)
+                        ))
                         || matches!(entry.instructions.as_slice(), [reserve, commit, _]
                         if matches!(
                             (&reserve.operation, reserve.results.as_slice()),
