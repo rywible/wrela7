@@ -150,7 +150,6 @@ impl WorkspaceLoader for CanonicalWorkspaceLoader {
         )?;
         let mut sources = SourceDatabase::default();
         let mut scenarios = Vec::new();
-        let mut declared_source_count = 0u64;
         let mut provided_source_count = 0u64;
         let mut declared_image_test_count = 0u64;
         let mut provided_scenario_count = 0u64;
@@ -222,12 +221,6 @@ impl WorkspaceLoader for CanonicalWorkspaceLoader {
                 "canonical manifest bytes",
             )?;
             add_count(
-                &mut declared_source_count,
-                manifest.modules.len(),
-                u64::from(request.limits.sources),
-                "declared source files",
-            )?;
-            add_count(
                 &mut declared_image_test_count,
                 manifest.image_tests.len(),
                 u64::from(request.limits.scenarios),
@@ -268,13 +261,13 @@ impl WorkspaceLoader for CanonicalWorkspaceLoader {
                 });
             }
 
-            let validated_sources = validate_sources(
+            let validated_sources = derive_modules(
                 &package.identity,
-                &manifest,
                 provided_sources,
                 request.hasher,
                 is_cancelled,
             )?;
+            reject_unknown_image_modules(&manifest, &validated_sources)?;
             let validated_scenarios = validate_scenarios(
                 &package.identity,
                 &manifest,
@@ -332,11 +325,6 @@ impl WorkspaceLoader for CanonicalWorkspaceLoader {
             });
         }
 
-        if declared_source_count != provided_source_count {
-            return Err(LoadError::Manifest(
-                "declared and provided source counts differ".to_owned(),
-            ));
-        }
         if u64::try_from(scenarios.len()).unwrap_or(u64::MAX) != provided_scenario_count {
             return Err(LoadError::Manifest(
                 "validated and provided scenario file counts differ".to_owned(),
@@ -670,9 +658,22 @@ fn validate_manifest_identity_and_dependencies(
     Ok(())
 }
 
-fn validate_sources(
+const MODULE_SOURCE_SUFFIX: &str = ".wr";
+
+/// Derive this package's modules from the provider-supplied source set.
+///
+/// There is no `[[module]]` declaration to consult: every acquired source is
+/// treated as one deterministic (sorted, portable) walk result under
+/// `source_root`. A `BTreeMap` keyed by path gives the sorted, duplicate-free
+/// order for free. Each surviving path must end in `.wr`, pass the same
+/// portable/NFC path rules a manifest field would (`validate_source_path`),
+/// and not collide with another module's path under ASCII case-folding; its
+/// module path is then derived by dropping the `.wr` suffix and splitting on
+/// `/`, with every segment validated as a source identifier by
+/// `ModulePath::new` (NFC, XID_start/continue, no reserved keyword, no
+/// wildcard `_`, no default-ignorable/bidi-control code point).
+fn derive_modules(
     package: &PackageIdentity,
-    manifest: &wrela_package::PackageManifest,
     sources: Vec<SourceInput>,
     hasher: &dyn crate::ContentHasher,
     is_cancelled: &dyn Fn() -> bool,
@@ -692,20 +693,47 @@ fn validate_sources(
             }
         }
     }
+    if provided.len() > wrela_package::MAX_MODULES {
+        return Err(resource_limit(
+            "package modules",
+            u64::try_from(wrela_package::MAX_MODULES).unwrap_or(u64::MAX),
+        ));
+    }
 
     let mut validated = try_loader_vec(
-        manifest.modules.len(),
+        provided.len(),
         "validated source records",
-        u64::try_from(manifest.modules.len()).unwrap_or(u64::MAX),
+        u64::try_from(provided.len()).unwrap_or(u64::MAX),
     )?;
-    for declaration in &manifest.modules {
+    let mut portable_paths = BTreeSet::new();
+    for (relative_path, (text, digest)) in provided {
         check_cancelled(is_cancelled)?;
-        let Some((relative_path, (text, digest))) = provided.remove_entry(&declaration.source_path)
-        else {
-            return Err(LoadError::MissingSource(bounded_path(
-                &declaration.source_path,
-            )));
+        wrela_package::validate_source_path(&relative_path)
+            .map_err(|error| LoadError::Manifest(bounded_load_error_value(&error.to_string())))?;
+        let Some(module_text) = relative_path.strip_suffix(MODULE_SOURCE_SUFFIX) else {
+            return Err(LoadError::Manifest(bounded_load_error_value(&format!(
+                "source {relative_path} under source_root is not a `.wr` module file"
+            ))));
         };
+        if !portable_paths.insert(relative_path.to_ascii_lowercase()) {
+            return Err(LoadError::Manifest(bounded_load_error_value(&format!(
+                "module source path collides portably: {relative_path}"
+            ))));
+        }
+        let mut segments = Vec::new();
+        try_reserve_loader_vec(
+            &mut segments,
+            module_text.split('/').count(),
+            "module path segments",
+            u64::try_from(module_text.len()).unwrap_or(u64::MAX),
+        )?;
+        segments.extend(module_text.split('/').map(str::to_owned));
+        let module = wrela_package::ModulePath::new(segments).map_err(|error| {
+            LoadError::Manifest(bounded_load_error_value(&format!(
+                "module path derived from {relative_path} is invalid: {error}"
+            )))
+        })?;
+
         let actual = sha256_cancellable(hasher, text.as_bytes(), is_cancelled)
             .map_err(|_| LoadError::Cancelled)?;
         if actual != digest {
@@ -721,24 +749,42 @@ fn validate_sources(
             });
         }
         validated.push(ValidatedSource {
-            module: declaration.module.clone(),
+            module,
             relative_path,
             text,
             digest,
         });
     }
-    if let Some((path, _)) = provided.pop_first() {
-        return Err(LoadError::UndeclaredSource(bounded_path(&path)));
-    }
     for pair in validated.windows(2) {
         check_cancelled(is_cancelled)?;
         if pair[0].relative_path >= pair[1].relative_path {
             return Err(LoadError::Manifest(
-                "declared module source paths are not canonical".to_owned(),
+                "derived module source paths are not canonical".to_owned(),
             ));
         }
     }
     Ok(validated)
+}
+
+/// Cross-check `[[image]]` entry modules against derived modules. The
+/// manifest cannot check this itself (`PackageManifest::validate` has no
+/// filesystem access), so it is deferred to the loader once modules are
+/// known.
+fn reject_unknown_image_modules(
+    manifest: &wrela_package::PackageManifest,
+    modules: &[ValidatedSource],
+) -> Result<(), LoadError> {
+    let derived: BTreeSet<&wrela_package::ModulePath> =
+        modules.iter().map(|module| &module.module).collect();
+    for image in &manifest.images {
+        if !derived.contains(&image.module) {
+            return Err(LoadError::Manifest(bounded_load_error_value(&format!(
+                "image {} refers to an undeclared module",
+                image.name
+            ))));
+        }
+    }
+    Ok(())
 }
 
 fn validate_scenarios(

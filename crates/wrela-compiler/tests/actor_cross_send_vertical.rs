@@ -48,12 +48,12 @@ async fn checkpoint():
     pass
 
 @service
-pub class Worker:
+pub struct Worker:
     pub async fn ping(mut self):
         await checkpoint()
 
 @app
-pub class Client:
+pub struct Client:
     worker: Actor[Worker]
 
     @task
@@ -62,7 +62,7 @@ pub class Client:
         await checkpoint()
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     img = Image(name="actor-cross-send-image", target=Target.aarch64_qemu_virt_uefi)
     worker = img.service(Worker, mailbox=1)
     client = img.app(Client, worker=worker.handle(), mailbox=1)

@@ -452,7 +452,6 @@ enum DeclarationSyntax<'a> {
     Function(&'a syntax::FunctionDeclaration),
     Initializer(&'a syntax::InitializerDeclaration),
     Structure(&'a syntax::TypeDeclaration),
-    Class(&'a syntax::TypeDeclaration),
     Enumeration(&'a syntax::EnumDeclaration),
     Interface(&'a syntax::InterfaceDeclaration),
     Implementation(&'a syntax::ImplementationDeclaration),
@@ -805,7 +804,6 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
             syntax::DeclarationKind::Brand(value) => DeclarationSyntax::Brand(value),
             syntax::DeclarationKind::Function(value) => DeclarationSyntax::Function(value),
             syntax::DeclarationKind::Structure(value) => DeclarationSyntax::Structure(value),
-            syntax::DeclarationKind::Class(value) => DeclarationSyntax::Class(value),
             syntax::DeclarationKind::Enumeration(value) => DeclarationSyntax::Enumeration(value),
             syntax::DeclarationKind::Interface(value) => DeclarationSyntax::Interface(value),
             syntax::DeclarationKind::Implementation(value) => {
@@ -999,7 +997,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
         let mut children = Vec::new();
         let mut then_count = 0usize;
         match syntax {
-            DeclarationSyntax::Structure(value) | DeclarationSyntax::Class(value) => {
+            DeclarationSyntax::Structure(value) => {
                 for member in &value.members {
                     if let Some(child) = self.predeclare_member(module, id, member)? {
                         push(
@@ -1368,7 +1366,6 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                     if matches!(
                         self.plans[parent.0 as usize].syntax,
                         DeclarationSyntax::Structure(_)
-                            | DeclarationSyntax::Class(_)
                             | DeclarationSyntax::Enumeration(_)
                             | DeclarationSyntax::Interface(_)
                             | DeclarationSyntax::Implementation(_)
@@ -2597,13 +2594,9 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                     },
                 ))
             }
-            DeclarationSyntax::Structure(value) | DeclarationSyntax::Class(value) => {
+            DeclarationSyntax::Structure(value) => {
                 let aggregate = self.lower_aggregate(id, value, header)?;
-                if matches!(syntax, DeclarationSyntax::Structure(_)) {
-                    Ok(hir::DeclarationKind::Structure(aggregate))
-                } else {
-                    Ok(hir::DeclarationKind::Class(aggregate))
-                }
+                Ok(hir::DeclarationKind::Structure(aggregate))
             }
             DeclarationSyntax::Enumeration(value) => Ok(hir::DeclarationKind::Enumeration(
                 self.lower_enumeration(id, value, header)?,
@@ -2623,36 +2616,12 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
             )),
             DeclarationSyntax::Projection(value) => {
                 let carrier = self.lower_projection_carrier(context, &value.carrier, 0)?;
-                let mut provenance = Vec::new();
-                for identifier in &value.provenance {
-                    let name = (identifier.spelling != "self")
-                        .then(|| self.name(identifier))
-                        .transpose()?;
-                    let parameter = header.parameters.iter().find(|parameter| {
-                        (identifier.spelling == "self"
-                            && self.program.parameters[parameter.0 as usize].receiver)
-                            || name.as_ref().is_some_and(|name| {
-                                self.program.parameters[parameter.0 as usize].name.as_ref()
-                                    == Some(name)
-                            })
-                    });
-                    if let Some(parameter) = parameter {
-                        if !provenance.contains(parameter) {
-                            push(
-                                &mut provenance,
-                                *parameter,
-                                "projection provenance",
-                                self.request.limits.parameters,
-                            )?;
-                        }
-                    } else {
-                        self.emit(
-                            "hir-invalid-projection-provenance",
-                            identifier.meta.span,
-                            "projection provenance must name one of the declaration parameters",
-                        )?;
-                    }
-                }
+                // Provenance is implicit now: every parameter (including a
+                // receiver) is an eligible borrow source, so no explicit
+                // `from ...` set is parsed. Populate it from the full
+                // parameter list so downstream HIR representation and
+                // validation are unchanged.
+                let mut provenance = header.parameters.clone();
                 provenance.sort_unstable();
                 let body = value
                     .body
@@ -2904,7 +2873,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                     && header.parameters.is_empty()
                     && match builtin {
                         hir::BuiltinAttribute::Image => {
-                            function.color == syntax::FunctionColor::Comptime
+                            function.color == syntax::FunctionColor::Sync
                                 && self.program.declarations[declaration.0 as usize].visibility
                                     != hir::Visibility::Private
                         }
@@ -3088,6 +3057,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
             implements,
             fields,
             members: header.children,
+            linear: value.linear,
         })
     }
 
@@ -3190,18 +3160,6 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                     ty: self.lower_type(context, ty, depth + 1)?,
                 },
             ),
-            syntax::ProjectionCarrier::Tuple { meta, elements } => {
-                let mut output = Vec::new();
-                for element in elements {
-                    push64(
-                        &mut output,
-                        self.lower_projection_carrier(context, element, depth + 1)?,
-                        "projection carrier elements",
-                        self.request.limits.model_edges,
-                    )?;
-                }
-                (meta.span, hir::ProjectionCarrierKind::Tuple(output))
-            }
             syntax::ProjectionCarrier::Option { meta, carrier } => (
                 meta.span,
                 hir::ProjectionCarrierKind::Option(Box::new(self.lower_projection_carrier(
@@ -3640,7 +3598,6 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
             if matches!(
                 self.plans[declaration.0 as usize].syntax,
                 DeclarationSyntax::Structure(_)
-                    | DeclarationSyntax::Class(_)
                     | DeclarationSyntax::Enumeration(_)
                     | DeclarationSyntax::Interface(_)
                     | DeclarationSyntax::Implementation(_)
@@ -4241,7 +4198,6 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                         self.plans[value.declaration.0 as usize].syntax,
                         DeclarationSyntax::Brand(_)
                             | DeclarationSyntax::Structure(_)
-                            | DeclarationSyntax::Class(_)
                             | DeclarationSyntax::Enumeration(_)
                             | DeclarationSyntax::Interface(_)
                     ) =>
@@ -5258,14 +5214,8 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                 scope: Some(scope),
                 declaration: parent_declaration,
             };
-            let pattern = self.lower_pattern(
-                arm_context,
-                &arm.pattern,
-                Some(scope),
-                true,
-                &mut Vec::new(),
-                0,
-            )?;
+            let pattern =
+                self.lower_pattern(arm_context, &arm.pattern, Some(scope), &mut Vec::new(), 0)?;
             let bindings = self.pattern_bindings(pattern)?;
             for binding in bindings {
                 self.push_current_visible(binding, "visible pattern bindings")?;
@@ -5429,8 +5379,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
             poll_cancellation(self.is_cancelled)?;
             for alternative in &self.program.patterns[pattern.0 as usize].alternatives {
                 match &alternative.kind {
-                    hir::PrimaryPattern::ContextualName { binding, .. }
-                    | hir::PrimaryPattern::Bind(binding) => push(
+                    hir::PrimaryPattern::Bind(binding) => push(
                         &mut ids,
                         *binding,
                         "pattern bindings",
@@ -5654,7 +5603,6 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                         context,
                         pattern,
                         binding_scope,
-                        true,
                         &mut Vec::new(),
                         depth + 1,
                     )?;
@@ -5773,9 +5721,23 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                 syntax::ExpressionKind::Array(values) => hir::ExpressionKind::Array(
                     self.lower_expression_list(context, values, depth + 1)?,
                 ),
-                syntax::ExpressionKind::Race(values) => hir::ExpressionKind::Race(
-                    self.lower_expression_list(context, values, depth + 1)?,
-                ),
+                syntax::ExpressionKind::DotName { name, .. } => {
+                    let spelling = self.name(name)?;
+                    let candidates = self.visible_variant_candidates(context, &spelling, false)?;
+                    if candidates.is_empty() {
+                        self.emit(
+                            "hir-unresolved-dot-variant",
+                            name.meta.span,
+                            "this dot-variant name does not resolve to a visible enum variant",
+                        )?;
+                        hir::ExpressionKind::Error
+                    } else {
+                        hir::ExpressionKind::DotName {
+                            spelling,
+                            candidates,
+                        }
+                    }
+                }
                 syntax::ExpressionKind::TrySend(inner) => hir::ExpressionKind::TrySend(
                     self.lower_expression(context, inner, depth + 1)?,
                 ),
@@ -6141,7 +6103,6 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
         context: ExpressionContext,
         value: &syntax::Pattern,
         binding_scope: Option<hir::ScopeId>,
-        top_level: bool,
         shared_bindings: &mut Vec<(hir::Name, hir::LocalId)>,
         depth: u32,
     ) -> Result<hir::PatternId, LowerFailure> {
@@ -6172,7 +6133,6 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                 context,
                 alternative,
                 binding_scope,
-                top_level,
                 shared_bindings,
                 depth + 1,
             )?;
@@ -6203,7 +6163,6 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
         context: ExpressionContext,
         value: &syntax::PrimaryPattern,
         binding_scope: Option<hir::ScopeId>,
-        top_level: bool,
         shared_bindings: &mut Vec<(hir::Name, hir::LocalId)>,
         depth: u32,
     ) -> Result<hir::PrimaryPattern, LowerFailure> {
@@ -6234,19 +6193,6 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                     )
                 })?;
                 let spelling = self.name(identifier)?;
-                if arguments.is_empty() && !top_level && name.segments.len() == 1 {
-                    let candidates = self.visible_variant_candidates(context, &spelling, true)?;
-                    let Some(binding) =
-                        self.pattern_binding(binding_scope, identifier, shared_bindings)?
-                    else {
-                        return Ok(hir::PrimaryPattern::Error);
-                    };
-                    return Ok(hir::PrimaryPattern::ContextualName {
-                        spelling,
-                        candidates,
-                        binding,
-                    });
-                }
                 let candidates = self.constructor_candidates(context, name)?;
                 if candidates.is_empty() {
                     self.emit(
@@ -6272,27 +6218,53 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                         },
                     )?;
                 }
-                let mut lowered_arguments = Vec::new();
-                for argument in arguments {
-                    let pattern = self.lower_pattern(
-                        context,
-                        &argument.pattern,
-                        binding_scope,
-                        false,
-                        shared_bindings,
-                        depth + 1,
+                let lowered_arguments = self.lower_pattern_arguments(
+                    context,
+                    arguments,
+                    binding_scope,
+                    shared_bindings,
+                    depth + 1,
+                )?;
+                Ok(hir::PrimaryPattern::Constructor {
+                    spelling,
+                    candidates,
+                    arguments: lowered_arguments,
+                })
+            }
+            syntax::PrimaryPattern::DotVariant {
+                name, arguments, ..
+            } => {
+                let spelling = self.name(name)?;
+                let candidates = self.visible_variant_candidates(context, &spelling, false)?;
+                if candidates.is_empty() {
+                    self.emit(
+                        "hir-unresolved-pattern-constructor",
+                        name.meta.span,
+                        "this pattern constructor does not resolve to a visible enum variant",
                     )?;
-                    push64(
-                        &mut lowered_arguments,
-                        hir::PatternArgument {
-                            take: argument.take,
-                            pattern,
-                            source: argument.meta.span,
+                    self.record_error_use(name)?;
+                    return Ok(hir::PrimaryPattern::Error);
+                }
+                if candidates.len() == 1 {
+                    let candidate = candidates[0].clone();
+                    self.record_resolution(
+                        name,
+                        &NameResolution {
+                            target: ResolutionTarget::Definition(hir::Definition::Variant(
+                                candidate.clone(),
+                            )),
+                            kind: BindingKind::Variant,
+                            binding: ResolvedBinding::Variant(candidate),
                         },
-                        "pattern arguments",
-                        self.request.limits.model_edges,
                     )?;
                 }
+                let lowered_arguments = self.lower_pattern_arguments(
+                    context,
+                    arguments,
+                    binding_scope,
+                    shared_bindings,
+                    depth + 1,
+                )?;
                 Ok(hir::PrimaryPattern::Constructor {
                     spelling,
                     candidates,
@@ -6337,7 +6309,6 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                 context,
                 &argument.pattern,
                 binding_scope,
-                false,
                 shared_bindings,
                 depth + 1,
             )?;
@@ -6441,7 +6412,16 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                     && binding.local_name == *spelling
                     && binding.target == SymbolTarget::Variant(variant.clone())
             });
-            if !(owner_visible || nested_visible || imported) {
+            // A dot-form or bare pattern name also resolves against any
+            // enum whose *type* (not necessarily each individual variant)
+            // is imported into this module, e.g. `from core.result import
+            // Result` makes `.Ok`/`.Err` resolvable without separately
+            // importing each variant by name.
+            let enum_type_imported = self.named_imports.iter().any(|binding| {
+                binding.module == module
+                    && binding.target == SymbolTarget::Declaration(variant.enumeration.clone())
+            });
+            if !(owner_visible || nested_visible || imported || enum_type_imported) {
                 continue;
             }
             if fieldless_only && !self.variant_is_fieldless(variant) {
@@ -6639,7 +6619,7 @@ fn declaration_identifier(value: DeclarationSyntax<'_>) -> Option<&syntax::Ident
         DeclarationSyntax::Brand(value) => Some(&value.name),
         DeclarationSyntax::Function(value) => Some(&value.name),
         DeclarationSyntax::Initializer(_) => None,
-        DeclarationSyntax::Structure(value) | DeclarationSyntax::Class(value) => Some(&value.name),
+        DeclarationSyntax::Structure(value) => Some(&value.name),
         DeclarationSyntax::Enumeration(value) => Some(&value.name),
         DeclarationSyntax::Interface(value) => Some(&value.name),
         DeclarationSyntax::Projection(value) => Some(&value.name),
@@ -6657,7 +6637,6 @@ fn top_syntax(declaration: &syntax::TopLevelDeclaration) -> DeclarationSyntax<'_
         syntax::DeclarationKind::Brand(value) => DeclarationSyntax::Brand(value),
         syntax::DeclarationKind::Function(value) => DeclarationSyntax::Function(value),
         syntax::DeclarationKind::Structure(value) => DeclarationSyntax::Structure(value),
-        syntax::DeclarationKind::Class(value) => DeclarationSyntax::Class(value),
         syntax::DeclarationKind::Enumeration(value) => DeclarationSyntax::Enumeration(value),
         syntax::DeclarationKind::Interface(value) => DeclarationSyntax::Interface(value),
         syntax::DeclarationKind::Implementation(value) => DeclarationSyntax::Implementation(value),
@@ -6671,7 +6650,7 @@ fn top_syntax(declaration: &syntax::TopLevelDeclaration) -> DeclarationSyntax<'_
 fn syntax_generics(value: DeclarationSyntax<'_>) -> &[syntax::GenericParameter] {
     match value {
         DeclarationSyntax::Function(value) => &value.generics,
-        DeclarationSyntax::Structure(value) | DeclarationSyntax::Class(value) => &value.generics,
+        DeclarationSyntax::Structure(value) => &value.generics,
         DeclarationSyntax::Enumeration(value) => &value.generics,
         DeclarationSyntax::Interface(value) => &value.generics,
         DeclarationSyntax::Projection(value) => &value.generics,
@@ -6695,7 +6674,6 @@ fn syntax_parameters(value: DeclarationSyntax<'_>) -> &[syntax::Parameter] {
         DeclarationSyntax::Constant(_)
         | DeclarationSyntax::Brand(_)
         | DeclarationSyntax::Structure(_)
-        | DeclarationSyntax::Class(_)
         | DeclarationSyntax::Enumeration(_)
         | DeclarationSyntax::Interface(_)
         | DeclarationSyntax::Implementation(_)
@@ -6727,7 +6705,6 @@ const fn lower_color(value: syntax::FunctionColor) -> hir::FunctionColor {
         syntax::FunctionColor::Sync => hir::FunctionColor::Sync,
         syntax::FunctionColor::Async => hir::FunctionColor::Async,
         syntax::FunctionColor::Isr => hir::FunctionColor::Isr,
-        syntax::FunctionColor::Comptime => hir::FunctionColor::Comptime,
     }
 }
 
@@ -6775,7 +6752,6 @@ const fn lower_binary_operator(value: syntax::BinaryOperator) -> hir::BinaryOper
         syntax::BinaryOperator::BitXor => hir::BinaryOperator::BitXor,
         syntax::BinaryOperator::BitAnd => hir::BinaryOperator::BitAnd,
         syntax::BinaryOperator::ShiftLeft => hir::BinaryOperator::ShiftLeft,
-        syntax::BinaryOperator::ShiftLeftModular => hir::BinaryOperator::ShiftLeftModular,
         syntax::BinaryOperator::ShiftRight => hir::BinaryOperator::ShiftRight,
     }
 }
@@ -6932,7 +6908,8 @@ fn primary_pattern_span(value: &syntax::PrimaryPattern) -> Span {
     match value {
         syntax::PrimaryPattern::Wildcard(meta)
         | syntax::PrimaryPattern::Tuple { meta, .. }
-        | syntax::PrimaryPattern::Array { meta, .. } => meta.span,
+        | syntax::PrimaryPattern::Array { meta, .. }
+        | syntax::PrimaryPattern::DotVariant { meta, .. } => meta.span,
         syntax::PrimaryPattern::Literal { literal, .. } => literal.meta.span,
         syntax::PrimaryPattern::Constructor { name, .. } => name.meta.span,
         syntax::PrimaryPattern::Bind(identifier) => identifier.meta.span,
@@ -7126,7 +7103,7 @@ mod tests {
         let hir::DeclarationKind::Function(boot_kind) = &boot.kind else {
             panic!("application image constructor must be a function")
         };
-        assert_eq!(boot_kind.color, hir::FunctionColor::Comptime);
+        assert_eq!(boot_kind.color, hir::FunctionColor::Sync);
         assert!(boot_kind.generics.is_empty());
         assert!(boot_kind.parameters.is_empty());
         assert!(matches!(

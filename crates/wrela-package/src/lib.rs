@@ -11,9 +11,10 @@ use std::fmt;
 use unicode_ident::{is_xid_continue, is_xid_start};
 use unicode_normalization::UnicodeNormalization;
 use wrela_build_model::{BuildProfile, LanguageRevision, Sha256Digest};
-use wrela_source::{FileId, MAX_SOURCE_PATH_BYTES};
+use wrela_source::FileId;
 
 pub const MAX_PACKAGES: usize = 1_000_000;
+/// Maximum derived modules (one per discovered `*.wr` file) in one package.
 pub const MAX_MODULES: usize = 1_000_000;
 pub const MAX_DEPENDENCIES_PER_PACKAGE: usize = 65_536;
 /// Maximum UTF-8 bytes retained from any project-controlled value in a
@@ -140,17 +141,12 @@ pub struct ManifestDependency {
     pub requirement: String,
 }
 
-/// Explicit source module declaration. There is no ambient directory walk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManifestModule {
-    pub module: ModulePath,
-    pub source_path: String,
-}
-
 /// One full bootable image entry point declared by the root package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageDeclaration {
     pub name: String,
+    /// Entry module path. Must equal a module derived from the package's
+    /// source-root walk; the loader checks this once modules are derived.
     pub module: ModulePath,
     pub entry: String,
     pub target: wrela_build_model::TargetIdentity,
@@ -172,6 +168,13 @@ pub struct ImageTestDeclaration {
 }
 
 /// Decoded, validated `wrela.toml` model.
+///
+/// Modules are not declared here: the loader derives them from a deterministic
+/// walk of `source_root`, mapping every `*.wr` file to the module path given by
+/// its root-relative path (`/` becomes `.`, the `.wr` suffix is dropped). See
+/// `wrela_package_loader`'s workspace loader for the derivation and the
+/// image-module cross-reference check, which both require filesystem access
+/// this pure model crate deliberately does not have.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageManifest {
     pub schema: u32,
@@ -179,7 +182,6 @@ pub struct PackageManifest {
     pub name: PackageName,
     pub version: PackageVersion,
     pub source_root: String,
-    pub modules: Vec<ManifestModule>,
     pub dependencies: Vec<ManifestDependency>,
     pub profiles: Vec<BuildProfile>,
     pub images: Vec<ImageDeclaration>,
@@ -193,10 +195,6 @@ impl PackageManifest {
             return Err(ManifestError::UnsupportedManifestSchema(self.schema));
         }
         validate_source_path(&self.source_root)?;
-        require_strict_order(
-            self.modules.iter().map(|module| module.module.dotted()),
-            "module",
-        )?;
         require_strict_order(
             self.profiles.iter().map(|profile| profile.name.clone()),
             "build profile",
@@ -212,47 +210,8 @@ impl PackageManifest {
             self.image_tests.iter().map(|test| test.name.clone()),
             "image test",
         )?;
-        if self.modules.len() > MAX_MODULES {
-            return Err(ManifestError::TooManyModules);
-        }
         if self.dependencies.len() > MAX_DEPENDENCIES_PER_PACKAGE {
             return Err(ManifestError::TooManyDependencies);
-        }
-        let mut exact_source_paths = BTreeSet::new();
-        let mut portable_source_paths = BTreeSet::new();
-        for module in &self.modules {
-            validate_source_path(&module.source_path)?;
-            let expected = module.module.expected_source_path();
-            if module.source_path != expected {
-                return Err(ManifestError::ModuleSourceMismatch {
-                    module: bounded_manifest_error_value(&module.module.dotted()),
-                    expected: bounded_manifest_error_value(&expected),
-                    actual: bounded_manifest_error_value(&module.source_path),
-                });
-            }
-            if !exact_source_paths.insert(module.source_path.clone()) {
-                return Err(ManifestError::DuplicateModuleSource(
-                    bounded_manifest_error_value(&module.source_path),
-                ));
-            }
-            if !portable_source_paths.insert(module.source_path.to_ascii_lowercase()) {
-                return Err(ManifestError::PortableSourceCollision(
-                    bounded_manifest_error_value(&module.source_path),
-                ));
-            }
-            let qualified_bytes = qualified_source_path_length(
-                &self.name,
-                &self.version,
-                &self.source_root,
-                &module.source_path,
-            );
-            if qualified_bytes > MAX_SOURCE_PATH_BYTES {
-                return Err(ManifestError::QualifiedSourcePathTooLong {
-                    module: bounded_manifest_error_value(&module.module.dotted()),
-                    bytes: qualified_bytes,
-                    limit: MAX_SOURCE_PATH_BYTES,
-                });
-            }
         }
         for dependency in &self.dependencies {
             if exact_requirement_version(&dependency.requirement).is_none() {
@@ -267,7 +226,6 @@ impl PackageManifest {
                 ManifestError::InvalidProfile(bounded_manifest_error_value(&error.to_string()))
             })?;
         }
-        let module_names: BTreeSet<_> = self.modules.iter().map(|module| &module.module).collect();
         let profile_names: BTreeSet<_> = self
             .profiles
             .iter()
@@ -288,11 +246,9 @@ impl PackageManifest {
                     target: bounded_manifest_error_value(image.target.as_str()),
                 });
             }
-            if !module_names.contains(&image.module) {
-                return Err(ManifestError::UnknownImageModule(
-                    bounded_manifest_error_value(&image.name),
-                ));
-            }
+            // `image.module` existence is checked by the loader once modules
+            // are derived from a filesystem walk; this pure model has no
+            // filesystem access.
             if !profile_names.contains(image.profile.as_str()) {
                 return Err(ManifestError::UnknownImageProfile {
                     image: bounded_manifest_error_value(&image.name),
@@ -551,26 +507,6 @@ pub fn exact_requirement_version(requirement: &str) -> Option<PackageVersion> {
         return None;
     }
     PackageVersion::new(version.to_owned()).ok()
-}
-
-fn qualified_source_path_length(
-    name: &PackageName,
-    version: &PackageVersion,
-    source_root: &str,
-    source_path: &str,
-) -> usize {
-    // `packages/` + hex(name) + `/` + hex(version) + `/` + SHA-256 hex +
-    // `/` + root + `/` + path. Hex identity components make this virtual path
-    // injective and immune to portable case-folding collisions.
-    9 + name.as_str().len() * 2
-        + 1
-        + version.as_str().len() * 2
-        + 1
-        + 64
-        + 1
-        + source_root.len()
-        + 1
-        + source_path.len()
 }
 
 /// One package in deterministic graph order.
@@ -931,7 +867,14 @@ fn require_strict_order(
     Ok(())
 }
 
-fn validate_source_path(path: &str) -> Result<(), ManifestError> {
+/// Validate a portable, NFC-normalized, `/`-separated manifest-relative path.
+///
+/// Rejects a leading separator, `\`, `:`, control characters, non-NFC
+/// spellings, and any empty, `.`, or `..` component. Shared by manifest field
+/// validation (`source_root`, image-test `scenario`) and by the loader's
+/// derived module-path walk, which applies the same rule to every discovered
+/// `*.wr` file since `[[module]]` no longer declares them.
+pub fn validate_source_path(path: &str) -> Result<(), ManifestError> {
     if path.is_empty()
         || path.len() > 4096
         || path.starts_with('/')
@@ -1026,52 +969,18 @@ pub enum ManifestError {
     NonCanonicalOrder(&'static str),
     InvalidSourcePath(String),
     InvalidDependencyRequirement(String),
-    TooManyModules,
     TooManyDependencies,
-    TooManyLockedPackages {
-        count: usize,
-        limit: usize,
-    },
-    ModuleSourceMismatch {
-        module: String,
-        expected: String,
-        actual: String,
-    },
-    DuplicateModuleSource(String),
-    PortableSourceCollision(String),
-    QualifiedSourcePathTooLong {
-        module: String,
-        bytes: usize,
-        limit: usize,
-    },
+    TooManyLockedPackages { count: usize, limit: usize },
     InvalidProfile(String),
-    InvalidSourceIdentifier {
-        kind: &'static str,
-        value: String,
-    },
-    InvalidAtom {
-        kind: &'static str,
-        value: String,
-    },
-    UnknownImageModule(String),
-    UnknownImageProfile {
-        image: String,
-        profile: String,
-    },
-    UnsupportedImageTarget {
-        image: String,
-        target: String,
-    },
+    InvalidSourceIdentifier { kind: &'static str, value: String },
+    InvalidAtom { kind: &'static str, value: String },
+    UnknownImageProfile { image: String, profile: String },
+    UnsupportedImageTarget { image: String, target: String },
     InvalidTestLimits(String),
     UnknownTestImage(String),
     MissingRootPackage,
-    MissingLockedDependency {
-        package: String,
-        dependency: String,
-    },
-    UnreachableLockedPackage {
-        package: String,
-    },
+    MissingLockedDependency { package: String, dependency: String },
+    UnreachableLockedPackage { package: String },
 }
 
 impl fmt::Display for ManifestError {
@@ -1100,10 +1009,6 @@ impl fmt::Display for ManifestError {
                     bounded_manifest_error_value(alias)
                 )
             }
-            Self::TooManyModules => write!(
-                formatter,
-                "manifest exceeds the module-count limit of {MAX_MODULES}"
-            ),
             Self::TooManyDependencies => write!(
                 formatter,
                 "manifest exceeds the dependency-count limit of {MAX_DEPENDENCIES_PER_PACKAGE}"
@@ -1111,40 +1016,6 @@ impl fmt::Display for ManifestError {
             Self::TooManyLockedPackages { count, limit } => write!(
                 formatter,
                 "lockfile contains {count} packages; limit is {limit}"
-            ),
-            Self::ModuleSourceMismatch {
-                module,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "module {} must use source path {:?}, not {:?}",
-                bounded_manifest_error_value(module),
-                bounded_manifest_error_value(expected),
-                bounded_manifest_error_value(actual)
-            ),
-            Self::DuplicateModuleSource(path) => {
-                write!(
-                    formatter,
-                    "source path {:?} is assigned to multiple modules",
-                    bounded_manifest_error_value(path)
-                )
-            }
-            Self::PortableSourceCollision(path) => {
-                write!(
-                    formatter,
-                    "module source path collides portably: {:?}",
-                    bounded_manifest_error_value(path)
-                )
-            }
-            Self::QualifiedSourcePathTooLong {
-                module,
-                bytes,
-                limit,
-            } => write!(
-                formatter,
-                "qualified source path for module {} is {bytes} bytes; limit is {limit}",
-                bounded_manifest_error_value(module)
             ),
             Self::InvalidProfile(message) => write!(
                 formatter,
@@ -1163,13 +1034,6 @@ impl fmt::Display for ManifestError {
                 "invalid {kind} {:?}",
                 bounded_manifest_error_value(value)
             ),
-            Self::UnknownImageModule(image) => {
-                write!(
-                    formatter,
-                    "image {} refers to an undeclared module",
-                    bounded_manifest_error_value(image)
-                )
-            }
             Self::UnknownImageProfile { image, profile } => write!(
                 formatter,
                 "image {} refers to unknown build profile {}",
@@ -1418,9 +1282,9 @@ mod tests {
     use super::{
         DependencyAlias, FORBIDDEN_IDENTIFIER_CODE_POINT_RANGES, GraphError, ImageDeclaration,
         ImageTestDeclaration, LOCKFILE_SCHEMA_VERSION, LockedDependency, LockedPackage, Lockfile,
-        MANIFEST_SCHEMA_VERSION, MAX_MANIFEST_ERROR_VALUE_BYTES, ManifestError, ManifestModule,
-        ModulePath, PackageGraphBuilder, PackageIdentity, PackageLocator, PackageManifest,
-        PackageName, PackageVersion, REVISION_0_1_KEYWORDS, bounded_manifest_error_value,
+        MANIFEST_SCHEMA_VERSION, MAX_MANIFEST_ERROR_VALUE_BYTES, ManifestError, ModulePath,
+        PackageGraphBuilder, PackageIdentity, PackageLocator, PackageManifest, PackageName,
+        PackageVersion, REVISION_0_1_KEYWORDS, bounded_manifest_error_value,
         validate_declared_atom, validate_source_identifier, validate_source_path,
     };
 
@@ -1440,10 +1304,6 @@ mod tests {
             name: PackageName::new("root").expect("package name"),
             version: PackageVersion::new("1.0.0").expect("package version"),
             source_root: "src".to_owned(),
-            modules: vec![ManifestModule {
-                module: module.clone(),
-                source_path: "app.wr".to_owned(),
-            }],
             dependencies: Vec::new(),
             profiles: vec![BuildProfile::development()],
             images: vec![ImageDeclaration {
@@ -1816,7 +1676,6 @@ mod tests {
             name: PackageName::new("root").expect("package name"),
             version: PackageVersion::new("1.0.0").expect("package version"),
             source_root: "src".to_owned(),
-            modules: Vec::new(),
             dependencies: Vec::new(),
             profiles: vec![profile],
             images: Vec::new(),

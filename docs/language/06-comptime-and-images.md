@@ -2,36 +2,49 @@
 
 ## 1. Compile-time evaluation
 
-`comptime` runs ordinary typed wrela code during the build. It is not a textual
-preprocessor and does not introduce a second expression language.
+`comptime` evaluates ordinary typed wrela code during the build. It is not a
+textual preprocessor and does not introduce a second expression language.
 
-It serves four primary roles:
+There is no comptime function color. A plain `fn` is phase-neutral: it may run
+at runtime, or be called from a comptime context when its transitive call
+closure is comptime-legal (section 2). `comptime` survives in source only as
+`comptime if`, `comptime assert`, and a prefix `comptime` expression that
+forces evaluation of the following expression at the enclosing comptime
+boundary.
 
-- constructing the image graph;
-- specializing generic types and constant control flow;
-- producing deterministic baked artifacts such as a small filesystem or font
-  atlas; and
-- validating device contracts, capacities, and post-layout reports.
+Comptime contexts include:
+
+- const initializers and generic const arguments;
+- `comptime if` conditions and a prefix `comptime` expression;
+- `@image` and `@layout_assert` bodies, evaluated only by the compiler
+  (section 8); and
+- a comptime-tier test body (section 12).
 
 ```wrela
-comptime fn ring_bytes(depth: usize) -> usize:
+fn ring_bytes(depth: usize) -> usize:
     return align_up(depth * VirtqDesc.size, 4096)
 
 const QDEPTH = 128
 const RING_BYTES = ring_bytes(QDEPTH)
 ```
 
-## 2. Purity and determinism
+Legality is checked at the comptime call boundary — the point where a comptime
+context calls a plain `fn` — against that function's complete transitive call
+closure. A violation is diagnosed with the offending call path from the
+boundary to the illegal operation.
 
-Compile-time code MUST be deterministic for a fixed compiler revision, target,
-source graph, declared build inputs, and step budget. It cannot:
+## 2. Comptime legality: purity and determinism
+
+A call closure is comptime-legal only when it is deterministic for a fixed
+compiler revision, target, source graph, declared build inputs, and step
+budget. It cannot:
 
 - perform filesystem, network, console, or device I/O;
 - read host environment variables or undeclared files;
 - inspect wall time, random state, process identity, or host addresses;
 - touch MMIO, DMA, IRQ, or runtime capabilities;
 - depend on hash-table iteration with unspecified order; or
-- invoke runtime-only code.
+- invoke async, actor, or ISR operations.
 
 Large or external inputs enter through the build system as declared,
 content-addressed byte values. Comptime may transform those values but cannot
@@ -66,10 +79,10 @@ Raising a quota changes build configuration, not language soundness. The
 compiler must still allow the user to interrupt evaluation and must not allow
 recursion or type-expression evaluation to escape quota accounting.
 
-When the bounded evaluator runs one `@test comptime fn`, section 12 catches
-step, memory, and call-depth exhaustion at that test boundary and records a
-failed comptime case. Quota exhaustion during ordinary build evaluation remains
-a build error.
+When the bounded evaluator runs one comptime-tier `@test fn`, section 12
+catches step, memory, and call-depth exhaustion at that test boundary and
+records a failed comptime case. Quota exhaustion during ordinary build
+evaluation remains a build error.
 
 ## 4. Comptime values and runtime data
 
@@ -126,8 +139,8 @@ Every interface call resolves to a direct concrete call or an explicit branch
 over a closed enum.
 
 Any configuration that changes the actor, task, ISR, capability, or effect
-graph MUST be a comptime type/constant argument of the affected class or image
-node. It cannot be duplicated as a runtime value or a second image-builder
+graph MUST be a comptime type/constant argument of the affected struct or
+image node. It cannot be duplicated as a runtime value or a second image-builder
 option. This makes the specialized graph used by validation identical to the
 graph that reaches code generation.
 
@@ -148,12 +161,13 @@ pass.
 
 ## 8. Image construction
 
-Exactly one reachable public `@image comptime fn` returns the `Image` value for
-a build. It declares the target and creates the complete typed runtime graph.
-The constructor is evaluated only by the compiler and is never emitted as a
-runtime function. After the graph is sealed, the compiler generates a distinct
-runtime image entry whose provenance names the constructor; generated test
-harness entries use a separate provenance kind.
+`@image` attaches to a plain `fn` returning `Image`. Exactly one reachable
+public `@image fn` returns the `Image` value for a build. It declares the
+target and creates the complete typed runtime graph. The constructor is
+evaluated only by the compiler and is never emitted as runtime code; a
+runtime reference to it is a build error. After the graph is sealed, the
+compiler generates a distinct runtime image entry whose provenance names the
+constructor; generated test harness entries use a separate provenance kind.
 
 ```wrela
 module appliance.image
@@ -165,7 +179,7 @@ from apps.notes import Notes
 const BLOCK_MODE: DriverMode = DriverMode.irq
 
 @image
-pub comptime fn build() -> Image:
+pub fn build() -> Image:
     img = Image(
         name="wrela-storage",
         target=Target.aarch64_qemu_virt_uefi,
@@ -218,7 +232,7 @@ pub comptime fn build() -> Image:
     return img.seal()
 
 @layout_assert
-comptime fn fits_in_64_mib(report: ImageReport):
+fn fits_in_64_mib(report: ImageReport):
     assert report.peak_memory < 64.MiB
 ```
 
@@ -308,11 +322,11 @@ components. No user comptime code runs.
 ### Phase 2: resolve signatures and compile-time code
 
 Names, visibility, orphan/coherence constraints, generic parameter kinds,
-declaration signatures, constant dependencies, attribute names, and comptime
-function bodies are resolved and type-checked. Semantic cycles in constants,
-layouts, and signatures are rejected. Runtime bodies are parsed and name
-resolved sufficiently to discover referenced declarations, but are not yet
-checked under an unspecialized comptime branch.
+declaration signatures, constant dependencies, attribute names, and bodies
+referenced from comptime contexts are resolved and type-checked. Semantic
+cycles in constants, layouts, and signatures are rejected. Runtime bodies are
+parsed and name resolved sufficiently to discover referenced declarations, but
+are not yet checked under an unspecialized comptime branch.
 
 ### Phase 3: evaluate image-root constants and construct the image
 
@@ -372,10 +386,12 @@ language-level safety or capacity proof.
 
 ### Phase 8: run post-layout assertions
 
-Functions marked `@layout_assert` receive only `ImageReport`. They may inspect
-layout, footprint, specialization, and timing summaries. They cannot emit code,
-change capacities, add actors, or cause another layout pass. Failure is a build
-error, so there is no phase-ordering fixpoint.
+`@layout_assert` attaches to a plain `fn` that receives only `ImageReport`. It
+is evaluated only by the compiler at this phase; a runtime reference to it is
+a build error. It may inspect layout, footprint, specialization, and timing
+summaries. It cannot emit code, change capacities, add actors, or cause
+another layout pass. Failure is a build error, so there is no phase-ordering
+fixpoint.
 
 ### Phase 9: emit and link
 
@@ -399,38 +415,23 @@ a declared hashed input.
 
 ## 12. Tests
 
-The complete revision 0.1 design reserves three test forms with two execution
-semantics. The first implementation claim is intentionally narrower: genuine
-source-level comptime unit tests over ordinary production functions. Test-plan
-construction, report rendering, QEMU orchestration, or a fixture containing
-only `comptime assert true` is not evidence that this source-unit contract is
-implemented.
+`@test` attaches to a plain `fn`. wrela has two test execution tiers: a
+comptime-tier test, whose closure may run in the build evaluator, and a
+runtime/image test, which runs as a generated image test (section 12.2).
 
-### 12.1 Bounded source-level comptime unit tests
+### 12.1 Comptime-tier tests
 
-This subsection describes the implemented bounded surface. It is a narrower
-delivery claim than the complete revision 0.1 design, and it remains supported
-only while the named source, workspace, and public-CLI gates recorded in the
-requirements matrix and verification log pass.
-
-The root package manifest declares both production and test modules in the
-ordinary module graph; there is no hidden test-only source loader. For example:
-
-```toml
-[[module]]
-name = "app.math"
-path = "app/math.wr"
-
-[[module]]
-name = "app.math_test"
-path = "app/math_test.wr"
-```
+Both production and test modules are discovered by the same deterministic
+sorted walk of `source_root` described in
+[Source language](02-source-language.md); there is no hidden test-only source
+loader or separate manifest listing. For example, `src/app/math.wr` and
+`src/app/math_test.wr` are both ordinary modules beneath `source_root`:
 
 ```wrela
 # src/app/math.wr
 module app.math
 
-pub comptime fn add(left: u32, right: u32) -> u32:
+pub fn add(left: u32, right: u32) -> u32:
     return left + right
 ```
 
@@ -441,204 +442,53 @@ module app.math_test
 from app.math import add
 
 @test
-comptime fn add_combines_two_values():
+fn add_combines_two_values():
     result: u32 = add(20, 22)
     comptime assert result == 42, "add returned the wrong value"
 ```
 
-Discovery selects `@test comptime fn` declarations from manifest-declared
-modules in the root package. It does not silently run `@test` declarations from
-dependencies. A selected test may import a public, module-level production
-`comptime fn`, pass supported values, consume its result, and exercise further
-direct user-function calls made by that production function. Every callee is
-the ordinary resolved HIR declaration; the compiler does not replace it with a
-fixture, host callback, or second evaluator implementation.
-
-The active scalar subset is `unit`, `bool`, and the target integer types `u8`,
-`u16`, `u32`, `u64`, `u128`, `usize`, `i8`, `i16`, `i32`, `i64`, `i128`, and
-`isize`. The active aggregate subset is a nominal, nongeneric `struct` whose
-fields are all active scalar types, have no defaults or attributes,
-and require no interface specialization. Such a flat structure may cross a
-module boundary through a public type and public fields; may be used as a
-parameter, local, or result; may be constructed with every field supplied
-exactly once; and may be projected to a scalar field. Multi-field constructors
-require named arguments and bind them by declaration name independent of source
-order. A one-field constructor may use its sole positional argument. Privacy,
-nominal identity, duplicate, missing, and unknown fields are checked rather
-than inferred from equal layouts.
-
-Within that subset, test and callee bodies may use typed parameters, typed or
-inferred locals, local initialization and reassignment, `if`/`elif`/`else` and
-`comptime if`, explicit and implicit unit returns, direct nested calls with
-positional or declaration-matched named arguments, integer
-unary/arithmetic/wrapping/bitwise/shift operations, scalar comparisons, and
-short-circuit `not`/`and`/`or`. A bare flat-structure parameter is a read, as in
-the ordinary parameter contract. Producing an independently owned value from
-it requires `copy`. Assignment and return move an owned non-scalar local unless
-`copy` is written; every continuing branch must leave a later-read local
-initialized. Use after move and an attempted ownership-producing use of a bare
-read parameter are rejected before evaluation. Integer widths, signed
-two's-complement ordering, checked and wrapping overflow, division/remainder,
-and shifts follow sections 5.1 and 8 of chapter 02. The exact most-negative
-signed literal is admitted without first requiring its unnegated magnitude to
-fit; this includes inferred `i64::MIN` and explicitly typed signed minima.
-`usize` and `isize` use the selected target width rather than the compiler host
-width.
+Discovery selects `@test fn` declarations from manifest-declared modules in
+the root package; it does not run `@test` declarations from dependencies. A
+selected test whose complete transitive call closure is comptime-legal
+(section 2) evaluates in the build evaluator against the ordinary resolved
+declarations — the compiler does not substitute a fixture, host callback, or
+second evaluator implementation. A test whose closure is not comptime-legal
+is a runtime/image test instead (section 12.2).
 
 Evaluation is deterministic and left-to-right, uses only the sealed source
 graph and declared build profile, and has no runtime or ambient-host effects.
-Every test receives fresh invocation frames. Calls preserve parameter/local
-isolation and a bounded source-aware stack containing each callee and call site.
-Steps and abstract evaluator memory are charged in host-independent units. The
-effective evaluator step limit is
-`min(semantic evaluator_steps, profile comptime_steps)`, and its effective
-memory limit is
-`min(semantic evaluator_bytes, profile comptime_memory_bytes)`. Active call
-depth is checked separately at
-`min(profile comptime_call_depth, 32)`; 32 is the reviewed host-safe envelope
-for active Wrela invocation frames. The complete retained host-recursion shape
-from active calls plus nested syntax is independently capped at the fixed
-cumulative envelope 48. This prevents otherwise legal call and per-function
-syntax maxima from multiplying beyond the reviewed host stack until evaluation
-moves to an explicit continuation stack. Aggregate-aware evaluator frames made
-the former 96-unit envelope unsafe on the deliberately small regression stack.
-The conservative 1-MiB-stack proof now genuinely admits 48 and rejects 49 with
-the stable comptime resource-limit classification; the language-visible
-active-call cap remains 32.
+Every test receives a fresh, isolated invocation frame with a bounded
+source-aware call stack.
 
-Flat structures have canonical evaluator accounting of 32 bytes for the value
-header plus 32 bytes per scalar field. Construction, copy, projection,
-replacement, discarded temporaries, and successful frame teardown poll their
-complete logical field traversal. Payload retention is released only after the
-corresponding bounded cleanup succeeds, so exact and one-under step and memory
-limits remain deterministic across compiler hosts.
+A false `comptime assert` is a failed case naming its phase, stable message,
+and source identity. Exhausting the evaluator's step, memory, or call-depth
+quota at a test boundary is likewise a failed case — not a build error —
+naming the exhausted resource and a source-aware call stack, as is a checked
+arithmetic error. These case failures publish the canonical test report and
+make the command unsuccessful; they are not reclassified as infrastructure
+failures. Outside a test boundary, an assertion or quota failure keeps its
+ordinary build-error classification.
 
-The other evaluator-owned payloads follow the same rule. Text is one explicitly
-polled allocation. An evaluated Image stores the image name and all installed
-actor names in one contiguous string arena, while actor records contain only
-copyable checked ranges into that arena. Replacement, discarded temporaries,
-successful frame cleanup, and image-install snapshots poll every logical actor
-or text chunk before crediting released quota; the remaining host destruction
-is constant-work even when cancellation interrupts cleanup. Arena appends and
-copies are chunk-polled, hidden project-sized value cloning is unavailable, and
-quota release uses checked subtraction that fails closed on an internal
-accounting mismatch.
+A source-shape error — an unsupported signature, an invalid call target or
+argument, a type mismatch, an uninitialized or moved-from use, and similar —
+aborts discovery with an ordinary compiler diagnostic instead of publishing a
+report. Publication is atomic: cancellation or an aborted discovery yields
+neither a partial plan nor a partial report.
 
-Canonical semantic ordering is also cancellation-aware. Every production sort
-in the analyzer uses a bounded stable merge/index sort with fallible scratch,
-polled comparisons/copy-back/permutation, and byte-polled string comparison.
-The exact scratch bound is accepted, the first over-bound input is rejected
-before scratch fill, and cancellation at the final comparison prevents result
-publication.
-
-Before execution, one bounded static checker validates the selected test and
-its complete direct-call closure, including operations in untaken branches and
-short-circuit right operands. Its work and storage ceilings are each the
-semantic `fact_edges` limit, and its effective syntax depth is
-`min(semantic constant_depth, 32)`. It publishes a type-check proof only after
-that closure succeeds; the proof names every checked declaration source and
-records the checker's exact work count. Before constructing a source-aware
-closure diagnostic, the checker charges its code, message, and stack labels
-against both the semantic `diagnostic_bytes` and `test_bytes` ceilings. A label
-costs its exact UTF-8 message bytes plus 64 canonical logical structural bytes;
-that logical charge is target-independent quota accounting, not a claim about
-one host allocator's layout. These checker ceilings are semantic analysis
-ceilings, not extra manifest comptime allowances. For every effective bound,
-the exact limit is accepted and the first over-limit operation fails.
-Cancellation is polled during static closure checking, diagnostic measurement
-and copying, discovery, expression/statement execution, calls, and bounded
-model/report construction.
-
-Semantic text materialized around this vertical is bounded at its source size:
-float-spelling normalization used by ordinary scalar analysis and actor-derived
-fact text check `fact_bytes` before allocation, reserve fallibly, and poll
-cancellation while copying each 64-byte source chunk. Exact size is admitted
-and the first extra byte fails. These bounded support paths do not add floats or
-actors to the comptime unit-test value subset.
-
-A false `comptime assert` is a failed case with phase `comptime`, its stable
-message, and source identity. Step, memory, active-call-depth, or cumulative
-host-recursion exhaustion is also a failed comptime case with code
-`semantic-comptime-resource-limit`, the applicable stable resource name and
-limit, and a source-aware stack. These case failures publish the canonical test
-report and make the command unsuccessful; they are not reclassified as
-infrastructure failures. Checked arithmetic errors are likewise failed
-comptime cases and retain the stable `semantic-comptime-arithmetic` code plus
-their source-aware call stack.
-
-Source-shape failures remain source diagnostics: unsupported signatures,
-invalid call targets or arguments, scalar type mismatches, invalid integer
-literals, invalid or uninitialized locals, and missing returns use
-`semantic-comptime-signature-not-supported`,
-`semantic-comptime-call-target`, `semantic-comptime-call-argument`,
-`semantic-comptime-type-mismatch`, `semantic-comptime-integer-literal`,
-`semantic-comptime-local`, `semantic-comptime-uninitialized`, and
-`semantic-comptime-missing-return`, respectively. Only an operation that is
-outside the implemented evaluator subset uses
-`semantic-comptime-operation-not-implemented`; it is not a catch-all for type,
-call, or quota errors. Any such source diagnostic aborts discovery and
-publishes no report that could be mistaken for a completed run. Exhausting a
-pre-execution semantic checker/model ceiling also aborts without a report;
-diagnostic construction that exceeds either output ceiling retains the stable
-`diagnostic bytes` or `test plan or results` resource classification.
-Cancellation likewise aborts the operation and atomically publishes neither a
-partial plan nor a partial report. Outside a test boundary, an assertion or
-evaluator-quota failure retains its ordinary build-error classification.
-
-Unsupported aggregate shapes use
-`semantic-comptime-aggregate-not-supported`. Constructor and field-shape
-failures, cross-module private-field access, use after an aggregate move, and an
-attempt to move a bare read parameter retain their more specific stable
-diagnostics, including `semantic-comptime-constructor-argument`,
-`semantic-comptime-field-private`, `semantic-comptime-use-after-move`, and
-`semantic-comptime-borrowed-value-move`. They are source diagnostics, not
-failed test cases or quota failures.
-
-The public comptime-only route is:
-
-```text
-wrela test <wrela.toml> <IMAGE> [OUTPUT-DIRECTORY] --comptime
-```
-
-It discovers and evaluates the genuine source tests, then publishes the same
-bounded canonical report schema used by the test system. Comptime cases carry
-no fabricated runtime duration or image execution. Their names are canonical
-`package@version::module::function` names and their dense IDs are assigned only
-after selection. The independent name-filter route is, for example:
-
-```text
-wrela test <wrela.toml> <IMAGE> [OUTPUT-DIRECTORY] --name-contains app.math_test::add_combines_two_values
-```
-
-`--comptime` and `--name-contains` are mutually exclusive selection modes and
-must not appear in the same invocation. `--name-contains <TEXT>` filters the
-canonical names before plan sealing, so the checked-in selection gate invokes
-the same imported production functions rather than selecting synthetic model
-fixtures. Canonical report bytes do not bind absolute workspace or output
-paths.
-
-This bounded vertical is not general unit-testing support. Class construction
-and values, receiver or associated methods, generic functions or structures,
-nested or otherwise non-flat aggregates, aggregate equality, floating point,
-loops and loop control, and other comptime forms remain follow-on evaluator
-work. `Result`/`Ok`/`Err` are not in the active core subset, so a returned `Err`
-is not currently a supported test outcome; when that core type is implemented,
-`Result[unit, E]` test returns require their own stable failure representation
-and gates. Runtime `assert` lowering, generated runtime-image unit tests, and
-ordinary or async runtime test execution are also explicit follow-on work and
-cannot be inferred from comptime report success.
+Discovery, evaluation, and reporting consume one canonical, sealed test plan.
+Tests are identified by canonical `package@version::module::function` name,
+independent of the invoking workspace or output path.
 
 ### 12.2 Runtime and image test design
 
-A zero-argument `@test fn` or `@test async fn` is reserved as an integration
-test. The complete implementation constructs a generated, bounded `@image`
-harness containing the selected tests and the same
-runtime/standard-library/target semantics as an ordinary image. Each test has a
-statically allocated activation, stack/frame, event, output, and timeout bound.
-The harness reports assertion/log/terminal events through the compiler-owned
-test runtime intrinsic; it is not a hosted executable and cannot call host
-libraries. This design is not an implemented runtime-unit claim until runtime
-assertion lowering and source-to-image end-to-end gates pass.
+A zero-argument `@test fn` or `@test async fn` whose closure is not
+comptime-legal is a runtime/image (integration) test. Discovery constructs a
+generated, bounded `@image` harness containing the selected tests under the
+same runtime/standard-library/target semantics as an ordinary image. Each
+test has a statically allocated activation, stack/frame, event, output, and
+timeout bound. The harness reports assertion/log/terminal events through the
+compiler-owned test runtime intrinsic; it is not a hosted executable and
+cannot call host libraries.
 
 An image test is declared in `wrela.toml`. It selects an existing declared
 `@image` root, a host scenario, finite boot/shutdown/event/output time and size

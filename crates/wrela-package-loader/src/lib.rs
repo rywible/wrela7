@@ -850,7 +850,6 @@ fn validate_candidate_manifest_shape(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), LoadError> {
     for (resource, count, limit) in [
-        ("manifest modules", manifest.modules.len(), limits.modules),
         (
             "manifest dependencies",
             manifest.dependencies.len(),
@@ -883,33 +882,6 @@ fn validate_candidate_manifest_shape(
         return Err(LoadError::InvalidOutput(
             "candidate source root exceeds the semantic limit".to_owned(),
         ));
-    }
-    for module in &manifest.modules {
-        if is_cancelled() {
-            return Err(LoadError::Cancelled);
-        }
-        if module.source_path.len() > 4096 {
-            return Err(LoadError::InvalidOutput(
-                "candidate module source path exceeds the semantic limit".to_owned(),
-            ));
-        }
-        let mut expected_path_bytes = ".wr".len();
-        for (index, segment) in module.module.segments().iter().enumerate() {
-            if is_cancelled() {
-                return Err(LoadError::Cancelled);
-            }
-            expected_path_bytes = expected_path_bytes
-                .checked_add(usize::from(index != 0))
-                .and_then(|bytes| bytes.checked_add(segment.len()))
-                .ok_or_else(|| {
-                    LoadError::InvalidOutput("candidate module path length overflow".to_owned())
-                })?;
-        }
-        if expected_path_bytes > 4096 {
-            return Err(LoadError::InvalidOutput(
-                "candidate module path exceeds the manifest path limit".to_owned(),
-            ));
-        }
     }
     for dependency in &manifest.dependencies {
         if is_cancelled() {
@@ -1343,12 +1315,6 @@ pub fn seal_loaded_workspace(
         u64::from(limits.packages),
     )?;
     package_bytes.resize(package_count, 0u64);
-    let mut package_module_counts = try_loader_vec(
-        package_count,
-        "per-package module counts",
-        u64::from(limits.packages),
-    )?;
-    package_module_counts.resize(package_count, 0usize);
     let mut package_records = try_loader_vec(
         package_count,
         "per-package content record sets",
@@ -1356,14 +1322,33 @@ pub fn seal_loaded_workspace(
     )?;
     let content_record_limit =
         u64::from(limits.sources).saturating_add(u64::from(limits.scenarios));
-    for loaded in &loaded_manifests {
+    // Modules are not declared by the manifest, so per-package module counts
+    // come from the graph (already sorted by `(package, path)`) rather than a
+    // manifest-side module list.
+    let mut package_module_counts = try_loader_vec(
+        package_count,
+        "per-package module counts",
+        u64::from(limits.packages),
+    )?;
+    package_module_counts.resize(package_count, 0usize);
+    for module in graph.modules() {
         if is_cancelled() {
             return Err(LoadError::Cancelled);
         }
-        let capacity = loaded
-            .manifest
-            .modules
-            .len()
+        let package_index = usize::try_from(module.package.0)
+            .map_err(|_| LoadError::InvalidOutput("package ID does not fit usize".to_owned()))?;
+        let count = package_module_counts
+            .get_mut(package_index)
+            .ok_or_else(|| LoadError::InvalidOutput("module package ID is not dense".to_owned()))?;
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| LoadError::InvalidOutput("package module count overflow".to_owned()))?;
+    }
+    for (loaded, module_count) in loaded_manifests.iter().zip(&package_module_counts) {
+        if is_cancelled() {
+            return Err(LoadError::Cancelled);
+        }
+        let capacity = module_count
             .checked_add(loaded.manifest.image_tests.len())
             .ok_or(LoadError::ResourceLimit {
                 resource: "per-package content records",
@@ -1384,7 +1369,22 @@ pub fn seal_loaded_workspace(
         })?;
         *package_total = bytes;
     }
+    // Modules are not declared by the manifest: the expected relative source
+    // path is a pure function of the graph-assigned module path (segments
+    // joined by `/`, `.wr` appended). This mirrors the derivation the loader
+    // itself performed when it built these modules from a source-root walk.
+    let mut module_relative_paths = try_loader_vec(
+        graph.modules().len(),
+        "module relative source paths",
+        u64::from(limits.sources),
+    )?;
     for module in graph.modules() {
+        if is_cancelled() {
+            return Err(LoadError::Cancelled);
+        }
+        module_relative_paths.push(module.path.expected_source_path());
+    }
+    for (module_index, module) in graph.modules().iter().enumerate() {
         if is_cancelled() {
             return Err(LoadError::Cancelled);
         }
@@ -1396,22 +1396,16 @@ pub fn seal_loaded_workspace(
         let loaded = loaded_manifests
             .get(package_index)
             .ok_or_else(|| LoadError::InvalidOutput("module manifest is missing".to_owned()))?;
-        let declared = loaded
-            .manifest
-            .modules
-            .binary_search_by(|declared| declared.module.cmp(&module.path))
-            .ok()
-            .and_then(|index| loaded.manifest.modules.get(index))
-            .ok_or_else(|| {
-                LoadError::InvalidOutput("graph contains an undeclared module".to_owned())
-            })?;
+        let relative_path = module_relative_paths.get(module_index).ok_or_else(|| {
+            LoadError::InvalidOutput("module relative source path is missing".to_owned())
+        })?;
         let source = sources
             .get(module.source)
             .ok_or_else(|| LoadError::InvalidOutput("module source ID is missing".to_owned()))?;
         let expected_path = qualified_source_path(
             &loaded.identity,
             &loaded.manifest.source_root,
-            &declared.source_path,
+            relative_path,
         )?;
         let bytes = u64::try_from(source.text().len()).map_err(|_| {
             LoadError::InvalidOutput("source byte count does not fit u64".to_owned())
@@ -1435,14 +1429,6 @@ pub fn seal_loaded_workspace(
                 ),
             )));
         }
-        let module_count = package_module_counts
-            .get_mut(package_index)
-            .ok_or_else(|| {
-                LoadError::InvalidOutput("module package count is missing".to_owned())
-            })?;
-        *module_count = module_count
-            .checked_add(1)
-            .ok_or_else(|| LoadError::InvalidOutput("package module count overflow".to_owned()))?;
         package_records
             .get_mut(package_index)
             .ok_or_else(|| {
@@ -1450,7 +1436,7 @@ pub fn seal_loaded_workspace(
             })?
             .push(PackageContentRecord {
                 kind: PackageContentKind::Source,
-                path: &declared.source_path,
+                path: relative_path,
                 digest: source.digest(),
             });
     }
@@ -1459,16 +1445,6 @@ pub fn seal_loaded_workspace(
             resource: "source graph bytes",
             limit: limits.source_bytes,
         });
-    }
-    for (loaded, count) in loaded_manifests.iter().zip(&package_module_counts) {
-        if is_cancelled() {
-            return Err(LoadError::Cancelled);
-        }
-        if *count != loaded.manifest.modules.len() {
-            return Err(LoadError::InvalidOutput(
-                "module graph does not exactly cover each manifest module".to_owned(),
-            ));
-        }
     }
 
     if u64::try_from(scenarios.len()).unwrap_or(u64::MAX) > u64::from(limits.scenarios) {
@@ -2162,7 +2138,6 @@ pub enum LoadError {
         actual: Sha256Digest,
     },
     UndeclaredSource(String),
-    MissingSource(String),
     DuplicateSource(String),
     UndeclaredScenario(String),
     MissingScenario(String),
@@ -2224,11 +2199,6 @@ impl fmt::Display for LoadError {
                     bounded_load_error_value(path)
                 )
             }
-            Self::MissingSource(path) => write!(
-                formatter,
-                "manifest source {} is missing",
-                bounded_load_error_value(path)
-            ),
             Self::DuplicateSource(path) => {
                 write!(
                     formatter,
@@ -2788,9 +2758,8 @@ mod loader_tests {
     }
 
     fn manifest_bytes(name: &str, version: &str, dependencies: &[(&str, &str, &str)]) -> Vec<u8> {
-        let module_name = name.replace('-', "_");
         let mut manifest = format!(
-            "schema = 1\nlanguage = \"0.1-design\"\n\n[package]\nname = \"{name}\"\nversion = \"{version}\"\nsource_root = \"src\"\n\n[[module]]\nname = \"{module_name}\"\npath = \"{module_name}.wr\"\n"
+            "schema = 1\nlanguage = \"0.1-design\"\n\n[package]\nname = \"{name}\"\nversion = \"{version}\"\nsource_root = \"src\"\n"
         );
         for (alias, package, requirement) in dependencies {
             manifest.push_str(&format!(
@@ -3323,12 +3292,30 @@ mod loader_tests {
     }
 
     #[test]
-    fn source_set_rejects_missing_duplicate_and_undeclared_inputs() {
+    fn source_set_rejects_missing_duplicate_and_oversized_inputs() {
+        // Modules are derived from whatever the provider supplies, so an
+        // emptied or extended source set is not a distinct "missing" or
+        // "undeclared" declared-source class any more: it silently derives a
+        // different module set, and the package content digest computed over
+        // that set then mismatches the identity locked for the original
+        // source set.
         let mut missing = minimal_fixture();
         root_bundle_mut(&mut missing).sources.clear();
         assert!(matches!(
             load_fixture(&missing, &never_cancelled),
-            Err(LoadError::MissingSource(_))
+            Err(LoadError::DigestMismatch { .. })
+        ));
+
+        let mut extra = minimal_fixture();
+        let text = "fn extra() -> unit:\n    return ()\n";
+        root_bundle_mut(&mut extra).sources.push(SourceInput {
+            path: "extra.wr".to_owned(),
+            text: text.to_owned(),
+            digest: SoftwareSha256.sha256(text.as_bytes()),
+        });
+        assert!(matches!(
+            load_fixture(&extra, &never_cancelled),
+            Err(LoadError::DigestMismatch { .. })
         ));
 
         let mut duplicate = minimal_fixture();
@@ -3339,15 +3326,17 @@ mod loader_tests {
             Err(LoadError::DuplicateSource(_))
         ));
 
-        let mut undeclared = minimal_fixture();
-        let text = "fn extra() -> unit:\n    return ()\n";
-        root_bundle_mut(&mut undeclared).sources.push(SourceInput {
-            path: "extra.wr".to_owned(),
+        // `UndeclaredSource` still fires for a source path over the portable
+        // length ceiling, independent of anything the manifest declares.
+        let mut oversized = minimal_fixture();
+        let oversized_path = "x".repeat(wrela_source::MAX_SOURCE_PATH_BYTES + 1);
+        root_bundle_mut(&mut oversized).sources.push(SourceInput {
+            path: oversized_path,
             text: text.to_owned(),
             digest: SoftwareSha256.sha256(text.as_bytes()),
         });
         assert!(matches!(
-            load_fixture(&undeclared, &never_cancelled),
+            load_fixture(&oversized, &never_cancelled),
             Err(LoadError::UndeclaredSource(_))
         ));
     }

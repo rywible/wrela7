@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use wrela_backend::{
     BackendReportAssembler, BackendReportRequest, CanonicalBackendReportAssembler, CodegenError,
     ObjectArtifact, PreparedBackendInput, emit_prepared_object, llvm_backend_available,
-    machine_wir::{CheckedIntegerOp, IntegerPredicate, MachineFunctionOrigin, MachineOperation},
+    machine_wir::{CheckedIntegerOp, ConversionOp, MachineFunctionOrigin, MachineOperation},
     prepare_canonical_frame_for_codegen,
 };
 use wrela_build_model::{
@@ -96,12 +96,10 @@ fn checked_in_runtime_workspace_is_canonical_and_names_two_exact_source_tests() 
     assert!(SOURCE_PATHS.windows(2).all(|pair| pair[0] < pair[1]));
     let (manifest, root_identity, canonical_lockfile) = canonical_workspace();
     assert_eq!(manifest.name.as_str(), IMAGE_NAME);
-    assert_eq!(manifest.modules.len(), 1);
-    assert_eq!(manifest.modules[0].module.dotted(), "runtime.time_test");
-    assert_eq!(manifest.modules[0].source_path, "runtime/time_test.wr");
     assert_eq!(manifest.images.len(), 1);
     assert_eq!(manifest.images[0].name, IMAGE_NAME);
     assert_eq!(manifest.images[0].entry, "boot");
+    assert_eq!(manifest.images[0].module.dotted(), "runtime.time_test");
     assert_eq!(
         canonical_lockfile,
         WORKSPACE_LOCKFILE,
@@ -122,12 +120,13 @@ fn checked_in_runtime_workspace_is_canonical_and_names_two_exact_source_tests() 
             "selector must name exactly one source test"
         );
     }
-    assert!(
-        APPLICATION_SOURCE.contains("from core.time import add, as_nanoseconds, less_than, ns")
-    );
+    assert!(APPLICATION_SOURCE.contains("from core.time import add, as_nanoseconds, ns"));
     assert!(APPLICATION_SOURCE.contains("as_nanoseconds(value=ns(value=42))"));
     assert!(APPLICATION_SOURCE.contains("add(left=ns(value=20), right=ns(value=22))"));
-    assert!(APPLICATION_SOURCE.contains("less_than(left=ns(value=41), right=ns(value=42))"));
+    assert!(
+        APPLICATION_SOURCE
+            .contains("as_nanoseconds(value=ns(value=41)) < as_nanoseconds(value=ns(value=42))")
+    );
     assert!(APPLICATION_SOURCE.contains("value: u8 = left << count"));
 }
 
@@ -174,7 +173,8 @@ fn installed_core_time_source_reaches_real_test_harness_machine_and_native_objec
             "wrela-core@0.1.0::time::add",
             "wrela-core@0.1.0::time::as_nanoseconds",
             "wrela-core@0.1.0::time::as_nanoseconds",
-            "wrela-core@0.1.0::time::less_than",
+            "wrela-core@0.1.0::time::as_nanoseconds",
+            "wrela-core@0.1.0::time::as_nanoseconds",
             "wrela-core@0.1.0::time::ns",
             "wrela-core@0.1.0::time::ns",
             "wrela-core@0.1.0::time::ns",
@@ -220,24 +220,26 @@ fn installed_core_time_source_reaches_real_test_harness_machine_and_native_objec
             }
         ) && matches!(instruction.source, Some(source) if source.file == fixture.core_time_file)
     ));
-    let core_less = flow_model
+    let core_as_nanoseconds = flow_model
         .functions
         .iter()
-        .find(|function| function.name == "wrela-core@0.1.0::time::less_than")
-        .expect("installed core.time.less_than is reachable");
-    assert!(core_less.blocks.iter().flat_map(|block| &block.instructions).any(
+        .find(|function| function.name == "wrela-core@0.1.0::time::as_nanoseconds")
+        .expect("installed core.time.as_nanoseconds is reachable");
+    assert!(core_as_nanoseconds.blocks.iter().flat_map(|block| &block.instructions).any(
         |instruction| matches!(
             &instruction.operation,
-            FlowOperation::Binary {
-                op: FlowBinaryOp::Less,
-                ..
-            }
+            FlowOperation::ExtractField { field: 0, .. }
         ) && matches!(instruction.source, Some(source) if source.file == fixture.core_time_file)
     ));
 
     let report = flow.report().clone();
     let mut exact_limits = FlowLoweringLimits::standard();
-    exact_limits.blocks = report.blocks;
+    // `installed_core_time_executes_in_qemu`'s body ends in a bounded `guard:
+    // u32 = 0; while guard < 1: guard += 1` marker (the mechanism that keeps
+    // it out of the comptime tier); its FlowWir lowering reserves one more
+    // block than the report's final trimmed count, so the tight bound below
+    // needs a `+ 1` fudge a marker-free body would not.
+    exact_limits.blocks = report.blocks + 1;
     exact_limits.instructions = report.instructions;
     CanonicalFlowLowerer::new()
         .lower(
@@ -329,8 +331,8 @@ fn installed_core_time_source_reaches_real_test_harness_machine_and_native_objec
         |block| &block.instructions
     ).any(|instruction| matches!(
         &instruction.operation,
-        MachineOperation::IntegerCompare {
-            predicate: IntegerPredicate::UnsignedLess,
+        MachineOperation::Convert {
+            op: ConversionOp::Bitcast,
             ..
         }
     ) && matches!(instruction.source, Some(source) if source.file == fixture.core_time_file)));
@@ -939,8 +941,15 @@ fn typed_runtime_failure_and_source_diagnostic_remain_exact() {
         .flat_map(|function| &function.blocks)
         .flat_map(|block| &block.instructions)
         .filter_map(|instruction| match &instruction.operation {
-            MachineOperation::CheckedInteger { op, .. }
-                if matches!(instruction.source, Some(source) if source.file == fixture.application_file) =>
+            // `typed_checked_failure_reaches_qemu`'s body ends in a bounded
+            // `while guard < 1: guard += 1` marker (the mechanism that keeps
+            // it out of the comptime tier); its `+= 1` also lowers to a
+            // `CheckedInteger::Add` in this same function, which this
+            // exercise is not about, so only the shift variant is collected.
+            MachineOperation::CheckedInteger {
+                op: op @ (CheckedIntegerOp::ShiftLeft | CheckedIntegerOp::ShiftLeftWrapping),
+                ..
+            } if matches!(instruction.source, Some(source) if source.file == fixture.application_file) =>
             {
                 Some(*op)
             }
@@ -1288,20 +1297,31 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
     let manifest = codec
         .decode_manifest(WORKSPACE_MANIFEST, manifest_limits(), &never_cancelled)
         .expect("checked-in runtime manifest");
+    // The checked-in manifest declares only `[[profile]]` overrides and no
+    // `[[module]]` block (modules are derived by the loader, not decoded
+    // here), so it need not be byte-identical to its own canonical
+    // re-encoding; every digest below binds the canonical bytes, exactly as
+    // the production loader does.
+    let canonical_manifest = codec
+        .canonical_manifest(&manifest, manifest_limits(), &never_cancelled)
+        .expect("canonical runtime manifest");
     assert_eq!(
         codec
-            .canonical_manifest(&manifest, manifest_limits(), &never_cancelled)
-            .expect("canonical runtime manifest"),
-        WORKSPACE_MANIFEST
+            .decode_manifest(&canonical_manifest, manifest_limits(), &never_cancelled)
+            .expect("redecode canonical runtime manifest"),
+        manifest
     );
     let core_manifest = codec
         .decode_manifest(CORE_MANIFEST, manifest_limits(), &never_cancelled)
         .expect("checked-in core manifest");
+    let canonical_core_manifest = codec
+        .canonical_manifest(&core_manifest, manifest_limits(), &never_cancelled)
+        .expect("canonical core manifest");
     let root_identity = PackageIdentity {
         name: manifest.name.clone(),
         version: manifest.version.clone(),
         source_digest: package_content_digest(
-            WORKSPACE_MANIFEST,
+            &canonical_manifest,
             &[content_record("runtime/time_test.wr", APPLICATION_SOURCE)],
             &HASHER,
             &never_cancelled,
@@ -1312,7 +1332,7 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
         name: core_manifest.name.clone(),
         version: core_manifest.version.clone(),
         source_digest: package_content_digest(
-            CORE_MANIFEST,
+            &canonical_core_manifest,
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
@@ -1333,7 +1353,7 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
                 alias: DependencyAlias::new("core").expect("core alias"),
                 identity: core_identity.clone(),
             }],
-            manifest_digest: HASHER.sha256(WORKSPACE_MANIFEST),
+            manifest_digest: HASHER.sha256(&canonical_manifest),
         },
         LockedPackage {
             identity: core_identity,
@@ -1341,7 +1361,7 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
                 component: "wrela-core-0.1".to_owned(),
             },
             dependencies: Vec::new(),
-            manifest_digest: HASHER.sha256(CORE_MANIFEST),
+            manifest_digest: HASHER.sha256(&canonical_core_manifest),
         },
     ];
     packages.sort_by(|left, right| left.identity.cmp(&right.identity));

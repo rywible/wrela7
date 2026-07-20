@@ -6,18 +6,6 @@ name = "wrela-core"
 version = "0.1.0"
 source_root = "src"
 
-[[module]]
-name = "image"
-path = "image.wr"
-
-[[module]]
-name = "result"
-path = "result.wr"
-
-[[module]]
-name = "time"
-path = "time.wr"
-
 [[profile]]
 name = "development"
 mode = "development"

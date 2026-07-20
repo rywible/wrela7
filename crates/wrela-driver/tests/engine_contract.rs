@@ -20,7 +20,7 @@ fn input_files() -> Vec<(TreeRecord, Vec<u8>)> {
     [
         (
             "src/math.wr",
-            b"module app.math\n\npub comptime fn add(left: u32, right: u32) -> u32:\n    return left + right\n"
+            b"module app.math\n\npub fn add(left: u32, right: u32) -> u32:\n    return left + right\n"
                 .as_slice(),
         ),
         ("wrela.lock", b"lock-version = 1\n".as_slice()),

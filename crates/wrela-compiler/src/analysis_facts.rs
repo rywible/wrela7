@@ -344,7 +344,7 @@ fn require_supported_actor_types(
                     .as_program()
                     .declaration(*declaration)
                     .is_some_and(|declaration| {
-                        matches!(declaration.kind, wrela_hir::DeclarationKind::Class(_))
+                        matches!(declaration.kind, wrela_hir::DeclarationKind::Structure(_))
                             && ty.source == Some(declaration.source)
                     });
                 if !source_matches
@@ -2798,12 +2798,13 @@ mod tests {
         TargetIdentity, ValidatedBuildConfiguration, seal_build_configuration,
     };
     use wrela_hir::{
-        AggregateDeclaration, Attribute, AttributeIdentity, Body, BodyId, BodyOwner,
-        BuiltinAttribute, CallArgument, Declaration, DeclarationId, DeclarationKind,
+        AggregateDeclaration, AssignmentOperator, Attribute, AttributeIdentity, Body, BodyId,
+        BodyOwner, BuiltinAttribute, CallArgument, Declaration, DeclarationId, DeclarationKind,
         DeclarationOwner, Definition, EnumDeclaration, EnumVariant, Expression, ExpressionId,
         ExpressionKind, ExpressionOwner, FunctionColor, FunctionDeclaration, LexicalScope, Literal,
-        Module, Name, Program, ResolvedDeclaration, ResolvedVariant, Statement, StatementId,
-        StatementKind, TypeExpression, TypeExpressionKind, ValidatedProgram, Visibility,
+        Local, Module, Name, PlaceTarget, Program, ResolvedDeclaration, ResolvedVariant, Statement,
+        StatementId, StatementKind, TypeExpression, TypeExpressionKind, ValidatedProgram,
+        Visibility,
     };
     use wrela_hir_lower::{
         CanonicalHirLowerer, ChangeSet as HirChangeSet, HirLowerer,
@@ -2843,7 +2844,7 @@ async fn checkpoint():
     pass
 
 @service
-pub class Worker:
+pub struct Worker:
     pub async fn ping(mut self):
         await checkpoint()
 
@@ -2852,7 +2853,7 @@ pub class Worker:
         await checkpoint()
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
     installed = img.service(Worker, mailbox=2)
     return img
@@ -2954,7 +2955,7 @@ pub comptime fn boot() -> Image:
                         source: span(0, 0, 6),
                     }],
                     kind: DeclarationKind::Function(FunctionDeclaration {
-                        color: FunctionColor::Comptime,
+                        color: FunctionColor::Sync,
                         generics: Vec::new(),
                         parameters: Vec::new(),
                         result: Some(TypeExpression {
@@ -2980,6 +2981,7 @@ pub comptime fn boot() -> Image:
                         implements: Vec::new(),
                         fields: Vec::new(),
                         members: Vec::new(),
+                        linear: false,
                     }),
                     source: span(1, 10, 60),
                 },
@@ -3037,9 +3039,26 @@ pub comptime fn boot() -> Image:
                     id: BodyId(1),
                     owner: BodyOwner::Declaration(DeclarationId(3)),
                     scope: wrela_hir::ScopeId(1),
-                    locals: Vec::new(),
-                    statements: vec![StatementId(1)],
+                    locals: vec![wrela_hir::LocalId(0)],
+                    statements: vec![StatementId(1), StatementId(2)],
                     source: span(0, 220, 290),
+                },
+                // `runtime_case`'s body is a bounded `while` (not a bare
+                // `pass`): a trivial `pass` body is structurally within the
+                // static comptime-legality checker's supported subset, so it
+                // would be silently misrouted into the comptime tier instead
+                // of exercising the generated runtime/image test harness
+                // this fixture's callers expect. A bounded `while` is
+                // unsupported by the static checker but fully supported by
+                // the runtime-shape checker, so it deterministically stays
+                // selectable as a runtime test.
+                Body {
+                    id: BodyId(2),
+                    owner: BodyOwner::Declaration(DeclarationId(3)),
+                    scope: wrela_hir::ScopeId(2),
+                    locals: Vec::new(),
+                    statements: vec![StatementId(3)],
+                    source: span(0, 270, 289),
                 },
             ],
             scopes: vec![
@@ -3055,8 +3074,28 @@ pub comptime fn boot() -> Image:
                     parent: None,
                     source: span(0, 220, 290),
                 },
+                LexicalScope {
+                    id: wrela_hir::ScopeId(2),
+                    body: BodyId(2),
+                    parent: Some(wrela_hir::ScopeId(1)),
+                    source: span(0, 270, 289),
+                },
             ],
-            locals: Vec::new(),
+            locals: vec![Local {
+                id: wrela_hir::LocalId(0),
+                body: BodyId(1),
+                scope: wrela_hir::ScopeId(1),
+                name: name("guard"),
+                ty: Some(TypeExpression {
+                    kind: TypeExpressionKind::Named {
+                        definition: Definition::Builtin(wrela_hir::Builtin::U32),
+                        arguments: Vec::new(),
+                    },
+                    source: span(0, 230, 233),
+                }),
+                shadowed: None,
+                source: span(0, 230, 235),
+            }],
             statements: vec![
                 Statement {
                     id: StatementId(0),
@@ -3069,8 +3108,36 @@ pub comptime fn boot() -> Image:
                     id: StatementId(1),
                     body: BodyId(1),
                     attributes: Vec::new(),
-                    kind: StatementKind::Pass,
-                    source: span(0, 230, 250),
+                    kind: StatementKind::Initialize {
+                        local: wrela_hir::LocalId(0),
+                        value: ExpressionId(4),
+                    },
+                    source: span(0, 230, 245),
+                },
+                Statement {
+                    id: StatementId(2),
+                    body: BodyId(1),
+                    attributes: Vec::new(),
+                    kind: StatementKind::While {
+                        condition: ExpressionId(5),
+                        body: BodyId(2),
+                    },
+                    source: span(0, 246, 289),
+                },
+                Statement {
+                    id: StatementId(3),
+                    body: BodyId(2),
+                    attributes: Vec::new(),
+                    kind: StatementKind::Assign {
+                        targets: vec![PlaceTarget {
+                            root: Definition::Local(wrela_hir::LocalId(0)),
+                            projections: Vec::new(),
+                            source: span(0, 270, 275),
+                        }],
+                        operator: AssignmentOperator::Add,
+                        value: ExpressionId(6),
+                    },
+                    source: span(0, 270, 284),
                 },
             ],
             expressions: vec![
@@ -3118,6 +3185,45 @@ pub comptime fn boot() -> Image:
                         variant: 0,
                     })),
                     source: span(0, 70, 90),
+                },
+                Expression {
+                    id: ExpressionId(4),
+                    owner: ExpressionOwner::Body(BodyId(1)),
+                    scope: Some(wrela_hir::ScopeId(1)),
+                    kind: ExpressionKind::Literal(Literal::Integer("0".to_owned())),
+                    source: span(0, 244, 245),
+                },
+                Expression {
+                    id: ExpressionId(5),
+                    owner: ExpressionOwner::Body(BodyId(1)),
+                    scope: Some(wrela_hir::ScopeId(1)),
+                    kind: ExpressionKind::Compare {
+                        left: ExpressionId(7),
+                        operator: wrela_hir::ComparisonOperator::Less,
+                        right: ExpressionId(8),
+                    },
+                    source: span(0, 252, 264),
+                },
+                Expression {
+                    id: ExpressionId(6),
+                    owner: ExpressionOwner::Body(BodyId(2)),
+                    scope: Some(wrela_hir::ScopeId(2)),
+                    kind: ExpressionKind::Literal(Literal::Integer("1".to_owned())),
+                    source: span(0, 281, 282),
+                },
+                Expression {
+                    id: ExpressionId(7),
+                    owner: ExpressionOwner::Body(BodyId(1)),
+                    scope: Some(wrela_hir::ScopeId(1)),
+                    kind: ExpressionKind::Reference(Definition::Local(wrela_hir::LocalId(0))),
+                    source: span(0, 252, 257),
+                },
+                Expression {
+                    id: ExpressionId(8),
+                    owner: ExpressionOwner::Body(BodyId(1)),
+                    scope: Some(wrela_hir::ScopeId(1)),
+                    kind: ExpressionKind::Literal(Literal::Integer("1".to_owned())),
+                    source: span(0, 260, 261),
                 },
             ],
             patterns: Vec::new(),

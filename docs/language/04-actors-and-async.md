@@ -6,16 +6,16 @@ Single-core execution prevents two ordinary instructions from running at the
 same instant. It does not prevent one async operation from suspending halfway
 through a state change and another operation from invalidating its assumptions.
 
-wrela therefore gives every runtime root one owner and one mailbox. Classes
-marked `@app`, `@service`, and `@driver` are actors. Their fields are private
-mutable state. Other actors hold generated typed handles, not object references.
-Apps are top-level workload leaves, services are reusable image dependencies,
-and drivers alone may own hardware authority; all three use the same turn and
-mailbox semantics.
+wrela therefore gives every runtime root one owner and one mailbox. Structs
+marked `@app`, `@service`, and `@driver` are actors and are implicitly linear.
+Their fields are private mutable state. Other actors hold generated typed
+handles, not object references. Apps are top-level workload leaves, services
+are reusable image dependencies, and drivers alone may own hardware authority;
+all three use the same turn and mailbox semantics.
 
 ```wrela
 @service
-pub class Storage:
+pub struct Storage:
     cache: BlockCache
     disk: Actor[BlkDriver]
 
@@ -41,7 +41,7 @@ A cross-actor message may contain:
 - explicit `Static[T]` handles to immutable image data;
 - values transferred with `take` through `iso` or sealed linear runtime handles.
 
-It MUST NOT contain a `view`, `mut view`, `mut` parameter, ordinary class
+It MUST NOT contain a `view`, `mut view`, `mut` parameter, ordinary object
 identity, or an unbounded container. Every payload layout is known at build
 time.
 
@@ -147,9 +147,9 @@ carrier and cannot be stored or propagated with `?`.
 
 ```wrela
 match try send logger.record(event=take event):
-    case admitted:
+    case .admitted:
         pass                         # `event` was moved
-    case rejected(reason):
+    case .rejected(reason):
         retain_for_later(reason, event=take event)  # source still owned it
 ```
 
@@ -198,15 +198,13 @@ bounded non-secret failure category.
 The effective result of every actor request is explicit:
 
 ```text
-declared R             -> Result[R, ActorCallError[Never]]
+declared R             -> Result[R, ActorCallError[never]]
 declared Result[T, E]  -> Result[T, ActorCallError[E]]
 
 ActorCallError[E] =
-    operation(E)
+    exit(AsyncExit[E])
   | peer_failed(PeerFailed)
   | not_admitted(AdmissionError)
-  | cancelled(Cancelled)
-  | deadline_exceeded(DeadlineExceeded)
 ```
 
 Variants impossible for a call may be eliminated after whole-image analysis but
@@ -281,7 +279,7 @@ reserves the required number of slots.
 Every non-actor async activation completes with an explicit sealed outcome:
 
 ```text
-declared R             -> Result[R, AsyncExit[Never]]
+declared R             -> Result[R, AsyncExit[never]]
 declared Result[T, E]  -> Result[T, AsyncExit[E]]
 
 AsyncExit[E] =
@@ -635,9 +633,10 @@ conforming public queue API.
 
 ### 12.3 Race and select
 
-`race(...)` is sealed syntax, not an ordinary function call. It reserves all
-child slots before evaluating an alternative; `race` requires that capacity to
-be build-proven and is a build error otherwise. After reservation, alternatives
+`race(...)` is a sealed standard-library call contract, not user-definable
+source. It reserves all child slots before evaluating an alternative; `race`
+requires that capacity to be build-proven and is a build error otherwise. After
+reservation, alternatives
 are evaluated and staged left-to-right, including their explicit moves, and none
 becomes runnable until all are staged. A downstream admission failure is that
 child's immediate typed result and leaves that call's arguments unevaluated.
@@ -732,50 +731,3 @@ already the `N = 1` case of a future per-core scheduler:
 A future multi-core revision may change mailbox transport and actor placement.
 It may not retroactively weaken the revision 0.1 guarantee that actor messages
 share no mutable state.
-
-## 16. Current implementation boundary
-
-The implemented messaging surface is deliberately narrow but executable. A
-manifest-installed `@service` with a one-message mailbox may give its startup
-`@task` one statement of this form:
-
-```wrela
-send self.ping()
-```
-
-`ping` must be a public, non-reentrant, async turn on that same actor, take no
-payload arguments, and return unit. The compiler creates a strict-linear
-reservation, proves the one-message capacity bound, commits the method tag with
-release ordering, and conditionally dispatches the turn after startup. The
-dispatch observes the tag with acquire ordering. An empty mailbox skips the
-turn; a matching receive clears the slot with release ordering so its capacity
-is reclaimed. A full slot or mismatched tag reaches the source-aware fatal path.
-All validators independently join the reservation, commit, mailbox storage,
-capacity proof, actor, target method, startup task, receive, and dispatch.
-
-This path is preserved through parsed source, semantic analysis, SemanticWir,
-FlowWir, canonical encoding, MachineWir, LLVM IR, and deterministic AArch64
-COFF emission. Its bounded scans poll cancellation, and exact/one-under
-validation, storage, instruction, and mailbox limits are tested. Unsupported
-receiver, producer, target, payload, and capacity shapes are rejected with
-stable source diagnostics rather than silently lowered.
-
-The same corridor admits exactly one image-wired cross-actor edge: one stateless
-`@app` startup task may receive an immutable `Actor[Service]` field from
-`service.handle()` at image installation and issue one unit send to that exact
-stateless `@service`. Both mailboxes have capacity one. The client owns startup
-and admission; the service owns the target mailbox, receive, turn, and dispatch.
-The capability remains tied to the installed service actor and cannot be
-returned, stored in runtime state, substituted with the client actor, or used as
-an unconstrained runtime actor ID. Canonical FlowWir preserves the target and
-wiring proof, while MachineWir preserves the exact target through its sealed
-capability materialization and mailbox operations.
-
-This is not general actor messaging or a recurring actor executor. Mobile actor
-handles, payload-bearing messages, multiple queued messages, recurring task or
-mailbox scheduling, supervision execution, actor class/method generalization,
-and actor assertion supervision remain explicit follow-on work. Selected
-generated-test assertions reaching native ABI2 objects do not close this actor
-boundary. Until those surfaces are implemented, documentation and reports must
-describe this feature as the bounded startup self-send or exact two-actor unit
-cross-send vertical.

@@ -22,7 +22,7 @@ when an early proposal and a later review disagreed.
 | Queue capacity | Requests reserve a complete descriptor chain before submission. Three-descriptor virtio-blk requests permit `floor(QDEPTH / 3)` concurrent direct chains, not `QDEPTH`. |
 | Cancellation | A request region owns cancellation, deadline, DMA, queue permit, and teardown. Submitted virtio buffers enter a quarantined recovery completion and are reclaimed only after queue reset or device reset proves quiescence. The scheduler may run unrelated work while the owning driver performs recovery. |
 | Drop/RAII | `with` is the universal scoped-effect form. Abort/exit actions are deterministic, synchronous, and nodes in a cleanup dependency DAG. A sealed device obligation may block a dependent node while a compiler-generated driver recovery turn runs; the scope completes only when the DAG is empty. |
-| Linear classes | Reclaimable linear resources have one sealed recovery transition; strict-linear resources such as published I/O receipts and partially initialized devices require an explicit proof-bearing terminal transition and cannot be silently forgotten. |
+| Linear values | Reclaimable linear resources have one sealed recovery transition; strict-linear resources such as published I/O receipts and partially initialized devices require an explicit proof-bearing terminal transition and cannot be silently forgotten. |
 | Ring ordering | Freestanding fences are not the public API. Typed standard-library ring operations define publication, acquire, and doorbell ordering. |
 | Wakeups | Parking is a compiler/runtime primitive with mask–arm–recheck semantics. A plain check followed by park is not legal synchronization. |
 | Interrupt ownership | One vector maps to one ISR entry; one driver may own N MSI-X vectors. Virtio-MMIO may demultiplex its one dedicated line. Legacy shared INTx is unsupported. |
@@ -31,6 +31,14 @@ when an early proposal and a later review disagreed.
 | Fault model | `Result` for recoverable operation faults, typed peer/task failure at concurrency boundaries, uncatchable abandonment for bugs, build errors for invalid images, and target-fatal failure when safe recovery is impossible. |
 | Supervision | The manifest is a zero-allocation supervision tree. Restart quiesces resources, resolves old-epoch replies, applies explicit linear constructor-argument provisions, then resets and reinitializes the frame—never raw `memset` over live resources. An admitted `take` is not magically restored; recovery is an explicit result/receipt contract. |
 | Security claim | Capabilities provide language-level authority control, not hardware process isolation. Target/runtime/compiler code remains trusted. |
+| Comptime phase | `comptime fn` removed; ordinary `fn` is phase-neutral and checked for comptime legality at the call boundary. Twin `_comptime` APIs are thereby impossible. |
+| Variant patterns | Leading-dot variant syntax; bare pattern identifiers always bind; `bind` and expected-type disambiguation removed. |
+| Aggregates | `class` merged into `struct` (+ optional init, `linear` modifier). One nominal product form. |
+| Projections | One view leaf per projection, implicit conservative provenance; multi-leaf, tuple carriers, `from` clauses, repair tokens deferred beyond 0.1. |
+| Wrapping shift | `<<%` removed; wrapping +%/-%/*% remain. |
+| Outcome types | ActorCallError composes AsyncExit instead of duplicating its variants. |
+| Module list | Manifest [[module]] table removed; module set derived from source_root with verified module-declaration bijection. |
+| Integer widths | u128/i128 considered for removal, retained (implemented, low surface cost). |
 
 ## Why actors are in revision 0.1
 
@@ -54,7 +62,7 @@ correct without those transformations, and tooling must continue to display the
 actor edge after it is optimized.
 
 Actors remain deliberately coarse. They are ownership, fault, and future
-placement units—not a replacement for ordinary classes and calls. Receipts,
+placement units—not a replacement for ordinary structs and calls. Receipts,
 batching, and explicit sharding address concurrency; accidental reentrancy is
 not reintroduced as an optimization.
 
@@ -86,3 +94,9 @@ structured cancellation and DMA ownership agree.
   future revision. Revision 0.1 uses bounded pools and generational handles.
 - A privileged ISR escape would weaken the clean ISR theorem and is not reserved
   syntactically.
+
+## Concept budget
+
+The census counted roughly 225 user-facing concepts across the chapters. The
+standing cap is 100. A change introducing a new named concept must name the
+concept it retires or subsumes.

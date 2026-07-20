@@ -177,17 +177,14 @@ failure case unreachable under the selected profile. Device-derived values are
 validated at their trust boundary; a validated range may then flow through FlowWir
 without redundant checks.
 
-Left shift retains two distinct failure contracts through optimization and
+Left shift retains a checked failure contract through optimization and
 MachineWir. `left << count` abandons when `count` is outside the operand width
 or when shifting and then shifting back does not reproduce `left`; the
 round-trip shift is arithmetic for signed integers and logical for unsigned
-integers. `left <<% count` wraps discarded result bits but still abandons for
-the same invalid count. Consequently a result-dead `<<%` is not pure unless a
-proof has discharged its count failure. Constant folding applies the target
-width and signed interpretation, and leaves an invalid or lossy checked shift
-in place. LLVM lowering selects a safe in-range count before `shl`, tests the
-required round trip for `<<`, and emits neither poison-producing invalid shifts
-nor `nsw`/`nuw` claims.
+integers. Constant folding applies the target width and signed interpretation,
+and leaves an invalid or lossy checked shift in place. LLVM lowering selects a
+safe in-range count before `shl`, tests the required round trip for `<<`, and
+emits neither poison-producing invalid shifts nor `nsw`/`nuw` claims.
 
 Typed MMIO, device-shared memory, `InterruptCell` publication, and DMA ownership
 transitions constrain optimization. A safe-language alias proof does not permit

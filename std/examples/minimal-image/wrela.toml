@@ -6,10 +6,6 @@ name = "bootstrap-image"
 version = "0.1.0"
 source_root = "src"
 
-[[module]]
-name = "bootstrap.image"
-path = "bootstrap/image.wr"
-
 [[dependency]]
 alias = "core"
 package = "wrela-core"

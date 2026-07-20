@@ -2,8 +2,9 @@
 //!
 //! Formatting deliberately does not load the lockfile or a toolchain.  The
 //! command decodes the selected root manifest, admits only source files
-//! declared by that manifest, parses the exact bytes that will be replaced,
-//! and publishes through a same-filesystem compare-and-replace transaction.
+//! discovered by a walk of its `source_root` (modules are derived, not
+//! declared), parses the exact bytes that will be replaced, and publishes
+//! through a same-filesystem compare-and-replace transaction.
 //! This keeps formatting useful while a workspace is being edited: a stale
 //! package content digest in `wrela.lock` cannot prevent the formatter from
 //! repairing the source that made it stale.
@@ -98,6 +99,7 @@ impl LocalFormatDriver {
             &manifest,
             requested_files,
             self.limits.format,
+            is_cancelled,
         )?;
         let (sources, source_inputs) =
             read_selected_sources(&selected, self.limits.format, !check_only, is_cancelled)?;
@@ -306,6 +308,7 @@ fn select_declared_files(
     manifest: &PackageManifest,
     requested: &[PathBuf],
     limits: FormatBatchLimits,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<SelectedFile>, DriverError> {
     limits
         .validate()
@@ -322,12 +325,21 @@ fn select_declared_files(
         )));
     }
 
+    // There is no `[[module]]` list to consult: formattable files are every
+    // `*.wr` file discovered by a deterministic, portable, symlink-rejecting
+    // walk of `source_root`, exactly mirroring the module derivation the
+    // package loader performs.
+    let source_directory = join_declared_path(workspace_root, &manifest.source_root)?;
+    let mut walked = Vec::new();
+    walk_declared_source_files(&source_directory, "", 0, &mut walked, is_cancelled)?;
     let mut declared = Vec::new();
     declared
-        .try_reserve_exact(manifest.modules.len())
+        .try_reserve_exact(walked.len())
         .map_err(|_| input_error("format selection", "cannot allocate declared source paths"))?;
-    for module in &manifest.modules {
-        let source_path = join_manifest_source(&manifest.source_root, &module.source_path)?;
+    for relative in walked {
+        wrela_package::validate_source_path(&relative)
+            .map_err(|error| input_error("format selection", error.to_string()))?;
+        let source_path = join_manifest_source(&manifest.source_root, &relative)?;
         let path = join_declared_path(workspace_root, &source_path)?;
         declared.push((path, source_path));
     }
@@ -376,6 +388,102 @@ fn select_declared_files(
     }
     selected.sort_by(|left, right| left.source_path.cmp(&right.source_path));
     Ok(selected)
+}
+
+/// Bound recursive directory depth for [`walk_declared_source_files`]. The
+/// portable path-length ceiling (`MAX_SOURCE_PATH_BYTES`) already bounds
+/// total path bytes; this additionally bounds the number of directory
+/// levels the walk will recurse before failing closed.
+const MAX_SOURCE_WALK_DEPTH: u32 = 64;
+
+/// Recursively enumerate every `*.wr` regular file under `directory` in
+/// sorted, portable order, appending each file's slash-separated path
+/// relative to the walk root (not `directory` itself) to `output`. Rejects
+/// symlinks and non-regular entries so the result cannot be steered by a
+/// race outside the process; this mirrors (but does not share code with)
+/// `wrela_package_loader`'s local filesystem provider, which performs the
+/// equivalent walk for compilation rather than formatting.
+fn walk_declared_source_files(
+    directory: &Path,
+    prefix: &str,
+    depth: u32,
+    output: &mut Vec<String>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), DriverError> {
+    check_cancelled(is_cancelled)?;
+    if depth > MAX_SOURCE_WALK_DEPTH {
+        return Err(input_error(
+            "format selection",
+            "source tree exceeds the maximum walk depth",
+        ));
+    }
+    let entries = fs::read_dir(directory).map_err(|error| {
+        map_file_error(
+            "format source directory",
+            directory,
+            LocalFileError::Io(error),
+        )
+    })?;
+    let mut names = Vec::new();
+    for entry in entries {
+        check_cancelled(is_cancelled)?;
+        let entry = entry.map_err(|error| {
+            map_file_error(
+                "format source directory",
+                directory,
+                LocalFileError::Io(error),
+            )
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(input_error(
+                "format selection",
+                "source tree entry name is not portable UTF-8",
+            ));
+        };
+        names.push(name.to_owned());
+    }
+    names.sort();
+    for name in names {
+        check_cancelled(is_cancelled)?;
+        let path = directory.join(&name);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            map_file_error("format source entry", &path, LocalFileError::Io(error))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(input_error(
+                "format selection",
+                "source tree contains a symlink",
+            ));
+        }
+        let relative = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if metadata.is_dir() {
+            walk_declared_source_files(
+                &path,
+                &relative,
+                depth.saturating_add(1),
+                output,
+                is_cancelled,
+            )?;
+        } else if metadata.is_file() {
+            if name.ends_with(".wr") {
+                output.try_reserve(1).map_err(|_| {
+                    input_error("format selection", "cannot allocate walked source paths")
+                })?;
+                output.push(relative);
+            }
+        } else {
+            return Err(input_error(
+                "format selection",
+                "source tree contains a non-regular entry",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn join_manifest_source(source_root: &str, source_path: &str) -> Result<String, DriverError> {
@@ -1228,9 +1336,8 @@ fn keyword_text(keyword: Keyword) -> &'static str {
         Keyword::Isr => "isr",
         Keyword::Comptime => "comptime",
         Keyword::Struct => "struct",
-        Keyword::Class => "class",
         Keyword::Enum => "enum",
-        Keyword::Iface => "iface",
+        Keyword::Iface => "interface",
         Keyword::Impl => "impl",
         Keyword::For => "for",
         Keyword::Projection => "projection",
@@ -1248,7 +1355,6 @@ fn keyword_text(keyword: Keyword) -> &'static str {
         Keyword::Else => "else",
         Keyword::Match => "match",
         Keyword::Case => "case",
-        Keyword::Bind => "bind",
         Keyword::In => "in",
         Keyword::Not => "not",
         Keyword::While => "while",
@@ -1268,7 +1374,6 @@ fn keyword_text(keyword: Keyword) -> &'static str {
         Keyword::Yield => "yield",
         Keyword::Await => "await",
         Keyword::Copy => "copy",
-        Keyword::Race => "race",
         Keyword::True => "true",
         Keyword::False => "false",
         Keyword::Unit => "unit",
@@ -1309,7 +1414,6 @@ fn operator_text(operator: Operator) -> &'static str {
         Operator::BitOr => "|",
         Operator::BitXor => "^",
         Operator::ShiftLeft => "<<",
-        Operator::ShiftLeftModular => "<<%",
         Operator::ShiftRight => ">>",
         Operator::Equal => "==",
         Operator::NotEqual => "!=",
@@ -1342,34 +1446,45 @@ fn space_between(
     current_role: TokenRole,
     delimiter_depth: u32,
 ) -> bool {
+    // A `.` is ambiguous in isolation: postfix field/tuple-index access
+    // (`value.field`) binds tightly with no leading space, while the
+    // leading-dot variant shorthand (`.Name`, `case .Name(...)`) is a
+    // primary position and wants the same space its identifier would have
+    // gotten. Disambiguate using the same predicate that already decides
+    // between indexing (`value[0]`) and an array literal (`[0]`).
+    if current == TokenKind::Punctuation(Punctuation::Dot) && can_end_expression(previous.kind) {
+        return false;
+    }
     if matches!(
         current,
         TokenKind::InterpolatedStringText | TokenKind::InterpolatedStringEnd
     ) || matches!(
         previous.kind,
         TokenKind::InterpolatedStringStart | TokenKind::InterpolatedStringText
-    ) || matches!(
-        current,
-        TokenKind::Punctuation(
-            Punctuation::Dot
-                | Punctuation::Comma
-                | Punctuation::Colon
-                | Punctuation::Semicolon
-                | Punctuation::RightParen
-                | Punctuation::RightBracket
-                | Punctuation::RightBrace
-                | Punctuation::Question
+    ) || (current != TokenKind::Punctuation(Punctuation::Dot)
+        && matches!(
+            current,
+            TokenKind::Punctuation(
+                Punctuation::Comma
+                    | Punctuation::Colon
+                    | Punctuation::Semicolon
+                    | Punctuation::RightParen
+                    | Punctuation::RightBracket
+                    | Punctuation::RightBrace
+                    | Punctuation::Question
+            )
+        ))
+        || matches!(
+            previous.kind,
+            TokenKind::Punctuation(
+                Punctuation::At
+                    | Punctuation::Dot
+                    | Punctuation::LeftBrace
+                    | Punctuation::LeftParen
+                    | Punctuation::LeftBracket
+            )
         )
-    ) || matches!(
-        previous.kind,
-        TokenKind::Punctuation(
-            Punctuation::At
-                | Punctuation::Dot
-                | Punctuation::LeftBrace
-                | Punctuation::LeftParen
-                | Punctuation::LeftBracket
-        )
-    ) || current == TokenKind::InterpolationFormat
+        || current == TokenKind::InterpolationFormat
     {
         return false;
     }
@@ -1425,7 +1540,7 @@ fn space_between(
 }
 
 fn callable_before_parenthesis(kind: TokenKind) -> bool {
-    can_end_expression(kind) || matches!(kind, TokenKind::Keyword(Keyword::Init | Keyword::Race))
+    can_end_expression(kind) || matches!(kind, TokenKind::Keyword(Keyword::Init))
 }
 
 fn can_end_expression(kind: TokenKind) -> bool {
@@ -2262,12 +2377,12 @@ mod tests {
     #[test]
     fn canonical_formatter_preserves_dedicated_init_syntax() {
         let output = format_text(
-            "module mini\nclass Cache:\n    value:u64\n    init( mut self,value:u64 ) :\n        self.value=value\n",
+            "module mini\nstruct Cache:\n    value:u64\n    init( mut self,value:u64 ) :\n        self.value=value\n",
         )
         .expect("format init");
         assert_eq!(
             output.formatted(),
-            "module mini\nclass Cache:\n    value: u64\n    init(mut self, value: u64):\n        self.value = value\n"
+            "module mini\nstruct Cache:\n    value: u64\n    init(mut self, value: u64):\n        self.value = value\n"
         );
         assert!(
             !format_text(output.formatted())
@@ -2483,8 +2598,23 @@ mod tests {
         let manifest = directory.write("wrela.toml", MINIMAL_MANIFEST);
         let source = directory.write("src/mini.wr", b"module mini\n");
         let other = directory.write("src/other.wr", b"module other\n");
+        let outside = directory.write("outside.wr", b"module outside\n");
         let driver = LocalFormatDriver::new(PipelineLimits::standard()).expect("driver");
-        for files in [vec![other], vec![source.clone(), source.clone()]] {
+        // `src/other.wr` is a derived module under the source root, so
+        // formatting it is an ordinary command now.
+        driver
+            .execute(
+                &Command::Format {
+                    manifest: manifest.clone(),
+                    files: vec![other],
+                    check_only: true,
+                },
+                &SilentEvents,
+                &never_cancelled,
+            )
+            .expect("derived module source formats");
+        // A path outside the source root and a duplicated path stay rejected.
+        for files in [vec![outside], vec![source.clone(), source.clone()]] {
             assert!(matches!(
                 driver.execute(
                     &Command::Format {

@@ -26,6 +26,7 @@ use wrela_test_model::{
 
 mod analyzer;
 mod comptime_check;
+mod interfaces;
 
 pub use analyzer::CanonicalSemanticAnalyzer;
 
@@ -546,8 +547,8 @@ pub enum FunctionOrigin {
     /// provenance without forging a declaration ID.
     SourceClosure { expression: ExpressionId },
     /// Runtime entry synthesized from a successfully evaluated source
-    /// `@image comptime fn`. The constructor itself never becomes runtime
-    /// code; retaining its declaration ID preserves exact provenance.
+    /// `@image fn`. The constructor itself never becomes runtime code;
+    /// retaining its declaration ID preserves exact provenance.
     GeneratedImageEntry { constructor: DeclarationId },
     /// Synthetic entry emitted only when compiling the named sealed test
     /// group. Its body is compiler-owned and therefore has no forged HIR ID.
@@ -651,6 +652,22 @@ pub enum ExpressionResolution {
         /// Exact source-to-parameter permutation. Records are canonical by
         /// `parameter_index`; `source_index` indexes the HIR call arguments.
         arguments: Vec<ResolvedCallArgument>,
+    },
+    /// A binary/comparison operator desugared to a direct call on a
+    /// `core.ops` interface impl method (chapter 10 §12). `source_index` 0
+    /// names the expression's `left` operand and 1 its `right` operand,
+    /// evaluated in that order regardless of `parameter_index` mapping.
+    /// `raw_result` is the value the call itself writes; when `negate` is
+    /// false (every operator but `<=`/`>=`) it is exactly the expression's
+    /// own recorded result, and the call writes that value directly. `<=`
+    /// and `>=` call `Ord::less_than` with swapped operands and negate: the
+    /// call instead writes a distinct intermediate `raw_result`, and the
+    /// expression's own result is a further logical NOT of it.
+    OperatorCall {
+        function: FunctionInstanceId,
+        arguments: Vec<ResolvedCallArgument>,
+        raw_result: ValueId,
+        negate: bool,
     },
     ActorRequest {
         actor: ActorId,
@@ -1168,14 +1185,11 @@ impl PartialAnalysis {
                 FunctionOrigin::Source { declaration, body } => {
                     declaration.0 < self.hir.declarations
                         && body.0 < self.hir.bodies
-                        && (function.color != FunctionColor::Comptime
-                            || function.role == FunctionRole::Test)
                         && function.role != FunctionRole::ImageEntry
                         && function.source.is_some()
                 }
                 FunctionOrigin::SourceClosure { expression } => {
                     expression.0 < self.hir.expressions
-                        && function.color != FunctionColor::Comptime
                         && function.role == FunctionRole::Ordinary
                         && function.source.is_some()
                 }
@@ -1447,14 +1461,11 @@ impl PartialAnalysis {
                 FunctionOrigin::Source { declaration, body } => {
                     declaration.0 < self.hir.declarations
                         && body.0 < self.hir.bodies
-                        && (function.color != FunctionColor::Comptime
-                            || function.role == FunctionRole::Test)
                         && function.role != FunctionRole::ImageEntry
                         && function.source.is_some()
                 }
                 FunctionOrigin::SourceClosure { expression } => {
                     expression.0 < self.hir.expressions
-                        && function.color != FunctionColor::Comptime
                         && function.role == FunctionRole::Ordinary
                         && function.source.is_some()
                 }
@@ -1738,22 +1749,30 @@ fn validate_exact_source_facts(
         {
             return Err(invalid("source function provenance differs from HIR"));
         }
-        if function.color == FunctionColor::Comptime {
-            if analysis
-                .expressions
+        // There is no comptime function color: a comptime-tier test is
+        // evaluated directly from HIR by the comptime evaluator and never
+        // populates a runtime body, so it is the only `FunctionOrigin::Source`
+        // instance that can legitimately have zero runtime facts. Every
+        // populated body appends at least one statement fact (even a lone
+        // `pass`), so "no facts at all" reliably identifies this case without
+        // relying on a declared color.
+        let has_runtime_facts = analysis
+            .expressions
+            .iter()
+            .any(|fact| fact.function == function.id)
+            || analysis
+                .statements
                 .iter()
                 .any(|fact| fact.function == function.id)
-                || analysis
-                    .statements
-                    .iter()
-                    .any(|fact| fact.function == function.id)
-                || analysis
-                    .values
-                    .iter()
-                    .any(|value| value.function == function.id)
-                || !function.parameters.is_empty()
-            {
-                return Err(invalid("comptime function retained runtime body facts"));
+            || analysis
+                .values
+                .iter()
+                .any(|value| value.function == function.id);
+        if !has_runtime_facts {
+            if function.role != FunctionRole::Test || !function.parameters.is_empty() {
+                return Err(invalid(
+                    "source function is missing its expected runtime body facts",
+                ));
             }
             continue;
         }
@@ -3495,7 +3514,7 @@ fn exact_flat_field_matches(
             fields,
         } if arguments.is_empty() && fields.is_empty() && index == 0 => {
             let Some(wrela_hir::Declaration {
-                kind: wrela_hir::DeclarationKind::Class(class),
+                kind: wrela_hir::DeclarationKind::Structure(class),
                 ..
             }) = program.declaration(*declaration)
             else {
@@ -3706,7 +3725,6 @@ fn exact_scalar_binary_matches(
                 | wrela_hir::BinaryOperator::BitXor
                 | wrela_hir::BinaryOperator::BitAnd
                 | wrela_hir::BinaryOperator::ShiftLeft
-                | wrela_hir::BinaryOperator::ShiftLeftModular
                 | wrela_hir::BinaryOperator::ShiftRight
         )
 }
@@ -4931,8 +4949,6 @@ fn root_matches_entry(analysis: &PartialAnalysis, graph: &ImageGraph) -> bool {
 
 fn valid_function_color_role(function: &FunctionInstance) -> bool {
     match (function.color, function.role) {
-        (FunctionColor::Comptime, FunctionRole::Test) => true,
-        (FunctionColor::Comptime, _) => false,
         (FunctionColor::Isr, FunctionRole::Isr(_)) => true,
         (FunctionColor::Isr, _) | (_, FunctionRole::Isr(_)) => false,
         (FunctionColor::Sync, FunctionRole::ImageEntry) => true,
@@ -5200,6 +5216,17 @@ fn valid_expression_fact(
                 && value.category == fact.category
         })
     });
+    // A non-negating operator call writes the expression's own result
+    // directly; only `<= >=` write a distinct intermediate `raw_result`
+    // ahead of a further logical NOT.
+    let operator_call_result_valid = match &fact.resolution {
+        ExpressionResolution::OperatorCall {
+            raw_result,
+            negate: false,
+            ..
+        } => fact.result == Some(*raw_result),
+        _ => true,
+    };
     (fact.function.0 as usize) < analysis.functions.len()
         && fact.expression.0 < analysis.hir.expressions
         && (fact.ty.0 as usize) < analysis.types.len()
@@ -5207,6 +5234,7 @@ fn valid_expression_fact(
         && fact.effects.is_valid()
         && valid_proof_set(&fact.proofs, analysis.proofs.len())
         && result_valid
+        && operator_call_result_valid
         && valid_expression_resolution(&fact.resolution, fact.function, analysis, graph)
 }
 
@@ -5279,6 +5307,27 @@ fn valid_expression_resolution(
                         },
                     )
             }),
+        ExpressionResolution::OperatorCall {
+            function: target,
+            arguments,
+            raw_result,
+            negate: _,
+        } => {
+            value_id(*raw_result)
+                && analysis
+                    .functions
+                    .get(target.0 as usize)
+                    .is_some_and(|target| {
+                        arguments.len() == 2
+                            && target.parameters.len() == 2
+                            && arguments.iter().zip(&target.parameters).enumerate().all(
+                                |(parameter_index, (actual, expected))| {
+                                    usize::try_from(actual.parameter_index) == Ok(parameter_index)
+                                        && actual.access == expected.access
+                                },
+                            )
+                    })
+        }
         ExpressionResolution::ActorRequest {
             actor,
             method,
@@ -5372,6 +5421,7 @@ fn valid_expression_region(fact: &ExpressionFact, graph: &ImageGraph) -> bool {
             | ExpressionResolution::Constructor { .. }
             | ExpressionResolution::ResultTry { .. }
             | ExpressionResolution::DirectCall { .. }
+            | ExpressionResolution::OperatorCall { .. }
             | ExpressionResolution::ActorRequest { .. }
             | ExpressionResolution::Closure { .. }
             | ExpressionResolution::Builtin(_) => fact.region.is_none(),
@@ -6362,7 +6412,7 @@ fn valid_image_constructor(hir: &ValidatedProgram, id: DeclarationId) -> bool {
             declaration.owner,
             wrela_hir::DeclarationOwner::Module(module) if module == declaration.module
         )
-        && function.color == FunctionColor::Comptime
+        && function.color == FunctionColor::Sync
         && function.generics.is_empty()
         && function.parameters.is_empty()
         && function.body.is_some()
@@ -6470,7 +6520,6 @@ fn function_origin_matches_hir(
                 wrela_hir::DeclarationKind::Constant(_)
                 | wrela_hir::DeclarationKind::Brand
                 | wrela_hir::DeclarationKind::Structure(_)
-                | wrela_hir::DeclarationKind::Class(_)
                 | wrela_hir::DeclarationKind::Enumeration(_)
                 | wrela_hir::DeclarationKind::Interface(_)
                 | wrela_hir::DeclarationKind::Implementation(_)
@@ -6772,7 +6821,8 @@ fn validate_fact_resources(
             ExpressionResolution::Constant(value) => {
                 push_fact_constant(&mut constants, (value, 1), limits)?;
             }
-            ExpressionResolution::DirectCall { arguments, .. } => meter.edges(arguments),
+            ExpressionResolution::DirectCall { arguments, .. }
+            | ExpressionResolution::OperatorCall { arguments, .. } => meter.edges(arguments),
             ExpressionResolution::Closure { captures, .. } => meter.edges(captures),
             ExpressionResolution::Error
             | ExpressionResolution::Value(_)

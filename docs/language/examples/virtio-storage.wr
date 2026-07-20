@@ -1,9 +1,10 @@
 # Corrected end-to-end design example for revision 0.1.
 #
 # This is aspirational source for the standard APIs named by the specification.
-# Executable coverage and the next required vertical slices are tracked in
-# virtio-storage-status.md; this file is not currently a successful boot claim.
-# It demonstrates the required ownership and scheduling shape; transport helper
+# Executable coverage and the next required vertical slices are tracked in the
+# conformance inventory (../conformance-inventory.md); this file is not
+# currently a successful boot claim. It demonstrates the required ownership
+# and scheduling shape; transport helper
 # implementations are intentionally in the standard library rather than
 # reimplementing memory ordering with freestanding fences here.
 # The tiny write-back extent filesystem is didactic, not crash-consistent.
@@ -91,7 +92,7 @@ struct DmaBlock:
 # ---------------------------------------------------------------------------
 
 @driver(device="virtio-blk")
-pub class BlkDriver[const MODE: DriverMode]:
+pub struct BlkDriver[const MODE: DriverMode]:
     device: RunningDevice[VirtioBlock]
     irq_regs: Mmio[VirtioIrqMmio]
     queue: VirtQueue[QDEPTH, DmaBlock]
@@ -268,25 +269,23 @@ struct CacheLine:
         return CacheLine(state=CacheState.invalid, data=Some(take block))
 
 
-# A suspend-safe linear scope used while a line is absent from the cache. On
-# cancellation it returns any recovered payload and leaves the line invalid;
-# commit restores a valid cache line. It stores an index and owned values, not a
+# A cache-fill value describes a line temporarily removed from the cache while
+# its replacement I/O is in flight. It is an ordinary owned value, not a scope
+# carrier: scopes cannot hold state across `await` in this revision, so
+# recovery on cancellation or failure is an explicit result contract driven by
+# `BlockCache.begin_replace` / `BlockCache.resolve_replace` rather than a
+# generated scope-exit action. It stores an index and owned values, not a
 # view, so it may live across await.
-class CacheFill:
+struct CacheFill:
     index: usize
-    prior: CacheState
-    data: iso[BlockPayloads] DmaBlock
     fallback: CacheState
-    next: Option[CacheState]
+    data: iso[BlockPayloads] DmaBlock
 
-    fn invalidate_on_exit(mut self):
+    fn invalidate_fallback(mut self):
         self.fallback = CacheState.invalid
 
-    fn commit(mut self, take state: CacheState):
-        self.next = Some(state)
 
-
-class BlockCache:
+struct BlockCache:
     lines: [CacheLine; CACHE_BLOCKS]
 
     init(mut self,
@@ -296,54 +295,57 @@ class BlockCache:
     fn lookup(read self, lba: u64) -> Option[usize]:
         index = (lba % CACHE_BLOCKS as u64) as usize
         match self.lines[index].state:
-            case clean(found) if found == lba:
+            case .clean(found) if found == lba:
                 return Some(index)
-            case dirty(found) if found == lba:
+            case .dirty(found) if found == lba:
                 return Some(index)
             case _:
                 return None
 
-    # `replace` is a suspend-safe standard scoped-resource pattern. It moves the
-    # block out and marks the slot unavailable; it does not lend cache storage.
-    @suspend_safe
-    scope replace(mut self, index: usize) -> CacheFill:
+    # Moves the block out and marks the slot unavailable; it does not lend
+    # cache storage. The caller owns the returned `CacheFill` across any
+    # number of `await` points and must eventually resolve it with
+    # `resolve_replace`.
+    fn begin_replace(mut self, index: usize) -> CacheFill:
         prior = copy self.lines[index].state
         removed = self.lines[index].data.take()
         match take removed:
-            case Some(take block):
+            case .Some(take block):
                 data = take block
-            case None:
+            case .None:
                 panic("cache line has no payload")
         self.lines[index].state = CacheState.replacing
-        enter CacheFill(
+        return CacheFill(
             index=index,
-            prior=copy prior,
-            data=take data,
             fallback=take prior,
-            next=None,
+            data=take data,
         )
-        exit fill:
-            self.lines[fill.index].data = Some(take fill.data)
-            self.lines[fill.index].state = fill.next.unwrap_or(
-                fallback=take fill.fallback,
-            )
 
-    projection peek(read self, index: usize) -> view DmaBlock from self:
+    # Restores the line's payload and sets its resulting state: `next` on
+    # success, or the fill's recorded fallback (invalid, once invalidated) on
+    # failure or cancellation.
+    fn resolve_replace(mut self, take fill: CacheFill, next: Option[CacheState]):
+        self.lines[fill.index].data = Some(take fill.data)
+        self.lines[fill.index].state = next.unwrap_or(
+            fallback=take fill.fallback,
+        )
+
+    projection peek(read self, index: usize) -> view DmaBlock:
         match self.lines[index].data:
-            case Some(data):
+            case .Some(data):
                 yield data
-            case None:
+            case .None:
                 panic("cache read of unavailable line")
 
-    projection edit(mut self, index: usize) -> mut view DmaBlock from self:
+    projection edit(mut self, index: usize) -> mut view DmaBlock:
         match self.lines[index].state:
-            case clean(_) | dirty(_):
+            case .clean(_) | .dirty(_):
                 match self.lines[index].data:
-                    case Some(data):
+                    case .Some(data):
                         yield data
-                    case None:
+                    case .None:
                         panic("cache line has no payload")
-            case invalid | replacing:
+            case .invalid | .replacing:
                 panic("cache edit of unavailable line")
 
     fn mark_dirty(mut self, index: usize, lba: u64):
@@ -353,41 +355,61 @@ class BlockCache:
                     disk: Actor[BlkDriver[BLOCK_MODE]],
                     request: RequestContext[R],
                     lba: u64) -> Result[usize, FsError]:
-        if self.lookup(lba) is Some(index):
+        if self.lookup(lba) is .Some(index):
             return Ok(index)
 
         index = (lba % CACHE_BLOCKS as u64).checked_as(usize)?
-        with self.replace(index) as fill:
-            match fill.prior:
-                case dirty(old_lba):
-                    write_receipt = await disk.submit_write(
-                        request=request,
-                        lba=old_lba,
-                        buffer=take fill.data,
-                    )?
-                    write_done = await write_receipt
-                    fill.data = take write_done.payload
-                    write_done.status?
-                case clean(_) | invalid:
-                    pass
-                case replacing:
-                    panic("non-reentrant cache entered replacing state")
+        fill = self.begin_replace(index)
 
-            # The device may partially overwrite a read payload. From this point
-            # cancellation or I/O failure restores an invalid line, never stale
-            # metadata for the previous contents.
-            fill.invalidate_on_exit()
-            read_receipt = await disk.submit_read(
-                request=request,
-                lba=lba,
-                buffer=take fill.data,
-            )?
-            read_done = await read_receipt
-            fill.data = take read_done.payload
-            read_done.status?
+        match fill.fallback:
+            case .dirty(old_lba):
+                match await disk.submit_write(
+                    request=request,
+                    lba=old_lba,
+                    buffer=take fill.data,
+                ):
+                    case .Ok(receipt):
+                        write_receipt = receipt
+                    case .Err(error):
+                        self.resolve_replace(take fill, next=None)
+                        return Err(FsError.from(error))
+                write_done = await write_receipt
+                fill.data = take write_done.payload
+                match write_done.status:
+                    case .Ok(_):
+                        pass
+                    case .Err(error):
+                        self.resolve_replace(take fill, next=None)
+                        return Err(FsError.from(error))
+            case .clean(_) | .invalid:
+                pass
+            case .replacing:
+                panic("non-reentrant cache entered replacing state")
 
-            fill.commit(state=take CacheState.clean(lba))
+        # The device may partially overwrite a read payload. From this point
+        # cancellation or I/O failure must leave the line invalid, never stale
+        # metadata for the previous contents.
+        fill.invalidate_fallback()
+        match await disk.submit_read(
+            request=request,
+            lba=lba,
+            buffer=take fill.data,
+        ):
+            case .Ok(receipt):
+                read_receipt = receipt
+            case .Err(error):
+                self.resolve_replace(take fill, next=None)
+                return Err(FsError.from(error))
+        read_done = await read_receipt
+        fill.data = take read_done.payload
+        match read_done.status:
+            case .Ok(_):
+                pass
+            case .Err(error):
+                self.resolve_replace(take fill, next=None)
+                return Err(FsError.from(error))
 
+        self.resolve_replace(take fill, next=Some(CacheState.clean(lba)))
         return Ok(index)
 
 
@@ -404,7 +426,7 @@ struct Inode:
     reserved: u32
 
 
-class ExtentFs:
+struct ExtentFs:
     disk: Actor[BlkDriver[BLOCK_MODE]]
     cache: BlockCache
     next_free_lba: u64
@@ -515,26 +537,39 @@ class ExtentFs:
         -> Result[unit, FsError]:
         for index in 0 .. CACHE_BLOCKS:
             match self.cache.lines[index].state:
-                case dirty(lba):
-                    with self.cache.replace(index) as fill:
-                        receipt = await self.disk.submit_write(
-                            request=request,
-                            lba=lba,
-                            buffer=take fill.data,
-                        )?
-                        done = await receipt
-                        fill.data = take done.payload
-                        done.status?
-                        fill.commit(CacheState.clean(lba))
-                case clean(_) | invalid:
+                case .dirty(lba):
+                    fill = self.cache.begin_replace(index)
+                    match await self.disk.submit_write(
+                        request=request,
+                        lba=lba,
+                        buffer=take fill.data,
+                    ):
+                        case .Ok(receipt):
+                            write_receipt = receipt
+                        case .Err(error):
+                            self.cache.resolve_replace(take fill, next=None)
+                            return Err(FsError.from(error))
+                    done = await write_receipt
+                    fill.data = take done.payload
+                    match done.status:
+                        case .Ok(_):
+                            pass
+                        case .Err(error):
+                            self.cache.resolve_replace(take fill, next=None)
+                            return Err(FsError.from(error))
+                    self.cache.resolve_replace(
+                        take fill,
+                        next=Some(CacheState.clean(lba)),
+                    )
+                case .clean(_) | .invalid:
                     pass
-                case replacing:
+                case .replacing:
                     panic("non-reentrant flush observed replacing line")
         return Ok(unit)
 
 
 @service
-pub class Storage:
+pub struct Storage:
     fs: ExtentFs
 
     init(mut self,
@@ -561,7 +596,7 @@ pub class Storage:
 # ---------------------------------------------------------------------------
 
 @app
-pub class Notes:
+pub struct Notes:
     storage: Actor[Storage]
     console: Actor[Console]
     buffers: IsoPool[AppBuffers, Bytes, 2]
@@ -608,7 +643,7 @@ pub class Notes:
 # ---------------------------------------------------------------------------
 
 @image
-pub comptime fn build() -> Image:
+pub fn build() -> Image:
     img = Image(
         name="virtio-storage-example",
         target=Target.aarch64_qemu_virt_uefi,
@@ -674,7 +709,7 @@ pub comptime fn build() -> Image:
 
 
 @layout_assert
-comptime fn example_limits(report: ImageReport):
+fn example_limits(report: ImageReport):
     assert report.peak_memory < 64.MiB
     assert report.queue("virtio-blk.0").max_direct_requests == 42
     assert report.region_promotions.len() == 0

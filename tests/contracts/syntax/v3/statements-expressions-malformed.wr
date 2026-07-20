@@ -8,12 +8,14 @@ fn malformed(value: u64, actor: Actor):
     match value:
         case -name:
             pass
-        case (bind item):
+        case (item):
             pass
         case [take,]:
             pass
+        case Legacy(item):
+            pass
     send value
-    bad_race = race(value)
+    bad_dot = .
     bad_send = try send value
     bad_args = actor.call(named=value, value)
     bad_mut_literal = actor.call(mut 1)

@@ -6,10 +6,6 @@ name = "stdlib-time-runtime"
 version = "0.1.0"
 source_root = "src"
 
-[[module]]
-name = "runtime.time_test"
-path = "runtime/time_test.wr"
-
 [[dependency]]
 alias = "core"
 package = "wrela-core"

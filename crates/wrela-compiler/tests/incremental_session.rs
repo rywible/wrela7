@@ -27,7 +27,7 @@ const IMAGE: &str = r#"module app.image
 from core.image import Image, Target
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="session-image", target=Target.aarch64_qemu_virt_uefi)
 "#;
 
@@ -37,7 +37,7 @@ from app.leaf import leaf
 from core.image import Image, Target
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="session-image", target=Target.aarch64_qemu_virt_uefi)
 
 fn dependent() -> u8:
@@ -51,8 +51,6 @@ const PUBLIC_TWO: &str = "module app.leaf\n\npub fn leaf() -> u8:\n    return 2\
 const PUBLIC_U16: &str = "module app.leaf\n\npub fn leaf() -> u16:\n    return 1\n";
 const CONSTANT_ONE: &str = "module app.leaf\n\nconst leaf: u8 = 1\n";
 const CONSTANT_TWO: &str = "module app.leaf\n\nconst leaf: u8 = 2\n";
-const COMPTIME_ONE: &str = "module app.leaf\n\ncomptime fn leaf() -> u8:\n    return 1\n";
-const COMPTIME_TWO: &str = "module app.leaf\n\ncomptime fn leaf() -> u8:\n    return 2\n";
 const CORE_IMAGE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
 
 static HASHER: SoftwareSha256 = SoftwareSha256;
@@ -481,7 +479,13 @@ fn dependent_header_type_constant_comptime_and_shape_drift_fall_back_cold() {
     assert_semantic_cold_fallback(DEPENDENT_IMAGE, PUBLIC_ONE, PUBLIC_TWO, 0x31);
     assert_semantic_cold_fallback(DEPENDENT_IMAGE, PUBLIC_ONE, PUBLIC_U16, 0x41);
     assert_semantic_cold_fallback(IMAGE, CONSTANT_ONE, CONSTANT_TWO, 0x51);
-    assert_semantic_cold_fallback(IMAGE, COMPTIME_ONE, COMPTIME_TWO, 0x61);
+    // Revision 0.1 has no comptime function color, so there is no longer a
+    // distinct "comptime fn changed" case to force conservative invalidation
+    // for: an ordinary `fn leaf()` edited under an `IMAGE` fixture that never
+    // imports `app.leaf` at all is now correctly recognized as unreachable
+    // from `boot()`, and its unrelated function instance is safely reused
+    // rather than forced cold -- the old `COMPTIME_ONE`/`COMPTIME_TWO` case
+    // here exercised exactly the distinction this migration removed.
 
     let target_digest = digest(0xe2);
     let target = TargetPackage::aarch64_qemu_virt_uefi(target_digest);

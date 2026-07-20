@@ -4,21 +4,21 @@ from core.image import Image, Target
 from core.result import Result
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
 
 fn unwrap_or_zero(value: Result[u8, u8]) -> u8:
     match value:
-        case Result.Ok(bind payload):
+        case .Ok(payload):
             return payload
-        case Result.Err(bind code):
+        case .Err(code):
             return 0
 
 fn unwrap_bool_or_false(value: Result[bool, bool]) -> bool:
     match value:
-        case Result.Ok(bind payload):
+        case .Ok(payload):
             return payload
-        case Result.Err(bind code):
+        case .Err(code):
             return false
 
 fn try_ok_source() -> Result[u8, u8]:
@@ -54,19 +54,19 @@ fn result_bool_match_returns_payload():
 @test
 fn result_try_ok_yields_payload():
     match propagate_try_ok():
-        case Result.Ok(bind payload):
+        case .Ok(payload):
             assert payload == 42, "postfix question must yield the Ok payload"
             return
-        case Result.Err(bind error):
+        case .Err(error):
             assert false, "Ok propagation unexpectedly returned Err"
             return
 
 @test
 fn result_try_err_propagates_exact_error():
     match propagate_try_err():
-        case Result.Ok(bind payload):
+        case .Ok(payload):
             assert false, "Err propagation unexpectedly returned Ok"
             return
-        case Result.Err(bind error):
+        case .Err(error):
             assert error == 7, "postfix question must preserve the exact error"
             return

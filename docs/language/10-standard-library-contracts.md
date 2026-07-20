@@ -19,9 +19,9 @@ allocation or authority.
 ## 2. `Option`, `Result`, and conversions
 
 `Option[T]` is the closed sum `Some(T) | None`. `Result[T, E]` is
-`Ok(T) | Err(E)`. Ownership of a payload follows ordinary enum rules. When a
-type argument contains a view leaf, the complete tuple/`Option`/`Result` shape
-is the second-class projection carrier defined in
+`Ok(T) | Err(E)`. Ownership of a payload follows ordinary enum rules. When the
+type argument is a view leaf, the `Option`/`Result` shape is the second-class
+projection carrier defined in
 [Values, views, and regions](03-values-views-regions.md): it has no storable
 layout and must be consumed immediately.
 
@@ -30,7 +30,7 @@ Postfix `?` on `Result[T, E]` either yields `T` or returns from the enclosing
 implementation equivalent to:
 
 ```wrela
-iface From[Source]:
+interface From[Source]:
     fn from(take value: Source) -> Self
 ```
 
@@ -67,16 +67,18 @@ regardless of whether the handler body is synchronous or async. Await consumes
 it. The effective results are:
 
 ```text
-declared R             → Result[R, ActorCallError[Never]]
+declared R             → Result[R, ActorCallError[never]]
 declared Result[T, E]  → Result[T, ActorCallError[E]]
 
 ActorCallError[E] =
-    operation(E)
+    exit(AsyncExit[E])
   | peer_failed(PeerFailed)
   | not_admitted(AdmissionError)
-  | cancelled(Cancelled)
-  | deadline_exceeded(DeadlineExceeded)
 ```
+
+`ActorCallError` composes the task/async exit sum defined in §6 rather than
+duplicating its `operation`/`cancelled`/`deadline_rejected`/`deadline_exceeded`
+variants.
 
 `PeerFailed` contains a static actor identity, non-wrapping supervision epoch,
 and bounded
@@ -163,11 +165,19 @@ it carries no admission authority or region brand.
 ## 5. Time
 
 `Duration` is a nonnegative checked span represented by a target-independent
-integer number of nanoseconds in the language model. `ns`, `us`, `ms`,
-`seconds`, and larger unit constructors are available at runtime and comptime
-when their input is comptime. Construction, addition, and multiplication fail
-at comptime on overflow and abandon at runtime unless their checked forms are
-used.
+integer number of nanoseconds. Named constructors `ns`, `us`, `ms`, `seconds`,
+`minutes`, `hours`, `days`, and `weeks` are ordinary phase-neutral functions:
+each is comptime-callable when its argument is comptime and otherwise callable
+at runtime. There is one surface, not a runtime/comptime twin pair.
+
+Arithmetic and comparison on `Duration` are the standard `Add`, `Sub`, and
+`Ord` interface implementations rather than named methods; `min`, `max`, and
+`clamp` follow from `Ord`, and `clamp(value, lower, upper)` requires
+`lower <= upper`. `as_nanoseconds() -> u64` is the sole accessor into the
+backing scalar. Overflow and underflow use ordinary checked arithmetic: a
+comptime evaluation that overflows is a build error, and a runtime evaluation
+abandons. The contract does not separately specify a bound assertion beyond
+what checked `Add`/`Sub` already establish for the backing integer width.
 
 `Instant` is an opaque point on the target's monotonic clock. It has total
 ordering, supports checked `Instant + Duration`, and subtracts two ordered
@@ -183,76 +193,12 @@ Record mode records every observed value, and replay supplies the recorded
 sequence. Wall time is a separate optional capability and is not used for
 scheduling, deadlines, or restart intensity.
 
-Implementation status: the checked-in `core.time` module publicly implements a
-bounded function-based subset. `Duration` is a nominal flat structure with a
-private u64 nanosecond field. Runtime callers can import `ns`, `us`, `ms`,
-`seconds`, `minutes`, `hours`, `days`, `weeks`, `as_nanoseconds`, `add`,
-`subtract`, `scale`, `less_than`, `less_than_or_equal`, `greater_than`,
-`greater_than_or_equal`, `min`, `max`, and `clamp`; comptime callers import the
-explicitly suffixed equivalents. The comptime constructors enforce exact u64
-nanosecond thresholds, including minute `307445734`, hour `5124095`, day
-`213503`, and week `30500`. Runtime unit conversion, addition, subtraction, and
-scaling use checked target arithmetic; subtraction underflow abandons rather
-than wrapping. `subtract_comptime` instead emits a source-aware failed
-assertion before evaluating an underflowing operation. Ordering is the unsigned
-total order of the private nanosecond scalar. `min`, `max`, and `clamp` use
-scalar locals and branches and reconstruct the selected value through `ns` or
-`ns_comptime`. `clamp(value, lower, upper)` requires `lower <= upper`: its
-runtime form preflights that invariant with checked target subtraction and
-abandons on inversion, while its comptime form emits a source-aware failed
-assertion before arithmetic. Runtime copy-expression lowering is not part of
-this surface.
-
-A canonical manifest-declared workspace imports those installed functions
-directly and proves genuine source evaluation, exact and max-plus-one overflow
-diagnostics with imported-call stacks, exact-zero subtraction, source-aware
-underflow rejection, equality/order edges, nested clamp/subtraction helpers,
-name filtering, deterministic reruns, exact/over step, memory, and call-depth
-quotas, deterministic cancellation, and unsupported-operation classification.
-A prior-tuple selected runtime source reached SemanticWir, FlowWir, canonical wire v9,
-backend revalidation, and MachineWir v9 with exact comparison, branch, checked
-arithmetic, projection, and call topology assertions. Machine lowering preserves
-nominal provenance while selecting an exact 8-byte, 8-aligned u64-backed
-representation. The authenticated native lane emits the same prepared model as
-deterministic independently validated ARM64 COFF after FlowWir and MachineWir
-agree on the exact 70-edge fully qualified harness/test/core call multiset. This
-compiles and lowers the selected source `@test fn`; it does not execute that test
-in a booted runtime image.
-
-This is not the complete normative surface above. Runtime and comptime names
-are currently distinct, the field remains private, and operator/method
-presentation, recoverable `Result`-returning checked forms, units larger than a
-week, `Instant`, `now`, runtime copy lowering, non-test/actor assertion
-supervision, and executed current-tuple runtime-image tests remain follow-on
-work. Selected generated-test assertions reach native ABI2 objects; system-QEMU
-execution is pending.
-
-The current nongeneric substrate admits a local closed enum with 1–256
-explicit variants, one shared positional copy-scalar payload, and exhaustive
-unguarded constructor-only matching. It lowers through SemanticWir 8,
-FlowWir/wire 10 and MachineWir 10 with a canonical `{u8,payload}` contract.
-Authenticated native emission for this checked-in source remains pending.
-The checked-in `core.result` module now declares that generic library shape,
-but runtime execution is deliberately limited to `Result[S,S]` for one
-supported copy scalar `S`. Sema authenticates the exact core declaration,
-retains and interns `[Type(S),Type(S)]`, requires contextual constructors, and
-then erases the specialization metadata into the existing canonical enum
-representation. Unequal, nonscalar, wrong-arity, forged non-core, and
-context-free forms are rejected. Postfix `?` is implemented only when its
-operand is an owned rvalue of that exact `Result[S,S]` specialization and the
-enclosing function returns the identical type. `Ok` yields its payload; `Err`
-reconstructs the exact error and takes the ordinary early-return path. Named
-places remain rejected until their move and cleanup semantics are implemented.
-This does not yet implement general `Result[T,E]`, `From` conversion, `Option`,
-or recoverable library APIs; recoverable checked conversions remain
-unimplemented.
-
 ## 6. Tasks, wake, and task failure
 
 Every local or nursery-installed async activation resolves once with:
 
 ```text
-declared R             -> Result[R, AsyncExit[Never]]
+declared R             -> Result[R, AsyncExit[never]]
 declared Result[T, E]  -> Result[T, AsyncExit[E]]
 AsyncExit[E] =
     operation(E) | cancelled(Cancelled)
@@ -260,9 +206,9 @@ AsyncExit[E] =
   | deadline_exceeded(DeadlineExceeded)
 ```
 
-Awaiting consumes the activation's completion. Actor transport maps these causes
-to the corresponding `ActorCallError` variants rather than nesting two error
-sums.
+Awaiting consumes the activation's completion. Actor transport composes these
+exact causes into `ActorCallError[E]` as `exit(AsyncExit[E])` rather than
+duplicating their variants.
 
 Each `@task` method has one or more statically reserved task slots determined by
 its declared activation bound. It does not produce a first-class bound method or
@@ -289,12 +235,12 @@ For a statically heterogeneous set of children, `join_all` returns a fixed tuple
 in start order. Tuple element ownership follows the language tuple rules. A
 homogeneous dynamic count returns `List[T, N]` with an explicit maximum.
 
-`race(a, b, ...)` is sealed syntax that build-proves/reserves all child slots
-before evaluating or starting any alternative; it is not an ordinary eager
-function call. The build rejects a race whose setup capacity is not proved. It
-returns a generated closed sum
-`RaceN[A, B, ...]` identifying
-which alternative won; it cannot return a tuple because only one result exists.
+`race(a, b, ...)` is a sealed stdlib contract, not grammar: its surface is an
+ordinary call expression, but the compiler build-proves and reserves all child
+slots before evaluating or starting any alternative, so it is not an ordinary
+eager function call. The build rejects a race whose setup capacity is not
+proved. It returns a generated closed sum `RaceN[A, B, ...]` identifying which
+alternative won; it cannot return a tuple because only one result exists.
 Before returning the winner it cancels every loser, waits for all sealed
 recovery completions, and proves that no loser retains a restoration obligation
 or quarantined mutable region. Winner selection among simultaneously ready
@@ -418,3 +364,45 @@ their surface declarations.
 An alternative standard library may rename wrappers around these intrinsics but
 cannot alter their graph nodes, generativity, phase, access effects, failure
 points, or cleanup/wait-for edges.
+
+## 12. Operator interfaces
+
+The closed operator interfaces named by
+[Source language](02-source-language.md) are declared in the standard-library
+module `core.ops` with exactly these shapes:
+
+```wrela
+pub interface Add:
+    fn add(read self, right: Self) -> Self
+
+pub interface Sub:
+    fn subtract(read self, right: Self) -> Self
+
+pub interface Ord:
+    fn less_than(read self, right: Self) -> bool
+```
+
+Operands are `read`: an operator expression never moves or mutates its
+operands, and an implementation constructs its result from field reads (with
+any non-scalar duplication written explicitly inside the implementation body).
+`Ord::less_than` is a strict total order over the implementing type.
+
+Operator expressions on a nominal type with a visible implementation desugar
+to direct specialized calls with the ordinary left-to-right operand evaluation
+of chapter 02:
+
+- `a + b` is `Add::add(a, b)`; `a - b` is `Sub::subtract(a, b)`.
+- `a < b` is `Ord::less_than(a, b)`; `a > b` is `Ord::less_than(b, a)`;
+  `a <= b` is `not Ord::less_than(b, a)`; `a >= b` is
+  `not Ord::less_than(a, b)`.
+
+Both operands are evaluated as written before the call regardless of the
+argument mapping. Structural `==`/`!=` on copyable structs and enums remain
+compiler-generated and do not consult an interface. `Eq` for non-structural
+equality, heterogeneous `Mul`, and the remaining named peers follow the same
+declaration pattern and are specified when their first standard implementation
+lands. Core scalar operators are built in and never desugar through these
+interfaces.
+
+`Duration` implements `Add`, `Sub`, and `Ord`; its checked overflow contract
+in section 5 is unchanged by the desugaring.

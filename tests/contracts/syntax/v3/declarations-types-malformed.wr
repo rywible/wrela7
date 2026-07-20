@@ -12,7 +12,7 @@ struct Broken[const N, region, T:]:
     missing_iso_brackets: iso u8
     missing_function_arrow: fn(u8) u8
 
-iface Invalid:
+interface Invalid:
     @budget(bound=1)
     field: u64
 
@@ -21,10 +21,10 @@ impl Reader[u64] for Broken:
     pub fn visible_member():
         pass
 
-projection invalid_carrier() -> u64 from source:
+projection invalid_carrier() -> u64:
     pass
 
-projection missing_source() -> view u64 from:
+projection missing_leaf() -> Option[u64]:
     pass
 
 scope missing_binding() -> unit:

@@ -81,7 +81,7 @@ code are rejected. Formatting contracts are specified in
 ```wrela
 module example.counter
 
-pub class Counter:
+pub struct Counter:
     value: u64
 
     pub fn get(read self) -> u64:
@@ -122,7 +122,7 @@ Import cycles are allowed. The compiler resolves each strongly connected module
 component as a unit because imports are name bindings and modules have no runtime
 initialization. Cycles through constant evaluation, type layout, generic
 instantiation, or image construction remain errors and the diagnostic MUST show
-the semantic cycle. Runtime construction belongs in class initializers and the
+the semantic cycle. Runtime construction belongs in struct initializers and the
 image graph.
 
 A package has the canonical identity `(name, version, source_digest)` recorded by
@@ -147,18 +147,23 @@ implementations do not silently ignore configuration from a newer schema.
 
 - `schema = 1` and `language = "0.1-design"`;
 - package `name`, `version`, and one portable relative `source_root`;
-- an explicit, strictly ordered list mapping every module path to one source
-  path beneath that root; directory walking never discovers source implicitly;
 - dependency local alias, nominal package name, and version requirement;
 - exactly one direct dependency under the reserved alias `core`; this selects
   the semantic standard-library package, while its locked toolchain locator
   selects the package bytes inside the verified standard-library component;
-- one or more finite named build profiles containing comptime, memory,
-  recovery, DMA, record/replay, optimization, and diagnostic policy;
+- one or more finite named build profiles, each stating only its overrides of
+  the language-defined defaults for comptime, memory, recovery, DMA,
+  record/replay, optimization, and diagnostic policy;
 - full-image entries, each naming an image name, module, `@image` function,
   target, and profile; and
 - optional full-image test entries, each naming a declared image, host scenario,
   nonzero boot/shutdown/event/output bounds, and optional deterministic seed.
+
+There is no `[[module]]` list. Modules are discovered by a deterministic
+sorted walk of `source_root`: every `.wr` file beneath it maps to the module
+path given by its path relative to the root, and that file's `module`
+declaration MUST equal the derived path — the same bijection stated in §2,
+now verified by the walk instead of transcribed in the manifest.
 
 Every module-path segment, dependency alias, and image `entry` is a
 revision-0.1 source identifier: Unicode 16.0.0 XID start/continue, NFC, not `_`,
@@ -177,6 +182,9 @@ stdout and stderr, not a separate allowance per stream. Scenario files are
 explicit package inputs: their canonical package/path/digest tuples participate
 in the source-graph and build-request identities.
 
+Every profile key except `name` and `mode` has a language-defined default; a
+profile block states only its overrides.
+
 Every list is stored in the canonical order defined by its stable name or
 identity; a canonical formatter may reorder TOML entries but doing so does not
 change semantics. Revision 0.1 accepts only full-image target entries and only
@@ -193,10 +201,6 @@ name = "appliance"
 version = "0.1.0"
 source_root = "src"
 
-[[module]]
-name = "appliance.image"
-path = "appliance/image.wr"
-
 [[dependency]]
 alias = "core"
 package = "wrela-core"
@@ -205,20 +209,7 @@ requirement = "=0.1.0"
 [[profile]]
 name = "development"
 mode = "development"
-comptime_steps = 10000000
-comptime_memory_bytes = 67108864
-comptime_call_depth = 256
-static_bytes = 268435456
-peak_bytes = 536870912
-event_log_bytes = 0
-dma_coherent = false
-require_iommu = false
-reset_timeout_ns = 5000000000
-quarantine_bytes = 16777216
-recording = "disabled"
 optimization = "development"
-sealed_deployment = false
-warnings_as_errors = false
 watchdogs = true
 
 [[image]]
@@ -265,17 +256,15 @@ ambient registry configuration are not part of the build.
 The principal declarations are:
 
 - `const` for a compile-time constant;
-- `fn`, `async fn`, `isr fn`, and `comptime fn` for the three runtime colors and
-  compile-time evaluation;
-- `struct` for structural values;
+- `fn`, `async fn`, and `isr fn` for the three function colors;
+- `struct` for aggregate values, optionally uniquely owned;
 - `brand` for a proof-only name bound exactly once by image construction;
-- `class` for uniquely owned state and behavior;
 - `enum` for closed sums;
-- `iface` and `impl` for static constraints and their implementations;
+- `interface` and `impl` for static constraints and their implementations;
 - `projection` and `scope` for computed loans and deterministic scoped effects;
 - compiler-recognized attributed declarations such as `@image` and `@dma`.
 
-Names at module scope cannot be overloaded in revision 0.1. A class can have
+Names at module scope cannot be overloaded in revision 0.1. A struct can have
 methods with distinct names; generic specialization does not create source-level
 overloads.
 
@@ -290,16 +279,24 @@ async fn fetch(client: ClientHandle) -> Result[iso[NetPackets] Bytes, NetError]:
 
 isr fn on_queue(self):
     ...
-
-comptime fn queue_bytes(depth: usize) -> usize:
-    return depth * 16
 ```
 
 `fn` is synchronous. `async fn` may suspend with `await`. `isr fn` is an
 interrupt top half with the effect restrictions in
-[Hardware safety](05-hardware-safety.md). `comptime fn` runs only during a
-compile-time phase and is governed by
+[Hardware safety](05-hardware-safety.md). These are the only three function
+colors in revision 0.1.
+
+An ordinary `fn` is phase-neutral: it may also be called from a compile-time
+context — a `const` initializer, a `comptime if` condition, `comptime assert`,
+a generic const argument, or `@image`/`@layout_assert` evaluation — when its
+transitive call closure is comptime-legal: deterministic, free of I/O, free of
+async/actor/ISR operations, and quota-bounded. Legality is checked at each
+comptime call boundary; a violation is diagnosed with the call path that
+reaches it. Compile-time evaluation itself is governed by
 [Comptime and images](06-comptime-and-images.md).
+
+A `fn`/`async fn` body whose result type is `unit` may fall off the end of its
+suite without a trailing `return`; doing so returns `unit`.
 
 `await` MUST occur in an `async fn`. An async function cannot be invoked as a
 detached future value: it is either awaited, sent one-way through an actor API,
@@ -329,7 +326,10 @@ The earlier postfix spelling `call().await` is not part of this revision.
 
 ### 3.2 Structs
 
-A `struct` is a product value with no observable object identity.
+A `struct` is a product value. A `linear struct` is additionally non-copyable
+and uniquely owned regardless of its fields; this is the sole way to declare a
+uniquely owned aggregate in revision 0.1. Neither form has observable object
+identity beyond its fields.
 
 ```wrela
 pub struct Point:
@@ -338,8 +338,11 @@ pub struct Point:
 ```
 
 Struct fields are private to their defining module unless marked `pub`. A
-struct may define methods. It is copyable only when every field is copyable and
-it owns no linear resource. Except for scalar values, duplication is always
+struct may define methods and may carry an `implements` clause naming
+interfaces it implements in the struct body; see
+[3.4](#34-interfaces). A non-linear struct is copyable exactly when every
+field is copyable and it owns no linear resource; a `linear struct` is never
+copyable. Except for scalar values, duplication of a copyable value is always
 written `copy value`; assignment without `copy` moves a non-scalar value even
 when that value is copyable. This makes the cost of large aggregate duplication
 source-visible. Physical copies and moves may be elided so long as value behavior
@@ -355,57 +358,54 @@ name to exactly one pool/device/vector node. Before binding it cannot appear in 
 runtime type, and after binding its identity is the minted node rather than the
 source spelling. Reusing one brand declaration for two nodes is a build error.
 
-A struct declaration generates a named-field constructor. All fields must be
-provided exactly once unless they have defaults. Positional construction is
-forbidden except for a one-field struct, preventing field order from becoming
-an accidental public ABI:
+A struct without an explicit `init` generates a named-field constructor. All
+fields must be provided exactly once unless they have defaults. Positional
+construction is forbidden except for a one-field struct, preventing field
+order from becoming an accidental public ABI:
 
 ```wrela
 p = Point(x=10, y=20)
 ```
 
-### 3.3 Classes
-
-A `class` is a uniquely owned stateful value. It may own resources, nested
-classes, and methods. Its fields are private to the defining module unless
-marked `pub`. Class values do not implicitly copy.
+A struct may instead declare `init`, which establishes every field before the
+instance becomes observable. `init` is a dedicated declaration, not a named
+function or actor message; it must begin with exactly one `mut self` receiver.
+Initializers cannot be public, generic, attributed, or conditionally declared,
+and a struct declares at most one. Construction through `init` also uses
+`Type(named_arguments...)`.
 
 ```wrela
-pub class Cache:
+pub struct Cache:
     lines: [CacheLine; 256]
 
     init(mut self):
         ...
 ```
 
-`init` establishes every field before the instance becomes observable. It is a
-dedicated class declaration, not a named function or actor message, and it must
-begin with exactly one `mut self` receiver. Initializers cannot be public,
-generic, attributed, or conditionally declared, and each class declares at most
-one.
 Partial initialization is tracked. A `take` from a field makes that field
-temporarily uninitialized; every normal control-flow path must replace it before
-the containing value is used as a whole or the turn returns.
+temporarily uninitialized; every normal control-flow path must replace it
+before the containing value is used as a whole or the turn returns.
 
-Construction uses `Type(named_arguments...)` and invokes `init`; classes
-without an explicit initializer receive a named-field initializer subject to
-field visibility. `init` MAY return `Result[unit, E]`. If it returns `Err`,
-the compiler tears down already-initialized reclaimable fields in reverse field
-initialization order. Every initialized strict-linear field must already be
-protected by a scope, moved into a manifest restart provision, or explicitly
-consumed on each error edge. The same rule applies to boot rollback.
+`init` MAY return `Result[unit, E]`. If it returns `Err`, the compiler tears
+down already-initialized reclaimable fields in reverse field initialization
+order. Every initialized strict-linear field must already be protected by a
+scope, moved into a manifest restart provision, or explicitly consumed on each
+error edge. The same rule applies to boot rollback.
 
-A class marked `@app`, `@service`, or `@driver` is an actor root and follows the
-additional rules in [Actors and async](04-actors-and-async.md). Apps are
-top-level workload leaves, services are image-wired reusable dependencies, and
-drivers alone receive hardware authority as defined by the image graph.
+A struct marked `@app`, `@service`, or `@driver` is an actor root, is
+implicitly `linear`, and follows the additional rules in
+[Actors and async](04-actors-and-async.md). Apps are top-level workload
+leaves, services are image-wired reusable dependencies, and drivers alone
+receive hardware authority as defined by the image graph.
 
 A method declaration without a `self` parameter is associated with its type and
 is called as `Type.method(...)`. It has no implicit receiver authority.
 
-### 3.4 Enums and matching
+### 3.3 Enums and matching
 
-An `enum` is a closed sum. Variants may carry values.
+An `enum` is a closed sum. Variants may carry values. The canonical formatter
+writes a one-payload variant as `Ok(T)`, never `Ok(T,)`; the grammar accepts
+both spellings.
 
 ```wrela
 enum Lookup[T]:
@@ -420,49 +420,46 @@ require, and the formatter does not invent, a default arm.
 
 ```wrela
 match lookup(key):
-    case found(value):
+    case .found(value):
         use(value)
-    case absent:
+    case .absent:
         return None
-    case failed(error):
+    case .failed(error):
         return Err(error)
 ```
 
 Exhaustiveness is checked after comptime specialization.
 
-Patterns include enum variants, tuple and fixed-array destructuring, literals,
-the wildcard `_`, alternatives joined with `|`, and guards introduced by `if`.
-Alternatives must bind the same names with the same types and access modes.
-A guard runs only after its pattern matches and may read those bindings. A
-guarded arm contributes nothing to exhaustiveness unless specialization proves
-its guard is the literal `true`; a later unguarded arm must cover the same
-constructor/value space. Fixed-array patterns have exactly the statically known
-array length; revision 0.1 has no rest/slice pattern.
+In a pattern, an enum variant is written with a leading dot — `.found(value)`,
+`.absent` — or, fully qualified, `Enum.variant(...)`. A bare identifier in a
+pattern is always a binding, never a variant reference, whatever its payload
+position or the expected type; removing or renaming a variant therefore cannot
+silently turn a pattern into a binding or vice versa. Patterns also include
+tuple and fixed-array destructuring, literals, the wildcard `_`, alternatives
+joined with `|`, and guards introduced by `if`. Alternatives must bind the
+same names with the same types and access modes. A guard runs only after its
+pattern matches and may read those bindings. A guarded arm contributes nothing
+to exhaustiveness unless specialization proves its guard is the literal
+`true`; a later unguarded arm must cover the same constructor/value space.
+Fixed-array patterns have exactly the statically known array length; revision
+0.1 has no rest/slice pattern.
 
 ```wrela
 match state:
-    case clean(found) if found == lba:
+    case .clean(found) if found == lba:
         use(found)
-    case dirty(found) if found == lba:
+    case .dirty(found) if found == lba:
         use(found)
-    case clean(_) | dirty(_) | invalid:
+    case .clean(_) | .dirty(_) | .invalid:
         pass
 ```
-
-A bare identifier at the top of an arm is never an implicit catch-all binding.
-It must resolve to a zero-payload variant of the scrutinee's closed enum or it is
-an error. A bare identifier in a constructor/tuple/array payload position
-introduces a binding unless that payload's expected enum type has a zero-payload
-variant of the same name; `bind name` forces a binding in that ambiguous case
-or at arm top level. This ensures that removing or renaming a variant cannot
-silently turn `case absent` into a match-all arm.
 
 `is` performs a refutable pattern test. Bindings introduced by the pattern are
 available only in the success-dominated right operand of `and` and in the
 corresponding `if` suite; they are unavailable in `else` and after the `if`:
 
 ```wrela
-if lookup(key) is Some(index):
+if lookup(key) is .Some(index):
     use(index)
 ```
 
@@ -470,12 +467,16 @@ Matching a `mut` or linear value does not implicitly copy its payload. A
 payload move uses `take` in the payload pattern; otherwise the arm receives the
 least read access needed by its body.
 
-### 3.5 Interfaces
+In expression position the same leading-dot shorthand, `.variant` or
+`.variant(args)`, is legal wherever the expected type is a known enum; the
+qualified `Enum.variant(...)` form remains legal everywhere.
 
-An `iface` is a static contract, never a runtime object type.
+### 3.4 Interfaces
+
+An `interface` is a static contract, never a runtime object type.
 
 ```wrela
-pub iface Hashable:
+pub interface Hashable:
     fn hash(read self) -> u64
 
 pub fn hash_pair[T: Hashable](a: T, b: T) -> u64:
@@ -506,7 +507,7 @@ block. `Self` denotes the type after `for`. Implementations are compile-time
 coherence facts, not runtime values, and are not independently exported:
 
 ```wrela
-pub iface From[Source]:
+pub interface From[Source]:
     fn from(take value: Source) -> Self
 
 impl From[ParseError] for FsError:
@@ -514,11 +515,12 @@ impl From[ParseError] for FsError:
         return FsError.invalid_input(error.kind)
 ```
 
-A class's `implements` clause is declaration-local shorthand for the same
-obligation when its method bodies are defined in the class. Structs, enums, and
-implementations kept separate from a class use `impl`. The whole image permits
-at most one implementation of an instantiated interface for a concrete type;
-an ambiguous pair is a build error naming both blocks.
+A struct's `implements` clause is declaration-local shorthand for the same
+obligation when its method bodies are defined in the struct. Enums and
+implementations kept separate from a struct's `implements` clause use `impl`.
+The whole image permits at most one implementation of an instantiated
+interface for a concrete type; an ambiguous pair is a build error naming both
+blocks.
 `impl` blocks are visible through their interface/type packages and cannot be
 marked `pub`; the parser accepts the uniform top-level modifier position, then
 semantic checking rejects that combination.
@@ -539,9 +541,11 @@ exhaustive branch. There is no `dyn` escape.
 `==` and `!=` are generated structurally for copyable structs and enums when
 all fields support equality. Ordering and operators on other user types resolve
 through the closed static interfaces `Eq`, `Ord`, `Add`, `Sub`, `Mul`, and their
-named peers; they never perform runtime dispatch. Implementations follow the
-same package orphan, symbolic non-overlap, and final image-coherence rules as
-other interfaces.
+named peers; they never perform runtime dispatch. The interface shapes,
+`core.ops` declarations, and exact desugaring are specified in
+[Standard library contracts](10-standard-library-contracts.md). Implementations
+follow the same package orphan, symbolic non-overlap, and final image-coherence
+rules as other interfaces.
 
 Error conversion for postfix `?` is also explicit. The propagated error must
 be the enclosing error type or have exactly one visible implementation of
@@ -550,43 +554,36 @@ numeric or enum widening are not considered. The selected conversion is
 monomorphized and shown by tooling. Propagation consumes the source error; the
 conversion therefore always has a `take` parameter.
 
-### 3.6 Projections and scopes
+### 3.5 Projections and scopes
 
 A `projection` is the only declaration form that may return a `view`. It is a
-synchronous accessor that yields one or more `view T`/`mut view T` leaves
-inside a second-class projection carrier. A carrier is a view leaf, a tuple of
-carriers, `Option[carrier]`, or `Result[carrier, E]`; `E` is an ordinary
-owned type. The declaration's mandatory `from` clause lists the
-receiver/parameters whose storage may back any yielded leaf. Its activation
-remains until all caller views end. Every successful path executes exactly one
-`yield`; every error/`None` path executes zero. It cannot suspend, and code
-before an unsuccessful return must leave no active loan.
+synchronous accessor that yields exactly one `view T`/`mut view T` leaf,
+optionally wrapped in `Option[...]` or `Result[..., E]`; `E` is an ordinary
+owned type. Provenance is implicitly conservative: every receiver and
+parameter of the projection may back the yielded leaf, and the caller retains
+access to all of them until the view ends. Every successful path executes
+exactly one `yield`; every error/`None` path executes zero. It cannot suspend,
+and code before an unsuccessful return must leave no active loan.
 
 ```wrela
-projection item(mut self, index: usize) -> mut view Item from self:
+projection item(mut self, index: usize) -> mut view Item:
     yield self.items[index]
 
-projection entry(mut self, key: Key)
-    -> Result[mut view Item, MissingKey] from self:
+projection entry(mut self, key: Key) -> Result[mut view Item, MissingKey]:
     index = self.resolve(key)?
     yield self.items[index]
 ```
 
-Projection carriers have no ordinary runtime type or storable layout. They may
+A projection's carrier has no ordinary runtime type or storable layout. It may
 appear only as the immediate result of a projection call consumed by a view
-binding/destructure, postfix `?`, or `match`. They cannot be assigned as
-ordinary values, returned from a function, placed in a non-carrier aggregate,
-captured, sent, or kept across suspension. A projection may yield multiple
-mutable leaves only when it proves their storage paths disjoint on every
-successful path.
+binding, postfix `?`, or `match`. It cannot be assigned as an ordinary value,
+returned from a function, placed in a non-carrier aggregate, captured, sent,
+or kept across suspension.
 
-The `from` set is part of the public type/effect and MUST match an interface
-declaration exactly. A caller conservatively retains access to every named source
-until all yielded leaves end, even when a runtime branch selected only one. A
-projection cannot yield storage rooted in a local, temporary, image-global not
-named in the set, or transitive mutable global. Ordinary `fn`, `async fn`,
-`isr fn`, and `comptime fn` return types cannot contain `view` at any
-nesting depth.
+A projection cannot yield storage rooted in a local, temporary, image-global
+outside its receiver/parameters, or transitive mutable global. Ordinary `fn`,
+`async fn`, and `isr fn` return types cannot contain `view` at any nesting
+depth.
 
 A `scope` defines the acquisition and exit protocol used by `with`. It has an
 ordinary parameter list and result type, an acquisition prefix ending in
@@ -596,21 +593,15 @@ clause covers every pre-enter mutation/move/resource obligation; the exit clause
 is registered atomically when `enter` succeeds. If exit transfers a sealed
 device obligation into generated recovery, the owning driver may finish it in a
 later turn while affected regions remain quarantined; source code cannot observe
-the scope as completed until its cleanup dependency graph is empty.
+the scope as completed until its cleanup dependency graph is empty. Scopes
+cannot hold state across `await` in revision 0.1.
 
 ```wrela
-@suspend_safe
 scope replace(mut self, index: usize) -> Replacement:
     enter self.begin_replace(index)
     exit replacement:
         self.finish_or_rollback(mut replacement)
 ```
-
-A suspend-safe actor-local scope may carry a sealed repair token for actor-owned
-state across `await`; that token is not a view, cannot be inspected or sent, and
-is usable only by the generated exit action in the same non-reentrant turn.
-Other mutable access to the protected state remains unavailable until commit or
-exit.
 
 ## 4. Parameter access effects
 
@@ -718,7 +709,7 @@ The core scalar types are:
 - `f32` and `f64` where the target enables floating point;
 - `char`, a Unicode scalar value;
 - `unit`, written as the value `unit`; and
-- `Never`, the uninhabited return type.
+- `never`, the uninhabited return type.
 
 Floating point is forbidden in ISR code. A target may further disable it in
 runtime code.
@@ -812,7 +803,7 @@ an expression therefore do not rely on capitalization or name lookup to parse.
 Generic type and constant parameters are compile-time parameters:
 
 ```wrela
-class Ring[T, const N: usize]:
+struct Ring[T, const N: usize]:
     items: [Option[T]; N]
 ```
 
@@ -850,8 +841,7 @@ Locals may be reassigned with the same type. Shadowing an outer local is a lint
 error by default and requires `shadow name = value` when intentional.
 In a tuple destructuring assignment, every bare target not already local is
 introduced simultaneously after the right side succeeds; existing and new
-targets cannot be mixed. This is the immediate binding form for a multi-view
-projection carrier.
+targets cannot be mixed.
 
 Core scalar values may be duplicated implicitly. Duplicating any other copyable
 value uses the prefix expression `copy`; it evaluates its operand once and
@@ -871,7 +861,7 @@ array as a whole with `for take element in take array`, or uses the sealed
 `map_take`/whole-array builder contract that consumes each element exactly once
 and returns a fully initialized array. A consuming loop leaves the source array
 uninitialized as a whole when it starts; `break`, `return`, or `?` must consume
-or reclaim the remaining elements according to their linear class.
+or reclaim the remaining elements according to their linear category.
 
 ## 7. Control flow
 
@@ -926,7 +916,7 @@ From tightest to loosest binding, the relevant operators are:
 4. checked conversion `as Type`;
 5. multiplicative `*`, `/`, `%`, `*%`;
 6. additive `+`, `-`, `+%`, `-%`;
-7. shifts `<<`, `<<%`, `>>`;
+7. shifts `<<`, `>>`;
 8. bitwise `&`, `^`, `|`;
 9. ranges `..` and `..=`;
 10. comparisons, membership, and identity-pattern tests;
@@ -948,12 +938,11 @@ specialized call `container.contains(item)` through `Contains[Item]` and
 `not in` negates that result; its declared access effects still apply. Pattern
 `is` is built in and does not invoke a user method.
 
-Left shifts never mask or reduce their count: both `left << count` and
-`left <<% count` fail when `count` is negative or is not less than the bit width
-of `left`. The checked `<<` additionally fails when its exact mathematical
-result is not representable in the operand type, so it never discards result
-bits. `<<%` instead wraps the result to that type's bit width. `<<%=` is not an
-assignment operator in revision 0.1.
+Left shift never masks or reduces its count: `left << count` fails when
+`count` is negative or is not less than the bit width of `left`. It also fails
+when its exact mathematical result is not representable in the operand type,
+so it never discards result bits. Revision 0.1 has no wrapping shift operator;
+an explicit mask before a checked `<<` covers driver needs.
 
 Except where short-circuiting or assignment is stated below, operands and
 subexpressions are evaluated exactly once from left to right as written. A call
@@ -1053,7 +1042,7 @@ Built-in revision 0.1 attributes include:
 
 | Attribute | Meaning |
 |---|---|
-| `@image` | The unique compile-time image constructor. |
+| `@image` | The unique compile-time image constructor; evaluated only at build time. |
 | `@app` | An application actor root. |
 | `@service` | A service actor root. |
 | `@driver` | A hardware-authorized driver actor root. |
@@ -1064,9 +1053,8 @@ Built-in revision 0.1 attributes include:
 | `@wire(...)` | A persistent/network byte layout with fixed endian, version, offsets, and padding. |
 | `@mmio` | A typed MMIO register layout checked by the target ABI. |
 | `@offset` | A target-ABI field offset inside an MMIO or device layout. |
-| `@layout_assert` | A read-only assertion evaluated after image layout. |
-| `@test` | Declares a test. The bounded source-unit delivery contract covers module-level `comptime fn` tests; the complete revision 0.1 design also reserves full-image runtime forms described in chapter 06. |
-| `@suspend_safe` | A scope whose owned state and exit action may remain active across `await`. |
+| `@layout_assert` | A read-only assertion evaluated after image layout, at build time only. |
+| `@test` | Declares a test on a plain function. A comptime-legal test runs in the build evaluator; other tests run as generated runtime tests per the test plan in chapter 06. |
 | `@no_promote` | Reject image-region promotion at the annotated allocation or scope. |
 | `@budget(...)` | Require a build-proven uninterrupted-work or memory bound. |
 | `@uninterrupted(bound=...)` | Replace an async loop checkpoint, or document a sync loop, with a proven finite uninterrupted bound. |
@@ -1076,41 +1064,14 @@ They attach typed metadata consumed in the fixed build phases. Unknown
 attributes are a compile error unless imported from a tool namespace explicitly
 declared as non-semantic.
 
+`@image` and `@layout_assert` attach to a plain `fn`. Both are evaluated only
+during the build; referencing either from runtime code is an error.
+
 The complete revision 0.1 declaration contract permits `@test` only on a
-zero-argument `comptime fn`, `fn`, or `async fn` whose result is `unit` or
-`Result[unit, E]`. It is not legal on an `isr fn`, method requiring a receiver,
-generic function without manifest-supplied concrete arguments, `@image`
-function, or function whose test activation/resource bounds cannot be proved.
-
-The bounded source-level unit-test implementation gate is deliberately
-narrower. To satisfy it, the compiler must accept a non-generic, module-level,
-zero-argument `@test comptime fn` returning `unit` from a module declared by the
-root package manifest. Production and test modules both appear in the
-manifest's ordinary ordered module list; there is no implicit test-source scan
-or hidden test-only module graph. Such a test may import and call ordinary
-public production `comptime fn` declarations whose parameters, locals, and
-result use `unit`, `bool`, a fixed-width or target-pointer-width integer, or a
-nominal nongeneric flat `struct` containing only those scalar fields. The
-implemented body subset includes typed or inferred locals and assignment,
-scalar-field projection, complete named construction (or the sole positional
-field of a one-field structure), flat-aggregate move and explicit-copy
-behavior, branch definite initialization, returns, nested direct calls with
-positional or declaration-matched named arguments, exact signed-minimum integer
-literals, integer and boolean operations, comparisons, and `comptime assert` as
-specified in chapter 06. Cross-module field access observes ordinary visibility
-and equal layouts do not erase nominal type identity.
-
-This is not a claim for class construction or values, receiver or associated
-methods, generics, nested or non-scalar aggregates, aggregate equality,
-floating-point values, `Result`/`Ok`/`Err`, non-test/actor assertion
-supervision, or generated runtime-image execution. Selected generated-test
-runtime assertions are implemented through native ABI2 objects, but their
-system-QEMU execution remains pending.
-Test execution, effective limits, result classification, and the exact current
-boundary are specified in chapter 06.
-Ordinary semantic float-literal lowering remains separately available to the
-language; bounding its source spelling is not evidence that float values have
-entered this comptime unit-test evaluator subset.
+zero-argument `fn` or `async fn` whose result is `unit` or `Result[unit, E]`.
+It is not legal on an `isr fn`, method requiring a receiver, generic function
+without manifest-supplied concrete arguments, `@image` function, or function
+whose test activation/resource bounds cannot be proved.
 
 Of the built-ins, only `@uninterrupted(bound=...)` may be a statement attribute,
 and it must immediately precede `for`, `while`, or `loop` at the same
@@ -1160,8 +1121,8 @@ import_list      = import_name, { ",", import_name }, [ "," ]
 import_name      = IDENT, [ "as", IDENT ] ;
 
 top_decl         = { attribute, NEWLINE }, [ "pub" ], top_declaration ;
-top_declaration  = const_decl | fn_decl | struct_decl | class_decl
-                 | enum_decl | iface_decl | impl_decl
+top_declaration  = const_decl | fn_decl | struct_decl
+                 | enum_decl | interface_decl | impl_decl
                  | projection_decl | scope_decl | brand_decl
                  | comptime_top_if ;
 attribute        = "@", qualified_name,
@@ -1173,23 +1134,21 @@ brand_decl       = "brand", IDENT ;
 
 fn_decl          = fn_prefix, "fn", IDENT, [ generic_params ],
                    "(", [ parameters ], ")", [ "->", type ], ":", suite ;
-fn_prefix        = [ "async" | "isr" | "comptime" ] ;
+fn_prefix        = [ "async" | "isr" ] ;
 parameters       = parameter, { ",", parameter }, [ "," ] ;
 parameter        = receiver | [ access_mode ], IDENT, ":", type ;
 receiver         = [ access_mode ], "self" ;
 access_mode      = "read" | "mut" | "take" ;
 
-struct_decl      = "struct", IDENT, [ generic_params ], ":", type_suite ;
-class_decl       = "class", IDENT, [ generic_params ],
-                   [ "implements", type_list ], ":", class_member_suite ;
+struct_decl      = [ "linear" ], "struct", IDENT, [ generic_params ],
+                   [ "implements", type_list ], ":", type_suite ;
 enum_decl        = "enum", IDENT, [ generic_params ], ":", enum_suite ;
-iface_decl       = "iface", IDENT, [ generic_params ], ":", iface_suite ;
+interface_decl   = "interface", IDENT, [ generic_params ], ":", interface_suite ;
 impl_decl        = "impl", type, "for", type, ":", impl_suite ;
 projection_decl  = "projection", IDENT, [ generic_params ],
                    "(", [ parameters ], ")",
-                   "->", projection_carrier, "from", provenance_set,
+                   "->", projection_carrier,
                    ":", projection_suite ;
-provenance_set   = IDENT, { ",", IDENT } ;
 scope_decl       = "scope", IDENT, "(", [ parameters ], ")",
                    "->", type, ":", scope_suite ;
 comptime_top_if  = "comptime", "if", expression, ":", top_decl_suite,
@@ -1209,25 +1168,23 @@ enum_variant     = IDENT, [ "(", [ variant_payload ], ")" ] ;
 variant_payload  = type, { ",", type }, [ "," ]
                  | variant_field, { ",", variant_field }, [ "," ] ;
 variant_field    = IDENT, ":", type ;
-iface_member     = { attribute, NEWLINE },
+interface_member = { attribute, NEWLINE },
                    ( fn_prefix, "fn", IDENT, [ generic_params ],
                      "(", [ parameters ], ")", [ "->", type ]
                    | "projection", IDENT, [ generic_params ],
                      "(", [ parameters ], ")", "->",
-                     projection_carrier, "from", provenance_set ) ;
+                     projection_carrier ) ;
 
 type_suite       = NEWLINE, INDENT,
-                   ( "pass" | member_decl, { NEWLINE, member_decl } ),
+                   ( "pass" | type_member, { NEWLINE, type_member } ),
                    [ NEWLINE ], DEDENT ;
+type_member      = initializer_decl | member_decl ;
 member_suite     = NEWLINE, INDENT, member_decl,
                    { NEWLINE, member_decl }, [ NEWLINE ], DEDENT ;
-class_member_suite = NEWLINE, INDENT, class_member_decl,
-                     { NEWLINE, class_member_decl }, [ NEWLINE ], DEDENT ;
-class_member_decl = initializer_decl | member_decl ;
 enum_suite       = NEWLINE, INDENT, enum_variant,
                    { NEWLINE, enum_variant }, [ NEWLINE ], DEDENT ;
-iface_suite      = NEWLINE, INDENT, iface_member,
-                   { NEWLINE, iface_member }, [ NEWLINE ], DEDENT ;
+interface_suite  = NEWLINE, INDENT, interface_member,
+                   { NEWLINE, interface_member }, [ NEWLINE ], DEDENT ;
 impl_suite       = NEWLINE, INDENT, impl_member,
                    { NEWLINE, impl_member }, [ NEWLINE ], DEDENT ;
 impl_member      = { attribute, NEWLINE }, ( fn_decl | projection_decl ) ;
@@ -1260,12 +1217,10 @@ function_type_params = function_type_param, { ",", function_type_param },
 function_type_param = [ access_mode ], type ;
 type_args        = type_arg, { ",", type_arg }, [ "," ] ;
 type_arg         = type | expression | "..", expression ;
-projection_carrier = "view", type | "mut", "view", type
-                   | "(", projection_carrier, ",",
-                     [ projection_carrier,
-                       { ",", projection_carrier }, [ "," ] ], ")"
-                   | "Option", "[", projection_carrier, "]"
-                   | "Result", "[", projection_carrier, ",", type, "]" ;
+projection_carrier = view_leaf
+                   | "Option", "[", view_leaf, "]"
+                   | "Result", "[", view_leaf, ",", type, "]" ;
+view_leaf        = "view", type | "mut", "view", type ;
 
 suite            = NEWLINE, INDENT, statement, { NEWLINE, statement },
                    [ NEWLINE ], DEDENT ;
@@ -1306,7 +1261,7 @@ match_arm        = "case", pattern, [ "if", expression ], ":", suite ;
 pattern          = primary_pattern, { "|", primary_pattern } ;
 primary_pattern  = "_" | literal_pattern | qualified_name,
                    [ "(", [ pattern_arguments ], ")" ]
-                 | "bind", IDENT
+                 | ".", IDENT, [ "(", [ pattern_arguments ], ")" ]
                  | "(", pattern, ",", [ pattern_arguments ], ")"
                  | "[", [ pattern_arguments ], "]" ;
 pattern_arguments = pattern_argument, { ",", pattern_argument }, [ "," ] ;
@@ -1344,7 +1299,7 @@ bit_or_expression = bit_xor_expression, { "|", bit_xor_expression } ;
 bit_xor_expression = bit_and_expression, { "^", bit_and_expression } ;
 bit_and_expression = shift_expression, { "&", shift_expression } ;
 shift_expression = additive_expression,
-                   { ( "<<" | "<<%" | ">>" ), additive_expression } ;
+                   { ( "<<" | ">>" ), additive_expression } ;
 additive_expression = multiplicative_expression,
                       { ( "+" | "-" | "+%" | "-%" ),
                         multiplicative_expression } ;
@@ -1361,14 +1316,13 @@ postfix_suffix   = ".", IDENT
                  | "(", [ arguments ], ")"
                  | "[", expression, "]" ;
 primary_expression = literal | qualified_name
+                   | ".", IDENT, [ "(", [ arguments ], ")" ]
                    | "(", expression, ")"
                    | "(", expression, ",",
                      [ expression, { ",", expression }, [ "," ] ], ")"
                    | "[", [ expression,
                      { ",", expression }, [ "," ] ], "]"
-                   | race_expression | try_send_expression ;
-race_expression  = "race", "(", expression, ",", expression,
-                   { ",", expression }, [ "," ], ")" ;
+                   | try_send_expression ;
 try_send_expression = "try", "send", call_expression ;
 
 place_expression = place_atom, { ".", IDENT | "[", expression, "]" } ;
@@ -1380,14 +1334,6 @@ literal          = INTEGER_LITERAL | FLOAT_LITERAL | STRING_LITERAL
                  | "true" | "false" | "unit" ;
 literal_pattern  = literal | "-", ( INTEGER_LITERAL | FLOAT_LITERAL ) ;
 ```
-
-The parser resolves a bare arm-top identifier only as a fieldless variant; a
-non-variant there is an error. In a constructor/tuple/array payload position, a
-bare identifier is a fieldless variant when the expected payload enum has one
-and otherwise introduces a binding. A constructor-head name followed by `(`
-must resolve to a variant. `bind name` always introduces a binding and is
-required to shadow a fieldless variant or bind at arm top level. These rules use
-the expected static type, never capitalization or import order.
 
 The `type_arg = type | expression | .. expression` choice is resolved contextually from the
 declared generic parameter at the named type constructor. Parsing produces an

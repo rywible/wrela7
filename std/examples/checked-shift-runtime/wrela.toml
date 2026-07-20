@@ -6,10 +6,6 @@ name = "checked-shift-runtime"
 version = "0.1.0"
 source_root = "src"
 
-[[module]]
-name = "checked_shift.image"
-path = "checked_shift/image.wr"
-
 [[dependency]]
 alias = "core"
 package = "wrela-core"

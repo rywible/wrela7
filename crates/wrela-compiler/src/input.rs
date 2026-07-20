@@ -378,27 +378,24 @@ fn acquire_local_package(
     }
     reject_duplicate_declarations(&manifest)?;
 
+    // There is no `[[module]]` list to consult: every acquired module source
+    // is one `*.wr` regular file discovered by a deterministic, portable,
+    // symlink-rejecting walk of `source_root`. Each file is still read
+    // through `root.read_stable_file`, so the same race-free
+    // open/hash/re-validate contract applies as it did for a manifest-
+    // declared path.
     let mut sources = Vec::new();
-    sources
-        .try_reserve_exact(manifest.modules.len())
-        .map_err(|_| ProviderError::TooLarge {
-            limit: maximum_bytes,
-        })?;
     let source_directory = join_portable_relative(package_directory, &manifest.source_root)?;
-    for module in &manifest.modules {
-        check_cancelled(is_cancelled)?;
-        let source_path = join_portable_relative(&source_directory, &module.source_path)?;
-        let source_file =
-            root.read_stable_file(&source_path, remaining, maximum_bytes, is_cancelled)?;
-        remaining = subtract_bytes(remaining, source_file.bytes.len(), maximum_bytes)?;
-        let text = decode_utf8(source_file.bytes, is_cancelled)
-            .map_err(|error| map_utf8_error(error, "declared source is not valid UTF-8"))?;
-        sources.push(SourceInput {
-            path: copy_bounded_path(&module.source_path, maximum_bytes)?,
-            text,
-            digest: source_file.digest,
-        });
-    }
+    walk_module_source_files(
+        root,
+        &source_directory,
+        "",
+        0,
+        &mut sources,
+        &mut remaining,
+        maximum_bytes,
+        is_cancelled,
+    )?;
 
     let mut scenarios = Vec::new();
     scenarios
@@ -1040,6 +1037,107 @@ fn join_portable_relative(base: &Path, relative: &str) -> Result<PathBuf, Provid
     Ok(path)
 }
 
+/// Bound recursive directory depth for [`walk_module_source_files`]. The
+/// portable path-length ceiling (`MAX_SOURCE_PATH_BYTES`) already bounds
+/// total path bytes; this additionally bounds directory nesting depth.
+const MAX_SOURCE_WALK_DEPTH: u32 = 64;
+
+/// Recursively acquire every `*.wr` regular file under `directory` in
+/// sorted, portable order as one module source. `prefix` is this
+/// subdirectory's slash-separated path relative to the walk root (the
+/// package's `source_root`), used verbatim as each discovered file's
+/// [`SourceInput::path`]. Each file is opened, hashed, and re-validated
+/// through `root.read_stable_file`, so a race replacing an entry between
+/// listing and reading still fails closed exactly as a manifest-declared
+/// path would have. Symlinks and non-regular entries are rejected; portable
+/// component and identifier rules (NFC, no `.`/`..`, no forbidden
+/// characters, XID identifiers) are re-validated downstream by the loader,
+/// which is the sole authority for a provider's untrusted input.
+#[allow(clippy::too_many_arguments)]
+fn walk_module_source_files(
+    root: &LocalPackageRoot,
+    directory: &Path,
+    prefix: &str,
+    depth: u32,
+    sources: &mut Vec<SourceInput>,
+    remaining: &mut u64,
+    maximum_bytes: u64,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), ProviderError> {
+    check_cancelled(is_cancelled)?;
+    if depth > MAX_SOURCE_WALK_DEPTH {
+        return Err(access_denied(
+            "package source tree exceeds the maximum walk depth",
+        ));
+    }
+    let entries = fs::read_dir(directory)
+        .map_err(|error| map_io_error(&error, "package source directory is unavailable"))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        check_cancelled(is_cancelled)?;
+        let entry = entry
+            .map_err(|error| map_io_error(&error, "package source directory is unavailable"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(access_denied(
+                "package source entry name is not portable UTF-8",
+            ));
+        };
+        names
+            .try_reserve(1)
+            .map_err(|_| corrupt("package source tree allocation failed"))?;
+        names.push(name.to_owned());
+    }
+    names.sort();
+    for name in names {
+        check_cancelled(is_cancelled)?;
+        let path = directory.join(&name);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| map_io_error(&error, "package source entry is unavailable"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(access_denied("package source tree contains a symlink"));
+        }
+        let relative = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if metadata.is_dir() {
+            walk_module_source_files(
+                root,
+                &path,
+                &relative,
+                depth.saturating_add(1),
+                sources,
+                remaining,
+                maximum_bytes,
+                is_cancelled,
+            )?;
+        } else if metadata.is_file() {
+            if name.ends_with(".wr") {
+                let source_file =
+                    root.read_stable_file(&path, *remaining, maximum_bytes, is_cancelled)?;
+                *remaining = subtract_bytes(*remaining, source_file.bytes.len(), maximum_bytes)?;
+                let text = decode_utf8(source_file.bytes, is_cancelled)
+                    .map_err(|error| map_utf8_error(error, "declared source is not valid UTF-8"))?;
+                sources
+                    .try_reserve(1)
+                    .map_err(|_| ProviderError::TooLarge {
+                        limit: maximum_bytes,
+                    })?;
+                sources.push(SourceInput {
+                    path: copy_bounded_path(&relative, maximum_bytes)?,
+                    text,
+                    digest: source_file.digest,
+                });
+            }
+        } else {
+            return Err(corrupt("package source tree contains a non-regular entry"));
+        }
+    }
+    Ok(())
+}
+
 fn manifest_codec_limits(maximum_bytes: u64) -> ManifestCodecLimits {
     let entries = u32::try_from(maximum_bytes).unwrap_or(u32::MAX);
     ManifestCodecLimits {
@@ -1056,21 +1154,9 @@ fn manifest_codec_limits(maximum_bytes: u64) -> ManifestCodecLimits {
 fn reject_duplicate_declarations(
     manifest: &wrela_package::PackageManifest,
 ) -> Result<(), ProviderError> {
-    let mut source_paths = Vec::new();
-    source_paths
-        .try_reserve_exact(manifest.modules.len())
-        .map_err(|_| corrupt("source declaration allocation failed"))?;
-    source_paths.extend(
-        manifest
-            .modules
-            .iter()
-            .map(|module| module.source_path.as_str()),
-    );
-    source_paths.sort_unstable();
-    if source_paths.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(corrupt("manifest declares one source file more than once"));
-    }
-
+    // Modules are not declared; they are discovered by a directory walk, so
+    // there is no manifest-side source-path list to check for duplicates
+    // here (a real directory cannot list one entry name twice).
     let mut scenario_paths = Vec::new();
     scenario_paths
         .try_reserve_exact(manifest.image_tests.len())
@@ -1600,14 +1686,10 @@ mod tests {
 
         fn with_sources(root_source: &[u8], core_source: &[u8]) -> Self {
             let directory = TestDirectory::new();
-            let core_manifest = test_package_manifest("wrela-core", "0.1.0", "core", &[]);
+            let core_manifest = test_package_manifest("wrela-core", "0.1.0", &[]);
             let core = CanonicalTestPackage::new(&core_manifest, "core.wr", core_source);
-            let root_manifest = test_package_manifest(
-                "appliance",
-                "0.1.0",
-                "app",
-                &[("core", "wrela-core", "0.1.0")],
-            );
+            let root_manifest =
+                test_package_manifest("appliance", "0.1.0", &[("core", "wrela-core", "0.1.0")]);
             let root = CanonicalTestPackage::new(&root_manifest, "app.wr", root_source);
             let root_locator = PackageLocator::Workspace {
                 path: "package".to_owned(),
@@ -1697,11 +1779,10 @@ mod tests {
     fn test_package_manifest(
         name: &str,
         version: &str,
-        module: &str,
         dependencies: &[(&str, &str, &str)],
     ) -> Vec<u8> {
         let mut manifest = format!(
-            "schema = 1\nlanguage = \"0.1-design\"\n\n[package]\nname = \"{name}\"\nversion = \"{version}\"\nsource_root = \"src\"\n\n[[module]]\nname = \"{module}\"\npath = \"{module}.wr\"\n"
+            "schema = 1\nlanguage = \"0.1-design\"\n\n[package]\nname = \"{name}\"\nversion = \"{version}\"\nsource_root = \"src\"\n"
         );
         for (alias, package, requirement) in dependencies {
             manifest.push_str(&format!(
@@ -1742,14 +1823,16 @@ mod tests {
     }
 
     #[test]
-    fn real_workspace_loads_and_parses_only_declared_modules() {
+    fn real_workspace_loads_and_parses_only_derived_modules() {
+        // Modules are derived from a walk of `source_root`, not declared: a
+        // file outside `source_root` is not a module regardless of its
+        // extension, but every `*.wr` file inside `source_root` is (there is
+        // no separate "ignored" class of `.wr` file under `source_root`).
         let fixture = WorkspaceFixture::new(SOURCE_TEXT.as_bytes());
         fixture
             .directory
-            .write("package/src/ignored/secret.wr", b"\xff\xfe\xfd");
-        fixture
-            .directory
             .write("package/undeclared.bin", &[0u8; 32]);
+        fixture.directory.write("package/src.wr", &[0u8; 32]);
 
         let service = LocalFrontendService::new(&fixture.directory.root).expect("frontend service");
         let frontend = service
@@ -1838,8 +1921,10 @@ mod tests {
     #[test]
     fn real_workspace_and_verified_toolchain_package_load_and_parse_together() {
         let fixture = ToolchainWorkspaceFixture::new();
+        // Non-source files inside and outside the source root are skipped by
+        // the derived module walk; every `.wr` file is load-bearing.
         fixture.directory.write(
-            "toolchain/share/wrela/std/wrela-core-0.1/src/ignored.wr",
+            "toolchain/share/wrela/std/wrela-core-0.1/src/ignored.txt",
             b"\xff\xfe\xfd",
         );
         fixture.directory.write(
@@ -1885,6 +1970,33 @@ mod tests {
                 .toolchain_provider()
                 .standard_library_root(),
             fixture.standard_library_root
+        );
+    }
+
+    #[test]
+    fn stray_invalid_source_file_in_derived_walk_fails_closed() {
+        // Under derived modules every `.wr` file below the source root is a
+        // module source; a stray undecodable one is a load error, never
+        // silently skipped.
+        let fixture = ToolchainWorkspaceFixture::new();
+        fixture.directory.write(
+            "toolchain/share/wrela/std/wrela-core-0.1/src/stray.wr",
+            b"\xff\xfe\xfd",
+        );
+        let service = LocalFrontendService::with_package_provider(fixture.composite_provider());
+        let error = service
+            .load_and_parse(
+                FrontendWorkspaceRequest {
+                    root_locator: &fixture.root_locator,
+                    load_limits: load_limits(),
+                    parse_limits: ParseLimits::standard(),
+                },
+                &never_cancelled,
+            )
+            .expect_err("stray invalid source must fail closed");
+        assert!(
+            format!("{error:?}").contains("not valid UTF-8"),
+            "unexpected error: {error:?}"
         );
     }
 

@@ -997,6 +997,7 @@ mod tests {
 
     const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.toml");
     const CORE_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/image.wr");
+    const CORE_OPS_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/ops.wr");
     const CORE_RESULT_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/result.wr");
     const CORE_TIME_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/time.wr");
     const APPLICATION_MANIFEST: &[u8] =
@@ -1395,6 +1396,7 @@ mod tests {
             CORE_MANIFEST,
             &[
                 ("image.wr", CORE_SOURCE),
+                ("ops.wr", CORE_OPS_SOURCE),
                 ("result.wr", CORE_RESULT_SOURCE),
                 ("time.wr", CORE_TIME_SOURCE),
             ],
@@ -1407,6 +1409,10 @@ mod tests {
         directory.write(
             "toolchain/share/wrela/std/wrela-core-0.1/src/image.wr",
             CORE_SOURCE,
+        );
+        directory.write(
+            "toolchain/share/wrela/std/wrela-core-0.1/src/ops.wr",
+            CORE_OPS_SOURCE,
         );
         directory.write(
             "toolchain/share/wrela/std/wrela-core-0.1/src/result.wr",
@@ -1432,6 +1438,7 @@ mod tests {
 
         let standard_library = tree_measurement(&[
             tree_record("wrela-core-0.1/src/image.wr", CORE_SOURCE),
+            tree_record("wrela-core-0.1/src/ops.wr", CORE_OPS_SOURCE),
             tree_record("wrela-core-0.1/src/result.wr", CORE_RESULT_SOURCE),
             tree_record("wrela-core-0.1/src/time.wr", CORE_TIME_SOURCE),
             tree_record("wrela-core-0.1/wrela.toml", CORE_MANIFEST),

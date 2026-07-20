@@ -87,7 +87,6 @@ pub enum FunctionColor {
     Sync,
     Async,
     Isr,
-    Comptime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -249,12 +248,11 @@ pub enum DeclarationKind {
     Constant(ConstantDeclaration),
     Brand,
     Function(FunctionDeclaration),
-    /// A class-owned construction body. Initializers are deliberately not
+    /// A struct-owned construction body. Initializers are deliberately not
     /// functions: they have no source name, generics, visibility, attributes,
     /// color, or optional body.
     Initializer(InitializerDeclaration),
     Structure(AggregateDeclaration),
-    Class(AggregateDeclaration),
     Enumeration(EnumDeclaration),
     Interface(InterfaceDeclaration),
     Implementation(ImplementationDeclaration),
@@ -336,6 +334,8 @@ pub struct AggregateDeclaration {
     pub implements: Vec<TypeExpression>,
     pub fields: Vec<Field>,
     pub members: Vec<DeclarationId>,
+    /// `linear struct Name:` — non-copyable regardless of fields.
+    pub linear: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -403,7 +403,6 @@ pub enum ProjectionCarrierKind {
         mutable: bool,
         ty: TypeExpression,
     },
-    Tuple(Vec<ProjectionCarrier>),
     Option(Box<ProjectionCarrier>),
     Result {
         carrier: Box<ProjectionCarrier>,
@@ -726,7 +725,13 @@ pub enum ExpressionKind {
     },
     Tuple(Vec<ExpressionId>),
     Array(Vec<ExpressionId>),
-    Race(Vec<ExpressionId>),
+    /// A leading-dot variant reference (`.Name`), pending contextual
+    /// resolution among same-spelling enum variants visible at this point.
+    /// `.Name(args)` lowers as `Call { callee: DotName { .. }, .. }`.
+    DotName {
+        spelling: Name,
+        candidates: Vec<ResolvedVariant>,
+    },
     TrySend(ExpressionId),
     Interpolate(Vec<InterpolationPart>),
     Error,
@@ -765,7 +770,6 @@ pub enum BinaryOperator {
     BitXor,
     BitAnd,
     ShiftLeft,
-    ShiftLeftModular,
     ShiftRight,
 }
 
@@ -879,20 +883,16 @@ pub enum PrimaryPattern {
         negative: bool,
         literal: Literal,
     },
+    /// A qualified (`Enum.variant(...)`) or leading-dot (`.variant(...)`)
+    /// variant pattern. `candidates` narrows same-spelling visible variants;
+    /// exactly one must remain by the semantic boundary.
     Constructor {
         spelling: Name,
         candidates: Vec<ResolvedVariant>,
         arguments: Vec<PatternArgument>,
     },
-    /// A bare identifier in a constructor/tuple/array payload. Expected-type
-    /// analysis selects a matching fieldless variant when one exists and the
-    /// preallocated binding otherwise. HIR must preserve both possibilities;
-    /// lowering may not guess from capitalization or import order.
-    ContextualName {
-        spelling: Name,
-        candidates: Vec<ResolvedVariant>,
-        binding: LocalId,
-    },
+    /// A bare identifier pattern. Always a fresh binding — bare identifiers
+    /// no longer disambiguate against fieldless enum variants.
     Bind(LocalId),
     Tuple(Vec<PatternArgument>),
     Array(Vec<PatternArgument>),
@@ -1390,7 +1390,7 @@ fn meter_declaration(
                 meter_type(meter, result, 1)?;
             }
         }
-        DeclarationKind::Structure(value) | DeclarationKind::Class(value) => {
+        DeclarationKind::Structure(value) => {
             meter.edges_usize(value.generics.len())?;
             meter.edges_usize(value.implements.len())?;
             meter.edges_usize(value.fields.len())?;
@@ -1515,12 +1515,6 @@ fn meter_carrier(
         })?;
     match &carrier.kind {
         ProjectionCarrierKind::View { ty, .. } => meter_type(meter, ty, 1)?,
-        ProjectionCarrierKind::Tuple(values) => {
-            meter.edges_usize(values.len())?;
-            for value in values {
-                meter_carrier(meter, value, next)?;
-            }
-        }
         ProjectionCarrierKind::Option(value) => meter_carrier(meter, value, next)?,
         ProjectionCarrierKind::Result { carrier, error } => {
             meter_carrier(meter, carrier, next)?;
@@ -1610,9 +1604,16 @@ fn meter_expression(
                 }
             }
         }
-        ExpressionKind::Tuple(values)
-        | ExpressionKind::Array(values)
-        | ExpressionKind::Race(values) => meter.edges_usize(values.len())?,
+        ExpressionKind::Tuple(values) | ExpressionKind::Array(values) => {
+            meter.edges_usize(values.len())?;
+        }
+        ExpressionKind::DotName {
+            spelling,
+            candidates,
+        } => {
+            meter.name(spelling)?;
+            meter.edges_usize(candidates.len())?;
+        }
         ExpressionKind::Interpolate(parts) => {
             meter.edges_usize(parts.len())?;
             for part in parts {
@@ -1655,14 +1656,6 @@ fn meter_pattern(
             meter.name(spelling)?;
             meter.edges_usize(candidates.len())?;
             meter.edges_usize(arguments.len())?;
-        }
-        PrimaryPattern::ContextualName {
-            spelling,
-            candidates,
-            ..
-        } => {
-            meter.name(spelling)?;
-            meter.edges_usize(candidates.len())?;
         }
         PrimaryPattern::Tuple(arguments) | PrimaryPattern::Array(arguments) => {
             meter.edges_usize(arguments.len())?;
@@ -2280,7 +2273,6 @@ impl Program {
         require_exact_coverage("expressions", &expression_coverage, &mut errors);
 
         let mut pattern_coverage = fallible_zeroed(self.patterns.len(), &mut errors);
-        let mut nested_patterns = fallible_zeroed(self.patterns.len(), &mut errors);
         // Every binding in an alternative belongs to the one lexical binding
         // set introduced by the top-level pattern.  Keep that root explicit
         // while validating: a local has one canonical source occurrence, so a
@@ -2339,7 +2331,6 @@ impl Program {
                         return Err(ValidationFailure::Cancelled);
                     }
                     increment_coverage(&mut pattern_coverage, argument.pattern.0);
-                    increment_coverage(&mut nested_patterns, argument.pattern.0);
                     set_pattern_root(&mut pattern_roots, argument.pattern, root);
                 }
             }
@@ -2422,16 +2413,13 @@ impl Program {
             if errors.poll() {
                 return Err(ValidationFailure::Cancelled);
             }
-            let nested = nested_patterns
-                .get(pattern.id.0 as usize)
-                .is_some_and(|count| *count == 1);
             let binding_root = pattern_roots
                 .get(pattern.id.0 as usize)
                 .copied()
                 .flatten()
                 .and_then(|root| self.pattern(root))
                 .unwrap_or(pattern);
-            validate_pattern(&self, pattern, binding_root, nested, &mut errors);
+            validate_pattern(&self, pattern, binding_root, &mut errors);
         }
         let mut local_binding_coverage = fallible_zeroed(self.locals.len(), &mut errors);
         for statement in &self.statements {
@@ -2462,12 +2450,8 @@ impl Program {
                 if errors.poll() {
                     return Err(ValidationFailure::Cancelled);
                 }
-                match &alternative.kind {
-                    PrimaryPattern::ContextualName { binding, .. }
-                    | PrimaryPattern::Bind(binding) => {
-                        increment_coverage(&mut local_binding_coverage, binding.0);
-                    }
-                    _ => {}
+                if let PrimaryPattern::Bind(binding) = &alternative.kind {
+                    increment_coverage(&mut local_binding_coverage, binding.0);
                 }
             }
         }
@@ -2878,7 +2862,7 @@ fn validate_name(name: &Name, kind: &'static str, errors: &mut ValidationErrorSi
 fn declaration_generics(declaration: &Declaration) -> &[GenericParameterId] {
     match &declaration.kind {
         DeclarationKind::Function(value) => &value.generics,
-        DeclarationKind::Structure(value) | DeclarationKind::Class(value) => &value.generics,
+        DeclarationKind::Structure(value) => &value.generics,
         DeclarationKind::Enumeration(value) => &value.generics,
         DeclarationKind::Interface(value) => &value.generics,
         DeclarationKind::Projection(value) => &value.generics,
@@ -2910,7 +2894,7 @@ fn is_scope_exit_parameter(program: &Program, parameter: ParameterId) -> bool {
 
 fn declaration_children(declaration: &Declaration) -> &[DeclarationId] {
     match &declaration.kind {
-        DeclarationKind::Structure(value) | DeclarationKind::Class(value) => &value.members,
+        DeclarationKind::Structure(value) => &value.members,
         DeclarationKind::Enumeration(value) => &value.members,
         DeclarationKind::Interface(value) => &value.requirements,
         DeclarationKind::Implementation(value) => &value.members,
@@ -3049,7 +3033,6 @@ fn valid_type_definition(
                             &declaration.kind,
                             DeclarationKind::Brand
                                 | DeclarationKind::Structure(_)
-                                | DeclarationKind::Class(_)
                                 | DeclarationKind::Enumeration(_)
                                 | DeclarationKind::Interface(_)
                         )
@@ -3079,7 +3062,6 @@ fn nearest_self_type_owner(
         if matches!(
             record.kind,
             DeclarationKind::Structure(_)
-                | DeclarationKind::Class(_)
                 | DeclarationKind::Enumeration(_)
                 | DeclarationKind::Interface(_)
                 | DeclarationKind::Implementation(_)
@@ -3324,7 +3306,6 @@ fn declaration_allows_receiver(program: &Program, declaration: &Declaration) -> 
         matches!(
             &parent.kind,
             DeclarationKind::Structure(_)
-                | DeclarationKind::Class(_)
                 | DeclarationKind::Enumeration(_)
                 | DeclarationKind::Interface(_)
                 | DeclarationKind::Implementation(_)
@@ -3478,7 +3459,7 @@ fn valid_image_candidate(declaration: &Declaration) -> bool {
     ) && matches!(
         &declaration.kind,
         DeclarationKind::Function(function)
-            if function.color == FunctionColor::Comptime
+            if function.color == FunctionColor::Sync
                 && function.generics.is_empty()
                 && function.parameters.is_empty()
     )
@@ -3666,7 +3647,7 @@ fn collect_declaration_expressions(declaration: &Declaration, coverage: &mut [u8
                 collect_type_expressions(result, coverage, 0);
             }
         }
-        DeclarationKind::Structure(value) | DeclarationKind::Class(value) => {
+        DeclarationKind::Structure(value) => {
             for ty in &value.implements {
                 collect_type_expressions(ty, coverage, 0);
             }
@@ -3711,11 +3692,6 @@ fn collect_carrier_expressions(carrier: &ProjectionCarrier, coverage: &mut [u8],
     }
     match &carrier.kind {
         ProjectionCarrierKind::View { ty, .. } => collect_type_expressions(ty, coverage, 0),
-        ProjectionCarrierKind::Tuple(values) => {
-            for value in values {
-                collect_carrier_expressions(value, coverage, depth + 1);
-            }
-        }
         ProjectionCarrierKind::Option(value) => {
             collect_carrier_expressions(value, coverage, depth + 1);
         }
@@ -3821,9 +3797,7 @@ fn collect_expression_children(kind: &ExpressionKind, coverage: &mut [u8]) {
             increment_coverage(coverage, base.0);
             increment_coverage(coverage, index.0);
         }
-        ExpressionKind::Tuple(values)
-        | ExpressionKind::Array(values)
-        | ExpressionKind::Race(values) => {
+        ExpressionKind::Tuple(values) | ExpressionKind::Array(values) => {
             for value in values {
                 increment_coverage(coverage, value.0);
             }
@@ -3837,6 +3811,7 @@ fn collect_expression_children(kind: &ExpressionKind, coverage: &mut [u8]) {
         }
         ExpressionKind::Literal(_)
         | ExpressionKind::Reference(_)
+        | ExpressionKind::DotName { .. }
         | ExpressionKind::Closure {
             body: ClosureBody::Body(_),
             ..
@@ -4237,10 +4212,10 @@ fn validate_declaration(
             }
         }
         DeclarationKind::Initializer(value) => {
-            let direct_class_owner = match declaration.owner {
+            let direct_struct_owner = match declaration.owner {
                 DeclarationOwner::Declaration(parent) => program
                     .declaration(parent)
-                    .is_some_and(|parent| matches!(&parent.kind, DeclarationKind::Class(_))),
+                    .is_some_and(|parent| matches!(&parent.kind, DeclarationKind::Structure(_))),
                 DeclarationOwner::Module(_) => false,
             };
             let receiver_is_exact = value.parameters.first().is_some_and(|parameter| {
@@ -4255,7 +4230,7 @@ fn validate_declaration(
                 .iter()
                 .skip(1)
                 .all(|parameter| program.parameter(*parameter).is_some_and(|p| !p.receiver));
-            if !direct_class_owner
+            if !direct_struct_owner
                 || declaration.visibility != Visibility::Private
                 || !declaration.attributes.is_empty()
                 || !receiver_is_exact
@@ -4263,7 +4238,7 @@ fn validate_declaration(
                 errors.push(ValidationError::InvalidRecord {
                     arena: "initializer",
                     id: declaration.id.0,
-                    reason: "class owner, private anonymous shape, or mutate receiver",
+                    reason: "struct owner, private anonymous shape, or mutate receiver",
                 });
             }
             if let Some(result) = &value.result {
@@ -4277,7 +4252,7 @@ fn validate_declaration(
                 errors,
             );
         }
-        DeclarationKind::Structure(value) | DeclarationKind::Class(value) => {
+        DeclarationKind::Structure(value) => {
             for implementation in &value.implements {
                 if errors.poll() {
                     return;
@@ -4322,19 +4297,18 @@ fn validate_declaration(
                     reason: "field/member namespace collision",
                 });
             }
-            if matches!(&declaration.kind, DeclarationKind::Class(_))
-                && value
-                    .members
-                    .iter()
-                    .filter_map(|member| program.declaration(*member))
-                    .filter(|member| matches!(&member.kind, DeclarationKind::Initializer(_)))
-                    .count()
-                    > 1
+            if value
+                .members
+                .iter()
+                .filter_map(|member| program.declaration(*member))
+                .filter(|member| matches!(&member.kind, DeclarationKind::Initializer(_)))
+                .count()
+                > 1
             {
                 errors.push(ValidationError::InvalidRecord {
                     arena: "initializer",
                     id: declaration.id.0,
-                    reason: "more than one initializer in a class",
+                    reason: "more than one initializer in a struct",
                 });
             }
         }
@@ -4543,21 +4517,6 @@ fn validate_carrier(
     }
     match &carrier.kind {
         ProjectionCarrierKind::View { ty, .. } => validate_type(program, ty, owner, 0, errors),
-        ProjectionCarrierKind::Tuple(values) => {
-            for value in values {
-                if errors.poll() {
-                    return;
-                }
-                if !span_contains(carrier.source, value.source) {
-                    errors.push(ValidationError::InvalidRecord {
-                        arena: "projection carrier",
-                        id: depth,
-                        reason: "child source",
-                    });
-                }
-                validate_carrier(program, value, owner, depth + 1, errors);
-            }
-        }
         ProjectionCarrierKind::Option(value) => {
             if !span_contains(carrier.source, value.source) {
                 errors.push(ValidationError::InvalidRecord {
@@ -5147,14 +5106,30 @@ fn validate_expression(
             child(*base, "index base", errors);
             child(*index, "index", errors);
         }
-        ExpressionKind::Tuple(values)
-        | ExpressionKind::Array(values)
-        | ExpressionKind::Race(values) => {
+        ExpressionKind::Tuple(values) | ExpressionKind::Array(values) => {
             for value in values {
                 if errors.poll() {
                     return;
                 }
                 child(*value, "aggregate expression", errors);
+            }
+        }
+        ExpressionKind::DotName {
+            spelling,
+            candidates,
+        } => {
+            validate_name(spelling, "dot-name expression", errors);
+            if candidates.is_empty()
+                || !candidates.windows(2).all(|pair| pair[0] < pair[1])
+                || candidates.iter().any(|value| {
+                    resolved_variant(program, value).is_none_or(|variant| variant.name != *spelling)
+                })
+            {
+                errors.push(ValidationError::InvalidRecord {
+                    arena: "dot-name expression",
+                    id: expression.id.0,
+                    reason: "candidates",
+                });
             }
         }
         ExpressionKind::Interpolate(parts) => {
@@ -5227,7 +5202,6 @@ fn validate_pattern(
     program: &Program,
     pattern: &Pattern,
     binding_root: &Pattern,
-    nested: bool,
     errors: &mut ValidationErrorSink,
 ) {
     if errors.poll() {
@@ -5292,28 +5266,6 @@ fn validate_pattern(
                     });
                 }
                 validate_pattern_arguments(program, pattern, arguments, errors);
-            }
-            PrimaryPattern::ContextualName {
-                spelling,
-                candidates,
-                binding,
-            } => {
-                validate_name(spelling, "contextual pattern", errors);
-                if !nested
-                    || !candidates.windows(2).all(|pair| pair[0] < pair[1])
-                    || candidates.iter().any(|candidate| {
-                        resolved_variant(program, candidate).is_none_or(|variant| {
-                            variant.name != *spelling || !variant.fields.is_empty()
-                        })
-                    })
-                    || !valid_pattern_binding(program, pattern, binding_root, *binding)
-                {
-                    errors.push(ValidationError::InvalidRecord {
-                        arena: "contextual pattern",
-                        id: pattern.id.0,
-                        reason: "spelling, candidates, or binding",
-                    });
-                }
             }
             PrimaryPattern::Bind(local) => {
                 if !valid_pattern_binding(program, pattern, binding_root, *local) {
@@ -5438,11 +5390,12 @@ mod tests {
                 name: Some(Name::new("Cache".to_owned()).expect("name")),
                 visibility: Visibility::Private,
                 attributes: Vec::new(),
-                kind: DeclarationKind::Class(AggregateDeclaration {
+                kind: DeclarationKind::Structure(AggregateDeclaration {
                     generics: Vec::new(),
                     implements: Vec::new(),
                     fields: Vec::new(),
                     members: vec![DeclarationId(1)],
+                    linear: false,
                 }),
                 source: span(1, 99),
             },
@@ -5782,7 +5735,7 @@ mod tests {
     }
 
     #[test]
-    fn initializer_shape_is_validated_as_a_dedicated_class_member() {
+    fn initializer_shape_is_validated_as_a_dedicated_struct_member() {
         let program = initializer_program();
         program.clone().validate().expect("valid initializer HIR");
 
@@ -5849,10 +5802,7 @@ mod tests {
             },
             {
                 let mut value = program.clone();
-                let DeclarationKind::Class(class) = value.declarations[0].kind.clone() else {
-                    unreachable!()
-                };
-                value.declarations[0].kind = DeclarationKind::Structure(class);
+                value.declarations[0].kind = DeclarationKind::Brand;
                 value
             },
             {
@@ -5894,12 +5844,12 @@ mod tests {
         second.kind = DeclarationKind::Error;
         second.owner = DeclarationOwner::Declaration(DeclarationId(0));
         duplicate.declarations.push(second);
-        let DeclarationKind::Class(class) = &mut duplicate.declarations[0].kind else {
+        let DeclarationKind::Structure(structure) = &mut duplicate.declarations[0].kind else {
             unreachable!()
         };
-        class.members.push(DeclarationId(2));
-        // First prove the class edge itself is canonical, then mutate it into
-        // a second initializer without constructing a second body arena.
+        structure.members.push(DeclarationId(2));
+        // First prove the struct edge itself is canonical, then mutate it
+        // into a second initializer without constructing a second body arena.
         duplicate
             .clone()
             .validate()
@@ -5907,7 +5857,7 @@ mod tests {
         duplicate.declarations[2].kind = duplicate.declarations[1].kind.clone();
         duplicate
             .validate()
-            .expect_err("a class cannot contain two initializers");
+            .expect_err("a struct cannot contain two initializers");
     }
 
     #[test]
@@ -6052,6 +6002,7 @@ mod tests {
                         implements: Vec::new(),
                         fields: Vec::new(),
                         members: vec![DeclarationId(1)],
+                        linear: false,
                     }),
                     source,
                 },
@@ -6521,11 +6472,7 @@ mod tests {
                     owner: ExpressionOwner::Body(BodyId(0)),
                     binding_scope: Some(ScopeId(1)),
                     alternatives: vec![PatternAlternative {
-                        kind: PrimaryPattern::ContextualName {
-                            spelling: Name::new("payload".to_owned()).expect("name"),
-                            candidates: Vec::new(),
-                            binding: LocalId(0),
-                        },
+                        kind: PrimaryPattern::Bind(LocalId(0)),
                         source: span(19, 23),
                     }],
                     source: span(19, 23),
@@ -6535,11 +6482,7 @@ mod tests {
                     owner: ExpressionOwner::Body(BodyId(0)),
                     binding_scope: Some(ScopeId(1)),
                     alternatives: vec![PatternAlternative {
-                        kind: PrimaryPattern::ContextualName {
-                            spelling: Name::new("payload".to_owned()).expect("name"),
-                            candidates: Vec::new(),
-                            binding: LocalId(0),
-                        },
+                        kind: PrimaryPattern::Bind(LocalId(0)),
                         source: span(30, 34),
                     }],
                     source: span(30, 34),

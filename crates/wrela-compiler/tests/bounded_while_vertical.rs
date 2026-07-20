@@ -42,7 +42,7 @@ const APPLICATION_SOURCE: &str = r#"module app
 from core.image import Image, Target
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="bounded-while-image", target=Target.aarch64_qemu_virt_uefi)
 
 @test

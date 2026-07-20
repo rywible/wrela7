@@ -7,10 +7,6 @@ source_root="src"
 version="1.0.0"
 name="mini"
 
-[[module]]
-path="mini.wr"
-name="mini"
-
 [[profile]]
 mode="development"
 name="development"

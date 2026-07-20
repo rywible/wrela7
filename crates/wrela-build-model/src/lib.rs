@@ -208,43 +208,82 @@ pub struct BuildProfile {
     pub diagnostics: DiagnosticPolicy,
 }
 
+/// Field defaults applied when a manifest `[[profile]]` block omits a key.
+///
+/// `name` and `mode` are the only keys a profile block must state explicitly;
+/// every other field is optional and falls back to the matching value here.
+/// These are revision 0.1's specified example defaults (see `docs/language`,
+/// owned by another workstream) and must not drift from it silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProfileDefaults {
+    pub comptime: ComptimeLimits,
+    pub memory: MemoryLimits,
+    pub dma: DmaPolicy,
+    pub recovery: RecoveryPolicy,
+    pub recording: RecordingMode,
+    pub optimization_level: OptimizationLevel,
+    pub diagnostics: DiagnosticPolicy,
+}
+
+/// The one canonical default table. Codecs read this directly instead of
+/// duplicating the constants; `BuildProfile::with_defaults` applies it.
+pub const PROFILE_DEFAULTS: ProfileDefaults = ProfileDefaults {
+    comptime: ComptimeLimits {
+        steps: 10_000_000,
+        memory_bytes: 64 * 1024 * 1024,
+        call_depth: 256,
+    },
+    memory: MemoryLimits {
+        static_bytes: 256 * 1024 * 1024,
+        peak_bytes: 512 * 1024 * 1024,
+        event_log_bytes: 0,
+    },
+    // Conservative for the AArch64 QEMU `virt` reference machine.
+    dma: DmaPolicy {
+        coherent: false,
+        require_iommu: false,
+    },
+    recovery: RecoveryPolicy {
+        reset_timeout_ns: 5_000_000_000,
+        quarantine_bytes: 16 * 1024 * 1024,
+    },
+    recording: RecordingMode::Disabled,
+    optimization_level: OptimizationLevel::Development,
+    diagnostics: DiagnosticPolicy {
+        sealed_deployment: false,
+        warnings_as_errors: false,
+        watchdogs: true,
+    },
+};
+
 impl BuildProfile {
+    /// Build a profile from an explicit `name`/`mode` plus every default
+    /// field from [`PROFILE_DEFAULTS`]. A manifest `[[profile]]` block that
+    /// declares only overrides decodes by starting here and replacing the
+    /// keys it states.
+    #[must_use]
+    pub fn with_defaults(name: String, mode: BuildMode) -> Self {
+        let defaults = PROFILE_DEFAULTS;
+        Self {
+            name,
+            mode,
+            comptime: defaults.comptime,
+            memory: defaults.memory,
+            dma: defaults.dma,
+            recovery: defaults.recovery,
+            recording: defaults.recording,
+            optimization: OptimizationPolicy {
+                level: defaults.optimization_level,
+                profile_data: None,
+            },
+            diagnostics: defaults.diagnostics,
+        }
+    }
+
     /// Reference development profile used by layer contract tests.
     #[must_use]
     pub fn development() -> Self {
-        Self {
-            name: "development".to_owned(),
-            mode: BuildMode::Development,
-            comptime: ComptimeLimits {
-                steps: 10_000_000,
-                memory_bytes: 64 * 1024 * 1024,
-                call_depth: 256,
-            },
-            memory: MemoryLimits {
-                static_bytes: 256 * 1024 * 1024,
-                peak_bytes: 512 * 1024 * 1024,
-                event_log_bytes: 0,
-            },
-            dma: DmaPolicy {
-                // Conservative for the AArch64 QEMU `virt` reference machine.
-                coherent: false,
-                require_iommu: false,
-            },
-            recovery: RecoveryPolicy {
-                reset_timeout_ns: 5_000_000_000,
-                quarantine_bytes: 16 * 1024 * 1024,
-            },
-            recording: RecordingMode::Disabled,
-            optimization: OptimizationPolicy {
-                level: OptimizationLevel::Development,
-                profile_data: None,
-            },
-            diagnostics: DiagnosticPolicy {
-                sealed_deployment: false,
-                warnings_as_errors: false,
-                watchdogs: true,
-            },
-        }
+        Self::with_defaults("development".to_owned(), BuildMode::Development)
     }
 
     /// Reject incomplete, contradictory, or nondeterministically ordered policy.

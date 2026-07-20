@@ -127,14 +127,22 @@ fn package_identities(
     let manifest = codec
         .decode_manifest(WORKSPACE_MANIFEST, manifest_limits(), &never_cancelled)
         .expect("checked-in runtime-result manifest");
+    // The checked-in manifest declares only `[[profile]]` overrides and no
+    // `[[module]]` block (modules are derived by the loader, not decoded
+    // here), so it need not be byte-identical to its own canonical
+    // re-encoding; every digest below binds the canonical bytes, exactly as
+    // the production loader does.
+    let canonical_manifest = codec
+        .canonical_manifest(&manifest, manifest_limits(), &never_cancelled)
+        .expect("canonical runtime-result manifest");
     assert_eq!(
         codec
-            .canonical_manifest(&manifest, manifest_limits(), &never_cancelled)
-            .expect("canonical runtime-result manifest"),
-        WORKSPACE_MANIFEST
+            .decode_manifest(&canonical_manifest, manifest_limits(), &never_cancelled)
+            .expect("redecode canonical runtime-result manifest"),
+        manifest
     );
     assert_eq!(manifest.name.as_str(), IMAGE_NAME);
-    assert_eq!(manifest.modules[0].module.dotted(), "runtime_result.image");
+    assert_eq!(manifest.images[0].module.dotted(), "runtime_result.image");
     let mut root_content = vec![content_record(
         "runtime_result/image.wr",
         application_source,
@@ -146,7 +154,7 @@ fn package_identities(
         name: manifest.name.clone(),
         version: manifest.version.clone(),
         source_digest: package_content_digest(
-            WORKSPACE_MANIFEST,
+            &canonical_manifest,
             &root_content,
             &HASHER,
             &never_cancelled,
@@ -156,11 +164,14 @@ fn package_identities(
     let core_manifest = codec
         .decode_manifest(CORE_MANIFEST, manifest_limits(), &never_cancelled)
         .expect("checked-in core manifest");
+    let canonical_core_manifest = codec
+        .canonical_manifest(&core_manifest, manifest_limits(), &never_cancelled)
+        .expect("canonical core manifest");
     let core = PackageIdentity {
         name: core_manifest.name.clone(),
         version: core_manifest.version.clone(),
         source_digest: package_content_digest(
-            CORE_MANIFEST,
+            &canonical_core_manifest,
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
@@ -190,7 +201,10 @@ fn package_identities(
         .find(|package| matches!(package.locator, PackageLocator::Workspace { .. }))
         .expect("locked workspace package");
     assert_eq!(workspace.identity, root);
-    assert_eq!(workspace.manifest_digest, HASHER.sha256(WORKSPACE_MANIFEST));
+    assert_eq!(
+        workspace.manifest_digest,
+        HASHER.sha256(&canonical_manifest)
+    );
     assert_eq!(workspace.dependencies[0].identity, core);
     let locked_core = lock
         .packages
@@ -198,7 +212,10 @@ fn package_identities(
         .find(|package| matches!(package.locator, PackageLocator::Toolchain { .. }))
         .expect("locked core package");
     assert_eq!(locked_core.identity, core);
-    assert_eq!(locked_core.manifest_digest, HASHER.sha256(CORE_MANIFEST));
+    assert_eq!(
+        locked_core.manifest_digest,
+        HASHER.sha256(&canonical_core_manifest)
+    );
     (root, core)
 }
 
@@ -741,9 +758,9 @@ fn runtime_result_specializes_u64_payload_with_deterministic_machine_layout() {
         r#"
 fn unwrap_u64_or_zero(value: Result[u64, u64]) -> u64:
     match value:
-        case Result.Ok(bind payload):
+        case .Ok(payload):
             return payload
-        case Result.Err(bind code):
+        case .Err(code):
             return 0
 
 @test
@@ -1033,7 +1050,7 @@ from core.image import Image, Target
 from core.result import Result
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
 
 "#;
@@ -1069,7 +1086,7 @@ enum Forged[T, E]:
     Err(E,)
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
 
 @test
@@ -1089,7 +1106,7 @@ from core.image import Image, Target
 from core.result import Result
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
 
 "#;

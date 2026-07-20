@@ -52,64 +52,46 @@ coverage remain open.
 ## Implemented flat-duration surface
 
 `core.time` publicly exports the nominal `Duration` type with a private `u64`
-nanosecond field. Runtime code can use `ns`, `us`, `ms`, `seconds`, `minutes`,
-`hours`, `days`, `weeks`, `as_nanoseconds`, `add`, `subtract`, `scale`,
-`less_than`, `less_than_or_equal`, `greater_than`, `greater_than_or_equal`,
-`min`, `max`, and `clamp`. Comptime code uses the corresponding explicitly
-suffixed functions. The suffixed comptime names are part of the current bounded
-surface; Wrela does not yet provide overload resolution or method syntax that
-could present one shared spelling. `clamp` requires `lower <= upper`; runtime
-code preflights that invariant with checked target subtraction, and comptime
-code rejects inversion with a source-aware failed assertion.
+nanosecond field, the named constructors `ns`, `us`, `ms`, `seconds`,
+`minutes`, `hours`, `days`, and `weeks`, the accessor `as_nanoseconds`, and
+the utilities `scale`, `min`, `max`, and `clamp`. Every function is one
+phase-neutral surface: the same body is comptime-evaluated when called from a
+comptime context and compiled for runtime otherwise. There are no suffixed
+comptime twins.
 
-`examples/stdlib-time-scalar` is the canonical consumer workspace for that
-installed API. Its manifest-declared test module imports the public functions
-directly from `core.time`; there is no local representation or duplicate
-production implementation. Genuine comptime tests cover construction,
-projection through the public reader, nested calls, explicit aggregate copies,
-exact ns/us/ms/s/minute/hour/day/week maxima, addition/scaling maxima and zero
-scaling, exact-zero and maximum subtraction, underflow rejection, total-order
-equality and endpoint cases, and nested `min`/`max`/`clamp`/subtraction. The
-minute, hour, day, and week max-plus-one cases retain the imported production
-assertion and call spans.
-Selection by test-name substring and deterministic reruns pass through the
-production loader, parser, HIR, semantic analyzer, and evaluator. The arithmetic
-case passes at exactly 1,350 evaluator steps and 896 bytes and fails at
-1,349/895. The ordering case passes at exactly 3,019 steps, 1,568 bytes, and
-call depth 3 and fails at 3,018/1,567/depth 2. The subtraction/clamp case passes
-at exactly 2,793 steps, 1,344 bytes, and depth 3 and fails at
-2,792/1,343/depth 2. All three poll for deterministic cancellation; a loop
-remains classified as `semantic-comptime-operation-not-implemented`.
+Duration arithmetic and ordering are the `core.ops` operator interfaces:
+`impl Add for Duration`, `impl Sub for Duration`, and `impl Ord for Duration`
+in `core.time`, reached through the desugared `+`, `-`, `<`, `<=`, `>`, and
+`>=` operators. There are no named arithmetic or comparison functions; `min`,
+`max`, and `clamp` use the operators internally. Overflow and underflow come
+from checked arithmetic (a comptime overflow is a build error; a runtime
+overflow abandons), and `clamp` asserts `lower <= upper`.
 
-A runtime test imports the same installed module and carries its reachable
-ordinary functions through SemanticWir, FlowWir, canonical Flow wire v10,
-backend revalidation, and MachineWir. The ordering helpers use the implemented
-scalar projection/comparison/local/branch subset and reconstruct their selected
-result through `ns`; this does not claim runtime copy-expression lowering. With
-the native backend enabled against system LLVM 22.1.3, the prepared model
-retains exactly three unsigned less comparisons, one unsigned less-equal
-comparison, four source branches, eight checked multiplies, two checked adds,
-two checked subtracts, twenty-two construction/projection/scalar-copy
-bitcasts, and the exact 70-edge fully qualified harness/test/core call
-multiset before emitting byte-identical independently validated ARM64 COFF
-twice. The source `@test fn` is compiled as the selected test group; this
-fixture does not boot an image or execute the test under the runtime runner. A
-separate ignored `stdlib_time_real_qemu` gate builds the manifest-declared
-installed-source workspace and executes it against the system-resolved
-`qemu-system-aarch64` and EDK2 firmware; its ordinary failure path remains
-non-ignored and verifies bounded path-free diagnostics.
+`examples/stdlib-time-scalar` is the canonical consumer workspace for the
+installed API. Its manifest-declared test module imports the public surface
+directly from `core.time` and proves construction, projection, operator
+arithmetic and ordering (including exact unit maxima, underflow rejection, and
+total-order endpoints), and nested `min`/`max`/`clamp` through the production
+loader, parser, HIR, semantic analyzer, and comptime evaluator. Exact
+evaluator step/byte/call-depth bounds are asserted by
+`crates/wrela-compiler/tests/stdlib_time_scalar.rs`; that test is the
+authority for the current exact quotas rather than this document.
 
-MachineWir v10 now consumes the supported one-field u64 representation as an
-exact 8-byte, 8-aligned scalar-backed ABI value with explicit construction and
-projection bitcasts. Runtime unit multiplication is checked and retains the
-compiler's closed fatal-failure path; runtime `add` and `scale` likewise use
-checked addition/multiplication; `subtract` uses checked target subtraction and
-abandons on underflow. Its comptime form classifies underflow with a stable
-source-aware failed assertion before subtraction. The constructor comptime
-forms prove exact u64 thresholds before multiplication. This does not claim the
-complete time contract: recoverable `Result`-returning checked forms, units
-larger than a week, `Instant`, `now`, class/method presentation, runtime copy or
-assertion lowering, and executed runtime-image unit tests remain follow-on work.
+A runtime test in `examples/stdlib-time-runtime` imports the same installed
+module and carries its reachable functions through SemanticWir, FlowWir, the
+canonical Flow wire, backend revalidation, and MachineWir; with the native
+backend enabled against the system LLVM it emits byte-identical independently
+validated ARM64 COFF twice
+(`crates/wrela-compiler/tests/stdlib_time_runtime_vertical.rs`). A separate
+ignored `stdlib_time_real_qemu` gate builds the manifest-declared workspace
+and executes it against the system-resolved `qemu-system-aarch64` and EDK2
+firmware; its ordinary failure path remains non-ignored and verifies bounded
+path-free diagnostics.
+
+This does not claim the complete time contract: recoverable
+`Result`-returning checked forms, units larger than a week, `Instant`, `now`,
+method-call syntax, and executed runtime-image unit tests remain follow-on
+work.
 
 ## Not implemented
 

@@ -3,5 +3,5 @@ module conformance.image
 from core.image import Image, Target
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="stdlib-time-scalar-conformance", target=Target.aarch64_qemu_virt_uefi)

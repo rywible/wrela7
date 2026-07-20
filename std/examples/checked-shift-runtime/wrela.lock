@@ -3,13 +3,13 @@ schema = 1
 [root]
 name = "checked-shift-runtime"
 version = "0.1.0"
-source_digest = "710f261d371075990ac3fc9723b32043e9d608c1a556bb35eb4ee4a2ae8ba12f"
+source_digest = "0f00c4bfa14264db5b6b57eb02227bf1b0f8913362e3562f7d1cb8dd8df87827"
 
 [[package]]
 name = "checked-shift-runtime"
 version = "0.1.0"
-source_digest = "710f261d371075990ac3fc9723b32043e9d608c1a556bb35eb4ee4a2ae8ba12f"
-manifest_digest = "4e87ba06a6548b3f6f4f3e802756defa86a76fe3dcf9d8b59ef10c1b2f6fd5f9"
+source_digest = "0f00c4bfa14264db5b6b57eb02227bf1b0f8913362e3562f7d1cb8dd8df87827"
+manifest_digest = "ef2dc1dda9325128d2b2a3539a7d06c629ac8f9dff3dca0cc93c521b46412c1b"
 locator = "workspace"
 locator_path = "."
 
@@ -17,12 +17,12 @@ locator_path = "."
 alias = "core"
 name = "wrela-core"
 version = "0.1.0"
-source_digest = "5da2bae2f9089643c235c54bf229e67a995f16ce9a0596c24604bd389661afd5"
+source_digest = "eba5dfc6ec9344b33674856853d953d81a52650f241f2078edf067dbebd7cb2e"
 
 [[package]]
 name = "wrela-core"
 version = "0.1.0"
-source_digest = "5da2bae2f9089643c235c54bf229e67a995f16ce9a0596c24604bd389661afd5"
-manifest_digest = "7eda3d023a968b8302de6a2d5bea13270be3fbdba58d57ca93d74007a1a65786"
+source_digest = "eba5dfc6ec9344b33674856853d953d81a52650f241f2078edf067dbebd7cb2e"
+manifest_digest = "ffa9445a0205d6e7a89fdf0457dd82ecbe011a65ea9c2a3faa147c6a848e5999"
 locator = "toolchain"
 locator_component = "wrela-core-0.1"

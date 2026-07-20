@@ -63,92 +63,92 @@ const CORE_RESULT_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/r
 const CORE_TIME_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/time.wr");
 const OVER_BOUND_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
-from core.time import as_nanoseconds_comptime, seconds_comptime
+from core.time import as_nanoseconds, seconds
 
 @test
-comptime fn scalar_second_conversion_rejects_one_over_bound():
-    result = seconds_comptime(18446744074)
-    comptime assert as_nanoseconds_comptime(result) == 0, "unreachable after duration overflow"
+fn scalar_second_conversion_rejects_one_over_bound():
+    result = seconds(18446744074)
+    comptime assert as_nanoseconds(result) == 0, "unreachable after duration overflow"
 "#;
 const MINUTE_OVER_BOUND_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
-from core.time import as_nanoseconds_comptime, minutes_comptime
+from core.time import as_nanoseconds, minutes
 
 @test
-comptime fn scalar_minute_conversion_rejects_one_over_bound():
-    result = minutes_comptime(307445735)
-    comptime assert as_nanoseconds_comptime(result) == 0, "unreachable after duration overflow"
+fn scalar_minute_conversion_rejects_one_over_bound():
+    result = minutes(307445735)
+    comptime assert as_nanoseconds(result) == 0, "unreachable after duration overflow"
 "#;
 const HOUR_OVER_BOUND_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
-from core.time import as_nanoseconds_comptime, hours_comptime
+from core.time import as_nanoseconds, hours
 
 @test
-comptime fn scalar_hour_conversion_rejects_one_over_bound():
-    result = hours_comptime(5124096)
-    comptime assert as_nanoseconds_comptime(result) == 0, "unreachable after duration overflow"
+fn scalar_hour_conversion_rejects_one_over_bound():
+    result = hours(5124096)
+    comptime assert as_nanoseconds(result) == 0, "unreachable after duration overflow"
 "#;
 const DAY_OVER_BOUND_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
-from core.time import as_nanoseconds_comptime, days_comptime
+from core.time import as_nanoseconds, days
 
 @test
-comptime fn scalar_day_conversion_rejects_one_over_bound():
-    result = days_comptime(213504)
-    comptime assert as_nanoseconds_comptime(result) == 0, "unreachable after duration overflow"
+fn scalar_day_conversion_rejects_one_over_bound():
+    result = days(213504)
+    comptime assert as_nanoseconds(result) == 0, "unreachable after duration overflow"
 "#;
 const WEEK_OVER_BOUND_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
-from core.time import as_nanoseconds_comptime, weeks_comptime
+from core.time import as_nanoseconds, weeks
 
 @test
-comptime fn scalar_week_conversion_rejects_one_over_bound():
-    result = weeks_comptime(30501)
-    comptime assert as_nanoseconds_comptime(result) == 0, "unreachable after duration overflow"
+fn scalar_week_conversion_rejects_one_over_bound():
+    result = weeks(30501)
+    comptime assert as_nanoseconds(result) == 0, "unreachable after duration overflow"
 "#;
 const ADD_OVER_BOUND_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
-from core.time import add_comptime, as_nanoseconds_comptime, ns_comptime
+from core.time import add, as_nanoseconds, ns
 
 @test
-comptime fn duration_addition_rejects_one_over_bound():
-    result = add_comptime(left=ns_comptime(18446744073709551615), right=ns_comptime(1))
-    comptime assert as_nanoseconds_comptime(result) == 0, "unreachable after duration addition overflow"
+fn duration_addition_rejects_one_over_bound():
+    result = add(left=ns(18446744073709551615), right=ns(1))
+    comptime assert as_nanoseconds(result) == 0, "unreachable after duration addition overflow"
 "#;
 const SCALE_OVER_BOUND_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
-from core.time import as_nanoseconds_comptime, ns_comptime, scale_comptime
+from core.time import as_nanoseconds, ns, scale
 
 @test
-comptime fn duration_scaling_rejects_one_over_bound():
-    result = scale_comptime(value=ns_comptime(9223372036854775808), factor=2)
-    comptime assert as_nanoseconds_comptime(result) == 0, "unreachable after duration scaling overflow"
+fn duration_scaling_rejects_one_over_bound():
+    result = scale(value=ns(9223372036854775808), factor=2)
+    comptime assert as_nanoseconds(result) == 0, "unreachable after duration scaling overflow"
 "#;
 const SUBTRACT_UNDERFLOW_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
-from core.time import as_nanoseconds_comptime, ns_comptime, subtract_comptime
+from core.time import as_nanoseconds, ns, subtract
 
 @test
-comptime fn duration_subtraction_rejects_underflow():
-    result = subtract_comptime(left=ns_comptime(0), right=ns_comptime(1))
-    comptime assert as_nanoseconds_comptime(result) == 0, "unreachable after duration subtraction underflow"
+fn duration_subtraction_rejects_underflow():
+    result = subtract(left=ns(0), right=ns(1))
+    comptime assert as_nanoseconds(result) == 0, "unreachable after duration subtraction underflow"
 "#;
 const CLAMP_INVERTED_BOUNDS_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
-from core.time import as_nanoseconds_comptime, clamp_comptime, ns_comptime
+from core.time import as_nanoseconds, clamp, ns
 
 @test
-comptime fn duration_clamp_rejects_inverted_bounds():
-    result = clamp_comptime(value=ns_comptime(42), lower=ns_comptime(42), upper=ns_comptime(20))
-    comptime assert as_nanoseconds_comptime(result) == 0, "unreachable after inverted duration clamp bounds"
+fn duration_clamp_rejects_inverted_bounds():
+    result = clamp(value=ns(42), lower=ns(42), upper=ns(20))
+    comptime assert as_nanoseconds(result) == 0, "unreachable after inverted duration clamp bounds"
 "#;
 const UNSUPPORTED_ARITHMETIC_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
-from core.time import add_comptime, ns_comptime
+from core.time import add, ns
 
 @test
-comptime fn duration_arithmetic_rejects_unsupported_loop():
-    result = add_comptime(left=ns_comptime(20), right=ns_comptime(22))
+fn duration_arithmetic_rejects_unsupported_loop():
+    result = add(left=ns(20), right=ns(22))
     loop:
         pass
 "#;
@@ -166,20 +166,6 @@ struct SourceFixture {
 fn checked_in_time_scalar_workspace_is_canonical_and_exact_bounds_pass() {
     let (manifest, root_identity, canonical_lockfile) = canonical_workspace();
     assert_eq!(
-        manifest
-            .modules
-            .iter()
-            .map(|module| (module.module.dotted(), module.source_path.as_str()))
-            .collect::<Vec<_>>(),
-        [
-            (
-                "conformance.duration_scalar_test".to_owned(),
-                "conformance/duration_scalar_test.wr"
-            ),
-            ("conformance.image".to_owned(), "conformance/image.wr"),
-        ]
-    );
-    assert_eq!(
         canonical_lockfile,
         WORKSPACE_LOCKFILE,
         "checked-in workspace lockfile is stale; canonical bytes were:\n{}",
@@ -191,6 +177,21 @@ fn checked_in_time_scalar_workspace_is_canonical_and_exact_bounds_pass() {
     assert_eq!(workspace.graph().packages().len(), 2);
     assert_eq!(workspace.graph().modules().len(), 5);
     assert_eq!(workspace.sources().len(), 5);
+    // The manifest declares no `[[module]]` block: modules are derived from
+    // a source-root walk. Confirm the loader derived exactly the two root
+    // package modules the checked-in sources provide.
+    let mut root_module_paths: Vec<String> = workspace
+        .graph()
+        .modules()
+        .iter()
+        .filter(|module| module.package == workspace.graph().root())
+        .map(|module| module.path.dotted())
+        .collect();
+    root_module_paths.sort();
+    assert_eq!(
+        root_module_paths,
+        ["conformance.duration_scalar_test", "conformance.image"]
+    );
     assert_eq!(workspace.lockfile().root, root_identity);
     let fixture = loaded_source_fixture(workspace, root_identity, manifest.profiles[0].clone());
     let first = analyze(&fixture, TestDiscoverySelection::Comptime);
@@ -323,19 +324,23 @@ fn checked_in_time_scalar_workspace_is_canonical_and_exact_bounds_pass() {
 
 #[test]
 fn installed_duration_arithmetic_rejects_exactly_one_over_bounds() {
+    // `add` and `scale` no longer have manual `comptime assert` bound checks
+    // -- they rely purely on checked u64 arithmetic trapping on overflow, so
+    // exactly one nanosecond (respectively one doubling) over the
+    // representable bound now fails with a code-prefixed
+    // `semantic-comptime-arithmetic` overflow, not an assertion-style
+    // message.
     let (manifest, root_identity, _) = canonical_workspace();
-    for (test_source, assertion, call, message) in [
+    for (test_source, arithmetic, call) in [
         (
             ADD_OVER_BOUND_TEST_SOURCE,
-            b"comptime assert left.nanoseconds <= 18446744073709551615 - right.nanoseconds, \"duration addition exceeds the u64 nanosecond representation\"".as_slice(),
-            b"add_comptime(left=ns_comptime(18446744073709551615), right=ns_comptime(1))".as_slice(),
-            "duration addition exceeds the u64 nanosecond representation",
+            b"left.nanoseconds + right.nanoseconds".as_slice(),
+            b"add(left=ns(18446744073709551615), right=ns(1))".as_slice(),
         ),
         (
             SCALE_OVER_BOUND_TEST_SOURCE,
-            b"comptime assert value.nanoseconds <= 18446744073709551615 / factor, \"duration scaling exceeds the u64 nanosecond representation\"".as_slice(),
-            b"scale_comptime(value=ns_comptime(9223372036854775808), factor=2)".as_slice(),
-            "duration scaling exceeds the u64 nanosecond representation",
+            b"value.nanoseconds * factor".as_slice(),
+            b"scale(value=ns(9223372036854775808), factor=2)".as_slice(),
         ),
     ] {
         let fixture = source_fixture(
@@ -349,18 +354,20 @@ fn installed_duration_arithmetic_rejects_exactly_one_over_bounds() {
             "arithmetic one-over source diagnostics: {:?}",
             output.diagnostics()
         );
-        let image = output.successful().expect("sealed arithmetic one-over analysis");
+        let image = output
+            .successful()
+            .expect("sealed arithmetic one-over analysis");
         let [result] = image.facts().comptime_test_results.as_slice() else {
             panic!("arithmetic one-over workspace must produce exactly one result");
         };
-        let expected_source = source_span(0, CORE_TIME_SOURCE, assertion);
+        let expected_source = source_span(0, CORE_TIME_SOURCE, arithmetic);
         let expected_call = source_span(1, test_source, call);
         assert_eq!(
             result.outcome,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "{message} [source {expected_source}; comptime calls <- {expected_call}]"
+                    "semantic-comptime-arithmetic: comptime integer arithmetic overflow [source {expected_source}; comptime calls <- {expected_call}]"
                 ),
             }
         );
@@ -387,16 +394,21 @@ fn installed_duration_subtraction_rejects_underflow_without_wrapping() {
     let [result] = image.facts().comptime_test_results.as_slice() else {
         panic!("subtraction underflow workspace must produce exactly one result");
     };
-    let assertion = b"comptime assert right.nanoseconds <= left.nanoseconds, \"duration subtraction would produce a negative duration\"";
-    let call = b"subtract_comptime(left=ns_comptime(0), right=ns_comptime(1))";
-    let expected_source = source_span(0, CORE_TIME_SOURCE, assertion);
+    // `subtract` no longer has a manual `comptime assert` underflow guard --
+    // it relies purely on checked u64 subtraction trapping on underflow, so
+    // this now fails with a code-prefixed `semantic-comptime-arithmetic`
+    // overflow (the evaluator reports underflow the same way as overflow),
+    // not an assertion-style message.
+    let arithmetic = b"left.nanoseconds - right.nanoseconds";
+    let call = b"subtract(left=ns(0), right=ns(1))";
+    let expected_source = source_span(0, CORE_TIME_SOURCE, arithmetic);
     let expected_call = source_span(1, SUBTRACT_UNDERFLOW_TEST_SOURCE, call);
     assert_eq!(
         result.outcome,
         TestOutcome::Failed {
             phase: FailurePhase::Comptime,
             message: format!(
-                "duration subtraction would produce a negative duration [source {expected_source}; comptime calls <- {expected_call}]"
+                "semantic-comptime-arithmetic: comptime integer arithmetic overflow [source {expected_source}; comptime calls <- {expected_call}]"
             ),
         }
     );
@@ -420,9 +432,12 @@ fn installed_duration_clamp_rejects_inverted_bounds() {
     let [result] = image.facts().comptime_test_results.as_slice() else {
         panic!("inverted clamp workspace must produce exactly one result");
     };
-    let assertion = b"comptime assert lower.nanoseconds <= upper.nanoseconds, \"duration clamp lower bound exceeds its upper bound\"";
-    let call =
-        b"clamp_comptime(value=ns_comptime(42), lower=ns_comptime(42), upper=ns_comptime(20))";
+    // `clamp` keeps its plain semantic-contract `assert lower.nanoseconds <=
+    // upper.nanoseconds` (a real invariant, not an overflow guard), so this
+    // still fails assertion-style (no diagnostic-code prefix), just against
+    // the plain (not `_comptime`-suffixed) call spelling.
+    let assertion = b"assert lower.nanoseconds <= upper.nanoseconds, \"duration clamp lower bound exceeds its upper bound\"";
+    let call = b"clamp(value=ns(42), lower=ns(42), upper=ns(20))";
     let expected_source = source_span(0, CORE_TIME_SOURCE, assertion);
     let expected_call = source_span(1, CLAMP_INVERTED_BOUNDS_TEST_SOURCE, call);
     assert_eq!(
@@ -444,6 +459,15 @@ fn installed_duration_arithmetic_unsupported_operation_fails_closed() {
         root_identity,
         manifest.profiles[0].clone(),
     );
+    // An unconditional `loop:` is unsupported both by the static
+    // comptime-legality checker (so this plain `fn` never qualifies for the
+    // comptime tier) and by the runtime-shape checker (it is not a bounded
+    // `while`), so this is not a supported test at either tier. An explicit
+    // `--comptime` selection prefers the comptime checker's own diagnostic
+    // in that case (it is the more specific, correct explanation), and
+    // since this fixture's only test candidate is the rejected one, there
+    // is nothing else for discovery to fall back to -- it fails closed with
+    // that diagnostic rather than silently sealing an empty test group.
     let output = analyze(&fixture, TestDiscoverySelection::Comptime);
     assert!(output.successful().is_none());
     let [diagnostic] = output.diagnostics() else {
@@ -462,37 +486,38 @@ fn installed_duration_arithmetic_unsupported_operation_fails_closed() {
 
 #[test]
 fn real_imported_unit_conversions_reject_exactly_one_over_bound() {
+    // Each per-unit conversion (`seconds`, `minutes`, ...) no longer has a
+    // manual `comptime assert` bound check -- it relies purely on the
+    // language's checked u64 multiplication trapping on overflow, so
+    // exactly one nanosecond over the representable bound now fails with a
+    // code-prefixed `semantic-comptime-arithmetic` overflow, not an
+    // assertion-style message.
     let (manifest, root_identity, _) = canonical_workspace();
-    for (test_source, assertion, call, message) in [
+    for (test_source, arithmetic, call) in [
         (
             OVER_BOUND_TEST_SOURCE,
-            b"comptime assert value <= 18446744073, \"seconds exceed the u64 nanosecond representation\"".as_slice(),
-            b"seconds_comptime(18446744074)".as_slice(),
-            "seconds exceed the u64 nanosecond representation",
+            b"value * 1000000000)".as_slice(),
+            b"seconds(18446744074)".as_slice(),
         ),
         (
             MINUTE_OVER_BOUND_TEST_SOURCE,
-            b"comptime assert value <= 307445734, \"minutes exceed the u64 nanosecond representation\"".as_slice(),
-            b"minutes_comptime(307445735)".as_slice(),
-            "minutes exceed the u64 nanosecond representation",
+            b"value * 60000000000)".as_slice(),
+            b"minutes(307445735)".as_slice(),
         ),
         (
             HOUR_OVER_BOUND_TEST_SOURCE,
-            b"comptime assert value <= 5124095, \"hours exceed the u64 nanosecond representation\"".as_slice(),
-            b"hours_comptime(5124096)".as_slice(),
-            "hours exceed the u64 nanosecond representation",
+            b"value * 3600000000000)".as_slice(),
+            b"hours(5124096)".as_slice(),
         ),
         (
             DAY_OVER_BOUND_TEST_SOURCE,
-            b"comptime assert value <= 213503, \"days exceed the u64 nanosecond representation\"".as_slice(),
-            b"days_comptime(213504)".as_slice(),
-            "days exceed the u64 nanosecond representation",
+            b"value * 86400000000000)".as_slice(),
+            b"days(213504)".as_slice(),
         ),
         (
             WEEK_OVER_BOUND_TEST_SOURCE,
-            b"comptime assert value <= 30500, \"weeks exceed the u64 nanosecond representation\"".as_slice(),
-            b"weeks_comptime(30501)".as_slice(),
-            "weeks exceed the u64 nanosecond representation",
+            b"value * 604800000000000)".as_slice(),
+            b"weeks(30501)".as_slice(),
         ),
     ] {
         let fixture = source_fixture(
@@ -510,10 +535,15 @@ fn real_imported_unit_conversions_reject_exactly_one_over_bound() {
         let [result] = image.facts().comptime_test_results.as_slice() else {
             panic!("one-over workspace must produce exactly one result");
         };
-        let expected_source = source_span(0, CORE_TIME_SOURCE, assertion);
+        // `arithmetic` above includes the trailing `)` so the needle search
+        // cannot ambiguously match a shorter numeric-literal prefix shared
+        // by another unit conversion (e.g. `value * 1000` inside `value *
+        // 1000000`).
+        let arithmetic_start = arithmetic.len() - 1;
+        let expected_source = source_span(0, CORE_TIME_SOURCE, &arithmetic[..arithmetic_start]);
         let expected_call = source_span(1, test_source, call);
         let expected = format!(
-            "{message} [source {expected_source}; comptime calls <- {expected_call}]"
+            "semantic-comptime-arithmetic: comptime integer arithmetic overflow [source {expected_source}; comptime calls <- {expected_call}]"
         );
         assert_eq!(
             result.outcome,
@@ -531,14 +561,20 @@ fn installed_duration_arithmetic_has_exact_resources_and_cancellation() {
     let workspace = load_checked_in_workspace();
     let fixture = loaded_source_fixture(workspace, root_identity, manifest.profiles[0].clone());
 
+    // The manual `comptime assert` bound checks in the deleted `_comptime`
+    // twins no longer execute, so the exact evaluator-step boundary for this
+    // selection dropped from the old dual-twin core (was 1350/1349); the new
+    // boundary below was measured empirically against the de-twinned
+    // `std/wrela-core-0.1/src/time.wr`. The evaluator-bytes boundary is
+    // unaffected (structure/argument byte accounting does not change).
     for (steps, expected) in [
-        (1350, TestOutcome::Passed),
+        (1167, TestOutcome::Passed),
         (
-            1349,
+            1166,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "comptime test exceeded comptime evaluator steps limit 1349 [source {}]",
+                    "comptime test exceeded comptime evaluator steps limit 1166 [source {}]",
                     source_span_nth(0, PASSING_TEST_SOURCE, b"42", 1),
                 ),
             },
@@ -558,16 +594,12 @@ fn installed_duration_arithmetic_has_exact_resources_and_cancellation() {
                 phase: FailurePhase::Comptime,
                 message: format!(
                     "comptime test exceeded comptime evaluator bytes limit 895 [source {}; comptime calls <- {} <- {}]",
-                    source_span_nth(4, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 1,),
-                    source_span(
-                        4,
-                        CORE_TIME_SOURCE,
-                        b"ns_comptime(value.nanoseconds * factor)",
-                    ),
+                    source_span_nth(4, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 0,),
+                    source_span(4, CORE_TIME_SOURCE, b"ns(value=value.nanoseconds * factor)"),
                     source_span(
                         0,
                         PASSING_TEST_SOURCE,
-                        b"scale_comptime(value=ns_comptime(20), factor=2)",
+                        b"scale(value=ns(value=20), factor=2)",
                     ),
                 ),
             },
@@ -590,7 +622,7 @@ fn installed_duration_arithmetic_has_exact_resources_and_cancellation() {
         TestOutcome::Passed
     );
     let complete_polls = polls.get();
-    assert!(complete_polls > 1350);
+    assert!(complete_polls > 1167);
     let cancel_at = complete_polls / 2;
     let cancelled_polls = Cell::new(0u64);
     let cancelled = arithmetic_outcome(&fixture, AnalysisLimits::standard(), &|| {
@@ -695,14 +727,19 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
         manifest.profiles[0].clone(),
     );
 
+    // Empirically re-measured against the de-twinned time.wr: the manual
+    // `comptime assert` bound checks in the deleted `_comptime` twins no
+    // longer execute, so the exact evaluator-step boundary dropped from the
+    // old dual-twin core (was 2793/2792). The evaluator-bytes boundary is
+    // unaffected.
     for (steps, expected) in [
-        (2793, TestOutcome::Passed),
+        (2823, TestOutcome::Passed),
         (
-            2792,
+            2822,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "comptime test exceeded comptime evaluator steps limit 2792 [source {}]",
+                    "comptime test exceeded comptime evaluator steps limit 2822 [source {}]",
                     source_span_nth(0, PASSING_TEST_SOURCE, b"22", 0),
                 ),
             },
@@ -724,12 +761,12 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
                 phase: FailurePhase::Comptime,
                 message: format!(
                     "comptime test exceeded comptime evaluator bytes limit 1343 [source {}; comptime calls <- {} <- {}]",
-                    source_span_nth(4, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 1),
-                    source_span_nth(4, CORE_TIME_SOURCE, b"ns_comptime(selected)", 2),
+                    source_span_nth(4, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 0),
+                    source_span_nth(4, CORE_TIME_SOURCE, b"ns(value=selected)", 2),
                     source_span(
                         0,
                         PASSING_TEST_SOURCE,
-                        b"clamp_comptime(value=ns_comptime(84), lower=ns_comptime(20),\n        upper=ns_comptime(42))",
+                        b"clamp(value=ns(value=84), lower=ns(value=20),\n        upper=ns(value=42))",
                     ),
                 ),
             },
@@ -763,12 +800,12 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
     let helper_call = source_span(
         4,
         CORE_TIME_SOURCE,
-        b"ns_comptime(left.nanoseconds - right.nanoseconds)",
+        b"ns(value=left.nanoseconds - right.nanoseconds)",
     );
     let outer_call = source_span(
         0,
         PASSING_TEST_SOURCE,
-        b"subtract_comptime(left=ns_comptime(42), right=ns_comptime(42))",
+        b"subtract(left=ns(value=42), right=ns(value=42))",
     );
     assert_eq!(
         subtraction_outcome(&over_depth, AnalysisLimits::standard(), &never_cancelled)
@@ -791,7 +828,7 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
         TestOutcome::Passed
     );
     let complete_polls = polls.get();
-    assert!(complete_polls > 2793);
+    assert!(complete_polls > 2823);
     let cancel_at = complete_polls / 2;
     for _ in 0..2 {
         let cancelled_polls = Cell::new(0u64);
@@ -814,14 +851,21 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
         manifest.profiles[0].clone(),
     );
 
+    // Empirically re-measured after deleting `less_than`,
+    // `less_than_or_equal`, `greater_than`, and `greater_than_or_equal`: the
+    // test now spells every ordering check as an `as_nanoseconds(...)`
+    // comparison using the raw `<`/`<=`/`>`/`>=` operators instead of calling
+    // the deleted helpers, so the exact evaluator-step boundary dropped (was
+    // 3124/3123 when those comparison helpers were still part of the call
+    // graph).
     for (steps, expected) in [
-        (3019, TestOutcome::Passed),
+        (2506, TestOutcome::Passed),
         (
-            3018,
+            2505,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "comptime test exceeded comptime evaluator steps limit 3018 [source {}]",
+                    "comptime test exceeded comptime evaluator steps limit 2505 [source {}]",
                     source_span_nth(0, PASSING_TEST_SOURCE, b"42", 6),
                 ),
             },
@@ -833,25 +877,22 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
             .expect("step-bounded installed duration ordering");
         assert_eq!(outcome, expected);
     }
+    // The evaluator-bytes boundary's cross-function-call chain used to
+    // bottom out in the deleted `less_than` helper (called from `max`);
+    // `max` now performs that comparison inline, so the chain instead runs
+    // through `max`'s own `ns` constructor call down to the same
+    // `Duration(nanoseconds=value)` leaf inside `ns`.
     for (bytes, expected) in [
-        (1568, TestOutcome::Passed),
+        (1472, TestOutcome::Passed),
         (
-            1567,
+            1471,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "comptime test exceeded comptime evaluator bytes limit 1567 [source {}; comptime calls <- {} <- {}]",
-                    source_span_nth(4, CORE_TIME_SOURCE, b"left", 29),
-                    source_span(
-                        4,
-                        CORE_TIME_SOURCE,
-                        b"less_than_comptime(left=left, right=right)",
-                    ),
-                    source_span(
-                        0,
-                        PASSING_TEST_SOURCE,
-                        b"max_comptime(left=zero, right=forty_two)",
-                    ),
+                    "comptime test exceeded comptime evaluator bytes limit 1471 [source {}; comptime calls <- {} <- {}]",
+                    source_span_nth(4, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 0),
+                    source_span_nth(4, CORE_TIME_SOURCE, b"ns(value=selected)", 1),
+                    source_span(0, PASSING_TEST_SOURCE, b"max(left=zero, right=forty_two)",),
                 ),
             },
         ),
@@ -879,15 +920,15 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
     over_profile.comptime.call_depth = 2;
     let over_depth =
         loaded_source_fixture(load_checked_in_workspace(), root_identity, over_profile);
-    let helper_call = source_span(
-        4,
-        CORE_TIME_SOURCE,
-        b"less_than_comptime(left=right, right=left)",
-    );
+    // The over-depth chain used to bottom out in the deleted `less_than`
+    // helper (called from `min`); `min` now performs that comparison inline,
+    // so the depth-3 call it still makes runs straight through to its own
+    // `ns` constructor call.
+    let helper_call = source_span_nth(4, CORE_TIME_SOURCE, b"ns(value=selected)", 0);
     let outer_call = source_span(
         0,
         PASSING_TEST_SOURCE,
-        b"greater_than_comptime(left=copy maximum, right=copy forty_two)",
+        b"min(left=copy forty_two, right=copy forty_one)",
     );
     assert_eq!(
         ordering_outcome(&over_depth, AnalysisLimits::standard(), &never_cancelled)
@@ -910,7 +951,7 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
         TestOutcome::Passed
     );
     let complete_polls = polls.get();
-    assert!(complete_polls > 3019);
+    assert!(complete_polls > 2506);
     let cancel_at = complete_polls / 2;
     let cancelled_polls = Cell::new(0u64);
     let cancelled = ordering_outcome(&fixture, AnalysisLimits::standard(), &|| {
@@ -1075,7 +1116,7 @@ fn installed_runtime_duration_functions_reach_canonical_machine_and_native_objec
         }
     }
     assert_eq!(semantic_aggregates, 1);
-    assert_eq!(semantic_projects, 20);
+    assert_eq!(semantic_projects, 22);
     assert_eq!(semantic_checked_multiplies, 8);
     assert_eq!(semantic_checked_adds, 2);
     assert_eq!(semantic_checked_subtracts, 2);
@@ -1090,7 +1131,8 @@ fn installed_runtime_duration_functions_reach_canonical_machine_and_native_objec
             SemanticBinaryOperator::Less,
             SemanticBinaryOperator::Less,
             SemanticBinaryOperator::Less,
-            SemanticBinaryOperator::LessEqual
+            SemanticBinaryOperator::LessEqual,
+            SemanticBinaryOperator::LessEqual,
         ]
     );
     assert_eq!(semantic_copies, 1);
@@ -1175,7 +1217,7 @@ fn installed_runtime_duration_functions_reach_canonical_machine_and_native_objec
         }
     }
     assert_eq!(flow_aggregates, 1);
-    assert_eq!(flow_projects, 20);
+    assert_eq!(flow_projects, 22);
     assert_eq!(flow_checked_multiplies, 8);
     assert_eq!(flow_checked_adds, 2);
     assert_eq!(flow_checked_subtracts, 2);
@@ -1190,7 +1232,8 @@ fn installed_runtime_duration_functions_reach_canonical_machine_and_native_objec
             FlowBinaryOp::Less,
             FlowBinaryOp::Less,
             FlowBinaryOp::Less,
-            FlowBinaryOp::LessEqual
+            FlowBinaryOp::LessEqual,
+            FlowBinaryOp::LessEqual,
         ]
     );
     assert_eq!(flow_copies, 1);
@@ -1284,7 +1327,7 @@ fn installed_runtime_duration_functions_reach_canonical_machine_and_native_objec
             }
         }
     }
-    assert_eq!(machine_bitcasts, 22);
+    assert_eq!(machine_bitcasts, 24);
     assert_eq!(machine_checked_multiplies, 8);
     assert_eq!(machine_checked_adds, 2);
     assert_eq!(machine_checked_subtracts, 2);
@@ -1299,6 +1342,7 @@ fn installed_runtime_duration_functions_reach_canonical_machine_and_native_objec
             IntegerPredicate::UnsignedLess,
             IntegerPredicate::UnsignedLess,
             IntegerPredicate::UnsignedLess,
+            IntegerPredicate::UnsignedLessEqual,
             IntegerPredicate::UnsignedLessEqual,
         ]
     );
@@ -1345,11 +1389,7 @@ fn expected_runtime_call_edges() -> Vec<(String, String)> {
     const AS_NANOSECONDS: &str = "wrela-core@0.1.0::time::as_nanoseconds";
     const CLAMP: &str = "wrela-core@0.1.0::time::clamp";
     const DAYS: &str = "wrela-core@0.1.0::time::days";
-    const GREATER_THAN: &str = "wrela-core@0.1.0::time::greater_than";
-    const GREATER_THAN_OR_EQUAL: &str = "wrela-core@0.1.0::time::greater_than_or_equal";
     const HOURS: &str = "wrela-core@0.1.0::time::hours";
-    const LESS_THAN: &str = "wrela-core@0.1.0::time::less_than";
-    const LESS_THAN_OR_EQUAL: &str = "wrela-core@0.1.0::time::less_than_or_equal";
     const MAX: &str = "wrela-core@0.1.0::time::max";
     const MILLISECONDS: &str = "wrela-core@0.1.0::time::ms";
     const MIN: &str = "wrela-core@0.1.0::time::min";
@@ -1368,17 +1408,13 @@ fn expected_runtime_call_edges() -> Vec<(String, String)> {
         }
     };
     push("__wrela_test_entry", TEST, 1);
-    push(TEST, AS_NANOSECONDS, 14);
+    push(TEST, AS_NANOSECONDS, 22);
     push(TEST, NANOSECONDS, 21);
     for callee in [
         ADD,
         CLAMP,
         DAYS,
-        GREATER_THAN,
-        GREATER_THAN_OR_EQUAL,
         HOURS,
-        LESS_THAN,
-        LESS_THAN_OR_EQUAL,
         MAX,
         MILLISECONDS,
         MIN,
@@ -1408,10 +1444,6 @@ fn expected_runtime_call_edges() -> Vec<(String, String)> {
     ] {
         push(caller, NANOSECONDS, 1);
     }
-    push(GREATER_THAN, LESS_THAN, 1);
-    push(GREATER_THAN_OR_EQUAL, LESS_THAN_OR_EQUAL, 1);
-    push(MAX, LESS_THAN, 1);
-    push(MIN, LESS_THAN_OR_EQUAL, 1);
     edges.sort();
     edges
 }
@@ -1421,20 +1453,31 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
     let manifest = codec
         .decode_manifest(WORKSPACE_MANIFEST, manifest_limits(), &never_cancelled)
         .expect("checked-in time-scalar manifest");
+    // The checked-in manifest declares only `[[profile]]` overrides and no
+    // `[[module]]` block (modules are derived by the loader, not decoded
+    // here), so it need not be byte-identical to its own canonical
+    // re-encoding; every digest below binds the canonical bytes, exactly as
+    // the production loader does.
+    let canonical_manifest = codec
+        .canonical_manifest(&manifest, manifest_limits(), &never_cancelled)
+        .expect("canonical time-scalar manifest");
     assert_eq!(
         codec
-            .canonical_manifest(&manifest, manifest_limits(), &never_cancelled)
-            .expect("canonical time-scalar manifest"),
-        WORKSPACE_MANIFEST
+            .decode_manifest(&canonical_manifest, manifest_limits(), &never_cancelled)
+            .expect("redecode canonical time-scalar manifest"),
+        manifest
     );
     let core_manifest = codec
         .decode_manifest(CORE_MANIFEST, manifest_limits(), &never_cancelled)
         .expect("checked-in core manifest");
+    let canonical_core_manifest = codec
+        .canonical_manifest(&core_manifest, manifest_limits(), &never_cancelled)
+        .expect("canonical core manifest");
     let root_identity = PackageIdentity {
         name: manifest.name.clone(),
         version: manifest.version.clone(),
         source_digest: package_content_digest(
-            WORKSPACE_MANIFEST,
+            &canonical_manifest,
             &[
                 content_record("conformance/duration_scalar_test.wr", PASSING_TEST_SOURCE),
                 content_record("conformance/image.wr", IMAGE_SOURCE),
@@ -1448,7 +1491,7 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
         name: core_manifest.name.clone(),
         version: core_manifest.version.clone(),
         source_digest: package_content_digest(
-            CORE_MANIFEST,
+            &canonical_core_manifest,
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
@@ -1469,7 +1512,7 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
                 alias: DependencyAlias::new("core").expect("core alias"),
                 identity: core_identity.clone(),
             }],
-            manifest_digest: HASHER.sha256(WORKSPACE_MANIFEST),
+            manifest_digest: HASHER.sha256(&canonical_manifest),
         },
         LockedPackage {
             identity: core_identity,
@@ -1477,7 +1520,7 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
                 component: "wrela-core-0.1".to_owned(),
             },
             dependencies: Vec::new(),
-            manifest_digest: HASHER.sha256(CORE_MANIFEST),
+            manifest_digest: HASHER.sha256(&canonical_core_manifest),
         },
     ];
     packages.sort_by(|left, right| left.identity.cmp(&right.identity));
@@ -1562,11 +1605,14 @@ fn override_root_identity(test_source: &str) -> PackageIdentity {
     let manifest = codec
         .decode_manifest(WORKSPACE_MANIFEST, manifest_limits(), &never_cancelled)
         .expect("checked-in time-scalar manifest");
+    let canonical_manifest = codec
+        .canonical_manifest(&manifest, manifest_limits(), &never_cancelled)
+        .expect("canonical time-scalar manifest");
     PackageIdentity {
         name: manifest.name,
         version: manifest.version,
         source_digest: package_content_digest(
-            WORKSPACE_MANIFEST,
+            &canonical_manifest,
             &[
                 content_record("conformance/duration_scalar_test.wr", test_source),
                 content_record("conformance/image.wr", IMAGE_SOURCE),

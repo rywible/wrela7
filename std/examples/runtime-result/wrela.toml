@@ -6,10 +6,6 @@ name = "runtime-result"
 version = "0.1.0"
 source_root = "src"
 
-[[module]]
-name = "runtime_result.image"
-path = "runtime_result/image.wr"
-
 [[dependency]]
 alias = "core"
 package = "wrela-core"

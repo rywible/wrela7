@@ -1,0 +1,10 @@
+module ops
+
+pub interface Add:
+    fn add(read self, right: Self) -> Self
+
+pub interface Sub:
+    fn subtract(read self, right: Self) -> Self
+
+pub interface Ord:
+    fn less_than(read self, right: Self) -> bool

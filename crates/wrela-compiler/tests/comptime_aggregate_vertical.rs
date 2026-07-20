@@ -30,7 +30,7 @@ const IMAGE_SOURCE: &str = r#"module app.image
 from core.image import Image, Target
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="comptime-aggregate-image", target=Target.aarch64_qemu_virt_uefi)
 "#;
 
@@ -40,25 +40,25 @@ pub struct Measurement:
     pub magnitude: u32
     pub accepted: bool
 
-pub comptime fn make_measurement(magnitude: u32, accepted: bool) -> Measurement:
+pub fn make_measurement(magnitude: u32, accepted: bool) -> Measurement:
     return Measurement(accepted=accepted, magnitude=magnitude)
 
-pub comptime fn forward(value: Measurement) -> Measurement:
+pub fn forward(value: Measurement) -> Measurement:
     return copy value
 
-pub comptime fn nested(left: u32, right: u32, accepted: bool) -> Measurement:
+pub fn nested(left: u32, right: u32, accepted: bool) -> Measurement:
     combined: u32 = left + right
     candidate = make_measurement(combined, accepted)
     if candidate.accepted:
         return forward(candidate)
     return make_measurement(0, false)
 
-pub comptime fn failing_leaf() -> Measurement:
+pub fn failing_leaf() -> Measurement:
     value = nested(20, 22, true)
     comptime assert value.magnitude == 0, "production aggregate failure"
     return value
 
-pub comptime fn failing_outer() -> Measurement:
+pub fn failing_outer() -> Measurement:
     return failing_leaf()
 "#;
 
@@ -67,17 +67,17 @@ const PASSING_TESTS: &str = r#"module app.values_test
 from app.values import failing_outer, nested
 
 @test
-comptime fn imported_aggregate_branch_and_nested_calls():
+fn imported_aggregate_branch_and_nested_calls():
     result = nested(20, 22, true)
     comptime assert result.magnitude == 42 and result.accepted, "aggregate branch result"
 
 @test
-comptime fn aggregate_name_filter_uses_production_code():
+fn aggregate_name_filter_uses_production_code():
     result = nested(99, 1, false)
     comptime assert result.magnitude == 0 and not result.accepted, "aggregate false branch"
 
 @test
-comptime fn nested_aggregate_failure_has_source_stack():
+fn nested_aggregate_failure_has_source_stack():
     failing_outer()
 "#;
 
@@ -87,10 +87,10 @@ pub struct Pair:
     pub left: u32
     pub right: u32
 
-pub comptime fn forward(value: Pair) -> Pair:
+pub fn forward(value: Pair) -> Pair:
     return copy value
 
-pub comptime fn make_and_forward(left: u32, right: u32) -> Pair:
+pub fn make_and_forward(left: u32, right: u32) -> Pair:
     pair: Pair = Pair(left=left, right=right)
     return forward(pair)
 "#;
@@ -100,7 +100,7 @@ const EXACT_TEST: &str = r#"module app.values_test
 from app.values import make_and_forward
 
 @test
-comptime fn aggregate_bound():
+fn aggregate_bound():
     result = make_and_forward(20, 22)
     comptime assert result.left + result.right == 42, "aggregate result"
 "#;
@@ -380,16 +380,16 @@ pub struct Pair:
 pub struct ScalarBox:
     pub value: u32
 
-pub comptime fn make(left: u32, right: u32) -> Pair:
+pub fn make(left: u32, right: u32) -> Pair:
     return Pair(right=right, left=left)
 
-pub comptime fn read_left(value: Pair) -> u32:
+pub fn read_left(value: Pair) -> u32:
     return value.left
 
-pub comptime fn copied(value: Pair) -> Pair:
+pub fn copied(value: Pair) -> Pair:
     return copy value
 
-pub comptime fn boxed() -> ScalarBox:
+pub fn boxed() -> ScalarBox:
     return ScalarBox(42)
 "#;
     let passing_tests = r#"module app.values_test
@@ -397,7 +397,7 @@ pub comptime fn boxed() -> ScalarBox:
 from app.values import boxed, copied, make, read_left
 
 @test
-comptime fn aggregate_moves_copy_and_reinitialize():
+fn aggregate_moves_copy_and_reinitialize():
     first = make(20, 22)
     second = first
     first = make(1, 2)
@@ -435,7 +435,7 @@ comptime fn aggregate_moves_copy_and_reinitialize():
 from app.values import make
 
 @test
-comptime fn every_continuing_branch_reinitializes():
+fn every_continuing_branch_reinitializes():
     value = make(20, 22)
     if true:
         moved = value
@@ -479,7 +479,7 @@ comptime fn every_continuing_branch_reinitializes():
 from app.values import make
 
 @test
-comptime fn moved_local_cannot_be_read():
+fn moved_local_cannot_be_read():
     first = make(20, 22)
     second = first
     comptime assert first.left == second.left, "moved local"
@@ -493,10 +493,10 @@ pub struct Pair:
     pub left: u32
     pub right: u32
 
-pub comptime fn make(left: u32, right: u32) -> Pair:
+pub fn make(left: u32, right: u32) -> Pair:
     return Pair(right=right, left=left)
 
-pub comptime fn invalid_forward(value: Pair) -> Pair:
+pub fn invalid_forward(value: Pair) -> Pair:
     return value
 "#,
             r#"module app.values_test
@@ -504,7 +504,7 @@ pub comptime fn invalid_forward(value: Pair) -> Pair:
 from app.values import invalid_forward, make
 
 @test
-comptime fn read_parameter_cannot_become_owned():
+fn read_parameter_cannot_become_owned():
     invalid_forward(make(20, 22))
 "#,
             "semantic-comptime-borrowed-value-move",
@@ -516,7 +516,7 @@ comptime fn read_parameter_cannot_become_owned():
 from app.values import make
 
 @test
-comptime fn one_branch_move_poison_joins():
+fn one_branch_move_poison_joins():
     value = make(20, 22)
     if true:
         moved = value
@@ -559,7 +559,7 @@ pub struct First:
 pub struct Second:
     pub value: u32
 
-pub comptime fn wrong_nominal() -> First:
+pub fn wrong_nominal() -> First:
     return Second(value=1)
 "#,
             r#"module app.values_test
@@ -567,7 +567,7 @@ pub comptime fn wrong_nominal() -> First:
 from app.values import wrong_nominal
 
 @test
-comptime fn nominal_identity_is_preserved():
+fn nominal_identity_is_preserved():
     wrong_nominal()
 "#,
             "semantic-comptime-type-mismatch",
@@ -581,7 +581,7 @@ pub struct Inner:
 pub struct Outer:
     pub inner: Inner
 
-pub comptime fn nested_shape() -> Outer:
+pub fn nested_shape() -> Outer:
     return Outer(inner=Inner(value=1))
 "#,
             r#"module app.values_test
@@ -589,7 +589,7 @@ pub comptime fn nested_shape() -> Outer:
 from app.values import nested_shape
 
 @test
-comptime fn nested_aggregate_is_future_work():
+fn nested_aggregate_is_future_work():
     nested_shape()
 "#,
             "semantic-comptime-aggregate-not-supported",
@@ -600,7 +600,7 @@ comptime fn nested_aggregate_is_future_work():
 pub struct Secret:
     value: u32
 
-pub comptime fn make_secret() -> Secret:
+pub fn make_secret() -> Secret:
     return Secret(value=7)
 "#,
             r#"module app.values_test
@@ -608,7 +608,7 @@ pub comptime fn make_secret() -> Secret:
 from app.values import make_secret
 
 @test
-comptime fn private_field_stays_private():
+fn private_field_stays_private():
     value = make_secret()
     comptime assert value.value == 7, "private field"
 "#,
@@ -621,7 +621,7 @@ pub struct Pair:
     pub left: u32
     pub right: u32
 
-pub comptime fn malformed() -> Pair:
+pub fn malformed() -> Pair:
     return Pair(left=1)
 "#,
             r#"module app.values_test
@@ -629,7 +629,7 @@ pub comptime fn malformed() -> Pair:
 from app.values import malformed
 
 @test
-comptime fn missing_constructor_field_is_rejected():
+fn missing_constructor_field_is_rejected():
     malformed()
 "#,
             "semantic-comptime-constructor-argument",
@@ -640,7 +640,7 @@ comptime fn missing_constructor_field_is_rejected():
 pub struct Flat:
     pub value: u32
 
-pub comptime fn unsupported_loop() -> Flat:
+pub fn unsupported_loop() -> Flat:
     loop:
         pass
     return Flat(value=1)
@@ -650,7 +650,7 @@ pub comptime fn unsupported_loop() -> Flat:
 from app.values import unsupported_loop
 
 @test
-comptime fn unsupported_operation_is_classified():
+fn unsupported_operation_is_classified():
     unsupported_loop()
 "#,
             "semantic-comptime-operation-not-implemented",
@@ -662,7 +662,7 @@ pub struct Pair:
     pub left: u32
     pub right: u32
 
-pub comptime fn positional_pair() -> Pair:
+pub fn positional_pair() -> Pair:
     return Pair(1, right=2)
 "#,
             r#"module app.values_test
@@ -670,7 +670,7 @@ pub comptime fn positional_pair() -> Pair:
 from app.values import positional_pair
 
 @test
-comptime fn multi_field_positional_is_rejected():
+fn multi_field_positional_is_rejected():
     positional_pair()
 "#,
             "semantic-comptime-constructor-argument",
@@ -681,7 +681,7 @@ comptime fn multi_field_positional_is_rejected():
 pub struct Flat:
     pub value: u32
 
-pub comptime fn generic_make[T](value: u32) -> Flat:
+pub fn generic_make[T](value: u32) -> Flat:
     return Flat(value=value)
 "#,
             r#"module app.values_test
@@ -689,7 +689,7 @@ pub comptime fn generic_make[T](value: u32) -> Flat:
 from app.values import generic_make
 
 @test
-comptime fn generic_aggregate_function_is_future_work():
+fn generic_aggregate_function_is_future_work():
     generic_make(1)
 "#,
             "semantic-comptime-signature-not-supported",
@@ -700,7 +700,7 @@ comptime fn generic_aggregate_function_is_future_work():
 pub struct GenericBox[T]:
     pub value: T
 
-pub comptime fn generic_box() -> GenericBox[u32]:
+pub fn generic_box() -> GenericBox[u32]:
     return GenericBox[u32](value=1)
 "#,
             r#"module app.values_test
@@ -708,7 +708,7 @@ pub comptime fn generic_box() -> GenericBox[u32]:
 from app.values import generic_box
 
 @test
-comptime fn generic_aggregate_shape_is_future_work():
+fn generic_aggregate_shape_is_future_work():
     generic_box()
 "#,
             "semantic-comptime-signature-not-supported",
@@ -720,10 +720,10 @@ pub struct Pair:
     pub left: u32
     pub right: u32
 
-    pub comptime fn sum(read self) -> u32:
+    pub fn sum(read self) -> u32:
         return self.left + self.right
 
-pub comptime fn make_pair() -> Pair:
+pub fn make_pair() -> Pair:
     return Pair(right=22, left=20)
 "#,
             r#"module app.values_test
@@ -731,7 +731,7 @@ pub comptime fn make_pair() -> Pair:
 from app.values import make_pair
 
 @test
-comptime fn aggregate_methods_are_future_work():
+fn aggregate_methods_are_future_work():
     value = make_pair()
     comptime assert value.sum() == 42, "method result"
 "#,

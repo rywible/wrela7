@@ -10,8 +10,7 @@ use wrela_build_model::{
 use wrela_package::{
     DependencyAlias, ImageDeclaration, ImageTestDeclaration, LOCKFILE_SCHEMA_VERSION,
     LockedDependency, LockedPackage, Lockfile, MANIFEST_SCHEMA_VERSION, ManifestDependency,
-    ManifestModule, ModulePath, PackageIdentity, PackageLocator, PackageManifest, PackageName,
-    PackageVersion,
+    ModulePath, PackageIdentity, PackageLocator, PackageManifest, PackageName, PackageVersion,
 };
 
 use crate::{DecodeError, LockfileCodecLimits, ManifestCodecLimits, PackageCodec};
@@ -468,10 +467,17 @@ fn optional_text(
     budget.copy(value, is_cancelled).map(Some)
 }
 
-fn required_bool(table: &DeTable<'_>, key: &str, field: &'static str) -> Result<bool, DecodeError> {
-    match required_value(table, key, field)?.get_ref() {
-        DeValue::Boolean(value) => Ok(*value),
-        _ => Err(unsupported(field, "boolean")),
+fn optional_bool(
+    table: &DeTable<'_>,
+    key: &str,
+    field: &'static str,
+) -> Result<Option<bool>, DecodeError> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(value) => match value.get_ref() {
+            DeValue::Boolean(value) => Ok(Some(*value)),
+            _ => Err(unsupported(field, "boolean")),
+        },
     }
 }
 
@@ -575,6 +581,23 @@ fn required_u32(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<u32, DecodeError> {
     u32::try_from(required_u64(table, key, field, is_cancelled)?).map_err(|_| {
+        malformed(
+            table.get(key).map_or(0, |value| value.span().start),
+            "integer does not fit u32",
+        )
+    })
+}
+
+fn optional_u32(
+    table: &DeTable<'_>,
+    key: &str,
+    field: &'static str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<u32>, DecodeError> {
+    let Some(value) = optional_u64(table, key, field, is_cancelled)? else {
+        return Ok(None);
+    };
+    u32::try_from(value).map(Some).map_err(|_| {
         malformed(
             table.get(key).map_or(0, |value| value.span().start),
             "integer does not fit u32",
@@ -720,7 +743,6 @@ fn project_manifest(
             "schema",
             "language",
             "package",
-            "module",
             "dependency",
             "profile",
             "image",
@@ -761,7 +783,6 @@ fn project_manifest(
         is_cancelled,
     )?;
 
-    let modules = project_modules(root, limits, &mut budget, is_cancelled)?;
     let dependencies = project_dependencies(root, limits, &mut budget, is_cancelled)?;
     let profiles = project_profiles(root, limits, &mut budget, is_cancelled)?;
     let images = project_images(root, limits, &mut budget, is_cancelled)?;
@@ -772,7 +793,6 @@ fn project_manifest(
         name,
         version,
         source_root,
-        modules,
         dependencies,
         profiles,
         images,
@@ -783,35 +803,6 @@ fn project_manifest(
         .map_err(|error| noncanonical(&error.to_string()))?;
     check_cancelled(is_cancelled)?;
     Ok(manifest)
-}
-
-fn project_modules(
-    root: &DeTable<'_>,
-    limits: ManifestCodecLimits,
-    budget: &mut StringBudget,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<Vec<ManifestModule>, DecodeError> {
-    let Some(values) = optional_array(root, "module", "[[module]]")? else {
-        return Ok(Vec::new());
-    };
-    check_count("manifest modules", values.len(), limits.modules)?;
-    let mut modules = Vec::new();
-    reserve(
-        &mut modules,
-        values.len(),
-        "manifest modules",
-        u64::from(limits.modules),
-    )?;
-    for value in values {
-        check_cancelled(is_cancelled)?;
-        let table = table_item(value, "[[module]]")?;
-        check_allowed_fields(table, "module", &["name", "path"], is_cancelled)?;
-        modules.push(ManifestModule {
-            module: required_module_path(table, "name", "module.name", budget, is_cancelled)?,
-            source_path: required_text(table, "path", "module.path", budget, is_cancelled)?,
-        });
-    }
-    Ok(modules)
 }
 
 fn project_dependencies(
@@ -933,100 +924,117 @@ fn project_profile(
         "release" => BuildMode::Release,
         _ => return Err(unsupported("profile.mode", "development or release")),
     };
-    let recording = match required_text(
+    // Every field below `name`/`mode` is optional; an absent key falls back
+    // to `wrela_build_model::PROFILE_DEFAULTS`. The canonical encoder always
+    // writes every field explicitly (see `encode_manifest`), so this is the
+    // only place partial profiles are ever materialized.
+    let defaults = wrela_build_model::PROFILE_DEFAULTS;
+    let recording = match optional_text(
         table,
         "recording",
         "profile.recording",
         budget,
         is_cancelled,
-    )?
-    .as_str()
-    {
-        "disabled" => RecordingMode::Disabled,
-        "record" => RecordingMode::Record,
-        "replay" => RecordingMode::Replay,
-        _ => {
-            return Err(unsupported(
-                "profile.recording",
-                "disabled, record, or replay",
-            ));
-        }
+    )? {
+        None => defaults.recording,
+        Some(value) => match value.as_str() {
+            "disabled" => RecordingMode::Disabled,
+            "record" => RecordingMode::Record,
+            "replay" => RecordingMode::Replay,
+            _ => {
+                return Err(unsupported(
+                    "profile.recording",
+                    "disabled, record, or replay",
+                ));
+            }
+        },
     };
-    let optimization = match required_text(
+    let optimization = match optional_text(
         table,
         "optimization",
         "profile.optimization",
         budget,
         is_cancelled,
-    )?
-    .as_str()
-    {
-        "none" => OptimizationLevel::None,
-        "development" => OptimizationLevel::Development,
-        "performance" => OptimizationLevel::Performance,
-        "size" => OptimizationLevel::Size,
-        _ => {
-            return Err(unsupported(
-                "profile.optimization",
-                "none, development, performance, or size",
-            ));
-        }
+    )? {
+        None => defaults.optimization_level,
+        Some(value) => match value.as_str() {
+            "none" => OptimizationLevel::None,
+            "development" => OptimizationLevel::Development,
+            "performance" => OptimizationLevel::Performance,
+            "size" => OptimizationLevel::Size,
+            _ => {
+                return Err(unsupported(
+                    "profile.optimization",
+                    "none, development, performance, or size",
+                ));
+            }
+        },
     };
     Ok(BuildProfile {
         name: required_text(table, "name", "profile.name", budget, is_cancelled)?,
         mode,
         comptime: ComptimeLimits {
-            steps: required_u64(
+            steps: optional_u64(
                 table,
                 "comptime_steps",
                 "profile.comptime_steps",
                 is_cancelled,
-            )?,
-            memory_bytes: required_u64(
+            )?
+            .unwrap_or(defaults.comptime.steps),
+            memory_bytes: optional_u64(
                 table,
                 "comptime_memory_bytes",
                 "profile.comptime_memory_bytes",
                 is_cancelled,
-            )?,
-            call_depth: required_u32(
+            )?
+            .unwrap_or(defaults.comptime.memory_bytes),
+            call_depth: optional_u32(
                 table,
                 "comptime_call_depth",
                 "profile.comptime_call_depth",
                 is_cancelled,
-            )?,
+            )?
+            .unwrap_or(defaults.comptime.call_depth),
         },
         memory: MemoryLimits {
-            static_bytes: required_u64(
+            static_bytes: optional_u64(
                 table,
                 "static_bytes",
                 "profile.static_bytes",
                 is_cancelled,
-            )?,
-            peak_bytes: required_u64(table, "peak_bytes", "profile.peak_bytes", is_cancelled)?,
-            event_log_bytes: required_u64(
+            )?
+            .unwrap_or(defaults.memory.static_bytes),
+            peak_bytes: optional_u64(table, "peak_bytes", "profile.peak_bytes", is_cancelled)?
+                .unwrap_or(defaults.memory.peak_bytes),
+            event_log_bytes: optional_u64(
                 table,
                 "event_log_bytes",
                 "profile.event_log_bytes",
                 is_cancelled,
-            )?,
+            )?
+            .unwrap_or(defaults.memory.event_log_bytes),
         },
         dma: DmaPolicy {
-            coherent: required_bool(table, "dma_coherent", "profile.dma_coherent")?,
-            require_iommu: required_bool(table, "require_iommu", "profile.require_iommu")?,
+            coherent: optional_bool(table, "dma_coherent", "profile.dma_coherent")?
+                .unwrap_or(defaults.dma.coherent),
+            require_iommu: optional_bool(table, "require_iommu", "profile.require_iommu")?
+                .unwrap_or(defaults.dma.require_iommu),
         },
         recovery: RecoveryPolicy {
-            reset_timeout_ns: required_u64(
+            reset_timeout_ns: optional_u64(
                 table,
                 "reset_timeout_ns",
                 "profile.reset_timeout_ns",
                 is_cancelled,
-            )?,
-            quarantine_bytes: required_u64(
+            )?
+            .unwrap_or(defaults.recovery.reset_timeout_ns),
+            quarantine_bytes: optional_u64(
                 table,
                 "quarantine_bytes",
                 "profile.quarantine_bytes",
                 is_cancelled,
-            )?,
+            )?
+            .unwrap_or(defaults.recovery.quarantine_bytes),
         },
         recording,
         optimization: OptimizationPolicy {
@@ -1040,17 +1048,20 @@ fn project_profile(
             )?,
         },
         diagnostics: DiagnosticPolicy {
-            sealed_deployment: required_bool(
+            sealed_deployment: optional_bool(
                 table,
                 "sealed_deployment",
                 "profile.sealed_deployment",
-            )?,
-            warnings_as_errors: required_bool(
+            )?
+            .unwrap_or(defaults.diagnostics.sealed_deployment),
+            warnings_as_errors: optional_bool(
                 table,
                 "warnings_as_errors",
                 "profile.warnings_as_errors",
-            )?,
-            watchdogs: required_bool(table, "watchdogs", "profile.watchdogs")?,
+            )?
+            .unwrap_or(defaults.diagnostics.warnings_as_errors),
+            watchdogs: optional_bool(table, "watchdogs", "profile.watchdogs")?
+                .unwrap_or(defaults.diagnostics.watchdogs),
         },
     })
 }
@@ -1447,7 +1458,6 @@ fn validate_manifest_resources(
             "manifest must declare at least one build profile",
         ));
     }
-    check_count("manifest modules", manifest.modules.len(), limits.modules)?;
     check_count(
         "manifest dependencies",
         manifest.dependencies.len(),
@@ -1470,11 +1480,6 @@ fn validate_manifest_resources(
     budget_text(&mut budget, manifest.name.as_str(), is_cancelled)?;
     budget_text(&mut budget, manifest.version.as_str(), is_cancelled)?;
     budget_text(&mut budget, &manifest.source_root, is_cancelled)?;
-    for module in &manifest.modules {
-        check_cancelled(is_cancelled)?;
-        budget_module_path(&mut budget, &module.module, is_cancelled)?;
-        budget_text(&mut budget, &module.source_path, is_cancelled)?;
-    }
     for dependency in &manifest.dependencies {
         check_cancelled(is_cancelled)?;
         budget_text(&mut budget, dependency.alias.as_str(), is_cancelled)?;
@@ -1776,11 +1781,9 @@ fn encode_manifest(
     writer.assignment_text("version", manifest.version.as_str())?;
     writer.assignment_text("source_root", &manifest.source_root)?;
 
-    for module in &manifest.modules {
-        writer.raw("\n[[module]]\n")?;
-        writer.assignment_text("name", &module.module.dotted())?;
-        writer.assignment_text("path", &module.source_path)?;
-    }
+    // Modules are derived by the loader from a filesystem walk of
+    // `source_root`, not declared here; there is no `[[module]]` block to
+    // emit.
     for dependency in &manifest.dependencies {
         writer.raw("\n[[dependency]]\n")?;
         writer.assignment_text("alias", dependency.alias.as_str())?;
@@ -1992,7 +1995,6 @@ mod tests {
         let representative = codec
             .decode_manifest(REPRESENTATIVE_MANIFEST, manifest_limits(), &never_cancelled)
             .expect("representative manifest");
-        assert_eq!(representative.modules.len(), 2);
         assert_eq!(representative.dependencies.len(), 2);
         assert_eq!(representative.images.len(), 1);
         assert_eq!(representative.image_tests.len(), 1);
@@ -2015,7 +2017,13 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_bootstrap_manifests_are_schema_one_and_byte_canonical() {
+    fn checked_in_bootstrap_manifests_are_schema_one_and_derive_stable_modules() {
+        // These checked-in manifests declare only `[[profile]]` overrides and
+        // no `[[module]]` block (modules are derived from a source-root walk
+        // by the loader, not decoded here), so they are valid schema-1 input
+        // without being byte-identical to their own canonical re-encoding.
+        // Round-tripping through decode -> canonical-encode -> decode again
+        // must still be a fixed point.
         let codec = CanonicalPackageCodec::new();
         let core = codec
             .decode_manifest(
@@ -2026,20 +2034,32 @@ mod tests {
             .expect("checked-in core manifest");
         assert_eq!(core.name.as_str(), "wrela-core");
         assert_eq!(core.version.as_str(), "0.1.0");
-        assert_eq!(core.modules.len(), 3);
-        assert_eq!(core.modules[0].module.dotted(), "image");
-        assert_eq!(core.modules[1].module.dotted(), "result");
-        assert_eq!(core.modules[2].module.dotted(), "time");
         assert!(core.dependencies.is_empty());
         assert_eq!(core.profiles.len(), 1);
         assert_eq!(core.profiles[0].name, "development");
-        assert!(core.images.is_empty());
+        // The checked-in profile overrides everything but the fields that
+        // already equal `PROFILE_DEFAULTS`; confirm the omitted fields
+        // decoded to those defaults.
         assert_eq!(
-            codec
-                .canonical_manifest(&core, manifest_limits(), &never_cancelled)
-                .expect("canonical core manifest"),
-            CHECKED_IN_CORE_MANIFEST
+            core.profiles[0].memory.event_log_bytes,
+            wrela_build_model::PROFILE_DEFAULTS.memory.event_log_bytes
         );
+        assert_eq!(
+            core.profiles[0].dma,
+            wrela_build_model::PROFILE_DEFAULTS.dma
+        );
+        assert_eq!(
+            core.profiles[0].recording,
+            wrela_build_model::PROFILE_DEFAULTS.recording
+        );
+        assert!(core.images.is_empty());
+        let core_canonical = codec
+            .canonical_manifest(&core, manifest_limits(), &never_cancelled)
+            .expect("canonical core manifest");
+        let core_roundtrip = codec
+            .decode_manifest(&core_canonical, manifest_limits(), &never_cancelled)
+            .expect("canonical core manifest redecodes");
+        assert_eq!(core_roundtrip, core);
 
         let application = codec
             .decode_manifest(
@@ -2048,7 +2068,7 @@ mod tests {
                 &never_cancelled,
             )
             .expect("checked-in minimum image manifest");
-        assert_eq!(application.modules[0].module.dotted(), "bootstrap.image");
+        assert_eq!(application.images[0].module.dotted(), "bootstrap.image");
         assert_eq!(application.dependencies.len(), 1);
         assert_eq!(application.dependencies[0].alias.as_str(), "core");
         assert_eq!(application.dependencies[0].package.as_str(), "wrela-core");
@@ -2058,15 +2078,18 @@ mod tests {
             application.images[0].target,
             TargetIdentity::aarch64_qemu_virt_uefi()
         );
-        assert_eq!(
-            codec
-                .canonical_manifest(&application, manifest_limits(), &never_cancelled)
-                .expect("canonical minimum image manifest"),
-            CHECKED_IN_MINIMUM_IMAGE_MANIFEST
-        );
+        let application_canonical = codec
+            .canonical_manifest(&application, manifest_limits(), &never_cancelled)
+            .expect("canonical minimum image manifest");
+        let application_roundtrip = codec
+            .decode_manifest(&application_canonical, manifest_limits(), &never_cancelled)
+            .expect("canonical minimum image manifest redecodes");
+        assert_eq!(application_roundtrip, application);
 
+        // Package content digests bind the *canonical* manifest bytes (what
+        // the loader always hashes), not the checked-in override-only TOML.
         let core_digest = package_content_digest(
-            CHECKED_IN_CORE_MANIFEST,
+            &core_canonical,
             &[
                 PackageContentRecord {
                     kind: PackageContentKind::Source,
@@ -2090,10 +2113,10 @@ mod tests {
         .expect("canonical core package content digest");
         assert_eq!(
             core_digest.to_hex(),
-            "5da2bae2f9089643c235c54bf229e67a995f16ce9a0596c24604bd389661afd5"
+            "d121c5e9cef32802172c53fa2bc8df0a020307e370b074d1d3d9b14931ec20c1"
         );
         let application_digest = package_content_digest(
-            CHECKED_IN_MINIMUM_IMAGE_MANIFEST,
+            &application_canonical,
             &[PackageContentRecord {
                 kind: PackageContentKind::Source,
                 path: "bootstrap/image.wr",
@@ -2105,7 +2128,7 @@ mod tests {
         .expect("canonical minimum application package content digest");
         assert_eq!(
             application_digest.to_hex(),
-            "b749bdf3ddacd8be2f707447d982ecf691b09fd431524da51fd57ce4748b6f1a"
+            "ca556c73183fe0c85b89515adf53d3f7afaa97dbbef353f2940040d8d69e8291"
         );
 
         let lockfile = codec
@@ -2125,7 +2148,7 @@ mod tests {
         assert_eq!(locked_core.identity.source_digest, core_digest);
         assert_eq!(
             locked_core.manifest_digest,
-            SoftwareSha256.sha256(CHECKED_IN_CORE_MANIFEST)
+            SoftwareSha256.sha256(&core_canonical)
         );
         assert!(matches!(
             &locked_core.locator,
@@ -2261,7 +2284,11 @@ mod tests {
         let manifest_length = u64::try_from(MINIMAL_MANIFEST.len()).expect("fixture length");
         let mut exact_manifest = manifest_limits();
         exact_manifest.bytes = manifest_length;
-        exact_manifest.string_bytes = 67;
+        // language(10) + package.name(4) + package.version(5) +
+        // package.source_root(3) + profile.mode(11) + profile.name(11) +
+        // profile.recording(8) + profile.optimization(4) = 56. There is no
+        // `[[module]]` block to budget for; modules are derived, not decoded.
+        exact_manifest.string_bytes = 56;
         let manifest = codec
             .decode_manifest(MINIMAL_MANIFEST, exact_manifest, &never_cancelled)
             .expect("exact manifest limits");
@@ -2282,7 +2309,7 @@ mod tests {
             })
         ));
         let mut too_few_strings = exact_manifest;
-        too_few_strings.string_bytes = 66;
+        too_few_strings.string_bytes = 55;
         assert!(matches!(
             codec.decode_manifest(MINIMAL_MANIFEST, too_few_strings, &never_cancelled),
             Err(DecodeError::ResourceLimit {
@@ -2313,12 +2340,12 @@ mod tests {
             })
         ));
 
-        let mut no_modules = manifest_limits();
-        no_modules.modules = 0;
+        let mut no_dependencies = manifest_limits();
+        no_dependencies.dependencies = 0;
         assert!(matches!(
-            codec.decode_manifest(MINIMAL_MANIFEST, no_modules, &never_cancelled),
+            codec.decode_manifest(REPRESENTATIVE_MANIFEST, no_dependencies, &never_cancelled),
             Err(DecodeError::ResourceLimit {
-                resource: "manifest modules",
+                resource: "manifest dependencies",
                 limit: 0
             })
         ));

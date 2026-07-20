@@ -25,7 +25,7 @@ address, an imported type name, or a cast cannot create one.
 
 ```wrela
 @driver(device="virtio-blk")
-pub class BlkDriver:
+pub struct BlkDriver:
     irq_regs: Mmio[VirtioIrqMmio]
     queue: VirtQueue[128]
 
@@ -55,7 +55,7 @@ capability type remains unconstructible and role-checked.
 
 ```wrela
 @app
-class Notes:
+struct Notes:
     fn poke(mut self):
         mmio_write(0x0a00_0050, 0)
         # error[capability]: no MMIO authority is in scope
@@ -126,8 +126,8 @@ padding, total size, and schema version independently of the target ABI.
 Ordinary structs and `@dma` structs cannot be passed to a byte-decoding
 `read_struct` operation; the type must be `@wire` or source must parse fields
 explicitly. `@wire` values confer no device authority and cannot contain
-classes, capabilities, views, native-width integers, floats without an explicit
-IEEE encoding, or fields whose representation depends on a target.
+linear structs, capabilities, views, native-width integers, floats without an
+explicit IEEE encoding, or fields whose representation depends on a target.
 
 wrela distinguishes two kinds of DMA memory.
 
@@ -441,7 +441,7 @@ and payload through supervised recovery.
 
 ## 13. IRQ, poll, and hybrid modes
 
-Driver mode is a constant generic of the driver class whenever it changes the
+Driver mode is a constant generic of the driver struct whenever it changes the
 ISR, actor, task, or effect graph:
 
 ```wrela

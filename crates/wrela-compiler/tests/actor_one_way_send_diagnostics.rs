@@ -33,7 +33,7 @@ async fn checkpoint():
     pass
 
 @service
-pub class Worker:
+pub struct Worker:
     pub async fn ping(mut self):
         await checkpoint()
 
@@ -43,7 +43,7 @@ pub class Worker:
         await checkpoint()
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     img = Image(name="actor-send-diagnostic-image", target=Target.aarch64_qemu_virt_uefi)
     installed = img.service(Worker, mailbox=1)
     return img

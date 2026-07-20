@@ -314,7 +314,9 @@ struct SignificantLine {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MemberContext {
-    Class,
+    /// A direct member of a `struct` declaration's own suite; the only
+    /// context in which `init` may appear.
+    TypeSuite,
     OtherType,
     Implementation,
 }
@@ -1302,7 +1304,6 @@ impl<'a, 'diag> Scanner<'a, 'diag> {
             ("&=", TokenKind::Operator(Operator::BitAndAssign)),
             ("|=", TokenKind::Operator(Operator::BitOrAssign)),
             ("^=", TokenKind::Operator(Operator::BitXorAssign)),
-            ("<<%", TokenKind::Operator(Operator::ShiftLeftModular)),
             ("<<", TokenKind::Operator(Operator::ShiftLeft)),
             (">>", TokenKind::Operator(Operator::ShiftRight)),
             ("+%", TokenKind::Operator(Operator::AddWrapping)),
@@ -1908,9 +1909,8 @@ fn keyword(spelling: &str) -> Option<Keyword> {
         "isr" => Keyword::Isr,
         "comptime" => Keyword::Comptime,
         "struct" => Keyword::Struct,
-        "class" => Keyword::Class,
         "enum" => Keyword::Enum,
-        "iface" => Keyword::Iface,
+        "interface" => Keyword::Iface,
         "impl" => Keyword::Impl,
         "for" => Keyword::For,
         "projection" => Keyword::Projection,
@@ -1928,7 +1928,6 @@ fn keyword(spelling: &str) -> Option<Keyword> {
         "else" => Keyword::Else,
         "match" => Keyword::Match,
         "case" => Keyword::Case,
-        "bind" => Keyword::Bind,
         "in" => Keyword::In,
         "not" => Keyword::Not,
         "while" => Keyword::While,
@@ -1948,7 +1947,6 @@ fn keyword(spelling: &str) -> Option<Keyword> {
         "yield" => Keyword::Yield,
         "await" => Keyword::Await,
         "copy" => Keyword::Copy,
-        "race" => Keyword::Race,
         "true" => Keyword::True,
         "false" => Keyword::False,
         "unit" => Keyword::Unit,
@@ -2237,18 +2235,34 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             let error_start = self.position;
             self.error_here(
                 "syntax-removed-initializer-spelling",
-                "`fn __init__` was removed; declare a class initializer with `init`",
+                "`fn __init__` was removed; declare a struct initializer with `init`",
             )?;
             self.recover_to_line_end()?;
             Some(DeclarationKind::Error(self.recovery_error(
                 error_start,
                 self.position,
-                "`init` class initializer",
+                "`init` struct initializer",
+                depth + 1,
+            )?))
+        } else if self.starts_comptime_fn_spelling() {
+            let error_start = self.position;
+            self.error_here(
+                "syntax-legacy-comptime-fn-color",
+                "`comptime` before `fn` is a legacy spelling; functions are phase-neutral",
+            )?;
+            self.recover_to_line_end()?;
+            Some(DeclarationKind::Error(self.recovery_error(
+                error_start,
+                self.position,
+                "revision-0.1 declaration",
                 depth + 1,
             )?))
         } else if self.starts_function() {
             self.parse_function(depth + 1, true)?
                 .map(DeclarationKind::Function)
+        } else if self.at_linear_struct() {
+            self.parse_type_declaration(depth + 1, true)?
+                .map(DeclarationKind::Structure)
         } else {
             match self.kind() {
                 TokenKind::Keyword(Keyword::Const) => self
@@ -2260,9 +2274,6 @@ impl<'a, 'diag> Parser<'a, 'diag> {
                 TokenKind::Keyword(Keyword::Struct) => self
                     .parse_type_declaration(depth + 1, false)?
                     .map(DeclarationKind::Structure),
-                TokenKind::Keyword(Keyword::Class) => self
-                    .parse_type_declaration(depth + 1, true)?
-                    .map(DeclarationKind::Class),
                 TokenKind::Keyword(Keyword::Enum) => self
                     .parse_enum_declaration(depth + 1)?
                     .map(DeclarationKind::Enumeration),
@@ -2319,6 +2330,22 @@ impl<'a, 'diag> Parser<'a, 'diag> {
                 self.kind(),
                 TokenKind::Keyword(Keyword::Async | Keyword::Isr | Keyword::Comptime)
             ) && self.nth_kind(1) == Some(TokenKind::Keyword(Keyword::Fn)))
+    }
+
+    /// `linear` is a contextual keyword: it is only a modifier when it
+    /// spells the current identifier token and is immediately followed by
+    /// `struct`. Anywhere else `linear` remains an ordinary identifier.
+    fn at_linear_struct(&self) -> bool {
+        self.kind() == TokenKind::Identifier
+            && self.token_text(self.position) == "linear"
+            && self.nth_kind(1) == Some(TokenKind::Keyword(Keyword::Struct))
+    }
+
+    /// `comptime fn` is a legacy color spelling: revision 0.1 has only
+    /// `fn`/`async fn`/`isr fn`, and a plain `fn` is phase-neutral.
+    fn starts_comptime_fn_spelling(&self) -> bool {
+        self.at_keyword(Keyword::Comptime)
+            && self.nth_kind(1) == Some(TokenKind::Keyword(Keyword::Fn))
     }
 
     fn starts_removed_initializer_spelling(&self) -> bool {
@@ -2406,10 +2433,6 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             TokenKind::Keyword(Keyword::Isr) => {
                 self.bump()?;
                 FunctionColor::Isr
-            }
-            TokenKind::Keyword(Keyword::Comptime) => {
-                self.bump()?;
-                FunctionColor::Comptime
             }
             _ => FunctionColor::Sync,
         };
@@ -2534,19 +2557,22 @@ impl<'a, 'diag> Parser<'a, 'diag> {
     fn parse_type_declaration(
         &mut self,
         depth: u32,
-        class: bool,
+        linear: bool,
     ) -> Result<Option<TypeDeclaration>, ParseFailure> {
         let start = self.position;
-        self.bump()?;
+        if linear {
+            self.bump()?; // consume the contextual `linear` identifier
+        }
+        self.bump()?; // consume `struct`
         let Some(name) = self.parse_identifier(depth + 1)? else {
             self.error_here(
                 "syntax-expected-type-name",
-                "expected a declaration name after the type keyword",
+                "expected a declaration name after `struct`",
             )?;
             return Ok(None);
         };
         let generics = self.parse_generic_parameters(depth + 1)?;
-        let implements = if class && self.eat_keyword(Keyword::Implements)? {
+        let implements = if self.eat_keyword(Keyword::Implements)? {
             self.parse_type_list(depth + 1, Punctuation::Colon)?
         } else {
             Vec::new()
@@ -2560,7 +2586,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         self.enter_indented_declaration_suite("type declaration")?;
         let mut explicit_pass = false;
         let mut members = Vec::new();
-        if !class && self.at_keyword(Keyword::Pass) {
+        if self.at_keyword(Keyword::Pass) {
             explicit_pass = true;
             self.bump()?;
             if self.at(TokenKind::Newline) {
@@ -2580,14 +2606,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             if self.at(TokenKind::Dedent) || self.at(TokenKind::EndOfFile) {
                 break;
             }
-            let member = self.parse_member_declaration(
-                depth + 1,
-                if class {
-                    MemberContext::Class
-                } else {
-                    MemberContext::OtherType
-                },
-            )?;
+            let member = self.parse_member_declaration(depth + 1, MemberContext::TypeSuite)?;
             if matches!(member.kind, MemberKind::Initializer(_))
                 && members.iter().any(|member: &MemberDeclaration| {
                     matches!(member.kind, MemberKind::Initializer(_))
@@ -2595,7 +2614,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             {
                 self.error_here(
                     "syntax-duplicate-initializer",
-                    "a class may declare exactly one direct `init` member",
+                    "a struct may declare exactly one direct `init` member",
                 )?;
             }
             push_ast_value(&mut members, member, self.limits.ast_nodes)?;
@@ -2603,13 +2622,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
                 self.bump()?;
             }
         }
-        if class && members.is_empty() {
-            self.error_here(
-                "syntax-empty-class-suite",
-                "class declarations require at least one member",
-            )?;
-        }
-        if !class && !explicit_pass && members.is_empty() {
+        if !explicit_pass && members.is_empty() {
             self.error_here(
                 "syntax-empty-struct-suite",
                 "struct declarations require members or an explicit `pass`",
@@ -2623,6 +2636,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             implements,
             members,
             explicit_pass,
+            linear,
         }))
     }
 
@@ -2700,27 +2714,40 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             let error_start = self.position;
             self.error_here(
                 "syntax-removed-initializer-spelling",
-                "`fn __init__` was removed; declare a class initializer with `init`",
+                "`fn __init__` was removed; declare a struct initializer with `init`",
             )?;
             self.recover_to_line_end()?;
             Some(MemberKind::Error(self.recovery_error(
                 error_start,
                 self.position,
-                "`init` class initializer",
+                "`init` struct initializer",
+                depth + 1,
+            )?))
+        } else if self.starts_comptime_fn_spelling() {
+            let error_start = self.position;
+            self.error_here(
+                "syntax-legacy-comptime-fn-color",
+                "`comptime` before `fn` is a legacy spelling; functions are phase-neutral",
+            )?;
+            self.recover_to_line_end()?;
+            Some(MemberKind::Error(self.recovery_error(
+                error_start,
+                self.position,
+                "revision-0.1 declaration",
                 depth + 1,
             )?))
         } else if self.at_keyword(Keyword::Init) {
-            if context != MemberContext::Class {
+            if context != MemberContext::TypeSuite {
                 let error_start = self.position;
                 self.error_here(
                     "syntax-initializer-context",
-                    "`init` is permitted only as a direct class member",
+                    "`init` is permitted only as a direct struct member",
                 )?;
                 self.recover_to_line_end()?;
                 Some(MemberKind::Error(self.recovery_error(
                     error_start,
                     self.position,
-                    "class initializer",
+                    "struct initializer",
                     depth + 1,
                 )?))
             } else {
@@ -2733,7 +2760,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
                 if public {
                     self.error_here(
                         "syntax-initializer-visibility",
-                        "class initializers cannot be marked `pub`",
+                        "struct initializers cannot be marked `pub`",
                     )?;
                 }
                 Some(MemberKind::Initializer(self.parse_initializer(depth + 1)?))
@@ -3066,7 +3093,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         let Some(name) = self.parse_identifier(depth + 1)? else {
             self.error_here(
                 "syntax-expected-interface-name",
-                "expected an identifier after `iface`",
+                "expected an identifier after `interface`",
             )?;
             return Ok(None);
         };
@@ -3137,7 +3164,20 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         if self.starts_removed_initializer_spelling() {
             self.error_here(
                 "syntax-removed-initializer-spelling",
-                "`fn __init__` was removed; declare a class initializer with `init`",
+                "`fn __init__` was removed; declare a struct initializer with `init`",
+            )?;
+            self.recover_to_line_end()?;
+            return Ok(InterfaceMember::Error(self.recovery_error(
+                start,
+                self.position,
+                "interface function or projection",
+                depth + 1,
+            )?));
+        }
+        if self.starts_comptime_fn_spelling() {
+            self.error_here(
+                "syntax-legacy-comptime-fn-color",
+                "`comptime` before `fn` is a legacy spelling; functions are phase-neutral",
             )?;
             self.recover_to_line_end()?;
             return Ok(InterfaceMember::Error(self.recovery_error(
@@ -3285,32 +3325,6 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             )?;
         }
         let carrier = self.parse_projection_carrier(depth + 1)?;
-        if !self.eat_keyword(Keyword::From)? {
-            self.error_here(
-                "syntax-projection-provenance",
-                "expected `from` before the projection provenance set",
-            )?;
-        }
-        let mut provenance = Vec::new();
-        loop {
-            let identifier = if self.at_keyword(Keyword::SelfValue) {
-                self.identifier_from_current(depth + 1)?
-            } else {
-                self.parse_identifier(depth + 1)?
-            };
-            if let Some(identifier) = identifier {
-                push_ast_value(&mut provenance, identifier, self.limits.ast_nodes)?;
-            } else {
-                self.error_here(
-                    "syntax-projection-provenance",
-                    "projection provenance requires at least one identifier",
-                )?;
-                break;
-            }
-            if !self.eat_punctuation(Punctuation::Comma)? {
-                break;
-            }
-        }
         let body = if body_required {
             if !self.eat_punctuation(Punctuation::Colon)? {
                 self.error_here(
@@ -3328,7 +3342,6 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             generics,
             parameters,
             carrier,
-            provenance,
             body,
         }))
     }
@@ -3368,61 +3381,74 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         Ok(parameters)
     }
 
-    fn parse_projection_carrier(&mut self, depth: u32) -> Result<ProjectionCarrier, ParseFailure> {
+    /// Parses a bare view leaf (`view T` / `mut view T`), returning `None`
+    /// when the current token does not start one.
+    fn parse_projection_view_leaf(
+        &mut self,
+        depth: u32,
+    ) -> Result<Option<ProjectionCarrier>, ParseFailure> {
         self.check_depth(depth)?;
         let start = self.position;
         if self.eat_keyword(Keyword::View)? {
             let ty = self.parse_type(depth + 1)?;
-            return Ok(ProjectionCarrier::View {
+            return Ok(Some(ProjectionCarrier::View {
                 meta: self.meta(start, self.position)?,
                 mutable: false,
                 ty: Box::new(ty),
-            });
+            }));
         }
-        if self.eat_keyword(Keyword::Mut)? {
-            if !self.eat_keyword(Keyword::View)? {
-                self.error_here(
-                    "syntax-projection-carrier-view",
-                    "expected `view` after `mut` in a projection carrier",
-                )?;
-            }
+        if self.at_keyword(Keyword::Mut)
+            && self.nth_kind(1) == Some(TokenKind::Keyword(Keyword::View))
+        {
+            self.bump()?;
+            self.bump()?;
             let ty = self.parse_type(depth + 1)?;
-            return Ok(ProjectionCarrier::View {
+            return Ok(Some(ProjectionCarrier::View {
                 meta: self.meta(start, self.position)?,
                 mutable: true,
                 ty: Box::new(ty),
-            });
+            }));
         }
-        if self.eat_punctuation(Punctuation::LeftParen)? {
-            let first = self.parse_projection_carrier(depth + 1)?;
-            if !self.eat_punctuation(Punctuation::Comma)? {
-                self.error_here(
-                    "syntax-projection-carrier-tuple",
-                    "tuple projection carriers require a comma",
-                )?;
-            }
-            let mut elements = Vec::new();
-            push_ast_value(&mut elements, first, self.limits.ast_nodes)?;
-            while !self.at_punctuation(Punctuation::RightParen)
-                && !self.at(TokenKind::EndOfFile)
-                && !self.at(TokenKind::Newline)
-            {
-                let element = self.parse_projection_carrier(depth + 1)?;
-                push_ast_value(&mut elements, element, self.limits.ast_nodes)?;
-                if !self.eat_punctuation(Punctuation::Comma)? {
-                    break;
-                }
-            }
-            if !self.eat_punctuation(Punctuation::RightParen)? {
-                self.error_here(
-                    "syntax-projection-carrier-tuple",
-                    "expected `)` after the tuple projection carrier",
-                )?;
-            }
-            return Ok(ProjectionCarrier::Tuple {
-                meta: self.meta(start, self.position)?,
-                elements,
-            });
+        Ok(None)
+    }
+
+    /// Parses the leaf required inside `Option[..]`/`Result[.., E]`; emits a
+    /// diagnostic and an error node when the leaf is missing.
+    fn parse_projection_leaf_or_error(
+        &mut self,
+        depth: u32,
+        wrapper: &'static str,
+    ) -> Result<ProjectionCarrier, ParseFailure> {
+        self.check_depth(depth)?;
+        let start = self.position;
+        if let Some(leaf) = self.parse_projection_view_leaf(depth + 1)? {
+            return Ok(leaf);
+        }
+        self.error_here(
+            "syntax-projection-carrier-leaf",
+            &format!(
+                "expected a `view` or `mut view` leaf inside a `{wrapper}` projection carrier"
+            ),
+        )?;
+        if !self.is_type_terminator() {
+            self.bump()?;
+        }
+        Ok(ProjectionCarrier::Error(self.recovery_error(
+            start,
+            self.position,
+            "projection carrier leaf",
+            depth + 1,
+        )?))
+    }
+
+    /// A projection carrier is exactly one view leaf, or that leaf wrapped
+    /// in a single `Option[..]` or `Result[.., E]` layer — no tuples and no
+    /// nested wrapping.
+    fn parse_projection_carrier(&mut self, depth: u32) -> Result<ProjectionCarrier, ParseFailure> {
+        self.check_depth(depth)?;
+        let start = self.position;
+        if let Some(leaf) = self.parse_projection_view_leaf(depth + 1)? {
+            return Ok(leaf);
         }
         if self.at(TokenKind::Identifier) && self.token_text(self.position) == "Option" {
             self.bump()?;
@@ -3432,7 +3458,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
                     "expected `[` after `Option` projection carrier",
                 )?;
             }
-            let carrier = self.parse_projection_carrier(depth + 1)?;
+            let carrier = self.parse_projection_leaf_or_error(depth + 1, "Option")?;
             if !self.eat_punctuation(Punctuation::RightBracket)? {
                 self.error_here(
                     "syntax-option-carrier",
@@ -3452,7 +3478,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
                     "expected `[` after `Result` projection carrier",
                 )?;
             }
-            let carrier = self.parse_projection_carrier(depth + 1)?;
+            let carrier = self.parse_projection_leaf_or_error(depth + 1, "Result")?;
             if !self.eat_punctuation(Punctuation::Comma)? {
                 self.error_here(
                     "syntax-result-carrier",
@@ -3474,7 +3500,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         }
         self.error_here(
             "syntax-projection-carrier",
-            "expected view, tuple, Option, or Result projection carrier",
+            "expected a view, Option[view], or Result[view, Error] projection carrier",
         )?;
         if !self.is_type_terminator() {
             self.bump()?;
@@ -4277,20 +4303,36 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             self.bump()?;
             return Ok(PrimaryPattern::Wildcard(self.meta(start, self.position)?));
         }
-        if self.eat_keyword(Keyword::Bind)? {
-            if let Some(name) = self.parse_identifier(depth + 1)? {
-                return Ok(PrimaryPattern::Bind(name));
-            }
-            self.error_here(
-                "syntax-pattern-binding",
-                "expected an identifier after `bind`",
-            )?;
-            return Ok(PrimaryPattern::Error(self.recovery_error(
-                start,
-                self.position,
-                "pattern binding",
-                depth + 1,
-            )?));
+        if self.eat_punctuation(Punctuation::Dot)? {
+            let Some(name) = self.parse_identifier(depth + 1)? else {
+                self.error_here(
+                    "syntax-expected-dot-variant-name",
+                    "expected an identifier after `.`",
+                )?;
+                return Ok(PrimaryPattern::Error(self.recovery_error(
+                    start,
+                    self.position,
+                    "dot-variant pattern",
+                    depth + 1,
+                )?));
+            };
+            let arguments = if self.eat_punctuation(Punctuation::LeftParen)? {
+                let arguments = self.parse_pattern_arguments(depth + 1, Punctuation::RightParen)?;
+                if !self.eat_punctuation(Punctuation::RightParen)? {
+                    self.error_here(
+                        "syntax-unclosed-pattern-constructor",
+                        "expected `)` to close the constructor pattern",
+                    )?;
+                }
+                arguments
+            } else {
+                Vec::new()
+            };
+            return Ok(PrimaryPattern::DotVariant {
+                meta: self.meta(start, self.position)?,
+                name,
+                arguments,
+            });
         }
         if self.at(TokenKind::Operator(Operator::Subtract)) {
             self.bump()?;
@@ -4331,7 +4373,63 @@ impl<'a, 'diag> Parser<'a, 'diag> {
                 literal: self.parse_literal_node(depth + 1)?,
             });
         }
+        if self.at(TokenKind::Identifier)
+            && self.nth_kind(1) != Some(TokenKind::Punctuation(Punctuation::Dot))
+        {
+            // A bare identifier (no qualifying dot follows) is always a
+            // binding now; unqualified variant-with-payload patterns
+            // require a leading dot. Parsed directly as an `Identifier`
+            // rather than through `parse_qualified_name` so no separate,
+            // immediately-discarded `QualifiedName` AST id is allocated.
+            if self.nth_kind(1) == Some(TokenKind::Punctuation(Punctuation::LeftParen)) {
+                // Legacy unqualified constructor-with-payload spelling. The
+                // name and its parenthesized payload are discarded during
+                // recovery, so they are skipped as raw tokens rather than
+                // parsed into AST nodes that would then go unreferenced.
+                self.error_here(
+                    "syntax-legacy-variant-pattern",
+                    "unqualified variant patterns require a leading dot, e.g. `.Name(...)`",
+                )?;
+                self.bump()?; // the identifier
+                self.bump()?; // `(`
+                let mut nesting: u32 = 1;
+                while nesting > 0
+                    && !self.at(TokenKind::EndOfFile)
+                    && !self.at(TokenKind::Newline)
+                    && !self.at(TokenKind::Dedent)
+                {
+                    if self.at_punctuation(Punctuation::LeftParen) {
+                        nesting += 1;
+                    } else if self.at_punctuation(Punctuation::RightParen) {
+                        nesting -= 1;
+                        if nesting == 0 {
+                            break;
+                        }
+                    }
+                    self.bump()?;
+                }
+                if !self.eat_punctuation(Punctuation::RightParen)? {
+                    self.error_here(
+                        "syntax-unclosed-pattern-constructor",
+                        "expected `)` to close the constructor pattern",
+                    )?;
+                }
+                return Ok(PrimaryPattern::Error(self.recovery_error(
+                    start,
+                    self.position,
+                    "dot-variant pattern",
+                    depth + 1,
+                )?));
+            }
+            let identifier = self.parse_identifier(depth + 1)?.ok_or_else(|| {
+                ParseFailure::InternalInvariant(
+                    "pattern name token did not form an identifier".to_owned(),
+                )
+            })?;
+            return Ok(PrimaryPattern::Bind(identifier));
+        }
         if self.at(TokenKind::Identifier) {
+            // A qualifying dot follows: this is `Enum.variant(...)`.
             let name = self
                 .parse_qualified_name(depth + 1, false)?
                 .ok_or_else(|| {
@@ -5365,7 +5463,6 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         loop {
             let operator = match self.kind() {
                 TokenKind::Operator(Operator::ShiftLeft) => BinaryOperator::ShiftLeft,
-                TokenKind::Operator(Operator::ShiftLeftModular) => BinaryOperator::ShiftLeftModular,
                 TokenKind::Operator(Operator::ShiftRight) => BinaryOperator::ShiftRight,
                 _ => break,
             };
@@ -5634,6 +5731,23 @@ impl<'a, 'diag> Parser<'a, 'diag> {
                     kind: ExpressionKind::Name(name),
                 })
             }
+            TokenKind::Punctuation(Punctuation::Dot) => {
+                self.bump()?;
+                let Some(name) = self.parse_identifier(depth + 1)? else {
+                    self.error_here(
+                        "syntax-expected-dot-variant-name",
+                        "expected an identifier after `.`",
+                    )?;
+                    return self.error_expression(start, self.position, depth);
+                };
+                Ok(Expression {
+                    meta: self.meta(start, self.position)?,
+                    kind: ExpressionKind::DotName {
+                        meta: self.meta(start, self.position)?,
+                        name,
+                    },
+                })
+            }
             TokenKind::Punctuation(Punctuation::LeftParen) => {
                 self.bump()?;
                 if self.at_punctuation(Punctuation::RightParen) {
@@ -5703,7 +5817,6 @@ impl<'a, 'diag> Parser<'a, 'diag> {
                     kind: ExpressionKind::Array(values),
                 })
             }
-            TokenKind::Keyword(Keyword::Race) => self.parse_race_expression(depth + 1),
             TokenKind::Keyword(Keyword::Try)
                 if self.nth_kind(1) == Some(TokenKind::Keyword(Keyword::Send)) =>
             {
@@ -5720,42 +5833,6 @@ impl<'a, 'diag> Parser<'a, 'diag> {
                 self.error_expression(start, self.position, depth)
             }
         }
-    }
-
-    fn parse_race_expression(&mut self, depth: u32) -> Result<Expression, ParseFailure> {
-        self.check_depth(depth)?;
-        let start = self.position;
-        self.bump()?;
-        if !self.eat_punctuation(Punctuation::LeftParen)? {
-            self.error_here("syntax-race-open", "expected `(` after `race`")?;
-        }
-        let mut values = Vec::new();
-        while !self.at_punctuation(Punctuation::RightParen)
-            && !self.at(TokenKind::Newline)
-            && !self.at(TokenKind::EndOfFile)
-        {
-            let value = self.parse_expression(depth + 1)?;
-            push_ast_value(&mut values, value, self.limits.ast_nodes)?;
-            if !self.eat_punctuation(Punctuation::Comma)? {
-                break;
-            }
-        }
-        if values.len() < 2 {
-            self.error_here(
-                "syntax-race-arity",
-                "`race` requires at least two expressions",
-            )?;
-        }
-        if !self.eat_punctuation(Punctuation::RightParen)? {
-            self.error_here(
-                "syntax-race-close",
-                "expected `)` to close the race expression",
-            )?;
-        }
-        Ok(Expression {
-            meta: self.meta(start, self.position)?,
-            kind: ExpressionKind::Race(values),
-        })
     }
 
     fn parse_try_send_expression(&mut self, depth: u32) -> Result<Expression, ParseFailure> {
@@ -6398,10 +6475,10 @@ mod tests {
     }
 
     #[test]
-    fn init_is_a_dedicated_class_member_and_keyword() {
+    fn init_is_a_dedicated_struct_member_and_keyword() {
         assert_eq!(SYNTAX_CONTRACT_VERSION, 3);
         let output = parse_clean(
-            "module contracts.initializer\nclass Cache:\n    value: u64\n    init(mut self, value: u64):\n        self.value = value\n",
+            "module contracts.initializer\nstruct Cache:\n    value: u64\n    init(mut self, value: u64):\n        self.value = value\n",
         );
         assert!(
             output
@@ -6411,10 +6488,11 @@ mod tests {
                 .iter()
                 .any(|token| { token.kind == TokenKind::Keyword(Keyword::Init) })
         );
-        let DeclarationKind::Class(class) = &output.parsed().ast().declarations[0].kind else {
-            panic!("expected class declaration");
+        let DeclarationKind::Structure(structure) = &output.parsed().ast().declarations[0].kind
+        else {
+            panic!("expected struct declaration");
         };
-        let MemberKind::Initializer(initializer) = &class.members[1].kind else {
+        let MemberKind::Initializer(initializer) = &structure.members[1].kind else {
             panic!("expected dedicated initializer member");
         };
         assert_eq!(initializer.parameters.len(), 2);
@@ -6426,19 +6504,20 @@ mod tests {
     #[test]
     fn removed_dunder_initializer_never_becomes_a_function() {
         let output = parse_with_limits(
-            "module contracts.initializer\nclass Cache:\n    fn __init__(mut self):\n        pass\n",
+            "module contracts.initializer\nstruct Cache:\n    fn __init__(mut self):\n        pass\n",
             ParseLimits::standard(),
         )
         .expect("removed spelling recovers");
         assert!(output.diagnostics().iter().any(|diagnostic| {
             diagnostic.code.as_deref() == Some("syntax-removed-initializer-spelling")
         }));
-        let DeclarationKind::Class(class) = &output.parsed().ast().declarations[0].kind else {
-            panic!("expected class declaration");
+        let DeclarationKind::Structure(structure) = &output.parsed().ast().declarations[0].kind
+        else {
+            panic!("expected struct declaration");
         };
-        assert!(matches!(class.members[0].kind, MemberKind::Error(_)));
+        assert!(matches!(structure.members[0].kind, MemberKind::Error(_)));
         assert!(
-            !class
+            !structure
                 .members
                 .iter()
                 .any(|member| matches!(member.kind, MemberKind::Function(_)))
@@ -6449,23 +6528,23 @@ mod tests {
     fn initializer_shape_and_context_fail_explicitly() {
         for (source, code) in [
             (
-                "module contracts.initializer\nclass Cache:\n    init(self):\n        pass\n",
+                "module contracts.initializer\nstruct Cache:\n    init(self):\n        pass\n",
                 "syntax-initializer-receiver",
             ),
             (
-                "module contracts.initializer\nstruct Cache:\n    init(mut self):\n        pass\n",
+                "module contracts.initializer\nstruct Cache:\n    comptime if true:\n        init(mut self):\n            pass\n",
                 "syntax-initializer-context",
             ),
             (
-                "module contracts.initializer\nclass Cache:\n    pub init(mut self):\n        pass\n",
+                "module contracts.initializer\nstruct Cache:\n    pub init(mut self):\n        pass\n",
                 "syntax-initializer-visibility",
             ),
             (
-                "module contracts.initializer\nclass Cache:\n    @budget(bound=1)\n    init(mut self):\n        pass\n",
+                "module contracts.initializer\nstruct Cache:\n    @budget(bound=1)\n    init(mut self):\n        pass\n",
                 "syntax-initializer-attribute",
             ),
             (
-                "module contracts.initializer\nclass Cache:\n    init(mut self):\n        pass\n    init(mut self):\n        pass\n",
+                "module contracts.initializer\nstruct Cache:\n    init(mut self):\n        pass\n    init(mut self):\n        pass\n",
                 "syntax-duplicate-initializer",
             ),
         ] {
@@ -6602,7 +6681,8 @@ mod tests {
             "syntax-negative-pattern-literal",
             "syntax-tuple-pattern-comma",
             "syntax-send-call",
-            "syntax-race-arity",
+            "syntax-legacy-variant-pattern",
+            "syntax-expected-dot-variant-name",
             "syntax-try-send-call",
             "syntax-positional-after-named-argument",
             "syntax-closure-parameter-type",
@@ -6734,6 +6814,10 @@ mod tests {
                     }
                     PrimaryPattern::Constructor { arguments, .. } => {
                         patterns.insert("constructor");
+                        arguments
+                    }
+                    PrimaryPattern::DotVariant { arguments, .. } => {
+                        patterns.insert("dot_variant");
                         arguments
                     }
                     PrimaryPattern::Bind(_) => {
@@ -6919,17 +7003,7 @@ mod tests {
                     );
                     "array"
                 }
-                ExpressionKind::Race(values) => {
-                    collect_expressions(
-                        values,
-                        expressions,
-                        patterns,
-                        flags,
-                        statements,
-                        operators,
-                    );
-                    "race"
-                }
+                ExpressionKind::DotName { .. } => "dot-name",
                 ExpressionKind::TrySend(value) => {
                     collect_expression(value, expressions, patterns, flags, statements, operators);
                     "try-send"
@@ -7321,6 +7395,7 @@ mod tests {
                 "cast",
                 "closure",
                 "comparison",
+                "dot-name",
                 "field",
                 "index",
                 "interpolated",
@@ -7328,7 +7403,6 @@ mod tests {
                 "literal",
                 "name",
                 "parenthesized",
-                "race",
                 "range",
                 "try",
                 "try-send",
@@ -7342,6 +7416,7 @@ mod tests {
                 "array",
                 "bind",
                 "constructor",
+                "dot_variant",
                 "literal",
                 "tuple",
                 "wildcard"
@@ -7743,25 +7818,29 @@ mod tests {
         ));
         assert!(matches!(field_type(7).kind, TypeExpressionKind::Iso { .. }));
 
-        let DeclarationKind::Class(class) = &declarations[4].kind else {
+        let DeclarationKind::Structure(service) = &declarations[4].kind else {
             panic!("fifth declaration must be Service");
         };
         assert_eq!(declarations[4].attributes.len(), 1);
-        assert_eq!(class.implements.len(), 2);
-        assert_eq!(class.members.len(), 7);
-        assert!(matches!(class.members[1].kind, MemberKind::Initializer(_)));
-        assert!(class.members[2].public);
-        assert!(matches!(class.members[2].kind, MemberKind::Function(_)));
+        assert!(service.linear);
+        assert_eq!(service.implements.len(), 2);
+        assert_eq!(service.members.len(), 7);
         assert!(matches!(
-            class.members[3].kind,
+            service.members[1].kind,
+            MemberKind::Initializer(_)
+        ));
+        assert!(service.members[2].public);
+        assert!(matches!(service.members[2].kind, MemberKind::Function(_)));
+        assert!(matches!(
+            service.members[3].kind,
             MemberKind::Function(FunctionDeclaration {
                 color: FunctionColor::Async,
                 ..
             })
         ));
-        assert!(matches!(class.members[4].kind, MemberKind::Constant(_)));
-        assert!(matches!(class.members[5].kind, MemberKind::Projection(_)));
-        assert!(matches!(class.members[6].kind, MemberKind::ComptimeIf(_)));
+        assert!(matches!(service.members[4].kind, MemberKind::Constant(_)));
+        assert!(matches!(service.members[5].kind, MemberKind::Projection(_)));
+        assert!(matches!(service.members[6].kind, MemberKind::ComptimeIf(_)));
 
         let DeclarationKind::Enumeration(enumeration) = &declarations[5].kind else {
             panic!("sixth declaration must be Outcome");
@@ -7810,11 +7889,10 @@ mod tests {
             panic!("ninth declaration must be locate");
         };
         assert_eq!(projection.generics.len(), 1);
-        assert_eq!(projection.provenance.len(), 2);
         assert!(matches!(
             projection.carrier,
             ProjectionCarrier::Result { ref carrier, .. }
-                if matches!(carrier.as_ref(), ProjectionCarrier::Option { .. })
+                if matches!(carrier.as_ref(), ProjectionCarrier::View { .. })
         ));
         assert!(matches!(
             projection
@@ -7842,7 +7920,9 @@ mod tests {
             FunctionColor::Sync,
             FunctionColor::Async,
             FunctionColor::Isr,
-            FunctionColor::Comptime,
+            // `capacity` was historically `comptime fn`; a plain `fn` is
+            // phase-neutral, so it now parses with `FunctionColor::Sync`.
+            FunctionColor::Sync,
         ]
         .into_iter()
         .enumerate()
@@ -7917,7 +7997,7 @@ mod tests {
             "syntax-implementation-member",
             "syntax-implementation-member-pub",
             "syntax-projection-carrier",
-            "syntax-projection-provenance",
+            "syntax-projection-carrier-leaf",
             "syntax-scope-exit-binding",
         ] {
             assert!(
@@ -7957,6 +8037,28 @@ mod tests {
                 "missing {expected}; got {codes:?}"
             );
         }
+    }
+
+    #[test]
+    fn comptime_fn_legacy_color_is_diagnosed_at_every_function_site() {
+        let text = "module x\n\ncomptime fn top() -> unit:\n    pass\n\nstruct S:\n    comptime fn member() -> unit:\n        pass\n\ninterface I:\n    comptime fn signature() -> unit\n";
+        let output = parse_with_limits(text, ParseLimits::standard())
+            .expect("legacy comptime-fn spellings remain recoverable");
+        assert!(output.parsed().recovery_complete());
+        let codes = output
+            .diagnostics()
+            .iter()
+            .filter_map(|diagnostic| diagnostic.code.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|code| **code == "syntax-legacy-comptime-fn-color")
+                .count(),
+            3,
+            "expected the legacy comptime-fn diagnostic at the top-level, member, and interface \
+             sites; got {codes:?}"
+        );
     }
 
     #[test]
@@ -8193,111 +8295,6 @@ mod tests {
             panic!("second statement is a local assignment");
         };
         assert!(matches!(value.kind, ExpressionKind::Cast { .. }));
-    }
-
-    #[test]
-    fn shift_left_modular_is_distinct_and_shares_shift_precedence() {
-        let text = concat!(
-            "module shifts\n",
-            "fn f(a: u32, b: u32, c: u32, d: u32):\n",
-            "    checked = a << b\n",
-            "    modular = a <<% b\n",
-            "    precedence = a + b <<% c + d << a\n",
-        );
-        let output = parse_clean(text);
-        let function = first_function(&output);
-
-        assert!(matches!(
-            local_value(function, "checked").kind,
-            ExpressionKind::Binary {
-                operator: BinaryOperator::ShiftLeft,
-                ..
-            }
-        ));
-        assert!(matches!(
-            local_value(function, "modular").kind,
-            ExpressionKind::Binary {
-                operator: BinaryOperator::ShiftLeftModular,
-                ..
-            }
-        ));
-
-        let ExpressionKind::Binary {
-            operator: BinaryOperator::ShiftLeft,
-            left,
-            ..
-        } = &local_value(function, "precedence").kind
-        else {
-            panic!("the final checked shift must bind at the shared shift precedence");
-        };
-        let ExpressionKind::Binary {
-            operator: BinaryOperator::ShiftLeftModular,
-            left: modular_left,
-            right: modular_right,
-        } = &left.kind
-        else {
-            panic!("shift operators must associate left-to-right");
-        };
-        assert!(matches!(
-            modular_left.kind,
-            ExpressionKind::Binary {
-                operator: BinaryOperator::Add,
-                ..
-            }
-        ));
-        assert!(matches!(
-            modular_right.kind,
-            ExpressionKind::Binary {
-                operator: BinaryOperator::Add,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn shift_left_modular_assignment_is_rejected_at_exact_equal_span() {
-        let text = concat!(
-            "module shifts\n",
-            "fn f(left: u32, count: u32):\n",
-            "    value = left <<%= count\n",
-        );
-        let output =
-            parse_with_limits(text, ParseLimits::standard()).expect("malformed shift recovers");
-        assert!(output.parsed().recovery_complete());
-
-        let tokens = &output.parsed().lexical().tokens;
-        let modular = tokens
-            .iter()
-            .position(|token| token.kind == TokenKind::Operator(Operator::ShiftLeftModular))
-            .expect("longest-match modular shift token");
-        assert_eq!(
-            tokens[modular..modular + 3]
-                .iter()
-                .map(|token| token.kind)
-                .collect::<Vec<_>>(),
-            vec![
-                TokenKind::Operator(Operator::ShiftLeftModular),
-                TokenKind::Operator(Operator::Assign),
-                TokenKind::Identifier,
-            ]
-        );
-        assert!(!tokens.iter().any(|token| {
-            matches!(
-                token.kind,
-                TokenKind::Operator(
-                    Operator::ShiftLeft | Operator::ShiftLeftAssign | Operator::RemainderAssign
-                )
-            )
-        }));
-
-        let diagnostic = output
-            .diagnostics()
-            .iter()
-            .find(|diagnostic| diagnostic.code.as_deref() == Some("syntax-expected-expression"))
-            .expect("the standalone equals is rejected as the missing right operand");
-        let equals = text.find("<<%=").expect("fixture operator") + "<<%".len();
-        assert_eq!(diagnostic.primary.range.start, equals as u32);
-        assert_eq!(diagnostic.primary.range.end, (equals + 1) as u32);
     }
 
     #[test]

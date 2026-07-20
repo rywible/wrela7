@@ -3,13 +3,13 @@ schema = 1
 [root]
 name = "bootstrap-image"
 version = "0.1.0"
-source_digest = "b749bdf3ddacd8be2f707447d982ecf691b09fd431524da51fd57ce4748b6f1a"
+source_digest = "ca556c73183fe0c85b89515adf53d3f7afaa97dbbef353f2940040d8d69e8291"
 
 [[package]]
 name = "bootstrap-image"
 version = "0.1.0"
-source_digest = "b749bdf3ddacd8be2f707447d982ecf691b09fd431524da51fd57ce4748b6f1a"
-manifest_digest = "246e47c3f54443ac10f3532f4b415eb61769fe8c20efe54791a4dd563bbd360c"
+source_digest = "ca556c73183fe0c85b89515adf53d3f7afaa97dbbef353f2940040d8d69e8291"
+manifest_digest = "21bc78eb2429b7ee780651f686114b7b3be1e7cf9eca35bfac6bfd382bc1793a"
 locator = "workspace"
 locator_path = "."
 
@@ -17,12 +17,12 @@ locator_path = "."
 alias = "core"
 name = "wrela-core"
 version = "0.1.0"
-source_digest = "5da2bae2f9089643c235c54bf229e67a995f16ce9a0596c24604bd389661afd5"
+source_digest = "eba5dfc6ec9344b33674856853d953d81a52650f241f2078edf067dbebd7cb2e"
 
 [[package]]
 name = "wrela-core"
 version = "0.1.0"
-source_digest = "5da2bae2f9089643c235c54bf229e67a995f16ce9a0596c24604bd389661afd5"
-manifest_digest = "7eda3d023a968b8302de6a2d5bea13270be3fbdba58d57ca93d74007a1a65786"
+source_digest = "eba5dfc6ec9344b33674856853d953d81a52650f241f2078edf067dbebd7cb2e"
+manifest_digest = "ffa9445a0205d6e7a89fdf0457dd82ecbe011a65ea9c2a3faa147c6a848e5999"
 locator = "toolchain"
 locator_component = "wrela-core-0.1"

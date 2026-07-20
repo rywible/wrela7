@@ -36,7 +36,7 @@ const APPLICATION_SOURCE: &str = r#"module app
 from core.image import Image, Target
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="compound-image", target=Target.aarch64_qemu_virt_uefi)
 
 @test
@@ -58,6 +58,13 @@ fn compound_runtime():
     else:
         value -= 1
     consume(value=value)
+    # A bounded `while` is outside the comptime evaluator's supported
+    # subset, so this keeps the test in the runtime/image tier
+    # deterministically (every function is otherwise phase-neutral and
+    # would be comptime-legal on its own).
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
     return
 
 fn consume(value: u32) -> u32:
@@ -179,7 +186,7 @@ fn source_compound_assignments_reach_checked_semantic_and_flow_operations() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(assignments.len(), 12);
+    assert_eq!(assignments.len(), 13);
     assert_eq!(
         assignments
             .iter()
@@ -332,8 +339,8 @@ fn source_compound_assignments_reach_checked_semantic_and_flow_operations() {
         )
         .expect("compound assignments lower to SemanticWir");
     let semantic_debug = format!("{:?}", semantic_output.wir().as_wir());
-    assert_eq!(semantic_debug.matches("operation: Binary {").count(), 12);
-    assert_eq!(semantic_debug.matches("arithmetic: Checked").count(), 12);
+    assert_eq!(semantic_debug.matches("operation: Binary {").count(), 14);
+    assert_eq!(semantic_debug.matches("arithmetic: Checked").count(), 14);
 
     let (semantic_wir, _) = semantic_output.into_parts();
     let flow_output = CanonicalFlowLowerer::new()
@@ -368,4 +375,250 @@ fn source_compound_assignments_reach_checked_semantic_and_flow_operations() {
             "missing Flow operation {operator}"
         );
     }
+}
+
+const IMPLICIT_RETURN_APPLICATION_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+@image
+pub fn boot() -> Image:
+    return Image(name="implicit-return-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test
+fn falls_off_the_end_returns_unit():
+    value: u32 = 40
+    value += 2
+    consume(value=value)
+    # A bounded `while` is outside the comptime evaluator's supported
+    # subset, so this keeps the test in the runtime/image tier
+    # deterministically (every function is otherwise phase-neutral and
+    # would be comptime-legal on its own) -- this test exists specifically
+    # to exercise the runtime pipeline's implicit-unit-return synthesis, so
+    # falling off the end here (no trailing `return`) is the point.
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
+
+fn consume(value: u32) -> u32:
+    return value
+"#;
+
+/// A `fn`/`async fn` body whose result type is `unit` may fall off the end of
+/// its suite without a trailing `return` (docs/language/02-source-language.md
+/// §3.1): the compiler synthesizes the implicit `return`. This drives
+/// `falls_off_the_end_returns_unit` (no trailing `return` at all) through the
+/// exact same discovery -> compile-test-group -> SemanticWir pipeline shape
+/// as `source_compound_assignments_reach_checked_semantic_and_flow_operations`
+/// above, and confirms the lowered body's last statement is the synthesized
+/// empty `Return`.
+#[test]
+fn unit_fn_without_trailing_return_compiles_and_lowers_with_a_synthesized_return() {
+    let source_graph_digest = Sha256Digest::from_bytes([0x91; 32]);
+    let core_package_digest = Sha256Digest::from_bytes([0x92; 32]);
+    let target_digest = Sha256Digest::from_bytes([0x93; 32]);
+    let mut sources = SourceDatabase::default();
+    let application_file = sources
+        .add(SourceInput {
+            path: "app.wr".to_owned(),
+            text: IMPLICIT_RETURN_APPLICATION_SOURCE.to_owned(),
+            digest: Sha256Digest::from_bytes([0x94; 32]),
+        })
+        .expect("application source");
+    let core_file = sources
+        .add(SourceInput {
+            path: "core/image.wr".to_owned(),
+            text: CORE_IMAGE_SOURCE.to_owned(),
+            digest: Sha256Digest::from_bytes([0x95; 32]),
+        })
+        .expect("core source");
+    let parsed_files = [application_file, core_file]
+        .into_iter()
+        .map(|file| {
+            let (parsed, diagnostics) = WrelaSyntaxParser::new()
+                .parse(
+                    ParseRequest {
+                        sources: &sources,
+                        file,
+                        limits: ParseLimits::standard(),
+                    },
+                    &never_cancelled,
+                )
+                .expect("source parses")
+                .into_parts();
+            assert!(diagnostics.is_empty(), "parse diagnostics: {diagnostics:?}");
+            parsed
+        })
+        .collect::<Vec<_>>();
+
+    let mut graph = PackageGraphBuilder::new(identity(
+        "implicit-return-application",
+        Sha256Digest::from_bytes([0x96; 32]),
+    ));
+    let core = graph
+        .add_package(identity("wrela-core", core_package_digest))
+        .expect("core package");
+    graph
+        .add_dependency(
+            graph.root(),
+            DependencyAlias::new("core").expect("core alias"),
+            core,
+        )
+        .expect("core dependency");
+    graph
+        .add_module(
+            graph.root(),
+            ModulePath::new(["app".to_owned()]).expect("application module"),
+            application_file,
+        )
+        .expect("application module record");
+    graph
+        .add_module(
+            core,
+            ModulePath::new(["image".to_owned()]).expect("core image module"),
+            core_file,
+        )
+        .expect("core module record");
+    let packages = Arc::new(graph.finish().expect("package graph"));
+    let changes = HirChangeSet {
+        previous_source_graph: None,
+        changed_files: Vec::new(),
+    };
+    let hir_output = CanonicalHirLowerer::new()
+        .lower(
+            HirLowerRequest {
+                packages,
+                source_graph_digest,
+                parsed_files: &parsed_files,
+                sources: &sources,
+                changes: &changes,
+                limits: HirLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("implicit-return source lowers to sealed HIR");
+    assert!(
+        hir_output.diagnostics().is_empty(),
+        "HIR diagnostics: {:?}",
+        hir_output.diagnostics()
+    );
+    let image_entry = *hir_output
+        .lowered()
+        .program()
+        .as_program()
+        .image_candidates
+        .first()
+        .expect("image entry candidate");
+    let hir = Arc::new(hir_output.into_parts().0.into_program());
+
+    let profile = BuildProfile::development();
+    let profile_digest = Sha256Digest::from_bytes([0x97; 32]);
+    let build = seal_build_configuration(
+        BuildConfiguration {
+            identity: BuildIdentity {
+                compiler: Sha256Digest::from_bytes([0x98; 32]),
+                language: LanguageRevision::Design0_1,
+                target: TargetIdentity::aarch64_qemu_virt_uefi(),
+                target_package: target_digest,
+                standard_library: Sha256Digest::from_bytes([0x99; 32]),
+                source_graph: source_graph_digest,
+                request: Sha256Digest::from_bytes([0x9a; 32]),
+                profile: profile_digest,
+            },
+            profile,
+        },
+        profile_digest,
+    )
+    .expect("validated build configuration");
+    let target = TargetPackage::aarch64_qemu_virt_uefi(target_digest);
+    let changes = AnalysisChangeSet {
+        previous_source_graph: None,
+        changed_declarations: Vec::new(),
+    };
+    let analyzer = CanonicalSemanticAnalyzer::new();
+    let discovery = analyzer
+        .analyze(
+            AnalysisRequest {
+                hir: Arc::clone(&hir),
+                standard_library_package: wrela_package::PackageId(1),
+                target: target.semantic(),
+                build: &build,
+                mode: AnalysisMode::DiscoverTests {
+                    image_name: "implicit-return-image",
+                    image_entry,
+                    declared_image_tests: &[],
+                    source_selection: TestDiscoverySelection::All,
+                },
+                changes: &changes,
+                limits: AnalysisLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("implicit-return test discovery");
+    assert!(
+        discovery.diagnostics().is_empty(),
+        "discovery diagnostics: {:?}",
+        discovery.diagnostics()
+    );
+    let plan = discovery
+        .successful()
+        .and_then(|image| image.facts().test_plan.as_ref())
+        .expect("implicit-return test plan")
+        .clone();
+    assert_eq!(
+        plan.image_groups().len(),
+        1,
+        "the runtime-tier test group must still build, with no explicit return required"
+    );
+    let compilation = analyzer
+        .analyze(
+            AnalysisRequest {
+                hir,
+                standard_library_package: wrela_package::PackageId(1),
+                target: target.semantic(),
+                build: &build,
+                mode: AnalysisMode::CompileTestGroup {
+                    plan: &plan,
+                    group: plan.image_groups()[0].id,
+                    declared_entry: None,
+                },
+                changes: &changes,
+                limits: AnalysisLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("implicit-return test semantic analysis");
+    assert!(
+        compilation.diagnostics().is_empty(),
+        "compilation diagnostics: {:?}",
+        compilation.diagnostics()
+    );
+    let analyzed = compilation
+        .into_parts()
+        .0
+        .expect("sealed implicit-return test image");
+    let semantic_output = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("implicit-return test lowers to SemanticWir");
+    let wir = semantic_output.wir().as_wir();
+    let test_function = wir
+        .functions
+        .iter()
+        .find(|function| function.role == wrela_semantic_lower::semantic_wir::FunctionRole::Test)
+        .expect("selected test function");
+    assert!(
+        matches!(
+            test_function.body.statements.last(),
+            Some(wrela_semantic_lower::semantic_wir::SemanticStatement::Return(values))
+                if values.is_empty()
+        ),
+        "a unit fn falling off the end must synthesize an implicit empty return: {:?}",
+        test_function.body.statements
+    );
 }

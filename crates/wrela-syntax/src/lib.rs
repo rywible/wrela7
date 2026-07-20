@@ -65,7 +65,6 @@ pub enum Keyword {
     Isr,
     Comptime,
     Struct,
-    Class,
     Enum,
     Iface,
     Impl,
@@ -85,7 +84,6 @@ pub enum Keyword {
     Else,
     Match,
     Case,
-    Bind,
     In,
     Not,
     While,
@@ -105,7 +103,6 @@ pub enum Keyword {
     Yield,
     Await,
     Copy,
-    Race,
     True,
     False,
     Unit,
@@ -144,7 +141,6 @@ pub enum Operator {
     BitOr,
     BitXor,
     ShiftLeft,
-    ShiftLeftModular,
     ShiftRight,
     Equal,
     NotEqual,
@@ -321,7 +317,6 @@ pub enum DeclarationKind {
     Brand(BrandDeclaration),
     Function(FunctionDeclaration),
     Structure(TypeDeclaration),
-    Class(TypeDeclaration),
     Enumeration(EnumDeclaration),
     Interface(InterfaceDeclaration),
     Implementation(ImplementationDeclaration),
@@ -350,7 +345,6 @@ pub enum FunctionColor {
     Sync,
     Async,
     Isr,
-    Comptime,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -415,6 +409,8 @@ pub struct TypeDeclaration {
     pub implements: Vec<TypeExpression>,
     pub members: Vec<MemberDeclaration>,
     pub explicit_pass: bool,
+    /// `linear struct Name:` — non-copyable regardless of fields.
+    pub linear: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -510,20 +506,18 @@ pub struct ProjectionDeclaration {
     pub generics: Vec<GenericParameter>,
     pub parameters: Vec<Parameter>,
     pub carrier: ProjectionCarrier,
-    pub provenance: Vec<Identifier>,
     pub body: Option<Suite>,
 }
 
+/// A projection carrier is now restricted to a single view leaf, or that
+/// leaf wrapped in exactly one `Option[..]`/`Result[.., E]` layer. Tuples of
+/// carriers and provenance sets no longer exist at the syntax level.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProjectionCarrier {
     View {
         meta: NodeMeta,
         mutable: bool,
         ty: Box<TypeExpression>,
-    },
-    Tuple {
-        meta: NodeMeta,
-        elements: Vec<ProjectionCarrier>,
     },
     Option {
         meta: NodeMeta,
@@ -695,6 +689,14 @@ pub struct Expression {
 pub enum ExpressionKind {
     Literal(Literal),
     Name(QualifiedName),
+    /// Expression-position leading-dot variant shorthand: `.name`, a variant
+    /// literal whose enum type is resolved contextually. `.name(args)` is
+    /// this node wrapped in the ordinary `ExpressionKind::Call` postfix — no
+    /// separate payload-carrying node is needed.
+    DotName {
+        meta: NodeMeta,
+        name: Identifier,
+    },
     Closure {
         asynchronous: bool,
         take_captures: bool,
@@ -744,7 +746,6 @@ pub enum ExpressionKind {
     Parenthesized(Box<Expression>),
     Tuple(Vec<Expression>),
     Array(Vec<Expression>),
-    Race(Vec<Expression>),
     TrySend(Box<Expression>),
     Interpolated(Vec<InterpolationPart>),
     Error(ErrorNode),
@@ -783,7 +784,6 @@ pub enum BinaryOperator {
     BitXor,
     BitAnd,
     ShiftLeft,
-    ShiftLeftModular,
     ShiftRight,
 }
 
@@ -899,6 +899,17 @@ pub enum PrimaryPattern {
         name: QualifiedName,
         arguments: Vec<PatternArgument>,
     },
+    /// Leading-dot variant pattern: `.name` or `.name(payload_patterns)`.
+    /// The enum type is resolved contextually, mirroring the qualified
+    /// `Enum.variant(...)` constructor form above.
+    DotVariant {
+        meta: NodeMeta,
+        name: Identifier,
+        arguments: Vec<PatternArgument>,
+    },
+    /// A bare identifier pattern. Always a fresh binding — bare identifiers
+    /// no longer disambiguate against fieldless enum variants; write
+    /// `.Variant` or `Enum.Variant` for a variant pattern instead.
     Bind(Identifier),
     Tuple {
         meta: NodeMeta,
@@ -2041,9 +2052,7 @@ impl AstValidator<'_> {
                 self.identifier(&value.name, depth + 2, inner)
             }
             DeclarationKind::Function(value) => self.function(value, depth + 1, parent),
-            DeclarationKind::Structure(value) | DeclarationKind::Class(value) => {
-                self.type_declaration(value, depth + 1, parent)
-            }
+            DeclarationKind::Structure(value) => self.type_declaration(value, depth + 1, parent),
             DeclarationKind::Enumeration(value) => self.enumeration(value, depth + 1, parent),
             DeclarationKind::Interface(value) => self.interface(value, depth + 1, parent),
             DeclarationKind::Implementation(value) => self.implementation(value, depth + 1, parent),
@@ -2320,9 +2329,6 @@ impl AstValidator<'_> {
             self.parameter(parameter, depth + 1, parent)?;
         }
         self.carrier(&value.carrier, depth + 1, parent)?;
-        for provenance in &value.provenance {
-            self.identifier(provenance, depth + 1, parent)?;
-        }
         if let Some(body) = &value.body {
             self.suite(body, depth + 1, parent)?;
         }
@@ -2339,13 +2345,6 @@ impl AstValidator<'_> {
             ProjectionCarrier::View { meta, ty, .. } => {
                 let parent = self.meta(*meta, depth, Some(parent))?;
                 self.ty(ty, depth + 1, parent)
-            }
-            ProjectionCarrier::Tuple { meta, elements } => {
-                let parent = self.meta(*meta, depth, Some(parent))?;
-                for element in elements {
-                    self.carrier(element, depth + 1, parent)?;
-                }
-                Ok(())
             }
             ProjectionCarrier::Option { meta, carrier } => {
                 let parent = self.meta(*meta, depth, Some(parent))?;
@@ -2534,6 +2533,10 @@ impl AstValidator<'_> {
         match &value.kind {
             ExpressionKind::Literal(value) => self.literal(value, depth + 1, parent),
             ExpressionKind::Name(value) => self.qualified(value, depth + 1, parent),
+            ExpressionKind::DotName { meta, name } => {
+                let inner = self.meta(*meta, depth + 1, Some(parent))?;
+                self.identifier(name, depth + 2, inner)
+            }
             ExpressionKind::Closure {
                 parameters, body, ..
             } => {
@@ -2611,9 +2614,7 @@ impl AstValidator<'_> {
                 self.expression(base, depth + 1, parent)?;
                 self.expression(index, depth + 1, parent)
             }
-            ExpressionKind::Tuple(values)
-            | ExpressionKind::Array(values)
-            | ExpressionKind::Race(values) => {
+            ExpressionKind::Tuple(values) | ExpressionKind::Array(values) => {
                 for value in values {
                     self.expression(value, depth + 1, parent)?;
                 }
@@ -2729,6 +2730,15 @@ impl AstValidator<'_> {
                 PrimaryPattern::Constructor { name, arguments } => {
                     self.qualified(name, depth + 1, parent)?;
                     self.pattern_arguments(arguments, depth + 1, parent)?;
+                }
+                PrimaryPattern::DotVariant {
+                    meta,
+                    name,
+                    arguments,
+                } => {
+                    let inner = self.meta(*meta, depth + 1, Some(parent))?;
+                    self.identifier(name, depth + 2, inner)?;
+                    self.pattern_arguments(arguments, depth + 2, inner)?;
                 }
                 PrimaryPattern::Bind(value) => self.identifier(value, depth + 1, parent)?,
                 PrimaryPattern::Tuple { meta, elements }

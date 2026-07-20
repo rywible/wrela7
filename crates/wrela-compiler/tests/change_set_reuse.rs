@@ -31,7 +31,7 @@ const IMAGE_SOURCE: &str = r#"module app.image
 from core.image import Image, Target
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="reuse-image", target=Target.aarch64_qemu_virt_uefi)
 "#;
 
@@ -41,7 +41,7 @@ from app.leaf import leaf
 from core.image import Image, Target
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="reuse-image", target=Target.aarch64_qemu_virt_uefi)
 
 fn dependent() -> u8:

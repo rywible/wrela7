@@ -111,8 +111,9 @@ requires a language or target-package revision recorded in the image report.
   reflection, trait objects, and an ambient heap are absent.
 - Runtime code has one address space, one core, and one event loop. Language
   safety is not equivalent to process or hardware fault containment.
-- `struct` values and uniquely owned `class` values form an ownership tree.
-  Runtime roots marked `@app`, `@service`, and `@driver` are actors.
+- `struct` values, including uniquely owned `linear struct` values, form an
+  ownership tree. Runtime roots marked `@app`, `@service`, and `@driver` are
+  actors, declared on a `struct`.
 - Actors share no mutable state. Cross-actor calls create typed logical messages
   and move scalar/explicitly copied values, provenance-branded `iso[P]` ownership, or
   sealed linear receipts; views and `mut` loans cannot cross an actor boundary.
@@ -154,3 +155,6 @@ requires a language or target-package revision recorded in the image report.
 - Recoverable faults use `Result[T, E]` and postfix `?`. Bugs cause uncatchable
   actor abandonment. Supervisors choose restart, escalation, or image-fatal
   behavior; restart first performs generated resource teardown.
+- The language holds a standing concept budget of roughly 100 user-facing
+  concepts; a proposal that adds one normally must retire another (full rule
+  in [Design decisions](design-decisions.md)).

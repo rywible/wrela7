@@ -510,7 +510,7 @@ fn validate_actor_source_type(
                 .as_program()
                 .declaration(*declaration)
                 .is_some_and(|declaration| {
-                    matches!(declaration.kind, wrela_hir::DeclarationKind::Class(_))
+                    matches!(declaration.kind, wrela_hir::DeclarationKind::Structure(_))
                         && ty.source == Some(declaration.source)
                 });
             if !source_matches
@@ -873,11 +873,14 @@ fn validate_actor_source_functions(
     let mut edge_count = 0u64;
     for fact in &facts.expressions {
         check_cancelled(is_cancelled)?;
-        let sema::ExpressionResolution::DirectCall {
-            function: target, ..
-        } = fact.resolution
-        else {
-            continue;
+        let target = match fact.resolution {
+            sema::ExpressionResolution::DirectCall {
+                function: target, ..
+            }
+            | sema::ExpressionResolution::OperatorCall {
+                function: target, ..
+            } => target,
+            _ => continue,
         };
         let caller = facts
             .functions
@@ -1907,11 +1910,14 @@ fn validate_reachable_source_functions(
     let mut edge_count = 0u64;
     for fact in &facts.expressions {
         check_cancelled(is_cancelled)?;
-        let sema::ExpressionResolution::DirectCall {
-            function: target, ..
-        } = &fact.resolution
-        else {
-            continue;
+        let target = match &fact.resolution {
+            sema::ExpressionResolution::DirectCall {
+                function: target, ..
+            }
+            | sema::ExpressionResolution::OperatorCall {
+                function: target, ..
+            } => target,
+            _ => continue,
         };
         let caller = facts
             .functions
@@ -3682,7 +3688,6 @@ fn lower_function_color(color: wrela_hir::FunctionColor) -> Result<wir::Function
         wrela_hir::FunctionColor::Sync => Ok(wir::FunctionColor::Sync),
         wrela_hir::FunctionColor::Async => Ok(wir::FunctionColor::Async),
         wrela_hir::FunctionColor::Isr => Ok(wir::FunctionColor::Isr),
-        wrela_hir::FunctionColor::Comptime => Err(unsupported("comptime runtime functions")),
     }
 }
 
@@ -4210,6 +4215,25 @@ struct DirectCallInput {
     effects: sema::EffectSet,
 }
 
+/// A binary/comparison operator desugared to a direct call on a `core.ops`
+/// interface impl method (chapter 10 §12). Unlike `DirectCallInput`, there is
+/// no source `Call` expression: `left`/`right` are the original operator's
+/// own operand expressions, evaluated in that order regardless of the
+/// argument-to-parameter binding recorded in `bindings`.
+struct OperatorCallInput {
+    expression: wrela_hir::ExpressionId,
+    source: Span,
+    left: wrela_hir::ExpressionId,
+    right: wrela_hir::ExpressionId,
+    target: sema::FunctionInstanceId,
+    bindings: Vec<sema::ResolvedCallArgument>,
+    raw_result: sema::ValueId,
+    negate: bool,
+    result_type: sema::SemanticTypeId,
+    result: Option<sema::ValueId>,
+    effects: sema::EffectSet,
+}
+
 struct AggregateInput {
     expression: wrela_hir::ExpressionId,
     source: Span,
@@ -4375,6 +4399,7 @@ enum SourceExpressionPlan {
     EnumAggregate(EnumAggregateInput),
     Project(ProjectInput),
     DirectCall(DirectCallInput),
+    OperatorCall(OperatorCallInput),
     Unary(ScalarUnaryInput),
     Binary(ScalarBinaryInput),
     Convert(ScalarConvertInput),
@@ -5731,6 +5756,86 @@ impl SourceFunctionLowerer<'_> {
                     })
                 }
                 (
+                    wrela_hir::ExpressionKind::Binary {
+                        operator,
+                        left,
+                        right,
+                    },
+                    sema::ExpressionResolution::OperatorCall {
+                        function,
+                        arguments,
+                        raw_result,
+                        negate,
+                    },
+                ) if !matches!(
+                    operator,
+                    wrela_hir::BinaryOperator::LogicalOr | wrela_hir::BinaryOperator::LogicalAnd
+                ) =>
+                {
+                    let mut copied_bindings = try_vec(
+                        arguments.len(),
+                        "operator-call semantic bindings",
+                        self.limits.model_edges,
+                    )?;
+                    for binding in arguments {
+                        check_cancelled(self.is_cancelled)?;
+                        copied_bindings.push(*binding);
+                    }
+                    SourceExpressionPlan::OperatorCall(OperatorCallInput {
+                        expression: expression_id,
+                        source: expression.source,
+                        left: *left,
+                        right: *right,
+                        target: *function,
+                        bindings: copied_bindings,
+                        raw_result: *raw_result,
+                        negate: *negate,
+                        result_type: fact.ty,
+                        result: fact.result,
+                        effects: fact.effects,
+                    })
+                }
+                (
+                    wrela_hir::ExpressionKind::Compare {
+                        left,
+                        operator,
+                        right,
+                    },
+                    sema::ExpressionResolution::OperatorCall {
+                        function,
+                        arguments,
+                        raw_result,
+                        negate,
+                    },
+                ) if !matches!(
+                    operator,
+                    wrela_hir::ComparisonOperator::In | wrela_hir::ComparisonOperator::NotIn
+                ) =>
+                {
+                    let mut copied_bindings = try_vec(
+                        arguments.len(),
+                        "operator-call semantic bindings",
+                        self.limits.model_edges,
+                    )?;
+                    for binding in arguments {
+                        check_cancelled(self.is_cancelled)?;
+                        copied_bindings.push(*binding);
+                    }
+                    SourceExpressionPlan::OperatorCall(OperatorCallInput {
+                        expression: expression_id,
+                        source: expression.source,
+                        left: *left,
+                        right: *right,
+                        target: *function,
+                        bindings: copied_bindings,
+                        raw_result: *raw_result,
+                        negate: *negate,
+                        result_type: fact.ty,
+                        result: fact.result,
+                        effects: fact.effects,
+                    })
+                }
+                (
                     wrela_hir::ExpressionKind::Cast { value: source, ty },
                     sema::ExpressionResolution::Value(value),
                 ) if fact.result == Some(*value)
@@ -5947,6 +6052,7 @@ impl SourceFunctionLowerer<'_> {
                 self.lower_flat_projection(project, statements)
             }
             SourceExpressionPlan::DirectCall(call) => self.lower_direct_call(call, statements),
+            SourceExpressionPlan::OperatorCall(call) => self.lower_operator_call(call, statements),
             SourceExpressionPlan::Unary(unary) => {
                 self.lower_scalar_unary(unary, source, statements)
             }
@@ -7137,6 +7243,151 @@ impl SourceFunctionLowerer<'_> {
         Ok(LoweredExpression::Value(result))
     }
 
+    /// Lower a binary/comparison operator desugared to a `core.ops` impl
+    /// method call (chapter 10 §12). There is no source `Call` expression:
+    /// `left`/`right` are the operator's own operand expressions and are
+    /// lowered in that exact order so their statements are emitted
+    /// left-to-right as written, regardless of the argument-to-parameter
+    /// binding recorded in `call.bindings`.
+    fn lower_operator_call(
+        &mut self,
+        call: OperatorCallInput,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<LoweredExpression, LowerError> {
+        let target_function = self
+            .input
+            .facts()
+            .functions
+            .get(call.target.0 as usize)
+            .filter(|function| {
+                function.id == call.target && function.role == sema::FunctionRole::Ordinary
+            })
+            .ok_or_else(|| self.fact_mismatch("operator-call target function"))?;
+        if call.bindings.len() != 2
+            || target_function.parameters.len() != 2
+            || target_function.effects != call.effects
+        {
+            return Err(self.fact_mismatch("operator-call signature"));
+        }
+        if call.negate {
+            if source_scalar_kind(self.input.facts(), target_function.result)
+                != Some(SourceScalarKind::Bool)
+                || source_scalar_kind(self.input.facts(), call.result_type)
+                    != Some(SourceScalarKind::Bool)
+            {
+                return Err(self.fact_mismatch("operator-call negated result type"));
+            }
+        } else if target_function.result != call.result_type
+            || call.raw_result
+                != call
+                    .result
+                    .ok_or_else(|| self.fact_mismatch("operator-call result"))?
+        {
+            return Err(self.fact_mismatch("operator-call result type"));
+        }
+        let raw_result_record = self
+            .input
+            .facts()
+            .values
+            .get(call.raw_result.0 as usize)
+            .filter(|value| {
+                value.function == self.function.id && value.ty == target_function.result
+            })
+            .ok_or_else(|| self.fact_mismatch("operator-call raw result value"))?;
+        let _ = raw_result_record;
+
+        let left_binding = call
+            .bindings
+            .iter()
+            .find(|binding| binding.source_index == 0)
+            .ok_or_else(|| self.fact_mismatch("operator-call left binding"))?;
+        let LoweredExpression::Value(left_value) =
+            self.lower_expression(call.left, left_binding.access, statements)?
+        else {
+            return Err(self.fact_mismatch("operator-call left operand value"));
+        };
+        let right_binding = call
+            .bindings
+            .iter()
+            .find(|binding| binding.source_index == 1)
+            .ok_or_else(|| self.fact_mismatch("operator-call right binding"))?;
+        let LoweredExpression::Value(right_value) =
+            self.lower_expression(call.right, right_binding.access, statements)?
+        else {
+            return Err(self.fact_mismatch("operator-call right operand value"));
+        };
+        let operands = [left_value, right_value];
+
+        let mut lowered_arguments = try_vec(
+            call.bindings.len(),
+            "SemanticWir operator-call arguments",
+            self.limits.model_edges,
+        )?;
+        for (parameter_index, binding) in call.bindings.iter().enumerate() {
+            check_cancelled(self.is_cancelled)?;
+            let parameter = target_function
+                .parameters
+                .get(parameter_index)
+                .ok_or_else(|| self.fact_mismatch("operator-call parameter index"))?;
+            let value_record = self
+                .input
+                .facts()
+                .values
+                .get(binding.value.0 as usize)
+                .filter(|value| value.function == self.function.id && value.ty == parameter.ty)
+                .ok_or_else(|| self.fact_mismatch("operator-call argument semantic value"))?;
+            let _ = value_record;
+            if binding.parameter_index as usize != parameter_index
+                || binding.access != parameter.access
+            {
+                return Err(self.fact_mismatch("operator-call argument permutation"));
+            }
+            let source_index = binding.source_index as usize;
+            let operand_value = *operands
+                .get(source_index)
+                .ok_or_else(|| self.fact_mismatch("operator-call source index"))?;
+            lowered_arguments.push(wir::Argument {
+                access: lower_access(binding.access),
+                value: operand_value,
+            });
+        }
+
+        let raw_result_wir = self.value_map.get(call.raw_result)?;
+        self.push_let(
+            statements,
+            raw_result_wir,
+            wir::SemanticOperation::Call {
+                function: wir::FunctionId(call.target.0),
+                arguments: lowered_arguments,
+                activation: None,
+            },
+            Some(call.source),
+        )?;
+        if !call.negate {
+            return Ok(LoweredExpression::Value(raw_result_wir));
+        }
+        let final_result = call
+            .result
+            .ok_or_else(|| self.fact_mismatch("operator-call negated result"))?;
+        let final_wir = self.lowered_expression_result(
+            call.expression,
+            final_result,
+            call.result_type,
+            call.source,
+        )?;
+        self.push_let(
+            statements,
+            final_wir,
+            wir::SemanticOperation::Unary {
+                operator: wir::UnaryOperator::BoolNot,
+                operand: raw_result_wir,
+                arithmetic: wir::ArithmeticMode::Checked,
+            },
+            Some(call.source),
+        )?;
+        Ok(LoweredExpression::Value(final_wir))
+    }
+
     fn call_argument(
         &self,
         expression: wrela_hir::ExpressionId,
@@ -7727,10 +7978,6 @@ fn lower_source_arithmetic_operator(
         wrela_hir::BinaryOperator::ShiftLeft => {
             (wir::BinaryOperator::ShiftLeft, wir::ArithmeticMode::Checked)
         }
-        wrela_hir::BinaryOperator::ShiftLeftModular => (
-            wir::BinaryOperator::ShiftLeft,
-            wir::ArithmeticMode::Wrapping,
-        ),
         wrela_hir::BinaryOperator::ShiftRight => (
             wir::BinaryOperator::ShiftRight,
             wir::ArithmeticMode::Checked,
@@ -8648,7 +8895,9 @@ fn preflight_input(
             "semantic model edges",
             limits.model_edges,
         )?;
-        if let sema::ExpressionResolution::DirectCall { arguments, .. } = &expression.resolution {
+        if let sema::ExpressionResolution::DirectCall { arguments, .. }
+        | sema::ExpressionResolution::OperatorCall { arguments, .. } = &expression.resolution
+        {
             add_bounded(
                 &mut edges,
                 arguments.len(),
@@ -9734,7 +9983,6 @@ fn semantic_function_matches(
         wrela_hir::FunctionColor::Sync => wrela_semantic_wir::FunctionColor::Sync,
         wrela_hir::FunctionColor::Async => wrela_semantic_wir::FunctionColor::Async,
         wrela_hir::FunctionColor::Isr => wrela_semantic_wir::FunctionColor::Isr,
-        wrela_hir::FunctionColor::Comptime => return Ok(false),
     };
     let mut proofs_match = output.proofs.len() == source.proofs.len();
     for (output, source) in output.proofs.iter().zip(&source.proofs) {
@@ -10545,7 +10793,7 @@ async fn checkpoint():
     pass
 
 @service
-pub class Worker:
+pub struct Worker:
     pub async fn ping(mut self):
         await checkpoint()
 
@@ -10554,7 +10802,7 @@ pub class Worker:
         await checkpoint()
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
     installed = img.service(Worker, mailbox=2)
     return img
@@ -10971,7 +11219,7 @@ pub comptime fn boot() -> Image:
                         source: span(0, 0, 6),
                     }],
                     kind: DeclarationKind::Function(FunctionDeclaration {
-                        color: FunctionColor::Comptime,
+                        color: FunctionColor::Sync,
                         generics: Vec::new(),
                         parameters: Vec::new(),
                         result: Some(TypeExpression {
@@ -10999,6 +11247,7 @@ pub comptime fn boot() -> Image:
                         implements: Vec::new(),
                         fields: Vec::new(),
                         members: Vec::new(),
+                        linear: false,
                     }),
                     source: span(1, 10, 60),
                 },
@@ -11138,7 +11387,7 @@ pub comptime fn boot() -> Image:
                         source: span(0, 410, 415),
                     }],
                     kind: DeclarationKind::Function(FunctionDeclaration {
-                        color: FunctionColor::Comptime,
+                        color: FunctionColor::Sync,
                         generics: Vec::new(),
                         parameters: Vec::new(),
                         result: None,
@@ -11206,6 +11455,139 @@ pub comptime fn boot() -> Image:
                 .test_candidates
                 .extend([DeclarationId(3), DeclarationId(4)]);
         }
+        if include_runtime_test && !scalar {
+            // A bounded `while` is outside the comptime evaluator's supported
+            // subset, so this (inserted before the final `return`) keeps
+            // `runtime_case` reachable through the runtime/image tier
+            // deterministically: with every function color now
+            // phase-neutral, its previous trivial `pass; return` body would
+            // otherwise be comptime-legal on its own and collide with
+            // `comptime_case`. The `scalar` fixture variant gets its own
+            // guard through `helper`'s body instead, so this only applies
+            // when that variant isn't in play.
+            let u32_ty = |source| TypeExpression {
+                kind: TypeExpressionKind::Named {
+                    definition: wrela_hir::Definition::Builtin(Builtin::U32),
+                    arguments: Vec::new(),
+                },
+                source,
+            };
+            program.locals.push(Local {
+                id: LocalId(0),
+                body: BodyId(1),
+                scope: wrela_hir::ScopeId(1),
+                name: name("guard"),
+                ty: Some(u32_ty(span(0, 236, 239))),
+                shadowed: None,
+                source: span(0, 236, 239),
+            });
+            program.bodies.push(Body {
+                id: BodyId(3),
+                owner: BodyOwner::Declaration(DeclarationId(3)),
+                scope: wrela_hir::ScopeId(3),
+                locals: Vec::new(),
+                statements: vec![StatementId(6)],
+                source: span(0, 236, 239),
+            });
+            program.scopes.push(LexicalScope {
+                id: wrela_hir::ScopeId(3),
+                body: BodyId(3),
+                parent: Some(wrela_hir::ScopeId(1)),
+                source: span(0, 236, 239),
+            });
+            program.bodies[1].locals = vec![LocalId(0)];
+            program.bodies[1].statements = vec![
+                StatementId(1),
+                StatementId(2),
+                StatementId(4),
+                StatementId(5),
+            ];
+            program.statements[2] = Statement {
+                id: StatementId(2),
+                body: BodyId(1),
+                attributes: Vec::new(),
+                kind: StatementKind::Initialize {
+                    local: LocalId(0),
+                    value: ExpressionId(4),
+                },
+                source: span(0, 236, 239),
+            };
+            program.statements.extend([
+                Statement {
+                    id: StatementId(4),
+                    body: BodyId(1),
+                    attributes: Vec::new(),
+                    kind: StatementKind::While {
+                        condition: ExpressionId(5),
+                        body: BodyId(3),
+                    },
+                    source: span(0, 236, 239),
+                },
+                Statement {
+                    id: StatementId(5),
+                    body: BodyId(1),
+                    attributes: Vec::new(),
+                    kind: StatementKind::Return(None),
+                    source: span(0, 240, 246),
+                },
+                Statement {
+                    id: StatementId(6),
+                    body: BodyId(3),
+                    attributes: Vec::new(),
+                    kind: StatementKind::Assign {
+                        targets: vec![wrela_hir::PlaceTarget {
+                            root: wrela_hir::Definition::Local(LocalId(0)),
+                            projections: Vec::new(),
+                            source: span(0, 236, 239),
+                        }],
+                        operator: wrela_hir::AssignmentOperator::Add,
+                        value: ExpressionId(8),
+                    },
+                    source: span(0, 236, 239),
+                },
+            ]);
+            program.expressions.extend([
+                Expression {
+                    id: ExpressionId(4),
+                    owner: ExpressionOwner::Body(BodyId(1)),
+                    scope: Some(wrela_hir::ScopeId(1)),
+                    kind: ExpressionKind::Literal(Literal::Integer("0".to_owned())),
+                    source: span(0, 236, 239),
+                },
+                Expression {
+                    id: ExpressionId(5),
+                    owner: ExpressionOwner::Body(BodyId(1)),
+                    scope: Some(wrela_hir::ScopeId(1)),
+                    kind: ExpressionKind::Compare {
+                        left: ExpressionId(6),
+                        operator: wrela_hir::ComparisonOperator::Less,
+                        right: ExpressionId(7),
+                    },
+                    source: span(0, 236, 239),
+                },
+                Expression {
+                    id: ExpressionId(6),
+                    owner: ExpressionOwner::Body(BodyId(1)),
+                    scope: Some(wrela_hir::ScopeId(1)),
+                    kind: ExpressionKind::Reference(wrela_hir::Definition::Local(LocalId(0))),
+                    source: span(0, 236, 239),
+                },
+                Expression {
+                    id: ExpressionId(7),
+                    owner: ExpressionOwner::Body(BodyId(1)),
+                    scope: Some(wrela_hir::ScopeId(1)),
+                    kind: ExpressionKind::Literal(Literal::Integer("1".to_owned())),
+                    source: span(0, 236, 239),
+                },
+                Expression {
+                    id: ExpressionId(8),
+                    owner: ExpressionOwner::Body(BodyId(3)),
+                    scope: Some(wrela_hir::ScopeId(3)),
+                    kind: ExpressionKind::Literal(Literal::Integer("1".to_owned())),
+                    source: span(0, 236, 239),
+                },
+            ]);
+        }
         if scalar {
             let bool_ty = |source| TypeExpression {
                 kind: TypeExpressionKind::Named {
@@ -11271,8 +11653,20 @@ pub comptime fn boot() -> Image:
                     id: BodyId(3),
                     owner: BodyOwner::Declaration(DeclarationId(5)),
                     scope: wrela_hir::ScopeId(3),
-                    locals: vec![LocalId(2)],
-                    statements: vec![StatementId(7), StatementId(9)],
+                    locals: vec![LocalId(2), LocalId(4)],
+                    // A bounded `while` is outside the comptime evaluator's
+                    // supported subset, so this (inserted before the final
+                    // `return`) keeps every test built on this `helper`
+                    // reachable through `runtime_case` in the runtime/image
+                    // tier deterministically, since every color is
+                    // otherwise phase-neutral and this body would be
+                    // comptime-legal on its own.
+                    statements: vec![
+                        StatementId(7),
+                        StatementId(10),
+                        StatementId(11),
+                        StatementId(12),
+                    ],
                     source: span(0, 180, 209),
                 },
                 Body {
@@ -11282,6 +11676,14 @@ pub comptime fn boot() -> Image:
                     locals: Vec::new(),
                     statements: vec![StatementId(8)],
                     source: span(0, 300, 350),
+                },
+                Body {
+                    id: BodyId(5),
+                    owner: BodyOwner::Declaration(DeclarationId(5)),
+                    scope: wrela_hir::ScopeId(5),
+                    locals: Vec::new(),
+                    statements: vec![StatementId(9)],
+                    source: span(0, 200, 203),
                 },
             ]);
             program.scopes.extend([
@@ -11296,6 +11698,12 @@ pub comptime fn boot() -> Image:
                     body: BodyId(4),
                     parent: Some(wrela_hir::ScopeId(1)),
                     source: span(0, 300, 350),
+                },
+                LexicalScope {
+                    id: wrela_hir::ScopeId(5),
+                    body: BodyId(5),
+                    parent: Some(wrela_hir::ScopeId(3)),
+                    source: span(0, 200, 203),
                 },
             ]);
             program.locals.extend([
@@ -11334,6 +11742,15 @@ pub comptime fn boot() -> Image:
                     ty: Some(u32_ty(span(0, 266, 269))),
                     shadowed: None,
                     source: span(0, 262, 269),
+                },
+                Local {
+                    id: LocalId(4),
+                    body: BodyId(3),
+                    scope: wrela_hir::ScopeId(3),
+                    name: name("guard"),
+                    ty: Some(u32_ty(span(0, 200, 203))),
+                    shadowed: None,
+                    source: span(0, 200, 203),
                 },
             ]);
             program.statements[1] = Statement {
@@ -11392,7 +11809,7 @@ pub comptime fn boot() -> Image:
                     source: span(0, 310, 350),
                 },
                 Statement {
-                    id: StatementId(9),
+                    id: StatementId(12),
                     body: BodyId(3),
                     attributes: Vec::new(),
                     kind: StatementKind::Return(Some(ExpressionId(11))),
@@ -11407,6 +11824,41 @@ pub comptime fn boot() -> Image:
                         value: ExpressionId(12),
                     },
                     source: span(0, 262, 280),
+                },
+                Statement {
+                    id: StatementId(10),
+                    body: BodyId(3),
+                    attributes: Vec::new(),
+                    kind: StatementKind::Initialize {
+                        local: LocalId(4),
+                        value: ExpressionId(14),
+                    },
+                    source: span(0, 200, 203),
+                },
+                Statement {
+                    id: StatementId(11),
+                    body: BodyId(3),
+                    attributes: Vec::new(),
+                    kind: StatementKind::While {
+                        condition: ExpressionId(15),
+                        body: BodyId(5),
+                    },
+                    source: span(0, 200, 203),
+                },
+                Statement {
+                    id: StatementId(9),
+                    body: BodyId(5),
+                    attributes: Vec::new(),
+                    kind: StatementKind::Assign {
+                        targets: vec![wrela_hir::PlaceTarget {
+                            root: wrela_hir::Definition::Local(LocalId(4)),
+                            projections: Vec::new(),
+                            source: span(0, 200, 203),
+                        }],
+                        operator: wrela_hir::AssignmentOperator::Add,
+                        value: ExpressionId(18),
+                    },
+                    source: span(0, 200, 203),
                 },
             ]);
             program
@@ -11504,6 +11956,45 @@ pub comptime fn boot() -> Image:
                     scope: Some(wrela_hir::ScopeId(4)),
                     kind: ExpressionKind::Reference(wrela_hir::Definition::Local(LocalId(1))),
                     source: span(0, 338, 344),
+                },
+                Expression {
+                    id: ExpressionId(14),
+                    owner: ExpressionOwner::Body(BodyId(3)),
+                    scope: Some(wrela_hir::ScopeId(3)),
+                    kind: ExpressionKind::Literal(Literal::Integer("0".to_owned())),
+                    source: span(0, 200, 201),
+                },
+                Expression {
+                    id: ExpressionId(15),
+                    owner: ExpressionOwner::Body(BodyId(3)),
+                    scope: Some(wrela_hir::ScopeId(3)),
+                    kind: ExpressionKind::Compare {
+                        left: ExpressionId(16),
+                        operator: wrela_hir::ComparisonOperator::Less,
+                        right: ExpressionId(17),
+                    },
+                    source: span(0, 200, 203),
+                },
+                Expression {
+                    id: ExpressionId(16),
+                    owner: ExpressionOwner::Body(BodyId(3)),
+                    scope: Some(wrela_hir::ScopeId(3)),
+                    kind: ExpressionKind::Reference(wrela_hir::Definition::Local(LocalId(4))),
+                    source: span(0, 200, 201),
+                },
+                Expression {
+                    id: ExpressionId(17),
+                    owner: ExpressionOwner::Body(BodyId(3)),
+                    scope: Some(wrela_hir::ScopeId(3)),
+                    kind: ExpressionKind::Literal(Literal::Integer("1".to_owned())),
+                    source: span(0, 202, 203),
+                },
+                Expression {
+                    id: ExpressionId(18),
+                    owner: ExpressionOwner::Body(BodyId(5)),
+                    scope: Some(wrela_hir::ScopeId(5)),
+                    kind: ExpressionKind::Literal(Literal::Integer("1".to_owned())),
+                    source: span(0, 202, 203),
                 },
             ]);
         }
@@ -11687,26 +12178,26 @@ pub comptime fn boot() -> Image:
         let StatementKind::If { else_body, .. } = &mut program.statements[5].kind else {
             unreachable!();
         };
-        *else_body = Some(BodyId(5));
+        *else_body = Some(BodyId(6));
         program.bodies[1].statements = vec![
             StatementId(1),
             StatementId(2),
             StatementId(4),
             StatementId(5),
             StatementId(6),
-            StatementId(11),
+            StatementId(14),
         ];
         program.bodies.push(Body {
-            id: BodyId(5),
+            id: BodyId(6),
             owner: BodyOwner::Declaration(DeclarationId(3)),
-            scope: wrela_hir::ScopeId(5),
+            scope: wrela_hir::ScopeId(6),
             locals: Vec::new(),
-            statements: vec![StatementId(10)],
+            statements: vec![StatementId(13)],
             source: span(0, 346, 350),
         });
         program.scopes.push(LexicalScope {
-            id: wrela_hir::ScopeId(5),
-            body: BodyId(5),
+            id: wrela_hir::ScopeId(6),
+            body: BodyId(6),
             parent: Some(wrela_hir::ScopeId(1)),
             source: span(0, 346, 350),
         });
@@ -11721,7 +12212,7 @@ pub comptime fn boot() -> Image:
                     source: span(0, 310, 316),
                 }],
                 operator: wrela_hir::AssignmentOperator::Assign,
-                value: ExpressionId(14),
+                value: ExpressionId(19),
             },
             source: span(0, 310, 320),
         };
@@ -11734,8 +12225,8 @@ pub comptime fn boot() -> Image:
         };
         program.statements.extend([
             Statement {
-                id: StatementId(10),
-                body: BodyId(5),
+                id: StatementId(13),
+                body: BodyId(6),
                 attributes: Vec::new(),
                 kind: StatementKind::Assign {
                     targets: vec![wrela_hir::PlaceTarget {
@@ -11744,12 +12235,12 @@ pub comptime fn boot() -> Image:
                         source: span(0, 346, 348),
                     }],
                     operator: wrela_hir::AssignmentOperator::Assign,
-                    value: ExpressionId(15),
+                    value: ExpressionId(20),
                 },
                 source: span(0, 346, 350),
             },
             Statement {
-                id: StatementId(11),
+                id: StatementId(14),
                 body: BodyId(1),
                 attributes: Vec::new(),
                 kind: StatementKind::Return(None),
@@ -11777,16 +12268,16 @@ pub comptime fn boot() -> Image:
         program.expressions[13].source = span(0, 374, 377);
         program.expressions.extend([
             Expression {
-                id: ExpressionId(14),
+                id: ExpressionId(19),
                 owner: ExpressionOwner::Body(BodyId(4)),
                 scope: Some(wrela_hir::ScopeId(4)),
                 kind: ExpressionKind::Literal(then_value),
                 source: span(0, 317, 319),
             },
             Expression {
-                id: ExpressionId(15),
-                owner: ExpressionOwner::Body(BodyId(5)),
-                scope: Some(wrela_hir::ScopeId(5)),
+                id: ExpressionId(20),
+                owner: ExpressionOwner::Body(BodyId(6)),
+                scope: Some(wrela_hir::ScopeId(6)),
                 kind: ExpressionKind::Literal(else_value),
                 source: span(0, 348, 350),
             },
@@ -11798,6 +12289,9 @@ pub comptime fn boot() -> Image:
         }
     }
 
+    // Base ids 14..=18 are claimed by `fixture_with_runtime_test`'s bounded
+    // `while` tier guard, so operand references synthesized for a particular
+    // operation start at 19, the first id free of that guard.
     fn helper_operand_expression(id: u32) -> Expression {
         Expression {
             id: ExpressionId(id),
@@ -11806,7 +12300,7 @@ pub comptime fn boot() -> Image:
             kind: ExpressionKind::Reference(wrela_hir::Definition::Parameter(
                 wrela_hir::ParameterId(0),
             )),
-            source: span(0, 200 + id - 14, 201 + id - 14),
+            source: span(0, 200 + id - 19, 201 + id - 19),
         }
     }
 
@@ -11818,9 +12312,9 @@ pub comptime fn boot() -> Image:
         analyze_generated_test_group_from(scalar_operation_fixture(ty, ty, argument, |program| {
             program.expressions[10].kind = ExpressionKind::Unary {
                 operator,
-                operand: ExpressionId(14),
+                operand: ExpressionId(19),
             };
-            program.expressions.push(helper_operand_expression(14));
+            program.expressions.push(helper_operand_expression(19));
         }))
     }
 
@@ -11834,12 +12328,12 @@ pub comptime fn boot() -> Image:
             |program| {
                 program.expressions[10].kind = ExpressionKind::Binary {
                     operator,
-                    left: ExpressionId(14),
-                    right: ExpressionId(15),
+                    left: ExpressionId(19),
+                    right: ExpressionId(20),
                 };
                 program
                     .expressions
-                    .extend([helper_operand_expression(14), helper_operand_expression(15)]);
+                    .extend([helper_operand_expression(19), helper_operand_expression(20)]);
             },
         ))
     }
@@ -11853,13 +12347,13 @@ pub comptime fn boot() -> Image:
             Literal::Integer("7".to_owned()),
             |program| {
                 program.expressions[10].kind = ExpressionKind::Compare {
-                    left: ExpressionId(14),
+                    left: ExpressionId(19),
                     operator,
-                    right: ExpressionId(15),
+                    right: ExpressionId(20),
                 };
                 program
                     .expressions
-                    .extend([helper_operand_expression(14), helper_operand_expression(15)]);
+                    .extend([helper_operand_expression(19), helper_operand_expression(20)]);
             },
         ))
     }
@@ -11871,12 +12365,72 @@ pub comptime fn boot() -> Image:
             Literal::Integer("7".to_owned()),
             |program| {
                 program.expressions[10].kind = ExpressionKind::Cast {
-                    value: ExpressionId(14),
+                    value: ExpressionId(19),
                     ty: scalar_type(Builtin::U64, span(0, 202, 205)),
                 };
-                program.expressions.push(helper_operand_expression(14));
+                program.expressions.push(helper_operand_expression(19));
             },
         ))
+    }
+
+    /// Removes the expression at `id` (which the caller has just made
+    /// unreachable) and shifts every higher expression id down by one, so
+    /// the arena stays dense. Only handles the narrow set of
+    /// `ExpressionKind`/`StatementKind` variants these HIR test fixtures
+    /// actually construct; panics loudly if it meets anything else, since a
+    /// silently-missed reference would reintroduce exactly the coverage gap
+    /// this exists to close.
+    fn drop_and_renumber_expression(program: &mut Program, id: ExpressionId) {
+        fn shift(candidate: &mut ExpressionId, removed: u32) {
+            if candidate.0 > removed {
+                candidate.0 -= 1;
+            }
+        }
+        let position = program
+            .expressions
+            .iter()
+            .position(|expression| expression.id == id)
+            .expect("expression id present");
+        program.expressions.remove(position);
+        for expression in &mut program.expressions {
+            shift(&mut expression.id, id.0);
+            match &mut expression.kind {
+                ExpressionKind::Literal(_) | ExpressionKind::Reference(_) => {}
+                ExpressionKind::Compare { left, right, .. }
+                | ExpressionKind::Binary { left, right, .. } => {
+                    shift(left, id.0);
+                    shift(right, id.0);
+                }
+                ExpressionKind::Unary { operand, .. } => shift(operand, id.0),
+                ExpressionKind::Cast { value, .. } => shift(value, id.0),
+                ExpressionKind::Call { callee, arguments } => {
+                    shift(callee, id.0);
+                    for argument in arguments {
+                        if let wrela_hir::CallArgumentValue::Value(value) = &mut argument.value {
+                            shift(value, id.0);
+                        }
+                    }
+                }
+                other => unreachable!("unexpected expression kind in test fixture: {other:?}"),
+            }
+        }
+        for statement in &mut program.statements {
+            match &mut statement.kind {
+                StatementKind::Pass | StatementKind::Return(None) => {}
+                StatementKind::Initialize { value, .. } | StatementKind::Assign { value, .. } => {
+                    shift(value, id.0);
+                }
+                StatementKind::Return(Some(value)) => shift(value, id.0),
+                StatementKind::Expression(value) => shift(value, id.0),
+                StatementKind::If { branches, .. } => {
+                    for (condition, _) in branches {
+                        shift(condition, id.0);
+                    }
+                }
+                StatementKind::While { condition, .. } => shift(condition, id.0),
+                other => unreachable!("unexpected statement kind in test fixture: {other:?}"),
+            }
+        }
     }
 
     fn analyze_scalar_generated_test_group_with_access(
@@ -11902,47 +12456,49 @@ pub comptime fn boot() -> Image:
                 source: span(0, 334, 345),
             },
         };
-        assert_eq!(
-            program.expressions.pop().map(|expression| expression.id),
-            Some(ExpressionId(13))
-        );
+        // The exclusive-access argument above now references `LocalId(1)`
+        // through a `PlaceTarget` instead of an owned expression, so the
+        // `ExpressionId(13)` it used to reference (`Reference(Local(1))`)
+        // is orphaned. Drop it and shift the ids above it down by one to
+        // keep the arena dense before adding anything further.
+        drop_and_renumber_expression(&mut program, ExpressionId(13));
         if access == AccessMode::Take {
             let StatementKind::If { else_body, .. } = &mut program.statements[5].kind else {
                 unreachable!();
             };
-            *else_body = Some(BodyId(5));
+            *else_body = Some(BodyId(6));
             program.bodies.push(Body {
-                id: BodyId(5),
+                id: BodyId(6),
                 owner: BodyOwner::Declaration(DeclarationId(3)),
-                scope: wrela_hir::ScopeId(5),
+                scope: wrela_hir::ScopeId(6),
                 locals: Vec::new(),
-                statements: vec![StatementId(10)],
+                statements: vec![StatementId(13)],
                 source: span(0, 346, 350),
             });
             program.scopes.push(LexicalScope {
-                id: wrela_hir::ScopeId(5),
-                body: BodyId(5),
+                id: wrela_hir::ScopeId(6),
+                body: BodyId(6),
                 parent: Some(wrela_hir::ScopeId(1)),
                 source: span(0, 346, 350),
             });
             program.statements.push(Statement {
-                id: StatementId(10),
-                body: BodyId(5),
+                id: StatementId(13),
+                body: BodyId(6),
                 attributes: Vec::new(),
-                kind: StatementKind::Expression(ExpressionId(13)),
+                kind: StatementKind::Expression(ExpressionId(18)),
                 source: span(0, 346, 350),
             });
             program.expressions.extend([
                 Expression {
-                    id: ExpressionId(13),
-                    owner: ExpressionOwner::Body(BodyId(5)),
-                    scope: Some(wrela_hir::ScopeId(5)),
+                    id: ExpressionId(18),
+                    owner: ExpressionOwner::Body(BodyId(6)),
+                    scope: Some(wrela_hir::ScopeId(6)),
                     kind: ExpressionKind::Call {
-                        callee: ExpressionId(14),
+                        callee: ExpressionId(19),
                         arguments: vec![
                             CallArgument {
                                 name: Some(name("y")),
-                                value: wrela_hir::CallArgumentValue::Value(ExpressionId(15)),
+                                value: wrela_hir::CallArgumentValue::Value(ExpressionId(20)),
                                 source: span(0, 347, 348),
                             },
                             CallArgument {
@@ -11962,9 +12518,9 @@ pub comptime fn boot() -> Image:
                     source: span(0, 346, 350),
                 },
                 Expression {
-                    id: ExpressionId(14),
-                    owner: ExpressionOwner::Body(BodyId(5)),
-                    scope: Some(wrela_hir::ScopeId(5)),
+                    id: ExpressionId(19),
+                    owner: ExpressionOwner::Body(BodyId(6)),
+                    scope: Some(wrela_hir::ScopeId(6)),
                     kind: ExpressionKind::Reference(wrela_hir::Definition::Declaration(
                         ResolvedDeclaration {
                             package: PackageId(0),
@@ -11975,9 +12531,9 @@ pub comptime fn boot() -> Image:
                     source: span(0, 346, 347),
                 },
                 Expression {
-                    id: ExpressionId(15),
-                    owner: ExpressionOwner::Body(BodyId(5)),
-                    scope: Some(wrela_hir::ScopeId(5)),
+                    id: ExpressionId(20),
+                    owner: ExpressionOwner::Body(BodyId(6)),
+                    scope: Some(wrela_hir::ScopeId(6)),
                     kind: ExpressionKind::Reference(wrela_hir::Definition::Local(LocalId(3))),
                     source: span(0, 347, 348),
                 },
@@ -12019,7 +12575,11 @@ pub comptime fn boot() -> Image:
                 &|| false,
             )
             .expect("test discovery");
-        assert!(discovery.diagnostics().is_empty());
+        assert!(
+            discovery.diagnostics().is_empty(),
+            "discovery diagnostics: {:?}",
+            discovery.diagnostics()
+        );
         let discovered = discovery.successful().expect("sealed discovery");
         let plan = discovered
             .facts()
@@ -12778,9 +13338,17 @@ pub comptime fn boot() -> Image:
             module.tests[0].timeout_ns,
             group.tests[0].descriptor.timeout_ns
         );
+        // `runtime_case`'s body carries the bounded-`while` tier guard
+        // (see `fixture_with_runtime_test`'s `!scalar` branch): an
+        // initializing `Let`, the guard `Loop`, then the implicit unit
+        // `Return`.
         assert!(matches!(
             module.functions[0].body.statements.as_slice(),
-            [wir::SemanticStatement::Return(values)] if values.is_empty()
+            [
+                wir::SemanticStatement::Let(_),
+                wir::SemanticStatement::Loop { .. },
+                wir::SemanticStatement::Return(values)
+            ] if values.is_empty()
         ));
         let harness = &module.functions[1];
         assert_eq!(
@@ -12864,7 +13432,11 @@ pub comptime fn boot() -> Image:
             &LoweringReport {
                 semantic_types: u32::try_from(module.types.len()).expect("type count"),
                 function_instances: 2,
-                operations: 11,
+                // `runtime_case`'s bounded-`while` tier guard adds 5 real
+                // operations (init, compare, the loop's carried-value join,
+                // literal, and the checked add) beyond the previously
+                // trivial `pass; return` body.
+                operations: 16,
                 proofs: 5,
                 image_nodes: 0,
                 tests: 1,
@@ -12996,28 +13568,39 @@ pub comptime fn boot() -> Image:
         assert_eq!(helper.instance_key, facts.functions[1].key.0);
         assert_eq!(helper.role, wir::FunctionRole::Ordinary);
         assert_eq!(helper.parameters, [wir::ValueId(0), wir::ValueId(1)]);
-        assert_eq!(helper.values.len(), 3);
+        // `helper`'s body carries the bounded-`while` tier guard (see
+        // `fixture_with_runtime_test`'s `scalar` branch), so beyond
+        // `x`/`y`/`copied` it also owns the guard local and every SSA
+        // value the loop's carried-value join threads through it.
+        assert_eq!(helper.values.len(), 12);
         assert_eq!(helper.values[0].name.as_deref(), Some("x"));
         assert_eq!(helper.values[1].name.as_deref(), Some("y"));
         assert_eq!(helper.values[2].name.as_deref(), Some("copied"));
+        assert_eq!(helper.values[3].name.as_deref(), Some("guard"));
         assert!(matches!(
             helper.body.statements.as_slice(),
             [
                 wir::SemanticStatement::Let(wir::LetStatement {
-                    results,
+                    results: copy_results,
                     operation: wir::SemanticOperation::Copy { value: wir::ValueId(0) },
                     ..
                 }),
+                wir::SemanticStatement::Let(_),
+                wir::SemanticStatement::Loop { .. },
                 wir::SemanticStatement::Return(returned),
-            ] if results.as_slice() == [wir::ValueId(2)]
-                && returned.as_slice() == [wir::ValueId(2)]
+            ] if copy_results.as_slice() == [wir::ValueId(2)]
+                && returned.as_slice() == [wir::ValueId(6)]
         ));
         assert_eq!(
             output.report(),
             &LoweringReport {
                 semantic_types: 8,
                 function_instances: 3,
-                operations: 16,
+                // `helper`'s bounded-`while` tier guard adds 5 real
+                // operations beyond its previously trivial `copied = x`
+                // body (see the analogous comment on
+                // `generated_group_lowers_exact_test_functions_protocol_frames_and_terminal_finish`).
+                operations: 21,
                 proofs: 7,
                 image_nodes: 0,
                 tests: 1,
@@ -13603,8 +14186,15 @@ pub comptime fn boot() -> Image:
         }
 
         fn helper_operation(module: &wir::SemanticWir) -> &wir::SemanticOperation {
+            // `helper`'s body carries the bounded-`while` tier guard (see
+            // `fixture_with_runtime_test`'s `scalar` branch) after the
+            // operation that computes `copied`: the operation's own `Let`,
+            // the guard's initializing `Let`, the guard `Loop`, then the
+            // `return copied`.
             let [
                 wir::SemanticStatement::Let(statement),
+                wir::SemanticStatement::Let(_),
+                wir::SemanticStatement::Loop { .. },
                 wir::SemanticStatement::Return(_),
             ] = module.functions[1].body.statements.as_slice()
             else {
@@ -13715,11 +14305,6 @@ pub comptime fn boot() -> Image:
                 wrela_hir::BinaryOperator::ShiftLeft,
                 wir::BinaryOperator::ShiftLeft,
                 wir::ArithmeticMode::Checked,
-            ),
-            (
-                wrela_hir::BinaryOperator::ShiftLeftModular,
-                wir::BinaryOperator::ShiftLeft,
-                wir::ArithmeticMode::Wrapping,
             ),
             (
                 wrela_hir::BinaryOperator::ShiftRight,
@@ -14059,8 +14644,14 @@ pub comptime fn boot() -> Image:
                 limit: 15,
             })
         ));
+        // 16 is the exact total `facts.values` across every discovered
+        // function (`runtime_case` + `helper`, both grown by the bounded-
+        // `while` tier guard), the smallest limit that still clears the
+        // `preflight_input` `"semantic values"` pre-check so the assertion
+        // below exercises the *cumulative* `"SemanticWir values"` check
+        // instead (module total is 21).
         let mut value_limits = LoweringLimits::standard();
-        value_limits.values = 11;
+        value_limits.values = 16;
         assert!(matches!(
             CanonicalSemanticLowerer::new().lower(
                 LowerRequest {
@@ -14071,7 +14662,7 @@ pub comptime fn boot() -> Image:
             ),
             Err(LowerError::ResourceLimit {
                 resource: "SemanticWir values",
-                limit: 11,
+                limit: 16,
             })
         ));
 

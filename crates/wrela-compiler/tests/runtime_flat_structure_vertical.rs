@@ -51,7 +51,7 @@ const IMAGE_SOURCE: &str = r#"module app.image
 from core.image import Image, Target
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="flat-duration-image", target=Target.aarch64_qemu_virt_uefi)
 "#;
 
@@ -90,6 +90,13 @@ fn imported_duration_constructors_reach_flow():
     micros: u64 = as_nanoseconds(value=microseconds(value=42))
     millis: u64 = as_nanoseconds(value=milliseconds(value=42))
     secs: u64 = as_nanoseconds(value=seconds(value=42))
+    # A bounded `while` is outside the comptime evaluator's supported
+    # subset, so this keeps the test in the runtime/image tier
+    # deterministically (every function is otherwise phase-neutral and
+    # would be comptime-legal on its own).
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
     return
 "#;
 
@@ -107,9 +114,9 @@ pub fn err(value: u8) -> LocalResult:
 
 pub fn unwrap_or_zero(value: LocalResult) -> u8:
     match value:
-        case LocalResult.Ok(bind payload):
+        case LocalResult.Ok(payload):
             return payload
-        case LocalResult.Err(bind code):
+        case LocalResult.Err(code):
             return 0
 "#;
 
@@ -154,6 +161,13 @@ from app.duration import last, make
 @test
 fn imported_late_field_is_bounded():
     value: u64 = last(value=make(a=1, b=2, c=3, d=4, e=5, f=6, g=7, h=8))
+    # A bounded `while` is outside the comptime evaluator's supported
+    # subset, so this keeps the test in the runtime/image tier
+    # deterministically (every function is otherwise phase-neutral and
+    # would be comptime-legal on its own).
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
     return
 "#;
 
@@ -818,16 +832,16 @@ fn local_result_constructor_and_exhaustive_match_reach_machine_switch() {
 fn structure_lowering_honors_exact_operation_bounds_and_late_cancellation() {
     let fixture = fixture(DURATION_SOURCE, TEST_SOURCE);
     let mut exact_lookup_limits = AnalysisLimits::standard();
-    exact_lookup_limits.runtime_aggregate_lookup_work = 126;
+    exact_lookup_limits.runtime_aggregate_lookup_work = 147;
     let exact_lookup = compile(&fixture, exact_lookup_limits, &never_cancelled)
         .expect("exact runtime aggregate lookup-work bound");
     assert!(exact_lookup.diagnostics().is_empty());
-    exact_lookup_limits.runtime_aggregate_lookup_work = 125;
+    exact_lookup_limits.runtime_aggregate_lookup_work = 146;
     assert!(matches!(
         compile(&fixture, exact_lookup_limits, &never_cancelled),
         Err(AnalysisFailure::ResourceLimit {
             resource: "runtime type and aggregate lookup work",
-            limit: 125,
+            limit: 146,
         })
     ));
 
@@ -963,8 +977,9 @@ fn late_named_field_lookup_has_an_exact_global_work_bound() {
     let fixture = fixture(WIDE_STRUCTURE_SOURCE, WIDE_STRUCTURE_TEST_SOURCE);
     let mut limits = AnalysisLimits::standard();
     // The field-name component is 8 * 8 + 8 = 72 comparisons. Including all
-    // type interning and nominal lookup scans makes the exact global work 155.
-    limits.runtime_aggregate_lookup_work = 155;
+    // type interning and nominal lookup scans, plus the bounded-while tier
+    // guard's own scalar local, makes the exact global work bound below.
+    limits.runtime_aggregate_lookup_work = 173;
     let exact = compile(&fixture, limits, &never_cancelled)
         .expect("exact late-field aggregate lookup-work bound");
     assert!(exact.diagnostics().is_empty());
@@ -1013,6 +1028,9 @@ from app.duration import malformed
 @test
 fn malformed_constructor():
     malformed(value=1)
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
     return
 "#,
             "semantic-runtime-constructor-argument",
@@ -1031,6 +1049,9 @@ from app.duration import unsupported
 @test
 fn nested_structure():
     unsupported(value=1)
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
     return
 "#,
             "semantic-runtime-aggregate-not-supported",
@@ -1048,6 +1069,9 @@ from app.duration import Secret, make
 fn private_projection():
     secret: Secret = make(value=1)
     consume(value=secret.value)
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
     return
 fn consume(value: u64):
     return
@@ -1067,6 +1091,9 @@ from app.duration import Flat, make
 fn implicit_copy():
     first: Flat = make(value=1)
     second: Flat = first
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
     return
 "#,
             "semantic-explicit-copy-required",
@@ -1085,6 +1112,9 @@ from app.duration import wrong_nominal
 @test
 fn nominal_substitution():
     wrong_nominal(value=1)
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
     return
 "#,
             "semantic-constructor-result-type",

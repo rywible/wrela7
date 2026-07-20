@@ -42,7 +42,7 @@ const APPLICATION_SOURCE: &str = r#"module app
 from core.image import Image, Target
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="elif-image", target=Target.aarch64_qemu_virt_uefi)
 
 @test
@@ -60,6 +60,13 @@ fn elif_runtime():
     else:
         joined = 19
     consume(value=joined)
+    # A bounded `while` is outside the comptime evaluator's supported
+    # subset, so this keeps the test in the runtime/image tier
+    # deterministically (every function is otherwise phase-neutral and
+    # would be comptime-legal on its own).
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
     return
 
 fn consume(value: u32) -> u32:
@@ -282,7 +289,7 @@ fn source_elif_reaches_nested_semantic_and_flow_ssa_joins() {
         )
         .expect("normalized elif lowers to SemanticWir");
     let semantic_debug = format!("{:?}", semantic_output.wir().as_wir());
-    assert_eq!(semantic_debug.matches("If {").count(), 3);
+    assert_eq!(semantic_debug.matches("If {").count(), 4);
 
     let (semantic_wir, _) = semantic_output.into_parts();
     let flow_output = CanonicalFlowLowerer::new()
@@ -309,10 +316,26 @@ fn source_elif_reaches_nested_semantic_and_flow_ssa_joins() {
         .collect::<Vec<_>>();
     assert_eq!(
         join_blocks.len(),
-        3,
-        "one scalar SSA join per source clause"
+        5,
+        "one scalar SSA join per source clause, plus the bounded-while tier guard's header and exit"
     );
-    assert!(join_blocks.iter().all(|block| block.parameters.len() == 1));
+    // The three elif-chain joins each carry exactly the one scalar `joined`
+    // result; the bounded `while` guard's header/exit blocks additionally
+    // thread every other local still live across the loop's back edge.
+    assert!(
+        join_blocks
+            .iter()
+            .filter(|block| block.parameters.len() == 1)
+            .count()
+            == 3
+    );
+    assert!(
+        join_blocks
+            .iter()
+            .filter(|block| block.parameters.len() == 5)
+            .count()
+            == 2
+    );
 
     let (flow_wir, _, _) = flow_output.into_parts();
     let encoded = encode_and_verify(
@@ -346,16 +369,16 @@ fn source_elif_reaches_nested_semantic_and_flow_ssa_joins() {
             .iter()
             .filter(|block| matches!(block.terminator, MachineTerminator::Branch { .. }))
             .count(),
-        3,
-        "all three elif conditions must remain executable machine branches"
+        4,
+        "all three elif conditions plus the bounded-while tier guard must remain executable machine branches"
     );
     assert_eq!(
         source_blocks
             .iter()
             .filter(|block| !block.parameters.is_empty())
             .count(),
-        3,
-        "all three scalar joins must survive ABI lowering"
+        5,
+        "all three scalar joins plus the bounded-while header/exit must survive ABI lowering"
     );
 
     match emit_prepared_object(&prepared, &target, &never_cancelled) {

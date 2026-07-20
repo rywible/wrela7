@@ -1555,7 +1555,7 @@ mod tests {
     const FRONTEND_BYTES: &[u8] = b"wrela frontend fixture";
     const BACKEND_BYTES: &[u8] = b"wrela backend fixture";
     const PACKAGE_MANIFEST: &[u8] = b"schema = 1\n";
-    const PACKAGE_SOURCE: &[u8] = b"module image\npub comptime fn target():\n    pass\n";
+    const PACKAGE_SOURCE: &[u8] = b"module image\npub fn target():\n    pass\n";
     const RUNTIME_OBJECT: &[u8] = b"AArch64 COFF runtime fixture";
     const TARGET_MANIFEST: &[u8] =
         include_bytes!("../../../toolchain/targets/aarch64-qemu-virt-uefi/target.toml");

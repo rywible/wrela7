@@ -68,6 +68,7 @@ pub(crate) struct CheckedComptimeClosure {
 /// preserve the semantic driver's existing classification policy.
 pub(crate) fn check_source_comptime_unit_test(
     hir: &ValidatedProgram,
+    standard_library_package: wrela_package::PackageId,
     target_pointer_width: u8,
     root: DeclarationId,
     limits: ComptimeCheckLimits,
@@ -87,7 +88,13 @@ pub(crate) fn check_source_comptime_unit_test(
         ));
     }
 
-    let mut checker = Checker::new(hir, u16::from(target_pointer_width), limits, is_cancelled)?;
+    let mut checker = Checker::new(
+        hir,
+        standard_library_package,
+        u16::from(target_pointer_width),
+        limits,
+        is_cancelled,
+    )?;
     match checker.check(root) {
         Ok(closure) => Ok(Ok(closure)),
         Err(CheckFailure::Diagnostic(mut diagnostics)) => {
@@ -166,6 +173,7 @@ type CheckResult<T> = Result<T, CheckFailure>;
 struct Checker<'a> {
     hir: &'a ValidatedProgram,
     program: &'a wrela_hir::Program,
+    standard_library_package: wrela_package::PackageId,
     pointer_width: u16,
     limits: ComptimeCheckLimits,
     states: Vec<VisitState>,
@@ -184,6 +192,7 @@ struct Checker<'a> {
 impl<'a> Checker<'a> {
     fn new(
         hir: &'a ValidatedProgram,
+        standard_library_package: wrela_package::PackageId,
         pointer_width: u16,
         limits: ComptimeCheckLimits,
         is_cancelled: &'a dyn Fn() -> bool,
@@ -266,6 +275,7 @@ impl<'a> Checker<'a> {
         Ok(Self {
             hir,
             program,
+            standard_library_package,
             pointer_width,
             limits,
             states,
@@ -346,7 +356,7 @@ impl<'a> Checker<'a> {
                 "comptime call target is not a function",
             ));
         };
-        if function.color != FunctionColor::Comptime
+        if function.color != FunctionColor::Sync
             || !function.generics.is_empty()
             || function.body.is_none()
         {
@@ -363,12 +373,22 @@ impl<'a> Checker<'a> {
         for parameter in &function.parameters {
             let record = self.parameter(*parameter, id, declaration.source)?;
             let record_source = record.source;
-            let parameter_type = match record.ty.as_ref() {
-                Some(ty) => self.source_type(ty)?,
-                None => None,
+            let receiver = record.receiver;
+            let access = record.access;
+            let supported = if receiver {
+                // A receiver has no separately written type; it is legal
+                // only when its enclosing struct/impl names a concrete
+                // struct, and only `read self` is reachable through operator
+                // desugaring (chapter 10 §12).
+                access == AccessMode::Read
+                    && crate::interfaces::receiver_concrete_struct(self.program, id).is_some()
+            } else {
+                let parameter_type = match record.ty.as_ref() {
+                    Some(ty) => self.source_type(ty)?,
+                    None => None,
+                };
+                access == AccessMode::Value && parameter_type.is_some()
             };
-            let supported =
-                record.access == AccessMode::Value && !record.receiver && parameter_type.is_some();
             self.node(record_source)?;
             if !supported {
                 return Err(self.signature_diagnostic(record_source));
@@ -768,19 +788,34 @@ impl<'a> Checker<'a> {
                 ComptimeType::Bool
             }
             ExpressionKind::Binary {
-                operator: _,
+                operator,
                 left,
                 right,
             } => {
-                if expected.is_some_and(|ty| !matches!(ty, ComptimeType::Integer { .. })) {
+                let desugar = crate::interfaces::DesugarOperator::from_binary(*operator);
+                if expected.is_some_and(|ty| {
+                    !(matches!(ty, ComptimeType::Integer { .. })
+                        || (desugar.is_some() && matches!(ty, ComptimeType::Structure(_))))
+                }) {
                     return Err(self.type_mismatch(expression.source));
                 }
                 let left_type = self.check_expression(*left, expected, declaration, depth + 1)?;
-                if !matches!(left_type, ComptimeType::Integer { .. }) {
-                    return Err(self.type_mismatch(expression.source));
+                match (desugar, left_type) {
+                    (Some(desugar), ComptimeType::Structure(struct_declaration)) => self
+                        .check_operator_call(
+                            desugar,
+                            struct_declaration,
+                            *right,
+                            declaration,
+                            expression.source,
+                            depth,
+                        )?,
+                    (_, ComptimeType::Integer { .. }) => {
+                        self.check_expression(*right, Some(left_type), declaration, depth + 1)?;
+                        left_type
+                    }
+                    _ => return Err(self.type_mismatch(expression.source)),
                 }
-                self.check_expression(*right, Some(left_type), declaration, depth + 1)?;
-                left_type
             }
             ExpressionKind::Compare {
                 left,
@@ -788,6 +823,23 @@ impl<'a> Checker<'a> {
                 right,
             } if !matches!(operator, ComparisonOperator::In | ComparisonOperator::NotIn) => {
                 let left_type = self.check_expression(*left, None, declaration, depth + 1)?;
+                if let (Some(desugar), ComptimeType::Structure(struct_declaration)) = (
+                    crate::interfaces::DesugarOperator::from_comparison(*operator),
+                    left_type,
+                ) {
+                    return self
+                        .check_operator_call(
+                            desugar,
+                            struct_declaration,
+                            *right,
+                            declaration,
+                            expression.source,
+                            depth,
+                        )
+                        .and_then(|actual| {
+                            self.require_expected(actual, expected, expression.source)
+                        });
+                }
                 if matches!(left_type, ComptimeType::Structure(_)) {
                     return Err(self.unsupported(expression.source));
                 }
@@ -824,7 +876,7 @@ impl<'a> Checker<'a> {
             | ExpressionKind::Index { .. }
             | ExpressionKind::Tuple(_)
             | ExpressionKind::Array(_)
-            | ExpressionKind::Race(_)
+            | ExpressionKind::DotName { .. }
             | ExpressionKind::TrySend(_)
             | ExpressionKind::Interpolate(_)
             | ExpressionKind::Error => return Err(self.unsupported(expression.source)),
@@ -924,7 +976,7 @@ impl<'a> Checker<'a> {
                 "comptime call target is not a function",
             ));
         };
-        if function.color != FunctionColor::Comptime
+        if function.color != FunctionColor::Sync
             || !function.generics.is_empty()
             || function.body.is_none()
             || arguments.len() != function.parameters.len()
@@ -1041,6 +1093,73 @@ impl<'a> Checker<'a> {
             }),
         )?;
         self.require_expected(result_type, expected, source)
+    }
+
+    /// Check a binary/comparison operator desugared to a `core.ops` impl
+    /// method call (chapter 10 §12). There is no source `Call` expression to
+    /// walk here, so this mirrors `check_call`'s signature validation and
+    /// closure enqueueing directly against the resolved impl method.
+    fn check_operator_call(
+        &mut self,
+        operator: crate::interfaces::DesugarOperator,
+        struct_declaration: DeclarationId,
+        right: ExpressionId,
+        caller: DeclarationId,
+        source: Span,
+        depth: u32,
+    ) -> CheckResult<ComptimeType> {
+        self.check_expression(
+            right,
+            Some(ComptimeType::Structure(struct_declaration)),
+            caller,
+            depth + 1,
+        )?;
+        let (model, _) = crate::interfaces::collect_interface_model(
+            self.program,
+            self.standard_library_package,
+            self.is_cancelled,
+        )?;
+        let Some(resolution) = model.resolve_operator(self.program, operator, struct_declaration)
+        else {
+            return Err(self.unsupported(source));
+        };
+        let target = self
+            .program
+            .declaration(resolution.function)
+            .ok_or_else(|| self.invariant("comptime operator impl target is absent from HIR"))?;
+        let target_source = target.source;
+        let DeclarationKind::Function(function) = &target.kind else {
+            return Err(self.call_signature_diagnostic(target_source, resolution.function, source));
+        };
+        if function.color != FunctionColor::Sync
+            || !function.generics.is_empty()
+            || function.body.is_none()
+            || function.parameters.len() != 2
+        {
+            return Err(self.call_signature_diagnostic(target_source, resolution.function, source));
+        }
+        let result_type = match function.result.as_ref() {
+            Some(result) => self.source_type(result)?.ok_or_else(|| {
+                self.call_signature_diagnostic(result.source, resolution.function, source)
+            })?,
+            None => ComptimeType::Unit,
+        };
+        if resolution.negate && result_type != ComptimeType::Bool {
+            return Err(self.call_signature_diagnostic(target_source, resolution.function, source));
+        }
+        self.queue_declaration(
+            resolution.function,
+            source,
+            Some(CallParent {
+                caller,
+                call_source: source,
+            }),
+        )?;
+        Ok(if resolution.negate {
+            ComptimeType::Bool
+        } else {
+            result_type
+        })
     }
 
     fn check_structure_constructor(
@@ -1168,6 +1287,11 @@ impl<'a> Checker<'a> {
         self.require_expected(ComptimeType::Structure(structure), expected, source)
     }
 
+    /// Look up a parameter belonging to `declaration`. A receiver (`self`) is
+    /// a legal result here: callers that must reject it (ordinary call
+    /// argument binding) check `parameter.receiver` explicitly at their own
+    /// call site, since a receiver is reachable only through operator
+    /// desugaring, never through explicit call-argument syntax.
     fn parameter(
         &self,
         id: ParameterId,
@@ -1177,9 +1301,7 @@ impl<'a> Checker<'a> {
         self.program
             .parameter(id)
             .filter(|parameter| {
-                parameter.id == id
-                    && parameter.owner == CallableOwner::Declaration(declaration)
-                    && !parameter.receiver
+                parameter.id == id && parameter.owner == CallableOwner::Declaration(declaration)
             })
             .ok_or_else(|| {
                 self.diagnostic(
@@ -1197,9 +1319,14 @@ impl<'a> Checker<'a> {
         source: Span,
     ) -> CheckResult<ComptimeType> {
         let parameter = self.parameter(id, declaration, source)?;
-        let ty = match parameter.ty.as_ref() {
-            Some(ty) => self.source_type(ty)?,
-            None => None,
+        let ty = if parameter.receiver {
+            crate::interfaces::receiver_concrete_struct(self.program, declaration)
+                .map(ComptimeType::Structure)
+        } else {
+            match parameter.ty.as_ref() {
+                Some(ty) => self.source_type(ty)?,
+                None => None,
+            }
         };
         ty.ok_or_else(|| self.signature_diagnostic(parameter.source))
     }
@@ -1456,6 +1583,14 @@ impl<'a> Checker<'a> {
     fn source_type(&mut self, ty: &TypeExpression) -> CheckResult<Option<ComptimeType>> {
         if let Some(scalar) = self.scalar_type(ty) {
             return Ok(Some(scalar));
+        }
+        if let TypeExpressionKind::SelfType { owner } = &ty.kind {
+            let Some(id) = crate::interfaces::concrete_struct_for_self_owner(self.program, *owner)
+            else {
+                return Ok(None);
+            };
+            self.ensure_flat_structure(id, ty.source)?;
+            return Ok(Some(ComptimeType::Structure(id)));
         }
         let TypeExpressionKind::Named {
             definition: Definition::Declaration(resolved),
@@ -2171,8 +2306,8 @@ mod tests {
     use wrela_source::{SourceDatabase, SourceInput};
     use wrela_syntax::{ParseLimits, ParseRequest, SyntaxParser, WrelaSyntaxParser};
 
-    const MATH: &str = "module app.math\n\npub comptime fn add(left: u32, right: u32) -> u32:\n    return left + right\n\npub comptime fn countdown(value: u32) -> u32:\n    if value == 0:\n        return 0\n    return countdown(value - 1)\n";
-    const TEST: &str = "module app.math_test\n\nfrom app.math import add, countdown\n\n@test\ncomptime fn scalar_closure():\n    value = add(right=22, left=20)\n    zero: u32 = countdown(2)\n    comptime assert value == 42 and zero == 0, \"scalar closure\"\n";
+    const MATH: &str = "module app.math\n\npub fn add(left: u32, right: u32) -> u32:\n    return left + right\n\npub fn countdown(value: u32) -> u32:\n    if value == 0:\n        return 0\n    return countdown(value - 1)\n";
+    const TEST: &str = "module app.math_test\n\nfrom app.math import add, countdown\n\n@test\nfn scalar_closure():\n    value = add(right=22, left=20)\n    zero: u32 = countdown(2)\n    comptime assert value == 42 and zero == 0, \"scalar closure\"\n";
 
     fn lower(math: &str, test: &str) -> ValidatedProgram {
         let mut sources = SourceDatabase::default();
@@ -2272,17 +2407,17 @@ mod tests {
         for (index, name) in names.iter().enumerate() {
             if let Some(next) = names.get(index + 1) {
                 math.push_str(&format!(
-                    "pub comptime fn {name}() -> bool:\n    return {next}()\n\n"
+                    "pub fn {name}() -> bool:\n    return {next}()\n\n"
                 ));
             } else {
                 math.push_str(&format!(
-                    "pub comptime fn {name}() -> bool:\n    loop:\n        pass\n    return true\n"
+                    "pub fn {name}() -> bool:\n    loop:\n        pass\n    return true\n"
                 ));
             }
         }
         let first = &names[0];
         let test = format!(
-            "module app.math_test\n\nfrom app.math import {first}\n\n@test\ncomptime fn long_qualified_first_parent_stack():\n    comptime assert {first}(), \"long stack\"\n"
+            "module app.math_test\n\nfrom app.math import {first}\n\n@test\nfn long_qualified_first_parent_stack():\n    comptime assert {first}(), \"long stack\"\n"
         );
         (math, test)
     }
@@ -2330,22 +2465,36 @@ mod tests {
     fn checks_real_imported_named_recursive_closure_with_an_exact_work_bound() {
         let hir = lower(MATH, TEST);
         let root = hir.as_program().test_candidates[0];
-        let checked = check_source_comptime_unit_test(&hir, 64, root, limits(1_000_000), &|| false)
-            .expect("checker analysis")
-            .expect("supported closure");
+        let checked = check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            limits(1_000_000),
+            &|| false,
+        )
+        .expect("checker analysis")
+        .expect("supported closure");
         assert_eq!(checked.declarations.len(), 3);
         assert_eq!(checked.declarations[0].declaration, root);
         assert!(checked.node_count > 0);
         assert!(checked.work_count > checked.node_count);
 
-        let exact =
-            check_source_comptime_unit_test(&hir, 64, root, limits(checked.work_count), &|| false)
-                .expect("exact checker analysis")
-                .expect("exact bound is admitted");
+        let exact = check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            limits(checked.work_count),
+            &|| false,
+        )
+        .expect("exact checker analysis")
+        .expect("exact bound is admitted");
         assert_eq!(exact, checked);
         assert!(matches!(
             check_source_comptime_unit_test(
                 &hir,
+                hir.as_program().packages.root(),
                 64,
                 root,
                 limits(checked.work_count - 1),
@@ -2366,7 +2515,7 @@ pub struct Pair:
     pub left: u32
     pub right: u32
 
-pub comptime fn make(left: u32, right: u32) -> Pair:
+pub fn make(left: u32, right: u32) -> Pair:
     return Pair(right=right, left=left)
 "#;
         const VALID: &str = r#"module app.math_test
@@ -2374,7 +2523,7 @@ pub comptime fn make(left: u32, right: u32) -> Pair:
 from app.math import make
 
 @test
-comptime fn every_path_reinitializes():
+fn every_path_reinitializes():
     value = make(20, 22)
     if true:
         moved = value
@@ -2390,19 +2539,33 @@ comptime fn every_path_reinitializes():
             let mut candidate = limits(10_000_000);
             candidate.storage_entries = storage_entries;
             matches!(
-                check_source_comptime_unit_test(&hir, 64, root, candidate, &|| false),
+                check_source_comptime_unit_test(
+                    &hir,
+                    hir.as_program().packages.root(),
+                    64,
+                    root,
+                    candidate,
+                    &|| false
+                ),
                 Ok(Ok(_))
             )
         });
         let mut exact = limits(10_000_000);
         exact.storage_entries = exact_storage;
-        check_source_comptime_unit_test(&hir, 64, root, exact, &|| false)
-            .expect("exact branch snapshot analysis")
-            .expect("every continuing path reinitializes the aggregate");
+        check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            exact,
+            &|| false,
+        )
+        .expect("exact branch snapshot analysis")
+        .expect("every continuing path reinitializes the aggregate");
         let mut over = exact;
         over.storage_entries = exact_storage - 1;
         assert!(matches!(
-            check_source_comptime_unit_test(&hir, 64, root, over, &|| false),
+            check_source_comptime_unit_test(&hir, hir.as_program().packages.root(), 64, root, over, &|| false),
             Err(AnalysisFailure::ResourceLimit {
                 resource: "comptime source checker storage entries",
                 limit,
@@ -2414,7 +2577,7 @@ comptime fn every_path_reinitializes():
 from app.math import make
 
 @test
-comptime fn one_path_leaves_value_moved():
+fn one_path_leaves_value_moved():
     value = make(20, 22)
     if true:
         moved = value
@@ -2425,10 +2588,16 @@ comptime fn one_path_leaves_value_moved():
 "#;
         let hir = lower(VALUES, INVALID);
         let root = hir.as_program().test_candidates[0];
-        let diagnostic =
-            check_source_comptime_unit_test(&hir, 64, root, limits(10_000_000), &|| false)
-                .expect("invalid branch join analysis")
-                .expect_err("a move on one continuing path poisons the joined local");
+        let diagnostic = check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            limits(10_000_000),
+            &|| false,
+        )
+        .expect("invalid branch join analysis")
+        .expect_err("a move on one continuing path poisons the joined local");
         assert_eq!(
             diagnostic.code.as_deref(),
             Some("semantic-comptime-use-after-move")
@@ -2437,15 +2606,24 @@ comptime fn one_path_leaves_value_moved():
 
     #[test]
     fn checks_short_circuit_rhs_and_polls_cancellation() {
+        // A plain `fn` is phase-neutral and would now be comptime-legal here,
+        // so this exercises a callee color that can never be comptime-legal
+        // (comptime forbids async operations) instead.
         const RUNTIME_MATH: &str =
-            "module app.math\n\npub fn runtime_only() -> bool:\n    return true\n";
-        const SHORT_CIRCUIT_TEST: &str = "module app.math_test\n\nfrom app.math import runtime_only\n\n@test\ncomptime fn rejected_rhs():\n    comptime assert false and runtime_only(), \"must inspect rhs\"\n";
+            "module app.math\n\npub async fn runtime_only() -> bool:\n    return true\n";
+        const SHORT_CIRCUIT_TEST: &str = "module app.math_test\n\nfrom app.math import runtime_only\n\n@test\nfn rejected_rhs():\n    comptime assert false and runtime_only(), \"must inspect rhs\"\n";
         let hir = lower(RUNTIME_MATH, SHORT_CIRCUIT_TEST);
         let root = hir.as_program().test_candidates[0];
-        let diagnostic =
-            check_source_comptime_unit_test(&hir, 64, root, limits(1_000_000), &|| false)
-                .expect("checker analysis")
-                .expect_err("runtime RHS is rejected even though it short-circuits");
+        let diagnostic = check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            limits(1_000_000),
+            &|| false,
+        )
+        .expect("checker analysis")
+        .expect_err("runtime RHS is rejected even though it short-circuits");
         assert_eq!(
             diagnostic.code.as_deref(),
             Some("semantic-comptime-signature-not-supported")
@@ -2463,7 +2641,14 @@ comptime fn one_path_leaves_value_moved():
             next >= 3
         };
         assert_eq!(
-            check_source_comptime_unit_test(&hir, 64, root, limits(1_000_000), &cancelled,),
+            check_source_comptime_unit_test(
+                &hir,
+                hir.as_program().packages.root(),
+                64,
+                root,
+                limits(1_000_000),
+                &cancelled,
+            ),
             Err(AnalysisFailure::Cancelled)
         );
         assert_eq!(polls.get(), 3);
@@ -2471,14 +2656,20 @@ comptime fn one_path_leaves_value_moved():
 
     #[test]
     fn nested_diagnostic_uses_the_deterministic_first_parent_call_path() {
-        const DIAMOND_MATH: &str = "module app.math\n\npub comptime fn hidden() -> bool:\n    loop:\n        pass\n    return true\n\npub comptime fn left() -> bool:\n    return hidden()\n\npub comptime fn right() -> bool:\n    return hidden()\n";
-        const DIAMOND_TEST: &str = "module app.math_test\n\nfrom app.math import left, right\n\n@test\ncomptime fn diamond_path():\n    comptime assert left() or right(), \"both branches are checked\"\n";
+        const DIAMOND_MATH: &str = "module app.math\n\npub fn hidden() -> bool:\n    loop:\n        pass\n    return true\n\npub fn left() -> bool:\n    return hidden()\n\npub fn right() -> bool:\n    return hidden()\n";
+        const DIAMOND_TEST: &str = "module app.math_test\n\nfrom app.math import left, right\n\n@test\nfn diamond_path():\n    comptime assert left() or right(), \"both branches are checked\"\n";
         let hir = lower(DIAMOND_MATH, DIAMOND_TEST);
         let root = hir.as_program().test_candidates[0];
-        let diagnostic =
-            check_source_comptime_unit_test(&hir, 64, root, limits(1_000_000), &|| false)
-                .expect("checker analysis")
-                .expect_err("hidden loop is unsupported");
+        let diagnostic = check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            limits(1_000_000),
+            &|| false,
+        )
+        .expect("checker analysis")
+        .expect_err("hidden loop is unsupported");
         assert_eq!(
             diagnostic.code.as_deref(),
             Some("semantic-comptime-operation-not-implemented")
@@ -2501,26 +2692,40 @@ comptime fn one_path_leaves_value_moved():
     fn long_integer_spelling_has_exact_work_and_mid_scan_cancellation() {
         let spelling = format!("0x{}1", "0_".repeat(1_024));
         let test = format!(
-            "module app.math_test\n\n@test\ncomptime fn long_literal():\n    value = {spelling}\n    comptime assert value == 1, \"long literal\"\n"
+            "module app.math_test\n\n@test\nfn long_literal():\n    value = {spelling}\n    comptime assert value == 1, \"long literal\"\n"
         );
         let hir = lower("module app.math\n", &test);
         let root = hir.as_program().test_candidates[0];
         let polls = Cell::new(0_u64);
-        let checked = check_source_comptime_unit_test(&hir, 64, root, limits(1_000_000), &|| {
-            polls.set(polls.get() + 1);
-            false
-        })
+        let checked = check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            limits(1_000_000),
+            &|| {
+                polls.set(polls.get() + 1);
+                false
+            },
+        )
         .expect("checker analysis")
         .expect("long literal closure");
         assert!(checked.work_count > 2_048);
-        let exact =
-            check_source_comptime_unit_test(&hir, 64, root, limits(checked.work_count), &|| false)
-                .expect("exact work analysis")
-                .expect("exact long-literal work bound");
+        let exact = check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            limits(checked.work_count),
+            &|| false,
+        )
+        .expect("exact work analysis")
+        .expect("exact long-literal work bound");
         assert_eq!(exact.work_count, checked.work_count);
         assert!(matches!(
             check_source_comptime_unit_test(
                 &hir,
+                hir.as_program().packages.root(),
                 64,
                 root,
                 limits(checked.work_count - 1),
@@ -2536,11 +2741,18 @@ comptime fn one_path_leaves_value_moved():
         assert!(cancel_at > 512);
         let cancelled_polls = Cell::new(0_u64);
         assert_eq!(
-            check_source_comptime_unit_test(&hir, 64, root, limits(1_000_000), &|| {
-                let next = cancelled_polls.get() + 1;
-                cancelled_polls.set(next);
-                next == cancel_at
-            },),
+            check_source_comptime_unit_test(
+                &hir,
+                hir.as_program().packages.root(),
+                64,
+                root,
+                limits(1_000_000),
+                &|| {
+                    let next = cancelled_polls.get() + 1;
+                    cancelled_polls.set(next);
+                    next == cancel_at
+                },
+            ),
             Err(AnalysisFailure::Cancelled)
         );
         assert_eq!(cancelled_polls.get(), cancel_at);
@@ -2552,10 +2764,16 @@ comptime fn one_path_leaves_value_moved():
         let (math, test) = long_first_parent_sources(DEPTH, 240);
         let hir = lower(&math, &test);
         let root = hir.as_program().test_candidates[0];
-        let diagnostic =
-            check_source_comptime_unit_test(&hir, 64, root, limits(10_000_000), &|| false)
-                .expect("generous diagnostic analysis")
-                .expect_err("deep loop is unsupported");
+        let diagnostic = check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            limits(10_000_000),
+            &|| false,
+        )
+        .expect("generous diagnostic analysis")
+        .expect_err("deep loop is unsupported");
         assert_eq!(diagnostic.labels.len(), DEPTH);
         assert!(diagnostic.labels.iter().all(|label| {
             label
@@ -2567,15 +2785,22 @@ comptime fn one_path_leaves_value_moved():
 
         let mut exact_diagnostic = limits(10_000_000);
         exact_diagnostic.diagnostic_bytes = exact_bytes;
-        let exact = check_source_comptime_unit_test(&hir, 64, root, exact_diagnostic, &|| false)
-            .expect("exact diagnostic-byte analysis")
-            .expect_err("supported diagnostic is retained at its exact byte bound");
+        let exact = check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            exact_diagnostic,
+            &|| false,
+        )
+        .expect("exact diagnostic-byte analysis")
+        .expect_err("supported diagnostic is retained at its exact byte bound");
         assert_eq!(accounted_diagnostic_bytes(&exact), exact_bytes);
 
         let mut over_diagnostic = exact_diagnostic;
         over_diagnostic.diagnostic_bytes = exact_bytes - 1;
         assert!(matches!(
-            check_source_comptime_unit_test(&hir, 64, root, over_diagnostic, &|| false),
+            check_source_comptime_unit_test(&hir, hir.as_program().packages.root(), 64, root, over_diagnostic, &|| false),
             Err(AnalysisFailure::ResourceLimit {
                 resource: "diagnostic bytes",
                 limit,
@@ -2584,15 +2809,22 @@ comptime fn one_path_leaves_value_moved():
 
         let mut exact_test = limits(10_000_000);
         exact_test.test_bytes = exact_bytes;
-        let exact = check_source_comptime_unit_test(&hir, 64, root, exact_test, &|| false)
-            .expect("exact test-output-byte analysis")
-            .expect_err("supported diagnostic is retained at its exact test-output bound");
+        let exact = check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            exact_test,
+            &|| false,
+        )
+        .expect("exact test-output-byte analysis")
+        .expect_err("supported diagnostic is retained at its exact test-output bound");
         assert_eq!(accounted_diagnostic_bytes(&exact), exact_bytes);
 
         let mut over_test = exact_test;
         over_test.test_bytes = exact_bytes - 1;
         assert!(matches!(
-            check_source_comptime_unit_test(&hir, 64, root, over_test, &|| false),
+            check_source_comptime_unit_test(&hir, hir.as_program().packages.root(), 64, root, over_test, &|| false),
             Err(AnalysisFailure::ResourceLimit {
                 resource: "test plan or results",
                 limit,
@@ -2607,14 +2839,28 @@ comptime fn one_path_leaves_value_moved():
         let mut no_diagnostic_bytes = limits(1_000_000);
         no_diagnostic_bytes.diagnostic_bytes = 0;
         assert_eq!(
-            check_source_comptime_unit_test(&hir, 64, root, no_diagnostic_bytes, &|| false,),
+            check_source_comptime_unit_test(
+                &hir,
+                hir.as_program().packages.root(),
+                64,
+                root,
+                no_diagnostic_bytes,
+                &|| false,
+            ),
             Err(AnalysisFailure::InvalidLimits)
         );
 
         let mut no_test_bytes = limits(1_000_000);
         no_test_bytes.test_bytes = 0;
         assert_eq!(
-            check_source_comptime_unit_test(&hir, 64, root, no_test_bytes, &|| false),
+            check_source_comptime_unit_test(
+                &hir,
+                hir.as_program().packages.root(),
+                64,
+                root,
+                no_test_bytes,
+                &|| false
+            ),
             Err(AnalysisFailure::InvalidLimits)
         );
     }
@@ -2633,7 +2879,7 @@ comptime fn one_path_leaves_value_moved():
             let mut candidate = limits(10_000_000);
             candidate.storage_entries = storage_entries;
             matches!(
-                check_source_comptime_unit_test(&hir, 64, root, candidate, &|| false),
+                check_source_comptime_unit_test(&hir, hir.as_program().packages.root(), 64, root, candidate, &|| false),
                 Ok(Err(diagnostic))
                     if diagnostic.code.as_deref()
                         == Some("semantic-comptime-operation-not-implemented")
@@ -2646,15 +2892,22 @@ comptime fn one_path_leaves_value_moved():
 
         let mut exact = limits(10_000_000);
         exact.storage_entries = exact_storage;
-        let diagnostic = check_source_comptime_unit_test(&hir, 64, root, exact, &|| false)
-            .expect("exact structural-storage analysis")
-            .expect_err("diagnostic labels fit at the exact structural bound");
+        let diagnostic = check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            exact,
+            &|| false,
+        )
+        .expect("exact structural-storage analysis")
+        .expect_err("diagnostic labels fit at the exact structural bound");
         assert_eq!(diagnostic.labels.len(), DEPTH);
 
         let mut over = exact;
         over.storage_entries = exact_storage - 1;
         assert!(matches!(
-            check_source_comptime_unit_test(&hir, 64, root, over, &|| false),
+            check_source_comptime_unit_test(&hir, hir.as_program().packages.root(), 64, root, over, &|| false),
             Err(AnalysisFailure::ResourceLimit {
                 resource: "comptime source checker storage entries",
                 limit,
@@ -2672,21 +2925,28 @@ comptime fn one_path_leaves_value_moved():
 
         let exact_work = minimum_admitted_limit(1, 10_000_000, |work_units| {
             matches!(
-                check_source_comptime_unit_test(&hir, 64, root, limits(work_units), &|| false),
+                check_source_comptime_unit_test(&hir, hir.as_program().packages.root(), 64, root, limits(work_units), &|| false),
                 Ok(Err(diagnostic))
                     if diagnostic.code.as_deref()
                         == Some("semantic-comptime-operation-not-implemented")
             )
         });
-        let exact_diagnostic =
-            check_source_comptime_unit_test(&hir, 64, root, limits(exact_work), &|| false)
-                .expect("exact error-path work analysis")
-                .expect_err("diagnostic construction fits its exact work bound");
+        let exact_diagnostic = check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            limits(exact_work),
+            &|| false,
+        )
+        .expect("exact error-path work analysis")
+        .expect_err("diagnostic construction fits its exact work bound");
         assert_eq!(exact_diagnostic.labels.len(), DEPTH);
         assert!(exact_work > accounted_diagnostic_bytes(&exact_diagnostic));
         assert!(matches!(
             check_source_comptime_unit_test(
                 &hir,
+                hir.as_program().packages.root(),
                 64,
                 root,
                 limits(exact_work - 1),
@@ -2699,10 +2959,17 @@ comptime fn one_path_leaves_value_moved():
         ));
 
         let polls = Cell::new(0u64);
-        check_source_comptime_unit_test(&hir, 64, root, limits(10_000_000), &|| {
-            polls.set(polls.get() + 1);
-            false
-        })
+        check_source_comptime_unit_test(
+            &hir,
+            hir.as_program().packages.root(),
+            64,
+            root,
+            limits(10_000_000),
+            &|| {
+                polls.set(polls.get() + 1);
+                false
+            },
+        )
         .expect("poll calibration analysis")
         .expect_err("poll calibration reaches the long diagnostic stack");
         let cancel_at = polls
@@ -2712,11 +2979,18 @@ comptime fn one_path_leaves_value_moved():
         assert!(cancel_at > NAME_BYTES as u64);
         let cancelled_polls = Cell::new(0u64);
         assert_eq!(
-            check_source_comptime_unit_test(&hir, 64, root, limits(10_000_000), &|| {
-                let next = cancelled_polls.get() + 1;
-                cancelled_polls.set(next);
-                next == cancel_at
-            }),
+            check_source_comptime_unit_test(
+                &hir,
+                hir.as_program().packages.root(),
+                64,
+                root,
+                limits(10_000_000),
+                &|| {
+                    let next = cancelled_polls.get() + 1;
+                    cancelled_polls.set(next);
+                    next == cancel_at
+                }
+            ),
             Err(AnalysisFailure::Cancelled)
         );
         assert_eq!(cancelled_polls.get(), cancel_at);

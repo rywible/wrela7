@@ -6,10 +6,6 @@ name = "mini"
 version = "1.0.0"
 source_root = "src"
 
-[[module]]
-name = "mini"
-path = "mini.wr"
-
 [[profile]]
 name = "development"
 mode = "development"

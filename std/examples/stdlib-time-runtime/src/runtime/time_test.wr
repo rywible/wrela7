@@ -1,28 +1,34 @@
 module runtime.time_test
 
 from core.image import Image, Target
-from core.time import add, as_nanoseconds, less_than, ns
+from core.time import as_nanoseconds, ns
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="stdlib-time-runtime", target=Target.aarch64_qemu_virt_uefi)
 
 @test
 fn installed_core_time_executes_in_qemu():
     constructed: u64 = as_nanoseconds(value=ns(value=42))
-    sum: u64 = as_nanoseconds(value=add(left=ns(value=20), right=ns(value=22)))
-    ordered: bool = less_than(left=ns(value=41), right=ns(value=42))
+    sum: u64 = as_nanoseconds(value=ns(value=20) + ns(value=22))
+    ordered: bool = ns(value=41) < ns(value=42)
     if constructed != 42:
         force_invalid_shift_count()
     if sum != 42:
         force_invalid_shift_count()
     if not ordered:
         force_invalid_shift_count()
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
     return
 
 @test
 fn typed_checked_failure_reaches_qemu():
     force_invalid_shift_count()
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
     return
 
 fn force_invalid_shift_count():

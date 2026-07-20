@@ -28,12 +28,12 @@ const IMAGE_SOURCE: &str = r#"module app.image
 from core.image import Image, Target
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="comptime-unit-image", target=Target.aarch64_qemu_virt_uefi)
 "#;
 const PRODUCTION_SOURCE: &str = r#"module app.math
 
-pub comptime fn countdown(value: u32) -> u32:
+pub fn countdown(value: u32) -> u32:
     if value == 0:
         return 42
     return countdown(value - 1)
@@ -43,12 +43,12 @@ const TEST_SOURCE: &str = r#"module app.math_test
 from app.math import countdown
 
 @test
-comptime fn shallow_imported_call():
+fn shallow_imported_call():
     result: u32 = countdown(0)
     comptime assert result == 42, "shallow imported call returned the wrong value"
 
 @test
-comptime fn deep_imported_call():
+fn deep_imported_call():
     result: u32 = countdown(24)
     comptime assert result == 42, "deep imported call returned the wrong value"
 "#;

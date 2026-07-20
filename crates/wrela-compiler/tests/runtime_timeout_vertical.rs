@@ -125,24 +125,31 @@ fn checked_in_runtime_timeout_retains_reachable_checked_u8_add_and_fatal_edge() 
     let manifest = codec
         .decode_manifest(WORKSPACE_MANIFEST, manifest_limits(), &never_cancelled)
         .expect("checked-in runtime-timeout manifest");
+    // The checked-in manifest declares only `[[profile]]` overrides and no
+    // `[[module]]` block (modules are derived by the loader from a
+    // source-root walk, not decoded here), so it need not be byte-identical
+    // to its own canonical re-encoding; decode -> canonical -> decode must
+    // still be a fixed point, and every digest below binds the canonical
+    // bytes exactly as the production loader does.
+    let canonical_manifest = codec
+        .canonical_manifest(&manifest, manifest_limits(), &never_cancelled)
+        .expect("canonical runtime-timeout manifest");
     assert_eq!(
         codec
-            .canonical_manifest(&manifest, manifest_limits(), &never_cancelled)
-            .expect("canonical runtime-timeout manifest"),
-        WORKSPACE_MANIFEST
+            .decode_manifest(&canonical_manifest, manifest_limits(), &never_cancelled)
+            .expect("redecode canonical runtime-timeout manifest"),
+        manifest
     );
     assert_eq!(manifest.name.as_str(), IMAGE_NAME);
-    assert_eq!(manifest.modules.len(), 1);
-    assert_eq!(manifest.modules[0].module.dotted(), "runtime_timeout.image");
-    assert_eq!(manifest.modules[0].source_path, "runtime_timeout/image.wr");
     assert_eq!(manifest.images.len(), 1);
     assert_eq!(manifest.images[0].name, IMAGE_NAME);
+    assert_eq!(manifest.images[0].module.dotted(), "runtime_timeout.image");
 
     let root_identity = PackageIdentity {
         name: manifest.name.clone(),
         version: manifest.version.clone(),
         source_digest: package_content_digest(
-            WORKSPACE_MANIFEST,
+            &canonical_manifest,
             &[content_record(
                 "runtime_timeout/image.wr",
                 APPLICATION_SOURCE,
@@ -155,17 +162,24 @@ fn checked_in_runtime_timeout_retains_reachable_checked_u8_add_and_fatal_edge() 
     let core_manifest = codec
         .decode_manifest(CORE_MANIFEST, manifest_limits(), &never_cancelled)
         .expect("checked-in core manifest");
+    let canonical_core_manifest = codec
+        .canonical_manifest(&core_manifest, manifest_limits(), &never_cancelled)
+        .expect("canonical core manifest");
     assert_eq!(
         codec
-            .canonical_manifest(&core_manifest, manifest_limits(), &never_cancelled)
-            .expect("canonical core manifest"),
-        CORE_MANIFEST
+            .decode_manifest(
+                &canonical_core_manifest,
+                manifest_limits(),
+                &never_cancelled
+            )
+            .expect("redecode canonical core manifest"),
+        core_manifest
     );
     let core_identity = PackageIdentity {
         name: core_manifest.name.clone(),
         version: core_manifest.version.clone(),
         source_digest: package_content_digest(
-            CORE_MANIFEST,
+            &canonical_core_manifest,
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
@@ -194,7 +208,7 @@ fn checked_in_runtime_timeout_retains_reachable_checked_u8_add_and_fatal_edge() 
     assert_eq!(locked_root.identity, root_identity);
     assert_eq!(
         locked_root.manifest_digest,
-        HASHER.sha256(WORKSPACE_MANIFEST)
+        HASHER.sha256(&canonical_manifest)
     );
     assert_eq!(locked_root.dependencies.len(), 1);
     assert_eq!(locked_root.dependencies[0].identity, core_identity);
@@ -204,7 +218,10 @@ fn checked_in_runtime_timeout_retains_reachable_checked_u8_add_and_fatal_edge() 
         .find(|package| matches!(package.locator, PackageLocator::Toolchain { .. }))
         .expect("locked core package");
     assert_eq!(locked_core.identity, core_identity);
-    assert_eq!(locked_core.manifest_digest, HASHER.sha256(CORE_MANIFEST));
+    assert_eq!(
+        locked_core.manifest_digest,
+        HASHER.sha256(&canonical_core_manifest)
+    );
     assert_eq!(
         APPLICATION_SOURCE
             .matches(&format!("fn {SELECTOR}():"))

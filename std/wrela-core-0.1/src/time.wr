@@ -1,5 +1,7 @@
 module time
 
+from ops import Add, Ord, Sub
+
 pub struct Duration:
     nanoseconds: u64
 
@@ -30,128 +32,38 @@ pub fn weeks(value: u64) -> Duration:
 pub fn as_nanoseconds(value: Duration) -> u64:
     return value.nanoseconds
 
-pub fn add(left: Duration, right: Duration) -> Duration:
-    return ns(value=left.nanoseconds + right.nanoseconds)
+impl Add for Duration:
+    fn add(read self, right: Duration) -> Duration:
+        return ns(value=self.nanoseconds + right.nanoseconds)
 
-pub fn subtract(left: Duration, right: Duration) -> Duration:
-    return ns(value=left.nanoseconds - right.nanoseconds)
+impl Sub for Duration:
+    fn subtract(read self, right: Duration) -> Duration:
+        return ns(value=self.nanoseconds - right.nanoseconds)
+
+impl Ord for Duration:
+    fn less_than(read self, right: Duration) -> bool:
+        return self.nanoseconds < right.nanoseconds
 
 pub fn scale(value: Duration, factor: u64) -> Duration:
     return ns(value=value.nanoseconds * factor)
 
-pub fn less_than(left: Duration, right: Duration) -> bool:
-    return left.nanoseconds < right.nanoseconds
-
-pub fn less_than_or_equal(left: Duration, right: Duration) -> bool:
-    return left.nanoseconds <= right.nanoseconds
-
-pub fn greater_than(left: Duration, right: Duration) -> bool:
-    return less_than(left=right, right=left)
-
-pub fn greater_than_or_equal(left: Duration, right: Duration) -> bool:
-    return less_than_or_equal(left=right, right=left)
-
 pub fn min(left: Duration, right: Duration) -> Duration:
-    selected: u64 = right.nanoseconds
-    if less_than_or_equal(left=left, right=right):
-        selected = left.nanoseconds
-    return ns(value=selected)
+    selected: Duration = copy right
+    if left <= right:
+        selected = left
+    return selected
 
 pub fn max(left: Duration, right: Duration) -> Duration:
-    selected: u64 = left.nanoseconds
-    if less_than(left=left, right=right):
-        selected = right.nanoseconds
-    return ns(value=selected)
+    selected: Duration = copy left
+    if left < right:
+        selected = right
+    return selected
 
 pub fn clamp(value: Duration, lower: Duration, upper: Duration) -> Duration:
-    width: u64 = upper.nanoseconds - lower.nanoseconds
-    maximum: u64 = lower.nanoseconds + width
-    selected: u64 = value.nanoseconds
-    if selected < lower.nanoseconds:
-        selected = lower.nanoseconds
-    if maximum < selected:
-        selected = maximum
-    return ns(value=selected)
-
-pub comptime fn ns_comptime(value: u64) -> Duration:
-    return Duration(nanoseconds=value)
-
-pub comptime fn us_comptime(value: u64) -> Duration:
-    comptime assert value <= 18446744073709551, "microseconds exceed the u64 nanosecond representation"
-    return ns_comptime(value * 1000)
-
-pub comptime fn ms_comptime(value: u64) -> Duration:
-    comptime assert value <= 18446744073709, "milliseconds exceed the u64 nanosecond representation"
-    return ns_comptime(value * 1000000)
-
-pub comptime fn seconds_comptime(value: u64) -> Duration:
-    comptime assert value <= 18446744073, "seconds exceed the u64 nanosecond representation"
-    return ns_comptime(value * 1000000000)
-
-pub comptime fn minutes_comptime(value: u64) -> Duration:
-    comptime assert value <= 307445734, "minutes exceed the u64 nanosecond representation"
-    return ns_comptime(value * 60000000000)
-
-pub comptime fn hours_comptime(value: u64) -> Duration:
-    comptime assert value <= 5124095, "hours exceed the u64 nanosecond representation"
-    return ns_comptime(value * 3600000000000)
-
-pub comptime fn days_comptime(value: u64) -> Duration:
-    comptime assert value <= 213503, "days exceed the u64 nanosecond representation"
-    return ns_comptime(value * 86400000000000)
-
-pub comptime fn weeks_comptime(value: u64) -> Duration:
-    comptime assert value <= 30500, "weeks exceed the u64 nanosecond representation"
-    return ns_comptime(value * 604800000000000)
-
-pub comptime fn as_nanoseconds_comptime(value: Duration) -> u64:
-    return value.nanoseconds
-
-pub comptime fn add_comptime(left: Duration, right: Duration) -> Duration:
-    comptime assert left.nanoseconds <= 18446744073709551615 - right.nanoseconds, "duration addition exceeds the u64 nanosecond representation"
-    return ns_comptime(left.nanoseconds + right.nanoseconds)
-
-pub comptime fn subtract_comptime(left: Duration, right: Duration) -> Duration:
-    comptime assert right.nanoseconds <= left.nanoseconds, "duration subtraction would produce a negative duration"
-    return ns_comptime(left.nanoseconds - right.nanoseconds)
-
-pub comptime fn scale_comptime(value: Duration, factor: u64) -> Duration:
-    if factor == 0:
-        return ns_comptime(0)
-    comptime assert value.nanoseconds <= 18446744073709551615 / factor, "duration scaling exceeds the u64 nanosecond representation"
-    return ns_comptime(value.nanoseconds * factor)
-
-pub comptime fn less_than_comptime(left: Duration, right: Duration) -> bool:
-    return left.nanoseconds < right.nanoseconds
-
-pub comptime fn less_than_or_equal_comptime(left: Duration, right: Duration) -> bool:
-    return left.nanoseconds <= right.nanoseconds
-
-pub comptime fn greater_than_comptime(left: Duration, right: Duration) -> bool:
-    return less_than_comptime(left=right, right=left)
-
-pub comptime fn greater_than_or_equal_comptime(left: Duration, right: Duration) -> bool:
-    return less_than_or_equal_comptime(left=right, right=left)
-
-pub comptime fn min_comptime(left: Duration, right: Duration) -> Duration:
-    selected: u64 = right.nanoseconds
-    if less_than_or_equal_comptime(left=left, right=right):
-        selected = left.nanoseconds
-    return ns_comptime(selected)
-
-pub comptime fn max_comptime(left: Duration, right: Duration) -> Duration:
-    selected: u64 = left.nanoseconds
-    if less_than_comptime(left=left, right=right):
-        selected = right.nanoseconds
-    return ns_comptime(selected)
-
-pub comptime fn clamp_comptime(value: Duration, lower: Duration, upper: Duration) -> Duration:
-    comptime assert lower.nanoseconds <= upper.nanoseconds, "duration clamp lower bound exceeds its upper bound"
-    width: u64 = upper.nanoseconds - lower.nanoseconds
-    maximum: u64 = lower.nanoseconds + width
-    selected: u64 = value.nanoseconds
-    if selected < lower.nanoseconds:
-        selected = lower.nanoseconds
-    if maximum < selected:
-        selected = maximum
-    return ns_comptime(selected)
+    assert lower <= upper, "duration clamp lower bound exceeds its upper bound"
+    selected: Duration = copy value
+    if selected < lower:
+        selected = lower
+    if upper < selected:
+        selected = upper
+    return selected

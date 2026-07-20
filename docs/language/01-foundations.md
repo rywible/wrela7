@@ -103,11 +103,14 @@ Every conforming implementation MUST enforce these invariants.
    `view` or a second-class view carrier.
 2. A `mut` access is exclusive for its lexical duration.
 3. A `take` access leaves its source uninitialized until explicitly replaced.
-4. Only a projection may yield a view, and its public provenance set names every
-   possible backing source. A view is lexical and second-class: it cannot be stored, sent, captured by an
-   escaping closure, submitted to hardware, or kept across `await`. A
-   tuple/`Result`/`Option` projection carrier exists only while immediately
-   binding, destructuring, propagating, or matching the projection.
+4. Only a projection may yield a view. Provenance is implicit and conservative:
+   every receiver and parameter reachable by the projection is treated as a
+   possible backing source, and callers retain that access until the view
+   ends. A view is lexical and second-class: it cannot be stored, sent,
+   captured by an escaping closure, submitted to hardware, or kept across
+   `await`. An `Option`/`Result` carrier wrapping one view leaf exists only
+   while immediately binding, destructuring, propagating, or matching the
+   projection.
 5. Non-scalar duplication is explicit with `copy`; assignment otherwise moves.
 6. Cross-actor messages contain scalar or explicitly copied values, immutable image-static values,
    transferred `iso` values, or sealed linear runtime handles such as device

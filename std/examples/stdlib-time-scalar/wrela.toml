@@ -6,14 +6,6 @@ name = "stdlib-time-scalar-conformance"
 version = "0.1.0"
 source_root = "src"
 
-[[module]]
-name = "conformance.duration_scalar_test"
-path = "conformance/duration_scalar_test.wr"
-
-[[module]]
-name = "conformance.image"
-path = "conformance/image.wr"
-
 [[dependency]]
 alias = "core"
 package = "wrela-core"

@@ -40,10 +40,10 @@ payloads are copyable. Copyability is structural and has no size heuristic.
 Duplicating a non-scalar copyable value requires the explicit `copy` expression
 and produces an independent value.
 
-Classes, capabilities, queue permits, completion tokens, `iso` handles, region
-handles, and values that contain any of them are linear. A linear value has one
-owner and cannot be implicitly copied or silently overwritten. Linear values
-belong to one of two teardown classes:
+Values of `linear struct` declarations, capabilities, queue permits, completion
+tokens, `iso` handles, region handles, and values that contain any of them are
+linear. A linear value has one owner and cannot be implicitly copied or
+silently overwritten. Linear values belong to one of two teardown classes:
 
 - **Reclaimable linear** values have a compiler-known, non-failing consume
   action. Branded `iso` pool handles and compiler-owned arena slots are the
@@ -53,8 +53,8 @@ belong to one of two teardown classes:
   preserve the payload must instead return it explicitly.
 - **Strict linear** values carry protocol or authority meaning that cannot be
   represented by forgetting them. Capabilities, queue permits, device receipts,
-  repair tokens, and active protocol states are strict. Every control-flow edge
-  must explicitly consume, return, transfer, or protect them with a scope whose
+  and active protocol states are strict. Every control-flow edge must
+  explicitly consume, return, transfer, or protect them with a scope whose
   exit contract does so.
 
 A composite is strict when any field is strict; otherwise it is reclaimable
@@ -103,7 +103,7 @@ an exclusive read-write projection. Neither is a general reference and neither
 has a source-level lifetime parameter.
 
 ```wrela
-projection header(read packet: Packet) -> view Header from packet:
+projection header(read packet: Packet) -> view Header:
     yield packet.header
 
 hdr: view Header = header(packet)
@@ -124,15 +124,17 @@ A view's lifetime is derived lexically:
 This is not runtime reference counting. The compiler computes the interval from
 source structure and reports the source path it freezes.
 
-A yielded view is a re-projection of storage owned by a receiver or parameter in
-the projection's declared `from` set. It receives a new lexical lifetime in the
-caller. Only a `projection` may yield it; ordinary functions cannot return a
-view of any source, local, or call-region temporary. The source's `read` or
-`mut` access is extended through the projection activation rather than ending
-at the call boundary.
+A yielded view is a re-projection of storage owned by the projection's
+receiver or parameters. Provenance is implicit and conservative: every
+receiver and parameter reachable by the projection body is a possible backing
+source, whether or not a given call actually yields from it. The view
+receives a new lexical lifetime in the caller. Only a `projection` may yield
+it; ordinary functions cannot return a view of any source, local, or
+call-region temporary. The source's `read` or `mut` access is extended
+through the projection activation rather than ending at the call boundary.
 
 ```wrela
-projection longer(a: Bytes, b: Bytes) -> view Bytes from a, b:
+projection longer(a: Bytes, b: Bytes) -> view Bytes:
     if a.len() >= b.len():
         yield a
     else:
@@ -146,7 +148,7 @@ while the caller's result remains live.
 
 A view MUST NOT:
 
-- be stored in a class or struct field;
+- be stored in a struct field;
 - be inserted into a collection or `iso` value;
 - be captured by an escaping closure;
 - be included in an actor message;
@@ -156,7 +158,7 @@ A view MUST NOT:
 - cross a scope whose teardown may invalidate its source.
 
 ```wrela
-class Holder:
+struct Holder:
     held: view Bytes             # compile error: fields cannot contain views
 
 async fn bad(mut self):
@@ -174,14 +176,13 @@ take ownership or end the access before `await`.
 
 There is one actor-local exception: a whole-value access rooted at the actor of
 the current non-reentrant turn may survive suspension. This includes an access
-to a transitively owned ordinary class such as `self.fs` or
+to a transitively owned ordinary struct such as `self.fs` or
 `self.fs.cache`. The frame stores a compiler path rooted at the actor and
 re-derives it on resume; it does not store a source-visible pointer or view.
 Exclusivity still applies against internal calls and structured child work. The
-access cannot be sent to a child, and moving any ancestor of the path requires a
-suspend-safe restoration obligation before suspension. Actor restart tears down
-the turn and actor together, so the path is never resumed into a replacement
-instance.
+access cannot be sent to a child, and moving any ancestor of the path before
+the access ends is a compile error. Actor restart tears down the turn and
+actor together, so the path is never resumed into a replacement instance.
 
 A private helper on an external argument is legal only when that argument's
 access ends before its first reachable `await`. In every case an async return
@@ -199,7 +200,7 @@ projection accessor:
 
 ```wrela
 projection entry(mut self, key: Key)
-    -> Result[mut view Item, MissingKey] from self:
+    -> Result[mut view Item, MissingKey]:
     index = self.resolve(key)?
     yield self.items[index]
 ```
@@ -218,19 +219,13 @@ item.count += 1
 This is the zero-copy read/modify/write mechanism. It replaces holding a stored
 reference or copying an entire cache line merely to patch one field.
 
-A view leaf, tuple of projection carriers, `Option[carrier]`, or
-`Result[carrier, E]` is legal only as a second-class projection carrier. The
-carrier is consumed immediately by a view binding/destructure, `?`, or
-`match`; only selected lexical views or the owned error/`None` path survives.
-It has no ordinary storage layout, cannot be rebound as a value, and cannot
-itself cross `await`. Multiple mutable leaves require a compiler proof that
-their paths are disjoint. An unsuccessful projection path executes no `yield`
-and releases every temporary access before returning.
-
-```wrela
-(left, right) = buffer.split_mut(mid)?
-# The names are inferred lexical views; the carrier itself is never bound.
-```
+A projection has exactly one view leaf, optionally wrapped in `Option[view T]`
+or `Result[view T, E]`. That wrapped form is legal only as a second-class
+projection carrier: it is consumed immediately by a view binding/destructure,
+`?`, or `match`; only the selected view or the owned error/`None` path
+survives. It has no ordinary storage layout, cannot be rebound as a value, and
+cannot itself cross `await`. An unsuccessful projection path executes no
+`yield` and releases every temporary access before returning.
 
 ### 4.4 Iteration
 
@@ -473,9 +468,9 @@ model. The standard pattern is `SlotMap[T, N]`:
 map: SlotMap[Node, 1024]
 key = map.insert(value=take node)?
 match map.get(key):
-    case Some(node):
+    case .Some(node):
         inspect(node)
-    case None:
+    case .None:
         return Err(GraphError.stale_key)
 ```
 
@@ -517,7 +512,6 @@ optional acquisition `abort`, and `exit`. A scope's result is an owned value,
 never an implicit view:
 
 ```wrela
-@suspend_safe
 scope transaction(mut self) -> Transaction:
     enter self.begin_transaction()
     abort:
@@ -525,21 +519,6 @@ scope transaction(mut self) -> Transaction:
     exit transaction:
         self.finish_or_rollback(mut transaction)
 ```
-
-An actor-local suspend-safe scope may protect temporarily incomplete actor state
-with a compiler-sealed repair token. The token records only the owning actor,
-field path, and exit action; source cannot dereference, store, send, or copy it.
-The non-reentrant turn remains the sole owner while suspended. This is how a
-cache can move a line into a request, await I/O, and still have a deterministic
-rollback without storing a mutable projection in the frame.
-
-Moving a field out of a suspend-safe scope into structured child work creates a
-**restoration obligation**. The move is legal only when the awaitable's explicit
-result or sealed cancellation contract returns that owned value, or when the
-scope's exit contract explicitly permits consuming it. Ordinary actor calls do
-not provide restoration merely because they accept `take`. Generated
-cancellation runs child teardown and discharges the obligation before making the
-dependent outer exit action runnable.
 
 Entering a `with` scope evaluates the acquisition prefix and `enter`
 expression before the scope becomes active. Before `enter`, source may perform
@@ -585,15 +564,10 @@ reclamation, not an async source destructor: the canceled frame never resumes,
 the owning driver retains hardware authority, and the event loop may continue
 running unrelated work.
 
-Each scope type declares whether suspension is allowed while it is active.
-Request and nursery scopes are suspend-safe. A live view, mutable projection,
-IRQ-masked scope, or ordinary device-register transaction is not. `await` inside
-a non-suspend-safe scope is a compile error.
-
-`@suspend_safe` requests verification; it is not an unsafe promise. The compiler
-must prove that the scope stores only owned/frame-safe state, that every moved
-resource has an explicit restoration or consumption path, that the cleanup graph
-is acyclic, and that abort/exit actions need no live view or forbidden effect.
+Each scope type declares whether suspension is allowed in its body. Request and
+nursery scopes may hold `await` in their body. A live view, mutable projection,
+IRQ-masked scope, or ordinary device-register transaction may not; `await`
+inside such a scope is a compile error.
 
 Strict-linear resources cannot be created and then forgotten. They must be
 moved to another owner, returned, installed in the image graph, or acquired

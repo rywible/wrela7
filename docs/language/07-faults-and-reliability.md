@@ -92,7 +92,7 @@ become runtime panics.
 comptime assert QDEPTH.is_power_of_two()
 
 @layout_assert
-comptime fn memory_ceiling(report: ImageReport):
+fn memory_ceiling(report: ImageReport):
     assert report.peak_memory <= 64.MiB
 ```
 

@@ -7,5 +7,4 @@ package."version" = '''
 1.0.0'''
 "package".source_root = """
 src"""
-module = [{ "name" = 'mini', path = "mini\u002Ewr" }]
 profile = [{ name = """development""", mode = 'development', comptime_steps = 0b1, comptime_memory_bytes = 0o1, comptime_call_depth = 0x1, static_bytes = +1, peak_bytes = 1, event_log_bytes = 0, dma_coherent = false, require_iommu = false, reset_timeout_ns = 1, quarantine_bytes = 0, recording = 'disabled', optimization = "none", sealed_deployment = false, warnings_as_errors = false, watchdogs = false }]

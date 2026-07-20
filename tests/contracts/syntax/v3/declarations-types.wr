@@ -17,7 +17,7 @@ struct Packet[T: Serializable, const N: usize, region R,]:
     owned: iso[PacketPool] T
 
 @service
-class Service[T] implements Reader[T], core.Closeable,:
+linear struct Service[T] implements Reader[T], core.Closeable,:
     state: iso[PacketPool] State
 
     init(mut self, state: iso[PacketPool] State):
@@ -32,7 +32,7 @@ class Service[T] implements Reader[T], core.Closeable,:
 
     const INITIAL: u64 = 0
 
-    projection state_view(read self) -> view State from self:
+    projection state_view(read self) -> view State:
         yield self.state
 
     comptime if true:
@@ -47,25 +47,25 @@ enum Outcome[T]:
     pair(T, u64,)
     named(code: u32, payload: T,)
 
-iface Reader[T]:
+interface Reader[T]:
     @budget(bound=1)
     fn fetch(read self, key: u64) -> Result[T, Error]
 
     async fn poll(read self) -> unit
     isr fn interrupt(self)
-    comptime fn default_value() -> T
-    projection inspect(read self) -> Option[(view T, mut view T,)] from self
+    fn default_value() -> T
+    projection inspect(read self) -> Option[mut view T]
 
 impl Reader[u64] for Service[u64]:
     @budget(bound=1)
     fn fetch(read self, key: u64) -> Result[u64, Error]:
         return key
 
-    projection inspect(read self) -> Result[view State, Missing] from self:
+    projection inspect(read self) -> Result[view State, Missing]:
         yield self.state
 
 projection locate[T](mut buffer: Buffer[T], index: usize,)
-    -> Result[Option[view T], Missing] from buffer, index:
+    -> Result[view T, Missing]:
     yield buffer.items[index]
 
 @suspend_safe
@@ -87,7 +87,7 @@ async fn asynchronous() -> unit:
 isr fn interrupt(self):
     pass
 
-comptime fn capacity[const N: usize]() -> usize:
+fn capacity[const N: usize]() -> usize:
     return N
 
 comptime if true:

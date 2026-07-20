@@ -57,6 +57,7 @@ use wrela_toolchain::{
 const MAX_FIXTURE_FILE_BYTES: usize = 1024 * 1024;
 const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.toml");
 const CORE_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/image.wr");
+const CORE_OPS_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/ops.wr");
 const CORE_RESULT_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/result.wr");
 const CORE_TIME_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/time.wr");
 const APPLICATION_MANIFEST: &[u8] =
@@ -68,7 +69,7 @@ const SCALAR_APPLICATION_SOURCE: &[u8] = br#"module bootstrap.image
 from core.image import Image, Target
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="bootstrap", target=Target.aarch64_qemu_virt_uefi)
 
 @test
@@ -87,6 +88,13 @@ fn scalar_runtime():
     else:
         joined = 17
     helper(x=joined)
+    # A bounded `while` is outside the comptime evaluator's supported
+    # subset, so this keeps the test in the runtime/image tier
+    # deterministically (every function is otherwise phase-neutral and
+    # would be comptime-legal on its own).
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
     return
 
 fn helper(x: u32) -> u32:
@@ -272,6 +280,7 @@ impl Fixture {
             core_manifest,
             &[
                 ("image.wr", CORE_SOURCE),
+                ("ops.wr", CORE_OPS_SOURCE),
                 ("result.wr", CORE_RESULT_SOURCE),
                 ("time.wr", CORE_TIME_SOURCE),
             ],
@@ -401,6 +410,7 @@ impl Fixture {
         let standard_library_measurement = canonical_tree_digest(
             &[
                 tree_record("wrela-core-0.1/src/image.wr", CORE_SOURCE),
+                tree_record("wrela-core-0.1/src/ops.wr", CORE_OPS_SOURCE),
                 tree_record("wrela-core-0.1/src/result.wr", CORE_RESULT_SOURCE),
                 tree_record("wrela-core-0.1/src/time.wr", CORE_TIME_SOURCE),
                 tree_record("wrela-core-0.1/wrela.toml", &core.manifest_bytes),
@@ -970,10 +980,10 @@ fn source_scalar_runtime_test_reaches_the_private_backend_boundary() {
     assert_debug_occurrences(&semantic_debug, "operator: Negate", 1);
     assert_debug_occurrences(&semantic_debug, "operator: BoolNot", 1);
     assert_debug_occurrences(&semantic_debug, "operator: BitNot", 1);
-    assert_debug_occurrences(&semantic_debug, "arithmetic: Checked", 19);
+    assert_debug_occurrences(&semantic_debug, "arithmetic: Checked", 21);
     assert_debug_occurrences(&semantic_debug, "arithmetic: Wrapping", 3);
     assert_debug_occurrences(&semantic_debug, "checked: true", 1);
-    assert_debug_occurrences(&semantic_debug, "If {", 2);
+    assert_debug_occurrences(&semantic_debug, "If {", 3);
     assert_debug_occurrences(&semantic_debug, "Yield([ValueId(", 4);
 
     let flow_output = CanonicalFlowLowerer::new()
@@ -1011,7 +1021,15 @@ fn source_scalar_runtime_test_reaches_the_private_backend_boundary() {
         "Greater",
         "GreaterEqual",
     ] {
-        assert_debug_occurrences(&flow_debug, &format!("op: {operator},"), 1);
+        // The bounded-while tier guard adds one extra `AddChecked` (its
+        // `+= 1`) and one extra `Less` (its `guard < 1` condition, checked
+        // at least once more on the loop's back edge).
+        let expected = match operator {
+            "AddChecked" => 2,
+            "Less" => 2,
+            _ => 1,
+        };
+        assert_debug_occurrences(&flow_debug, &format!("op: {operator},"), expected);
     }
     assert_debug_occurrences(&flow_debug, "op: Negate,", 1);
     assert_debug_occurrences(&flow_debug, "op: BoolNot,", 1);
@@ -1023,7 +1041,28 @@ fn source_scalar_runtime_test_reaches_the_private_backend_boundary() {
         .iter()
         .filter(|block| !block.parameters.is_empty())
         .collect::<Vec<_>>();
-    assert_eq!(join_blocks.len(), 2, "inner and outer scalar SSA joins");
+    // The bounded-while tier guard contributes its own header/exit join
+    // blocks, which thread every other local still live across the loop's
+    // back edge (all 7 locals in scope), distinct from the two single-value
+    // scalar `if`/nested-`if` joins this test otherwise exercises.
+    let scalar_joins = join_blocks
+        .iter()
+        .filter(|block| block.parameters.len() == 1)
+        .copied()
+        .collect::<Vec<_>>();
+    let guard_joins = join_blocks
+        .iter()
+        .filter(|block| block.parameters.len() == 7)
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        scalar_joins.len() + guard_joins.len(),
+        join_blocks.len(),
+        "every join block must be either a scalar join or the tier guard's"
+    );
+    assert_eq!(scalar_joins.len(), 2, "inner and outer scalar SSA joins");
+    assert_eq!(guard_joins.len(), 2, "the tier guard's header and exit");
+    let join_blocks = scalar_joins;
     for join in &join_blocks {
         assert_eq!(join.parameters.len(), 1);
         let target = format!("target: {:?}", join.id);

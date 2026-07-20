@@ -6,14 +6,6 @@ name = "appliance"
 version = "0.1.0"
 source_root = "src"
 
-[[module]]
-name = "appliance.image"
-path = "appliance/image.wr"
-
-[[module]]
-name = "appliance.runtime"
-path = "appliance/runtime.wr"
-
 [[dependency]]
 alias = "core"
 package = "wrela-core"

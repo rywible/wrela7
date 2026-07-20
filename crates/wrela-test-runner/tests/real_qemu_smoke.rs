@@ -1371,10 +1371,6 @@ name = "runner-smoke"
 version = "0.1.0"
 source_root = "src"
 
-[[module]]
-name = "bootstrap.image"
-path = "bootstrap/image.wr"
-
 [[dependency]]
 alias = "core"
 package = "wrela-core"
@@ -1412,12 +1408,18 @@ const APPLICATION_SOURCE: &[u8] = br#"module bootstrap.image
 from core.image import Image, Target
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="bootstrap", target=Target.aarch64_qemu_virt_uefi)
 
 @test
 fn runtime_case():
-    pass
+    # A bounded `while` is outside the comptime evaluator's supported
+    # subset, so this keeps the test in the runtime/image tier
+    # deterministically (every function is otherwise phase-neutral and
+    # would be comptime-legal on its own).
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
 "#;
 const APPLICATION_TEST_NAME: &str = "runner-smoke@0.1.0::bootstrap.image::runtime_case";
 const APPLICATION_TEST_TIMEOUT_NS: u64 = 30_000_000_000;
@@ -2288,8 +2290,28 @@ fn smoke_lockfile(manifest: &wrela_toolchain::ToolchainManifest) -> Vec<u8> {
             &never_cancelled,
         )
         .expect("decode embedded smoke manifest");
+    // The embedded manifest declares no `[[module]]` block (modules are
+    // derived, not decoded); canonicalize before hashing so this matches
+    // exactly what the production loader binds into package/manifest
+    // digests, independent of whether the literal above happens to already
+    // be byte-canonical.
+    let canonical_application_manifest = codec
+        .canonical_manifest(
+            &application,
+            ManifestCodecLimits {
+                bytes: 1024 * 1024,
+                string_bytes: 1024 * 1024,
+                modules: 16,
+                dependencies: 16,
+                profiles: 16,
+                images: 16,
+                image_tests: 16,
+            },
+            &never_cancelled,
+        )
+        .expect("canonicalize embedded smoke manifest");
     let source_digest = package_content_digest(
-        APPLICATION_MANIFEST,
+        &canonical_application_manifest,
         &[PackageContentRecord {
             kind: PackageContentKind::Source,
             path: "bootstrap/image.wr",
@@ -2322,7 +2344,7 @@ fn smoke_lockfile(manifest: &wrela_toolchain::ToolchainManifest) -> Vec<u8> {
             alias: DependencyAlias::new("core").expect("core dependency alias"),
             identity: core.identity.clone(),
         }],
-        manifest_digest: HASHER.sha256(APPLICATION_MANIFEST),
+        manifest_digest: HASHER.sha256(&canonical_application_manifest),
     };
     let core = LockedPackage {
         identity: core.identity.clone(),
@@ -3789,14 +3811,24 @@ mod tests {
         let manifest = codec
             .decode_manifest(RUNTIME_TIMEOUT_MANIFEST, manifest_limits, &never_cancelled)
             .expect("decode canonical runtime-timeout manifest");
+        // This checked-in manifest declares only `[[profile]]` overrides and
+        // no `[[module]]` block (modules are derived, not decoded), so it is
+        // valid schema-1 input without being byte-identical to its own
+        // canonical re-encoding. Round-tripping through decode -> canonical
+        // -> decode must still be a fixed point, and every digest below
+        // binds the canonical bytes, matching what the production loader
+        // hashes.
+        let canonical_manifest = codec
+            .canonical_manifest(&manifest, manifest_limits, &never_cancelled)
+            .expect("encode canonical runtime-timeout manifest");
         assert_eq!(
             codec
-                .canonical_manifest(&manifest, manifest_limits, &never_cancelled)
-                .expect("encode canonical runtime-timeout manifest"),
-            RUNTIME_TIMEOUT_MANIFEST,
+                .decode_manifest(&canonical_manifest, manifest_limits, &never_cancelled)
+                .expect("redecode canonical runtime-timeout manifest"),
+            manifest,
         );
         let source_digest = package_content_digest(
-            RUNTIME_TIMEOUT_MANIFEST,
+            &canonical_manifest,
             &[PackageContentRecord {
                 kind: PackageContentKind::Source,
                 path: "runtime_timeout/image.wr",

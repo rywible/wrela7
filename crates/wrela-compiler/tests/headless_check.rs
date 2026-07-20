@@ -35,6 +35,7 @@ use wrela_toolchain::{
 
 const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.toml");
 const CORE_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/image.wr");
+const CORE_OPS_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/ops.wr");
 const CORE_RESULT_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/result.wr");
 const CORE_TIME_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/time.wr");
 const APPLICATION_MANIFEST: &[u8] =
@@ -126,7 +127,7 @@ fn frozen_minimal_image_lockfile_matches_the_derived_current_identity_exactly() 
     assert_eq!(derived, APPLICATION_LOCKFILE);
     assert_eq!(
         digest(&derived).to_hex(),
-        "2003f707b3eb8689b2371750998bc7d37b9959bc02be760a72159f285ff314c2"
+        "29ebae766554f7cff30229a4b21f28a9cf8d3ec8b3bc7adaf75b90050c690ceb"
     );
 }
 
@@ -709,19 +710,34 @@ impl Drop for TestDirectory {
     }
 }
 
+/// Re-encode a checked-in manifest to its canonical bytes. These fixtures
+/// declare only `[[profile]]` overrides and no `[[module]]` block (modules
+/// are derived, not decoded), so they are not necessarily byte-canonical
+/// themselves; every package or manifest digest must bind the same
+/// canonical bytes the production loader hashes, never the raw checked-in
+/// TOML.
+fn canonical_manifest_bytes(raw: &[u8]) -> Vec<u8> {
+    let codec = CanonicalPackageCodec::new();
+    let manifest = codec
+        .decode_manifest(raw, manifest_limits(), &|| false)
+        .expect("checked-in manifest");
+    codec
+        .canonical_manifest(&manifest, manifest_limits(), &|| false)
+        .expect("canonical manifest identity bytes")
+}
+
 fn current_core_identity() -> PackageIdentity {
     let codec = CanonicalPackageCodec::new();
     let core = codec
         .decode_manifest(CORE_MANIFEST, manifest_limits(), &|| false)
         .expect("checked-in core manifest");
-    let canonical_core_manifest = codec
-        .canonical_manifest(&core, manifest_limits(), &|| false)
-        .expect("canonical core manifest identity bytes");
+    let canonical_core_manifest = canonical_manifest_bytes(CORE_MANIFEST);
     package_identity(
         &core,
         &canonical_core_manifest,
         &[
             ("image.wr", CORE_SOURCE),
+            ("ops.wr", CORE_OPS_SOURCE),
             ("result.wr", CORE_RESULT_SOURCE),
             ("time.wr", CORE_TIME_SOURCE),
         ],
@@ -814,7 +830,7 @@ fn deliberately_stale_application_lockfile(source: &[u8]) -> Vec<u8> {
 
 fn application_source_digest(source: &[u8]) -> Sha256Digest {
     package_content_digest(
-        APPLICATION_MANIFEST,
+        &canonical_manifest_bytes(APPLICATION_MANIFEST),
         &[PackageContentRecord {
             kind: PackageContentKind::Source,
             path: "bootstrap/image.wr",
@@ -856,6 +872,10 @@ fn install_toolchain(directory: &TestDirectory, frontend_bytes: &[u8]) {
         CORE_SOURCE,
     );
     directory.write(
+        "toolchain/share/wrela/std/wrela-core-0.1/src/ops.wr",
+        CORE_OPS_SOURCE,
+    );
+    directory.write(
         "toolchain/share/wrela/std/wrela-core-0.1/src/result.wr",
         CORE_RESULT_SOURCE,
     );
@@ -879,6 +899,7 @@ fn install_toolchain(directory: &TestDirectory, frontend_bytes: &[u8]) {
 
     let standard_library = tree_measurement(&[
         tree_record("wrela-core-0.1/src/image.wr", CORE_SOURCE),
+        tree_record("wrela-core-0.1/src/ops.wr", CORE_OPS_SOURCE),
         tree_record("wrela-core-0.1/src/result.wr", CORE_RESULT_SOURCE),
         tree_record("wrela-core-0.1/src/time.wr", CORE_TIME_SOURCE),
         tree_record("wrela-core-0.1/wrela.toml", CORE_MANIFEST),
@@ -901,7 +922,7 @@ fn install_toolchain(directory: &TestDirectory, frontend_bytes: &[u8]) {
             locator: PackageLocator::Toolchain {
                 component: "wrela-core-0.1".to_owned(),
             },
-            manifest_digest: HASHER.sha256(CORE_MANIFEST),
+            manifest_digest: HASHER.sha256(&canonical_manifest_bytes(CORE_MANIFEST)),
         }],
         components: vec![
             shipped_component(ComponentKind::Frontend, frontend_path(), frontend_bytes),

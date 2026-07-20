@@ -778,9 +778,7 @@ fn census_builtin_attributes(
     for declaration in &program.declarations {
         census.visit_owner(limits, is_cancelled)?;
         census.visit_attributes(&declaration.attributes, limits, is_cancelled)?;
-        if let DeclarationKind::Structure(aggregate) | DeclarationKind::Class(aggregate) =
-            &declaration.kind
-        {
+        if let DeclarationKind::Structure(aggregate) = &declaration.kind {
             for field in &aggregate.fields {
                 census.visit_owner(limits, is_cancelled)?;
                 census.visit_attributes(&field.attributes, limits, is_cancelled)?;
@@ -919,6 +917,14 @@ impl SemanticAnalyzer for CanonicalSemanticAnalyzer {
             census_builtin_attributes(request.hir.as_program(), request.limits, is_cancelled)?;
         let mut diagnostics = census.diagnostics;
         diagnose_unsupported_initializers(&request, &mut diagnostics, is_cancelled)?;
+        let (_, interface_diagnostics) = crate::interfaces::collect_interface_model(
+            request.hir.as_program(),
+            request.standard_library_package,
+            is_cancelled,
+        )?;
+        for diagnostic in interface_diagnostics {
+            push_diagnostic(&mut diagnostics, diagnostic, request.limits)?;
+        }
         if !diagnostics.is_empty() {
             check_cancelled(is_cancelled)?;
             return finish_analysis(&request, partial, diagnostics, is_cancelled);
@@ -1401,6 +1407,12 @@ struct SupportedSourceTest {
     name: String,
     source: Span,
     checked_comptime: Option<CheckedComptimeClosure>,
+    // Set when this test's transitive closure failed the comptime-legality
+    // check but it was still accepted as a valid runtime/image test. An
+    // explicit `--comptime` selection that ends up excluding every
+    // candidate uses this to explain *why*, instead of silently sealing an
+    // empty comptime test group.
+    comptime_gate_diagnostic: Option<Diagnostic>,
     runtime_statements: Vec<StatementId>,
     assertions: Vec<PlannedAssertionDescriptor>,
     work_bound: u64,
@@ -1467,18 +1479,48 @@ fn discover_tests(
 
     let initial_diagnostic_count = diagnostics.len();
     let mut runtime_aggregate_work = RuntimeAggregateWork::default();
+    // An explicit `--comptime` selection that ends up excluding every
+    // candidate (each one only qualified for a different tier) has
+    // discovered zero tests for no visible reason; remember the first
+    // exclusion's own comptime-legality diagnostic so that scenario can
+    // fail closed with a real explanation instead of silently sealing an
+    // empty test group. A selection that keeps at least one comptime test
+    // alongside other, differently-tiered candidates is a normal, healthy
+    // scan, so this is never consulted when `unit_tests` ends up nonempty.
+    let mut comptime_selection_exclusion: Option<Diagnostic> = None;
     for candidate in &program.test_candidates {
         check_cancelled(is_cancelled)?;
         if !source_test_selected(request, *candidate, source_selection, is_cancelled)? {
             continue;
         }
-        let supported = match inspect_source_test(request, *candidate, is_cancelled)? {
-            Ok(test) => test,
-            Err(diagnostic) => {
-                push_diagnostic(diagnostics, diagnostic, request.limits)?;
-                continue;
-            }
+        let supported =
+            match inspect_source_test(request, *candidate, source_selection, is_cancelled)? {
+                Ok(test) => test,
+                Err(diagnostic) => {
+                    push_diagnostic(diagnostics, diagnostic, request.limits)?;
+                    continue;
+                }
+            };
+        // A plain `fn` test's tier is decided by whether its transitive call
+        // closure is comptime-legal, not by its declared color, so the
+        // requested `--comptime`/`--integration` selection can only be
+        // enforced once that has actually been checked.
+        let is_comptime_tier = supported.checked_comptime.is_some();
+        let tier_selected = match source_selection {
+            TestDiscoverySelection::Comptime => is_comptime_tier,
+            TestDiscoverySelection::Integration => !is_comptime_tier,
+            TestDiscoverySelection::All
+            | TestDiscoverySelection::None
+            | TestDiscoverySelection::NameContains(_) => true,
         };
+        if !tier_selected {
+            if matches!(source_selection, TestDiscoverySelection::Comptime)
+                && comptime_selection_exclusion.is_none()
+            {
+                comptime_selection_exclusion = supported.comptime_gate_diagnostic;
+            }
+            continue;
+        }
         match append_source_test_function(
             request,
             partial,
@@ -1501,43 +1543,45 @@ fn discover_tests(
             source: Some(supported.source),
             timeout_ns: COMPTIME_TEST_TIMEOUT_NS,
         };
-        match supported.color {
-            FunctionColor::Comptime => {
-                let result_descriptor = TestDescriptor {
-                    id: TestId(descriptor.id.0),
-                    name: copy_bounded_test_text(request, &descriptor.name, is_cancelled)?,
-                    kind: TestKind::ComptimeUnit,
-                    source: descriptor.source,
-                    timeout_ns: descriptor.timeout_ns,
-                };
-                match evaluate_comptime_test(request, &supported, result_descriptor, is_cancelled)?
-                {
-                    ComptimeCase::Result(result) => {
-                        unit_tests.push(ComptimeTest {
-                            descriptor,
-                            function_key: supported.key,
-                        });
-                        comptime_results.push(result);
-                    }
-                    ComptimeCase::Unsupported(diagnostic) => {
-                        push_diagnostic(diagnostics, diagnostic, request.limits)?;
-                    }
+        if is_comptime_tier {
+            let result_descriptor = TestDescriptor {
+                id: TestId(descriptor.id.0),
+                name: copy_bounded_test_text(request, &descriptor.name, is_cancelled)?,
+                kind: TestKind::ComptimeUnit,
+                source: descriptor.source,
+                timeout_ns: descriptor.timeout_ns,
+            };
+            match evaluate_comptime_test(request, &supported, result_descriptor, is_cancelled)? {
+                ComptimeCase::Result(result) => {
+                    unit_tests.push(ComptimeTest {
+                        descriptor,
+                        function_key: supported.key,
+                    });
+                    comptime_results.push(result);
+                }
+                ComptimeCase::Unsupported(diagnostic) => {
+                    push_diagnostic(diagnostics, diagnostic, request.limits)?;
                 }
             }
-            FunctionColor::Sync | FunctionColor::Async => {
-                runtime_tests.push(PendingImageTest {
-                    name: supported.name,
-                    kind: TestKind::IntegrationImage,
-                    source: Some(supported.source),
-                    timeout_ns: INTEGRATION_TEST_TIMEOUT_NS,
-                    invocation: ImageTestInvocation::GeneratedFunction {
-                        function_key: supported.key,
-                    },
-                    assertions: supported.assertions,
-                });
-            }
-            FunctionColor::Isr => return Err(AnalysisFailure::RequestMismatch),
+        } else {
+            runtime_tests.push(PendingImageTest {
+                name: supported.name,
+                kind: TestKind::IntegrationImage,
+                source: Some(supported.source),
+                timeout_ns: INTEGRATION_TEST_TIMEOUT_NS,
+                invocation: ImageTestInvocation::GeneratedFunction {
+                    function_key: supported.key,
+                },
+                assertions: supported.assertions,
+            });
         }
+    }
+
+    if unit_tests.is_empty()
+        && diagnostics.len() == initial_diagnostic_count
+        && let Some(diagnostic) = comptime_selection_exclusion
+    {
+        push_diagnostic(diagnostics, diagnostic, request.limits)?;
     }
 
     if diagnostics.len() != initial_diagnostic_count {
@@ -1771,7 +1815,11 @@ fn source_test_selected(
     .ok_or(AnalysisFailure::RequestMismatch)?;
     Ok(match selection {
         TestDiscoverySelection::All => true,
-        TestDiscoverySelection::Comptime => function.color == FunctionColor::Comptime,
+        // Only a plain `fn` can ever be comptime-legal; an `async fn` test
+        // can never run in the comptime tier (section 2 forbids async
+        // operations at comptime), so this remains a coarse pre-filter and
+        // the exact tier is decided once the closure is actually checked.
+        TestDiscoverySelection::Comptime => function.color == FunctionColor::Sync,
         TestDiscoverySelection::Integration => {
             matches!(function.color, FunctionColor::Sync | FunctionColor::Async)
         }
@@ -1957,6 +2005,7 @@ fn canonical_declared_scenarios(
 fn inspect_source_test(
     request: &AnalysisRequest<'_>,
     id: DeclarationId,
+    source_selection: TestDiscoverySelection<'_>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Result<SupportedSourceTest, Diagnostic>, AnalysisFailure> {
     let program = request.hir.as_program();
@@ -1986,9 +2035,29 @@ fn inspect_source_test(
     let _body = program
         .body(body_id)
         .ok_or(AnalysisFailure::RequestMismatch)?;
-    let checked_comptime = if function.color == FunctionColor::Comptime {
+    // Revision 0.1 has no comptime function color: a plain `fn` test is
+    // comptime-tier when its transitive call closure happens to be
+    // comptime-legal, and a runtime/image test otherwise (an `async fn`
+    // test can never be comptime-legal, since comptime forbids async
+    // operations). Try the comptime tier first; a closure-legality failure
+    // here is not itself a hard error on its own -- this test may still be a
+    // perfectly good runtime/image test, so fall through to the runtime
+    // shape check below. An explicit `--comptime` selection, though, is a
+    // request to run *this* test at the comptime tier specifically: if the
+    // runtime shape check *also* rejects the closure, the comptime
+    // checker's own diagnostic is the more specific and correct one to
+    // report (it names the real reason, e.g. a moved-value read or an
+    // unsupported aggregate shape, rather than the runtime checker's
+    // generic "not supported"), so prefer it over the runtime shape
+    // failure below. For every other selection, the runtime shape
+    // checker's own diagnostic remains authoritative -- it is, after all,
+    // testing the runtime tier specifically.
+    let prefer_comptime_diagnostic = matches!(source_selection, TestDiscoverySelection::Comptime);
+    let mut comptime_failure = None;
+    let checked_comptime = if function.color == FunctionColor::Sync {
         match check_source_comptime_unit_test(
             request.hir.as_ref(),
+            request.standard_library_package,
             request.target.pointer_width(),
             id,
             ComptimeCheckLimits {
@@ -2001,14 +2070,17 @@ fn inspect_source_test(
             is_cancelled,
         )? {
             Ok(checked) => Some(checked),
-            Err(diagnostic) => return Ok(Err(diagnostic)),
+            Err(diagnostic) => {
+                comptime_failure = Some(diagnostic);
+                None
+            }
         }
     } else {
         None
     };
     let mut runtime_statements = Vec::new();
     let mut runtime_callees = Vec::new();
-    if function.color != FunctionColor::Comptime {
+    if checked_comptime.is_none() {
         match inspect_runtime_body_shape(
             request,
             body_id,
@@ -2020,18 +2092,28 @@ fn inspect_source_test(
         ) {
             Ok(()) => {}
             Err(RuntimeShapeFailure::Unsupported(source)) => {
-                return Ok(Err(test_source_diagnostic(
+                let runtime_diagnostic = test_source_diagnostic(
                     source,
                     "semantic-runtime-test-body-not-supported",
                     "runtime bodies support scalar initialization and assignment, direct calls, return, and scalar `if` joins",
-                )));
+                );
+                return Ok(Err(if prefer_comptime_diagnostic {
+                    comptime_failure.unwrap_or(runtime_diagnostic)
+                } else {
+                    runtime_diagnostic
+                }));
             }
             Err(RuntimeShapeFailure::UnsupportedAssertion(source)) => {
-                return Ok(Err(test_source_diagnostic(
+                let runtime_diagnostic = test_source_diagnostic(
                     source,
                     "semantic-runtime-assertion-not-supported",
                     "runtime assertions are supported only in selected generated tests",
-                )));
+                );
+                return Ok(Err(if prefer_comptime_diagnostic {
+                    comptime_failure.unwrap_or(runtime_diagnostic)
+                } else {
+                    runtime_diagnostic
+                }));
             }
             Err(RuntimeShapeFailure::Failure(error)) => return Err(error),
         }
@@ -2057,7 +2139,15 @@ fn inspect_source_test(
             let Some(helper_body) = helper.body else {
                 continue;
             };
-            inspect_runtime_body_shape(
+            // A plain `fn` test's transitive call closure can now genuinely
+            // reach a helper whose own body is unsupported by the runtime
+            // shape checker (revision 0.1 has no comptime function color, so
+            // any helper can be called from a test whose own shape happens
+            // to look supported at the call site); report the same clean
+            // diagnostics the top-level body check above would, rather than
+            // treating an unsupported helper shape as an internal
+            // request/facts mismatch.
+            match inspect_runtime_body_shape(
                 request,
                 helper_body,
                 helper.color,
@@ -2065,12 +2155,34 @@ fn inspect_source_test(
                 &mut runtime_statements,
                 &mut runtime_callees,
                 is_cancelled,
-            )
-            .map_err(|failure| match failure {
-                RuntimeShapeFailure::Failure(error) => error,
-                RuntimeShapeFailure::Unsupported(_)
-                | RuntimeShapeFailure::UnsupportedAssertion(_) => AnalysisFailure::RequestMismatch,
-            })?;
+            ) {
+                Ok(()) => {}
+                Err(RuntimeShapeFailure::Unsupported(source)) => {
+                    let runtime_diagnostic = test_source_diagnostic(
+                        source,
+                        "semantic-runtime-test-body-not-supported",
+                        "runtime bodies support scalar initialization and assignment, direct calls, return, and scalar `if` joins",
+                    );
+                    return Ok(Err(if prefer_comptime_diagnostic {
+                        comptime_failure.unwrap_or(runtime_diagnostic)
+                    } else {
+                        runtime_diagnostic
+                    }));
+                }
+                Err(RuntimeShapeFailure::UnsupportedAssertion(source)) => {
+                    let runtime_diagnostic = test_source_diagnostic(
+                        source,
+                        "semantic-runtime-assertion-not-supported",
+                        "runtime assertions are supported only in selected generated tests",
+                    );
+                    return Ok(Err(if prefer_comptime_diagnostic {
+                        comptime_failure.unwrap_or(runtime_diagnostic)
+                    } else {
+                        runtime_diagnostic
+                    }));
+                }
+                Err(RuntimeShapeFailure::Failure(error)) => return Err(error),
+            }
         }
     }
     let work_bound = runtime_body_work_bound(program, body_id)
@@ -2153,6 +2265,7 @@ fn inspect_source_test(
         name: copy_test_name(request, id, is_cancelled)?,
         source: declaration.source,
         checked_comptime,
+        comptime_gate_diagnostic: comptime_failure,
         runtime_statements,
         assertions,
         work_bound,
@@ -2675,7 +2788,6 @@ fn inspect_runtime_expression_shape(
                     | wrela_hir::BinaryOperator::BitXor
                     | wrela_hir::BinaryOperator::BitAnd
                     | wrela_hir::BinaryOperator::ShiftLeft
-                    | wrela_hir::BinaryOperator::ShiftLeftModular
                     | wrela_hir::BinaryOperator::ShiftRight,
                 left,
                 right,
@@ -2778,8 +2890,11 @@ fn append_source_test_function_inner(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Result<FunctionInstanceId, Diagnostic>, AnalysisFailure> {
     check_cancelled(is_cancelled)?;
-    let checked_comptime = match (test.color, test.checked_comptime.as_ref()) {
-        (FunctionColor::Comptime, Some(checked))
+    // `test.color` no longer signals the tier (there is no comptime color);
+    // `test.checked_comptime` is the sole tier signal, set by `check_source_test`
+    // when the closure was found comptime-legal.
+    let checked_comptime = match test.checked_comptime.as_ref() {
+        Some(checked)
             if checked
                 .declarations
                 .first()
@@ -2787,8 +2902,8 @@ fn append_source_test_function_inner(
         {
             Some(checked)
         }
-        (FunctionColor::Sync | FunctionColor::Async, None) => None,
-        _ => return Err(AnalysisFailure::RequestMismatch),
+        None => None,
+        Some(_) => return Err(AnalysisFailure::RequestMismatch),
     };
     let proof_count = 2usize;
     if partial.functions.len() >= request.limits.monomorphizations as usize
@@ -2899,7 +3014,7 @@ fn append_source_test_function_inner(
         subject: bounded_test_fact(request, "test effects: ", &test.name, is_cancelled)?,
         sources: vec![test.source],
         depends_on: vec![first_proof],
-        bound: Some(if test.color == FunctionColor::Comptime {
+        bound: Some(if checked_comptime.is_some() {
             request
                 .limits
                 .evaluator_steps
@@ -2907,15 +3022,16 @@ fn append_source_test_function_inner(
         } else {
             test.work_bound
         }),
-        explanation: vec![match test.color {
-            FunctionColor::Comptime => {
-                "the test executes only inside the bounded comptime evaluator".to_owned()
+        explanation: vec![if checked_comptime.is_some() {
+            "the test executes only inside the bounded comptime evaluator".to_owned()
+        } else {
+            match test.color {
+                FunctionColor::Sync | FunctionColor::Async => {
+                    "the selected runtime test body admits only bounded scalar effects and MAY_FAIL assertion paths"
+                        .to_owned()
+                }
+                FunctionColor::Isr => return Err(AnalysisFailure::RequestMismatch),
             }
-            FunctionColor::Sync | FunctionColor::Async => {
-                "the selected runtime test body admits only bounded scalar effects and MAY_FAIL assertion paths"
-                    .to_owned()
-            }
-            FunctionColor::Isr => return Err(AnalysisFailure::RequestMismatch),
         }],
     });
     partial.functions.push(FunctionInstance {
@@ -2934,7 +3050,7 @@ fn append_source_test_function_inner(
         effects: EffectSet(0),
         stack_bytes_bound: 0,
         frame_bytes_bound: 0,
-        uninterrupted_work_bound: Some(if test.color == FunctionColor::Comptime {
+        uninterrupted_work_bound: Some(if checked_comptime.is_some() {
             request
                 .limits
                 .evaluator_steps
@@ -2942,7 +3058,7 @@ fn append_source_test_function_inner(
         } else {
             test.work_bound
         }),
-        recursive_depth_bound: Some(if test.color == FunctionColor::Comptime {
+        recursive_depth_bound: Some(if checked_comptime.is_some() {
             request
                 .build
                 .profile
@@ -2955,7 +3071,7 @@ fn append_source_test_function_inner(
         proofs: vec![first_proof, effect_proof],
         source: Some(test.source),
     });
-    if test.color != FunctionColor::Comptime {
+    if checked_comptime.is_none() {
         match populate_runtime_body(
             request,
             partial,
@@ -5330,6 +5446,16 @@ enum RuntimeScalarType {
     Float { bits: u16 },
 }
 
+fn runtime_struct_declaration(
+    partial: &PartialAnalysis,
+    ty: SemanticTypeId,
+) -> Option<DeclarationId> {
+    match &partial.types.get(ty.0 as usize)?.kind {
+        SemanticTypeKind::Structure { declaration, .. } => Some(*declaration),
+        _ => None,
+    }
+}
+
 fn runtime_scalar_type(partial: &PartialAnalysis, ty: SemanticTypeId) -> Option<RuntimeScalarType> {
     match partial.types.get(ty.0 as usize)?.kind {
         SemanticTypeKind::Bool => Some(RuntimeScalarType::Bool),
@@ -5541,6 +5667,20 @@ fn analyze_scalar_binary(
             "convert one operand explicitly with checked `as`",
         ));
     }
+    if let Some(struct_declaration) = runtime_struct_declaration(partial, left.ty) {
+        return analyze_operator_interface_binary(
+            request,
+            partial,
+            function,
+            binary,
+            struct_declaration,
+            left,
+            right,
+            expression_request,
+            state,
+            is_cancelled,
+        );
+    }
     let operand = runtime_scalar_type(partial, left.ty).ok_or_else(|| {
         runtime_type_diagnostic(
             request,
@@ -5565,7 +5705,6 @@ fn analyze_scalar_binary(
             | wrela_hir::BinaryOperator::BitXor
             | wrela_hir::BinaryOperator::BitAnd
             | wrela_hir::BinaryOperator::ShiftLeft
-            | wrela_hir::BinaryOperator::ShiftLeftModular
             | wrela_hir::BinaryOperator::ShiftRight => {
                 matches!(operand, RuntimeScalarType::Integer { .. })
             }
@@ -5639,6 +5778,182 @@ fn analyze_scalar_binary(
     )?;
     Ok(RuntimeExpression {
         ty: result_ty,
+        result: Some(result),
+        referenced: None,
+        effects,
+    })
+}
+
+/// Desugar `+ - < <= > >=` on a value of a nominal struct type into a direct
+/// call to the unique visible `core.ops` impl method (chapter 10 §12). Both
+/// operands are already evaluated left-to-right as written by the caller;
+/// only the argument *binding* is swapped for `> <= >=`, and `<= >=` also
+/// negate the raw call result.
+#[allow(clippy::too_many_arguments)]
+fn analyze_operator_interface_binary(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    binary: RuntimeBinary,
+    struct_declaration: DeclarationId,
+    left: RuntimeExpression,
+    right: RuntimeExpression,
+    expression_request: RuntimeExpressionRequest,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<RuntimeExpression> {
+    let operator = match binary.operator {
+        RuntimeBinaryOperator::Arithmetic(operator) => {
+            crate::interfaces::DesugarOperator::from_binary(operator)
+        }
+        RuntimeBinaryOperator::Compare(operator) => {
+            crate::interfaces::DesugarOperator::from_comparison(operator)
+        }
+    };
+    let Some(operator) = operator else {
+        return Err(runtime_type_diagnostic(
+            request,
+            binary.source,
+            "semantic-binary-operand",
+            "binary operator is not defined for this scalar type",
+            "arithmetic, bitwise, and shifts require integers; bool supports equality only",
+            "change the operands or choose an operator defined for their exact type",
+        ));
+    };
+    let (model, _) = crate::interfaces::collect_interface_model(
+        request.hir.as_program(),
+        request.standard_library_package,
+        is_cancelled,
+    )?;
+    let Some(resolution) =
+        model.resolve_operator(request.hir.as_program(), operator, struct_declaration)
+    else {
+        return Err(runtime_type_diagnostic(
+            request,
+            binary.source,
+            "semantic-interface-operator-missing",
+            "no visible implementation defines this operator for the operand type",
+            "operators on a nominal struct desugar only through a unique visible core.ops impl",
+            "add `impl Add`/`Sub`/`Ord for <Type>:` with the matching method",
+        ));
+    };
+    let target = ensure_ordinary_source_function(
+        request,
+        partial,
+        resolution.function,
+        state.allow_assertions,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    let target_record = partial
+        .functions
+        .get(target.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if target_record.parameters.len() != 2 {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    let self_parameter = target_record.parameters[0];
+    let other_parameter = target_record.parameters[1];
+    let raw_result_ty = target_record.result;
+    let target_effects = target_record.effects;
+
+    let (self_operand, self_source_index, other_operand, other_source_index) = if resolution.swap {
+        (&right, 1u32, &left, 0u32)
+    } else {
+        (&left, 0u32, &right, 1u32)
+    };
+    let self_value = self_operand
+        .result
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let other_value = other_operand
+        .result
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let arguments = vec![
+        ResolvedCallArgument {
+            source_index: self_source_index,
+            parameter_index: 0,
+            access: self_parameter.access,
+            value: self_value,
+        },
+        ResolvedCallArgument {
+            source_index: other_source_index,
+            parameter_index: 1,
+            access: other_parameter.access,
+            value: other_value,
+        },
+    ];
+
+    let final_ty = if resolution.negate {
+        ensure_primitive_type(
+            request,
+            partial,
+            PrimitiveSemanticType::Bool,
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )?
+    } else {
+        raw_result_ty
+    };
+    if expression_request
+        .expected
+        .is_some_and(|expected| expected != final_ty)
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            binary.source,
+            "semantic-binary-result",
+            "binary result type does not match its required context",
+            "comparisons produce bool and interface operators preserve their declared result type",
+            "change the context or convert the result explicitly",
+        ));
+    }
+    let result = expression_result(
+        request,
+        partial,
+        function,
+        (binary.expression, binary.source),
+        final_ty,
+        expression_request.desired_result,
+        is_cancelled,
+    )?;
+    let raw_result = if resolution.negate {
+        append_semantic_value(
+            request,
+            partial,
+            function,
+            raw_result_ty,
+            (
+                SemanticValueOrigin::Expression(binary.expression),
+                Some(binary.source),
+                None,
+            ),
+            is_cancelled,
+        )?
+    } else {
+        result
+    };
+    let effects = EffectSet(left.effects.0 | right.effects.0 | target_effects.0);
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: binary.expression,
+            ty: final_ty,
+            result: Some(result),
+            resolution: ExpressionResolution::OperatorCall {
+                function: target,
+                arguments,
+                raw_result,
+                negate: resolution.negate,
+            },
+            effects,
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    Ok(RuntimeExpression {
+        ty: final_ty,
         result: Some(result),
         referenced: None,
         effects,
@@ -6063,6 +6378,24 @@ fn analyze_runtime_place(
     })
 }
 
+/// Structs no longer come in two source-level flavors; the initializer
+/// protocol now applies to any struct that declares an `init` member
+/// (formerly the exclusive province of `class`), while structs without one
+/// keep the flat field-construction call form.
+fn aggregate_has_initializer(program: &wrela_hir::Program, declaration: DeclarationId) -> bool {
+    let Some(record) = program.declaration(declaration) else {
+        return false;
+    };
+    let DeclarationKind::Structure(aggregate) = &record.kind else {
+        return false;
+    };
+    aggregate.members.iter().any(|member| {
+        program
+            .declaration(*member)
+            .is_some_and(|member| matches!(member.kind, DeclarationKind::Initializer(_)))
+    })
+}
+
 fn analyze_direct_call(
     request: &AnalysisRequest<'_>,
     partial: &mut PartialAnalysis,
@@ -6095,12 +6428,13 @@ fn analyze_direct_call(
     else {
         return Err(AnalysisFailure::RequestMismatch.into());
     };
-    if request
+    let is_struct = request
         .hir
         .as_program()
         .declaration(resolved.declaration)
-        .is_some_and(|record| matches!(&record.kind, DeclarationKind::Structure(_)))
-    {
+        .is_some_and(|record| matches!(&record.kind, DeclarationKind::Structure(_)));
+    let has_initializer = aggregate_has_initializer(request.hir.as_program(), resolved.declaration);
+    if is_struct && !has_initializer {
         return analyze_flat_structure_constructor(
             request,
             partial,
@@ -6112,19 +6446,14 @@ fn analyze_direct_call(
             is_cancelled,
         );
     }
-    if request
-        .hir
-        .as_program()
-        .declaration(resolved.declaration)
-        .is_some_and(|record| matches!(&record.kind, DeclarationKind::Class(_)))
-    {
+    if has_initializer {
         return Err(runtime_type_diagnostic(
             request,
             call.source,
             "semantic-class-construction-not-supported",
-            "class construction is not yet supported by semantic analysis",
-            "classes require the dedicated initializer protocol; they cannot use structure field construction",
-            "remove the class construction call until initializer execution is implemented",
+            "initializer-based construction is not yet supported by semantic analysis",
+            "structs with an `init` member require the dedicated initializer protocol; they cannot use structure field construction",
+            "remove the initializer-based construction call until initializer execution is implemented",
         ));
     }
     let target = ensure_ordinary_source_function(
@@ -7282,16 +7611,41 @@ fn ensure_ordinary_source_function(
             .get(parameter_id.0 as usize)
             .filter(|parameter| parameter.id == *parameter_id)
             .ok_or(AnalysisFailure::RequestMismatch)?;
-        let ty = semantic_type_from_source(
-            request,
-            partial,
-            parameter
-                .ty
-                .as_ref()
-                .ok_or(AnalysisFailure::RequestMismatch)?,
-            &mut *aggregate_work,
-            is_cancelled,
-        )?;
+        let ty = if parameter.receiver {
+            let receiver_declaration = crate::interfaces::receiver_concrete_struct(
+                request.hir.as_program(),
+                declaration,
+            )
+            .ok_or_else(|| {
+                runtime_diagnostic(
+                    request,
+                    parameter.source,
+                    "semantic-interface-unsupported",
+                    "a `self` receiver here does not resolve to a concrete implementing struct",
+                    None,
+                    "revision 0.1's bounded interface support requires a receiver's enclosing block to name a concrete struct",
+                    "declare this method inside a struct or a concrete `impl Interface for ConcreteStruct` block",
+                )
+            })?;
+            ensure_flat_structure_type(
+                request,
+                partial,
+                receiver_declaration,
+                &mut *aggregate_work,
+                is_cancelled,
+            )?
+        } else {
+            semantic_type_from_source(
+                request,
+                partial,
+                parameter
+                    .ty
+                    .as_ref()
+                    .ok_or(AnalysisFailure::RequestMismatch)?,
+                &mut *aggregate_work,
+                is_cancelled,
+            )?
+        };
         let value = append_semantic_value(
             request,
             partial,
@@ -7674,6 +8028,28 @@ fn semantic_type_from_source(
                 request,
                 partial,
                 declaration.id,
+                &mut *aggregate_work,
+                is_cancelled,
+            )
+        }
+        TypeExpressionKind::SelfType { owner } => {
+            let Some(declaration) =
+                crate::interfaces::concrete_struct_for_self_owner(request.hir.as_program(), *owner)
+            else {
+                return Err(runtime_diagnostic(
+                    request,
+                    source.source,
+                    "semantic-interface-unsupported",
+                    "`Self` here does not resolve to a concrete implementing struct",
+                    None,
+                    "revision 0.1's bounded interface support requires `Self` to name a concrete struct",
+                    "use a concrete `impl Interface for ConcreteStruct` block",
+                ));
+            };
+            ensure_flat_structure_type(
+                request,
+                partial,
+                declaration,
                 &mut *aggregate_work,
                 is_cancelled,
             )
@@ -8684,7 +9060,17 @@ fn compile_generated_test_group(
             .get(&function_key)
             .copied()
             .ok_or(AnalysisFailure::RequestMismatch)?;
-        let test = match inspect_source_test(request, declaration, is_cancelled)? {
+        // This re-verifies an already-planned runtime/integration test
+        // (checked below via `test.checked_comptime.is_some()` needing to
+        // be false), not a fresh `--comptime` discovery request, so it must
+        // not prefer a comptime-legality diagnostic over the runtime shape
+        // checker's own.
+        let test = match inspect_source_test(
+            request,
+            declaration,
+            TestDiscoverySelection::Integration,
+            is_cancelled,
+        )? {
             Ok(test) => test,
             Err(diagnostic) => {
                 push_diagnostic(diagnostics, diagnostic, request.limits)?;
@@ -8692,6 +9078,7 @@ fn compile_generated_test_group(
             }
         };
         if !matches!(test.color, FunctionColor::Sync | FunctionColor::Async)
+            || test.checked_comptime.is_some()
             || planned.descriptor.kind != TestKind::IntegrationImage
             || planned.descriptor.name != test.name
             || planned.descriptor.source != Some(test.source)
@@ -9458,11 +9845,11 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 "selected image entry is not a function",
             ));
         };
-        if function.color != FunctionColor::Comptime {
+        if function.color != FunctionColor::Sync {
             return Err(self.diagnostic(
                 declaration.source,
                 "semantic-image-constructor-color",
-                "an image constructor must be a comptime function",
+                "an image constructor must be a plain, phase-neutral function",
             ));
         }
         if function.body.is_none() {
@@ -9498,11 +9885,11 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 "selected comptime test is not a function",
             ));
         };
-        if function.color != FunctionColor::Comptime {
+        if function.color != FunctionColor::Sync {
             return Err(self.diagnostic(
                 declaration.source,
                 "semantic-test-color",
-                "compiler-evaluated tests must be comptime functions",
+                "compiler-evaluated tests must be plain, phase-neutral functions",
             ));
         }
         if function.body.is_none() {
@@ -9801,11 +10188,11 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                         expression.source,
                         depth + 1,
                     )
-                } else if self.direct_class_callee(*callee)?.is_some() {
+                } else if self.direct_initializer_struct_callee(*callee)?.is_some() {
                     Err(self.diagnostic(
                         expression.source,
                         "semantic-class-construction-not-supported",
-                        "class construction is not yet supported by semantic analysis",
+                        "initializer-based construction is not yet supported by semantic analysis",
                     ))
                 } else {
                     let callee = self.evaluate_expression(*callee, None, depth + 1)?;
@@ -9961,7 +10348,20 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 let left = self.evaluate_expression(*left, operand_type, depth + 1)?;
                 let right_type = left.value_type().or(operand_type);
                 let right = self.evaluate_expression(*right, right_type, depth + 1)?;
-                self.evaluate_binary_values(*operator, left, right, expression.source)
+                if let (Some(desugar), ComptimeValue::Structure { .. }) = (
+                    crate::interfaces::DesugarOperator::from_binary(*operator),
+                    &left,
+                ) {
+                    self.evaluate_operator_interface_binary(
+                        desugar,
+                        left,
+                        right,
+                        expression.source,
+                        depth + 1,
+                    )
+                } else {
+                    self.evaluate_binary_values(*operator, left, right, expression.source)
+                }
             }
             ExpressionKind::Compare {
                 left,
@@ -9979,7 +10379,20 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 let left = self.evaluate_expression(*left, operand_type, depth + 1)?;
                 let right_type = left.value_type().or(operand_type);
                 let right = self.evaluate_expression(*right, right_type, depth + 1)?;
-                self.evaluate_comparison(*operator, left, right, expression.source)
+                if let (Some(desugar), ComptimeValue::Structure { .. }) = (
+                    crate::interfaces::DesugarOperator::from_comparison(*operator),
+                    &left,
+                ) {
+                    self.evaluate_operator_interface_binary(
+                        desugar,
+                        left,
+                        right,
+                        expression.source,
+                        depth + 1,
+                    )
+                } else {
+                    self.evaluate_comparison(*operator, left, right, expression.source)
+                }
             }
             ExpressionKind::Literal(_)
             | ExpressionKind::Reference(_)
@@ -9993,7 +10406,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             | ExpressionKind::Index { .. }
             | ExpressionKind::Tuple(_)
             | ExpressionKind::Array(_)
-            | ExpressionKind::Race(_)
+            | ExpressionKind::DotName { .. }
             | ExpressionKind::TrySend(_)
             | ExpressionKind::Interpolate(_)
             | ExpressionKind::Error => Err(self.unsupported(expression.source)),
@@ -10078,12 +10491,18 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             .program
             .declaration(declaration)
             .is_some_and(|record| {
-                !is_standard_image && matches!(&record.kind, DeclarationKind::Structure(_))
+                !is_standard_image
+                    && matches!(&record.kind, DeclarationKind::Structure(_))
+                    && !self.aggregate_has_initializer(declaration)
             })
             .then_some(declaration))
     }
 
-    fn direct_class_callee(
+    fn aggregate_has_initializer(&self, declaration: DeclarationId) -> bool {
+        aggregate_has_initializer(self.program, declaration)
+    }
+
+    fn direct_initializer_struct_callee(
         &self,
         callee: ExpressionId,
     ) -> Result<Option<DeclarationId>, EvaluationFailure> {
@@ -10091,9 +10510,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             return Ok(None);
         };
         Ok(self
-            .program
-            .declaration(declaration)
-            .is_some_and(|record| matches!(&record.kind, DeclarationKind::Class(_)))
+            .aggregate_has_initializer(declaration)
             .then_some(declaration))
     }
 
@@ -10331,7 +10748,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
         let DeclarationKind::Function(function) = &declaration_record.kind else {
             return Err(self.unsupported(source));
         };
-        if function.color != FunctionColor::Comptime
+        if function.color != FunctionColor::Sync
             || !function.generics.is_empty()
             || function.body.is_none()
             || arguments.len() != function.parameters.len()
@@ -10493,7 +10910,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
         let DeclarationKind::Function(function) = &declaration_record.kind else {
             return Err(self.unsupported(declaration_record.source));
         };
-        if function.color != FunctionColor::Comptime || !function.generics.is_empty() {
+        if function.color != FunctionColor::Sync || !function.generics.is_empty() {
             return Err(self.unsupported(declaration_record.source));
         }
         let body = function
@@ -10960,18 +11377,6 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 }
                 shifted
             }
-            wrela_hir::BinaryOperator::ShiftLeftModular => {
-                let shift = right
-                    .shift_count()
-                    .filter(|shift| *shift < u32::from(left.bits));
-                let shift = shift.ok_or_else(invalid_shift)?;
-                ComptimeInteger {
-                    // Modular left shift wraps only the result. Its count has
-                    // the same checked target-width domain as ordinary `<<`.
-                    raw: left.raw.checked_shl(shift).unwrap_or(0) & mask,
-                    ..left
-                }
-            }
             wrela_hir::BinaryOperator::ShiftRight => {
                 let shift = right
                     .shift_count()
@@ -11087,6 +11492,84 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             return Err(self.type_mismatch(source));
         }
         Ok(ComptimeValue::Boolean(result))
+    }
+
+    /// Desugar `+ - < <= > >=` on a comptime struct value into a direct
+    /// invocation of the unique visible `core.ops` impl method (chapter 10
+    /// §12). `left`/`right` are already evaluated left-to-right as written;
+    /// only the argument binding is swapped for `> <= >=`, and `<= >=` also
+    /// negate the raw call result.
+    fn evaluate_operator_interface_binary(
+        &mut self,
+        operator: crate::interfaces::DesugarOperator,
+        left: ComptimeValue,
+        right: ComptimeValue,
+        source: Span,
+        depth: u32,
+    ) -> Result<ComptimeValue, EvaluationFailure> {
+        let ComptimeValue::Structure {
+            declaration: left_declaration,
+            ..
+        } = &left
+        else {
+            return Err(self.unsupported(source));
+        };
+        let ComptimeValue::Structure {
+            declaration: right_declaration,
+            ..
+        } = &right
+        else {
+            return Err(self.type_mismatch(source));
+        };
+        if left_declaration != right_declaration {
+            return Err(self.type_mismatch(source));
+        }
+        let struct_declaration = *left_declaration;
+        let (model, _) = crate::interfaces::collect_interface_model(
+            self.program,
+            self.request.standard_library_package,
+            self.is_cancelled,
+        )
+        .map_err(EvaluationFailure::Analysis)?;
+        let Some(resolution) = model.resolve_operator(self.program, operator, struct_declaration)
+        else {
+            return Err(self.unsupported(source));
+        };
+        let DeclarationKind::Function(function_decl) = &self
+            .program
+            .declaration(resolution.function)
+            .ok_or_else(|| self.unsupported(source))?
+            .kind
+        else {
+            return Err(self.unsupported(source));
+        };
+        if function_decl.parameters.len() != 2 {
+            return Err(self.unsupported(source));
+        }
+        let self_parameter_id = function_decl.parameters[0];
+        let other_parameter_id = function_decl.parameters[1];
+        let (self_value, other_value) = if resolution.swap {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        let raw = self.invoke_function(
+            resolution.function,
+            vec![
+                (self_parameter_id, self_value),
+                (other_parameter_id, other_value),
+            ],
+            Some(source),
+            depth,
+        )?;
+        if resolution.negate {
+            match raw {
+                ComptimeValue::Boolean(value) => Ok(ComptimeValue::Boolean(!value)),
+                _ => Err(self.type_mismatch(source)),
+            }
+        } else {
+            Ok(raw)
+        }
     }
 
     fn expression_value_type(
@@ -11224,6 +11707,12 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
     }
 
     fn source_value_type(&self, source: &TypeExpression) -> Option<ComptimeType> {
+        if let TypeExpressionKind::SelfType { owner } = &source.kind {
+            let declaration =
+                crate::interfaces::concrete_struct_for_self_owner(self.program, *owner)?;
+            return (!self.is_standard_image_declaration(declaration))
+                .then_some(ComptimeType::Structure(declaration));
+        }
         let TypeExpressionKind::Named {
             definition,
             arguments,
@@ -11558,7 +12047,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
 
     fn actor_class_kind(&self, declaration: DeclarationId) -> Option<EvaluatedActorKind> {
         let declaration = self.program.declaration(declaration)?;
-        if !matches!(declaration.kind, DeclarationKind::Class(_)) {
+        if !matches!(declaration.kind, DeclarationKind::Structure(_)) {
             return None;
         }
         let mut selected = None;
@@ -11690,7 +12179,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             )
         })?;
         let dependency = if arguments.len() == 3 {
-            let DeclarationKind::Class(actor_class) = &declaration.kind else {
+            let DeclarationKind::Structure(actor_class) = &declaration.kind else {
                 return Err(self.unsupported(class_argument.source));
             };
             let [field] = actor_class.fields.as_slice() else {
@@ -11767,7 +12256,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             }
             Some((target_actor, wiring_argument.source))
         } else {
-            let DeclarationKind::Class(actor_class) = &declaration.kind else {
+            let DeclarationKind::Structure(actor_class) = &declaration.kind else {
                 return Err(self.unsupported(class_argument.source));
             };
             if !actor_class.fields.is_empty() {
@@ -12851,13 +13340,13 @@ fn inspect_actor_plans(
         let declaration = program
             .declaration(actor.class)
             .ok_or(AnalysisFailure::RequestMismatch)?;
-        let DeclarationKind::Class(class) = &declaration.kind else {
+        let DeclarationKind::Structure(class) = &declaration.kind else {
             return Err(actor_runtime_diagnostic(
                 Category::ACTOR,
                 actor.source,
                 "semantic-actor-install-class",
-                "installed actor declaration is not a class",
-                "install an @app or @service class",
+                "installed actor declaration is not a struct",
+                "install an @app or @service struct",
             ));
         };
         if declaration.visibility != wrela_hir::Visibility::Public
@@ -12938,13 +13427,13 @@ fn inspect_actor_plans(
                     "bind the ISR through a supported driver/device image installation",
                 ));
             }
-            if function.color == FunctionColor::Comptime || !function.generics.is_empty() {
+            if !function.generics.is_empty() {
                 return Err(actor_runtime_diagnostic(
                     Category::ACTOR,
                     member.source,
                     "semantic-actor-method-shape",
                     "actor runtime methods must be concrete sync or async functions",
-                    "remove comptime color and generic parameters from the installed runtime method",
+                    "remove generic parameters from the installed runtime method",
                 ));
             }
             let mut task_attribute = None;
@@ -13331,7 +13820,7 @@ fn resolve_self_actor_send(
             })
             .and_then(|declaration| program.declaration(declaration))
             .and_then(|declaration| match &declaration.kind {
-                DeclarationKind::Class(class) => Some(class),
+                DeclarationKind::Structure(class) => Some(class),
                 _ => None,
             })
             .ok_or(AnalysisFailure::RequestMismatch)?;
@@ -15367,9 +15856,9 @@ mod tests {
     }
 
     const PARSED_CORE_IMAGE_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
-    const PARSED_COMPTIME_IMAGE_SOURCE: &str = "module app.image\n\nfrom core.image import Image, Target\n\n@image\npub comptime fn boot() -> Image:\n    return Image(name=\"bootstrap\", target=Target.aarch64_qemu_virt_uefi)\n";
-    const PARSED_COMPTIME_MATH_SOURCE: &str = "module app.math\n\npub comptime fn add(left: u32, right: u32) -> u32:\n    return left + right\n\npub comptime fn leaf(value: u32) -> u32:\n    return add(value, 1)\n\npub comptime fn middle(value: u32) -> u32:\n    return leaf(value)\n";
-    const PARSED_COMPTIME_TEST_SOURCE: &str = "module app.math_test\n\nfrom app.math import add, middle\n\n@test\ncomptime fn imported_scalars_work():\n    caller: u32 = 40\n    nested: u32 = middle(caller)\n    caller = add(caller, 2)\n    valid: bool = nested == 41 and not false\n    if valid:\n        comptime assert caller == 42, \"caller local was not preserved\"\n    else:\n        comptime assert false, \"nested scalar call failed\"\n";
+    const PARSED_COMPTIME_IMAGE_SOURCE: &str = "module app.image\n\nfrom core.image import Image, Target\n\n@image\npub fn boot() -> Image:\n    return Image(name=\"bootstrap\", target=Target.aarch64_qemu_virt_uefi)\n";
+    const PARSED_COMPTIME_MATH_SOURCE: &str = "module app.math\n\npub fn add(left: u32, right: u32) -> u32:\n    return left + right\n\npub fn leaf(value: u32) -> u32:\n    return add(value, 1)\n\npub fn middle(value: u32) -> u32:\n    return leaf(value)\n";
+    const PARSED_COMPTIME_TEST_SOURCE: &str = "module app.math_test\n\nfrom app.math import add, middle\n\n@test\nfn imported_scalars_work():\n    caller: u32 = 40\n    nested: u32 = middle(caller)\n    caller = add(caller, 2)\n    valid: bool = nested == 41 and not false\n    if valid:\n        comptime assert caller == 42, \"caller local was not preserved\"\n    else:\n        comptime assert false, \"nested scalar call failed\"\n";
     const PARSED_UNIMPLEMENTED_ATTRIBUTES_SOURCE: &str = r#"module app.math
 
 @layout_assert
@@ -15393,7 +15882,7 @@ pub fn marked():
     const PARSED_ATTRIBUTE_TEST_SOURCE: &str = r#"module app.math_test
 
 @test
-comptime fn attribute_census_fixture():
+fn attribute_census_fixture():
     comptime assert true, "attribute fixture"
 "#;
     const PARSED_WIRE_ATTRIBUTE_SOURCE: &str = r#"module app.math
@@ -15791,7 +16280,7 @@ pub struct Packet:
                         source: span(0, 0, 6),
                     }],
                     kind: DeclarationKind::Function(FunctionDeclaration {
-                        color: FunctionColor::Comptime,
+                        color: FunctionColor::Sync,
                         generics: Vec::new(),
                         parameters: Vec::new(),
                         result: Some(TypeExpression {
@@ -15814,6 +16303,7 @@ pub struct Packet:
                         implements: Vec::new(),
                         fields: Vec::new(),
                         members: Vec::new(),
+                        linear: false,
                     }),
                     source: span(1, 10, 60),
                 },
@@ -15935,7 +16425,7 @@ pub struct Packet:
                         source: span(0, 210, 215),
                     }],
                     kind: DeclarationKind::Function(FunctionDeclaration {
-                        color: FunctionColor::Comptime,
+                        color: FunctionColor::Sync,
                         generics: Vec::new(),
                         parameters: Vec::new(),
                         result: None,
@@ -15955,7 +16445,19 @@ pub struct Packet:
                         source: span(0, 310, 315),
                     }],
                     kind: DeclarationKind::Function(FunctionDeclaration {
-                        color: FunctionColor::Sync,
+                        // Every color in this fixture family after the color
+                        // removal is phase-neutral, so a trivial `pass` body
+                        // would otherwise be comptime-legal and this
+                        // declaration would stop exercising the runtime tier.
+                        // `UnsupportedRuntimeTest` still needs the `Sync`
+                        // color: its mutations (loop/await/closure/actor-send)
+                        // specifically exercise the `Sync`-gated rejection of
+                        // those operations in the runtime shape checker.
+                        color: if matches!(kind, ProgramKind::UnsupportedRuntimeTest) {
+                            FunctionColor::Sync
+                        } else {
+                            FunctionColor::Async
+                        },
                         generics: Vec::new(),
                         parameters: Vec::new(),
                         result: None,
@@ -17052,7 +17554,7 @@ async fn checkpoint():
     pass
 
 @service
-pub class Worker:
+pub struct Worker:
     pub async fn ping(mut self):
         await checkpoint()
 
@@ -17061,7 +17563,7 @@ pub class Worker:
         await checkpoint()
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
     installed = img.service(Worker, mailbox=2)
     return img
@@ -17184,12 +17686,12 @@ pub comptime fn boot() -> Image:
 
 from core.image import Image, Target
 
-class Cache:
+struct Cache:
     init(mut self):
         pass
 
 @image
-pub comptime fn boot() -> Image:
+pub fn boot() -> Image:
     return Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
 "#;
         let fixture = parsed_actor_fixture(SOURCE);
@@ -17214,8 +17716,13 @@ pub comptime fn boot() -> Image:
     }
 
     #[test]
-    fn parsed_runtime_class_construction_has_one_exact_unsupported_diagnostic() {
-        const TYPES: &str = "module app.math\n\npub class Cache:\n    value: u32\n";
+    fn parsed_initializer_struct_flat_call_is_rejected_by_the_initializer_diagnostic() {
+        // A struct with an `init` member is caught by the blanket
+        // not-yet-supported initializer diagnostic before any call
+        // expression (including a would-be flat construction call) is
+        // ever reached, so no separate construction-specific diagnostic
+        // fires here.
+        const TYPES: &str = "module app.math\n\npub struct Cache:\n    value: u32\n\n    init(mut self, value: u32):\n        self.value = value\n";
         const TEST: &str = concat!(
             "module app.math_test\n\n",
             "from app.math import Cache\n\n",
@@ -17236,18 +17743,15 @@ pub comptime fn boot() -> Image:
         *source_selection = TestDiscoverySelection::Integration;
         let output = CanonicalSemanticAnalyzer::new()
             .analyze(discovery, &|| false)
-            .expect("class construction is a structured source diagnostic");
+            .expect("initializer-bearing struct is a structured source diagnostic");
         assert!(output.successful().is_none());
         assert_eq!(output.diagnostics().len(), 1);
         let diagnostic = &output.diagnostics()[0];
         assert_eq!(
             diagnostic.code.as_deref(),
-            Some("semantic-class-construction-not-supported")
+            Some("semantic-initializer-not-supported")
         );
         assert_eq!(diagnostic.category, Category::TYPE);
-        let start = u32::try_from(TEST.find("Cache()").expect("call spelling"))
-            .expect("bounded source offset");
-        assert_eq!(diagnostic.primary, span(2, start, start + 7));
         assert!(
             output.partial().expressions.iter().all(|fact| {
                 !matches!(fact.resolution, ExpressionResolution::Constructor { .. })
@@ -17514,7 +18018,7 @@ pub comptime fn boot() -> Image:
         );
         let zero_mailbox = BOUNDED_ACTOR_SOURCE.replace("mailbox=2", "mailbox=0");
         let driver = BOUNDED_ACTOR_SOURCE
-            .replace("@service\npub class Worker", "@driver\npub class Worker")
+            .replace("@service\npub struct Worker", "@driver\npub struct Worker")
             .replace("img.service(Worker", "img.driver(Worker");
         for (source, code, category) in [
             (
@@ -17799,51 +18303,43 @@ pub comptime fn boot() -> Image:
     }
 
     #[test]
-    fn parsed_checked_and_modular_left_shifts_are_exact_bounded_and_cancellable() {
+    fn parsed_checked_left_shifts_are_exact_bounded_and_cancellable() {
         const MATH: &str = r#"module app.math
 
-pub comptime fn checked_u8(value: u8, count: u8) -> u8:
+pub fn checked_u8(value: u8, count: u8) -> u8:
     return value << count
 
-pub comptime fn modular_u8(value: u8, count: u8) -> u8:
-    return value <<% count
-
-pub comptime fn checked_i8(value: i8, count: i8) -> i8:
+pub fn checked_i8(value: i8, count: i8) -> i8:
     return value << count
 "#;
         const TEST: &str = r#"module app.math_test
 
-from app.math import checked_u8, modular_u8, checked_i8
+from app.math import checked_u8, checked_i8
 
 @test
-comptime fn safe_and_modular_shifts():
+fn safe_shifts():
     checked_unsigned: u8 = checked_u8(1, 7)
     checked_signed: i8 = checked_i8(-64, 1)
-    modular_unsigned: u8 = modular_u8(255, 1)
-    comptime assert checked_unsigned == 128 and checked_signed == -128 and modular_unsigned == 254, "target-width left shifts"
+    comptime assert checked_unsigned == 128 and checked_signed == -128, "target-width left shifts"
 
 @test
-comptime fn checked_unsigned_result_loss():
+fn checked_unsigned_result_loss():
     value: u8 = checked_u8(128, 1)
 
 @test
-comptime fn checked_signed_positive_result_loss():
+fn checked_signed_positive_result_loss():
     value: i8 = checked_i8(64, 1)
 
 @test
-comptime fn checked_signed_negative_result_loss():
+fn checked_signed_negative_result_loss():
     value: i8 = checked_i8(-65, 1)
 
 @test
-comptime fn checked_count_out_of_range():
+fn checked_count_out_of_range():
     value: u8 = checked_u8(1, 8)
 
 @test
-comptime fn modular_count_out_of_range():
-    value: u8 = modular_u8(1, 8)
-
-@test
-comptime fn negative_count_out_of_range():
+fn negative_count_out_of_range():
     value: i8 = checked_i8(1, -1)
 "#;
         let fixture = parsed_comptime_fixture(MATH, TEST);
@@ -17860,12 +18356,12 @@ comptime fn negative_count_out_of_range():
             output.diagnostics()
         );
         let image = output.successful().expect("sealed parsed shift discovery");
-        assert_eq!(image.facts().comptime_test_results.len(), 7);
+        assert_eq!(image.facts().comptime_test_results.len(), 6);
         let safe = image
             .facts()
             .comptime_test_results
             .iter()
-            .find(|result| result.descriptor.name.ends_with("safe_and_modular_shifts"))
+            .find(|result| result.descriptor.name.ends_with("safe_shifts"))
             .expect("safe shift result");
         assert_eq!(safe.outcome, TestOutcome::Passed);
         for (name, code) in [
@@ -17883,10 +18379,6 @@ comptime fn negative_count_out_of_range():
             ),
             (
                 "checked_count_out_of_range",
-                "semantic-comptime-shift-count",
-            ),
-            (
-                "modular_count_out_of_range",
                 "semantic-comptime-shift-count",
             ),
             (
@@ -17923,7 +18415,7 @@ comptime fn negative_count_out_of_range():
                     .as_program()
                     .declaration(*candidate)
                     .and_then(|declaration| declaration.name.as_ref())
-                    .is_some_and(|name| name.as_str() == "safe_and_modular_shifts")
+                    .is_some_and(|name| name.as_str() == "safe_shifts")
             })
             .expect("safe parsed shift declaration");
         let evaluator_request =
@@ -17985,8 +18477,8 @@ comptime fn negative_count_out_of_range():
 
     #[test]
     fn parsed_imported_comptime_infers_locals_signed_minimum_and_named_arguments() {
-        const MATH: &str = "module app.math\n\npub comptime fn add(left: u32, right: u32) -> u32:\n    return left + right\n\npub comptime fn preserve(value: i64) -> i64:\n    return value\n";
-        const TEST: &str = "module app.math_test\n\nfrom app.math import add, preserve\n\n@test\ncomptime fn inferred_imported_scalars_work():\n    sum = add(right=2, left=40)\n    minimum = preserve(-9223372036854775808)\n    valid = sum == 42 and minimum == -9223372036854775808\n    comptime assert valid, \"inferred imported scalar result\"\n    comptime assert -9223372036854775808 == -9223372036854775808, \"unconstrained signed minimum\"\n";
+        const MATH: &str = "module app.math\n\npub fn add(left: u32, right: u32) -> u32:\n    return left + right\n\npub fn preserve(value: i64) -> i64:\n    return value\n";
+        const TEST: &str = "module app.math_test\n\nfrom app.math import add, preserve\n\n@test\nfn inferred_imported_scalars_work():\n    sum = add(right=2, left=40)\n    minimum = preserve(-9223372036854775808)\n    valid = sum == 42 and minimum == -9223372036854775808\n    comptime assert valid, \"inferred imported scalar result\"\n    comptime assert -9223372036854775808 == -9223372036854775808, \"unconstrained signed minimum\"\n";
         let fixture = parsed_comptime_fixture(MATH, TEST);
         let changes = no_changes();
 
@@ -18305,10 +18797,10 @@ comptime fn negative_count_out_of_range():
     fn long_named_comptime_argument_comparison_polls_each_source_byte() {
         let parameter = "parameter".repeat(28);
         let math = format!(
-            "module app.math\n\npub comptime fn identity({parameter}: u32) -> u32:\n    return {parameter}\n"
+            "module app.math\n\npub fn identity({parameter}: u32) -> u32:\n    return {parameter}\n"
         );
         let test_source = format!(
-            "module app.math_test\n\nfrom app.math import identity\n\n@test\ncomptime fn named_argument_is_polled():\n    result = identity({parameter}=42)\n    comptime assert result == 42, \"named result\"\n"
+            "module app.math_test\n\nfrom app.math import identity\n\n@test\nfn named_argument_is_polled():\n    result = identity({parameter}=42)\n    comptime assert result == 42, \"named result\"\n"
         );
         let fixture = parsed_comptime_fixture(&math, &test_source);
         let changes = no_changes();
@@ -18340,8 +18832,8 @@ comptime fn negative_count_out_of_range():
 
     #[test]
     fn imported_comptime_evaluator_has_exact_step_memory_depth_and_cancellation_bounds() {
-        const MATH: &str = "module app.math\n\npub comptime fn leaf() -> u32:\n    return 42\n\npub comptime fn middle() -> u32:\n    return leaf()\n";
-        const TEST: &str = "module app.math_test\n\nfrom app.math import middle\n\n@test\ncomptime fn bounded_import():\n    result: u32 = middle()\n    comptime assert result == 42, \"nested result\"\n";
+        const MATH: &str = "module app.math\n\npub fn leaf() -> u32:\n    return 42\n\npub fn middle() -> u32:\n    return leaf()\n";
+        const TEST: &str = "module app.math_test\n\nfrom app.math import middle\n\n@test\nfn bounded_import():\n    result: u32 = middle()\n    comptime assert result == 42, \"nested result\"\n";
         let mut fixture = parsed_comptime_fixture(MATH, TEST);
         let test = fixture.fixture.hir.as_program().test_candidates[0];
         let changes = no_changes();
@@ -18456,10 +18948,10 @@ pub struct Pair:
     pub left: u32
     pub right: u32
 
-pub comptime fn forward(value: Pair) -> Pair:
+pub fn forward(value: Pair) -> Pair:
     return copy value
 
-pub comptime fn make_and_forward(left: u32, right: u32) -> Pair:
+pub fn make_and_forward(left: u32, right: u32) -> Pair:
     pair: Pair = Pair(left=left, right=right)
     return forward(pair)
 "#;
@@ -18468,7 +18960,7 @@ pub comptime fn make_and_forward(left: u32, right: u32) -> Pair:
 from app.math import make_and_forward
 
 @test
-comptime fn aggregate_bound():
+fn aggregate_bound():
     result = make_and_forward(20, 22)
     comptime assert result.left + result.right == 42, "aggregate result"
 "#;
@@ -18660,7 +19152,7 @@ pub struct Pair:
     pub left: u32
     pub right: u32
 
-pub comptime fn cleanup(value: Pair) -> u32:
+pub fn cleanup(value: Pair) -> u32:
     local: Pair = copy value
     local = Pair(right=local.right, left=local.left)
     return local.left
@@ -18670,7 +19162,7 @@ pub comptime fn cleanup(value: Pair) -> u32:
 from app.math import Pair, cleanup
 
 @test
-comptime fn cleanup_fixture():
+fn cleanup_fixture():
     value = Pair(right=22, left=20)
     comptime assert cleanup(value) == 20, "cleanup result"
 "#;
@@ -19515,7 +20007,7 @@ comptime fn cleanup_fixture():
         const TEST: &str = r#"module app.math_test
 
 @test
-comptime fn projection_fixture():
+fn projection_fixture():
     comptime assert true, "fixture"
 "#;
         let fixture = parsed_comptime_fixture(&values, TEST);
@@ -19600,10 +20092,10 @@ comptime fn projection_fixture():
 
     #[test]
     fn recursive_comptime_calls_admit_exact_host_cap_and_reject_cap_plus_one() {
-        const MATH: &str = "module app.math\n\npub comptime fn countdown(value: u32) -> u32:\n    if value == 0:\n        return 0\n    return countdown(value - 1)\n";
+        const MATH: &str = "module app.math\n\npub fn countdown(value: u32) -> u32:\n    if value == 0:\n        return 0\n    return countdown(value - 1)\n";
         let test_source = |count| {
             format!(
-                "module app.math_test\n\nfrom app.math import countdown\n\n@test\ncomptime fn recursion_is_bounded():\n    result: u32 = countdown({count})\n    comptime assert result == 0, \"countdown result\"\n"
+                "module app.math_test\n\nfrom app.math import countdown\n\n@test\nfn recursion_is_bounded():\n    result: u32 = countdown({count})\n    comptime assert result == 0, \"countdown result\"\n"
             )
         };
         let passing_source = test_source(30);
@@ -19666,13 +20158,13 @@ comptime fn projection_fixture():
         let math = |wrapper_count| {
             let wrappers = "comptime ".repeat(wrapper_count);
             format!(
-                "module app.math\n\npub comptime fn countdown(value: u32) -> u32:\n    if value == 0:\n        return 0\n    return {wrappers}countdown(value - 1)\n"
+                "module app.math\n\npub fn countdown(value: u32) -> u32:\n    if value == 0:\n        return 0\n    return {wrappers}countdown(value - 1)\n"
             )
         };
         let source = |count, wrapper_count| {
             let wrappers = "comptime ".repeat(wrapper_count);
             format!(
-                "module app.math_test\n\nfrom app.math import countdown\n\n@test\ncomptime fn combined_host_bound():\n    result = {wrappers}countdown({count})\n    comptime assert result == 0, \"countdown result\"\n"
+                "module app.math_test\n\nfrom app.math import countdown\n\n@test\nfn combined_host_bound():\n    result = {wrappers}countdown({count})\n    comptime assert result == 0, \"countdown result\"\n"
             )
         };
         // The root frame contributes 1, the once-wrapped first call contributes
@@ -19885,7 +20377,7 @@ comptime fn projection_fixture():
     }
 
     #[test]
-    fn comptime_checked_and_modular_left_shifts_observe_exact_target_boundaries() {
+    fn comptime_checked_left_shifts_observe_exact_target_boundaries() {
         let fixture = fixture(ProgramKind::MinimumImage);
         let changes = no_changes();
         let request = request(&fixture, &changes, AnalysisLimits::standard());
@@ -19937,28 +20429,6 @@ comptime fn projection_fixture():
         assert_eq!(
             evaluator
                 .evaluate_binary_values(
-                    wrela_hir::BinaryOperator::ShiftLeftModular,
-                    unsigned(255),
-                    unsigned(1),
-                    source,
-                )
-                .expect("u8 modular result loss"),
-            unsigned(254)
-        );
-        assert_eq!(
-            evaluator
-                .evaluate_binary_values(
-                    wrela_hir::BinaryOperator::ShiftLeftModular,
-                    signed(-65),
-                    signed(1),
-                    source,
-                )
-                .expect("i8 modular result loss"),
-            signed(126)
-        );
-        assert_eq!(
-            evaluator
-                .evaluate_binary_values(
                     wrela_hir::BinaryOperator::ShiftLeft,
                     signed_128(-1),
                     signed_128(127),
@@ -19966,17 +20436,6 @@ comptime fn projection_fixture():
                 )
                 .expect("i128 checked sign boundary"),
             signed_128(i128::MIN)
-        );
-        assert_eq!(
-            evaluator
-                .evaluate_binary_values(
-                    wrela_hir::BinaryOperator::ShiftLeftModular,
-                    unsigned_128(u128::MAX),
-                    unsigned_128(1),
-                    source,
-                )
-                .expect("u128 modular result loss"),
-            unsigned_128(u128::MAX - 1)
         );
 
         for (left, right) in [
@@ -20004,17 +20463,7 @@ comptime fn projection_fixture():
                 unsigned(1),
                 unsigned(8),
             ),
-            (
-                wrela_hir::BinaryOperator::ShiftLeftModular,
-                unsigned(1),
-                unsigned(8),
-            ),
             (wrela_hir::BinaryOperator::ShiftLeft, signed(1), signed(-1)),
-            (
-                wrela_hir::BinaryOperator::ShiftLeftModular,
-                signed(1),
-                signed(-1),
-            ),
         ] {
             assert!(matches!(
                 evaluator.evaluate_binary_values(operator, left, right, source),
@@ -20128,8 +20577,8 @@ comptime fn projection_fixture():
 
     #[test]
     fn nested_unsupported_comptime_operation_retains_callee_and_call_site() {
-        const MATH: &str = "module app.math\n\npub comptime fn leaf() -> u32:\n    loop:\n        pass\n    return 0\n\npub comptime fn middle() -> u32:\n    return leaf()\n";
-        const TEST: &str = "module app.math_test\n\nfrom app.math import middle\n\n@test\ncomptime fn unsupported_import():\n    value: u32 = middle()\n";
+        const MATH: &str = "module app.math\n\npub fn leaf() -> u32:\n    loop:\n        pass\n    return 0\n\npub fn middle() -> u32:\n    return leaf()\n";
+        const TEST: &str = "module app.math_test\n\nfrom app.math import middle\n\n@test\nfn unsupported_import():\n    value: u32 = middle()\n";
         let fixture = parsed_comptime_fixture(MATH, TEST);
         let changes = no_changes();
         let program = fixture.fixture.hir.as_program();
@@ -20223,8 +20672,8 @@ comptime fn projection_fixture():
 
     #[test]
     fn static_comptime_closure_rejects_an_untaken_unsupported_rhs_before_proof() {
-        const MATH: &str = "module app.math\n\npub comptime fn unsupported() -> bool:\n    loop:\n        pass\n    return true\n";
-        const TEST: &str = "module app.math_test\n\nfrom app.math import unsupported\n\n@test\ncomptime fn hidden_unsupported_rhs():\n    comptime assert true or unsupported(), \"runtime short circuit must not hide unsupported source\"\n";
+        const MATH: &str = "module app.math\n\npub fn unsupported() -> bool:\n    loop:\n        pass\n    return true\n";
+        const TEST: &str = "module app.math_test\n\nfrom app.math import unsupported\n\n@test\nfn hidden_unsupported_rhs():\n    comptime assert true or unsupported(), \"runtime short circuit must not hide unsupported source\"\n";
         let fixture = parsed_comptime_fixture(MATH, TEST);
         let changes = no_changes();
         let output = CanonicalSemanticAnalyzer::new()
@@ -20233,6 +20682,14 @@ comptime fn projection_fixture():
                 &|| false,
             )
             .expect("bounded static closure diagnostic");
+        // The checker must have statically inspected the untaken RHS eagerly:
+        // if it were lazy about `or`'s short-circuit, `unsupported()` would
+        // never be reached and the closure would be judged comptime-legal
+        // (a real, passing result) instead of failing here. An explicit
+        // `--comptime` selection surfaces a closure-legality failure
+        // directly rather than silently reattempting the test at the
+        // runtime tier, so the checker's own diagnostic for `unsupported`'s
+        // `loop` is what should come back.
         assert!(output.successful().is_none());
         assert_eq!(output.diagnostics().len(), 1);
         assert_eq!(
@@ -20709,7 +21166,6 @@ comptime fn projection_fixture():
             wrela_hir::BinaryOperator::BitXor,
             wrela_hir::BinaryOperator::BitAnd,
             wrela_hir::BinaryOperator::ShiftLeft,
-            wrela_hir::BinaryOperator::ShiftLeftModular,
             wrela_hir::BinaryOperator::ShiftRight,
         ];
         for operator in binary_operators {
@@ -21545,7 +22001,7 @@ comptime fn projection_fixture():
         );
         assert_eq!(discovery.diagnostics()[0].primary, span(0, 430, 436));
 
-        let modular_bool = mutate_scalar_fixture(|program| {
+        let shift_bool = mutate_scalar_fixture(|program| {
             configure_scalar_helper_types(
                 program,
                 Builtin::Bool,
@@ -21553,7 +22009,7 @@ comptime fn projection_fixture():
                 Literal::Boolean(true),
             );
             program.expressions[11].kind = ExpressionKind::Binary {
-                operator: wrela_hir::BinaryOperator::ShiftLeftModular,
+                operator: wrela_hir::BinaryOperator::ShiftLeft,
                 left: ExpressionId(13),
                 right: ExpressionId(14),
             };
@@ -21562,8 +22018,8 @@ comptime fn projection_fixture():
                 .extend([scalar_operand_expression(13), scalar_operand_expression(14)]);
         });
         let discovery = CanonicalSemanticAnalyzer::new()
-            .analyze(discovery_request(&modular_bool, &changes), &|| false)
-            .expect("invalid modular shift discovery is recoverable");
+            .analyze(discovery_request(&shift_bool, &changes), &|| false)
+            .expect("invalid shift discovery is recoverable");
         assert!(discovery.successful().is_none());
         assert_eq!(discovery.diagnostics().len(), 1);
         assert_eq!(

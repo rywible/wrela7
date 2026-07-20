@@ -361,10 +361,10 @@ A conforming toolchain test suite includes, at minimum:
    invalid shifts, checked/wrapping conversion, canonical NaN, and float-to-int
    edge cases;
 4. explicit aggregate copy versus move and rejection of copying every linear
-   class;
+   struct;
 5. every legal and illegal access/view example, including projection-only
-   returns, public provenance matching, branch-dependent sources, multiple
-   disjoint views, and rejection of overlapping mutable leaves;
+   returns, conservative implicit provenance, branch-dependent sources, and
+   disjoint mutable-projection paths;
 6. rejection of a view/external access across `await`, plus legal turn-rooted
    access to nested actor-owned state;
 7. every second-class carrier shape and rejection of storing, returning,
@@ -428,7 +428,7 @@ A conforming toolchain test suite includes, at minimum:
 33. logical versus physical mailbox accounting and actor-chatter diagnostics;
     and
 34. emitted section sizes and target-runtime reservations matching the report;
-35. compiler-evaluated `@test comptime fn` quota/cache/failure reporting,
+35. compiler-evaluated `@test fn` quota/cache/failure reporting,
     generated integration-test image isolation and bounds, declared image-test
     scenarios, framed-event corruption/sequence/terminal rejection, boot/crash/
     timeout/protocol failure classification, and evidence that no runtime test
@@ -438,10 +438,9 @@ A conforming toolchain test suite includes, at minimum:
 
 The corrected virtio appliance in
 [`examples/virtio-storage.wr`](examples/virtio-storage.wr) is a required
-integration-shape test once the corresponding standard-library APIs exist. Its
-[implementation status](examples/virtio-storage-status.md) distinguishes the
-retained executable foundations from aspirational source and records the next
-vertical slices; the worked source alone is not boot or device-I/O evidence.
+integration-shape test once the corresponding standard-library APIs exist; the
+worked source alone is not boot or device-I/O evidence. Current status is
+tracked in the [conformance inventory](conformance-inventory.md).
 
 ## 9. Performance claims
 
@@ -465,7 +464,3 @@ A revision 0.1 compiler conforms only if it implements all normative semantics
 in chapters 01 through 10 for its advertised target profile. A target may omit
 an optional profile such as deterministic recording. It may not advertise a
 feature while weakening its invariants.
-
-Because this repository currently contains a design specification rather than a
-compiler, the conformance requirements are acceptance criteria for future
-implementations, not a statement of present implementation status.

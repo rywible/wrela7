@@ -700,7 +700,7 @@ fn validate_model_resources(
                     push_model_work(&mut types, (result, 1), limits.model_edges)?;
                 }
             }
-            DeclarationKind::Structure(value) | DeclarationKind::Class(value) => {
+            DeclarationKind::Structure(value) => {
                 meter.edges(&value.generics);
                 meter.edges(&value.implements);
                 meter.edges(&value.fields);
@@ -873,9 +873,7 @@ fn validate_model_resources(
                     }
                 }
             }
-            ExpressionKind::Tuple(values)
-            | ExpressionKind::Array(values)
-            | ExpressionKind::Race(values) => meter.edges(values),
+            ExpressionKind::Tuple(values) | ExpressionKind::Array(values) => meter.edges(values),
             ExpressionKind::Interpolate(parts) => {
                 meter.edges(parts);
                 for part in parts {
@@ -899,6 +897,7 @@ fn validate_model_resources(
             | ExpressionKind::Try(_)
             | ExpressionKind::Index { .. }
             | ExpressionKind::TrySend(_)
+            | ExpressionKind::DotName { .. }
             | ExpressionKind::Error => {}
         }
     }
@@ -917,14 +916,6 @@ fn validate_model_resources(
                     meter.text(spelling.as_str());
                     meter.edges(candidates);
                     meter.edges(arguments);
-                }
-                PrimaryPattern::ContextualName {
-                    spelling,
-                    candidates,
-                    ..
-                } => {
-                    meter.text(spelling.as_str());
-                    meter.edges(candidates);
                 }
                 PrimaryPattern::Tuple(arguments) | PrimaryPattern::Array(arguments) => {
                     meter.edges(arguments);
@@ -998,13 +989,6 @@ fn validate_model_resources(
         match &carrier.kind {
             ProjectionCarrierKind::View { ty, .. } => {
                 push_model_work(&mut types, (ty, next), limits.model_edges)?;
-            }
-            ProjectionCarrierKind::Tuple(values) => {
-                meter.edges(values);
-                for value in values {
-                    poll_cancellation(is_cancelled)?;
-                    push_model_work(&mut carriers, (value, next), limits.model_edges)?;
-                }
             }
             ProjectionCarrierKind::Option(value) => {
                 push_model_work(&mut carriers, (value, next), limits.model_edges)?;
@@ -2062,7 +2046,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn canonical_lowerer_preserves_checked_and_modular_left_shift() {
+    fn canonical_lowerer_preserves_checked_left_shift() {
         let fixture = source_fixture(
             "shift-frontend.wr",
             &["shift_frontend"],
@@ -2070,13 +2054,12 @@ mod contract_tests {
                 "module shift_frontend\n",
                 "fn shifts(left: u32, count: u32):\n",
                 "    checked = left << count\n",
-                "    modular = left <<% count\n",
-                "    mixed = left + 1 <<% count + 2 << 1\n",
+                "    mixed = left + 1 << count + 2 << 1\n",
             ),
         );
         let output = CanonicalHirLowerer::new()
             .lower(fixture.request(LoweringLimits::standard()), &|| false)
-            .expect("checked and modular shifts lower to sealed HIR");
+            .expect("checked shifts lower to sealed HIR");
         assert_eq!(output.diagnostics(), &[]);
         let program = output.lowered().program().as_program();
         let expression_by_source = |spelling: &str| {
@@ -2094,34 +2077,27 @@ mod contract_tests {
                 ..
             }
         ));
-        assert!(matches!(
-            &expression_by_source("left <<% count").kind,
-            wrela_hir::ExpressionKind::Binary {
-                operator: wrela_hir::BinaryOperator::ShiftLeftModular,
-                ..
-            }
-        ));
 
         let wrela_hir::ExpressionKind::Binary {
             operator: wrela_hir::BinaryOperator::ShiftLeft,
             left,
             ..
-        } = &expression_by_source("left + 1 <<% count + 2 << 1").kind
+        } = &expression_by_source("left + 1 << count + 2 << 1").kind
         else {
             panic!("outer checked shift must retain shared left associativity");
         };
-        let modular = program.expression(*left).expect("outer shift left operand");
+        let inner = program.expression(*left).expect("outer shift left operand");
         let wrela_hir::ExpressionKind::Binary {
-            operator: wrela_hir::BinaryOperator::ShiftLeftModular,
-            left: modular_left,
-            right: modular_right,
-        } = &modular.kind
+            operator: wrela_hir::BinaryOperator::ShiftLeft,
+            left: inner_left,
+            right: inner_right,
+        } = &inner.kind
         else {
-            panic!("modular shift must remain distinct in HIR");
+            panic!("shift must associate left-to-right");
         };
-        for operand in [*modular_left, *modular_right] {
+        for operand in [*inner_left, *inner_right] {
             assert!(matches!(
-                &program.expression(operand).expect("modular operand").kind,
+                &program.expression(operand).expect("shift operand").kind,
                 wrela_hir::ExpressionKind::Binary {
                     operator: wrela_hir::BinaryOperator::Add,
                     ..
@@ -2288,13 +2264,13 @@ mod contract_tests {
     }
 
     #[test]
-    fn class_initializer_lowers_to_dedicated_private_hir() {
+    fn struct_initializer_lowers_to_dedicated_private_hir() {
         let fixture = source_fixture(
             "initializer.wr",
             &["initializer"],
             concat!(
                 "module initializer\n",
-                "class Cache:\n",
+                "struct Cache:\n",
                 "    value: u64\n",
                 "    init(mut self, value: u64):\n",
                 "        pass\n",
@@ -2318,9 +2294,9 @@ mod contract_tests {
                     .as_ref()
                     .is_some_and(|name| name.as_str() == "Cache")
             })
-            .expect("class declaration");
-        let wrela_hir::DeclarationKind::Class(class_kind) = &class.kind else {
-            panic!("Cache must remain a class")
+            .expect("struct declaration");
+        let wrela_hir::DeclarationKind::Structure(class_kind) = &class.kind else {
+            panic!("Cache must remain a struct")
         };
         let initializer = class_kind
             .members
@@ -2678,7 +2654,7 @@ mod contract_tests {
                 "@no_promote\n",
                 "@budget\n",
                 "@uninterrupted\n",
-                "pub comptime fn all_attributes():\n",
+                "pub fn all_attributes():\n",
                 "    pass\n",
                 "@test\n",
                 "fn test_entry():\n",
@@ -2780,15 +2756,13 @@ mod contract_tests {
                 "    payload(u64,)\n",
                 "fn inspect(value: State) -> u64:\n",
                 "    match value:\n",
-                "        case ready:\n",
+                "        case .ready:\n",
                 "            return 0\n",
-                "        case payload(ready):\n",
-                "            return 0\n",
-                "        case payload(bind x) | payload(bind x):\n",
+                "        case .payload(x) | .payload(x):\n",
                 "            return x\n",
-                "        case State.payload(bind z):\n",
+                "        case State.payload(z):\n",
                 "            return z\n",
-                "    if value is payload(bind y) and y > 0:\n",
+                "    if value is .payload(y) and y > 0:\n",
                 "        return y\n",
                 "    return 0\n",
             ),
@@ -2806,11 +2780,11 @@ mod contract_tests {
             pattern.alternatives.iter().any(|alternative| {
                 matches!(
                     &alternative.kind,
-                    wrela_hir::PrimaryPattern::ContextualName {
+                    wrela_hir::PrimaryPattern::Constructor {
                         spelling,
                         candidates,
-                        ..
-                    } if spelling.as_str() == "ready" && candidates.len() == 1
+                        arguments,
+                    } if spelling.as_str() == "ready" && candidates.len() == 1 && arguments.is_empty()
                 )
             })
         }));
