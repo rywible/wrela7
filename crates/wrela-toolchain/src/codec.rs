@@ -464,7 +464,6 @@ fn component_kind_name(kind: ComponentKind) -> &'static str {
         ComponentKind::Frontend => "frontend",
         ComponentKind::Backend => "backend",
         ComponentKind::StandardLibrary => "standard_library",
-        ComponentKind::Aarch64Emulator => "aarch64_emulator",
     }
 }
 
@@ -981,7 +980,6 @@ impl<'a> Parser<'a> {
                     "frontend" => ComponentKind::Frontend,
                     "backend" => ComponentKind::Backend,
                     "standard_library" => ComponentKind::StandardLibrary,
-                    "aarch64_emulator" => ComponentKind::Aarch64Emulator,
                     _ => return Err(malformed(byte_offset, "unknown component kind")),
                 };
                 let builder = self.component_builder(byte_offset)?;
@@ -2006,8 +2004,6 @@ mod tests {
         manifest.components[0].path = ComponentPath::new("bin/wrela.exe").expect("path");
         manifest.components[1].path =
             ComponentPath::new("libexec/wrela/wrela-backend.exe").expect("path");
-        manifest.components[3].path =
-            ComponentPath::new("libexec/wrela/qemu-system-aarch64.exe").expect("path");
         manifest.validate(&required).expect("Windows layout");
     }
 

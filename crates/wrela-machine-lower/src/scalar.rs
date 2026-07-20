@@ -1422,7 +1422,7 @@ fn lower_activation_subset(
                 MachineActivationSchedule::StartupOnce,
                 Some(dispatch),
             ) if dispatch.producer == caller.id => {
-                let message = if app.is_some() {
+                if app.is_some() {
                     let [capability, reserve, commit, candidate] = entry.instructions.as_slice()
                     else {
                         return Err(unsupported(
@@ -1492,8 +1492,7 @@ fn lower_activation_subset(
                                     } if committed == reservation && arguments.is_empty())
                                 && reserve.source == commit.source
                         ))
-                };
-                message
+                }
             }
             (MachineActivationOwner::Task { .. }, MachineActivationSchedule::StartupOnce, None) => {
                 entry.instructions.len() == 1

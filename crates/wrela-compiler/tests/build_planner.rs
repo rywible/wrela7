@@ -117,8 +117,6 @@ const APPLICATION_LOCKFILE: &[u8] =
     include_bytes!("../../../std/examples/minimal-image/wrela.lock");
 const TARGET_MANIFEST: &[u8] =
     include_bytes!("../../../toolchain/targets/aarch64-qemu-virt-uefi/target.toml");
-const FIRMWARE_CODE: &[u8] = b"firmware-code";
-const FIRMWARE_VARIABLES: &[u8] = b"firmware-vars";
 const RUNTIME_OBJECT: &[u8] = b"runtime-object";
 
 static HASHER: SoftwareSha256 = SoftwareSha256;
@@ -259,8 +257,6 @@ struct ToolchainMeasurements {
     backend_bytes: u64,
     standard_library_digest: Sha256Digest,
     standard_library_bytes: u64,
-    emulator_digest: Sha256Digest,
-    emulator_bytes: u64,
     target_digest: Sha256Digest,
     target_bytes: u64,
 }
@@ -390,8 +386,6 @@ impl Fixture {
 
         let target_measurement = canonical_tree_digest(
             &[
-                tree_record("firmware/QEMU_EFI.fd", FIRMWARE_CODE),
-                tree_record("firmware/QEMU_VARS.fd", FIRMWARE_VARIABLES),
                 tree_record("runtime/wrela-runtime-aarch64.obj", RUNTIME_OBJECT),
                 tree_record("target.toml", TARGET_MANIFEST),
             ],
@@ -403,7 +397,6 @@ impl Fixture {
         let target = decode_target(target_measurement.digest);
         let compiler_bytes = b"wrela frontend integration fixture";
         let backend_bytes = b"wrela backend integration fixture";
-        let emulator_bytes = b"qemu integration fixture";
         let compiler_digest = HASHER.sha256(compiler_bytes);
         let standard_library_measurement = canonical_tree_digest(
             &[
@@ -435,24 +428,11 @@ impl Fixture {
             &format!("toolchain/{}", backend_component_path()),
             backend_bytes,
         );
-        let emulator_path = directory.write(
-            &format!("toolchain/{}", emulator_component_path()),
-            emulator_bytes,
-        );
         set_executable(&frontend_path);
         set_executable(&backend_path);
-        set_executable(&emulator_path);
         directory.write(
             "toolchain/share/wrela/targets/aarch64-qemu-virt-uefi/target.toml",
             TARGET_MANIFEST,
-        );
-        directory.write(
-            "toolchain/share/wrela/targets/aarch64-qemu-virt-uefi/firmware/QEMU_EFI.fd",
-            FIRMWARE_CODE,
-        );
-        directory.write(
-            "toolchain/share/wrela/targets/aarch64-qemu-virt-uefi/firmware/QEMU_VARS.fd",
-            FIRMWARE_VARIABLES,
         );
         directory.write(
             "toolchain/share/wrela/targets/aarch64-qemu-virt-uefi/runtime/wrela-runtime-aarch64.obj",
@@ -475,8 +455,6 @@ impl Fixture {
                 backend_bytes: u64::try_from(backend_bytes.len()).expect("backend byte count"),
                 standard_library_digest: standard_library_component_digest,
                 standard_library_bytes: standard_library_measurement.content_bytes,
-                emulator_digest: HASHER.sha256(emulator_bytes),
-                emulator_bytes: u64::try_from(emulator_bytes.len()).expect("emulator byte count"),
                 target_digest: target_measurement.digest,
                 target_bytes: target_measurement.content_bytes,
             },
@@ -578,18 +556,11 @@ fn verified_toolchain(
             digest: measurements.standard_library_digest,
             bytes: measurements.standard_library_bytes,
         },
-        ShippedComponent {
-            kind: ComponentKind::Aarch64Emulator,
-            path: ComponentPath::new(emulator_component_path()).expect("emulator component path"),
-            digest: measurements.emulator_digest,
-            bytes: measurements.emulator_bytes,
-        },
     ];
-    let target_files = vec![
-        shipped_target_file("firmware/QEMU_EFI.fd", FIRMWARE_CODE),
-        shipped_target_file("firmware/QEMU_VARS.fd", FIRMWARE_VARIABLES),
-        shipped_target_file("runtime/wrela-runtime-aarch64.obj", RUNTIME_OBJECT),
-    ];
+    let target_files = vec![shipped_target_file(
+        "runtime/wrela-runtime-aarch64.obj",
+        RUNTIME_OBJECT,
+    )];
     let targets = vec![ShippedTarget {
         identity: TargetIdentity::aarch64_qemu_virt_uefi(),
         path: ComponentPath::new("share/wrela/targets/aarch64-qemu-virt-uefi")
@@ -666,16 +637,6 @@ const fn backend_component_path() -> &'static str {
 #[cfg(not(windows))]
 const fn backend_component_path() -> &'static str {
     "libexec/wrela/wrela-backend"
-}
-
-#[cfg(windows)]
-const fn emulator_component_path() -> &'static str {
-    "libexec/wrela/qemu-system-aarch64.exe"
-}
-
-#[cfg(not(windows))]
-const fn emulator_component_path() -> &'static str {
-    "libexec/wrela/qemu-system-aarch64"
 }
 
 #[cfg(unix)]

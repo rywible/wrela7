@@ -64,13 +64,7 @@ impl ProcessExecutor for LocalProcessExecutor {
         validate_specification(specification)?;
         validate_scenario_contract(specification, scenario)?;
         check_cancelled(is_cancelled)?;
-        verify_file(
-            specification.program.path(),
-            specification.program.digest(),
-            specification.program.bytes(),
-            true,
-            is_cancelled,
-        )?;
+        verify_ambient_file(&specification.program, true, is_cancelled)?;
         let staged = stage_inputs(specification, is_cancelled)?;
         if let Err(error) = prepare_shutdown_control(specification) {
             return match cleanup_process_directory(specification, &staged, false) {
@@ -117,7 +111,7 @@ fn validate_specification(specification: &ProcessSpecification) -> Result<(), Ex
         ))?;
         ensure_existing_ancestors_are_not_symlinks(parent)?;
     }
-    if !super::normal_absolute_path(specification.program.path())
+    if !super::normal_absolute_path(&specification.program)
         || !super::normal_absolute_path(&specification.current_directory)
         || specification.current_directory.components().count() <= 1
     {
@@ -374,22 +368,17 @@ fn stage_input(
     Ok(())
 }
 
-fn verify_file(
+/// Apply hygiene and open-time-identity checks to an ambient system path (the
+/// resolved QEMU program) that carries no separately declared expected digest
+/// or length to compare against, unlike a staged [`ProcessInput`] source.
+fn verify_ambient_file(
     path: &Path,
-    expected_digest: wrela_build_model::Sha256Digest,
-    expected_bytes: u64,
     executable: bool,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), ExecuteError> {
     check_cancelled(is_cancelled)?;
     let before = checked_source_metadata(path, executable)?;
-    if before.len() != expected_bytes {
-        return verification(
-            path,
-            "verified file length differs from its sealed identity",
-        );
-    }
-    let mut file = File::open(path).map_err(|error| ExecuteError::Stage {
+    let file = File::open(path).map_err(|error| ExecuteError::Stage {
         path: path.to_owned(),
         error,
     })?;
@@ -399,19 +388,6 @@ fn verify_file(
     })?;
     if !same_open_file(&before, &opened) {
         return verification(path, "verified file changed while it was opened");
-    }
-    let (bytes, digest) = measure_reader(&mut file, path, expected_bytes, is_cancelled)?;
-    let after_open = file.metadata().map_err(|error| ExecuteError::Stage {
-        path: path.to_owned(),
-        error,
-    })?;
-    let after_path = checked_source_metadata(path, executable)?;
-    if bytes != expected_bytes
-        || digest != expected_digest
-        || !same_open_file(&before, &after_open)
-        || !same_open_file(&before, &after_path)
-    {
-        return verification(path, "verified file identity, size, or digest changed");
     }
     check_cancelled(is_cancelled)
 }
@@ -539,23 +515,6 @@ fn copy_and_measure<W: Write>(
     Ok((total, digest.finish()))
 }
 
-fn measure_reader(
-    source: &mut File,
-    source_path: &Path,
-    expected_bytes: u64,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<(u64, wrela_build_model::Sha256Digest), ExecuteError> {
-    let mut sink = io::sink();
-    copy_and_measure(
-        source,
-        &mut sink,
-        expected_bytes,
-        source_path,
-        None,
-        is_cancelled,
-    )
-}
-
 fn set_staged_permissions(path: &Path, writable: bool) -> Result<(), ExecuteError> {
     let mut permissions = fs::metadata(path)
         .map_err(|error| ExecuteError::Stage {
@@ -614,7 +573,7 @@ fn run_child(
 ) -> Result<ProcessOutput, ExecuteError> {
     run_program(
         ChildRequest {
-            program: specification.program.path(),
+            program: &specification.program,
             arguments: &specification.arguments,
             current_directory: &specification.current_directory,
             environment: &specification.environment,
@@ -632,7 +591,7 @@ fn run_interactive_child(
 ) -> Result<ProcessOutput, ExecuteError> {
     run_interactive_program(
         InteractiveRequest {
-            program: specification.program.path(),
+            program: &specification.program,
             arguments: &specification.arguments,
             current_directory: &specification.current_directory,
             environment: &specification.environment,

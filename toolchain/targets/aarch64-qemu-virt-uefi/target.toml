@@ -59,9 +59,11 @@ dynamic_linking = false
 default_libraries = false
 relocations = true
 
-# Full-image tests always execute the emitted artifact. The QEMU executable and
-# both firmware files are shipped, hashed toolchain components; ambient PATH
-# and system firmware are never consulted.
+# Full-image tests always execute the emitted artifact under the developer's
+# installed qemu-system-aarch64 and EDK2 firmware, resolved at run time from
+# WRELA_QEMU / WRELA_QEMU_FIRMWARE_CODE / WRELA_QEMU_FIRMWARE_VARS or the system
+# default. The paths below name the firmware layout inside the booted image, not
+# where the host binaries live.
 [runner]
 emulator = "qemu-system-aarch64"
 machine = "virt-10.0,gic-version=3,secure=off"

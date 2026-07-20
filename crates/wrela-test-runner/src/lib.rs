@@ -155,7 +155,7 @@ pub struct RunRequest<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSpecification {
-    pub program: VerifiedPath,
+    pub program: PathBuf,
     pub arguments: Vec<OsString>,
     pub current_directory: PathBuf,
     /// Environment is exact and sorted; the ambient host environment is not
@@ -222,6 +222,20 @@ impl VerifiedProcessFile {
         }
     }
 
+    /// Construct from an ambient system path that is not tracked by any
+    /// verified toolchain manifest (the system QEMU binary or its EDK2
+    /// firmware). The exact bytes are measured once, immediately, by this
+    /// process capability itself rather than trusted from a prior
+    /// verification.
+    pub fn from_system_path(path: PathBuf) -> Result<Self, std::io::Error> {
+        let (digest, bytes) = crate::sha256::digest_file(&path)?;
+        Ok(Self {
+            path,
+            digest,
+            bytes,
+        })
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -252,10 +266,15 @@ pub struct ProcessOutput {
 /// or any undeclared installation path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageExecutionComponents {
-    pub emulator: VerifiedPath,
+    /// System QEMU binary, self-measured from `wrela_toolchain::system_qemu()`.
+    pub emulator: VerifiedProcessFile,
     pub target_package: VerifiedPath,
-    pub firmware_code: VerifiedPath,
-    pub firmware_variables: VerifiedPath,
+    /// System EDK2 firmware code, self-measured from
+    /// `wrela_toolchain::system_firmware_code()`.
+    pub firmware_code: VerifiedProcessFile,
+    /// System EDK2 firmware variable-store template, self-measured from
+    /// `wrela_toolchain::system_firmware_vars()`.
+    pub firmware_variables: VerifiedProcessFile,
 }
 
 /// The only process-launch capability. Production uses a bounded child-process
@@ -291,6 +310,7 @@ pub struct ImageSummaryRequest<'a> {
     pub group: &'a FullImageTestGroup,
     pub artifact: &'a ImageArtifact,
     pub command: &'a ProcessSpecification,
+    pub components: &'a ImageExecutionComponents,
     pub output: ProcessOutput,
     pub events: &'a [TestEvent],
     pub scenario: Option<&'a ImageScenario>,
@@ -315,6 +335,7 @@ pub trait ImageHarness {
     fn command_digest(
         &self,
         command: &ProcessSpecification,
+        components: &ImageExecutionComponents,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<Sha256Digest, RunError>;
 
@@ -474,22 +495,21 @@ impl TestRunner<'_> {
         }
 
         // Emulator and firmware are execution capabilities, so resolve them
-        // only when at least one group produced a runnable image.
-        let emulator = request
-            .toolchain
-            .aarch64_emulator()
-            .map_err(|error| RunError::Toolchain(error.to_string()))?;
-        let firmware_code = request
-            .toolchain
-            .target_file(&plan.target, request.target.runner().firmware_code())
-            .map_err(|error| RunError::Toolchain(error.to_string()))?;
-        let firmware_variables = request
-            .toolchain
-            .target_file(
-                &plan.target,
-                request.target.runner().firmware_variables_template(),
-            )
-            .map_err(|error| RunError::Toolchain(error.to_string()))?;
+        // only when at least one group produced a runnable image. Neither is
+        // tracked by the toolchain manifest; each is self-measured from its
+        // ambient system location immediately before use.
+        let emulator = VerifiedProcessFile::from_system_path(wrela_toolchain::system_qemu())
+            .map_err(|error| RunError::Toolchain(format!("system qemu binary: {error}")))?;
+        let firmware_code =
+            VerifiedProcessFile::from_system_path(wrela_toolchain::system_firmware_code())
+                .map_err(|error| {
+                    RunError::Toolchain(format!("system qemu firmware code: {error}"))
+                })?;
+        let firmware_variables =
+            VerifiedProcessFile::from_system_path(wrela_toolchain::system_firmware_vars())
+                .map_err(|error| {
+                    RunError::Toolchain(format!("system qemu firmware variables: {error}"))
+                })?;
         let execution_components = ImageExecutionComponents {
             emulator: emulator.clone(),
             target_package: installed_target.clone(),
@@ -536,7 +556,7 @@ impl TestRunner<'_> {
             let expected_timeout = group
                 .execution_timeout_ns(scenario)
                 .ok_or_else(|| RunError::InvalidInvocation("timeout budget overflow".to_owned()))?;
-            if command.program != emulator
+            if command.program.as_path() != emulator.path()
                 || command.timeout_ns != expected_timeout
                 || command.protocol_limits != execution_policy.limits
                 || command.maximum_output_bytes != execution_policy.maximum_output_bytes
@@ -595,13 +615,16 @@ impl TestRunner<'_> {
                     group,
                     artifact,
                     command: &command,
+                    components: &execution_components,
                     output,
                     events: &events,
                     scenario,
                 },
                 is_cancelled,
             )?;
-            let command_digest = self.harness.command_digest(&command, is_cancelled)?;
+            let command_digest =
+                self.harness
+                    .command_digest(&command, &execution_components, is_cancelled)?;
             let event_stream_digest = self.harness.event_stream_digest(&events, is_cancelled)?;
             if result.group != group.id
                 || result.evidence.image_digest != Some(artifact.digest())
@@ -781,7 +804,7 @@ fn valid_process_shape(command: &ProcessSpecification, limits: RunnerLimits) -> 
     {
         return false;
     }
-    let path_bytes = [command.program.path(), &command.current_directory]
+    let path_bytes = [command.program.as_path(), &command.current_directory]
         .into_iter()
         .chain(
             command
@@ -864,14 +887,8 @@ fn valid_process_inputs(
 ) -> bool {
     let expected = [
         (VerifiedProcessFile::from_image(artifact), false),
-        (
-            VerifiedProcessFile::from_toolchain(&components.firmware_code),
-            false,
-        ),
-        (
-            VerifiedProcessFile::from_toolchain(&components.firmware_variables),
-            true,
-        ),
+        (components.firmware_code.clone(), false),
+        (components.firmware_variables.clone(), true),
     ];
     valid_exact_process_inputs(working_directory, inputs, &expected)
 }

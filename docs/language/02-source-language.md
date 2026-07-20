@@ -1105,7 +1105,7 @@ methods, generics, nested or non-scalar aggregates, aggregate equality,
 floating-point values, `Result`/`Ok`/`Err`, non-test/actor assertion
 supervision, or generated runtime-image execution. Selected generated-test
 runtime assertions are implemented through native ABI2 objects, but their
-packaged-QEMU execution remains pending.
+system-QEMU execution remains pending.
 Test execution, effective limits, result classification, and the exact current
 boundary are specified in chapter 06.
 Ordinary semantic float-literal lowering remains separately available to the

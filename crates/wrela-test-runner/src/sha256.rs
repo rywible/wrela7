@@ -4,7 +4,30 @@
 //! bytes checked immediately before a QEMU launch must be measured by the
 //! process capability itself.
 
+use std::io::Read;
+use std::path::Path;
+
 use wrela_build_model::Sha256Digest;
+
+/// Measure one ambient filesystem path (not otherwise tracked by a verified
+/// toolchain manifest) by streaming its exact bytes through this crate's own
+/// hasher. Used to self-measure the system QEMU binary and its EDK2 firmware
+/// images before they cross into a process specification.
+pub(crate) fn digest_file(path: &Path) -> std::io::Result<(Sha256Digest, u64)> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total_bytes: u64 = 0;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        total_bytes = total_bytes.saturating_add(read as u64);
+    }
+    Ok((hasher.finish(), total_bytes))
+}
 
 const INITIAL_STATE: [u32; 8] = [
     0x6a09_e667,

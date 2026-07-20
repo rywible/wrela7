@@ -17,7 +17,7 @@ use wrela_test_model::{
 use wrela_test_protocol::{CanonicalTestEventCodec, ProtocolLimits, seal_encoded_event};
 use wrela_test_runner::{
     CanonicalImageHarness, ImageHarness, LocalProcessExecutor, ProcessExecutor,
-    ProcessSpecification,
+    ProcessSpecification, VerifiedProcessFile,
 };
 use wrela_toolchain::{
     ComponentKind, LocalToolchainVerificationLimits, LocalToolchainVerifier, Toolchain,
@@ -174,10 +174,8 @@ fn installed_core_time_source_executes_under_enrolled_qemu() {
         .toolchain()
         .component(ComponentKind::StandardLibrary)
         .expect("verified standard library");
-    let emulator = verification
-        .toolchain()
-        .component(ComponentKind::Aarch64Emulator)
-        .expect("verified AArch64 emulator");
+    let emulator = VerifiedProcessFile::from_system_path(wrela_toolchain::system_qemu())
+        .expect("measure system qemu binary");
     let target = verification
         .toolchain()
         .target(&target_identity)
@@ -207,7 +205,7 @@ fn installed_core_time_source_executes_under_enrolled_qemu() {
         let output = case_root.join("output");
 
         let specification = ProcessSpecification {
-            program: frontend.clone(),
+            program: frontend.path().to_owned(),
             arguments: vec![
                 OsString::from("test"),
                 workspace.join("wrela.toml").into_os_string(),

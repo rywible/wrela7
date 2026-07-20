@@ -196,9 +196,6 @@ const CORE_TIME_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/
 const TARGET_MANIFEST: &[u8] =
     include_bytes!("../../../toolchain/targets/aarch64-qemu-virt-uefi/target.toml");
 const BACKEND_BYTES: &[u8] = b"wrela CLI test backend";
-const EMULATOR_BYTES: &[u8] = b"wrela CLI test emulator";
-const FIRMWARE_CODE: &[u8] = b"wrela CLI test firmware code";
-const FIRMWARE_VARIABLES: &[u8] = b"wrela CLI test firmware variables";
 const RUNTIME_OBJECT: &[u8] = b"wrela CLI test runtime object";
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1286,7 +1283,7 @@ fn public_doctor_verifies_a_complete_installed_toolchain() {
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 doctor output");
     let lines = stdout.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 4, "{stdout}");
+    assert_eq!(lines.len(), 3, "{stdout}");
     assert!(
         lines.iter().all(|line| line.trim_start().starts_with("ok")),
         "{stdout}"
@@ -1299,7 +1296,6 @@ fn public_doctor_rejects_mutated_installed_content_while_every_path_exists() {
     let toolchain = install_toolchain(&directory);
     let cases = [
         ("backend", toolchain.join(backend_path())),
-        ("emulator", toolchain.join(emulator_path())),
         (
             "standard library source",
             toolchain.join("share/wrela/std/wrela-core-0.1/src/image.wr"),
@@ -1309,10 +1305,6 @@ fn public_doctor_rejects_mutated_installed_content_while_every_path_exists() {
             toolchain.join(
                 "share/wrela/targets/aarch64-qemu-virt-uefi/runtime/wrela-runtime-aarch64.obj",
             ),
-        ),
-        (
-            "firmware",
-            toolchain.join("share/wrela/targets/aarch64-qemu-virt-uefi/firmware/QEMU_EFI.fd"),
         ),
         (
             "toolchain manifest",
@@ -1671,21 +1663,11 @@ fn install_toolchain_with_frontend(directory: &TestDirectory, frontend_bytes: &[
 
     let frontend = directory.write(&format!("toolchain/{}", frontend_path()), frontend_bytes);
     let backend = directory.write(&format!("toolchain/{}", backend_path()), BACKEND_BYTES);
-    let emulator = directory.write(&format!("toolchain/{}", emulator_path()), EMULATOR_BYTES);
     set_executable(&frontend);
     set_executable(&backend);
-    set_executable(&emulator);
 
     let target_root = "toolchain/share/wrela/targets/aarch64-qemu-virt-uefi";
     directory.write(&format!("{target_root}/target.toml"), TARGET_MANIFEST);
-    directory.write(
-        &format!("{target_root}/firmware/QEMU_EFI.fd"),
-        FIRMWARE_CODE,
-    );
-    directory.write(
-        &format!("{target_root}/firmware/QEMU_VARS.fd"),
-        FIRMWARE_VARIABLES,
-    );
     directory.write(
         &format!("{target_root}/runtime/wrela-runtime-aarch64.obj"),
         RUNTIME_OBJECT,
@@ -1698,8 +1680,6 @@ fn install_toolchain_with_frontend(directory: &TestDirectory, frontend_bytes: &[
         tree_record("wrela-core-0.1/wrela.toml", CORE_MANIFEST),
     ]);
     let target = tree_measurement(&[
-        tree_record("firmware/QEMU_EFI.fd", FIRMWARE_CODE),
-        tree_record("firmware/QEMU_VARS.fd", FIRMWARE_VARIABLES),
         tree_record("runtime/wrela-runtime-aarch64.obj", RUNTIME_OBJECT),
         tree_record("target.toml", TARGET_MANIFEST),
     ]);
@@ -1738,11 +1718,6 @@ fn install_toolchain_with_frontend(directory: &TestDirectory, frontend_bytes: &[
                 digest: standard_library.digest,
                 bytes: standard_library.content_bytes,
             },
-            shipped_component(
-                ComponentKind::Aarch64Emulator,
-                emulator_path(),
-                EMULATOR_BYTES,
-            ),
         ],
         targets: vec![ShippedTarget {
             identity: TargetIdentity::aarch64_qemu_virt_uefi(),
@@ -1750,11 +1725,10 @@ fn install_toolchain_with_frontend(directory: &TestDirectory, frontend_bytes: &[
                 .expect("target path"),
             digest: target.digest,
             bytes: target.content_bytes,
-            files: vec![
-                shipped_target_file("firmware/QEMU_EFI.fd", FIRMWARE_CODE),
-                shipped_target_file("firmware/QEMU_VARS.fd", FIRMWARE_VARIABLES),
-                shipped_target_file("runtime/wrela-runtime-aarch64.obj", RUNTIME_OBJECT),
-            ],
+            files: vec![shipped_target_file(
+                "runtime/wrela-runtime-aarch64.obj",
+                RUNTIME_OBJECT,
+            )],
         }],
     };
     let manifest = CanonicalToolchainManifestCodec::new()
@@ -1858,16 +1832,6 @@ const fn backend_path() -> &'static str {
 #[cfg(not(windows))]
 const fn backend_path() -> &'static str {
     "libexec/wrela/wrela-backend"
-}
-
-#[cfg(windows)]
-const fn emulator_path() -> &'static str {
-    "libexec/wrela/qemu-system-aarch64.exe"
-}
-
-#[cfg(not(windows))]
-const fn emulator_path() -> &'static str {
-    "libexec/wrela/qemu-system-aarch64"
 }
 
 #[cfg(unix)]

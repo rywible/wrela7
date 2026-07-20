@@ -97,9 +97,9 @@ requires a language or target-package revision recorded in the image report.
   for ARM64 COFF objects and PE32+ images; the checked-in target package pins
   the accepted header, subsystem, relocation, and entry policy.
 - QEMU's [AArch64 `virt` machine contract](https://www.qemu.org/docs/master/system/arm/virt)
-  as realized by the bundled, digest-pinned QEMU release. The target uses the
-  versioned `virt-10.0` machine and explicit `cortex-a57` CPU rather than moving
-  `virt` or `max` aliases.
+  as realized by the developer's own installed `qemu-system-aarch64`. The
+  target uses the versioned `virt-10.0` machine and explicit `cortex-a57` CPU
+  rather than moving `virt` or `max` aliases.
 - [Virtio 1.2 Committee Specification 01](https://docs.oasis-open.org/virtio/virtio/v1.2/cs01/virtio-v1.2-cs01.html)
   for the standard virtio transport/queue contracts. Virtio 1.3 is not silently
   included because its published latest stage is a committee-specification

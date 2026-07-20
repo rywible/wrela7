@@ -493,18 +493,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wrela-engine"
-version = "0.1.0"
-dependencies = [
- "wrela-build-model",
- "wrela-compiler",
- "wrela-driver",
- "wrela-package",
- "wrela-package-loader",
- "wrela-toolchain",
-]
-
-[[package]]
 name = "wrela-flow-lower"
 version = "0.1.0"
 dependencies = [
@@ -777,7 +765,6 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "sha2",
 ]
 
 [[package]]

@@ -404,6 +404,9 @@ pub enum LinkError {
     ResidualOutput {
         path: PathBuf,
     },
+    OutputSeal {
+        path: PathBuf,
+    },
     ImageTooLarge {
         limit: u64,
         actual: u64,
@@ -460,6 +463,11 @@ impl fmt::Display for LinkError {
             Self::ResidualOutput { path } => write!(
                 formatter,
                 "EFI linking failed and left an unsealed output at {}",
+                path.display()
+            ),
+            Self::OutputSeal { path } => write!(
+                formatter,
+                "cannot seal linked EFI image permissions at {}",
                 path.display()
             ),
             Self::ImageTooLarge { limit, actual } => write!(
@@ -536,6 +544,11 @@ fn link_with_driver(
         if is_cancelled() {
             return Err(LinkError::Cancelled);
         }
+        // The system `lld-link` executable writes its output with default
+        // permissions. Restore the private, non-executable seal the former
+        // in-process driver applied so the linked image is never left
+        // group/other readable or executable.
+        seal_output_permissions(request.output)?;
         // LLD re-opens path arguments. Re-inspection closes persistent path or
         // byte replacement between the pre-link seal and native consumption.
         inspect_objects(request, object_inspector, is_cancelled)?;
@@ -1129,6 +1142,24 @@ fn next_argument_total(
 ///
 /// Returns an exact [`LinkError`] when the request or measurements do not
 /// satisfy the target, resource, identity, entry, or cancellation contract.
+/// Seal the linked image as a private, non-executable regular file.
+fn seal_output_permissions(path: &Path) -> Result<(), LinkError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|_| {
+            LinkError::OutputSeal {
+                path: path.to_owned(),
+            }
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 pub fn seal_artifact(
     request: &LinkRequest<'_>,
     measurements: ImageMeasurements,

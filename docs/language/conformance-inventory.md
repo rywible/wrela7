@@ -20,8 +20,8 @@ chapters 01–10. It describes the advertised
   A dash in a layer list is an explicit missing layer, not “not applicable”.
 - Evidence names checked-in files. A test name without a successful recorded run
   is implementation evidence, not proof of conformance. The focused gate for a
-  row is `cargo xgate <owning-slice>`; milestone proof additionally requires the
-  release gates and pinned QEMU profile.
+  row is `cargo xgate <owning-slice>`; milestone proof additionally requires
+  the native `--full` gates against the system QEMU profile.
 - A new normative heading or obligation must add or split a row in the same
   change. Unsupported source must fail closed with a source diagnostic; accepting
   and silently weakening a row is forbidden.

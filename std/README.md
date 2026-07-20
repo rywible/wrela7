@@ -1,8 +1,8 @@
 # wrela standard library
 
-Distribution builds copy the validated standard-library closure into
-`share/wrela/std`; it is a pinned part of the toolchain rather than a host
-dependency.
+The standard library is a pinned part of the toolchain rather than a host
+dependency: an installed wrela toolchain seals its validated standard-library
+closure at `share/wrela/std`.
 
 ## Bootstrap surface
 
@@ -40,10 +40,11 @@ Named-place `?` is rejected until its move and cleanup contract is implemented.
 This is development substrate for the recoverable spine, not general generic
 execution. Checked-in verticals independently specialize `Result[u8, u8]`,
 `Result[bool, bool]`, and `Result[u64, u64]`; the u64 case proves the exact
-16-byte, 8-aligned `{u8 tag, u64 payload}` target layout and, when the enrolled
-LLVM backend is available, emits byte-identical independently inspected ARM64
-COFF twice. Unequal or nonscalar payloads, wrong generic arity, forged non-core
-generic enums, and context-free constructors fail with stable diagnostics.
+16-byte, 8-aligned `{u8 tag, u64 payload}` target layout and, when the native
+backend is enabled (`wrela-backend/bundled-backend`, system LLVM), emits
+byte-identical independently inspected ARM64 COFF twice. Unequal or nonscalar
+payloads, wrong generic arity, forged non-core generic enums, and
+context-free constructors fail with stable diagnostics.
 General `Result[T, E]`, error conversion, `Option`, recoverable
 standard-library operations, EFI/QEMU execution, and installed-distribution
 coverage remain open.
@@ -85,19 +86,18 @@ ordinary functions through SemanticWir, FlowWir, canonical Flow wire v10,
 backend revalidation, and MachineWir. The ordering helpers use the implemented
 scalar projection/comparison/local/branch subset and reconstruct their selected
 result through `ns`; this does not claim runtime copy-expression lowering. With
-the authenticated LLVM 22.1.3 lane enabled, the prepared model retains exactly
-three unsigned less comparisons, one unsigned less-equal comparison, four
-source branches, eight checked multiplies, two checked adds, two checked
-subtracts, twenty-two construction/projection/scalar-copy bitcasts, and the
-exact 70-edge fully qualified harness/test/core call multiset before emitting
-byte-identical independently validated ARM64 COFF twice. The source `@test fn`
-is compiled as the selected test group; this fixture does not boot an image or
-execute the test under the runtime runner. A separate ignored
-`stdlib_time_real_qemu` gate builds the manifest-declared installed-source
-workspace and executes it with an explicitly enrolled toolchain; its ordinary
-failure path remains non-ignored and verifies bounded path-free diagnostics.
-The repository does not treat an absent enrollment environment variable as
-QEMU evidence.
+the native backend enabled against system LLVM 22.1.3, the prepared model
+retains exactly three unsigned less comparisons, one unsigned less-equal
+comparison, four source branches, eight checked multiplies, two checked adds,
+two checked subtracts, twenty-two construction/projection/scalar-copy
+bitcasts, and the exact 70-edge fully qualified harness/test/core call
+multiset before emitting byte-identical independently validated ARM64 COFF
+twice. The source `@test fn` is compiled as the selected test group; this
+fixture does not boot an image or execute the test under the runtime runner. A
+separate ignored `stdlib_time_real_qemu` gate builds the manifest-declared
+installed-source workspace and executes it against the system-resolved
+`qemu-system-aarch64` and EDK2 firmware; its ordinary failure path remains
+non-ignored and verifies bounded path-free diagnostics.
 
 MachineWir v10 now consumes the supported one-field u64 representation as an
 exact 8-byte, 8-aligned scalar-backed ABI value with explicit construction and

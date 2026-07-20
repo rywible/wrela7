@@ -1,8 +1,7 @@
 //! Raw LLD driver boundary.
 //!
-//! This is the only crate permitted to contain the C ABI declaration and
-//! unsafe call for the pinned C++ shim. It contains no Wrela model or target
-//! policy.
+//! This is the only crate permitted to shell out to the system `lld-link`
+//! executable. It contains no Wrela model or target policy.
 
 use std::fmt;
 
@@ -86,9 +85,8 @@ impl std::error::Error for LldError {}
 
 /// Invoke the raw COFF driver with already policy-validated arguments.
 ///
-/// The shim prepends the fixed `lld-link` program name, captures diagnostics
-/// into a fixed Rust-owned buffer, seals the one direct output as a private
-/// non-executable regular file, and serializes in-process LLD calls.
+/// This shells out to the system `lld-link` executable, passing `arguments`
+/// as the remaining argv entries (the linker binary itself is argv[0]).
 pub fn link_coff(arguments: &[String]) -> Result<(), LldError> {
     validate_arguments(arguments)?;
     #[cfg(feature = "bundled-lld")]
@@ -141,111 +139,37 @@ fn validate_arguments(arguments: &[String]) -> Result<(), LldError> {
 
 #[cfg(feature = "bundled-lld")]
 mod native {
-    use std::ffi::CString;
-    use std::os::raw::c_char;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::env;
+    use std::path::PathBuf;
+    use std::process::Command;
 
     use super::{LldError, MAX_LLD_DIAGNOSTIC_BYTES};
 
-    static DRIVER_LOCK: Mutex<()> = Mutex::new(());
-    static DRIVER_AVAILABLE: AtomicBool = AtomicBool::new(true);
-
-    #[repr(C)]
-    struct NativeResult {
-        status: i32,
-        can_run_again: u8,
-        reserved: [u8; 3],
-        captured_bytes: usize,
-        total_bytes: usize,
-    }
-
-    unsafe extern "C" {
-        fn wrela_lld_link_coff(
-            arguments: *const *const c_char,
-            argument_count: usize,
-            diagnostics: *mut c_char,
-            diagnostic_capacity: usize,
-        ) -> NativeResult;
-    }
+    const FALLBACK_LLD_LINK: &str = "/opt/homebrew/opt/lld/bin/lld-link";
 
     pub(super) fn link_coff(arguments: &[String]) -> Result<(), LldError> {
-        let _guard = DRIVER_LOCK
-            .lock()
-            .map_err(|_| LldError::NativeStateUnavailable)?;
-        if !DRIVER_AVAILABLE.load(Ordering::Acquire) {
-            return Err(LldError::NativeStateUnavailable);
-        }
-        let mut native_arguments = Vec::new();
-        native_arguments
-            .try_reserve_exact(arguments.len() + 1)
-            .map_err(|_| LldError::ResourceLimit {
-                resource: "argument count",
-                limit: super::MAX_LLD_ARGUMENTS + 1,
-                actual: arguments.len() + 1,
+        require_exactly_one_direct_output(arguments)?;
+        let linker = discover_linker();
+        let output = Command::new(&linker)
+            .args(arguments)
+            .output()
+            .map_err(|error| LldError::DriverFailed {
+                status: -1,
+                diagnostic: format!("cannot execute {}: {error}", linker.display()),
             })?;
-        native_arguments.push(c_string("lld-link")?);
-        for argument in arguments {
-            native_arguments.push(c_string(argument)?);
-        }
-        let mut pointers = Vec::new();
-        pointers
-            .try_reserve_exact(native_arguments.len())
-            .map_err(|_| LldError::ResourceLimit {
-                resource: "argument count",
-                limit: super::MAX_LLD_ARGUMENTS + 1,
-                actual: native_arguments.len(),
-            })?;
-        pointers.extend(native_arguments.iter().map(|argument| argument.as_ptr()));
-        let mut diagnostics = Vec::new();
-        diagnostics
-            .try_reserve_exact(MAX_LLD_DIAGNOSTIC_BYTES)
-            .map_err(|_| LldError::ResourceLimit {
-                resource: "diagnostic bytes",
-                limit: MAX_LLD_DIAGNOSTIC_BYTES,
-                actual: MAX_LLD_DIAGNOSTIC_BYTES,
-            })?;
-        diagnostics.resize(MAX_LLD_DIAGNOSTIC_BYTES, 0u8);
-
-        // SAFETY: every pointer comes from a live `CString`, the pointer array
-        // and fixed diagnostic buffer remain alive for the complete call, and
-        // the C++ shim exposes this exact `repr(C)` signature without throwing.
-        let result = unsafe {
-            wrela_lld_link_coff(
-                pointers.as_ptr(),
-                pointers.len(),
-                diagnostics.as_mut_ptr().cast(),
-                diagnostics.len(),
-            )
-        };
-        if result.can_run_again > 1 || result.captured_bytes > diagnostics.len() {
-            DRIVER_AVAILABLE.store(false, Ordering::Release);
-            return Err(LldError::NativeStateUnavailable);
-        }
-        if result.can_run_again == 0 {
-            DRIVER_AVAILABLE.store(false, Ordering::Release);
-        }
-        if result.total_bytes > diagnostics.len() {
-            return Err(LldError::DiagnosticTooLarge {
-                limit: diagnostics.len(),
-                actual: result.total_bytes,
-            });
-        }
-        diagnostics.truncate(result.captured_bytes);
-        let diagnostic =
-            String::from_utf8(diagnostics).map_err(|_| LldError::InvalidDiagnosticEncoding)?;
+        let status = output.status.code().unwrap_or(-1);
+        let mut diagnostic = String::with_capacity(output.stdout.len() + output.stderr.len());
+        diagnostic.push_str(&String::from_utf8_lossy(&output.stdout));
+        diagnostic.push_str(&String::from_utf8_lossy(&output.stderr));
         let diagnostic = trim_in_place(diagnostic);
-        if result.can_run_again == 0 {
-            return Err(LldError::DriverCannotRunAgain {
-                status: result.status,
-                diagnostic,
+        if diagnostic.len() > MAX_LLD_DIAGNOSTIC_BYTES {
+            return Err(LldError::DiagnosticTooLarge {
+                limit: MAX_LLD_DIAGNOSTIC_BYTES,
+                actual: diagnostic.len(),
             });
         }
-        if result.status != 0 {
-            return Err(LldError::DriverFailed {
-                status: result.status,
-                diagnostic,
-            });
+        if !output.status.success() {
+            return Err(LldError::DriverFailed { status, diagnostic });
         }
         if !diagnostic.is_empty() {
             return Err(LldError::UnexpectedOutput(diagnostic));
@@ -253,24 +177,38 @@ mod native {
         Ok(())
     }
 
-    fn c_string(value: &str) -> Result<CString, LldError> {
-        let capacity = value.len().checked_add(1).ok_or(LldError::ResourceLimit {
-            resource: "argument bytes",
-            limit: super::MAX_LLD_ARGUMENT_BYTES,
-            actual: usize::MAX,
-        })?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(capacity)
-            .map_err(|_| LldError::ResourceLimit {
-                resource: "argument bytes",
-                limit: super::MAX_LLD_ARGUMENT_BYTES,
-                actual: capacity,
-            })?;
-        bytes.extend_from_slice(value.as_bytes());
-        bytes.push(0);
-        CString::from_vec_with_nul(bytes)
-            .map_err(|_| LldError::InvalidArguments("arguments must be nonempty NUL-free UTF-8"))
+    /// Port of the old in-process shim's one-`/out:`-path guard, checked
+    /// before spawning the linker so behavior matches the prior boundary.
+    fn require_exactly_one_direct_output(arguments: &[String]) -> Result<(), LldError> {
+        let direct_outputs = arguments
+            .iter()
+            .filter(|argument| argument.to_ascii_lowercase().starts_with("/out:"))
+            .count();
+        if direct_outputs != 1 {
+            return Err(LldError::DriverFailed {
+                status: -2,
+                diagnostic: "LLD invocation requires exactly one direct /out: path".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn discover_linker() -> PathBuf {
+        if let Some(path) = env::var_os("WRELA_LLD_LINK") {
+            return PathBuf::from(path);
+        }
+        if let Some(path) = find_on_path("lld-link") {
+            return path;
+        }
+        PathBuf::from(FALLBACK_LLD_LINK)
+    }
+
+    fn find_on_path(name: &str) -> Option<PathBuf> {
+        let path_variable = env::var_os("PATH")?;
+        env::split_paths(&path_variable).find_map(|directory| {
+            let candidate = directory.join(name);
+            candidate.is_file().then_some(candidate)
+        })
     }
 
     fn trim_in_place(mut value: String) -> String {

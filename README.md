@@ -4,11 +4,12 @@ wrela is a language whose compilation unit is a sealed, bootable machine image.
 This repository contains the language specification and the in-progress
 self-contained revision-0.1 compiler toolchain.
 
-The public command will be `wrela`. Release archives will include the compiler,
-the LLVM code-generation backend, the LLD COFF linker, the AArch64 target,
-runtime and UEFI firmware, QEMU for full-image tests, the standard library, and
-required licenses. Installing those components separately is not part of the
-user contract.
+The public command will be `wrela`. wrela does not bundle or acquire LLVM,
+LLD, or QEMU: the native backend links against the LLVM already installed on
+the developer's machine, the EFI linker shells out to the system `lld-link`,
+and full-image tests invoke the system `qemu-system-aarch64` and system EDK2
+firmware. The compiler, the AArch64 target's runtime object, and the standard
+library remain wrela's own sealed artifacts.
 
 ## Development
 
@@ -28,8 +29,11 @@ requirements, commands, and timing budget. It then runs package-scoped rustfmt,
 denied, and architecture validation. Arbitrary extra arguments and test filters
 are rejected so a caller cannot turn acceptance into a zero-test filtered run.
 Non-native `--full` gates report that no additional check applies only after
-fast verification succeeds; native `--full` gates invoke the applicable
-LLVM or distribution path and fail honestly while that path is unavailable.
+fast verification succeeds; native `--full` gates run `cargo test` with the
+`wrela-backend/bundled-backend` feature enabled, which builds and links
+against the system LLVM/LLD (and, for the `testing`/`cli` slices, exercises
+the system `qemu-system-aarch64` and firmware) and fails honestly when those
+are unavailable on disk.
 
 `cargo xcheck`, `cargo xtest`, and `cargo xlint` remain available as granular
 developer commands and accept either a named boundary or one exact crate. They
@@ -59,8 +63,12 @@ cargo test -p wrela-flow-wir-codec
 cargo test -p wrela-link-efi
 ```
 
-LLVM/LLD acquisition and distribution assembly live behind `cargo xtask` and
-use the exact revision recorded in [`toolchain/llvm.lock.toml`](toolchain/llvm.lock.toml).
+`xtask` no longer acquires or builds LLVM, LLD, or QEMU: enable the native
+backend with the `wrela-backend/bundled-backend` Cargo feature, which links
+`wrela-codegen-llvm` against the system LLVM (via `.cargo/config.toml`'s
+`LLVM_SYS_221_PREFIX`, pointed at the on-disk install) and links
+`wrela-link-efi` against the system `lld-link` (override with
+`WRELA_LLD_LINK`).
 
 The supported public command shapes currently include:
 
@@ -85,8 +93,10 @@ wrela doctor
 These commands are real for the explicitly supported minimum semantic surface;
 they are not a claim that the full language specification is implemented.
 `wrela doctor` reports a complete installation healthy only after bounded
-content, compatibility, target/runtime/firmware, and running-frontend identity
-verification; the presence table alone is not a success condition.
+content, compatibility, target/runtime, and running-frontend identity
+verification; the presence table alone is not a success condition. QEMU and
+firmware are resolved from the developer's system and are not part of the
+sealed installation this checks.
 
 See the [language specification](docs/language/README.md), the
 [toolchain architecture](docs/toolchain-architecture.md), and the enforceable

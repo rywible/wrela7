@@ -14,8 +14,11 @@ pub(super) fn emit_object(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<ObjectArtifact, CodegenError> {
     check_cancelled(is_cancelled)?;
+    // The backend links whatever LLVM 22.1.x is installed on the host, so the
+    // gate pins the major/minor ABI series (matching inkwell's `llvm22-1`
+    // feature) and accepts any patch release rather than one exact build.
     let observed_version = inkwell::support::get_llvm_version();
-    if observed_version != PINNED_LLVM_VERSION {
+    if (observed_version.0, observed_version.1) != (PINNED_LLVM_VERSION.0, PINNED_LLVM_VERSION.1) {
         return Err(CodegenError::LlvmVersionMismatch {
             expected: PINNED_LLVM_VERSION,
             observed: observed_version,

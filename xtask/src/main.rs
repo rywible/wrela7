@@ -9,11 +9,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
-mod dist;
-mod linux_engine;
-mod llvm;
-mod qemu;
-
 const HELP: &str = "\
 xtask commands:
   architecture-check [--root <absolute-workspace>]  enforce crate dependency contracts
@@ -22,13 +17,7 @@ xtask commands:
   test <slice|crate> [...]   cargo test for one boundary
   lint <slice|crate>         clippy -D warnings for one boundary
   gate <slice|crate> [--full]  complete locked, offline focused gate
-  llvm [options]      fetch, verify, and build pinned LLVM/LLD
-  linux-engine [--plan|--record-output|--offline]  build the static AArch64 Linux engine
-  qemu [options]      authenticate and build pinned QEMU/firmware
-  cargo-vendor [options]  acquire or exactly re-enroll the Cargo dependency closure
-  dist [options]      assemble and validate an atomic toolchain bundle
 ";
-const MACOS_DEPLOYMENT_TARGET: &str = "13.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FullRoute {
@@ -155,10 +144,7 @@ const DEVELOPMENT_SLICES: &[DevelopmentSlice] = &[
         upstream: &["machine"],
         downstream: &["backend", "testing"],
         fixture_families: &["protocol/v1", "target/v1"],
-        native_requirements: &[
-            "pinned LLVM 22 AArch64 static libraries",
-            "bundled LLD COFF driver",
-        ],
+        native_requirements: &["system LLVM 22 (llvm-config on disk)", "system lld-link"],
         full_route: FullRoute::ArtifactNative,
         fast_budget_seconds: 90,
     },
@@ -225,10 +211,7 @@ const DEVELOPMENT_SLICES: &[DevelopmentSlice] = &[
         upstream: &["flow", "machine", "artifact"],
         downstream: &["cli"],
         fixture_families: &["protocol/v1", "target/v1"],
-        native_requirements: &[
-            "pinned LLVM 22 AArch64 static libraries",
-            "bundled LLD COFF driver",
-        ],
+        native_requirements: &["system LLVM 22 (llvm-config on disk)", "system lld-link"],
         full_route: FullRoute::BackendNative,
         fast_budget_seconds: 120,
     },
@@ -244,17 +227,10 @@ const DEVELOPMENT_SLICES: &[DevelopmentSlice] = &[
         ],
         upstream: &["artifact"],
         downstream: &["cli"],
-        fixture_families: &[
-            "package/v1",
-            "protocol/v1",
-            "target/v1",
-            "toolchain/linux-payload-authority/v1",
-            "toolchain/v1",
-        ],
+        fixture_families: &["package/v1", "protocol/v1", "target/v1", "toolchain/v1"],
         native_requirements: &[
             "installed target and runtime object",
-            "pinned QEMU aarch64-system emulator",
-            "pinned EDK2 firmware",
+            "system qemu-system-aarch64 + EDK2 firmware (on disk)",
         ],
         full_route: FullRoute::Distribution,
         fast_budget_seconds: 90,
@@ -262,12 +238,7 @@ const DEVELOPMENT_SLICES: &[DevelopmentSlice] = &[
     DevelopmentSlice {
         name: "cli",
         purpose: "public driver, CLI surface, and sealed headless engine process",
-        packages: &[
-            "wrela-driver",
-            "wrela-compiler",
-            "wrela-cli",
-            "wrela-engine",
-        ],
+        packages: &["wrela-driver", "wrela-compiler", "wrela-cli"],
         upstream: &["frontend", "backend", "testing"],
         downstream: &[],
         fixture_families: &[
@@ -275,12 +246,11 @@ const DEVELOPMENT_SLICES: &[DevelopmentSlice] = &[
             "protocol/v1",
             "syntax/v3",
             "target/v1",
-            "toolchain/linux-payload-authority/v1",
             "toolchain/v1",
         ],
         native_requirements: &[
-            "self-contained LLVM/LLD backend",
-            "installed target, runtime, QEMU, and firmware",
+            "system LLVM/LLD backend (on disk)",
+            "installed target, runtime, and system QEMU + firmware (on disk)",
         ],
         full_route: FullRoute::Distribution,
         fast_budget_seconds: 180,
@@ -296,10 +266,9 @@ const DEVELOPMENT_SLICES: &[DevelopmentSlice] = &[
             "protocol/v1",
             "syntax/v3",
             "target/v1",
-            "toolchain/linux-payload-authority/v1",
             "toolchain/v1",
         ],
-        native_requirements: &["complete self-contained distribution toolchain"],
+        native_requirements: &["system LLVM/LLD + QEMU toolchain on disk"],
         full_route: FullRoute::Distribution,
         fast_budget_seconds: 300,
     },
@@ -484,15 +453,6 @@ const EXTERNAL_DEPENDENCIES: &[ExternalDependencyContract] = &[
         requirement: "^1",
         optional: false,
         default_features: true,
-        features: &[],
-    },
-    ExternalDependencyContract {
-        owner: "xtask",
-        name: "sha2",
-        kind: DependencySection::Normal,
-        requirement: "=0.10.9",
-        optional: false,
-        default_features: false,
         features: &[],
     },
 ];
@@ -785,17 +745,6 @@ const CONTRACTS: &[CrateContract] = &[
             "wrela-test-model",
         ],
         dev: &[],
-    },
-    CrateContract {
-        name: "wrela-engine",
-        directory: "crates/wrela-engine",
-        normal: &[
-            "wrela-build-model",
-            "wrela-compiler",
-            "wrela-driver",
-            "wrela-toolchain",
-        ],
-        dev: &["wrela-package", "wrela-package-loader"],
     },
     CrateContract {
         name: "wrela-flow-lower",
@@ -1091,56 +1040,6 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some("llvm") => {
-            let arguments: Vec<_> = arguments.collect();
-            match workspace_root().and_then(|root| llvm::run(&root, &arguments)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Some("linux-engine") => {
-            let arguments: Vec<_> = arguments.collect();
-            match workspace_root().and_then(|root| linux_engine::run(&root, &arguments)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Some("qemu") => {
-            let arguments: Vec<_> = arguments.collect();
-            match workspace_root().and_then(|root| qemu::run(&root, &arguments)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Some("cargo-vendor") => {
-            let arguments: Vec<_> = arguments.collect();
-            match workspace_root().and_then(|root| dist::run_cargo_vendor(&root, &arguments)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Some("dist") => {
-            let arguments: Vec<_> = arguments.collect();
-            match workspace_root().and_then(|root| dist::run(&root, &arguments)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         Some(command) => {
             eprintln!("error: unknown xtask command `{command}`\n\n{HELP}");
             ExitCode::from(2)
@@ -1158,7 +1057,7 @@ fn print_slice_names() {
 fn print_slices(root: &Path) -> Result<(), String> {
     validate_development_slice_metadata()?;
     validate_fixture_inventory(root)?;
-    let metadata = resolved_cargo_metadata(root, None)?;
+    let metadata = resolved_cargo_metadata(root)?;
     eprintln!("authoritative development slice inventory:");
     for slice in DEVELOPMENT_SLICES {
         let target = gate_target(slice.name)?;
@@ -1278,24 +1177,17 @@ fn exact_crate_full_profile(name: &str) -> (FullRoute, &'static [&'static str], 
     match name {
         "wrela-codegen-llvm" | "wrela-lld-sys" | "wrela-link-efi" => (
             FullRoute::ArtifactNative,
-            &[
-                "pinned LLVM 22 AArch64 static libraries",
-                "bundled LLD COFF driver",
-            ],
+            &["system LLVM 22 (llvm-config on disk)", "system lld-link"],
             90,
         ),
         "wrela-backend" => (
             FullRoute::BackendNative,
-            &[
-                "pinned LLVM 22 AArch64 static libraries",
-                "bundled LLD COFF driver",
-            ],
+            &["system LLVM 22 (llvm-config on disk)", "system lld-link"],
             120,
         ),
-        "wrela-compiler" | "wrela-cli" | "wrela-engine" | "wrela-test-runner"
-        | "wrela-toolchain" | "xtask" => (
+        "wrela-compiler" | "wrela-cli" | "wrela-test-runner" | "wrela-toolchain" | "xtask" => (
             FullRoute::Distribution,
-            &["complete self-contained distribution toolchain"],
+            &["system LLVM/LLD + QEMU toolchain on disk"],
             180,
         ),
         _ => (FullRoute::None, &[], 60),
@@ -1519,7 +1411,6 @@ fn reviewed_fixture_families(workspace: &BTreeSet<String>) -> BTreeSet<String> {
         fixtures.insert("protocol/v1".to_owned());
     }
     if workspace.contains("wrela-toolchain") {
-        fixtures.insert("toolchain/linux-payload-authority/v1".to_owned());
         fixtures.insert("toolchain/v1".to_owned());
     }
     fixtures
@@ -1727,10 +1618,14 @@ fn full_route_description(route: FullRoute) -> &'static str {
     match route {
         FullRoute::None => "none; the fast gate is complete for this non-native target",
         FullRoute::ArtifactNative => {
-            "cargo xtask llvm, then feature-enabled LLVM/LLD artifact check"
+            "system LLVM/LLD on disk: cargo test with wrela-backend/bundled-backend"
         }
-        FullRoute::BackendNative => "cargo xtask llvm, then feature-enabled bundled backend check",
-        FullRoute::Distribution => "cargo xtask dist (native/distribution integration)",
+        FullRoute::BackendNative => {
+            "system LLVM/LLD on disk: cargo test with wrela-backend/bundled-backend"
+        }
+        FullRoute::Distribution => {
+            "system LLVM/LLD (+ QEMU) on disk: cargo test with wrela-backend/bundled-backend"
+        }
     }
 }
 
@@ -1738,7 +1633,7 @@ fn run_gate(root: &Path, request: &GateRequest) -> Result<(), String> {
     let started = Instant::now();
     validate_development_slice_metadata()?;
     let target = gate_target(&request.target)?;
-    let metadata = resolved_cargo_metadata(root, None)?;
+    let metadata = resolved_cargo_metadata(root)?;
     let closure = validate_gate_closure(&target, &metadata)?;
     print_gate_metadata(&target, &closure);
 
@@ -1824,7 +1719,7 @@ fn run_gate(root: &Path, request: &GateRequest) -> Result<(), String> {
     }
 
     if request.full {
-        run_full_route(root, &target)?;
+        run_full_route(root, &target, &closure)?;
     }
     Ok(())
 }
@@ -1846,20 +1741,11 @@ fn append_package_selection(
 }
 
 fn run_cargo(root: &Path, label: &str, arguments: &[String]) -> Result<(), String> {
-    run_cargo_with_native_environment(root, label, arguments, None)
-}
-
-fn run_cargo_with_native_environment(
-    root: &Path,
-    label: &str,
-    arguments: &[String],
-    native: Option<&llvm::VerifiedNativeEnvironment>,
-) -> Result<(), String> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     eprintln!("gate step {label}: cargo {}", arguments.join(" "));
     let mut command = Command::new(cargo);
     command.args(arguments).current_dir(root);
-    configure_cargo_gate_environment(&mut command, native)?;
+    configure_cargo_gate_environment(&mut command);
     let status = command
         .status()
         .map_err(|error| format!("cannot execute cargo for {label}: {error}"))?;
@@ -1870,103 +1756,48 @@ fn run_cargo_with_native_environment(
     }
 }
 
-fn configure_cargo_gate_environment(
-    command: &mut Command,
-    native: Option<&llvm::VerifiedNativeEnvironment>,
-) -> Result<(), String> {
-    if native.is_some() && !cfg!(target_os = "macos") {
-        return Err(
-            "the current authenticated native route is a Darwin bootstrap only; the authoritative Linux engine is not implemented"
-                .to_owned(),
-        );
-    }
+fn configure_cargo_gate_environment(command: &mut Command) {
+    // System LLVM/LLD/QEMU are on disk; LLVM_SYS_221_PREFIX and the
+    // WRELA_LLVM_* environment come from the workspace .cargo/config.toml
+    // [env] table, so the gate itself only needs to stay offline.
     command.env("CARGO_NET_OFFLINE", "true");
-    if let Some(native) = native {
-        command
-            .env("LLVM_SYS_221_PREFIX", &native.prefix)
-            .env("WRELA_LLVM_PREFIX", &native.prefix)
-            .env("WRELA_LLVM_CXX", &native.cxx)
-            .env("WRELA_LLVM_AR", &native.ar)
-            .env("WRELA_LLVM_SYSROOT", &native.sysroot)
-            .env("MACOSX_DEPLOYMENT_TARGET", MACOS_DEPLOYMENT_TARGET);
-    }
-    Ok(())
 }
 
-fn run_full_route(root: &Path, target: &GateTarget) -> Result<(), String> {
-    let steps = full_route_steps(target.full_route);
+fn run_full_route(root: &Path, target: &GateTarget, closure: &GateClosure) -> Result<(), String> {
+    let steps = full_route_steps(target, closure);
     if steps.is_empty() {
         println!(
-            "full gate {} has no additional native or process check; fast evidence is complete",
+            "full gate {} has no additional native check; fast evidence is complete",
             target.name
         );
         return Ok(());
     }
-    let mut native = None;
-    for step in steps {
-        run_cargo_with_native_environment(root, step.label, &step.arguments, native.as_ref())?;
-        if step.label == "cargo xtask llvm" {
-            native = Some(llvm::verified_environment_for_full_route(root)?);
-        }
+    for step in &steps {
+        run_cargo(root, step.label, &step.arguments)?;
     }
     Ok(())
 }
 
-fn full_route_steps(route: FullRoute) -> Vec<CargoStep> {
-    let native_task = |command: &'static str| CargoStep {
-        label: if command == "llvm" {
-            "cargo xtask llvm"
-        } else {
-            "cargo xtask dist"
-        },
-        arguments: vec![
-            "run".to_owned(),
-            "--locked".to_owned(),
-            "--offline".to_owned(),
-            "--package".to_owned(),
-            "xtask".to_owned(),
-            "--".to_owned(),
-            command.to_owned(),
-        ],
-    };
-    match route {
-        FullRoute::None => Vec::new(),
-        FullRoute::ArtifactNative => vec![
-            native_task("llvm"),
-            CargoStep {
-                label: "feature-enabled LLVM/LLD artifact check",
-                arguments: vec![
-                    "check".to_owned(),
-                    "--all-targets".to_owned(),
-                    "--locked".to_owned(),
-                    "--offline".to_owned(),
-                    "--package".to_owned(),
-                    "wrela-codegen-llvm".to_owned(),
-                    "--package".to_owned(),
-                    "wrela-link-efi".to_owned(),
-                    "--features".to_owned(),
-                    "wrela-codegen-llvm/llvm,wrela-link-efi/bundled-lld".to_owned(),
-                ],
-            },
-        ],
-        FullRoute::BackendNative => vec![
-            native_task("llvm"),
-            CargoStep {
-                label: "feature-enabled bundled backend check",
-                arguments: vec![
-                    "check".to_owned(),
-                    "--all-targets".to_owned(),
-                    "--locked".to_owned(),
-                    "--offline".to_owned(),
-                    "--package".to_owned(),
-                    "wrela-backend".to_owned(),
-                    "--features".to_owned(),
-                    "bundled-backend".to_owned(),
-                ],
-            },
-        ],
-        FullRoute::Distribution => vec![native_task("dist")],
+fn full_route_steps(target: &GateTarget, closure: &GateClosure) -> Vec<CargoStep> {
+    if target.full_route == FullRoute::None {
+        return Vec::new();
     }
+    let mut arguments = vec![
+        "test".to_owned(),
+        "--all-targets".to_owned(),
+        "--no-fail-fast".to_owned(),
+        "--locked".to_owned(),
+        "--offline".to_owned(),
+    ];
+    append_package_selection(&mut arguments, target, closure, "--workspace", "--package");
+    arguments.extend([
+        "--features".to_owned(),
+        "wrela-backend/bundled-backend".to_owned(),
+    ]);
+    vec![CargoStep {
+        label: "native system LLVM/LLD (+ QEMU) gate",
+        arguments,
+    }]
 }
 
 fn run_development_slice(
@@ -2068,42 +1899,7 @@ fn architecture_root(arguments: &[String]) -> Result<PathBuf, String> {
     }
 }
 
-struct ArchitectureCommandTools<'a> {
-    cargo: &'a Path,
-    rustc: &'a Path,
-    rustdoc: &'a Path,
-    cargo_home: &'a Path,
-    current_directory: &'a Path,
-}
-
 pub(crate) fn check_architecture(root: &Path) -> Result<(), String> {
-    check_architecture_inner(root, None)
-}
-
-pub(crate) fn check_architecture_with_tools(
-    root: &Path,
-    cargo: &Path,
-    rustc: &Path,
-    rustdoc: &Path,
-    cargo_home: &Path,
-    current_directory: &Path,
-) -> Result<(), String> {
-    check_architecture_inner(
-        root,
-        Some(&ArchitectureCommandTools {
-            cargo,
-            rustc,
-            rustdoc,
-            cargo_home,
-            current_directory,
-        }),
-    )
-}
-
-fn check_architecture_inner(
-    root: &Path,
-    tools: Option<&ArchitectureCommandTools<'_>>,
-) -> Result<(), String> {
     validate_development_slice_metadata()?;
     validate_fixture_inventory(root)?;
     let workspace_names: BTreeSet<_> = CONTRACTS.iter().map(|contract| contract.name).collect();
@@ -2111,7 +1907,7 @@ fn check_architecture_inner(
         .iter()
         .map(|contract| contract.directory.to_owned())
         .collect();
-    let metadata = cargo_metadata(root, tools)?;
+    let metadata = cargo_metadata(root)?;
     let packages = metadata
         .get("packages")
         .and_then(serde_json::Value::as_array)
@@ -2222,15 +2018,12 @@ fn check_architecture_inner(
     }
     check_external_dependencies(packages, &workspace_names)?;
     check_toolchain_contracts(root)?;
-    validate_gate_inventory_against_metadata(root, tools)?;
+    validate_gate_inventory_against_metadata(root)?;
     Ok(())
 }
 
-fn validate_gate_inventory_against_metadata(
-    root: &Path,
-    tools: Option<&ArchitectureCommandTools<'_>>,
-) -> Result<(), String> {
-    let metadata = resolved_cargo_metadata(root, tools)?;
+fn validate_gate_inventory_against_metadata(root: &Path) -> Result<(), String> {
+    let metadata = resolved_cargo_metadata(root)?;
     for slice in DEVELOPMENT_SLICES {
         let target = gate_target(slice.name)?;
         validate_gate_closure(&target, &metadata)?;
@@ -2365,14 +2158,8 @@ fn check_documented_contract_inventory(
     Ok(())
 }
 
-fn cargo_metadata(
-    root: &Path,
-    tools: Option<&ArchitectureCommandTools<'_>>,
-) -> Result<serde_json::Value, String> {
-    let cargo = tools.map_or_else(
-        || env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
-        |tools| tools.cargo.as_os_str().to_owned(),
-    );
+fn cargo_metadata(root: &Path) -> Result<serde_json::Value, String> {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
     command
         .args([
@@ -2385,7 +2172,7 @@ fn cargo_metadata(
             "--manifest-path",
         ])
         .arg(root.join("Cargo.toml"));
-    configure_architecture_command(&mut command, root, tools);
+    configure_architecture_command(&mut command, root);
     let output = command
         .output()
         .map_err(|error| format!("cannot execute cargo metadata: {error}"))?;
@@ -2399,15 +2186,9 @@ fn cargo_metadata(
         .map_err(|error| format!("cannot decode cargo metadata: {error}"))
 }
 
-fn resolved_cargo_metadata(
-    root: &Path,
-    tools: Option<&ArchitectureCommandTools<'_>>,
-) -> Result<ResolvedMetadata, String> {
-    let host = rustc_host_triple(root, tools)?;
-    let cargo = tools.map_or_else(
-        || env::var_os("CARGO").unwrap_or_else(|| "cargo".into()),
-        |tools| tools.cargo.as_os_str().to_owned(),
-    );
+fn resolved_cargo_metadata(root: &Path) -> Result<ResolvedMetadata, String> {
+    let host = rustc_host_triple(root)?;
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
     command
         .args([
@@ -2421,7 +2202,7 @@ fn resolved_cargo_metadata(
         .arg(root.join("Cargo.toml"))
         .args(["--filter-platform"])
         .arg(&host);
-    configure_architecture_command(&mut command, root, tools);
+    configure_architecture_command(&mut command, root);
     let output = command
         .output()
         .map_err(|error| format!("cannot execute resolved cargo metadata: {error}"))?;
@@ -2436,17 +2217,11 @@ fn resolved_cargo_metadata(
     decode_resolved_metadata(&value)
 }
 
-fn rustc_host_triple(
-    root: &Path,
-    tools: Option<&ArchitectureCommandTools<'_>>,
-) -> Result<String, String> {
-    let rustc = tools.map_or_else(
-        || env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
-        |tools| tools.rustc.as_os_str().to_owned(),
-    );
+fn rustc_host_triple(root: &Path) -> Result<String, String> {
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let mut command = Command::new(rustc);
     command.arg("-vV");
-    configure_architecture_command(&mut command, root, tools);
+    configure_architecture_command(&mut command, root);
     let output = command
         .output()
         .map_err(|error| format!("cannot query rustc host triple: {error}"))?;
@@ -2463,26 +2238,8 @@ fn rustc_host_triple(
         .ok_or_else(|| "rustc -vV omitted its host triple".to_owned())
 }
 
-fn configure_architecture_command(
-    command: &mut Command,
-    root: &Path,
-    tools: Option<&ArchitectureCommandTools<'_>>,
-) {
-    if let Some(tools) = tools {
-        command
-            .current_dir(tools.current_directory)
-            .env_clear()
-            .env("CARGO_HOME", tools.cargo_home)
-            .env("CARGO_NET_OFFLINE", "true")
-            .env("HOME", tools.current_directory)
-            .env("LC_ALL", "C")
-            .env("PATH", "/wrela/no-ambient-path")
-            .env("RUSTC", tools.rustc)
-            .env("RUSTDOC", tools.rustdoc)
-            .env("TZ", "UTC");
-    } else {
-        command.current_dir(root).env("CARGO_NET_OFFLINE", "true");
-    }
+fn configure_architecture_command(command: &mut Command, root: &Path) {
+    command.current_dir(root).env("CARGO_NET_OFFLINE", "true");
 }
 
 fn decode_resolved_metadata(value: &serde_json::Value) -> Result<ResolvedMetadata, String> {
@@ -2808,46 +2565,12 @@ fn external_dependency_key(
 fn check_toolchain_contracts(root: &Path) -> Result<(), String> {
     let checks: &[(&str, &[&str])] = &[
         (
-            "toolchain/llvm.lock.toml",
-            &[
-                "version = \"22.1.3\"",
-                "tag = \"llvmorg-22.1.3\"",
-                "projects = [\"lld\"]",
-                "targets = [\"AArch64\"]",
-            ],
-        ),
-        (
-            "toolchain/linux-engine.lock.toml",
-            &[
-                "channel = \"1.95.0\"",
-                "host = \"aarch64-apple-darwin\"",
-                "target = \"aarch64-unknown-linux-musl\"",
-                "target_archive_sha256 = \"f6710416ed9a7d5cf2a15efa761eb79a1deeb43f9961bbe05cc97bec4ef9064a\"",
-                "target_tree_sha256 = \"2abe3013ed2be1f3af94f4177b98b5ef9ab5b8449aebbf979348a049554cc3fe\"",
-                "rust_sysroot_tree_sha256 = \"fdeae0ef57277b65c8604e059b5631596a31a9ec510c6009d831fac062867504\"",
-                "xz_liblzma_sha256 = \"701b6dd5c9cf5864ae39121d6b7218a2ed6a24f36d82cb8d79947cb220c0e2cc\"",
-                "package = \"wrela-engine\"",
-                "profile = \"dist\"",
-            ],
-        ),
-        (
             "crates/wrela-toolchain/src/lib.rs",
             &["REQUIRED_LLVM_PROJECT_REVISION: &str = \"llvmorg-22.1.3\""],
         ),
         (
             "crates/wrela-codegen-llvm/src/lib.rs",
             &["PINNED_LLVM_VERSION: (u32, u32, u32) = (22, 1, 3)"],
-        ),
-        (
-            "toolchain/emulation.lock.toml",
-            &[
-                "version = \"10.1.5\"",
-                "system_targets = [\"aarch64-softmmu\"]",
-                "machine_contract = \"virt-10.0\"",
-                "cpu_contract = \"cortex-a57\"",
-                "source_path = \"pc-bios/edk2-aarch64-code.fd.bz2\"",
-                "source_path = \"pc-bios/edk2-arm-vars.fd.bz2\"",
-            ],
         ),
         (
             "toolchain/targets/aarch64-qemu-virt-uefi/target.toml",
@@ -3035,10 +2758,9 @@ mod tests {
 
     use super::{
         DEVELOPMENT_SLICES, EXTERNAL_DEPENDENCIES, FullRoute, GateClosure, GateRequest,
-        MACOS_DEPLOYMENT_TARGET, PathBuf, REVIEWED_EXTERNAL_PACKAGES, architecture_root,
-        check_architecture, compare_gate_closure, configure_cargo_gate_environment,
-        expected_gate_closure, full_route_steps, gate_target, llvm, parse_gate_arguments,
-        validate_development_slice_metadata, workspace_root,
+        REVIEWED_EXTERNAL_PACKAGES, architecture_root, check_architecture, compare_gate_closure,
+        configure_cargo_gate_environment, expected_gate_closure, full_route_steps, gate_target,
+        parse_gate_arguments, validate_development_slice_metadata, workspace_root,
     };
 
     fn strings(values: &[&str]) -> BTreeSet<String> {
@@ -3054,70 +2776,13 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_native_gate_environment_is_explicitly_darwin_bootstrap_only() {
-        let mut ordinary = Command::new("cargo");
-        configure_cargo_gate_environment(&mut ordinary, None).expect("ordinary gate environment");
+    fn cargo_gate_environment_disables_network_access() {
+        let mut command = Command::new("cargo");
+        configure_cargo_gate_environment(&mut command);
         assert_eq!(
-            environment_value(&ordinary, "CARGO_NET_OFFLINE").as_deref(),
+            environment_value(&command, "CARGO_NET_OFFLINE").as_deref(),
             Some("true")
         );
-        assert_eq!(
-            environment_value(&ordinary, "MACOSX_DEPLOYMENT_TARGET"),
-            None
-        );
-
-        let native = llvm::VerifiedNativeEnvironment {
-            prefix: PathBuf::from("/authenticated/llvm"),
-            cxx: PathBuf::from("/authenticated/clang++"),
-            ar: PathBuf::from("/authenticated/ar"),
-            sysroot: PathBuf::from("/authenticated/MacOSX.sdk"),
-        };
-        let mut focused_native = Command::new("cargo");
-        let configured = configure_cargo_gate_environment(&mut focused_native, Some(&native));
-        if cfg!(target_os = "macos") {
-            configured
-                .as_ref()
-                .expect("Darwin bootstrap native gate environment");
-            assert_eq!(
-                environment_value(&focused_native, "WRELA_LLVM_PREFIX").as_deref(),
-                Some("/authenticated/llvm")
-            );
-            assert_eq!(
-                environment_value(&focused_native, "WRELA_LLVM_CXX").as_deref(),
-                Some("/authenticated/clang++")
-            );
-            assert_eq!(
-                environment_value(&focused_native, "WRELA_LLVM_AR").as_deref(),
-                Some("/authenticated/ar")
-            );
-            assert_eq!(
-                environment_value(&focused_native, "WRELA_LLVM_SYSROOT").as_deref(),
-                Some("/authenticated/MacOSX.sdk")
-            );
-            assert_eq!(
-                environment_value(&focused_native, "MACOSX_DEPLOYMENT_TARGET").as_deref(),
-                Some(MACOS_DEPLOYMENT_TARGET)
-            );
-        } else {
-            assert_eq!(
-                configured,
-                Err(
-                    "the current authenticated native route is a Darwin bootstrap only; the authoritative Linux engine is not implemented"
-                        .to_owned(),
-                )
-            );
-            for name in [
-                "LLVM_SYS_221_PREFIX",
-                "WRELA_LLVM_PREFIX",
-                "WRELA_LLVM_CXX",
-                "WRELA_LLVM_AR",
-                "WRELA_LLVM_SYSROOT",
-                "MACOSX_DEPLOYMENT_TARGET",
-                "CARGO_NET_OFFLINE",
-            ] {
-                assert_eq!(environment_value(&focused_native, name), None);
-            }
-        }
     }
 
     #[test]
@@ -3296,25 +2961,26 @@ mod tests {
             FullRoute::Distribution
         );
 
-        let artifact_steps = full_route_steps(FullRoute::ArtifactNative);
-        assert_eq!(artifact_steps.len(), 2);
-        assert_eq!(
-            artifact_steps[0].arguments.last().map(String::as_str),
-            Some("llvm")
+        let artifact = gate_target("artifact").expect("artifact target");
+        let artifact_closure = expected_gate_closure(&artifact).expect("artifact closure");
+        let artifact_steps = full_route_steps(&artifact, &artifact_closure);
+        assert_eq!(artifact_steps.len(), 1);
+        assert!(artifact_steps[0].arguments.contains(&"test".to_owned()));
+        assert!(
+            artifact_steps[0]
+                .arguments
+                .contains(&"wrela-backend/bundled-backend".to_owned())
         );
         assert!(
-            artifact_steps[1]
+            artifact_steps[0]
                 .arguments
-                .contains(&"wrela-codegen-llvm/llvm,wrela-link-efi/bundled-lld".to_owned())
+                .iter()
+                .any(|argument| argument == "wrela-codegen-llvm")
         );
 
-        let distribution_steps = full_route_steps(FullRoute::Distribution);
-        assert_eq!(distribution_steps.len(), 1);
-        assert_eq!(
-            distribution_steps[0].arguments.last().map(String::as_str),
-            Some("dist")
-        );
-        assert!(full_route_steps(FullRoute::None).is_empty());
+        let syntax = gate_target("syntax").expect("syntax target");
+        let syntax_closure = expected_gate_closure(&syntax).expect("syntax closure");
+        assert!(full_route_steps(&syntax, &syntax_closure).is_empty());
     }
 
     #[test]

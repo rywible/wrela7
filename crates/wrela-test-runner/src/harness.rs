@@ -16,8 +16,8 @@ use wrela_test_protocol::{
 
 use crate::sha256::Sha256;
 use crate::{
-    ImageCommandRequest, ImageHarness, ImageSummaryRequest, ProcessInput, ProcessShutdownControl,
-    ProcessSpecification, RunError, VerifiedProcessFile,
+    ImageCommandRequest, ImageExecutionComponents, ImageHarness, ImageSummaryRequest, ProcessInput,
+    ProcessShutdownControl, ProcessSpecification, RunError, VerifiedProcessFile,
 };
 
 const SLIP_END: u8 = 0xc0;
@@ -101,12 +101,12 @@ impl ImageHarness for CanonicalImageHarness {
                 writable: false,
             },
             ProcessInput {
-                source: VerifiedProcessFile::from_toolchain(&request.components.firmware_code),
+                source: request.components.firmware_code.clone(),
                 destination: firmware_code.clone(),
                 writable: false,
             },
             ProcessInput {
-                source: VerifiedProcessFile::from_toolchain(&request.components.firmware_variables),
+                source: request.components.firmware_variables.clone(),
                 destination: firmware_variables.clone(),
                 writable: true,
             },
@@ -145,7 +145,7 @@ impl ImageHarness for CanonicalImageHarness {
         ];
         check_cancelled(is_cancelled)?;
         Ok(ProcessSpecification {
-            program: request.components.emulator.clone(),
+            program: request.components.emulator.path().to_owned(),
             arguments,
             current_directory: request.working_directory.to_owned(),
             environment,
@@ -189,13 +189,14 @@ impl ImageHarness for CanonicalImageHarness {
     fn command_digest(
         &self,
         command: &ProcessSpecification,
+        components: &ImageExecutionComponents,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<Sha256Digest, RunError> {
         check_cancelled(is_cancelled)?;
         let mut digest = CanonicalDigest::new(COMMAND_DIGEST_MAGIC, COMMAND_DIGEST_VERSION);
         let working = command.current_directory.as_os_str().as_encoded_bytes();
-        digest.bytes(command.program.digest().as_bytes())?;
-        digest.u64(command.program.bytes())?;
+        digest.bytes(components.emulator.digest().as_bytes())?;
+        digest.u64(components.emulator.bytes())?;
         digest.count(command.arguments.len())?;
         for argument in &command.arguments {
             check_cancelled(is_cancelled)?;
@@ -296,7 +297,8 @@ impl ImageHarness for CanonicalImageHarness {
         } else {
             None
         };
-        let command_digest = self.command_digest(request.command, is_cancelled)?;
+        let command_digest =
+            self.command_digest(request.command, request.components, is_cancelled)?;
         let event_stream_digest = self.event_stream_digest(request.events, is_cancelled)?;
         let result = ImageGroupResult {
             group: request.group.id,
@@ -305,7 +307,7 @@ impl ImageHarness for CanonicalImageHarness {
             evidence: ImageExecutionEvidence {
                 image_digest: Some(request.artifact.digest()),
                 target_digest: request.artifact.build().target_package,
-                emulator_digest: Some(request.command.program.digest()),
+                emulator_digest: Some(request.components.emulator.digest()),
                 scenario_digest: request.scenario.map(|scenario| scenario.digest),
                 command_digest: Some(command_digest),
                 event_stream_digest: Some(event_stream_digest),

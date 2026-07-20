@@ -45,26 +45,10 @@ path = "share/wrela/std"
 digest = "0505050505050505050505050505050505050505050505050505050505050505"
 bytes = 1
 
-[[components]]
-kind = "aarch64_emulator"
-path = "libexec/wrela/qemu-system-aarch64"
-digest = "0606060606060606060606060606060606060606060606060606060606060606"
-bytes = 1
-
 [[targets]]
 identity = "aarch64-qemu-virt-uefi"
 path = "share/wrela/targets/aarch64-qemu-virt-uefi"
 digest = "0707070707070707070707070707070707070707070707070707070707070707"
-bytes = 1
-
-[[targets.files]]
-path = "firmware/QEMU_EFI.fd"
-digest = "0808080808080808080808080808080808080808080808080808080808080808"
-bytes = 1
-
-[[targets.files]]
-path = "firmware/QEMU_VARS.fd"
-digest = "0909090909090909090909090909090909090909090909090909090909090909"
 bytes = 1
 
 [[targets.files]]

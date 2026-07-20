@@ -46,9 +46,6 @@ const APPLICATION_LOCKFILE: &[u8] =
 const TARGET_MANIFEST: &[u8] =
     include_bytes!("../../../toolchain/targets/aarch64-qemu-virt-uefi/target.toml");
 const BACKEND_BYTES: &[u8] = b"headless check fixture backend";
-const EMULATOR_BYTES: &[u8] = b"headless check fixture emulator";
-const FIRMWARE_CODE: &[u8] = b"headless check fixture firmware";
-const FIRMWARE_VARIABLES: &[u8] = b"headless check fixture variables";
 const RUNTIME_OBJECT: &[u8] = b"headless check fixture runtime";
 const MAX_FIXTURE_FILE_BYTES: usize = 1024 * 1024;
 
@@ -870,21 +867,11 @@ fn install_toolchain(directory: &TestDirectory, frontend_bytes: &[u8]) {
     let frontend =
         directory.write_trusted(&format!("toolchain/{}", frontend_path()), frontend_bytes);
     let backend = directory.write(&format!("toolchain/{}", backend_path()), BACKEND_BYTES);
-    let emulator = directory.write(&format!("toolchain/{}", emulator_path()), EMULATOR_BYTES);
     set_executable(&frontend);
     set_executable(&backend);
-    set_executable(&emulator);
 
     let target_root = "toolchain/share/wrela/targets/aarch64-qemu-virt-uefi";
     directory.write(&format!("{target_root}/target.toml"), TARGET_MANIFEST);
-    directory.write(
-        &format!("{target_root}/firmware/QEMU_EFI.fd"),
-        FIRMWARE_CODE,
-    );
-    directory.write(
-        &format!("{target_root}/firmware/QEMU_VARS.fd"),
-        FIRMWARE_VARIABLES,
-    );
     directory.write(
         &format!("{target_root}/runtime/wrela-runtime-aarch64.obj"),
         RUNTIME_OBJECT,
@@ -897,8 +884,6 @@ fn install_toolchain(directory: &TestDirectory, frontend_bytes: &[u8]) {
         tree_record("wrela-core-0.1/wrela.toml", CORE_MANIFEST),
     ]);
     let target = tree_measurement(&[
-        tree_record("firmware/QEMU_EFI.fd", FIRMWARE_CODE),
-        tree_record("firmware/QEMU_VARS.fd", FIRMWARE_VARIABLES),
         tree_record("runtime/wrela-runtime-aarch64.obj", RUNTIME_OBJECT),
         tree_record("target.toml", TARGET_MANIFEST),
     ]);
@@ -927,22 +912,16 @@ fn install_toolchain(directory: &TestDirectory, frontend_bytes: &[u8]) {
                 digest: standard_library.digest,
                 bytes: standard_library.content_bytes,
             },
-            shipped_component(
-                ComponentKind::Aarch64Emulator,
-                emulator_path(),
-                EMULATOR_BYTES,
-            ),
         ],
         targets: vec![ShippedTarget {
             identity: TargetIdentity::aarch64_qemu_virt_uefi(),
             path: ComponentPath::new(target_path).expect("target path"),
             digest: target.digest,
             bytes: target.content_bytes,
-            files: vec![
-                shipped_target_file("firmware/QEMU_EFI.fd", FIRMWARE_CODE),
-                shipped_target_file("firmware/QEMU_VARS.fd", FIRMWARE_VARIABLES),
-                shipped_target_file("runtime/wrela-runtime-aarch64.obj", RUNTIME_OBJECT),
-            ],
+            files: vec![shipped_target_file(
+                "runtime/wrela-runtime-aarch64.obj",
+                RUNTIME_OBJECT,
+            )],
         }],
     };
     let bytes = CanonicalToolchainManifestCodec::new()
@@ -1040,16 +1019,6 @@ const fn backend_path() -> &'static str {
 #[cfg(not(windows))]
 const fn backend_path() -> &'static str {
     "libexec/wrela/wrela-backend"
-}
-
-#[cfg(windows)]
-const fn emulator_path() -> &'static str {
-    "libexec/wrela/qemu-system-aarch64.exe"
-}
-
-#[cfg(not(windows))]
-const fn emulator_path() -> &'static str {
-    "libexec/wrela/qemu-system-aarch64"
 }
 
 #[cfg(unix)]

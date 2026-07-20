@@ -10,26 +10,9 @@ use wrela_build_model::{LanguageRevision, Sha256Digest, TargetIdentity};
 use wrela_package::{PackageIdentity, PackageLocator};
 
 mod codec;
-mod linux_execution_inputs;
-mod linux_payload;
 mod local;
 
 pub use codec::CanonicalToolchainManifestCodec;
-pub use linux_execution_inputs::{
-    LINUX_EXECUTION_INPUT_EMULATOR, LINUX_EXECUTION_INPUT_FILE_DIGEST, LINUX_EXECUTION_INPUT_HOST,
-    LINUX_EXECUTION_INPUT_RECEIPT_SCHEMA, LINUX_EXECUTION_INPUT_ROUTE,
-    LINUX_EXECUTION_INPUT_RUNNER, LINUX_EXECUTION_INPUT_SCHEMA, LINUX_EXECUTION_INPUT_TARGET,
-    LINUX_EXECUTION_INPUT_TREE_DIGEST, LINUX_EXECUTION_INPUT_USER_MODE_EMULATION,
-    LinuxExecutionInput, LinuxExecutionInputError, LinuxExecutionInputKind,
-    LinuxExecutionInputReceipt, LinuxExecutionInputRequest,
-    MAX_LINUX_EXECUTION_INPUT_RECEIPT_BYTES, MAX_LINUX_EXECUTION_INPUT_REQUEST_BYTES,
-    MAX_LINUX_NATIVE_RUNNER_AUTHORITY_BYTES,
-};
-pub use linux_payload::{
-    LINUX_PAYLOAD_AUTHORITY_SCHEMA, LINUX_PAYLOAD_ENGINE_PROTOCOL, LINUX_PAYLOAD_HOST,
-    LINUX_PAYLOAD_ROUTE, LinuxPayloadAuthority, LinuxPayloadAuthorityError,
-    LinuxPayloadFileWitness, MAX_LINUX_FRONTEND_ENGINE_BYTES, MAX_LINUX_PAYLOAD_AUTHORITY_BYTES,
-};
 pub use local::{
     LocalToolchainVerification, LocalToolchainVerificationError, LocalToolchainVerificationLimits,
     LocalToolchainVerifier,
@@ -96,6 +79,69 @@ pub const fn current_host_identity() -> Option<&'static str> {
     } else {
         None
     }
+}
+
+const QEMU_ENV_OVERRIDE: &str = "WRELA_QEMU";
+const QEMU_FIRMWARE_CODE_ENV_OVERRIDE: &str = "WRELA_QEMU_FIRMWARE_CODE";
+const QEMU_FIRMWARE_VARS_ENV_OVERRIDE: &str = "WRELA_QEMU_FIRMWARE_VARS";
+const QEMU_BINARY_NAME: &str = "qemu-system-aarch64";
+const QEMU_HOMEBREW_DEFAULT: &str = "/opt/homebrew/bin/qemu-system-aarch64";
+const QEMU_FIRMWARE_CODE_HOMEBREW_DEFAULT: &str = "/opt/homebrew/share/qemu/edk2-aarch64-code.fd";
+const QEMU_FIRMWARE_VARS_HOMEBREW_DEFAULT: &str = "/opt/homebrew/share/qemu/edk2-arm-vars.fd";
+
+/// System `qemu-system-aarch64` binary, resolved from `WRELA_QEMU` if set,
+/// otherwise located on `PATH`, otherwise the Homebrew default install
+/// location. Total: always returns a path without verifying it exists.
+#[must_use]
+pub fn system_qemu() -> PathBuf {
+    resolve_qemu_binary(env::var_os(QEMU_ENV_OVERRIDE), env::var_os("PATH"))
+}
+
+fn resolve_qemu_binary(
+    override_value: Option<std::ffi::OsString>,
+    path_value: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(path) = override_value {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = path_value {
+        for directory in env::split_paths(&path) {
+            let candidate = directory.join(QEMU_BINARY_NAME);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from(QEMU_HOMEBREW_DEFAULT)
+}
+
+/// System EDK2 AArch64 code firmware, resolved from
+/// `WRELA_QEMU_FIRMWARE_CODE` if set, otherwise the Homebrew default install
+/// location. Total: always returns a path without verifying it exists.
+#[must_use]
+pub fn system_firmware_code() -> PathBuf {
+    resolve_override_or_default(
+        env::var_os(QEMU_FIRMWARE_CODE_ENV_OVERRIDE),
+        QEMU_FIRMWARE_CODE_HOMEBREW_DEFAULT,
+    )
+}
+
+/// System EDK2 AArch64 variable store, resolved from
+/// `WRELA_QEMU_FIRMWARE_VARS` if set, otherwise the Homebrew default install
+/// location. Total: always returns a path without verifying it exists.
+#[must_use]
+pub fn system_firmware_vars() -> PathBuf {
+    resolve_override_or_default(
+        env::var_os(QEMU_FIRMWARE_VARS_ENV_OVERRIDE),
+        QEMU_FIRMWARE_VARS_HOMEBREW_DEFAULT,
+    )
+}
+
+fn resolve_override_or_default(
+    override_value: Option<std::ffi::OsString>,
+    default: &'static str,
+) -> PathBuf {
+    override_value.map_or_else(|| PathBuf::from(default), PathBuf::from)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,7 +358,6 @@ pub enum ComponentKind {
     Frontend,
     Backend,
     StandardLibrary,
-    Aarch64Emulator,
 }
 
 /// Validated portable path relative to the toolchain root.
@@ -542,10 +587,6 @@ impl VerifiedToolchain {
             .ok()
             .map(|index| &self.manifest.standard_library_packages[index])
     }
-
-    pub fn aarch64_emulator(&self) -> Result<VerifiedPath, ManifestError> {
-        self.component(ComponentKind::Aarch64Emulator)
-    }
 }
 
 impl ToolchainManifest {
@@ -583,7 +624,7 @@ impl ToolchainManifest {
         {
             return Err(ManifestError::InvalidStandardLibraryPackages);
         }
-        if self.components.len() != 4 {
+        if self.components.len() != 3 {
             return Err(ManifestError::MissingOrDuplicateComponent);
         }
         if !self
@@ -597,7 +638,6 @@ impl ToolchainManifest {
             ComponentKind::Frontend,
             ComponentKind::Backend,
             ComponentKind::StandardLibrary,
-            ComponentKind::Aarch64Emulator,
         ] {
             if self
                 .components
@@ -703,7 +743,7 @@ impl fmt::Display for ManifestError {
                 formatter.write_str("installed toolchain versions do not match this frontend")
             }
             Self::MissingOrDuplicateComponent => formatter.write_str(
-                "toolchain must contain exactly one frontend, backend, standard library, and AArch64 emulator",
+                "toolchain must contain exactly one frontend, backend, and standard library",
             ),
             Self::InvalidStandardLibraryPackages => formatter.write_str(
                 "toolchain standard-library package index is empty, invalid, duplicated, or noncanonical",
@@ -837,11 +877,7 @@ fn digest_is_nonzero(digest: Sha256Digest) -> bool {
     digest.as_bytes().iter().any(|byte| *byte != 0)
 }
 
-const REQUIRED_TARGET_FILES: [&str; 3] = [
-    "firmware/QEMU_EFI.fd",
-    "firmware/QEMU_VARS.fd",
-    "runtime/wrela-runtime-aarch64.obj",
-];
+const REQUIRED_TARGET_FILES: [&str; 1] = ["runtime/wrela-runtime-aarch64.obj"];
 
 const fn expected_component_path(kind: ComponentKind, windows_host: bool) -> &'static str {
     match (kind, windows_host) {
@@ -850,8 +886,6 @@ const fn expected_component_path(kind: ComponentKind, windows_host: bool) -> &'s
         (ComponentKind::Backend, false) => "libexec/wrela/wrela-backend",
         (ComponentKind::Backend, true) => "libexec/wrela/wrela-backend.exe",
         (ComponentKind::StandardLibrary, _) => "share/wrela/std",
-        (ComponentKind::Aarch64Emulator, false) => "libexec/wrela/qemu-system-aarch64",
-        (ComponentKind::Aarch64Emulator, true) => "libexec/wrela/qemu-system-aarch64.exe",
     }
 }
 
@@ -950,15 +984,6 @@ impl Toolchain {
         self.root.join("share/wrela/std")
     }
 
-    /// Bundled, digest-checked emulator for AArch64 full-image tests.
-    #[must_use]
-    pub fn aarch64_emulator(&self) -> PathBuf {
-        self.root
-            .join("libexec")
-            .join("wrela")
-            .join(executable_name("qemu-system-aarch64"))
-    }
-
     /// Selected installed target directory. The caller must first match its
     /// identity and digest against a validated [`ToolchainManifest`].
     #[must_use]
@@ -975,7 +1000,6 @@ impl Toolchain {
             ComponentCheck::new("backend", self.backend()),
             ComponentCheck::new("manifest", self.manifest()),
             ComponentCheck::new("standard library", self.standard_library()),
-            ComponentCheck::new("AArch64 emulator", self.aarch64_emulator()),
         ];
         DoctorReport {
             checks: checks.into_iter().collect(),
@@ -1114,13 +1138,6 @@ mod tests {
                     digest,
                     bytes: 1,
                 },
-                ShippedComponent {
-                    kind: ComponentKind::Aarch64Emulator,
-                    path: ComponentPath::new("libexec/wrela/qemu-system-aarch64")
-                        .expect("emulator path"),
-                    digest,
-                    bytes: 1,
-                },
             ],
             targets: vec![ShippedTarget {
                 identity: TargetIdentity::aarch64_qemu_virt_uefi(),
@@ -1128,26 +1145,12 @@ mod tests {
                     .expect("AArch64 target path"),
                 digest,
                 bytes: 3,
-                files: vec![
-                    ShippedTargetFile {
-                        path: ComponentPath::new("firmware/QEMU_EFI.fd")
-                            .expect("firmware code path"),
-                        digest,
-                        bytes: 1,
-                    },
-                    ShippedTargetFile {
-                        path: ComponentPath::new("firmware/QEMU_VARS.fd")
-                            .expect("firmware variables path"),
-                        digest,
-                        bytes: 1,
-                    },
-                    ShippedTargetFile {
-                        path: ComponentPath::new("runtime/wrela-runtime-aarch64.obj")
-                            .expect("runtime object path"),
-                        digest,
-                        bytes: 1,
-                    },
-                ],
+                files: vec![ShippedTargetFile {
+                    path: ComponentPath::new("runtime/wrela-runtime-aarch64.obj")
+                        .expect("runtime object path"),
+                    digest,
+                    bytes: 1,
+                }],
             }],
         };
         (manifest, compatibility, digest)
@@ -1216,8 +1219,8 @@ mod tests {
             .expect("verified installation");
         assert_eq!(
             verified
-                .aarch64_emulator()
-                .expect("emulator component")
+                .component(ComponentKind::Backend)
+                .expect("backend component")
                 .digest,
             digest
         );
@@ -1258,6 +1261,44 @@ mod tests {
                 &|| false,
             ),
             Err(ToolchainDecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn system_qemu_env_override_takes_precedence_over_path_search() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+
+        use super::resolve_qemu_binary;
+
+        let overridden = resolve_qemu_binary(
+            Some(OsString::from("/custom/qemu-system-aarch64")),
+            Some(OsString::from("/usr/bin:/bin")),
+        );
+        assert_eq!(
+            overridden,
+            PathBuf::from("/custom/qemu-system-aarch64"),
+            "an explicit WRELA_QEMU override must win over any PATH search"
+        );
+    }
+
+    #[test]
+    fn system_firmware_env_overrides_take_precedence_over_defaults() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+
+        use super::resolve_override_or_default;
+
+        assert_eq!(
+            resolve_override_or_default(
+                Some(OsString::from("/custom/edk2-code.fd")),
+                "/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
+            ),
+            PathBuf::from("/custom/edk2-code.fd")
+        );
+        assert_eq!(
+            resolve_override_or_default(None, "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"),
+            PathBuf::from("/opt/homebrew/share/qemu/edk2-aarch64-code.fd")
         );
     }
 }

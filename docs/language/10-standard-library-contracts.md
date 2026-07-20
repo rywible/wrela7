@@ -224,8 +224,8 @@ are currently distinct, the field remains private, and operator/method
 presentation, recoverable `Result`-returning checked forms, units larger than a
 week, `Instant`, `now`, runtime copy lowering, non-test/actor assertion
 supervision, and executed current-tuple runtime-image tests remain follow-on
-work. Selected generated-test assertions reach native ABI2 objects; packaged
-QEMU execution is pending.
+work. Selected generated-test assertions reach native ABI2 objects; system-QEMU
+execution is pending.
 
 The current nongeneric substrate admits a local closed enum with 1–256
 explicit variants, one shared positional copy-scalar payload, and exhaustive

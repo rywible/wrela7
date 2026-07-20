@@ -1,3 +1,10 @@
+# System LLVM prefix for inkwell/llvm-sys when the native backend feature is
+# built. Points at the on-disk Homebrew LLVM 22 by default; override by
+# exporting LLVM_SYS_221_PREFIX (or WRELA_LLVM_PREFIX) before invoking cargo.
+[env]
+LLVM_SYS_221_PREFIX = "/opt/homebrew/opt/llvm"
+WRELA_LLVM_PREFIX = "/opt/homebrew/opt/llvm"
+
 [alias]
 xtask = "run --locked --offline --package xtask --"
 xarch = "run --locked --offline --package xtask -- architecture-check"

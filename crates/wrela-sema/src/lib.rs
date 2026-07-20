@@ -3453,6 +3453,7 @@ fn exact_flat_constructor_matches(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exact_flat_field_matches(
     analysis: &PartialAnalysis,
     program: &wrela_hir::Program,

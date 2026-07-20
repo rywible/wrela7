@@ -18,18 +18,13 @@ manifest/lock/provider -> package-loader -> source/package graph
 `wrela-compiler` is the sole wide composition root. It injects every phase
 trait and bounded host capability into the small public `wrela-driver` API;
 lower crates never depend back on either orchestration implementation state.
-`wrela-engine` is the executable authority boundary around that composition
-root: it accepts only canonical engine-protocol records plus explicit private
-staging/toolchain capabilities and emits only a validated response stream. The
-current crate is a one-request process slice; a reproducible static AArch64
-Linux binary, appliance execution, and thin host launchers remain separate
-distribution consumers.
+`wrela-cli` is the sole consumer of that composition root.
 
 Manifest-declared comptime tests can import and execute the implemented subset
 of ordinary production `comptime fn` declarations during semantic analysis.
 The runtime integration/image route shares the ordinary backend, protocol, and
 target-owned QEMU design. Selected generated-test runtime assertions now reach
-native ABI2 objects, but current packaged-QEMU execution and non-test/actor
+native ABI2 objects, but current system-QEMU execution and non-test/actor
 assertion supervision remain open; `wrela-test-model`, `wrela-test-protocol`,
 and `wrela-test-runner` own that execution boundary.
 

@@ -40,7 +40,7 @@ use wrela_package_loader::{
     CanonicalPackageCodec, ContentHasher, ManifestCodecLimits, PackageCodec, SoftwareSha256,
 };
 use wrela_source::SourceDatabase;
-use wrela_toolchain::{LinuxPayloadAuthority, Toolchain};
+use wrela_toolchain::Toolchain;
 
 use crate::{LocalCheckDriver, PipelineLimits};
 
@@ -269,7 +269,6 @@ pub struct HeadlessCheckExecutor {
     toolchain: Toolchain,
     pipeline_limits: PipelineLimits,
     protocol_limits: EngineProtocolLimits,
-    linux_payload_authority: Option<LinuxPayloadAuthority>,
     stage: Option<Stage>,
     sealed: Option<SealedInput>,
     executed: bool,
@@ -423,37 +422,11 @@ impl HeadlessCheckExecutor {
             toolchain,
             pipeline_limits,
             protocol_limits,
-            linux_payload_authority: None,
             stage: None,
             sealed: None,
             executed: false,
             poisoned: false,
         })
-    }
-
-    /// Construct the exact Linux direct-child execution path. The authority
-    /// is bound during the driver's existing single toolchain verification.
-    pub fn new_with_linux_payload_authority(
-        staging_parent: impl Into<PathBuf>,
-        toolchain: Toolchain,
-        expected_launcher_identity: Sha256Digest,
-        expected_engine_identity: Sha256Digest,
-        authority: LinuxPayloadAuthority,
-        pipeline_limits: PipelineLimits,
-        protocol_limits: EngineProtocolLimits,
-    ) -> Result<Self, HeadlessCheckError> {
-        let payload_identity = authority.payload_identity();
-        let mut executor = Self::new(
-            staging_parent,
-            toolchain,
-            expected_launcher_identity,
-            expected_engine_identity,
-            payload_identity,
-            pipeline_limits,
-            protocol_limits,
-        )?;
-        executor.linux_payload_authority = Some(authority);
-        Ok(executor)
     }
 
     /// Decode and validate exactly once, then consume only the owned validated
@@ -675,16 +648,7 @@ impl HeadlessCheckExecutor {
             }
         }
 
-        let driver = if let Some(authority) = &self.linux_payload_authority {
-            LocalCheckDriver::new_with_linux_payload_authority(
-                self.toolchain.clone(),
-                limits,
-                authority.clone(),
-            )
-        } else {
-            LocalCheckDriver::new(self.toolchain.clone(), limits)
-        }
-        .map_err(|_| {
+        let driver = LocalCheckDriver::new(self.toolchain.clone(), limits).map_err(|_| {
             HeadlessCheckError::Materialization("bounded local check composition failed")
         })?;
         let events = PhaseEvents::new(request.resources.events);

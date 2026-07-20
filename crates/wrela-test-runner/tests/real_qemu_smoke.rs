@@ -538,6 +538,20 @@ impl From<VerifiedPath> for PinnedPath {
     }
 }
 
+/// Self-measure one ambient system path (the system QEMU binary or its EDK2
+/// firmware) that is no longer tracked by the toolchain manifest. Mirrors
+/// `wrela_test_runner::VerifiedProcessFile::from_system_path`.
+fn pinned_system_path(path: PathBuf) -> Result<PinnedPath, SmokeFailure> {
+    let bytes = fs::read(&path).map_err(|error| smoke_io("system component", &path, &error))?;
+    let byte_count = u64::try_from(bytes.len())
+        .map_err(|_| SmokeFailure::InvalidBundle("system component exceeds u64 bytes"))?;
+    Ok(PinnedPath {
+        digest: HASHER.sha256(&bytes),
+        bytes: byte_count,
+        path,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EnrolledBundle {
     root: PathBuf,
@@ -567,26 +581,18 @@ impl EnrolledBundle {
                 .map(PinnedPath::from)
                 .map_err(|_| SmokeFailure::InvalidBundle("missing verified component"))
         };
-        let target_file = |relative: &str| {
-            toolchain
-                .target_file(target, relative)
-                .map(PinnedPath::from)
-                .map_err(|_| SmokeFailure::InvalidBundle("missing verified target file"))
-        };
         let bundle = Self {
             root: toolchain.root().to_owned(),
             frontend: component(ComponentKind::Frontend)?,
             backend: component(ComponentKind::Backend)?,
             standard_library: component(ComponentKind::StandardLibrary)?,
-            emulator: component(ComponentKind::Aarch64Emulator)?,
+            emulator: pinned_system_path(wrela_toolchain::system_qemu())?,
             target_package: toolchain
                 .target(target)
                 .map(PinnedPath::from)
                 .map_err(|_| SmokeFailure::InvalidBundle("missing verified target package"))?,
-            firmware_code: target_file(verification.target().runner().firmware_code())?,
-            firmware_variables: target_file(
-                verification.target().runner().firmware_variables_template(),
-            )?,
+            firmware_code: pinned_system_path(wrela_toolchain::system_firmware_code())?,
+            firmware_variables: pinned_system_path(wrela_toolchain::system_firmware_vars())?,
         };
         bundle.validate(true)?;
         if bundle.target_package.digest != verification.target().semantic().content_digest() {
@@ -604,17 +610,18 @@ impl EnrolledBundle {
             ));
         }
         let paths = [
-            ("frontend", &self.frontend, true),
-            ("backend", &self.backend, true),
-            ("standard library", &self.standard_library, false),
-            ("emulator", &self.emulator, true),
-            ("target package", &self.target_package, false),
-            ("firmware code", &self.firmware_code, true),
-            ("firmware variables", &self.firmware_variables, true),
+            ("frontend", &self.frontend, true, true),
+            ("backend", &self.backend, true, true),
+            ("standard library", &self.standard_library, false, true),
+            ("emulator", &self.emulator, true, false),
+            ("target package", &self.target_package, false, true),
+            ("firmware code", &self.firmware_code, true, false),
+            ("firmware variables", &self.firmware_variables, true, false),
         ];
         let mut identities = Vec::with_capacity(paths.len());
-        for (label, pinned, regular_file) in paths {
-            if !strict_descendant(&pinned.path, &self.root)
+        for (label, pinned, regular_file, under_root) in paths {
+            if (under_root && !strict_descendant(&pinned.path, &self.root))
+                || (!under_root && !normal_absolute_path(&pinned.path))
                 || pinned.bytes == 0
                 || pinned.digest.as_bytes().iter().all(|byte| *byte == 0)
             {

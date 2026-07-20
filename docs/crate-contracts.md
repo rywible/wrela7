@@ -91,8 +91,6 @@ wrela-compiler -> wrela-backend, wrela-build-model, wrela-diagnostics, wrela-dri
 wrela-compiler -[dev]-> wrela-link-efi
 wrela-diagnostics -> wrela-source
 wrela-driver -> wrela-build-model, wrela-diagnostics, wrela-format, wrela-image-report, wrela-lint, wrela-source, wrela-test-model
-wrela-engine -> wrela-build-model, wrela-compiler, wrela-driver, wrela-toolchain
-wrela-engine -[dev]-> wrela-package, wrela-package-loader
 wrela-flow-lower -> wrela-diagnostics, wrela-flow-wir, wrela-semantic-wir
 wrela-flow-lower -[dev]-> wrela-build-model, wrela-source, wrela-test-model, wrela-test-protocol
 wrela-flow-opt -> wrela-build-model, wrela-flow-wir, wrela-test-model
@@ -130,8 +128,12 @@ xtask -> no workspace dependencies
 ```
 <!-- architecture-check: dependency graph end -->
 
-Workspace build dependencies are forbidden. Native acquisition and
-distribution assembly belong to `xtask`, never a Cargo build script.
+Workspace build dependencies are forbidden. LLVM/LLD and QEMU are resolved
+from the developer's own machine, never acquired or assembled by this
+repository: the native backend feature (`wrela-backend/bundled-backend`) links
+the system LLVM via `.cargo/config.toml`'s `LLVM_SYS_221_PREFIX` and shells out
+to the system `lld-link`; full-image tests invoke the system
+`qemu-system-aarch64` and system EDK2 firmware, resolved at runtime.
 
 ## 3. End-to-end producer/consumer chain
 
@@ -166,7 +168,7 @@ route evaluates manifest-declared `@test comptime fn` source against imported
 production declarations and publishes canonical comptime cases. Generated
 runtime harnesses, declared image plans, and selected generated-test runtime
 assertions share the ordinary backend model; those assertions now reach native
-ABI2 objects. Current packaged-QEMU execution and general non-test/actor
+ABI2 objects. Current system-QEMU execution and general non-test/actor
 assertion supervision are not complete. Enabled forms must boot the same
 AArch64 UEFI semantics used by production images.
 
@@ -401,7 +403,7 @@ it. It injects phase implementations and bounded host capabilities, while
   real cross-module source. Generic or nested aggregates, classes/methods,
   floating point, `Result`, loops, and non-test/actor assertion supervision
   remain fail-closed follow-on work. Selected generated-test assertions are
-  implemented through native ABI2 objects; packaged-QEMU execution is pending.
+  implemented through native ABI2 objects; system-QEMU execution is pending.
 - Partial and successful outcomes share one owned fact database: the private
   result sum cannot pair an unrelated partial database and sealed image or clone
   image-sized facts. Diagnostics are canonicalized before that outcome is
@@ -843,12 +845,17 @@ it. It injects phase implementations and bounded host capabilities, while
 
 ### `wrela-lld-sys`
 
-- Input: raw LLD COFF argument vector from `wrela-link-efi` or the sealed
-  distribution smoke driver, with exactly one direct `/out:` path.
-- Output: success only after the emitted PE is re-opened without following
-  links and sealed as the same one-link regular file with private Unix mode
-  `0600`, or a captured native/boundary failure.
-- Owns all workspace unsafe/native FFI. It knows no Wrela model or policy.
+- Input: raw LLD COFF argument vector from `wrela-link-efi`, with exactly one
+  direct `/out:` path.
+- Output: `Ok(())` only after the system `lld-link` child process exits
+  successfully with empty combined stdout/stderr, or a captured driver
+  failure (nonzero exit, unexpected diagnostic output, or a bounded
+  diagnostic-size overflow).
+- The only crate permitted to shell out to the system `lld-link` executable
+  (resolved from `WRELA_LLD_LINK`, then `PATH`, then a fixed Homebrew
+  fallback); it contains no unsafe code, no Wrela model, and no target
+  policy. Behind the `bundled-lld` feature; without it, `link_coff` returns
+  `LldError::NotLinked`.
 
 ### `wrela-link-efi`
 
@@ -1104,7 +1111,7 @@ it. It injects phase implementations and bounded host capabilities, while
   evidence for every declared component, target, and target-relative file.
 - Output: `VerifiedToolchain`, the only capability accepted by the test runner,
   plus controlled content-addressed paths for frontend, private backend,
-  standard library, AArch64 emulator, target package, and doctor checks.
+  standard library, target package, and doctor checks.
 - Manifest decoding is request-bound: after limit and exact interface-identity validation,
   canonical re-encoding must reproduce the complete supplied manifest bytes
   before component observation can create `VerifiedToolchain`; decode and
@@ -1114,45 +1121,20 @@ it. It injects phase implementations and bounded host capabilities, while
   `Toolchain` locator beneath `share/wrela/std`, and pins the canonical package
   manifest digest. The verified whole-directory digest and index together let
   consumers reject package identity, locator, or manifest substitutions.
-- Every shipped component and target-relative runtime/firmware file carries a
-  nonzero byte count and digest. Consumers resolve only manifest-declared
-  target files, never arbitrary children of a trusted directory. `VerifiedPath`
+- Every shipped component and target-relative runtime file carries a nonzero
+  byte count and digest. Consumers resolve only manifest-declared target
+  files, never arbitrary children of a trusted directory. `VerifiedPath`
   fields are private and only `VerifiedToolchain` can derive one.
 - The exact interface-identity tuple independently fixes language,
   build-profile encoding, target
   package, backend protocol, all three IR models, Flow wire, runtime ABI, image
   report, test plan/report/scenario, test event, and test frame versions.
-- Does not search `PATH`. The target digest covers firmware and runtime; the
-  emulator is a separately digest-checked shipped component.
-- Linux execution-input schema 1 is a separate path-free acquisition contract.
-  Its fixed-order request names exact nonzero bounded witnesses for the static
-  AArch64 Linux engine, canonical Linux toolchain manifest, Linux backend,
-  Linux `qemu-system-aarch64`, both firmware images, standard-library tree,
-  target tree, runtime object, and an externally produced native-runner
-  authority envelope. The header fixes the Linux-musl host, direct route,
-  target, system-emulator kind, refusal of user-mode emulation, raw-file
-  SHA-256, and canonical-tree digest v1. Missing,
-  duplicated, reordered, aliased, stale, unknown, noncanonical, substituted,
-  zero, and oversized inputs fail closed with cooperative cancellation.
-- The matching receipt cross-binds the request and all observed identities with
-  distinct domain-separated request and receipt identities. It derives the
-  existing `LinuxPayloadAuthority` and hands it to the already-complete local
-  manifest/frontend binding without a second toolchain scan. The receipt has
-  exact `execution_proven=false` and `runner_authority_proven=false`: a digest
-  placed in the native-runner role does not prove native hardware. Only an
-  independently authenticated native-runner or immutable-appliance envelope
-  and its real execution consumer can close those facts. The pure contract does
-  not itself observe or authenticate any underlying file.
-- `LocalToolchainVerification::seal_linux_execution_inputs` is the immediate
-  filesystem consumer. It maps engine, manifest, backend, system QEMU,
-  standard-library, target, both firmware files, and runtime directly from the
-  already-complete verification observations, with no reread or second hash.
-  It observes only one disjoint opaque runner-envelope file through the existing
-  symlink-denying stable bounded reader, rejects zero/one-over, nonregular,
-  replacement, substitution, wrong-host/target, and cancellation, seals the
-  receipt, and rebinds its payload authority to the same verification before
-  returning. Even this accepted receipt authenticates no runner semantics and
-  leaves both runner and execution proof false.
+- Does not search `PATH` for its own manifest-sealed components. The target
+  digest covers the pinned runtime object; QEMU and EDK2 firmware are resolved
+  from the developer's system (`system_qemu`, `system_firmware_code`,
+  `system_firmware_vars`, overridable by `WRELA_QEMU`,
+  `WRELA_QEMU_FIRMWARE_CODE`, and `WRELA_QEMU_FIRMWARE_VARS`) and are not
+  sealed by the manifest.
 - In schema 1, the standard-library component and target-package directory use
   canonical tree digest v1 (`WRELTRE\0`, version 1); executables and declared
   target files use raw SHA-256. Reinterpreting either requires a schema bump.
@@ -1174,14 +1156,16 @@ it. It injects phase implementations and bounded host capabilities, while
   checked aggregate timeout, output ceiling, and event ceiling are revalidated
   before/after execution. Each `ImageArtifact` is sealed against an exact plan
   group, build identity, path, digest, measured byte count, and image limit.
-  The process executor reverifies the emulator and hashes the EFI image plus
-  both firmware inputs while staging private per-run copies; only the variable
-  store copy is writable. Shipped firmware templates are never launched in
-  place. Artifact build identity and compiler, standard
-  library, target, and emulator digests must match the verified installation.
-  Canonical command and event-stream digests and the summarizer's retained
-  event stream are independently compared. Missing emulator or firmware is an
-  infrastructure error, never a pass result.
+  The process executor reverifies the system-resolved emulator and hashes the
+  EFI image plus both firmware inputs while staging private per-run copies;
+  only the variable store copy is writable. Installed firmware is never
+  launched in place. Artifact build identity and compiler, standard library,
+  and target digests must match the verified installation; the emulator and
+  firmware are not manifest-sealed, so they are freshly hashed and reverified
+  each run rather than matched against a pinned digest. Canonical command and
+  event-stream digests and the summarizer's retained event stream are
+  independently compared. Missing emulator or firmware is an infrastructure
+  error, never a pass result.
 - The local executor observes serial output incrementally while the guest is
   live, writes bounded scenario input to the guest serial channel, enforces each
   step deadline, and issues explicit QMP `qmp_capabilities`/`quit` only for a
@@ -1299,75 +1283,6 @@ it. It injects phase implementations and bounded host capabilities, while
   neither an image-sized byte clone nor an untyped report/encoding join.
 - This is the only wide fan-in crate and no lower layer may depend on it.
 
-### `wrela-engine`
-
-- Input: fixed ordered arguments naming one existing normalized absolute private
-  staging parent, one disjoint verified toolchain root, and exact nonzero
-  launcher/engine/payload SHA-256 identities; stdin is one exact-current engine
-  v1 frame stream with 92-byte headers and bounded payloads.
-- Output: either no stdout and one bounded process error, or a completely
-  encoded canonical response stream whose server hello, events, empty output
-  tree, resource use, request identity, and terminal status pass the independent
-  driver response validator. Source rejection is a successful transport with a
-  rejected terminal status, not a process crash.
-- Owns the Linux-portable executable boundary around
-  `HeadlessCheckExecutor`. It remeasures its running process image, binds that
-  digest to both the request and verified toolchain, reads no workspace from
-  the current directory, performs no `PATH` discovery, and gives the compiler
-  only the request-materialized private tree and verified payload root.
-- The process accepts exactly one request. It validates every complete frame
-  through the shared codec, requires EOF after a sealed request or one
-  request-bound pre-execution cancellation, and encodes the entire response
-  before writing stdout. Corruption, truncation, stale/future versions,
-  sequence gaps, identity substitution, oversized frames, reordered authority
-  arguments, and duplicate/late controls publish no response prefix.
-- The exact-current toolchain schema initially enrolls the running engine bytes
-  as `ComponentKind::Frontend`; the local driver then independently binds those
-  same bytes. Adding a dedicated `Engine` component is an atomic future schema,
-  verifier, payload, and distribution change, not an alias or fallback.
-- This first executable is a process-boundary slice, not yet a claimed Linux
-  payload. Its exact `direct` mode is a thin AArch64-Linux-musl ABI consumer. It
-  refuses every other build before parsing arguments or observing paths; binds
-  byte-count/SHA-256 witnesses for the opaque producer output, producer receipt,
-  request stream, its own static ELF, and a canonical schema-1
-  `LinuxPayloadAuthority` outside both mutable staging and the payload root.
-  That authority fixes the direct route, Linux-musl host, engine protocol, exact
-  canonical toolchain-manifest witness, and exact frontend-engine witness; its
-  domain-separated identity is the request payload identity. `direct` requires
-  request launcher/engine identity and the authority frontend to equal its ELF,
-  validates the request with the shared engine-v1 stream validator, then uses an
-  empty environment to self-spawn the exact `direct-child` mode. The child
-  refuses a non-AArch64-Linux-musl ABI before path observation, cheaply binds
-  authority frontend to its own measured digest and bytes, and passes the
-  authority into the existing single `LocalToolchainVerifier` scan. The local
-  driver binds the already-observed canonical manifest and frontend before
-  compilation; it does not repeat the payload scan. The parent bounds
-  stdin/stdout/stderr, timeout, and an explicit private cancellation file;
-  kills, reaps, and joins on every supervised failure; and independently
-  validates the complete response.
-- The validated response is flushed to the caller before a create-new receipt
-  can be published. Schema-2 publication additionally requires the validated
-  event stream to contain one ordered, non-reused completion of
-  `toolchain-verification`; cancellation or failure before that point publishes
-  neither response nor receipt. The path-free strict decoder reconstructs the
-  canonical payload authority, recomputes its file witness and identity,
-  requires its frontend to equal the receipt engine, and binds protocol,
-  timeout, producer/request/engine/response witnesses, output-tree measurement,
-  terminal outcome, and exact resource use. It is deliberately a candidate
-  with `execution_proven=false`, `payload_authority_proven=true`, and
-  `runner_authority_proven=false`.
-- This direct-mode implementation is development evidence only. The current
-  enrolled ELF predates the authority/direct-child source and no canonical
-  authority file has been produced from an enrolled Linux payload. An
-  AArch64-Linux ABI process could also still be running under user-mode
-  emulation. Real execution evidence therefore still needs a newly enrolled
-  exact ELF plus canonical Linux payload whose frontend equals it and a
-  separately authenticated native runner or appliance envelope. That native
-  execution receipt, immutable appliance execution, persistent vsock transport,
-  concurrent isolation, in-flight protocol cancellation, the thin Darwin
-  launcher, cross-route byte equality, and Darwin-native retirement remain
-  required consumers.
-
 ### `wrela-cli`
 
 - Input: command-line arguments for doctor, check, build, test, lint, and format.
@@ -1386,38 +1301,30 @@ it. It injects phase implementations and bounded host capabilities, while
 
 ### `xtask`
 
-- Input: maintainer command and checked-in lock/configuration.
-- Output: architecture validation, pinned LLVM/LLD/QEMU acquisition/build, and
-  atomic distribution assembly.
+- Input: maintainer command (`architecture-check`, `slices`, `check`, `test`,
+  `lint`, `gate`) and Cargo's own locked metadata.
+- Output: architecture validation and the focused-slice check/test/lint/gate
+  commands. `xtask` no longer acquires, builds, or assembles anything; it does
+  not touch LLVM, LLD, QEMU, firmware, or a distribution tree. LLVM, LLD, and
+  QEMU are resolved from the developer's own machine.
 - `architecture-check` reads Cargo's own locked metadata and rejects a
   missing/extra crate, workspace edge, dev edge, workspace build dependency,
   source-unused workspace edge, untested interface crate, unreviewed
-  registry/Git/path dependency, feature-forwarding change, missing native lock,
-  inconsistent AArch64 triple/CPU/X18/machine pin, or reintroduced x86 target.
-  `cargo xtask llvm` strictly validates the canonical LLVM lock and exact
-  Inkwell contract; verifies a pinned HTTPS or explicit local archive before
-  hostile-input extraction; stages the hashed CMake contract; builds only
-  static AArch64 LLVM and LLD with fingerprinted explicit tools and bounded
-  jobs; and atomically publishes a full-input-addressed prefix. Its canonical
-  receipt binds the inputs and complete prefix tree. A separate strict
-  `toolchain/llvm.outputs.toml` input-to-tree lock must match before cached
-  `llvm-config` can execute; reuse then rechecks installed LLVM version, target,
-  linkage, and host semantics. `--record-output` is an explicit maintainer-only
-  fresh-build enrollment route, never a fallback for ordinary reuse.
+  registry/Git/path dependency, feature-forwarding change, inconsistent
+  AArch64 triple/CPU/X18/machine pin, or reintroduced x86 target.
   `cargo xgate <slice-or-crate>` validates the locked, host-filtered Cargo
   resolution against reviewed workspace and versioned external/transitive
   closures, prints the complete slice contract, then runs scoped formatting,
   all-target checks, unfiltered unit/contract tests, Clippy with warnings
   denied, and architecture validation under forced offline mode. It rejects
-  arbitrary extra arguments and routes `--full` to an applicable native command
-  rather than silently skipping unavailable LLVM, LLD, QEMU, firmware, or
-  distribution work. `cargo xtask slices` is the authoritative package,
-  boundary, fixture, native requirement, command, closure, and timing-budget
-  inventory. Named `check`, `test`, and `lint` remain lower-level direct
-  commands; `cargo xfmt` remains the whole-workspace formatting handoff gate.
-  Distribution work verifies digests, signatures, licenses, target
-  firmware/runtime, emulator, and boots conformance images with public `PATH`
-  cleared.
+  arbitrary extra arguments; a slice/crate whose `full_route` is native routes
+  `--full` to `cargo test` with the `wrela-backend/bundled-backend` feature
+  enabled against the system LLVM/LLD (and, for the `testing`/`cli` slices,
+  system QEMU and firmware) instead of silently skipping that work.
+  `cargo xtask slices` is the authoritative package, boundary, fixture, native
+  requirement, command, closure, and timing-budget inventory. Named `check`,
+  `test`, and `lint` remain lower-level direct commands; `cargo xfmt` remains
+  the whole-workspace formatting handoff gate.
 
 ## 9. Independent implementation rule
 

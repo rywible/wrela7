@@ -20,14 +20,11 @@ use std::os::unix::fs::MetadataExt;
 use std::os::windows::fs::MetadataExt;
 
 use crate::{
-    CanonicalToolchainManifestCodec, ComponentKind, LINUX_EXECUTION_INPUT_HOST, LINUX_PAYLOAD_HOST,
-    LinuxExecutionInput, LinuxExecutionInputError, LinuxExecutionInputKind,
-    LinuxExecutionInputReceipt, LinuxExecutionInputRequest, LinuxPayloadAuthority,
-    LinuxPayloadFileWitness, MAX_LINUX_NATIVE_RUNNER_AUTHORITY_BYTES, ManifestError,
-    ObservedInstallation, REQUIRED_LLVM_PROJECT_REVISION, ShippedComponent, ShippedTarget,
-    ShippedTargetFile, Toolchain, ToolchainCompatibility, ToolchainDecodeError,
-    ToolchainDecodeLimits, ToolchainDecodeRequest, ToolchainManifest, VerifiedToolchain,
-    current_host_identity, decode_and_verify_toolchain_manifest,
+    CanonicalToolchainManifestCodec, ComponentKind, ManifestError, ObservedInstallation,
+    REQUIRED_LLVM_PROJECT_REVISION, ShippedComponent, ShippedTarget, ShippedTargetFile, Toolchain,
+    ToolchainCompatibility, ToolchainDecodeError, ToolchainDecodeLimits, ToolchainDecodeRequest,
+    ToolchainManifest, VerifiedToolchain, current_host_identity,
+    decode_and_verify_toolchain_manifest,
 };
 use wrela_build_model::{Sha256Digest, TargetIdentity};
 use wrela_package::PackageLocator;
@@ -46,9 +43,6 @@ const MAX_TRAVERSAL_DEPTH: u32 = 256;
 const TREE_ENTRY_METADATA_BYTES: u64 = 64;
 const TARGET_MANIFEST_PATH: &str = "target.toml";
 const PACKAGE_MANIFEST_NAME: &str = "wrela.toml";
-const FIRMWARE_CODE_PATH: &str = "firmware/QEMU_EFI.fd";
-const FIRMWARE_VARIABLES_PATH: &str = "firmware/QEMU_VARS.fd";
-const RUNTIME_OBJECT_PATH: &str = "runtime/wrela-runtime-aarch64.obj";
 
 /// Finite policy for one complete local installation verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +108,6 @@ impl Default for LocalToolchainVerificationLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalToolchainVerification {
     manifest: ToolchainManifest,
-    manifest_witness: LinuxPayloadFileWitness,
     observed: ObservedInstallation,
     toolchain: VerifiedToolchain,
     target: TargetPackage,
@@ -125,227 +118,6 @@ impl LocalToolchainVerification {
     #[must_use]
     pub const fn manifest(&self) -> &ToolchainManifest {
         &self.manifest
-    }
-
-    /// Bind the exact manifest and frontend measurements already produced by
-    /// this verification to a sealed Linux payload authority. This performs
-    /// no second filesystem scan.
-    pub fn bind_linux_payload_authority(
-        &self,
-        authority: &LinuxPayloadAuthority,
-    ) -> Result<(), LocalToolchainVerificationError> {
-        if self.manifest.host != LINUX_PAYLOAD_HOST {
-            return Err(LocalToolchainVerificationError::PayloadAuthorityMismatch);
-        }
-        let frontend = self
-            .observed
-            .components()
-            .iter()
-            .find(|component| component.kind == ComponentKind::Frontend)
-            .ok_or(LocalToolchainVerificationError::InternalInvariant)?;
-        let frontend_witness = LinuxPayloadFileWitness {
-            digest: frontend.digest,
-            bytes: frontend.bytes,
-        };
-        if authority.toolchain_manifest() != self.manifest_witness
-            || authority.frontend_engine() != frontend_witness
-        {
-            return Err(LocalToolchainVerificationError::PayloadAuthorityMismatch);
-        }
-        Ok(())
-    }
-
-    /// Seal the complete Linux execution-input receipt from this verifier's
-    /// already-retained observations plus one separately stored opaque runner
-    /// envelope. Toolchain components are never reread or rehashed here.
-    ///
-    /// The runner envelope is only a bounded stable-file witness. Neither its
-    /// role nor its digest proves a native kernel, native hardware, appliance
-    /// boot, or execution; the returned receipt keeps both proof flags false.
-    pub fn seal_linux_execution_inputs(
-        &self,
-        request: &LinuxExecutionInputRequest,
-        runner_envelope: &Path,
-        runner_maximum_bytes: u64,
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<LinuxExecutionInputReceipt, LocalToolchainVerificationError> {
-        check_cancelled(is_cancelled)?;
-        if self.manifest.host != LINUX_EXECUTION_INPUT_HOST {
-            return Err(
-                LocalToolchainVerificationError::LinuxExecutionInputHostMismatch {
-                    required: LINUX_EXECUTION_INPUT_HOST,
-                    installed: self.manifest.host.clone(),
-                },
-            );
-        }
-        if runner_maximum_bytes == 0
-            || runner_maximum_bytes > MAX_LINUX_NATIVE_RUNNER_AUTHORITY_BYTES
-        {
-            return Err(
-                LocalToolchainVerificationError::InvalidLinuxRunnerEnvelopeLimit {
-                    maximum: runner_maximum_bytes,
-                },
-            );
-        }
-        if runner_envelope.starts_with(self.toolchain.root()) {
-            return Err(
-                LocalToolchainVerificationError::InvalidLinuxRunnerEnvelopePath(
-                    runner_envelope.to_path_buf(),
-                ),
-            );
-        }
-        if request
-            .input(LinuxExecutionInputKind::NativeRunnerAuthority)
-            .witness
-            .bytes
-            > runner_maximum_bytes
-        {
-            return Err(
-                LocalToolchainVerificationError::LinuxRunnerEnvelopeTooLarge {
-                    limit: runner_maximum_bytes,
-                },
-            );
-        }
-        self.validate_linux_execution_request(request)?;
-        let runner =
-            observe_linux_runner_envelope(runner_envelope, runner_maximum_bytes, is_cancelled)?;
-        self.seal_observed_linux_execution_inputs(request, runner, is_cancelled)
-    }
-
-    fn validate_linux_execution_request(
-        &self,
-        request: &LinuxExecutionInputRequest,
-    ) -> Result<(), LocalToolchainVerificationError> {
-        let runner = request
-            .input(LinuxExecutionInputKind::NativeRunnerAuthority)
-            .witness;
-        let observed = self.linux_execution_inputs(runner)?;
-        for input in observed {
-            if request.input(input.kind) != input {
-                return Err(LocalToolchainVerificationError::LinuxExecutionInputs(
-                    LinuxExecutionInputError::InputSubstitution(input.kind),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn seal_observed_linux_execution_inputs(
-        &self,
-        request: &LinuxExecutionInputRequest,
-        runner: LinuxPayloadFileWitness,
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<LinuxExecutionInputReceipt, LocalToolchainVerificationError> {
-        let inputs = self.linux_execution_inputs(runner)?;
-        let receipt = LinuxExecutionInputReceipt::seal(request, &inputs, is_cancelled)
-            .map_err(LocalToolchainVerificationError::LinuxExecutionInputs)?;
-        receipt
-            .bind_payload_authority(self)
-            .map_err(LocalToolchainVerificationError::LinuxExecutionInputs)?;
-        Ok(receipt)
-    }
-
-    fn linux_execution_inputs(
-        &self,
-        runner: LinuxPayloadFileWitness,
-    ) -> Result<Vec<LinuxExecutionInput>, LocalToolchainVerificationError> {
-        let target = self.linux_execution_target()?;
-        Ok(vec![
-            LinuxExecutionInput {
-                kind: LinuxExecutionInputKind::StaticEngine,
-                witness: self.component_witness(ComponentKind::Frontend)?,
-            },
-            LinuxExecutionInput {
-                kind: LinuxExecutionInputKind::ToolchainManifest,
-                witness: self.manifest_witness,
-            },
-            LinuxExecutionInput {
-                kind: LinuxExecutionInputKind::Backend,
-                witness: self.component_witness(ComponentKind::Backend)?,
-            },
-            LinuxExecutionInput {
-                kind: LinuxExecutionInputKind::SystemQemu,
-                witness: self.component_witness(ComponentKind::Aarch64Emulator)?,
-            },
-            LinuxExecutionInput {
-                kind: LinuxExecutionInputKind::FirmwareCode,
-                witness: target_file_witness(target, FIRMWARE_CODE_PATH)?,
-            },
-            LinuxExecutionInput {
-                kind: LinuxExecutionInputKind::FirmwareVariables,
-                witness: target_file_witness(target, FIRMWARE_VARIABLES_PATH)?,
-            },
-            LinuxExecutionInput {
-                kind: LinuxExecutionInputKind::StandardLibrary,
-                witness: self.component_witness(ComponentKind::StandardLibrary)?,
-            },
-            LinuxExecutionInput {
-                kind: LinuxExecutionInputKind::Target,
-                witness: LinuxPayloadFileWitness {
-                    digest: target.digest,
-                    bytes: target.bytes,
-                },
-            },
-            LinuxExecutionInput {
-                kind: LinuxExecutionInputKind::Runtime,
-                witness: target_file_witness(target, RUNTIME_OBJECT_PATH)?,
-            },
-            LinuxExecutionInput {
-                kind: LinuxExecutionInputKind::NativeRunnerAuthority,
-                witness: runner,
-            },
-        ])
-    }
-
-    fn component_witness(
-        &self,
-        component_kind: ComponentKind,
-    ) -> Result<LinuxPayloadFileWitness, LocalToolchainVerificationError> {
-        let mut matching = self
-            .observed
-            .components()
-            .iter()
-            .filter(|component| component.kind == component_kind);
-        let component =
-            matching
-                .next()
-                .ok_or(LocalToolchainVerificationError::MissingLinuxExecutionInput(
-                    execution_kind_for_component(component_kind),
-                ))?;
-        if matching.next().is_some() {
-            return Err(LocalToolchainVerificationError::MissingLinuxExecutionInput(
-                execution_kind_for_component(component_kind),
-            ));
-        }
-        Ok(LinuxPayloadFileWitness {
-            digest: component.digest,
-            bytes: component.bytes,
-        })
-    }
-
-    fn linux_execution_target(&self) -> Result<&ShippedTarget, LocalToolchainVerificationError> {
-        let required = TargetIdentity::aarch64_qemu_virt_uefi();
-        if self.target.identity() != &required {
-            return Err(
-                LocalToolchainVerificationError::LinuxExecutionInputTargetMismatch { required },
-            );
-        }
-        let mut matching = self
-            .observed
-            .targets()
-            .iter()
-            .filter(|target| target.identity == required);
-        let target = matching.next().ok_or_else(|| {
-            LocalToolchainVerificationError::LinuxExecutionInputTargetMismatch {
-                required: required.clone(),
-            }
-        })?;
-        if matching.next().is_some() {
-            return Err(
-                LocalToolchainVerificationError::LinuxExecutionInputTargetMismatch { required },
-            );
-        }
-        Ok(target)
     }
 
     #[must_use]
@@ -515,9 +287,7 @@ impl LocalToolchainVerifier {
             check_cancelled(is_cancelled)?;
             let path = join_manifest_path(self.root(), component.path.as_str())?;
             let observed = match component.kind {
-                ComponentKind::Frontend
-                | ComponentKind::Backend
-                | ComponentKind::Aarch64Emulator => {
+                ComponentKind::Frontend | ComponentKind::Backend => {
                     let file = read_stable_file(
                         &path,
                         limits.single_file_bytes,
@@ -622,92 +392,12 @@ impl LocalToolchainVerifier {
         check_cancelled(is_cancelled)?;
         Ok(LocalToolchainVerification {
             manifest,
-            manifest_witness: LinuxPayloadFileWitness {
-                digest: manifest_file.digest,
-                bytes: manifest_file.bytes,
-            },
             observed,
             toolchain: verified_toolchain,
             target,
             target_manifest: selected_target_manifest,
         })
     }
-}
-
-const fn execution_kind_for_component(kind: ComponentKind) -> LinuxExecutionInputKind {
-    match kind {
-        ComponentKind::Frontend => LinuxExecutionInputKind::StaticEngine,
-        ComponentKind::Backend => LinuxExecutionInputKind::Backend,
-        ComponentKind::StandardLibrary => LinuxExecutionInputKind::StandardLibrary,
-        ComponentKind::Aarch64Emulator => LinuxExecutionInputKind::SystemQemu,
-    }
-}
-
-fn target_file_witness(
-    target: &ShippedTarget,
-    path: &str,
-) -> Result<LinuxPayloadFileWitness, LocalToolchainVerificationError> {
-    let kind = match path {
-        FIRMWARE_CODE_PATH => LinuxExecutionInputKind::FirmwareCode,
-        FIRMWARE_VARIABLES_PATH => LinuxExecutionInputKind::FirmwareVariables,
-        RUNTIME_OBJECT_PATH => LinuxExecutionInputKind::Runtime,
-        _ => return Err(LocalToolchainVerificationError::InternalInvariant),
-    };
-    let mut matching = target
-        .files
-        .iter()
-        .filter(|file| file.path.as_str() == path);
-    let file =
-        matching
-            .next()
-            .ok_or(LocalToolchainVerificationError::MissingLinuxExecutionInput(
-                kind,
-            ))?;
-    if matching.next().is_some() {
-        return Err(LocalToolchainVerificationError::MissingLinuxExecutionInput(
-            kind,
-        ));
-    }
-    Ok(LinuxPayloadFileWitness {
-        digest: file.digest,
-        bytes: file.bytes,
-    })
-}
-
-fn observe_linux_runner_envelope(
-    path: &Path,
-    maximum_bytes: u64,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<LinuxPayloadFileWitness, LocalToolchainVerificationError> {
-    check_cancelled(is_cancelled)?;
-    if maximum_bytes == 0 || maximum_bytes > MAX_LINUX_NATIVE_RUNNER_AUTHORITY_BYTES {
-        return Err(
-            LocalToolchainVerificationError::InvalidLinuxRunnerEnvelopeLimit {
-                maximum: maximum_bytes,
-            },
-        );
-    }
-    let observed =
-        read_stable_file(path, maximum_bytes, false, false, is_cancelled).map_err(|error| {
-            match error {
-                LocalToolchainVerificationError::ResourceLimit {
-                    resource: "single-file bytes",
-                    ..
-                } => LocalToolchainVerificationError::LinuxRunnerEnvelopeTooLarge {
-                    limit: maximum_bytes,
-                },
-                other => other,
-            }
-        })?;
-    if observed.bytes == 0 {
-        return Err(LocalToolchainVerificationError::EmptyLinuxRunnerEnvelope(
-            path.to_path_buf(),
-        ));
-    }
-    Ok(LinuxPayloadFileWitness {
-        digest: observed.digest,
-        bytes: observed.bytes,
-    })
 }
 
 #[derive(Debug)]
@@ -749,24 +439,6 @@ pub enum LocalToolchainVerificationError {
     },
     MeasurementMismatch(PathBuf),
     RunningFrontendMismatch(PathBuf),
-    PayloadAuthorityMismatch,
-    LinuxExecutionInputHostMismatch {
-        required: &'static str,
-        installed: String,
-    },
-    LinuxExecutionInputTargetMismatch {
-        required: TargetIdentity,
-    },
-    MissingLinuxExecutionInput(LinuxExecutionInputKind),
-    InvalidLinuxRunnerEnvelopePath(PathBuf),
-    InvalidLinuxRunnerEnvelopeLimit {
-        maximum: u64,
-    },
-    EmptyLinuxRunnerEnvelope(PathBuf),
-    LinuxRunnerEnvelopeTooLarge {
-        limit: u64,
-    },
-    LinuxExecutionInputs(LinuxExecutionInputError),
     TargetNotDeclared(TargetIdentity),
     ToolchainManifest(ToolchainDecodeError),
     TreeDigest(CanonicalTreeDigestError),
@@ -885,44 +557,6 @@ impl fmt::Display for LocalToolchainVerificationError {
                 "running compiler {} differs from the verified toolchain frontend",
                 path.display()
             ),
-            Self::PayloadAuthorityMismatch => formatter
-                .write_str("verified installation differs from the sealed Linux payload authority"),
-            Self::LinuxExecutionInputHostMismatch {
-                required,
-                installed,
-            } => write!(
-                formatter,
-                "Linux execution inputs require host {required}, but the verified installation declares {installed}"
-            ),
-            Self::LinuxExecutionInputTargetMismatch { required } => write!(
-                formatter,
-                "Linux execution inputs require verified target {}",
-                required.as_str()
-            ),
-            Self::MissingLinuxExecutionInput(kind) => write!(
-                formatter,
-                "verified installation is missing Linux execution input {}",
-                kind.as_str()
-            ),
-            Self::InvalidLinuxRunnerEnvelopePath(path) => write!(
-                formatter,
-                "Linux runner envelope is not separate from the toolchain root: {}",
-                path.display()
-            ),
-            Self::InvalidLinuxRunnerEnvelopeLimit { maximum } => write!(
-                formatter,
-                "invalid Linux runner envelope byte limit {maximum}"
-            ),
-            Self::EmptyLinuxRunnerEnvelope(path) => write!(
-                formatter,
-                "Linux runner envelope is empty: {}",
-                path.display()
-            ),
-            Self::LinuxRunnerEnvelopeTooLarge { limit } => write!(
-                formatter,
-                "Linux runner envelope exceeds byte limit {limit}"
-            ),
-            Self::LinuxExecutionInputs(error) => error.fmt(formatter),
             Self::TargetNotDeclared(target) => {
                 write!(
                     formatter,
@@ -948,7 +582,6 @@ impl std::error::Error for LocalToolchainVerificationError {
             Self::TreeDigest(error) => Some(error),
             Self::Manifest(error) => Some(error),
             Self::TargetPackage(error) => Some(error),
-            Self::LinuxExecutionInputs(error) => Some(error),
             _ => None,
         }
     }
@@ -1921,11 +1554,8 @@ mod tests {
 
     const FRONTEND_BYTES: &[u8] = b"wrela frontend fixture";
     const BACKEND_BYTES: &[u8] = b"wrela backend fixture";
-    const EMULATOR_BYTES: &[u8] = b"qemu-system-aarch64 fixture";
     const PACKAGE_MANIFEST: &[u8] = b"schema = 1\n";
     const PACKAGE_SOURCE: &[u8] = b"module image\npub comptime fn target():\n    pass\n";
-    const FIRMWARE_CODE: &[u8] = b"QEMU EFI fixture";
-    const FIRMWARE_VARIABLES: &[u8] = b"QEMU variables fixture";
     const RUNTIME_OBJECT: &[u8] = b"AArch64 COFF runtime fixture";
     const TARGET_MANIFEST: &[u8] =
         include_bytes!("../../../toolchain/targets/aarch64-qemu-virt-uefi/target.toml");
@@ -1987,13 +1617,10 @@ mod tests {
             let directory = TestDirectory::new();
             let frontend_path = frontend_path();
             let backend_path = backend_path();
-            let emulator_path = emulator_path();
             directory.write(frontend_path, FRONTEND_BYTES);
             directory.write(backend_path, BACKEND_BYTES);
-            directory.write(emulator_path, EMULATOR_BYTES);
             set_executable(&directory.root.join(frontend_path));
             set_executable(&directory.root.join(backend_path));
-            set_executable(&directory.root.join(emulator_path));
 
             directory.write(
                 &format!("share/wrela/std/{PACKAGE_COMPONENT}/wrela.toml"),
@@ -2006,14 +1633,6 @@ mod tests {
             let target_root = "share/wrela/targets/aarch64-qemu-virt-uefi";
             directory.write(&format!("{target_root}/target.toml"), TARGET_MANIFEST);
             directory.write(
-                &format!("{target_root}/firmware/QEMU_EFI.fd"),
-                FIRMWARE_CODE,
-            );
-            directory.write(
-                &format!("{target_root}/firmware/QEMU_VARS.fd"),
-                FIRMWARE_VARIABLES,
-            );
-            directory.write(
                 &format!("{target_root}/runtime/wrela-runtime-aarch64.obj"),
                 RUNTIME_OBJECT,
             );
@@ -2023,8 +1642,6 @@ mod tests {
                 tree_record("wrela-core-0.1/wrela.toml", PACKAGE_MANIFEST),
             ]);
             let target = tree_measurement(&[
-                tree_record("firmware/QEMU_EFI.fd", FIRMWARE_CODE),
-                tree_record("firmware/QEMU_VARS.fd", FIRMWARE_VARIABLES),
                 tree_record("runtime/wrela-runtime-aarch64.obj", RUNTIME_OBJECT),
                 tree_record("target.toml", TARGET_MANIFEST),
             ]);
@@ -2055,22 +1672,16 @@ mod tests {
                         digest: standard_library.digest,
                         bytes: standard_library.content_bytes,
                     },
-                    shipped_component(
-                        ComponentKind::Aarch64Emulator,
-                        emulator_path,
-                        EMULATOR_BYTES,
-                    ),
                 ],
                 targets: vec![ShippedTarget {
                     identity: TargetIdentity::aarch64_qemu_virt_uefi(),
                     path: ComponentPath::new(target_root).expect("target path"),
                     digest: target.digest,
                     bytes: target.content_bytes,
-                    files: vec![
-                        shipped_target_file("firmware/QEMU_EFI.fd", FIRMWARE_CODE),
-                        shipped_target_file("firmware/QEMU_VARS.fd", FIRMWARE_VARIABLES),
-                        shipped_target_file("runtime/wrela-runtime-aarch64.obj", RUNTIME_OBJECT),
-                    ],
+                    files: vec![shipped_target_file(
+                        "runtime/wrela-runtime-aarch64.obj",
+                        RUNTIME_OBJECT,
+                    )],
                 }],
             };
             let fixture = Self {
@@ -2122,321 +1733,6 @@ mod tests {
             fixture.manifest.targets[0].digest
         );
         assert_eq!(verified.target_manifest_bytes(), TARGET_MANIFEST);
-    }
-
-    #[test]
-    fn linux_execution_inputs_reuse_exact_verification_observations() {
-        let fixture = Fixture::new();
-        let verified = fixture.verify().expect("complete verified toolchain");
-        let runner_bytes = b"opaque external runner envelope";
-        let runner = LinuxPayloadFileWitness {
-            digest: SoftwareSha256.sha256(runner_bytes),
-            bytes: runner_bytes.len() as u64,
-        };
-        let inputs = verified
-            .linux_execution_inputs(runner)
-            .expect("retained Linux input observations");
-        let request = LinuxExecutionInputRequest::from_inputs(&inputs)
-            .expect("canonical Linux input request");
-
-        assert_eq!(
-            request
-                .input(LinuxExecutionInputKind::ToolchainManifest)
-                .witness,
-            verified.manifest_witness
-        );
-        assert_eq!(
-            request.input(LinuxExecutionInputKind::StaticEngine).witness,
-            LinuxPayloadFileWitness {
-                digest: fixture.manifest.components[0].digest,
-                bytes: fixture.manifest.components[0].bytes,
-            }
-        );
-        assert_eq!(
-            request.input(LinuxExecutionInputKind::Backend).witness,
-            LinuxPayloadFileWitness {
-                digest: fixture.manifest.components[1].digest,
-                bytes: fixture.manifest.components[1].bytes,
-            }
-        );
-        assert_eq!(
-            request
-                .input(LinuxExecutionInputKind::StandardLibrary)
-                .witness,
-            LinuxPayloadFileWitness {
-                digest: fixture.manifest.components[2].digest,
-                bytes: fixture.manifest.components[2].bytes,
-            }
-        );
-        assert_eq!(
-            request.input(LinuxExecutionInputKind::SystemQemu).witness,
-            LinuxPayloadFileWitness {
-                digest: fixture.manifest.components[3].digest,
-                bytes: fixture.manifest.components[3].bytes,
-            }
-        );
-        assert_eq!(
-            request.input(LinuxExecutionInputKind::Target).witness,
-            LinuxPayloadFileWitness {
-                digest: fixture.manifest.targets[0].digest,
-                bytes: fixture.manifest.targets[0].bytes,
-            }
-        );
-        for (kind, file) in [
-            (
-                LinuxExecutionInputKind::FirmwareCode,
-                &fixture.manifest.targets[0].files[0],
-            ),
-            (
-                LinuxExecutionInputKind::FirmwareVariables,
-                &fixture.manifest.targets[0].files[1],
-            ),
-            (
-                LinuxExecutionInputKind::Runtime,
-                &fixture.manifest.targets[0].files[2],
-            ),
-        ] {
-            assert_eq!(
-                request.input(kind).witness,
-                LinuxPayloadFileWitness {
-                    digest: file.digest,
-                    bytes: file.bytes,
-                }
-            );
-        }
-        assert_eq!(
-            request
-                .input(LinuxExecutionInputKind::NativeRunnerAuthority)
-                .witness,
-            runner
-        );
-
-        let runner_directory = TestDirectory::new();
-        let runner_path = runner_directory.write("runner-envelope.receipt", runner_bytes);
-        if verified.manifest.host != LINUX_EXECUTION_INPUT_HOST {
-            assert!(matches!(
-                verified.seal_linux_execution_inputs(
-                    &request,
-                    &runner_directory.root.join("not-observed"),
-                    runner_bytes.len() as u64,
-                    &never_cancelled,
-                ),
-                Err(LocalToolchainVerificationError::LinuxExecutionInputHostMismatch { .. })
-            ));
-        }
-
-        // Representation-model evidence only: changing this private retained
-        // host atom exercises the public Linux seal/rebind path without
-        // claiming that these fixture bytes ran on Linux or native hardware.
-        let mut linux_model = verified.clone();
-        linux_model.manifest.host = LINUX_EXECUTION_INPUT_HOST.to_owned();
-        let receipt = linux_model
-            .seal_linux_execution_inputs(
-                &request,
-                &runner_path,
-                runner_bytes.len() as u64,
-                &never_cancelled,
-            )
-            .expect("model Linux execution input receipt");
-        assert_eq!(
-            receipt
-                .input(LinuxExecutionInputKind::NativeRunnerAuthority)
-                .witness,
-            runner
-        );
-        let encoded = receipt.encode_canonical();
-        let text = std::str::from_utf8(&encoded).expect("receipt UTF-8");
-        assert!(text.contains("\nexecution_proven=false\nrunner_authority_proven=false\n"));
-        assert!(!text.contains("_proven=true\n"));
-        assert_eq!(
-            LinuxExecutionInputReceipt::decode_canonical(
-                &encoded,
-                encoded.len() as u64,
-                &request,
-                &never_cancelled,
-            )
-            .expect("canonical model receipt"),
-            receipt
-        );
-        receipt
-            .bind_payload_authority(&linux_model)
-            .expect("same model verification accepts payload authority");
-
-        let mut substituted_inputs = inputs;
-        substituted_inputs
-            .iter_mut()
-            .find(|input| input.kind == LinuxExecutionInputKind::Backend)
-            .expect("backend input")
-            .witness
-            .digest = SoftwareSha256.sha256(b"substituted backend before runner observation");
-        let substituted_request = LinuxExecutionInputRequest::from_inputs(&substituted_inputs)
-            .expect("canonical substituted request");
-        let nonexistent_runner = runner_directory.root.join("not-observed");
-        assert!(matches!(
-            linux_model.seal_linux_execution_inputs(
-                &substituted_request,
-                &nonexistent_runner,
-                runner_bytes.len() as u64,
-                &never_cancelled,
-            ),
-            Err(LocalToolchainVerificationError::LinuxExecutionInputs(
-                LinuxExecutionInputError::InputSubstitution(LinuxExecutionInputKind::Backend)
-            ))
-        ));
-        assert!(!nonexistent_runner.exists());
-    }
-
-    #[test]
-    fn linux_execution_input_mapping_rejects_missing_target_and_substitution() {
-        let fixture = Fixture::new();
-        let verified = fixture.verify().expect("complete verified toolchain");
-        let runner = LinuxPayloadFileWitness {
-            digest: SoftwareSha256.sha256(b"runner envelope"),
-            bytes: b"runner envelope".len() as u64,
-        };
-        let inputs = verified
-            .linux_execution_inputs(runner)
-            .expect("retained Linux input observations");
-
-        let mut substituted = inputs.clone();
-        substituted
-            .iter_mut()
-            .find(|input| input.kind == LinuxExecutionInputKind::Backend)
-            .expect("backend input")
-            .witness
-            .digest = SoftwareSha256.sha256(b"substituted backend");
-        let substituted = LinuxExecutionInputRequest::from_inputs(&substituted)
-            .expect("canonical substituted request");
-        assert!(matches!(
-            verified.seal_observed_linux_execution_inputs(&substituted, runner, &never_cancelled,),
-            Err(LocalToolchainVerificationError::LinuxExecutionInputs(
-                LinuxExecutionInputError::InputSubstitution(LinuxExecutionInputKind::Backend)
-            ))
-        ));
-
-        let mut substituted_runner = inputs.clone();
-        substituted_runner
-            .iter_mut()
-            .find(|input| input.kind == LinuxExecutionInputKind::NativeRunnerAuthority)
-            .expect("runner input")
-            .witness
-            .digest = SoftwareSha256.sha256(b"substituted runner envelope");
-        let substituted_runner = LinuxExecutionInputRequest::from_inputs(&substituted_runner)
-            .expect("canonical runner-substituted request");
-        assert!(matches!(
-            verified.seal_observed_linux_execution_inputs(
-                &substituted_runner,
-                runner,
-                &never_cancelled,
-            ),
-            Err(LocalToolchainVerificationError::LinuxExecutionInputs(
-                LinuxExecutionInputError::InputSubstitution(
-                    LinuxExecutionInputKind::NativeRunnerAuthority
-                )
-            ))
-        ));
-
-        let mut missing = verified.clone();
-        missing
-            .observed
-            .components
-            .retain(|component| component.kind != ComponentKind::Backend);
-        assert!(matches!(
-            missing.linux_execution_inputs(runner),
-            Err(LocalToolchainVerificationError::MissingLinuxExecutionInput(
-                LinuxExecutionInputKind::Backend
-            ))
-        ));
-
-        let mut wrong_target = verified;
-        wrong_target.observed.targets[0].identity =
-            TargetIdentity::new("aarch64-other-target").expect("test target identity");
-        assert!(matches!(
-            wrong_target.linux_execution_inputs(runner),
-            Err(LocalToolchainVerificationError::LinuxExecutionInputTargetMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn runner_envelope_observation_enforces_exact_limits_empty_type_and_cancellation() {
-        let directory = TestDirectory::new();
-        let bytes = b"opaque runner envelope";
-        let path = directory.write("runner.receipt", bytes);
-        let observed = observe_linux_runner_envelope(&path, bytes.len() as u64, &never_cancelled)
-            .expect("exact runner envelope limit");
-        assert_eq!(observed.digest, SoftwareSha256.sha256(bytes));
-        assert_eq!(observed.bytes, bytes.len() as u64);
-        assert!(matches!(
-            observe_linux_runner_envelope(&path, bytes.len() as u64 - 1, &never_cancelled),
-            Err(LocalToolchainVerificationError::LinuxRunnerEnvelopeTooLarge { .. })
-        ));
-        for maximum in [0, MAX_LINUX_NATIVE_RUNNER_AUTHORITY_BYTES + 1] {
-            assert!(matches!(
-                observe_linux_runner_envelope(&path, maximum, &never_cancelled),
-                Err(LocalToolchainVerificationError::InvalidLinuxRunnerEnvelopeLimit { .. })
-            ));
-        }
-
-        let empty = directory.write("empty.receipt", b"");
-        assert!(matches!(
-            observe_linux_runner_envelope(&empty, 1, &never_cancelled),
-            Err(LocalToolchainVerificationError::EmptyLinuxRunnerEnvelope(_))
-        ));
-        assert!(matches!(
-            observe_linux_runner_envelope(&directory.root, 1, &never_cancelled),
-            Err(LocalToolchainVerificationError::NonRegularEntry(_))
-        ));
-        assert!(matches!(
-            observe_linux_runner_envelope(&path, bytes.len() as u64, &|| true),
-            Err(LocalToolchainVerificationError::Cancelled)
-        ));
-
-        let large_bytes = vec![0x5a; READ_CHUNK_BYTES * 2];
-        let large = directory.write("large-runner.receipt", &large_bytes);
-        let cancel_at = large.components().count().saturating_add(5);
-        let polls = Cell::new(0_usize);
-        assert!(matches!(
-            observe_linux_runner_envelope(&large, large_bytes.len() as u64, &|| {
-                let next = polls.get().saturating_add(1);
-                polls.set(next);
-                next >= cancel_at
-            }),
-            Err(LocalToolchainVerificationError::Cancelled)
-        ));
-        assert!(polls.get() >= cancel_at);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn runner_envelope_symlink_and_in_flight_replacement_are_rejected() {
-        let directory = TestDirectory::new();
-        let path = directory.write("runner.receipt", b"original runner envelope");
-        let alias = directory.root.join("runner-alias.receipt");
-        symlink(&path, &alias).expect("runner envelope symlink");
-        assert!(matches!(
-            observe_linux_runner_envelope(&alias, 1024, &never_cancelled),
-            Err(LocalToolchainVerificationError::Symlink(_))
-        ));
-
-        let trigger = path.components().count().saturating_add(4);
-        let polls = Cell::new(0_usize);
-        let replaced = Cell::new(false);
-        let cancellation_hook = || {
-            let next = polls.get().saturating_add(1);
-            polls.set(next);
-            if next == trigger {
-                fs::remove_file(&path).expect("remove opened runner envelope path");
-                fs::write(&path, b"replacement runner envelope")
-                    .expect("replace runner envelope path");
-                replaced.set(true);
-            }
-            false
-        };
-        assert!(matches!(
-            observe_linux_runner_envelope(&path, 1024, &cancellation_hook),
-            Err(LocalToolchainVerificationError::ReplacementDetected(_))
-        ));
-        assert!(replaced.get());
     }
 
     #[test]
@@ -2576,8 +1872,8 @@ mod tests {
 
         let changed = Fixture::new();
         changed.directory.write(
-            "share/wrela/targets/aarch64-qemu-virt-uefi/firmware/QEMU_EFI.fd",
-            b"substituted firmware",
+            "share/wrela/targets/aarch64-qemu-virt-uefi/runtime/wrela-runtime-aarch64.obj",
+            b"substituted runtime object",
         );
         assert!(matches!(
             changed.verify(),
@@ -2801,16 +2097,6 @@ mod tests {
     #[cfg(not(windows))]
     const fn backend_path() -> &'static str {
         "libexec/wrela/wrela-backend"
-    }
-
-    #[cfg(windows)]
-    const fn emulator_path() -> &'static str {
-        "libexec/wrela/qemu-system-aarch64.exe"
-    }
-
-    #[cfg(not(windows))]
-    const fn emulator_path() -> &'static str {
-        "libexec/wrela/qemu-system-aarch64"
     }
 
     fn host_identity() -> &'static str {
