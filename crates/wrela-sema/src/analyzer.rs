@@ -6385,6 +6385,29 @@ fn analyze_runtime_expression(
         .as_program()
         .expression(expression_id)
         .ok_or(AnalysisFailure::RequestMismatch)?;
+    // A qualified field/reference such as `Inner.a` is a complete value when
+    // `a` is a unit variant. Payload-bearing variants routed through this path
+    // retain the constructor's named arity rejection; calls continue through
+    // `analyze_direct_call` below.
+    if let Some(resolved) =
+        exact_resolved_enum_constructor(request.hir.as_program(), expression_id, is_cancelled)?
+    {
+        return analyze_closed_enum_constructor(
+            request,
+            partial,
+            function,
+            RuntimeDirectCall {
+                expression: expression_id,
+                source: expression.source,
+                callee: expression_id,
+                arguments: &[],
+            },
+            &resolved,
+            expression_request,
+            state,
+            is_cancelled,
+        );
+    }
     match &expression.kind {
         ExpressionKind::Literal(literal) => {
             if !matches!(
@@ -10847,28 +10870,6 @@ fn analyze_closed_enum_constructor(
             EffectSet(0)
         }
         Some(payload_ty) => {
-            // T0.1d: a nongeneric closed enum is admitted as a variant PAYLOAD
-            // TYPE (folding into the tagged-union slot, resolved above), but
-            // CONSTRUCTING such a variant (`.some(Inner.a)`) requires building the
-            // inner enum value first — an initialization path this slice does not
-            // yet plumb (it would otherwise surface a non-diagnostic RequestMismatch
-            // from the inner enum-value analysis). Fail closed with a NEW named
-            // diagnostic here, after the outer enum TYPE has already resolved into
-            // `partial.types`, rather than propagating an internal invariant/panic.
-            if partial
-                .types
-                .get(payload_ty.0 as usize)
-                .is_some_and(|record| matches!(record.kind, SemanticTypeKind::Enumeration { .. }))
-            {
-                return Err(runtime_type_diagnostic(
-                    request,
-                    call.source,
-                    "semantic-runtime-enum-enum-payload-construction-pending",
-                    "constructing a variant with a nongeneric-enum payload is not yet supported at the runtime tier",
-                    "this slice admits enum payloads into type resolution and layout; building the inner enum value is a later slice",
-                    "resolve the enum-payload type only (e.g. via an annotation or match), or use a scalar or flat-struct payload",
-                ));
-            }
             // The callee sub-expression fact precedes the payload it applies to.
             append_expression_fact(
                 request,
@@ -29678,15 +29679,10 @@ fn projection_fixture():
     }
 
     #[test]
-    fn runtime_enum_enum_payload_construction_fails_closed() {
-        // Constructing an enum-payload variant `.some(Inner.a)` requires first
-        // building the inner enum value `Inner.a` — a unit-variant construction
-        // that is not yet plumbed at the runtime tier. The construction therefore
-        // fails closed with a named source diagnostic (NOT an internal invariant
-        // or panic). The enum-payload TYPE still resolves (asserted in the sibling
-        // layout test); here we only require a clean, named fail-closed. `Inner.a`
-        // routes through the unit-variant construction path, whose named pending
-        // diagnostic is `semantic-runtime-enum-unit-construction-pending`.
+    fn runtime_enum_enum_payload_construction_analyzes_clean() {
+        // Constructing `.some(Inner.a)` recursively analyzes the inner unit enum
+        // value against the outer variant's exact payload type. Both constructor
+        // facts must survive exact sealing; layout support alone is insufficient.
         let source = dot_variant_actor_source(
             "pub enum Inner:\n    a\n    b\n\npub enum Outer:\n    none\n    some(Inner)\n\nasync fn checkpoint():\n    state: Outer = .some(Inner.a)\n    pass\n\n",
         );
@@ -29697,30 +29693,47 @@ fn projection_fixture():
                 parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
                 &|| false,
             )
-            .expect("enum-payload construction is a structured source diagnostic, not a panic");
+            .expect("closed enum-payload construction should analyze");
         assert!(
-            output.has_errors(),
-            "constructing `.some(Inner.a)` must fail closed, not silently succeed: {:?}",
+            output.diagnostics().is_empty(),
+            "constructing `.some(Inner.a)` must analyze cleanly: {:?}",
             output.diagnostics()
         );
+        let successful = output
+            .successful()
+            .expect("closed enum-payload construction must produce an exactly sealed image");
+        let facts = successful.facts();
+        let inner_ty = facts
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(&ty.kind, SemanticTypeKind::Enumeration { variants, .. }
+                    if variants.iter().map(|variant| variant.name.as_str()).eq(["a", "b"]))
+            })
+            .expect("the nested `Inner` enum type")
+            .id;
+        let mut forged = facts.clone();
+        let inner_variant = forged
+            .expressions
+            .iter_mut()
+            .find_map(|fact| match &mut fact.resolution {
+                ExpressionResolution::Constructor {
+                    ty,
+                    variant: Some(variant),
+                } if *ty == inner_ty && fact.result.is_some() => Some(variant),
+                _ => None,
+            })
+            .expect("the nested unit constructor fact");
+        assert_eq!(*inner_variant, 0, "source constructs `Inner.a`");
+        *inner_variant = 1;
+        forged
+            .validate_partial_structure()
+            .expect("same-enum variant forgery remains prefix-valid");
         assert!(
-            output.diagnostics().iter().all(|diagnostic| diagnostic
-                .code
-                .as_deref()
-                .is_some_and(|code| !code.is_empty())),
-            "every emitted diagnostic must carry a stable named code (no anonymous internal invariant): {:?}",
-            output.diagnostics()
-        );
-        assert!(
-            output
-                .diagnostics()
-                .iter()
-                .any(|diagnostic| diagnostic.code.as_deref()
-                    == Some("semantic-runtime-enum-unit-construction-pending")
-                    || diagnostic.code.as_deref()
-                        == Some("semantic-runtime-enum-enum-payload-construction-pending")),
-            "enum-payload construction must fail closed with a named pending diagnostic: {:?}",
-            output.diagnostics()
+            forged
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err(),
+            "exact sealing must reject changing the nested payload from `Inner.a` to `Inner.b`",
         );
     }
 

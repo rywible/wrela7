@@ -3514,6 +3514,31 @@ fn validate_exact_expression_fact(
                     )
                 }) => {}
         (
+            wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Variant(source)),
+            ExpressionResolution::Constructor {
+                ty,
+                variant: Some(variant),
+            },
+            Some(_),
+        ) if *ty == fact.ty
+            && exact_unit_enum_constructor_reference_matches(
+                analysis, program, source, *ty, *variant,
+            ) => {}
+        (
+            wrela_hir::ExpressionKind::Field { .. },
+            ExpressionResolution::Constructor {
+                ty,
+                variant: Some(variant),
+            },
+            Some(_),
+        ) if *ty == fact.ty
+            && exact_resolved_enum_constructor(program, fact.expression, is_cancelled)?
+                .is_some_and(|source| {
+                    exact_unit_enum_constructor_reference_matches(
+                        analysis, program, &source, *ty, *variant,
+                    )
+                }) => {}
+        (
             wrela_hir::ExpressionKind::DotName { candidates, .. },
             ExpressionResolution::Constructor {
                 ty,
