@@ -153,3 +153,52 @@ Use this commit as the concrete reference implementation when porting scheduler 
 | `codex/rev01-p0-13-a2` | local | 2026-07-18 17:47:52 -0600 | `e650809f` | Merge P0-10 representation authority -Codex Automated | **delete** | Duplicate tip (`e650809`) of `codex/rev01-p0-13-a1`; no unique commits. |
 | `codex/rev01-p0-16-respec` | local | 2026-07-18 20:53:12 -0600 | `6b4d299d` | respec final Linux backend Cargo pin refresh -Codex Automated | **harvest** | P0-16 final Linux backend Cargo pin refresh respec. |
 | `origin/codex/rev01-integration` | remote | 2026-07-18 11:35:50 -0600 | `cf705550` | workflow setup | **delete** | Stale remote tip at workflow-setup stub; superseded by local `codex/rev01-integration`. |
+
+## Execution record (2026-07-21)
+
+Lane 0 stabilize executed the **delete** verdicts on branch `drive`. Safety rule: tip must equal or be an ancestor of the named surviving duplicate (or of local `codex/rev01-integration` for superseded explore tips) before `git branch -D`.
+
+### Deleted local branches (21)
+
+| Branch | Tip | Safety check |
+|--------|-----|--------------|
+| `codex/rev01-a-20-a2` | `fb28763b` | same tip as `codex/rev01-a-20-a1` |
+| `codex/rev01-a-46-a2` | `f298400b` | same tip as `codex/rev01-c-19-gate-a2` |
+| `codex/rev01-a-53-a1` | `546640a6` | same tip as `codex/rev01-integration` |
+| `codex/rev01-a-61-fixture-followup` | `546640a6` | same tip as `codex/rev01-integration` |
+| `codex/rev01-a13-a14-respec` | `ebf1564e` | same tip as `codex/rev01-explore-a13-a14-1` (then explore tip ancestor of integration) |
+| `codex/rev01-c-01-a1` | `cf705550` | same tip as peer workflow stubs; ancestor of `codex/rev01-integration` |
+| `codex/rev01-c-01-a2` | `cf705550` | same tip as peer workflow stubs; ancestor of `codex/rev01-integration` |
+| `codex/rev01-c-18-a2` | `cb6d7423` | same tip as `codex/rev01-c-18-a1` |
+| `codex/rev01-c-20-a1` | `546640a6` | same tip as `codex/rev01-integration` |
+| `codex/rev01-explore-a-28-1` | `c73bc003` | ancestor of `codex/rev01-integration` |
+| `codex/rev01-explore-a-28-2` | `c73bc003` | same tip as `codex/rev01-explore-a-28-1` |
+| `codex/rev01-explore-a13-a14-1` | `ebf1564e` | ancestor of `codex/rev01-integration` |
+| `codex/rev01-explore-a13-a14-2` | `ebf1564e` | same tip as `codex/rev01-explore-a13-a14-1` |
+| `codex/rev01-explore-c18-p013-1` | `1a6a82ab` | ancestor of `codex/rev01-integration` |
+| `codex/rev01-explore-c18-p013-2` | `1a6a82ab` | same tip as `codex/rev01-explore-c18-p013-1` |
+| `codex/rev01-h-10-a1` | `fb28763b` | same tip as `codex/rev01-a-20-a1` |
+| `codex/rev01-h-10-a2` | `fb28763b` | same tip as `codex/rev01-a-20-a1` |
+| `codex/rev01-p0-05-a1` | `cf705550` | same tip as peer workflow stubs; ancestor of `codex/rev01-integration` |
+| `codex/rev01-p0-05-a2` | `cf705550` | same tip as peer workflow stubs; ancestor of `codex/rev01-integration` |
+| `codex/rev01-p0-10-a2` | `974e21d2` | same tip as `codex/rev01-p0-10-a1` |
+| `codex/rev01-p0-13-a2` | `e650809f` | same tip as `codex/rev01-p0-13-a1` |
+
+### Deleted remote branch (1)
+
+| Branch | Tip | Action |
+|--------|-----|--------|
+| `origin/codex/rev01-integration` | `cf705550` | `git push origin --delete codex/rev01-integration` (stale workflow-setup stub; local `codex/rev01-integration` kept) |
+
+### Skips
+
+None — all 22 delete-verdict refs passed the ancestor/same-tip check.
+
+### Retained
+
+- Local `codex/rev01-integration` (**keep**) and all **harvest** / **harvest (Task B5)** branches remain.
+- `lane-*` branches, worktrees under `.claude/worktrees/`, `complete`, and `worldclass` were out of scope.
+
+### Stale remote-tracking prune (same pass)
+
+Removed leftover remote-tracking refs from deleted remotes: `complete-latest`, `complete-local`, `complete-tip`, `local/complete`, `main-complete`, `main-repo/complete`, `mainrepo-complete`, `origin-complete`. Ran `git remote prune origin` (also dropped gone `origin/complete` and `origin/complete-local`). Remaining remotes: `origin/main`, `origin/cursor/cloud-env-linux-02f5`.
