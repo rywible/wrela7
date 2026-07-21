@@ -1602,6 +1602,13 @@ impl PartialAnalysis {
                     "semantic structure type differs from its exact HIR specialization",
                 ));
             }
+            if matches!(&ty.kind, SemanticTypeKind::Enumeration { arguments, .. } if !arguments.is_empty())
+                && !exact_generic_enum_type_matches(self, hir.as_program(), ty)
+            {
+                return Err(invalid(
+                    "semantic enumeration type differs from its exact HIR specialization",
+                ));
+            }
         }
         for value in &self.values {
             if value.function.0 as usize >= self.functions.len()
@@ -4245,18 +4252,29 @@ fn runtime_enum_arguments_supported(
     if arguments.is_empty() {
         return true;
     }
-    matches!(arguments, [SemanticArgument::Type(ok), SemanticArgument::Type(err)] if ok == err)
+    let core_result_shape = matches!(arguments, [SemanticArgument::Type(ok), SemanticArgument::Type(err)] if ok == err)
         && matches!(variants, [ok, err]
-            if ok.name == "Ok"
-                && err.name == "Err"
-                && matches!((ok.fields.as_slice(), err.fields.as_slice()), ([ok_field], [err_field])
-                    if ok_field.name.is_empty()
-                        && err_field.name.is_empty()
-                        && ok_field.public
-                        && err_field.public
-                        && ok_field.ty == err_field.ty
-                        && matches!(arguments, [SemanticArgument::Type(payload), _]
-                            if *payload == ok_field.ty)))
+                if ok.name == "Ok"
+                    && err.name == "Err"
+                    && matches!((ok.fields.as_slice(), err.fields.as_slice()), ([ok_field], [err_field])
+                        if ok_field.name.is_empty()
+                            && err_field.name.is_empty()
+                            && ok_field.public
+                            && err_field.public
+                            && ok_field.ty == err_field.ty
+                            && matches!(arguments, [SemanticArgument::Type(payload), _]
+                                if *payload == ok_field.ty)));
+    core_result_shape
+        || (arguments
+            .iter()
+            .all(|argument| matches!(argument, SemanticArgument::Type(_)))
+            && variants
+                .iter()
+                .all(|variant| match variant.fields.as_slice() {
+                    [] => true,
+                    [field] => field.name.is_empty() && field.public,
+                    _ => false,
+                }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5130,6 +5148,125 @@ fn exact_flat_structure_type_matches(
         }
         && semantic.size_upper_bound == Some(size)
         && semantic.alignment_lower_bound == alignment
+}
+
+fn exact_generic_enum_type_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    semantic: &SemanticType,
+) -> bool {
+    let SemanticTypeKind::Enumeration {
+        declaration,
+        arguments,
+        variants,
+    } = &semantic.kind
+    else {
+        return false;
+    };
+    let Some(source) = program.declaration(*declaration) else {
+        return false;
+    };
+    let wrela_hir::DeclarationKind::Enumeration(enumeration) = &source.kind else {
+        return false;
+    };
+    if arguments.is_empty()
+        || semantic.source != Some(source.source)
+        || enumeration.generics.len() != arguments.len()
+        || enumeration.variants.len() != variants.len()
+        || enumeration.variants.is_empty()
+        || enumeration.variants.len() > 256
+        || semantic.linearity != Linearity::ExplicitCopy
+    {
+        return false;
+    }
+    for (generic_id, argument) in enumeration.generics.iter().zip(arguments) {
+        let Some(generic) = program.generic_parameter(*generic_id) else {
+            return false;
+        };
+        if generic.owner != *declaration
+            || !matches!(
+                generic.kind,
+                wrela_hir::GenericParameterKind::Type { bound: None }
+            )
+            || !matches!(argument, SemanticArgument::Type(ty)
+                if exact_stored_copy_scalar_layout(analysis, *ty).is_some())
+        {
+            return false;
+        }
+    }
+    if exact_core_result_declaration_matches(program, *declaration)
+        && !matches!(arguments.as_slice(),
+            [SemanticArgument::Type(left), SemanticArgument::Type(right)] if left == right)
+    {
+        return false;
+    }
+
+    let mut payload_slot: Option<(u64, u32)> = None;
+    for (source_variant, semantic_variant) in enumeration.variants.iter().zip(variants) {
+        if semantic_variant.name != source_variant.name.as_str() {
+            return false;
+        }
+        let expected = match source_variant.fields.as_slice() {
+            [] => None,
+            [field] if field.name.is_none() => match &field.ty.kind {
+                wrela_hir::TypeExpressionKind::Named {
+                    definition: wrela_hir::Definition::Builtin(_),
+                    arguments: source_arguments,
+                } if source_arguments.is_empty() => exact_scalar_source_type(analysis, &field.ty),
+                wrela_hir::TypeExpressionKind::Named {
+                    definition: wrela_hir::Definition::Generic(generic),
+                    arguments: source_arguments,
+                } if source_arguments.is_empty() => enumeration
+                    .generics
+                    .iter()
+                    .position(|candidate| candidate == generic)
+                    .and_then(|position| arguments.get(position))
+                    .and_then(|argument| match argument {
+                        SemanticArgument::Type(ty) => Some(*ty),
+                        SemanticArgument::Constant(_) | SemanticArgument::Region(_) => None,
+                    }),
+                _ => None,
+            },
+            _ => return false,
+        };
+        match (expected, semantic_variant.fields.as_slice()) {
+            (None, []) if source_variant.fields.is_empty() => {}
+            (Some(expected), [field])
+                if field.name.is_empty() && field.public && field.ty == expected =>
+            {
+                let Some((size, alignment)) = exact_stored_copy_scalar_layout(analysis, expected)
+                else {
+                    return false;
+                };
+                payload_slot = Some(match payload_slot {
+                    None => (size, alignment),
+                    Some((current_size, current_alignment)) => {
+                        (current_size.max(size), current_alignment.max(alignment))
+                    }
+                });
+            }
+            _ => return false,
+        }
+    }
+    let (size, alignment) = match payload_slot {
+        None => (1_u64, 1_u32),
+        Some((payload_size, alignment)) => {
+            let mask = u64::from(alignment).checked_sub(1);
+            let Some(offset) = mask.and_then(|mask| 1_u64.checked_add(mask).map(|v| v & !mask))
+            else {
+                return false;
+            };
+            let Some(size) = offset
+                .checked_add(payload_size)
+                .and_then(|value| value.checked_add(u64::from(alignment) - 1))
+                .map(|value| value & !(u64::from(alignment) - 1))
+            else {
+                return false;
+            };
+            (size, alignment)
+        }
+    };
+    semantic.size_upper_bound == Some(size) && semantic.alignment_lower_bound == alignment
 }
 
 fn exact_stored_copy_scalar_layout(

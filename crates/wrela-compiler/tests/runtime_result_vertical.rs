@@ -482,7 +482,11 @@ fn assert_discovery_diagnostic(application_source: &str, expected: &str) {
             &never_cancelled,
         )
         .expect("bounded Result rejection analysis");
-    assert!(output.successful().is_none());
+    assert!(
+        output.successful().is_none(),
+        "unexpectedly accepted source:\n{application_source}\ndiagnostics: {:?}",
+        output.diagnostics()
+    );
     assert!(
         output
             .diagnostics()
@@ -1046,12 +1050,15 @@ enum Forged[T, E]:
 pub fn boot() -> Image:
     return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
 
+fn forged_helper() -> Forged[u8, u8]:
+    return Forged.Ok(1)
+
 @test
 fn reject_forged():
-    value: Forged[u8, u8] = Forged.Ok(1)
+    value: u8 = forged_helper()?
     return
 "#,
-        "semantic-runtime-result-not-core",
+        "semantic-runtime-try-result-required",
     );
 }
 

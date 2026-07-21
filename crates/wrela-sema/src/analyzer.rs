@@ -6101,7 +6101,7 @@ fn analyze_closed_enum_match(
                 "semantic-runtime-match-scrutinee",
                 "runtime match requires a supported closed enum",
                 "R1 matching dispatches only on a canonical dense enum tag",
-                "match a nongeneric scalar-backed enum value",
+                "match a closed enum value with supported copy-scalar type arguments",
             )
         })?;
     if arms.len() != variants {
@@ -6809,7 +6809,7 @@ fn analyze_closed_enum_is_pattern(
                 "semantic-runtime-is-scrutinee",
                 "runtime `is` requires a supported closed enum",
                 "the admitted pattern test dispatches on one canonical enum tag",
-                "test a nongeneric closed enum value",
+                "test a closed enum value with supported copy-scalar type arguments",
             )
         })?;
     let pattern = request
@@ -10785,24 +10785,31 @@ fn analyze_closed_enum_constructor(
             is_cancelled,
         )?
     } else {
-        if !is_exact_core_result_declaration(request, &resolved.enumeration, declaration) {
-            return Err(runtime_type_diagnostic(
-                request,
-                call.source,
-                "semantic-runtime-result-not-core",
-                "generic enum constructor is not owned by authenticated core Result",
-                "generic constructor specialization cannot be forged by another package",
-                "use Result.Ok or Result.Err imported from core.result",
-            ));
-        }
+        let core_result =
+            is_exact_core_result_declaration(request, &resolved.enumeration, declaration);
         let Some(expected) = expression_request.expected else {
+            let (code, message, explanation, help) = if core_result {
+                (
+                    "semantic-runtime-result-constructor-context",
+                    "core Result constructor requires an exact contextual Result[T, T] type",
+                    "R2 does not infer generic Result arguments from a context-free payload",
+                    "add an explicit Result[T, T] local, parameter, or return type",
+                )
+            } else {
+                (
+                    "semantic-runtime-generic-enum-inference-required",
+                    "generic enum constructor requires an expected specialized type",
+                    "constructor payloads do not infer a closed-world specialization in this bounded slice",
+                    "add a local, parameter, or result type naming the complete enum specialization",
+                )
+            };
             return Err(runtime_type_diagnostic(
                 request,
                 call.source,
-                "semantic-runtime-result-constructor-context",
-                "core Result constructor requires an exact contextual Result[T, T] type",
-                "R2 does not infer generic Result arguments from a context-free payload",
-                "add an explicit Result[T, T] local, parameter, or return type",
+                code,
+                message,
+                explanation,
+                help,
             ));
         };
         let valid_expected = partial.types.get(expected.0 as usize).is_some_and(|record| {
@@ -10811,16 +10818,36 @@ fn analyze_closed_enum_constructor(
                 arguments,
                 ..
             } if *declaration == resolved.enumeration.declaration
-                && matches!(arguments.as_slice(), [SemanticArgument::Type(left), SemanticArgument::Type(right)] if left == right))
+                && if core_result {
+                    matches!(arguments.as_slice(), [SemanticArgument::Type(left), SemanticArgument::Type(right)] if left == right)
+                } else {
+                    arguments.len() == enumeration.generics.len()
+                        && arguments.iter().all(|argument| matches!(argument, SemanticArgument::Type(_)))
+                })
         });
         if !valid_expected {
+            let (code, message, explanation, help) = if core_result {
+                (
+                    "semantic-runtime-result-constructor-context",
+                    "core Result constructor context is not the exact supported specialization",
+                    "the constructor must target authenticated Result[T, T] with one supported scalar T",
+                    "construct the Result variant in an explicit matching Result[T, T] context",
+                )
+            } else {
+                (
+                    "semantic-runtime-generic-enum-constructor-context",
+                    "generic enum constructor context is not the exact declared specialization",
+                    "a constructor can only produce the same nominal enum and complete type arguments required by its context",
+                    "construct the variant in a context naming its exact enum specialization",
+                )
+            };
             return Err(runtime_type_diagnostic(
                 request,
                 call.source,
-                "semantic-runtime-result-constructor-context",
-                "core Result constructor context is not the exact supported specialization",
-                "the constructor must target authenticated Result[T, T] with one supported scalar T",
-                "construct the Result variant in an explicit matching Result[T, T] context",
+                code,
+                message,
+                explanation,
+                help,
             ));
         }
         expected
@@ -13112,11 +13139,20 @@ fn semantic_type_from_source(
                         &mut *aggregate_work,
                         is_cancelled,
                     )
-                } else {
+                } else if is_exact_core_result_declaration(request, resolved, declaration) {
                     ensure_core_result_type(
                         request,
                         partial,
                         resolved,
+                        arguments,
+                        &mut *aggregate_work,
+                        is_cancelled,
+                    )
+                } else {
+                    ensure_closed_scalar_enum_type_from_source_arguments(
+                        request,
+                        partial,
+                        declaration.id,
                         arguments,
                         &mut *aggregate_work,
                         is_cancelled,
@@ -13407,6 +13443,143 @@ fn ensure_closed_scalar_enum_type(
     aggregate_work: &mut RuntimeAggregateWork,
     is_cancelled: &dyn Fn() -> bool,
 ) -> RuntimeResult<SemanticTypeId> {
+    ensure_closed_scalar_enum_type_specialized(
+        request,
+        partial,
+        declaration,
+        &[],
+        aggregate_work,
+        is_cancelled,
+    )
+}
+
+fn ensure_closed_scalar_enum_type_from_source_arguments(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    declaration: DeclarationId,
+    source_arguments: &[wrela_hir::GenericArgument],
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
+    let record = request
+        .hir
+        .as_program()
+        .declaration(declaration)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let DeclarationKind::Enumeration(enumeration) = &record.kind else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    if source_arguments.len() != enumeration.generics.len() {
+        return Err(runtime_type_diagnostic(
+            request,
+            record.source,
+            "semantic-runtime-generic-enum-argument-count",
+            "runtime generic enum specialization has the wrong number of arguments",
+            "every declared type parameter must receive one exact type argument",
+            "supply one supported copy-scalar type argument for every type parameter",
+        ));
+    }
+    let mut arguments = Vec::new();
+    arguments
+        .try_reserve_exact(source_arguments.len())
+        .map_err(|_| fact_resource(request, "runtime enum arguments"))?;
+    for (generic_id, argument) in enumeration.generics.iter().zip(source_arguments) {
+        charge_runtime_aggregate_lookup(request, &mut *aggregate_work, is_cancelled)?;
+        let generic = request
+            .hir
+            .as_program()
+            .generic_parameter(*generic_id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if generic.owner != declaration
+            || !matches!(
+                generic.kind,
+                wrela_hir::GenericParameterKind::Type { bound: None }
+            )
+        {
+            return Err(runtime_type_diagnostic(
+                request,
+                generic.source,
+                "semantic-runtime-generic-enum-parameter",
+                "runtime generic enum parameter is outside the bounded type-only subset",
+                "constant, region, and bounded type parameters require later specialization semantics",
+                "use an unbounded type parameter specialized with a supported copy scalar",
+            ));
+        }
+        arguments.push(SemanticArgument::Type(generic_enum_scalar_argument(
+            request,
+            partial,
+            argument,
+            aggregate_work,
+            is_cancelled,
+        )?));
+    }
+    ensure_closed_scalar_enum_type_specialized(
+        request,
+        partial,
+        declaration,
+        &arguments,
+        aggregate_work,
+        is_cancelled,
+    )
+}
+
+fn generic_enum_scalar_argument(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    argument: &wrela_hir::GenericArgument,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
+    let wrela_hir::GenericArgumentKind::Type(source) = &argument.kind else {
+        return Err(runtime_type_diagnostic(
+            request,
+            argument.source,
+            "semantic-runtime-generic-enum-argument-type",
+            "runtime generic enum argument must be a type",
+            "constant, region, capacity, and unresolved arguments are not runtime type specializations",
+            "supply a primitive boolean, integer, or floating-point type",
+        ));
+    };
+    if !matches!(&source.kind, TypeExpressionKind::Named {
+        definition: Definition::Builtin(_),
+        arguments,
+    } if arguments.is_empty())
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            source.source,
+            "semantic-runtime-generic-enum-argument-type",
+            "runtime generic enum argument is not a supported copy scalar",
+            "nominal, nested generic, view, tuple, and function types require later specialization semantics",
+            "use bool, an integer type, or f32/f64",
+        ));
+    }
+    let ty = semantic_type_from_source(request, partial, source, aggregate_work, is_cancelled)?;
+    let record = partial
+        .types
+        .get(ty.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if !is_stored_copy_scalar_type(record) {
+        return Err(runtime_type_diagnostic(
+            request,
+            source.source,
+            "semantic-runtime-generic-enum-argument-type",
+            "runtime generic enum argument is not a supported stored copy scalar",
+            "unit and non-runtime builtins have no canonical payload representation",
+            "use bool, an integer type, or f32/f64",
+        ));
+    }
+    Ok(ty)
+}
+
+fn ensure_closed_scalar_enum_type_specialized(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    declaration: DeclarationId,
+    semantic_arguments: &[SemanticArgument],
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
     // Cycle guard (T0.1d): a payload enum whose id is already on the active
     // resolution stack recurses into itself (directly, or transitively through
     // another enum), so it has no finite machine layout. Fail closed here BEFORE
@@ -13440,6 +13613,7 @@ fn ensure_closed_scalar_enum_type(
         request,
         partial,
         declaration,
+        semantic_arguments,
         &mut *aggregate_work,
         is_cancelled,
     );
@@ -13451,6 +13625,7 @@ fn ensure_closed_scalar_enum_type_resolved(
     request: &AnalysisRequest<'_>,
     partial: &mut PartialAnalysis,
     declaration: DeclarationId,
+    semantic_arguments: &[SemanticArgument],
     aggregate_work: &mut RuntimeAggregateWork,
     is_cancelled: &dyn Fn() -> bool,
 ) -> RuntimeResult<SemanticTypeId> {
@@ -13460,7 +13635,7 @@ fn ensure_closed_scalar_enum_type_resolved(
             declaration: candidate,
             arguments,
             ..
-        } if *candidate == declaration && arguments.is_empty())
+        } if *candidate == declaration && arguments.as_slice() == semantic_arguments)
         {
             return Ok(existing.id);
         }
@@ -13473,14 +13648,14 @@ fn ensure_closed_scalar_enum_type_resolved(
     let DeclarationKind::Enumeration(enumeration) = &record.kind else {
         return Err(AnalysisFailure::RequestMismatch.into());
     };
-    if !enumeration.generics.is_empty() {
+    if enumeration.generics.len() != semantic_arguments.len() {
         return Err(runtime_type_diagnostic(
             request,
             record.source,
             "semantic-runtime-enum-generic-not-supported",
-            "runtime enum must be nongeneric in this revision slice",
-            "generic Result specialization is a later atomic capability",
-            "declare a local nongeneric closed enum",
+            "runtime enum specialization does not bind every generic parameter",
+            "closed-world enum resolution requires an exact specialization key",
+            "supply one supported copy-scalar argument for every type parameter",
         ));
     }
     if enumeration.variants.is_empty() || enumeration.variants.len() > 256 {
@@ -13544,6 +13719,20 @@ fn ensure_closed_scalar_enum_type_resolved(
         }
         let payload = match &field.ty.kind {
             TypeExpressionKind::Named {
+                definition: Definition::Generic(generic),
+                arguments,
+            } if arguments.is_empty() => {
+                let position = enumeration
+                    .generics
+                    .iter()
+                    .position(|candidate| candidate == generic)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                match semantic_arguments.get(position) {
+                    Some(SemanticArgument::Type(ty)) => *ty,
+                    _ => return Err(AnalysisFailure::RequestMismatch.into()),
+                }
+            }
+            TypeExpressionKind::Named {
                 definition: Definition::Builtin(_),
                 arguments,
             } if arguments.is_empty() => {
@@ -13594,6 +13783,16 @@ fn ensure_closed_scalar_enum_type_resolved(
                 definition: Definition::Declaration(resolved),
                 arguments,
             } if arguments.is_empty() => {
+                if !semantic_arguments.is_empty() {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        field.source,
+                        "semantic-runtime-generic-enum-payload-type",
+                        "runtime generic enum payload is outside the scalar specialization subset",
+                        "this closed-world increment substitutes only primitive stored-copy type parameters and primitive scalar fields",
+                        "use a primitive scalar or one of this enum's unbounded type parameters as the payload",
+                    ));
+                }
                 let payload_declaration = request
                     .hir
                     .resolved_declaration(resolved)
@@ -13710,7 +13909,7 @@ fn ensure_closed_scalar_enum_type_resolved(
         id,
         kind: SemanticTypeKind::Enumeration {
             declaration,
-            arguments: Vec::new(),
+            arguments: semantic_arguments.to_vec(),
             variants,
         },
         linearity: Linearity::ExplicitCopy,
@@ -29131,6 +29330,217 @@ fn projection_fixture():
                 .is_err(),
             "full sealing must derive primitive and specialized layouts independently"
         );
+    }
+
+    #[test]
+    fn generic_enum_specializes_copy_scalar_payload_for_construction_match_and_is() {
+        let source = dot_variant_actor_source(
+            "pub enum Maybe[T]:\n    none\n    some(T)\n\nasync fn checkpoint():\n    small: Maybe[u8] = .some(7)\n    wide: Maybe[u64] = .some(9)\n    present: bool = small is Maybe.some(_)\n    match wide:\n        case Maybe.none:\n            pass\n        case Maybe.some(value):\n            pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("generic enum specialization should analyze");
+        assert!(
+            output.diagnostics().is_empty(),
+            "copy-scalar generic enums must specialize and remain consumable: {:?}",
+            output.diagnostics()
+        );
+        let successful = output.successful().expect("sealed enum specializations");
+        let maybe = fixture
+            .fixture
+            .hir
+            .as_program()
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name.as_ref().map(Name::as_str) == Some("Maybe"))
+            .expect("Maybe declaration")
+            .id;
+        let specializations: Vec<_> = successful
+            .facts()
+            .types
+            .iter()
+            .filter(|ty| {
+                matches!(&ty.kind, SemanticTypeKind::Enumeration { declaration, .. }
+                    if *declaration == maybe)
+            })
+            .collect();
+        assert_eq!(specializations.len(), 2);
+        assert!(specializations.iter().all(|ty| {
+            let SemanticTypeKind::Enumeration {
+                arguments,
+                variants,
+                ..
+            } = &ty.kind
+            else {
+                return false;
+            };
+            let [SemanticArgument::Type(argument)] = arguments.as_slice() else {
+                return false;
+            };
+            matches!(
+                successful.facts().types[argument.0 as usize].kind,
+                SemanticTypeKind::Integer {
+                    signed: false,
+                    bits: 8 | 64,
+                    pointer_sized: false
+                }
+            ) && matches!(variants.as_slice(), [none, some]
+                if none.name == "none" && none.fields.is_empty()
+                    && some.name == "some"
+                    && matches!(some.fields.as_slice(), [field]
+                        if field.ty == *argument && field.public && field.name.is_empty()))
+        }));
+
+        let mut forged = successful.facts().clone();
+        let replacement = forged
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(
+                    ty.kind,
+                    SemanticTypeKind::Integer {
+                        signed: false,
+                        bits: 64,
+                        pointer_sized: false
+                    }
+                )
+            })
+            .expect("u64 specialization argument")
+            .id;
+        let forged_maybe = forged
+            .types
+            .iter_mut()
+            .find(|ty| {
+                matches!(&ty.kind, SemanticTypeKind::Enumeration { declaration, arguments, .. }
+                    if *declaration == maybe
+                        && matches!(arguments.as_slice(), [SemanticArgument::Type(argument)]
+                            if *argument != replacement))
+            })
+            .expect("u8 Maybe specialization");
+        let SemanticTypeKind::Enumeration { variants, .. } = &mut forged_maybe.kind else {
+            unreachable!("selected enum specialization")
+        };
+        variants[1].fields[0].ty = replacement;
+        forged
+            .validate_partial_structure()
+            .expect("cross-specialization payload forgery remains prefix-safe");
+        assert!(
+            forged
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err(),
+            "full sealing must authenticate generic enum payload substitution against exact HIR"
+        );
+        let mut forged_name = successful.facts().clone();
+        let forged_maybe = forged_name
+            .types
+            .iter_mut()
+            .find(|ty| {
+                matches!(&ty.kind, SemanticTypeKind::Enumeration { declaration, .. }
+                    if *declaration == maybe)
+            })
+            .expect("one Maybe specialization");
+        let SemanticTypeKind::Enumeration { variants, .. } = &mut forged_maybe.kind else {
+            unreachable!("selected enum specialization")
+        };
+        variants[0].name = "absent".to_owned();
+        forged_name
+            .validate_partial_structure()
+            .expect("variant-name forgery remains prefix-safe");
+        assert!(
+            forged_name
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err(),
+            "full sealing must authenticate specialized variant names against exact HIR"
+        );
+    }
+
+    #[test]
+    fn generic_enum_rejects_constant_parameters_by_name() {
+        let source = dot_variant_actor_source(
+            "pub enum Fixed[const N: u8]:\n    value(u8)\n\nasync fn checkpoint():\n    fixed: Fixed[1] = .value(1)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("constant generic enum should fail with a source diagnostic");
+        assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-runtime-generic-enum-parameter")
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn generic_enum_rejects_nominal_type_arguments_by_name() {
+        let source = dot_variant_actor_source(
+            "pub struct Payload:\n    pub word: u8\n\npub enum Maybe[T]:\n    none\n    some(T)\n\nasync fn checkpoint():\n    item: Maybe[Payload] = .none\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("nominal generic enum argument should fail with a source diagnostic");
+        assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-runtime-generic-enum-argument-type")
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn generic_enum_constructor_requires_expected_specialization() {
+        let source = dot_variant_actor_source(
+            "pub enum Maybe[T]:\n    none\n    some(T)\n\nasync fn checkpoint():\n    Maybe.some(1)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("unconstrained generic enum construction should fail by name");
+        assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-runtime-generic-enum-inference-required")
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn generic_enum_nominal_payload_tail_fails_closed_by_name() {
+        let source = dot_variant_actor_source(
+            "pub struct Detail:\n    pub word: u8\n\npub enum Envelope[T]:\n    detail(Detail)\n    value(T)\n\nasync fn checkpoint():\n    item: Envelope[u8] = .value(1)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("generic enum nominal payload tail should fail by name");
+        assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-runtime-generic-enum-payload-type")
+        );
+        assert!(output.has_errors());
     }
 
     #[test]
