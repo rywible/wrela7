@@ -711,6 +711,15 @@ pub enum ExpressionResolution {
         err_payload: ValueId,
         propagated: ValueId,
     },
+    /// Analysis-only closed iterator. `ExpressionFact::ty` is the yielded
+    /// integer type rather than a first-class range value type; ranges are
+    /// consumable only by the enclosing `for` statement in this slice.
+    ClosedRange {
+        start: ValueId,
+        end: ValueId,
+        inclusive: bool,
+        maximum_iterations: u64,
+    },
     DirectCall {
         function: FunctionInstanceId,
         /// Exact source-to-parameter permutation. Records are canonical by
@@ -2312,7 +2321,12 @@ fn validate_exact_expression_local_values(
                 pending.push(*value);
             }
             wrela_hir::ExpressionKind::Binary { left, right, .. }
-            | wrela_hir::ExpressionKind::Compare { left, right, .. } => {
+            | wrela_hir::ExpressionKind::Compare { left, right, .. }
+            | wrela_hir::ExpressionKind::Range {
+                start: left,
+                end: right,
+                ..
+            } => {
                 reserve_validation_scratch(&mut pending, 2, program.expressions.len() as u64)?;
                 pending.push(*right);
                 pending.push(*left);
@@ -2428,7 +2442,12 @@ fn expression_references_local(
                 pending.push(*operand);
             }
             wrela_hir::ExpressionKind::Binary { left, right, .. }
-            | wrela_hir::ExpressionKind::Compare { left, right, .. } => {
+            | wrela_hir::ExpressionKind::Compare { left, right, .. }
+            | wrela_hir::ExpressionKind::Range {
+                start: left,
+                end: right,
+                ..
+            } => {
                 reserve_validation_scratch(&mut pending, 2, program.expressions.len() as u64)?;
                 pending.push(*right);
                 pending.push(*left);
@@ -2793,6 +2812,64 @@ fn validate_exact_body_local_value_flow(
                     return Err(invalid("branch has a spurious local-value join definition"));
                 }
                 EffectSet(condition_effects.0 | then_effects.0 | else_effects.0)
+            }
+            wrela_hir::StatementKind::For {
+                binding,
+                iterable,
+                body,
+                ..
+            } => {
+                validate_exact_expression_local_values(
+                    analysis,
+                    program,
+                    function.id,
+                    *iterable,
+                    locals,
+                    is_cancelled,
+                )?;
+                let iterable_effects = exact_child_expression(analysis, function.id, *iterable)
+                    .filter(|fact| {
+                        matches!(fact.resolution, ExpressionResolution::ClosedRange { .. })
+                    })
+                    .ok_or_else(|| invalid("for iterable fact is not a closed range"))?
+                    .effects;
+                let [definition] = fact.definitions.as_slice() else {
+                    return Err(invalid("for local-value binding is missing"));
+                };
+                if definition.local != *binding {
+                    return Err(invalid("for local-value binding differs from HIR"));
+                }
+                let mut body_locals = copy_exact_local_values(locals)?;
+                let slot = body_locals
+                    .get_mut(binding.0 as usize)
+                    .ok_or_else(|| invalid("for local-value binding is invalid"))?;
+                if slot.replace(definition.value).is_some() {
+                    return Err(invalid("for local-value binding shadows live state"));
+                }
+                let body_effects = validate_exact_body_local_value_flow(
+                    analysis,
+                    program,
+                    function,
+                    *body,
+                    &mut body_locals,
+                    depth + 1,
+                    is_cancelled,
+                )?;
+                if body_locals.get(binding.0 as usize).copied().flatten() != Some(definition.value)
+                {
+                    return Err(invalid("for body changes its generated binding"));
+                }
+                for (index, (before, after)) in locals.iter().zip(&body_locals).enumerate() {
+                    check_analysis_cancelled(is_cancelled)?;
+                    let local_is_nested = program
+                        .locals
+                        .get(index)
+                        .is_some_and(|local| body_is_ancestor(program, *body, local.body));
+                    if !local_is_nested && before != after {
+                        return Err(invalid("for body changes outer local-value flow"));
+                    }
+                }
+                EffectSet(iterable_effects.0 | body_effects.0)
             }
             wrela_hir::StatementKind::While { condition, body } => {
                 if fact.definitions.len() % 2 != 0 {
@@ -3277,6 +3354,20 @@ fn collect_source_body_closure(
                     )?;
                     pending_bodies.push(*body);
                 }
+                wrela_hir::StatementKind::For { iterable, body, .. } => {
+                    reserve_validation_scratch(
+                        &mut pending_expressions,
+                        1,
+                        program.expressions.len() as u64,
+                    )?;
+                    pending_expressions.push(*iterable);
+                    reserve_validation_scratch(
+                        &mut pending_bodies,
+                        1,
+                        program.bodies.len() as u64,
+                    )?;
+                    pending_bodies.push(*body);
+                }
                 wrela_hir::StatementKind::Break | wrela_hir::StatementKind::Continue => {}
                 wrela_hir::StatementKind::Match { scrutinee, arms } => {
                     reserve_validation_scratch(
@@ -3395,7 +3486,12 @@ fn collect_source_body_closure(
                 pending_expressions.push(*operand);
             }
             wrela_hir::ExpressionKind::Binary { left, right, .. }
-            | wrela_hir::ExpressionKind::Compare { left, right, .. } => {
+            | wrela_hir::ExpressionKind::Compare { left, right, .. }
+            | wrela_hir::ExpressionKind::Range {
+                start: left,
+                end: right,
+                ..
+            } => {
                 reserve_validation_scratch(
                     &mut pending_expressions,
                     2,
@@ -3535,6 +3631,31 @@ fn validate_exact_expression_fact(
             ExpressionResolution::Constant(constant),
             Some(_),
         ) if constant_matches_literal(analysis, fact.ty, literal, constant) => {}
+        (
+            wrela_hir::ExpressionKind::Range {
+                start,
+                end,
+                inclusive,
+            },
+            ExpressionResolution::ClosedRange {
+                start: start_value,
+                end: end_value,
+                inclusive: resolved_inclusive,
+                maximum_iterations,
+            },
+            None,
+        ) if exact_closed_literal_range_matches(
+            analysis,
+            function.id,
+            fact,
+            *start,
+            *end,
+            *inclusive,
+            *start_value,
+            *end_value,
+            *resolved_inclusive,
+            *maximum_iterations,
+        ) => {}
         (
             wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(local)),
             ExpressionResolution::Value(value),
@@ -5997,6 +6118,59 @@ fn validate_exact_statement_fact(
                 return Err(invalid("enum match omits a constructor variant"));
             }
         }
+        wrela_hir::StatementKind::For {
+            take_binding,
+            binding,
+            take_iterable,
+            iterable,
+            body,
+        } => {
+            let [definition] = fact.definitions.as_slice() else {
+                return Err(invalid("closed range loop lacks one exact binding"));
+            };
+            let iterable_fact = exact_child_expression(analysis, function.id, *iterable)
+                .filter(|fact| {
+                    fact.result.is_none()
+                        && matches!(
+                            fact.resolution,
+                            ExpressionResolution::ClosedRange {
+                                inclusive: false,
+                                ..
+                            }
+                        )
+                })
+                .ok_or_else(|| invalid("for iterable is not an exact closed range"))?;
+            let local_record = program
+                .locals
+                .get(binding.0 as usize)
+                .filter(|record| {
+                    record.id == *binding && record.body == *body && record.ty.is_none()
+                })
+                .ok_or_else(|| invalid("for binding local differs from its child body"))?;
+            let value_record = analysis
+                .values
+                .get(definition.value.0 as usize)
+                .filter(|record| {
+                    definition.local == *binding
+                        && record.function == function.id
+                        && record.ty == iterable_fact.ty
+                        && record.origin == SemanticValueOrigin::Local(*binding)
+                        && record.source == Some(local_record.source)
+                        && record.source_name.as_deref() == Some(local_record.name.as_str())
+                        && record.category == ValueCategory::Value
+                        && record.class == SemanticValueClass::FirstClass
+                })
+                .ok_or_else(|| invalid("for binding value provenance is invalid"))?;
+            if *take_binding
+                || *take_iterable
+                || analysis.expressions.iter().any(|expression| {
+                    expression.function == function.id && expression.result == Some(value_record.id)
+                })
+            {
+                return Err(invalid("for binding differs from the closed range HIR"));
+            }
+            increment_definition(definitions, definition.value)?;
+        }
         wrela_hir::StatementKind::If { .. } | wrela_hir::StatementKind::While { .. } => {
             for definition in &fact.definitions {
                 check_analysis_cancelled(is_cancelled)?;
@@ -7182,6 +7356,73 @@ fn constant_matches_literal(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn exact_closed_literal_range_matches(
+    analysis: &PartialAnalysis,
+    function: FunctionInstanceId,
+    range: &ExpressionFact,
+    start: ExpressionId,
+    end: ExpressionId,
+    source_inclusive: bool,
+    start_value: ValueId,
+    end_value: ValueId,
+    resolved_inclusive: bool,
+    maximum_iterations: u64,
+) -> bool {
+    if source_inclusive || resolved_inclusive || range.result.is_some() {
+        return false;
+    }
+    let endpoint = |expression, value| {
+        analysis
+            .expressions
+            .binary_search_by_key(&(function, expression), |fact| {
+                (fact.function, fact.expression)
+            })
+            .ok()
+            .and_then(|index| analysis.expressions.get(index))
+            .filter(|fact| {
+                fact.ty == range.ty
+                    && fact.result == Some(value)
+                    && matches!(fact.resolution, ExpressionResolution::Constant(_))
+            })
+    };
+    let (Some(start_fact), Some(end_fact)) =
+        (endpoint(start, start_value), endpoint(end, end_value))
+    else {
+        return false;
+    };
+    let parse = |fact: &ExpressionFact| match fact.resolution {
+        ExpressionResolution::Constant(ConstantValue::Unsigned { bits: 64, value }) => {
+            u64::try_from(value).ok()
+        }
+        _ => None,
+    };
+    let (Some(start_constant), Some(end_constant)) = (parse(start_fact), parse(end_fact)) else {
+        return false;
+    };
+    analysis.types.get(range.ty.0 as usize).is_some_and(|ty| {
+        matches!(
+            ty.kind,
+            SemanticTypeKind::Integer {
+                signed: false,
+                bits: 64,
+                pointer_sized: false,
+            }
+        )
+    }) && maximum_iterations == half_open_trip_count(start_constant, end_constant)
+        && range.effects == EffectSet(start_fact.effects.0 | end_fact.effects.0)
+}
+
+// Keep the subtraction explicit: the sealed proof is defined in terms of a
+// checked difference, with an empty range on underflow.
+#[allow(clippy::manual_unwrap_or, clippy::manual_unwrap_or_default)]
+fn half_open_trip_count(start: u64, end: u64) -> u64 {
+    match end.checked_sub(start) {
+        Some(iterations) => iterations,
+        None => 0,
+    }
+}
+
 fn parse_hir_float(value: &str) -> Option<String> {
     let mut spelling = String::new();
     spelling.try_reserve_exact(value.len()).ok()?;
@@ -7770,6 +8011,9 @@ fn valid_expression_resolution(
             *err_payload,
             *propagated,
         ),
+        ExpressionResolution::ClosedRange { start, end, .. } => {
+            start != end && value_id(*start) && value_id(*end)
+        }
         ExpressionResolution::DirectCall {
             function: target,
             arguments,
@@ -8604,6 +8848,7 @@ fn valid_expression_region(
             | ExpressionResolution::Projection(_)
             | ExpressionResolution::Constructor { .. }
             | ExpressionResolution::ResultTry { .. }
+            | ExpressionResolution::ClosedRange { .. }
             | ExpressionResolution::DirectCall { .. }
             | ExpressionResolution::MethodCall { .. }
             | ExpressionResolution::ScopeCall { .. }
@@ -10570,6 +10815,7 @@ fn validate_fact_resources(
             | ExpressionResolution::Projection(_)
             | ExpressionResolution::Constructor { .. }
             | ExpressionResolution::ResultTry { .. }
+            | ExpressionResolution::ClosedRange { .. }
             | ExpressionResolution::ActorRequest { .. }
             | ExpressionResolution::Field { .. }
             | ExpressionResolution::Index { .. }

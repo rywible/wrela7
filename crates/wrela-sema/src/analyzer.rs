@@ -3191,6 +3191,28 @@ fn bounded_while_shape(
     Some(bound)
 }
 
+fn closed_literal_range_shape(
+    program: &wrela_hir::Program,
+    iterable: ExpressionId,
+) -> Option<(ExpressionId, ExpressionId, u64, u64)> {
+    let expression = program.expression(iterable)?;
+    let ExpressionKind::Range {
+        start,
+        end,
+        inclusive: false,
+    } = expression.kind
+    else {
+        return None;
+    };
+    let parse = |id| match &program.expression(id)?.kind {
+        ExpressionKind::Literal(Literal::Integer(spelling)) => {
+            u64::try_from(parse_integer_spelling(spelling)?).ok()
+        }
+        _ => None,
+    };
+    Some((start, end, parse(start)?, parse(end)?))
+}
+
 fn runtime_body_work_bound(program: &wrela_hir::Program, body: BodyId) -> Option<u64> {
     let body = program.body(body)?;
     body.statements.iter().try_fold(0u64, |total, id| {
@@ -3215,6 +3237,19 @@ fn runtime_body_work_bound(program: &wrela_hir::Program, body: BodyId) -> Option
                 bounded_while_shape(program, *condition, *body)?
                     .checked_mul(runtime_body_work_bound(program, *body)?.checked_add(1)?)?
                     .checked_add(1)?
+            }
+            StatementKind::For { iterable, body, .. } => {
+                let body_work = runtime_body_work_bound(program, *body)?.checked_add(1)?;
+                if let Some((_, _, start, end)) = closed_literal_range_shape(program, *iterable) {
+                    half_open_trip_count(start, end)
+                        .checked_mul(body_work)?
+                        .checked_add(1)?
+                } else {
+                    // Unsupported forms still need enough provisional shape
+                    // to reach their stable diagnostic. No successful fact
+                    // product can retain this fallback bound.
+                    body_work.checked_add(1)?
+                }
             }
             StatementKind::With { body, .. } => {
                 runtime_body_work_bound(program, *body)?.checked_add(1)?
@@ -3401,9 +3436,24 @@ fn inspect_runtime_body_shape(
                     )?;
                     bodies.push(*body);
                 }
+                StatementKind::For { iterable, body, .. } => {
+                    inspect_runtime_expression_shape(
+                        request,
+                        *iterable,
+                        color,
+                        callees,
+                        is_cancelled,
+                    )?;
+                    reserve_runtime_shape(
+                        &mut bodies,
+                        1,
+                        request.limits.fact_edges,
+                        "runtime body scratch",
+                    )?;
+                    bodies.push(*body);
+                }
                 StatementKind::Break | StatementKind::Continue => {}
                 StatementKind::Yield(_)
-                | StatementKind::For { .. }
                 | StatementKind::Loop { .. }
                 | StatementKind::ComptimeIf { .. }
                 | StatementKind::Error => {
@@ -3610,6 +3660,11 @@ fn inspect_runtime_expression_shape(
                 reserve_runtime_shape(&mut pending, 2, limit, "runtime expression scratch")?;
                 pending.push(*right);
                 pending.push(*left);
+            }
+            ExpressionKind::Range { start, end, .. } => {
+                reserve_runtime_shape(&mut pending, 2, limit, "runtime expression scratch")?;
+                pending.push(*end);
+                pending.push(*start);
             }
             ExpressionKind::Field { base, .. } => {
                 reserve_runtime_shape(&mut pending, 1, limit, "runtime expression scratch")?;
@@ -5418,6 +5473,31 @@ fn analyze_runtime_body(
                     is_cancelled,
                 )?;
             }
+            StatementKind::For {
+                take_binding,
+                binding,
+                take_iterable,
+                iterable,
+                body,
+            } => {
+                statement_effects = analyze_closed_range_for(
+                    request,
+                    partial,
+                    function,
+                    statement_id,
+                    *take_binding,
+                    *binding,
+                    *take_iterable,
+                    *iterable,
+                    *body,
+                    locals,
+                    parameters,
+                    allow_assertions,
+                    &mut *aggregate_work,
+                    &mut definitions,
+                    is_cancelled,
+                )?;
+            }
             StatementKind::While { condition, body } => {
                 let bound = bounded_while_shape(request.hir.as_program(), *condition, *body)
                     .ok_or_else(|| {
@@ -5615,6 +5695,249 @@ fn analyze_runtime_body(
         )?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_closed_range_for(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    statement: StatementId,
+    take_binding: bool,
+    binding: LocalId,
+    take_iterable: bool,
+    iterable: ExpressionId,
+    body: BodyId,
+    locals: &mut [Option<RuntimeBinding>],
+    parameters: &mut [Option<RuntimeBinding>],
+    allow_assertions: bool,
+    aggregate_work: &mut RuntimeAggregateWork,
+    definitions: &mut Vec<LocalDefinition>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<EffectSet> {
+    let program = request.hir.as_program();
+    let statement_record = program
+        .statement(statement)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let iterable_record = program
+        .expression(iterable)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let ExpressionKind::Range { inclusive, .. } = iterable_record.kind else {
+        return Err(runtime_type_diagnostic(
+            request,
+            iterable_record.source,
+            "semantic-for-iteration-target",
+            "for-loop target is not an admitted closed iterator",
+            "revision 0.1 has no user-defined iteration protocol; fixed arrays and standard-container iterators require their own authenticated producers",
+            "use a half-open literal integer range in this analysis slice",
+        ));
+    };
+    if take_binding || take_iterable {
+        return Err(runtime_type_diagnostic(
+            request,
+            statement_record.source,
+            "semantic-for-range-take-forbidden",
+            "integer range iteration cannot use take syntax",
+            "range elements are generated copyable integers rather than elements moved from owned storage",
+            "remove both take markers from the range loop",
+        ));
+    }
+    if inclusive {
+        return Err(runtime_type_diagnostic(
+            request,
+            iterable_record.source,
+            "semantic-for-inclusive-range-pending",
+            "inclusive range iteration is not yet admitted by this analysis slice",
+            "maximum-endpoint execution needs its distinct non-overflowing lowering contract",
+            "use a half-open literal range until inclusive range lowering lands",
+        ));
+    }
+    let Some((start_expression, end_expression, start_constant, end_constant)) =
+        closed_literal_range_shape(program, iterable)
+    else {
+        return Err(runtime_type_diagnostic(
+            request,
+            iterable_record.source,
+            "semantic-for-range-bound-not-constant",
+            "range bounds are not both nonnegative integer literals",
+            "this slice authenticates an exact finite trip count directly from the two HIR literal spellings",
+            "use two u64-representable integer literals or retain a canonical bounded while loop",
+        ));
+    };
+    let maximum_iterations = half_open_trip_count(start_constant, end_constant);
+    let element_ty = ensure_primitive_type(
+        request,
+        partial,
+        PrimitiveSemanticType::Integer {
+            signed: false,
+            bits: 64,
+            pointer_sized: false,
+        },
+        aggregate_work,
+        is_cancelled,
+    )?;
+    let mut state = RuntimeState {
+        locals: &mut *locals,
+        parameters: &mut *parameters,
+        aggregate_work: &mut *aggregate_work,
+        allow_assertions,
+        allow_scope_call: false,
+    };
+    let start = analyze_runtime_expression(
+        request,
+        partial,
+        function,
+        start_expression,
+        RuntimeExpressionRequest {
+            expected: Some(element_ty),
+            desired_result: None,
+            access: AccessMode::Value,
+        },
+        &mut state,
+        is_cancelled,
+    )?;
+    let end = analyze_runtime_expression(
+        request,
+        partial,
+        function,
+        end_expression,
+        RuntimeExpressionRequest {
+            expected: Some(element_ty),
+            desired_result: None,
+            access: AccessMode::Value,
+        },
+        &mut state,
+        is_cancelled,
+    )?;
+    let (Some(start_value), Some(end_value)) = (start.result, end.result) else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: iterable,
+            ty: element_ty,
+            result: None,
+            resolution: ExpressionResolution::ClosedRange {
+                start: start_value,
+                end: end_value,
+                inclusive: false,
+                maximum_iterations,
+            },
+            effects: EffectSet(start.effects.0 | end.effects.0),
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    let local_record = program
+        .locals
+        .get(binding.0 as usize)
+        .filter(|record| record.id == binding && record.body == body && record.ty.is_none())
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let binding_value = append_semantic_value(
+        request,
+        partial,
+        function,
+        element_ty,
+        (
+            SemanticValueOrigin::Local(binding),
+            Some(local_record.source),
+            Some(local_record.name.as_str()),
+        ),
+        is_cancelled,
+    )?;
+    definitions
+        .try_reserve_exact(1)
+        .map_err(|_| fact_resource(request, "for-loop binding definitions"))?;
+    definitions.push(LocalDefinition {
+        local: binding,
+        value: binding_value,
+    });
+    let mut body_locals = copy_binding_map(locals, request.limits.values)?;
+    let slot = body_locals
+        .get_mut(binding.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if slot
+        .replace(RuntimeBinding {
+            value: binding_value,
+            state: OwnershipState::Owned,
+            authority: RuntimeAuthority::Own,
+            origin: RuntimeBindingOrigin::Local(binding),
+            source: local_record.source,
+        })
+        .is_some()
+    {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    let mut body_parameters = copy_binding_map(parameters, request.limits.values)?;
+    let nested_fact_start = partial.statements.len();
+    analyze_runtime_body(
+        request,
+        partial,
+        function,
+        body,
+        &mut body_locals,
+        &mut body_parameters,
+        allow_assertions,
+        aggregate_work,
+        is_cancelled,
+    )?;
+    for (index, (before, after)) in locals.iter().zip(&body_locals).enumerate() {
+        check_cancelled(is_cancelled)?;
+        let local_is_nested = program
+            .locals
+            .get(index)
+            .is_some_and(|local| body_is_ancestor(program, body, local.body));
+        if !local_is_nested && before != after {
+            return Err(runtime_type_diagnostic(
+                request,
+                statement_record.source,
+                "semantic-for-loop-carried-state-pending",
+                "range loop mutates state declared outside its body",
+                "this analysis slice proves the loop binding and finite trip count but does not yet construct aggregate loop-carried SSA joins",
+                "keep mutations local to the loop body or use the canonical bounded while form",
+            ));
+        }
+    }
+    if body_parameters != parameters {
+        return Err(runtime_type_diagnostic(
+            request,
+            statement_record.source,
+            "semantic-for-loop-carried-state-pending",
+            "range loop changes parameter ownership state",
+            "repeated parameter ownership transitions need a separately authenticated loop-carried state",
+            "avoid moving or mutating parameters inside this range loop",
+        ));
+    }
+    let binding_after = body_locals
+        .get(binding.0 as usize)
+        .copied()
+        .flatten()
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if binding_after.value != binding_value
+        || binding_after.state != OwnershipState::Owned
+        || binding_after.authority != RuntimeAuthority::Own
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            statement_record.source,
+            "semantic-for-binding-mutated",
+            "range loop binding is reassigned or consumed by its body",
+            "the canonical binding is regenerated for every proved iteration and remains immutable in this slice",
+            "read the binding without assigning, moving, or taking it",
+        ));
+    }
+    let mut effects = EffectSet(start.effects.0 | end.effects.0);
+    for nested in partial
+        .statements
+        .get(nested_fact_start..)
+        .ok_or(AnalysisFailure::RequestMismatch)?
+    {
+        effects.0 |= nested.effects.0;
+    }
+    Ok(effects)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -30542,6 +30865,256 @@ fn projection_fixture():
         format!(
             "module app\n\nfrom core.image import Image, Target\n\n{DOT_VARIANT_LOOKUP_ENUM}\n{app_body}\n@service\npub struct Worker:\n    pub async fn ping(mut self):\n        await checkpoint()\n\n@image\npub fn boot() -> Image:\n    img = Image(name=\"actor-image\", target=Target.aarch64_qemu_virt_uefi)\n    installed = img.service(Worker, mailbox=2)\n    return img\n"
         )
+    }
+
+    #[test]
+    fn closed_literal_range_for_loop_analyzes_with_exact_u64_binding() {
+        let source = dot_variant_actor_source(
+            "async fn checkpoint():\n    for index in 0 .. 4:\n        observed: u64 = index\n        pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("closed literal range analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "the canonical finite range must analyze cleanly: {:?}",
+            output.diagnostics()
+        );
+        let facts = output.successful().expect("sealed literal range image");
+        let binding = facts
+            .facts()
+            .values
+            .iter()
+            .find(|value| value.source_name.as_deref() == Some("index"))
+            .expect("range binding value");
+        assert!(matches!(
+            facts.facts().types[binding.ty.0 as usize].kind,
+            SemanticTypeKind::Integer {
+                signed: false,
+                bits: 64,
+                pointer_sized: false,
+            }
+        ));
+        let range = facts
+            .facts()
+            .expressions
+            .iter()
+            .find(|fact| matches!(fact.resolution, ExpressionResolution::ClosedRange { .. }))
+            .expect("closed range fact");
+        assert!(matches!(
+            range.resolution,
+            ExpressionResolution::ClosedRange {
+                inclusive: false,
+                maximum_iterations: 4,
+                ..
+            }
+        ));
+
+        let mut forged_trip_count = facts.facts().clone();
+        let forged_range = forged_trip_count
+            .expressions
+            .iter_mut()
+            .find(|fact| matches!(fact.resolution, ExpressionResolution::ClosedRange { .. }))
+            .expect("mutable closed range fact");
+        let ExpressionResolution::ClosedRange {
+            maximum_iterations, ..
+        } = &mut forged_range.resolution
+        else {
+            unreachable!();
+        };
+        *maximum_iterations = 3;
+        assert!(
+            forged_trip_count
+                .validate_for_seal(facts.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut forged_endpoint = facts.facts().clone();
+        let forged_range = forged_endpoint
+            .expressions
+            .iter_mut()
+            .find(|fact| matches!(fact.resolution, ExpressionResolution::ClosedRange { .. }))
+            .expect("mutable closed range fact");
+        let ExpressionResolution::ClosedRange { start, end, .. } = &mut forged_range.resolution
+        else {
+            unreachable!();
+        };
+        *end = *start;
+        assert!(
+            forged_endpoint
+                .validate_for_seal(facts.hir(), &|| false)
+                .is_err()
+        );
+
+        let for_statement = facts
+            .facts()
+            .statements
+            .iter()
+            .find(|fact| {
+                facts
+                    .hir()
+                    .as_program()
+                    .statement(fact.statement)
+                    .is_some_and(|statement| matches!(statement.kind, StatementKind::For { .. }))
+            })
+            .expect("for statement fact");
+        let endpoint = match range.resolution {
+            ExpressionResolution::ClosedRange { start, .. } => start,
+            _ => unreachable!(),
+        };
+        let mut forged_binding = facts.facts().clone();
+        forged_binding
+            .statements
+            .iter_mut()
+            .find(|fact| fact.statement == for_statement.statement)
+            .expect("mutable for statement")
+            .definitions[0]
+            .value = endpoint;
+        assert!(
+            forged_binding
+                .validate_for_seal(facts.hir(), &|| false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn closed_literal_range_zero_trip_and_exact_fact_limit_are_admitted() {
+        let source = dot_variant_actor_source(
+            "async fn checkpoint():\n    for index in 4 .. 0:\n        observed: u64 = index\n        pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let baseline = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("zero-trip range analysis");
+        assert!(baseline.diagnostics().is_empty());
+        let image = baseline.successful().expect("sealed zero-trip range image");
+        assert!(image.facts().expressions.iter().any(|fact| matches!(
+            fact.resolution,
+            ExpressionResolution::ClosedRange {
+                maximum_iterations: 0,
+                ..
+            }
+        )));
+        let exact_count =
+            u32::try_from(image.facts().expressions.len()).expect("bounded expression fact count");
+        let mut exact_limits = AnalysisLimits::standard();
+        exact_limits.expression_facts = exact_count;
+        assert!(
+            CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, exact_limits),
+                    &|| false
+                )
+                .expect("exact range fact limit")
+                .successful()
+                .is_some()
+        );
+        let mut below_limits = AnalysisLimits::standard();
+        below_limits.expression_facts = exact_count - 1;
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, below_limits),
+                &|| false,
+            ),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "expression facts",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn closed_range_for_tails_fail_closed_by_name() {
+        for (body, code) in [
+            (
+                "    for index in 0 ..= 4:\n        pass\n",
+                "semantic-for-inclusive-range-pending",
+            ),
+            (
+                "    limit: u64 = 4\n    for index in 0 .. limit:\n        pass\n",
+                "semantic-for-range-bound-not-constant",
+            ),
+            (
+                "    for take index in take 0 .. 4:\n        pass\n",
+                "semantic-for-range-take-forbidden",
+            ),
+            (
+                "    for index in 4:\n        pass\n",
+                "semantic-for-iteration-target",
+            ),
+            (
+                "    total: u64 = 0\n    for index in 0 .. 4:\n        total = index\n",
+                "semantic-for-loop-carried-state-pending",
+            ),
+            (
+                "    for index in 0 .. 4:\n        index = 2\n",
+                "semantic-for-binding-mutated",
+            ),
+        ] {
+            let source = dot_variant_actor_source(&format!("async fn checkpoint():\n{body}\n"));
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("range tail is a diagnostic");
+            assert_eq!(
+                output
+                    .diagnostics()
+                    .first()
+                    .and_then(|diagnostic| diagnostic.code.as_deref()),
+                Some(code),
+                "{body}: {:?}",
+                output.diagnostics()
+            );
+            assert!(output.successful().is_none());
+        }
+    }
+
+    #[test]
+    fn closed_literal_range_analysis_honors_late_cancellation() {
+        let source = dot_variant_actor_source(
+            "async fn checkpoint():\n    for index in 0 .. 4:\n        observed: u64 = index\n        pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let polls = Cell::new(0u32);
+        let baseline = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("counted range analysis");
+        assert!(baseline.successful().is_some());
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
     }
 
     #[test]

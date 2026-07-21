@@ -121,9 +121,10 @@ These are dispatched or landable immediately; none needs Tier 0.
 | B5b | Unified wait-for graph + `wait-cycle`/self-wait diagnostics | **running** |
 | B2a | Promotion/region report schema (`PromotionFact`/`RegionAssignmentFact`) | **landed + hardened** |
 | B4a | `with`/scope sema analysis: cleanup DAG + `CleanupAcyclic` + cycle diagnostic | **landed**; parameterless/pass-only actor-turn scopes also reach an authenticated real normal-exit Flow cleanup call |
+| A2a | `for` closed-iteration analysis | **literal-range analysis landed** — non-taking half-open ranges over two `u64`-representable literals carry exact endpoint/binding/trip-count facts; inclusive/dynamic/taking ranges, arrays/containers, outer loop-carried state, and all lowering remain named fail-closed |
 
 Lane A front-ends that are likely Tier 1 (need a surface-verification pass before
-dispatch, same as the B tasks got): A2 `for`/closed-iteration *rejection* set,
+dispatch, same as the B tasks got): A2 `for` lowering and remaining closed iterators,
 A7 string/format *diagnostics*, A3 match-completeness *analysis*. Each: verify
 whether its positive case introduces a new runtime value shape (→ needs Tier 0)
 or is pure analysis (→ Tier 1, land now).

@@ -320,6 +320,16 @@ impl CanonicalSemanticLinter {
                         )?;
                     }
                 }
+                ExpressionResolution::ClosedRange { start, end, .. } => {
+                    for value in [start, end] {
+                        mark_value(
+                            &mut value_state,
+                            *value,
+                            VALUE_STATE_USED,
+                            &self.unused_local,
+                        )?;
+                    }
+                }
                 ExpressionResolution::Error
                 | ExpressionResolution::Constant(_)
                 | ExpressionResolution::Function(_)
