@@ -3997,6 +3997,10 @@ struct RuntimeAggregateWork {
     // the `comparisons` budget to eventually stop. Threaded through the existing
     // aggregate-work context so call sites are unchanged.
     resolving_enums: Vec<DeclarationId>,
+    // Exact source-function specializations on the active population path.
+    // This is checked before completed-instance lookup so direct and mutual
+    // recursion cannot observe a half-populated semantic instance.
+    resolving_functions: Vec<(DeclarationId, Vec<SemanticArgument>)>,
 }
 
 fn charge_runtime_aggregate_lookup(
@@ -7632,6 +7636,7 @@ fn analyze_operator_interface_binary(
         request,
         partial,
         resolution.function,
+        &[],
         state.allow_assertions,
         &mut *state.aggregate_work,
         is_cancelled,
@@ -9247,6 +9252,310 @@ fn analyze_projection_direct_call(
     })
 }
 
+fn generic_function_signature_position(
+    request: &AnalysisRequest<'_>,
+    _declaration: DeclarationId,
+    generics: &[wrela_hir::GenericParameterId],
+    source: &TypeExpression,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<Option<usize>> {
+    match &source.kind {
+        TypeExpressionKind::Named {
+            definition: Definition::Builtin(_),
+            arguments,
+        } if arguments.is_empty() => Ok(None),
+        TypeExpressionKind::Named {
+            definition: Definition::Generic(generic),
+            arguments,
+        } if arguments.is_empty() => {
+            for (index, candidate) in generics.iter().enumerate() {
+                charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+                if candidate == generic {
+                    return Ok(Some(index));
+                }
+            }
+            Err(runtime_type_diagnostic(
+                request,
+                source.source,
+                "semantic-generic-function-signature-pending",
+                "generic function signature refers to a type parameter owned elsewhere",
+                "closed-world specialization substitutes only this function's ordered parameters",
+                "use one of the function's own unbounded type parameters",
+            ))
+        }
+        _ => Err(runtime_type_diagnostic(
+            request,
+            source.source,
+            "semantic-generic-function-signature-pending",
+            "generic function signature is outside the copy-scalar specialization subset",
+            "nested nominal, generic, view, tuple, array, and function types require later monomorphization support",
+            "use primitive stored copy scalars or bare unbounded type parameters",
+        )),
+    }
+}
+
+fn known_call_argument_type(
+    request: &AnalysisRequest<'_>,
+    partial: &PartialAnalysis,
+    argument: &wrela_hir::CallArgument,
+    state: &RuntimeState<'_>,
+) -> Option<SemanticTypeId> {
+    let binding = match &argument.value {
+        wrela_hir::CallArgumentValue::Value(expression) => {
+            match request.hir.as_program().expression(*expression)?.kind {
+                ExpressionKind::Reference(Definition::Local(local)) => {
+                    state.locals.get(local.0 as usize)?.as_ref()?
+                }
+                ExpressionKind::Reference(Definition::Parameter(parameter)) => {
+                    state.parameters.get(parameter.0 as usize)?.as_ref()?
+                }
+                _ => return None,
+            }
+        }
+        wrela_hir::CallArgumentValue::Exclusive { place, .. } => match place.root {
+            Definition::Local(local) => state.locals.get(local.0 as usize)?.as_ref()?,
+            Definition::Parameter(parameter) => {
+                state.parameters.get(parameter.0 as usize)?.as_ref()?
+            }
+            _ => return None,
+        },
+    };
+    partial
+        .values
+        .get(binding.value.0 as usize)
+        .map(|value| value.ty)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_generic_function_arguments(
+    request: &AnalysisRequest<'_>,
+    partial: &PartialAnalysis,
+    call: RuntimeDirectCall<'_>,
+    declaration: DeclarationId,
+    source: &wrela_hir::FunctionDeclaration,
+    expected: Option<SemanticTypeId>,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<Vec<SemanticArgument>> {
+    const MAX_KEYED_ARGUMENTS: usize = 26;
+    let declaration_record = request
+        .hir
+        .as_program()
+        .declaration(declaration)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if source.color != FunctionColor::Sync
+        || !matches!(
+            declaration_record.owner,
+            wrela_hir::DeclarationOwner::Module(_)
+        )
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            declaration_record.source,
+            "semantic-generic-function-signature-pending",
+            "generic runtime specialization currently requires a module-level synchronous function",
+            "methods, receivers, async functions, and nested declarations require later specialization and lowering contracts",
+            "use a module-level `fn` with copy-scalar parameters and result",
+        ));
+    }
+    if source.generics.len() > MAX_KEYED_ARGUMENTS {
+        return Err(runtime_type_diagnostic(
+            request,
+            declaration_record.source,
+            "semantic-generic-function-parameter-count",
+            "generic function declares more type parameters than the bounded specialization key supports",
+            "this analysis slice authenticates at most 26 ordered primitive type arguments",
+            "split the function into smaller generic helpers",
+        ));
+    }
+    for generic_id in &source.generics {
+        check_cancelled(is_cancelled)?;
+        let generic = request
+            .hir
+            .as_program()
+            .generic_parameter(*generic_id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if generic.owner != declaration
+            || !matches!(
+                generic.kind,
+                wrela_hir::GenericParameterKind::Type { bound: None }
+            )
+        {
+            return Err(runtime_type_diagnostic(
+                request,
+                generic.source,
+                "semantic-generic-function-parameter-kind",
+                "generic runtime function parameter is outside the unbounded type-only subset",
+                "constant, region, and bounded type parameters require later inference and specialization contracts",
+                "use an unbounded type parameter specialized by a primitive stored copy scalar",
+            ));
+        }
+    }
+    if call.arguments.len() != source.parameters.len() {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-generic-function-argument-count",
+            "generic function call has the wrong number of value arguments",
+            "inference requires one exact call argument for every declared parameter",
+            "supply every declared function argument exactly once",
+        ));
+    }
+
+    let mut inferred = Vec::new();
+    inferred
+        .try_reserve_exact(source.generics.len())
+        .map_err(|_| fact_resource(request, "generic function inference"))?;
+    inferred.resize(source.generics.len(), None);
+    let constrain = |inferred: &mut [Option<SemanticTypeId>],
+                     position: usize,
+                     ty: SemanticTypeId,
+                     source_span: Span|
+     -> RuntimeResult<()> {
+        let record = partial
+            .types
+            .get(ty.0 as usize)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if !is_stored_copy_scalar_type(record) {
+            return Err(runtime_type_diagnostic(
+                request,
+                source_span,
+                "semantic-generic-function-argument-type",
+                "generic function inference produced a non-scalar type argument",
+                "this specialization slice admits only bool, integer, and f32/f64 stored copy scalars",
+                "pass a supported copy-scalar value",
+            ));
+        }
+        let slot = inferred
+            .get_mut(position)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if slot.is_some_and(|existing| existing != ty) {
+            return Err(runtime_type_diagnostic(
+                request,
+                source_span,
+                "semantic-generic-function-inference-conflict",
+                "generic function constraints infer different types for one parameter",
+                "expected result and typed arguments must agree on each ordered type argument",
+                "make every use of this type parameter the same primitive copy-scalar type",
+            ));
+        }
+        *slot = Some(ty);
+        Ok(())
+    };
+
+    if let (Some(result), Some(expected)) = (&source.result, expected) {
+        if let Some(position) = generic_function_signature_position(
+            request,
+            declaration,
+            &source.generics,
+            result,
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )? {
+            constrain(&mut inferred, position, expected, result.source)?;
+        }
+    } else if let Some(result) = &source.result {
+        generic_function_signature_position(
+            request,
+            declaration,
+            &source.generics,
+            result,
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )?;
+    }
+
+    let mut inference_parameters = Vec::new();
+    inference_parameters
+        .try_reserve_exact(source.parameters.len())
+        .map_err(|_| fact_resource(request, "generic function inference parameters"))?;
+    let mut non_receiver_count = 0usize;
+    for parameter_id in &source.parameters {
+        check_cancelled(is_cancelled)?;
+        let parameter = request
+            .hir
+            .as_program()
+            .parameter(*parameter_id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if parameter.receiver {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        }
+        non_receiver_count = non_receiver_count
+            .checked_add(1)
+            .ok_or_else(|| fact_resource(request, "generic function inference parameters"))?;
+        inference_parameters.push(FunctionParameter {
+            parameter: *parameter_id,
+            value: ValueId(0),
+            access: lower_access(parameter.access),
+            ty: SemanticTypeId(0),
+        });
+    }
+    let mut resolved = optional_call_map(call.arguments.len(), request.limits.fact_edges)?;
+    for (source_index, argument) in call.arguments.iter().enumerate() {
+        let parameter_index = resolve_declaration_owned_argument(
+            request,
+            &inference_parameters,
+            argument,
+            &resolved,
+            non_receiver_count,
+            is_cancelled,
+        )?;
+        let parameter = request
+            .hir
+            .as_program()
+            .parameter(source.parameters[parameter_index])
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let parameter_ty = parameter
+            .ty
+            .as_ref()
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if let Some(position) = generic_function_signature_position(
+            request,
+            declaration,
+            &source.generics,
+            parameter_ty,
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )? && let Some(ty) = known_call_argument_type(request, partial, argument, state)
+        {
+            constrain(&mut inferred, position, ty, argument.source)?;
+        }
+        resolved[parameter_index] = Some(ResolvedCallArgument {
+            source_index: u32::try_from(source_index)
+                .map_err(|_| fact_resource(request, "generic function inference arguments"))?,
+            parameter_index: u32::try_from(parameter_index)
+                .map_err(|_| fact_resource(request, "generic function inference arguments"))?,
+            access: AccessMode::Value,
+            value: ValueId(0),
+        });
+    }
+
+    let mut arguments = Vec::new();
+    arguments
+        .try_reserve_exact(inferred.len())
+        .map_err(|_| fact_resource(request, "generic function arguments"))?;
+    for (position, inferred) in inferred.into_iter().enumerate() {
+        let Some(ty) = inferred else {
+            let source_span = source
+                .generics
+                .get(position)
+                .and_then(|generic| request.hir.as_program().generic_parameter(*generic))
+                .map_or(declaration_record.source, |generic| generic.source);
+            return Err(runtime_type_diagnostic(
+                request,
+                source_span,
+                "semantic-generic-function-inference-required",
+                "generic function type argument is unconstrained at this call",
+                "every type parameter must be fixed by an expected result or a typed named argument",
+                "add an explicit result context or pass a previously typed local or parameter",
+            ));
+        };
+        arguments.push(SemanticArgument::Type(ty));
+    }
+    Ok(arguments)
+}
+
 fn analyze_direct_call(
     request: &AnalysisRequest<'_>,
     partial: &mut PartialAnalysis,
@@ -9362,16 +9671,44 @@ fn analyze_direct_call(
             "remove the initializer-based construction call until initializer execution is implemented",
         ));
     }
+    let generic_arguments = match request
+        .hir
+        .as_program()
+        .declaration(resolved.declaration)
+        .map(|record| &record.kind)
+    {
+        Some(DeclarationKind::Function(source)) if !source.generics.is_empty() => {
+            infer_generic_function_arguments(
+                request,
+                partial,
+                call,
+                resolved.declaration,
+                source,
+                expression_request.expected,
+                state,
+                is_cancelled,
+            )?
+        }
+        _ => Vec::new(),
+    };
     let target = ensure_ordinary_source_function(
         request,
         partial,
         resolved.declaration,
+        &generic_arguments,
         state.allow_assertions,
         &mut *state.aggregate_work,
         is_cancelled,
     )?;
     if target == function {
-        return Err(AnalysisFailure::RequestMismatch.into());
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-runtime-recursive-call-pending",
+            "recursive runtime call is outside the bounded specialization subset",
+            "a source function may not re-enter an in-progress monomorphization",
+            "rewrite the recursion as a statically bounded loop or an iterative helper",
+        ));
     }
     let target_record = partial
         .functions
@@ -10912,10 +11249,133 @@ fn ensure_scope_protocol(
     Ok(id)
 }
 
+fn semantic_generic_function_signature_type(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    generics: &[wrela_hir::GenericParameterId],
+    arguments: &[SemanticArgument],
+    source: &TypeExpression,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
+    match &source.kind {
+        TypeExpressionKind::Named {
+            definition: Definition::Generic(generic),
+            arguments: source_arguments,
+        } if source_arguments.is_empty() => {
+            for (index, candidate) in generics.iter().enumerate() {
+                charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+                if candidate == generic {
+                    return match arguments.get(index) {
+                        Some(SemanticArgument::Type(ty)) => Ok(*ty),
+                        _ => Err(AnalysisFailure::RequestMismatch.into()),
+                    };
+                }
+            }
+            Err(runtime_type_diagnostic(
+                request,
+                source.source,
+                "semantic-generic-function-signature-pending",
+                "generic function signature refers to a type parameter owned elsewhere",
+                "closed-world specialization substitutes only this function's ordered parameters",
+                "use one of the function's own unbounded type parameters",
+            ))
+        }
+        TypeExpressionKind::Named {
+            definition: Definition::Builtin(_),
+            arguments: source_arguments,
+        } if source_arguments.is_empty() => {
+            semantic_type_from_source(request, partial, source, aggregate_work, is_cancelled)
+        }
+        _ => Err(runtime_type_diagnostic(
+            request,
+            source.source,
+            "semantic-generic-function-signature-pending",
+            "generic function signature is outside the copy-scalar specialization subset",
+            "nested nominal, generic, view, tuple, array, and function types require later monomorphization support",
+            "use primitive stored copy scalars or bare unbounded type parameters",
+        )),
+    }
+}
+
 fn ensure_ordinary_source_function(
     request: &AnalysisRequest<'_>,
     partial: &mut PartialAnalysis,
     declaration: DeclarationId,
+    generic_arguments: &[SemanticArgument],
+    allow_assertions: bool,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<FunctionInstanceId> {
+    // Nongeneric async recursion is intentionally admitted far enough for the
+    // wait-graph analysis to diagnose exact suspension cycles. Only generic
+    // specialization needs this half-populated-instance guard.
+    if generic_arguments.is_empty() {
+        return ensure_ordinary_source_function_inner(
+            request,
+            partial,
+            declaration,
+            generic_arguments,
+            allow_assertions,
+            aggregate_work,
+            is_cancelled,
+        );
+    }
+    for (active_declaration, active_arguments) in &aggregate_work.resolving_functions {
+        check_cancelled(is_cancelled)?;
+        if *active_declaration == declaration && active_arguments.as_slice() == generic_arguments {
+            let source = request
+                .hir
+                .as_program()
+                .declaration(declaration)
+                .map_or(fallback_span(request.hir.as_program()), |record| {
+                    record.source
+                });
+            return Err(runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-runtime-recursive-call-pending",
+                "recursive runtime specialization is outside the bounded call subset",
+                "direct and mutual re-entry cannot consume a half-populated monomorphized function",
+                "rewrite the recursion as a statically bounded loop or an iterative helper",
+            ));
+        }
+    }
+    let mut active_arguments = Vec::new();
+    active_arguments
+        .try_reserve_exact(generic_arguments.len())
+        .map_err(|_| fact_resource(request, "active function specializations"))?;
+    active_arguments.extend_from_slice(generic_arguments);
+    aggregate_work
+        .resolving_functions
+        .try_reserve(1)
+        .map_err(|_| fact_resource(request, "active function specializations"))?;
+    aggregate_work
+        .resolving_functions
+        .push((declaration, active_arguments));
+    let result = ensure_ordinary_source_function_inner(
+        request,
+        partial,
+        declaration,
+        generic_arguments,
+        allow_assertions,
+        aggregate_work,
+        is_cancelled,
+    );
+    let popped = aggregate_work.resolving_functions.pop();
+    if popped.as_ref().is_none_or(|(candidate, arguments)| {
+        *candidate != declaration || arguments.as_slice() != generic_arguments
+    }) {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    result
+}
+
+fn ensure_ordinary_source_function_inner(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    declaration: DeclarationId,
+    generic_arguments: &[SemanticArgument],
     allow_assertions: bool,
     aggregate_work: &mut RuntimeAggregateWork,
     is_cancelled: &dyn Fn() -> bool,
@@ -10928,6 +11388,7 @@ fn ensure_ordinary_source_function(
                 declaration: candidate,
                 ..
             } if candidate == declaration
+                && existing.generic_arguments.as_slice() == generic_arguments
         ) {
             return Ok(existing.id);
         }
@@ -10947,9 +11408,50 @@ fn ensure_ordinary_source_function(
     if !matches!(
         source_function.color,
         FunctionColor::Sync | FunctionColor::Async
-    ) || !source_function.generics.is_empty()
-    {
-        return Err(AnalysisFailure::RequestMismatch.into());
+    ) {
+        return Err(runtime_type_diagnostic(
+            request,
+            declaration_record.source,
+            "semantic-runtime-function-color-not-supported",
+            "source function color is outside the runtime direct-call subset",
+            "runtime specialization admits synchronous and asynchronous source functions only",
+            "use `fn` or `async fn`",
+        ));
+    }
+    if source_function.generics.len() != generic_arguments.len() {
+        return Err(runtime_type_diagnostic(
+            request,
+            declaration_record.source,
+            "semantic-generic-function-argument-count",
+            "generic function specialization has the wrong number of type arguments",
+            "every declared type parameter must have one inferred semantic argument",
+            "call the function in a context that constrains every type parameter",
+        ));
+    }
+    for (generic_id, argument) in source_function.generics.iter().zip(generic_arguments) {
+        check_cancelled(is_cancelled)?;
+        let generic = request
+            .hir
+            .as_program()
+            .generic_parameter(*generic_id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if generic.owner != declaration
+            || !matches!(
+                generic.kind,
+                wrela_hir::GenericParameterKind::Type { bound: None }
+            )
+            || !matches!(argument, SemanticArgument::Type(ty)
+                if partial.types.get(ty.0 as usize).is_some_and(is_stored_copy_scalar_type))
+        {
+            return Err(runtime_type_diagnostic(
+                request,
+                generic.source,
+                "semantic-generic-function-parameter-kind",
+                "generic function specialization is outside the unbounded copy-scalar type subset",
+                "constant, region, bounded, and non-scalar arguments require later monomorphization semantics",
+                "use unbounded type parameters inferred as primitive stored copy scalars",
+            ));
+        }
     }
     let mut body_statements = Vec::new();
     let mut body_callees = Vec::new();
@@ -11048,9 +11550,18 @@ fn ensure_ordinary_source_function(
         }
     }
     let result = match source_function.result.as_ref() {
-        Some(result) => {
+        Some(result) if source_function.generics.is_empty() => {
             semantic_type_from_source(request, partial, result, &mut *aggregate_work, is_cancelled)?
         }
+        Some(result) => semantic_generic_function_signature_type(
+            request,
+            partial,
+            &source_function.generics,
+            generic_arguments,
+            result,
+            &mut *aggregate_work,
+            is_cancelled,
+        )?,
         None => SemanticTypeId(0),
     };
     let proof_count = if source_function.color == FunctionColor::Async {
@@ -11204,10 +11715,23 @@ fn ensure_ordinary_source_function(
                 &mut *aggregate_work,
                 is_cancelled,
             )?
-        } else {
+        } else if source_function.generics.is_empty() {
             semantic_type_from_source(
                 request,
                 partial,
+                parameter
+                    .ty
+                    .as_ref()
+                    .ok_or(AnalysisFailure::RequestMismatch)?,
+                &mut *aggregate_work,
+                is_cancelled,
+            )?
+        } else {
+            semantic_generic_function_signature_type(
+                request,
+                partial,
+                &source_function.generics,
+                generic_arguments,
                 parameter
                     .ty
                     .as_ref()
@@ -11249,14 +11773,39 @@ fn ensure_ordinary_source_function(
     let work_bound = runtime_body_work_bound(request.hir.as_program(), body)
         .and_then(|count| count.checked_add(1))
         .ok_or_else(|| fact_resource(request, "ordinary source work bound"))?;
+    let key = if generic_arguments.is_empty() {
+        source_test_key(request, declaration)
+    } else {
+        source_function_specialization_key(
+            request.build.identity.request,
+            declaration,
+            generic_arguments,
+            partial,
+        )
+        .ok_or_else(|| {
+            runtime_type_diagnostic(
+                request,
+                declaration_record.source,
+                "semantic-generic-function-specialization-key",
+                "generic function specialization cannot be represented by the bounded canonical key",
+                "the key admits at most 26 ordered primitive stored copy-scalar arguments",
+                "reduce the number of generic parameters or use supported primitive arguments",
+            )
+        })?
+    };
+    let mut stored_generic_arguments = Vec::new();
+    stored_generic_arguments
+        .try_reserve_exact(generic_arguments.len())
+        .map_err(|_| fact_resource(request, "generic function arguments"))?;
+    stored_generic_arguments.extend_from_slice(generic_arguments);
     partial.functions.push(FunctionInstance {
         id: function_id,
-        key: source_test_key(request, declaration),
+        key,
         name,
         origin: FunctionOrigin::Source { declaration, body },
         role: FunctionRole::Ordinary,
         color: source_function.color,
-        generic_arguments: Vec::new(),
+        generic_arguments: stored_generic_arguments,
         parameters: semantic_parameters,
         result,
         effects: EffectSet(if source_function.color == FunctionColor::Async {
@@ -27644,6 +28193,209 @@ fn projection_fixture():
         assert_eq!(
             output.diagnostics()[0].code.as_deref(),
             Some("semantic-runtime-generic-structure-inference-required")
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn generic_copy_scalar_function_specializes_expected_types() {
+        let source = dot_variant_actor_source(
+            "pub fn identity[T](value: T) -> T:\n    return value\n\nasync fn checkpoint():\n    small: u8 = identity(1)\n    wide: u64 = identity(2)\n    small_again: u8 = identity(3)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("generic copy-scalar function specialization should analyze");
+        assert!(
+            output.diagnostics().is_empty(),
+            "generic identity specializations must analyze: {:?}",
+            output.diagnostics()
+        );
+        let successful = output.successful().expect("sealed generic functions");
+        let facts = successful.facts();
+        let identity = fixture
+            .fixture
+            .hir
+            .as_program()
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name.as_ref().map(Name::as_str) == Some("identity"))
+            .expect("identity declaration")
+            .id;
+        let instances: Vec<_> = facts
+            .functions
+            .iter()
+            .filter(|function| {
+                matches!(function.origin, FunctionOrigin::Source { declaration, .. }
+                    if declaration == identity)
+            })
+            .collect();
+        assert_eq!(
+            instances.len(),
+            2,
+            "repeat u8 specialization must deduplicate"
+        );
+        assert_ne!(instances[0].key, instances[1].key);
+        for instance in instances {
+            let [SemanticArgument::Type(argument)] = instance.generic_arguments.as_slice() else {
+                panic!("identity specialization must carry one type argument")
+            };
+            assert_eq!(instance.parameters.len(), 1);
+            assert_eq!(instance.parameters[0].ty, *argument);
+            assert_eq!(instance.result, *argument);
+            assert!(matches!(
+                facts.types[argument.0 as usize].kind,
+                SemanticTypeKind::Integer {
+                    signed: false,
+                    bits: 8 | 64,
+                    pointer_sized: false,
+                }
+            ));
+        }
+
+        let mut forged = facts.clone();
+        let instance = forged
+            .functions
+            .iter_mut()
+            .find(|instance| {
+                matches!(instance.origin, FunctionOrigin::Source { declaration, .. }
+                    if declaration == identity)
+                    && matches!(instance.generic_arguments.as_slice(), [SemanticArgument::Type(ty)]
+                        if matches!(forged.types[ty.0 as usize].kind,
+                            SemanticTypeKind::Integer { bits: 8, .. }))
+            })
+            .expect("u8 identity specialization");
+        let u64_ty = facts
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(
+                    ty.kind,
+                    SemanticTypeKind::Integer {
+                        signed: false,
+                        bits: 64,
+                        pointer_sized: false,
+                    }
+                )
+            })
+            .expect("u64 semantic type")
+            .id;
+        instance.generic_arguments[0] = SemanticArgument::Type(u64_ty);
+        forged
+            .validate_partial_structure()
+            .expect("generic-argument forgery remains prefix-safe");
+        assert!(
+            forged
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn generic_function_infers_from_a_typed_argument_without_result_context() {
+        let source = dot_variant_actor_source(
+            "pub fn identity[T](value: T) -> T:\n    return value\n\nasync fn checkpoint():\n    source: u16 = 1\n    identity(source)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("typed argument should constrain generic function inference");
+        assert!(
+            output.diagnostics().is_empty(),
+            "{:?}",
+            output.diagnostics()
+        );
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn generic_function_inference_conflict_is_named() {
+        let source = dot_variant_actor_source(
+            "pub fn choose[T](left: T, right: T) -> T:\n    return left\n\nasync fn checkpoint():\n    small: u8 = 1\n    wide: u64 = 2\n    out: u8 = choose(left=small, right=wide)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("conflicting generic constraints should be a source diagnostic");
+        assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-generic-function-inference-conflict")
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn generic_function_unconstrained_argument_is_named() {
+        let source = dot_variant_actor_source(
+            "pub fn marker[T](value: u8) -> u8:\n    return value\n\nasync fn checkpoint():\n    out: u8 = marker(1)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("unconstrained generic inference should be a source diagnostic");
+        assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-generic-function-inference-required")
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn generic_function_parameter_kinds_fail_closed_by_name() {
+        let source = dot_variant_actor_source(
+            "pub fn fixed[const N: u8](value: u8) -> u8:\n    return value\n\nasync fn checkpoint():\n    out: u8 = fixed(1)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("constant generic function should be a source diagnostic");
+        assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-generic-function-parameter-kind")
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn generic_function_recursion_fails_closed_by_name() {
+        let source = dot_variant_actor_source(
+            "pub fn recurse[T](value: T) -> T:\n    return recurse(value)\n\nasync fn checkpoint():\n    out: u8 = recurse(1)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("generic recursion should be a source diagnostic");
+        assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-runtime-recursive-call-pending")
         );
         assert!(output.has_errors());
     }

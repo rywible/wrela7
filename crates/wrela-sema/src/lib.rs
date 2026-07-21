@@ -1931,6 +1931,18 @@ fn validate_exact_source_facts(
         {
             return Err(invalid("source function provenance differs from HIR"));
         }
+        if !exact_source_function_specialization_matches(
+            analysis,
+            program,
+            function,
+            declaration,
+            declaration_record,
+            source_function,
+        ) {
+            return Err(invalid(
+                "source function specialization differs from its exact HIR signature",
+            ));
+        }
         // There is no comptime function color: a comptime-tier test is
         // evaluated directly from HIR by the comptime evaluator and never
         // populates a runtime body, so it is the only `FunctionOrigin::Source`
@@ -2796,6 +2808,113 @@ fn validate_exact_local_value_flow(
         is_cancelled,
     )?;
     Ok(())
+}
+
+fn exact_generic_signature_source_type(
+    analysis: &PartialAnalysis,
+    source: &wrela_hir::TypeExpression,
+    generics: &[wrela_hir::GenericParameterId],
+    arguments: &[SemanticArgument],
+) -> Option<SemanticTypeId> {
+    if let Some(scalar) = exact_scalar_source_type(analysis, source) {
+        return Some(scalar);
+    }
+    let wrela_hir::TypeExpressionKind::Named {
+        definition: wrela_hir::Definition::Generic(generic),
+        arguments: source_arguments,
+    } = &source.kind
+    else {
+        return None;
+    };
+    if !source_arguments.is_empty() {
+        return None;
+    }
+    let position = generics.iter().position(|candidate| candidate == generic)?;
+    match arguments.get(position)? {
+        SemanticArgument::Type(ty) => Some(*ty),
+        SemanticArgument::Constant(_) | SemanticArgument::Region(_) => None,
+    }
+}
+
+fn exact_source_function_specialization_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    function: &FunctionInstance,
+    declaration: DeclarationId,
+    declaration_record: &wrela_hir::Declaration,
+    source: &wrela_hir::FunctionDeclaration,
+) -> bool {
+    if source.generics.is_empty() {
+        return function.generic_arguments.is_empty();
+    }
+    if source.color != FunctionColor::Sync
+        || function.role != FunctionRole::Ordinary
+        || !matches!(
+            declaration_record.owner,
+            wrela_hir::DeclarationOwner::Module(_)
+        )
+        || source.generics.len() != function.generic_arguments.len()
+        || source.generics.len() > 26
+        || source.parameters.len() != function.parameters.len()
+    {
+        return false;
+    }
+    for (generic_id, argument) in source.generics.iter().zip(&function.generic_arguments) {
+        let Some(generic) = program.generic_parameter(*generic_id) else {
+            return false;
+        };
+        if generic.owner != declaration
+            || !matches!(
+                generic.kind,
+                wrela_hir::GenericParameterKind::Type { bound: None }
+            )
+            || !matches!(argument, SemanticArgument::Type(ty)
+                if exact_stored_copy_scalar_layout(analysis, *ty).is_some())
+        {
+            return false;
+        }
+    }
+    if source_function_specialization_key(
+        analysis.build.request,
+        declaration,
+        &function.generic_arguments,
+        analysis,
+    ) != Some(function.key)
+    {
+        return false;
+    }
+    let expected_result = source
+        .result
+        .as_ref()
+        .map_or(Some(SemanticTypeId(0)), |result| {
+            exact_generic_signature_source_type(
+                analysis,
+                result,
+                &source.generics,
+                &function.generic_arguments,
+            )
+        });
+    if expected_result != Some(function.result) {
+        return false;
+    }
+    source
+        .parameters
+        .iter()
+        .zip(&function.parameters)
+        .all(|(parameter_id, semantic)| {
+            let Some(parameter) = program.parameter(*parameter_id) else {
+                return false;
+            };
+            !parameter.receiver
+                && parameter.ty.as_ref().is_some_and(|ty| {
+                    exact_generic_signature_source_type(
+                        analysis,
+                        ty,
+                        &source.generics,
+                        &function.generic_arguments,
+                    ) == Some(semantic.ty)
+                })
+        })
 }
 
 fn validate_exact_parameters(
@@ -4903,6 +5022,107 @@ fn exact_stored_copy_scalar_layout(
     let alignment = u32::try_from(bytes).ok()?;
     (record.size_upper_bound == Some(bytes) && record.alignment_lower_bound == alignment)
         .then_some((bytes, alignment))
+}
+
+fn stored_copy_scalar_specialization_code(
+    analysis: &PartialAnalysis,
+    ty: SemanticTypeId,
+) -> Option<u8> {
+    exact_stored_copy_scalar_layout(analysis, ty)?;
+    Some(match analysis.types.get(ty.0 as usize)?.kind {
+        SemanticTypeKind::Bool => 1,
+        SemanticTypeKind::Integer {
+            signed: false,
+            bits: 8,
+            pointer_sized: false,
+        } => 2,
+        SemanticTypeKind::Integer {
+            signed: false,
+            bits: 16,
+            pointer_sized: false,
+        } => 3,
+        SemanticTypeKind::Integer {
+            signed: false,
+            bits: 32,
+            pointer_sized: false,
+        } => 4,
+        SemanticTypeKind::Integer {
+            signed: false,
+            bits: 64,
+            pointer_sized: false,
+        } => 5,
+        SemanticTypeKind::Integer {
+            signed: false,
+            bits: 128,
+            pointer_sized: false,
+        } => 6,
+        SemanticTypeKind::Integer {
+            signed: false,
+            pointer_sized: true,
+            ..
+        } => 7,
+        SemanticTypeKind::Integer {
+            signed: true,
+            bits: 8,
+            pointer_sized: false,
+        } => 8,
+        SemanticTypeKind::Integer {
+            signed: true,
+            bits: 16,
+            pointer_sized: false,
+        } => 9,
+        SemanticTypeKind::Integer {
+            signed: true,
+            bits: 32,
+            pointer_sized: false,
+        } => 10,
+        SemanticTypeKind::Integer {
+            signed: true,
+            bits: 64,
+            pointer_sized: false,
+        } => 11,
+        SemanticTypeKind::Integer {
+            signed: true,
+            bits: 128,
+            pointer_sized: false,
+        } => 12,
+        SemanticTypeKind::Integer {
+            signed: true,
+            pointer_sized: true,
+            ..
+        } => 13,
+        SemanticTypeKind::Float { bits: 32 } => 14,
+        SemanticTypeKind::Float { bits: 64 } => 15,
+        _ => return None,
+    })
+}
+
+fn source_function_specialization_key(
+    request: Sha256Digest,
+    declaration: DeclarationId,
+    arguments: &[SemanticArgument],
+    analysis: &PartialAnalysis,
+) -> Option<FunctionKey> {
+    const HEADER_BYTES: usize = 6;
+    let mut bytes = *request.as_bytes();
+    if arguments.is_empty() || arguments.len() > bytes.len().checked_sub(HEADER_BYTES)? {
+        return None;
+    }
+    bytes[0] ^= 0x47;
+    for (destination, source) in bytes[1..5].iter_mut().zip(declaration.0.to_be_bytes()) {
+        *destination ^= source;
+    }
+    bytes[5] ^= u8::try_from(arguments.len()).ok()?;
+    for (index, argument) in arguments.iter().enumerate() {
+        let SemanticArgument::Type(ty) = argument else {
+            return None;
+        };
+        bytes[HEADER_BYTES + index] ^= stored_copy_scalar_specialization_code(analysis, *ty)?;
+    }
+    if bytes.iter().all(|byte| *byte == 0) {
+        bytes[0] = 0x47;
+    }
+    Some(FunctionKey(Sha256Digest::from_bytes(bytes)))
 }
 
 fn exact_integer_kind(

@@ -217,6 +217,7 @@ fn supported_input<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedInput<'a>, LowerError> {
+    validate_generic_function_lowering_boundary(input.facts())?;
     match input.facts().root {
         sema::AnalysisRoot::DeclaredImage { .. } => {
             if input
@@ -234,6 +235,21 @@ fn supported_input<'a>(
             supported_generated_tests(input, limits, is_cancelled)
                 .map(SupportedInput::GeneratedTests)
         }
+    }
+}
+
+fn validate_generic_function_lowering_boundary(
+    facts: &sema::PartialAnalysis,
+) -> Result<(), LowerError> {
+    if facts.functions.iter().any(|function| {
+        matches!(function.origin, sema::FunctionOrigin::Source { .. })
+            && !function.generic_arguments.is_empty()
+    }) {
+        Err(unsupported(
+            "semantic-generic-function-lowering-pending (generic function specialization)",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -15350,6 +15366,25 @@ pub fn boot() -> Image:
             validate_supported_source_type(&specialization, &facts),
             Err(LowerError::UnsupportedInput {
                 feature: "semantic-generic-structure-lowering-pending (generic structure specialization)"
+            })
+        ));
+    }
+
+    #[test]
+    fn generic_function_specialization_stops_at_named_lowering_boundary() {
+        let mut facts = analyze_parsed_actor().into_facts();
+        let scalar = facts.types.first().expect("actor fixture unit type").id;
+        let function = facts
+            .functions
+            .iter_mut()
+            .find(|function| matches!(function.origin, sema::FunctionOrigin::Source { .. }))
+            .expect("actor fixture source function");
+        function.generic_arguments = vec![sema::SemanticArgument::Type(scalar)];
+
+        assert!(matches!(
+            validate_generic_function_lowering_boundary(&facts),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-generic-function-lowering-pending (generic function specialization)"
             })
         ));
     }
