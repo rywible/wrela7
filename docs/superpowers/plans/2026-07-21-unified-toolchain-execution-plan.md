@@ -185,20 +185,34 @@ D2 need this scope substantially complete; B10 needs F5.
 
 | Tier | Slice | Deps | Status |
 |---|---|---|---|
-| 1 | B1a view/provenance semantics | — | running |
-| 1 | B5b wait-for graph + diagnostics | — | running |
-| 1 | B2a promotion/region report schema | — | running |
-| 1 | B4a cleanup DAG sema analysis | — | dispatching |
-| 0 | T0.1a unit variants in type resolution | — | **landed** ce8385e6 (mixed-arity + all-unit type resolve; construction/multi-field deferred, fail-closed) |
-| 0 | T0.1b unit-variant construction (DotName) + multi-field payloads | T0.1a | queued |
-| 0 | T0.2 ephemeral type kind | T0.1 | queued |
+| 1 | B2a promotion/region report schema | — | **landed** 3eb2cb69 |
+| 1 | B5b wait-for graph + diagnostics | — | **landed** 3e216d38 |
+| 1 | B1a view/provenance semantics | — | not started (never dispatched) |
+| 1 | B4a cleanup DAG sema analysis | — | not started (first attempt discarded in isolation recovery; redo fresh) |
+| 0 | **T0.1 general nongeneric ADTs — COMPLETE** | — | **landed** — enum type resolution: unit + mixed-arity + heterogeneous-scalar + flat-struct + nongeneric-enum payloads, tagged-union max-slot layout, structural cycle rejection |
+| 0 | · T0.1a unit variants | — | landed ce8385e6 |
+| 0 | · T0.1b heterogeneous scalar payloads | T0.1a | landed 4b5f125a |
+| 0 | · T0.1c flat-struct payloads | T0.1b | landed c509694d |
+| 0 | · T0.1d enum payloads + cycle rejection | T0.1c | landed 0b953537 |
+| 0 | T0.1 deferred tails (fail-closed) | T0.1 | nominal/enum **construction** + **lowering**, generic/view/tuple/array payloads, unit-variant DotName construction — all named-diagnostic fail-closed |
+| 0 | T0.2 ephemeral type kind | T0.1 + a **producer** | **producer-gated** — needs views (B1) or `try send` (B5c) to exercise the `?`-vs-`match`/`is` rule end to end |
 | 0 | T0.3 generics/monomorphization (A6) | T0.1 | queued (multi-session) |
+| — | General `match`/`is` over ADTs (consumer; uses T0.1, needed for AdmissionResult consumption) | T0.1 | **next — cleanly testable now** |
 | 2 | L2.1 place-level aggregate mutation | T0 | queued |
 | 2 | L2.2 values-through-WIR + codegen | L2.1,T0 | queued |
 | 2 | L2.3 region/escape producer | L2.2 | queued |
 | 2 | L2.4 reply-slot + scheduler (B5c) | L2.2,T0.1 | queued |
 | 2 | L2.5 scope-op lowering (B4b/c) | L2.2,B4a | queued |
 | 3 | feature verticals (B1b,B2b/c,B3,B5c,B6–B10,A1/3/4/5/7/8) | tiers 0–2 | queued |
+
+**Sequencing note (2026-07-21):** T0.1 (ADT type resolution) is complete. T0.2
+(ephemeral kind) turned out **producer-gated** — the `?`-rejection rule can't be
+exercised without a value of an ephemeral type, and the only producers (views,
+`try send`) are themselves unbuilt. So the autonomous path pivots to consumers
+and producers that are testable now: general `match`/`is` over the new ADTs
+(next), then B1a view analysis (the first ephemeral producer) which unblocks
+T0.2. Generics (T0.3) and Tier-2 lowering proceed in parallel as independent
+tracks.
 
 Update this table and the cited inventory rows as each slice lands. One commit
 per slice; the branch is the integration unit for the whole A+B scope.
