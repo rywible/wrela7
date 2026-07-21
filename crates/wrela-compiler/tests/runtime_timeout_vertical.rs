@@ -22,12 +22,10 @@ use wrela_hir_lower::{
     CanonicalHirLowerer, ChangeSet as HirChangeSet, HirLowerer, LowerRequest as HirLowerRequest,
     LoweringLimits as HirLoweringLimits,
 };
-use wrela_package::{
-    DependencyAlias, ModulePath, PackageGraphBuilder, PackageIdentity, PackageLocator,
-};
+use wrela_package::{DependencyAlias, ModulePath, PackageGraphBuilder, PackageIdentity};
 use wrela_package_loader::{
-    CanonicalPackageCodec, ContentHasher, LockfileCodecLimits, ManifestCodecLimits, PackageCodec,
-    PackageContentKind, PackageContentRecord, SoftwareSha256, package_content_digest,
+    CanonicalPackageCodec, ContentHasher, ManifestCodecLimits, PackageCodec, PackageContentKind,
+    PackageContentRecord, SoftwareSha256, package_content_digest,
 };
 use wrela_sema::{
     AnalysisChangeSet, AnalysisLimits, AnalysisMode, AnalysisRequest, CanonicalSemanticAnalyzer,
@@ -44,8 +42,6 @@ use wrela_test_model::{TestId, TestKind};
 
 const WORKSPACE_MANIFEST: &[u8] =
     include_bytes!("../../../std/examples/runtime-timeout/wrela.toml");
-const WORKSPACE_LOCKFILE: &[u8] =
-    include_bytes!("../../../std/examples/runtime-timeout/wrela.lock");
 const APPLICATION_SOURCE: &str =
     include_str!("../../../std/examples/runtime-timeout/src/runtime_timeout/image.wr");
 const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.toml");
@@ -80,15 +76,6 @@ fn manifest_limits() -> ManifestCodecLimits {
         profiles: 16,
         images: 16,
         image_tests: 16,
-    }
-}
-
-fn lockfile_limits() -> LockfileCodecLimits {
-    LockfileCodecLimits {
-        bytes: 1024 * 1024,
-        string_bytes: 1024 * 1024,
-        packages: 16,
-        dependencies: 16,
     }
 }
 
@@ -197,38 +184,9 @@ fn checked_in_runtime_timeout_retains_reachable_checked_u8_add_and_fatal_edge() 
         )
         .expect("core package identity"),
     };
-    let lock = codec
-        .decode_lockfile(WORKSPACE_LOCKFILE, lockfile_limits(), &never_cancelled)
-        .expect("checked-in runtime-timeout lockfile");
-    assert_eq!(
-        codec
-            .canonical_lockfile(&lock, lockfile_limits(), &never_cancelled)
-            .expect("canonical runtime-timeout lockfile"),
-        WORKSPACE_LOCKFILE
-    );
-    assert_eq!(lock.root, root_identity);
-    let locked_root = lock
-        .packages
-        .iter()
-        .find(|package| matches!(package.locator, PackageLocator::Workspace { .. }))
-        .expect("locked workspace package");
-    assert_eq!(locked_root.identity, root_identity);
-    assert_eq!(
-        locked_root.manifest_digest,
-        HASHER.sha256(&canonical_manifest)
-    );
-    assert_eq!(locked_root.dependencies.len(), 1);
-    assert_eq!(locked_root.dependencies[0].identity, core_identity);
-    let locked_core = lock
-        .packages
-        .iter()
-        .find(|package| matches!(package.locator, PackageLocator::Toolchain { .. }))
-        .expect("locked core package");
-    assert_eq!(locked_core.identity, core_identity);
-    assert_eq!(
-        locked_core.manifest_digest,
-        HASHER.sha256(&canonical_core_manifest)
-    );
+    // There is no lockfile to also cross-check these identities against:
+    // they are exactly what the loader computes at load time, independently
+    // recomputed here from the same checked-in manifests and sources.
     assert_eq!(
         APPLICATION_SOURCE
             .matches(&format!("fn {SELECTOR}():"))

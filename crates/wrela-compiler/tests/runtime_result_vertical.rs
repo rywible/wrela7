@@ -28,12 +28,10 @@ use wrela_hir_lower::{
     LoweringLimits as HirLoweringLimits,
 };
 use wrela_link_efi::{CanonicalCoffObjectInspector, CoffInspectError, CoffObjectInspector};
-use wrela_package::{
-    DependencyAlias, ModulePath, PackageGraphBuilder, PackageIdentity, PackageLocator,
-};
+use wrela_package::{DependencyAlias, ModulePath, PackageGraphBuilder, PackageIdentity};
 use wrela_package_loader::{
-    CanonicalPackageCodec, ContentHasher, LockfileCodecLimits, ManifestCodecLimits, PackageCodec,
-    PackageContentKind, PackageContentRecord, SoftwareSha256, package_content_digest,
+    CanonicalPackageCodec, ContentHasher, ManifestCodecLimits, PackageCodec, PackageContentKind,
+    PackageContentRecord, SoftwareSha256, package_content_digest,
 };
 use wrela_sema::{
     AnalysisChangeSet, AnalysisLimits, AnalysisMode, AnalysisRequest, CanonicalSemanticAnalyzer,
@@ -48,7 +46,6 @@ use wrela_syntax::{ParseLimits, ParseRequest, SyntaxParser, WrelaSyntaxParser};
 use wrela_target::TargetPackage;
 
 const WORKSPACE_MANIFEST: &[u8] = include_bytes!("../../../std/examples/runtime-result/wrela.toml");
-const WORKSPACE_LOCKFILE: &[u8] = include_bytes!("../../../std/examples/runtime-result/wrela.lock");
 const APPLICATION_SOURCE: &str =
     include_str!("../../../std/examples/runtime-result/src/runtime_result/image.wr");
 const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.toml");
@@ -92,15 +89,6 @@ fn manifest_limits() -> ManifestCodecLimits {
     }
 }
 
-fn lockfile_limits() -> LockfileCodecLimits {
-    LockfileCodecLimits {
-        bytes: 1024 * 1024,
-        string_bytes: 1024 * 1024,
-        packages: 16,
-        dependencies: 16,
-    }
-}
-
 fn content_record<'a>(path: &'a str, source: &str) -> PackageContentRecord<'a> {
     PackageContentRecord {
         kind: PackageContentKind::Source,
@@ -122,7 +110,6 @@ fn add_source(sources: &mut SourceDatabase, path: &str, text: &str) -> FileId {
 fn package_identities(
     application_source: &str,
     forged_result_source: Option<&str>,
-    require_checked_lock: bool,
 ) -> (PackageIdentity, PackageIdentity) {
     let codec = CanonicalPackageCodec::new();
     let manifest = codec
@@ -184,69 +171,32 @@ fn package_identities(
         )
         .expect("core package identity"),
     };
-    if !require_checked_lock {
-        return (root, core);
-    }
-    let lock = codec
-        .decode_lockfile(WORKSPACE_LOCKFILE, lockfile_limits(), &never_cancelled)
-        .expect("checked-in runtime-result lockfile");
-    assert_eq!(
-        codec
-            .canonical_lockfile(&lock, lockfile_limits(), &never_cancelled)
-            .expect("canonical runtime-result lockfile"),
-        WORKSPACE_LOCKFILE
-    );
-    assert_eq!(lock.root, root);
-    let workspace = lock
-        .packages
-        .iter()
-        .find(|package| matches!(package.locator, PackageLocator::Workspace { .. }))
-        .expect("locked workspace package");
-    assert_eq!(workspace.identity, root);
-    assert_eq!(
-        workspace.manifest_digest,
-        HASHER.sha256(&canonical_manifest)
-    );
-    assert_eq!(workspace.dependencies[0].identity, core);
-    let locked_core = lock
-        .packages
-        .iter()
-        .find(|package| matches!(package.locator, PackageLocator::Toolchain { .. }))
-        .expect("locked core package");
-    assert_eq!(locked_core.identity, core);
-    assert_eq!(
-        locked_core.manifest_digest,
-        HASHER.sha256(&canonical_core_manifest)
-    );
+    // There is no lockfile to also cross-check these identities against:
+    // they are exactly what the loader computes at load time, independently
+    // recomputed here from the same checked-in manifests and sources.
     (root, core)
 }
 
 fn source_fixture() -> SourceFixture {
-    source_fixture_for(APPLICATION_SOURCE, true)
+    source_fixture_for(APPLICATION_SOURCE)
 }
 
-fn source_fixture_for(application_source: &str, require_checked_lock: bool) -> SourceFixture {
-    try_source_fixture_for(application_source, require_checked_lock)
+fn source_fixture_for(application_source: &str) -> SourceFixture {
+    try_source_fixture_for(application_source)
         .unwrap_or_else(|diagnostics| panic!("HIR diagnostics: {diagnostics:?}"))
 }
 
 fn try_source_fixture_for(
     application_source: &str,
-    require_checked_lock: bool,
 ) -> Result<SourceFixture, Vec<wrela_diagnostics::Diagnostic>> {
-    try_source_fixture_with_forged_result(application_source, None, require_checked_lock)
+    try_source_fixture_with_forged_result(application_source, None)
 }
 
 fn try_source_fixture_with_forged_result(
     application_source: &str,
     forged_result_source: Option<&str>,
-    require_checked_lock: bool,
 ) -> Result<SourceFixture, Vec<wrela_diagnostics::Diagnostic>> {
-    let (root, core_identity) = package_identities(
-        application_source,
-        forged_result_source,
-        require_checked_lock,
-    );
+    let (root, core_identity) = package_identities(application_source, forged_result_source);
     let mut sources = SourceDatabase::default();
     let core_file = add_source(&mut sources, "core/image.wr", CORE_IMAGE_SOURCE);
     let core_result_file = add_source(&mut sources, "core/result.wr", CORE_RESULT_SOURCE);
@@ -503,7 +453,7 @@ fn compile_selected(
 }
 
 fn assert_discovery_diagnostic(application_source: &str, expected: &str) {
-    let fixture = source_fixture_for(application_source, false);
+    let fixture = source_fixture_for(application_source);
     let changes = AnalysisChangeSet {
         previous_source_graph: None,
         changed_declarations: Vec::new(),
@@ -539,7 +489,7 @@ fn assert_discovery_diagnostic(application_source: &str, expected: &str) {
 }
 
 fn assert_hir_diagnostic(application_source: &str, expected: &str) {
-    let diagnostics = try_source_fixture_for(application_source, false)
+    let diagnostics = try_source_fixture_for(application_source)
         .err()
         .expect("wrong generic arity must be rejected before sema");
     assert!(
@@ -772,7 +722,7 @@ fn result_u64_match_returns_payload():
     return
 "#,
     );
-    let fixture = source_fixture_for(&source, false);
+    let fixture = source_fixture_for(&source);
     let semantic = compile_selected(&fixture, "result_u64_match_returns_payload");
     let repeated_semantic = compile_selected(&fixture, "result_u64_match_returns_payload");
     assert_eq!(semantic.as_wir(), repeated_semantic.as_wir());

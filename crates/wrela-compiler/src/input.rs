@@ -34,7 +34,6 @@ use wrela_syntax::{
 use wrela_toolchain::{ShippedStandardLibraryPackage, VerifiedToolchain};
 
 const MANIFEST_FILE_NAME: &str = "wrela.toml";
-const LOCKFILE_FILE_NAME: &str = "wrela.lock";
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_HOST_PATH_BYTES: usize = 64 * 1024;
 const CANCELLED_MESSAGE: &str = "package acquisition was cancelled";
@@ -87,23 +86,14 @@ impl LocalWorkspaceProvider {
         self.root
             .read_stable_file(&path, maximum_bytes, maximum_bytes, is_cancelled)
     }
-
-    fn read_lockfile(
-        &self,
-        maximum_bytes: u64,
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<StableFile, ProviderError> {
-        let path = join_fixed_name(self.root.path(), LOCKFILE_FILE_NAME)?;
-        self.root
-            .read_stable_file(&path, maximum_bytes, maximum_bytes, is_cancelled)
-    }
 }
 
 impl PackageSourceProvider for LocalWorkspaceProvider {
     fn acquire(
         &self,
         locator: &PackageLocator,
-        expected: &PackageIdentity,
+        expected_name: &PackageName,
+        expected_version: &PackageVersion,
         maximum_bytes: u64,
         maximum_manifest_bytes: u64,
         is_cancelled: &dyn Fn() -> bool,
@@ -114,11 +104,13 @@ impl PackageSourceProvider for LocalWorkspaceProvider {
             &self.root,
             &package_directory,
             locator,
-            expected,
+            expected_name,
+            expected_version,
             LocalAcquisitionLimits {
                 total_bytes: maximum_bytes,
                 manifest_bytes: maximum_manifest_bytes,
             },
+            None,
             None,
             is_cancelled,
         )
@@ -157,6 +149,26 @@ impl LocalToolchainPackageProvider {
         self.root.path()
     }
 
+    /// Select the toolchain-shipped package matching this exact name and
+    /// version. Revision 0.1 never infers the reserved `core` alias's bytes
+    /// from a package name or digest (`docs/language/02-source-language.md`
+    /// §2.1); the driver resolves the locator once, here, from the verified
+    /// installation index, and passes it to the loader as
+    /// `LoadRequest::core_locator`.
+    pub fn locate(
+        &self,
+        name: &PackageName,
+        version: &PackageVersion,
+    ) -> Result<PackageLocator, ProviderError> {
+        self.packages
+            .iter()
+            .find(|package| &package.identity.name == name && &package.identity.version == version)
+            .map(|package| package.locator.clone())
+            .ok_or_else(|| {
+                access_denied("toolchain does not ship the requested core component version")
+            })
+    }
+
     fn package_directory(&self, locator: &PackageLocator) -> Result<PathBuf, ProviderError> {
         let PackageLocator::Toolchain { component } = locator else {
             return Err(access_denied(
@@ -171,7 +183,8 @@ impl PackageSourceProvider for LocalToolchainPackageProvider {
     fn acquire(
         &self,
         locator: &PackageLocator,
-        expected: &PackageIdentity,
+        expected_name: &PackageName,
+        expected_version: &PackageVersion,
         maximum_bytes: u64,
         maximum_manifest_bytes: u64,
         is_cancelled: &dyn Fn() -> bool,
@@ -180,9 +193,11 @@ impl PackageSourceProvider for LocalToolchainPackageProvider {
         let package_directory = self.package_directory(locator)?;
         let indexed = self
             .packages
-            .binary_search_by(|package| package.identity.cmp(expected))
-            .ok()
-            .and_then(|index| self.packages.get(index))
+            .iter()
+            .find(|package| {
+                &package.identity.name == expected_name
+                    && &package.identity.version == expected_version
+            })
             .ok_or(ProviderError::IdentityMismatch)?;
         if &indexed.locator != locator {
             return Err(ProviderError::IdentityMismatch);
@@ -191,12 +206,14 @@ impl PackageSourceProvider for LocalToolchainPackageProvider {
             &self.root,
             &package_directory,
             locator,
-            expected,
+            expected_name,
+            expected_version,
             LocalAcquisitionLimits {
                 total_bytes: maximum_bytes,
                 manifest_bytes: maximum_manifest_bytes,
             },
             Some(indexed.manifest_digest),
+            Some(indexed.identity.source_digest),
             is_cancelled,
         )
     }
@@ -297,7 +314,8 @@ impl PackageSourceProvider for LocalPackageProvider {
     fn acquire(
         &self,
         locator: &PackageLocator,
-        expected: &PackageIdentity,
+        expected_name: &PackageName,
+        expected_version: &PackageVersion,
         maximum_bytes: u64,
         maximum_manifest_bytes: u64,
         is_cancelled: &dyn Fn() -> bool,
@@ -306,14 +324,16 @@ impl PackageSourceProvider for LocalPackageProvider {
         match locator {
             PackageLocator::Workspace { .. } => self.workspace.acquire(
                 locator,
-                expected,
+                expected_name,
+                expected_version,
                 maximum_bytes,
                 maximum_manifest_bytes,
                 is_cancelled,
             ),
             PackageLocator::Toolchain { .. } => self.toolchain.acquire(
                 locator,
-                expected,
+                expected_name,
+                expected_version,
                 maximum_bytes,
                 maximum_manifest_bytes,
                 is_cancelled,
@@ -331,13 +351,16 @@ struct LocalAcquisitionLimits {
     manifest_bytes: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn acquire_local_package(
     root: &LocalPackageRoot,
     package_directory: &Path,
     locator: &PackageLocator,
-    expected: &PackageIdentity,
+    expected_name: &PackageName,
+    expected_version: &PackageVersion,
     limits: LocalAcquisitionLimits,
     expected_manifest_digest: Option<wrela_build_model::Sha256Digest>,
+    expected_source_digest: Option<wrela_build_model::Sha256Digest>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<PackageBundle, ProviderError> {
     check_cancelled(is_cancelled)?;
@@ -373,7 +396,7 @@ fn acquire_local_package(
     let manifest = codec
         .decode_manifest(&manifest_file.bytes, codec_limits, is_cancelled)
         .map_err(|error| map_manifest_error(error, effective_manifest_bytes))?;
-    if manifest.name != expected.name || manifest.version != expected.version {
+    if manifest.name != *expected_name || manifest.version != *expected_version {
         return Err(ProviderError::IdentityMismatch);
     }
     reject_duplicate_declarations(&manifest)?;
@@ -397,6 +420,15 @@ fn acquire_local_package(
         is_cancelled,
     )?;
 
+    // The package identity (in particular its content digest) is not known
+    // until content has been read; there is no lockfile to have pre-recorded
+    // it. Each scenario's `package` field is filled in once that identity is
+    // computed below.
+    let placeholder_identity = PackageIdentity {
+        name: expected_name.clone(),
+        version: expected_version.clone(),
+        source_digest: wrela_build_model::Sha256Digest::from_bytes([0; 32]),
+    };
     let mut scenarios = Vec::new();
     scenarios
         .try_reserve_exact(manifest.image_tests.len())
@@ -412,7 +444,7 @@ fn acquire_local_package(
         validate_utf8(&scenario_file.bytes, is_cancelled)
             .map_err(|error| map_utf8_error(error, "declared scenario is not valid UTF-8"))?;
         scenarios.push(ScenarioInput {
-            package: expected.clone(),
+            package: placeholder_identity.clone(),
             path: copy_bounded_path(&test.scenario, maximum_bytes)?,
             bytes: scenario_file.bytes,
             digest: scenario_file.digest,
@@ -422,8 +454,8 @@ fn acquire_local_package(
     let canonical_manifest = codec
         .canonical_manifest(&manifest, codec_limits, is_cancelled)
         .map_err(|error| map_manifest_error(error, effective_manifest_bytes))?;
-    verify_package_content(
-        expected,
+    let source_digest = compute_package_content_digest(
+        expected_source_digest,
         &canonical_manifest,
         &sources,
         &scenarios,
@@ -431,8 +463,16 @@ fn acquire_local_package(
         is_cancelled,
     )?;
     check_cancelled(is_cancelled)?;
+    let identity = PackageIdentity {
+        name: manifest.name,
+        version: manifest.version,
+        source_digest,
+    };
+    for scenario in &mut scenarios {
+        scenario.package = identity.clone();
+    }
     Ok(PackageBundle {
-        identity: expected.clone(),
+        identity,
         locator: locator.clone(),
         manifest_bytes: manifest_file.bytes,
         sources,
@@ -531,7 +571,7 @@ impl LocalFrontendService {
     }
 
     /// Construct from an already configured local workspace/toolchain
-    /// provider. Root manifest and lockfile reads still use only its workspace
+    /// provider. The root manifest read still uses only its workspace
     /// capability.
     #[must_use]
     pub fn with_package_provider(provider: LocalPackageProvider) -> Self {
@@ -586,21 +626,53 @@ impl LocalFrontendService {
                 is_cancelled,
             )
             .map_err(|error| map_frontend_provider_error(error, is_cancelled))?;
-        let lockfile = self
-            .workspace_provider
-            .read_lockfile(request.load_limits.lockfile_bytes, is_cancelled)
-            .map_err(|error| map_frontend_provider_error(error, is_cancelled))?;
         let package_provider: &dyn PackageSourceProvider = self
             .package_provider
             .as_ref()
             .map_or(&self.workspace_provider, |provider| provider);
+        // There is no lockfile: the reserved `core` alias's package bytes are
+        // selected here, from the verified toolchain installation index,
+        // never inferred from the manifest's package name
+        // (`docs/language/02-source-language.md` §2.1). If the root manifest
+        // turns out not to declare a valid `core` dependency at all, the
+        // loader's own decode/validation reports that precisely regardless
+        // of this placeholder; this lookup only needs to succeed when one
+        // genuinely exists.
+        let manifest_limits = manifest_codec_limits(request.load_limits.manifest_bytes_per_package);
+        let core_locator = self
+            .package_provider
+            .as_ref()
+            .and_then(|provider| {
+                let decoded = self
+                    .package_codec
+                    .decode_manifest(&root_manifest.bytes, manifest_limits, is_cancelled)
+                    .ok()?;
+                let core_dependency = decoded
+                    .dependencies
+                    .iter()
+                    .find(|dependency| dependency.alias.as_str() == "core")?;
+                let core_version =
+                    wrela_package::exact_requirement_version(&core_dependency.requirement)?;
+                provider
+                    .toolchain_provider()
+                    .locate(&core_dependency.package, &core_version)
+                    .ok()
+            })
+            .unwrap_or(PackageLocator::Toolchain {
+                // A non-empty but unreachable placeholder: with no
+                // configured package provider there is no toolchain
+                // installation to resolve `core` against at all, and the
+                // fallback workspace-only provider fails closed on any
+                // non-workspace locator regardless of its exact spelling.
+                component: "unconfigured".to_owned(),
+            });
         let workspace = self
             .workspace_loader
             .load(
                 LoadRequest {
                     root_locator: request.root_locator.clone(),
                     root_manifest_bytes: &root_manifest.bytes,
-                    lockfile_bytes: &lockfile.bytes,
+                    core_locator,
                     provider: package_provider,
                     hasher: &self.hasher,
                     codec: &self.package_codec,
@@ -1176,14 +1248,20 @@ fn reject_duplicate_declarations(
     Ok(())
 }
 
-fn verify_package_content(
-    expected: &PackageIdentity,
+/// Compute this package's content digest from its already digest-verified
+/// sources and scenarios plus its canonical manifest. `expected` is `Some`
+/// only for a toolchain component, whose identity is independently known
+/// from the verified installation index; a workspace root has no such
+/// pre-recorded value (there is no lockfile), so its returned digest is
+/// simply the computed one, trusted as the definition of its identity.
+fn compute_package_content_digest(
+    expected: Option<wrela_build_model::Sha256Digest>,
     canonical_manifest: &[u8],
     sources: &[SourceInput],
     scenarios: &[ScenarioInput],
     maximum_bytes: u64,
     is_cancelled: &dyn Fn() -> bool,
-) -> Result<(), ProviderError> {
+) -> Result<wrela_build_model::Sha256Digest, ProviderError> {
     let record_count =
         sources
             .len()
@@ -1218,12 +1296,12 @@ fn verify_package_content(
                     corrupt("package content declarations are not canonical")
                 }
             })?;
-    if actual != expected.source_digest {
+    if expected.is_some_and(|expected| actual != expected) {
         return Err(corrupt(
             "package content differs from its expected identity",
         ));
     }
-    Ok(())
+    Ok(actual)
 }
 
 fn subtract_bytes(
@@ -1425,17 +1503,17 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use wrela_build_model::Sha256Digest;
-    use wrela_package::{
-        DependencyAlias, LOCKFILE_SCHEMA_VERSION, LockedDependency, LockedPackage, Lockfile,
-        PackageName, PackageVersion,
-    };
-    use wrela_package_loader::LockfileCodecLimits;
+    use wrela_package::{PackageName, PackageVersion};
 
     use super::*;
 
     const TEST_BYTES: u64 = 4 * 1024 * 1024;
-    const MINIMAL_MANIFEST: &[u8] =
-        include_bytes!("../../../tests/contracts/package/v1/minimal.toml");
+    // Unlike the checked-in `tests/contracts/package/v1/minimal.toml` fixture
+    // (a codec byte-fidelity pin with no dependency), every loadable
+    // revision-0.1 workspace now declares exactly one dependency, the
+    // reserved `core` alias -- there is no lockfile to instead resolve a
+    // wider declared set (`docs/language/02-source-language.md` §2.1).
+    const MINIMAL_MANIFEST: &[u8] = b"schema = 1\nlanguage = \"0.1-design\"\n\n[package]\nname = \"mini\"\nversion = \"1.0.0\"\nsource_root = \"src\"\n\n[[dependency]]\nalias = \"core\"\npackage = \"wrela-core\"\nrequirement = \"=0.1.0\"\n\n[[profile]]\nname = \"development\"\nmode = \"development\"\n";
     const SOURCE_TEXT: &str = "module mini\nfn mini():\n    return \"ok\"\n";
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1489,7 +1567,6 @@ mod tests {
         locator: PackageLocator,
         identity: PackageIdentity,
         manifest_bytes: Vec<u8>,
-        lockfile_bytes: Vec<u8>,
         source_bytes: Vec<u8>,
         scenario_bytes: Vec<Vec<u8>>,
         manifest_path: PathBuf,
@@ -1563,32 +1640,16 @@ mod tests {
                 version: manifest.version,
                 source_digest: package_digest,
             };
-            let manifest_digest = hasher.sha256(&manifest_bytes);
-            let lockfile = Lockfile {
-                schema: LOCKFILE_SCHEMA_VERSION,
-                root: identity.clone(),
-                packages: vec![LockedPackage {
-                    identity: identity.clone(),
-                    locator: locator.clone(),
-                    dependencies: Vec::new(),
-                    manifest_digest,
-                }],
-            };
-            let lockfile_bytes = codec
-                .canonical_lockfile(&lockfile, lockfile_limits(), &never_cancelled)
-                .expect("canonical lockfile");
             let manifest_path = directory.write("package/wrela.toml", &manifest_bytes);
             let source_path = directory.write("package/src/mini.wr", source_bytes);
             for (path, bytes) in scenarios {
                 directory.write(&format!("package/{path}"), bytes);
             }
-            directory.write("wrela.lock", &lockfile_bytes);
             Self {
                 directory,
                 locator,
                 identity,
                 manifest_bytes,
-                lockfile_bytes,
                 source_bytes: source_bytes.to_vec(),
                 scenario_bytes: scenarios.iter().map(|(_, bytes)| bytes.to_vec()).collect(),
                 manifest_path,
@@ -1697,39 +1758,12 @@ mod tests {
             let core_locator = PackageLocator::Toolchain {
                 component: "wrela-core-0.1".to_owned(),
             };
-            let mut packages = vec![
-                LockedPackage {
-                    identity: root.identity.clone(),
-                    locator: root_locator.clone(),
-                    dependencies: vec![LockedDependency {
-                        alias: DependencyAlias::new("core").expect("dependency alias"),
-                        identity: core.identity.clone(),
-                    }],
-                    manifest_digest: root.manifest_digest,
-                },
-                LockedPackage {
-                    identity: core.identity.clone(),
-                    locator: core_locator.clone(),
-                    dependencies: Vec::new(),
-                    manifest_digest: core.manifest_digest,
-                },
-            ];
-            packages.sort_by(|left, right| left.identity.cmp(&right.identity));
-            let lockfile = Lockfile {
-                schema: LOCKFILE_SCHEMA_VERSION,
-                root: root.identity.clone(),
-                packages,
-            };
-            let lockfile_bytes = CanonicalPackageCodec::new()
-                .canonical_lockfile(&lockfile, lockfile_limits(), &never_cancelled)
-                .expect("two-package lockfile");
 
             directory.write("workspace/package/wrela.toml", &root.manifest_bytes);
             directory.write(
                 &format!("workspace/package/src/{}", root.source_path),
                 &root.source_bytes,
             );
-            directory.write("workspace/wrela.lock", &lockfile_bytes);
             directory.write(
                 "toolchain/share/wrela/std/wrela-core-0.1/wrela.toml",
                 &core.manifest_bytes,
@@ -1795,12 +1829,43 @@ mod tests {
         manifest.into_bytes()
     }
 
-    fn lockfile_limits() -> LockfileCodecLimits {
-        LockfileCodecLimits {
-            bytes: TEST_BYTES,
-            string_bytes: TEST_BYTES,
-            packages: 16,
-            dependencies: 64,
+    /// Write a trivial toolchain-shipped `wrela-core` package into
+    /// `directory`, matching `MINIMAL_MANIFEST`'s declared `core` dependency
+    /// (name `wrela-core`, exact version `0.1.0`). Returns the standard-
+    /// library root path and the package's computed identity/manifest data,
+    /// ready for [`core_toolchain_provider`]. Revision 0.1 has no lockfile to
+    /// instead resolve this alias's bytes from a recorded locator/digest.
+    fn write_core_package(
+        directory: &TestDirectory,
+        core_source: &[u8],
+    ) -> (PathBuf, CanonicalTestPackage) {
+        let core_manifest = test_package_manifest("wrela-core", "0.1.0", &[]);
+        let core = CanonicalTestPackage::new(&core_manifest, "core.wr", core_source);
+        directory.write(
+            "toolchain/share/wrela/std/wrela-core-0.1/wrela.toml",
+            &core.manifest_bytes,
+        );
+        directory.write(
+            "toolchain/share/wrela/std/wrela-core-0.1/src/core.wr",
+            &core.source_bytes,
+        );
+        (directory.root.join("toolchain/share/wrela/std"), core)
+    }
+
+    /// Build the toolchain provider half for a [`write_core_package`] output.
+    fn core_toolchain_provider(
+        standard_library_root: &Path,
+        core: &CanonicalTestPackage,
+    ) -> LocalToolchainPackageProvider {
+        LocalToolchainPackageProvider {
+            root: LocalPackageRoot::new(standard_library_root).expect("standard library root"),
+            packages: Arc::new(vec![ShippedStandardLibraryPackage {
+                identity: core.identity.clone(),
+                locator: PackageLocator::Toolchain {
+                    component: "wrela-core-0.1".to_owned(),
+                },
+                manifest_digest: core.manifest_digest,
+            }]),
         }
     }
 
@@ -1810,7 +1875,6 @@ mod tests {
             sources: 64,
             manifest_bytes_per_package: TEST_BYTES,
             manifest_bytes: TEST_BYTES,
-            lockfile_bytes: TEST_BYTES,
             source_bytes: TEST_BYTES,
             scenarios: 16,
             scenario_bytes: TEST_BYTES,
@@ -1828,13 +1892,26 @@ mod tests {
         // file outside `source_root` is not a module regardless of its
         // extension, but every `*.wr` file inside `source_root` is (there is
         // no separate "ignored" class of `.wr` file under `source_root`).
+        // The workspace's declared `core` dependency now must actually
+        // resolve (there is no lockfile to instead pin a single package), so
+        // this exercises a real two-package (root + toolchain core) load.
         let fixture = WorkspaceFixture::new(SOURCE_TEXT.as_bytes());
         fixture
             .directory
             .write("package/undeclared.bin", &[0u8; 32]);
         fixture.directory.write("package/src.wr", &[0u8; 32]);
+        let (standard_library_root, core) = write_core_package(
+            &fixture.directory,
+            b"module core\nfn core():\n    return \"core\"\n",
+        );
 
-        let service = LocalFrontendService::new(&fixture.directory.root).expect("frontend service");
+        let workspace_provider =
+            LocalWorkspaceProvider::new(&fixture.directory.root).expect("workspace provider");
+        let toolchain_provider = core_toolchain_provider(&standard_library_root, &core);
+        let service = LocalFrontendService::with_package_provider(LocalPackageProvider::new(
+            workspace_provider,
+            toolchain_provider,
+        ));
         let frontend = service
             .load_and_parse(
                 FrontendWorkspaceRequest {
@@ -1846,11 +1923,18 @@ mod tests {
             )
             .expect("real filesystem frontend");
 
-        assert_eq!(frontend.workspace().graph().packages().len(), 1);
-        assert_eq!(frontend.workspace().graph().modules().len(), 1);
-        assert_eq!(frontend.workspace().sources().len(), 1);
-        assert_eq!(frontend.parsed_modules().len(), 1);
-        assert!(frontend.parsed_modules()[0].diagnostics().is_empty());
+        assert_eq!(frontend.workspace().graph().packages().len(), 2);
+        assert_eq!(frontend.workspace().graph().modules().len(), 2);
+        assert_eq!(frontend.workspace().sources().len(), 2);
+        assert_eq!(frontend.parsed_modules().len(), 2);
+        assert!(
+            frontend
+                .parsed_modules()
+                .iter()
+                .all(|output| output.diagnostics().is_empty())
+        );
+        // The root is always graph package 0, so its sole derived module
+        // (`mini.wr`) sorts before core's.
         let module = &frontend.workspace().graph().modules()[0];
         assert_eq!(
             frontend.parsed_module(module.id),
@@ -1860,7 +1944,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_dot_locator_loads_manifest_and_lockfile_from_workspace_root() {
+    fn exact_dot_locator_loads_manifest_from_workspace_root() {
         let fixture = WorkspaceFixture::new(SOURCE_TEXT.as_bytes());
         let root_locator = PackageLocator::Workspace {
             path: ".".to_owned(),
@@ -1871,23 +1955,18 @@ mod tests {
         fixture
             .directory
             .write("src/mini.wr", &fixture.source_bytes);
-        let lockfile = Lockfile {
-            schema: LOCKFILE_SCHEMA_VERSION,
-            root: fixture.identity.clone(),
-            packages: vec![LockedPackage {
-                identity: fixture.identity.clone(),
-                locator: root_locator.clone(),
-                dependencies: Vec::new(),
-                manifest_digest: SoftwareSha256.sha256(&fixture.manifest_bytes),
-            }],
-        };
-        let lockfile_bytes = CanonicalPackageCodec::new()
-            .canonical_lockfile(&lockfile, lockfile_limits(), &never_cancelled)
-            .expect("root-layout lockfile");
-        fixture.directory.write("wrela.lock", &lockfile_bytes);
+        let (standard_library_root, core) = write_core_package(
+            &fixture.directory,
+            b"module core\nfn core():\n    return \"core\"\n",
+        );
 
-        let service = LocalFrontendService::new(&fixture.directory.root)
-            .expect("root-layout frontend service");
+        let workspace_provider = LocalWorkspaceProvider::new(&fixture.directory.root)
+            .expect("root-layout workspace provider");
+        let toolchain_provider = core_toolchain_provider(&standard_library_root, &core);
+        let service = LocalFrontendService::with_package_provider(LocalPackageProvider::new(
+            workspace_provider,
+            toolchain_provider,
+        ));
         let frontend = service
             .load_and_parse(
                 FrontendWorkspaceRequest {
@@ -1898,8 +1977,8 @@ mod tests {
                 &never_cancelled,
             )
             .expect("root-layout workspace");
-        assert_eq!(frontend.workspace().graph().packages().len(), 1);
-        assert_eq!(frontend.workspace().graph().modules().len(), 1);
+        assert_eq!(frontend.workspace().graph().packages().len(), 2);
+        assert_eq!(frontend.workspace().graph().modules().len(), 2);
         assert_eq!(frontend.workspace().manifests()[0].locator(), &root_locator);
 
         for path in ["", "./", "./package", "package/.", "package/../package"] {
@@ -1908,7 +1987,8 @@ mod tests {
                     &PackageLocator::Workspace {
                         path: path.to_owned(),
                     },
-                    &fixture.identity,
+                    &fixture.identity.name,
+                    &fixture.identity.version,
                     TEST_BYTES,
                     TEST_BYTES,
                     &never_cancelled,
@@ -2141,7 +2221,8 @@ mod tests {
         let root = provider
             .acquire(
                 &fixture.root_locator,
-                &fixture.root_identity,
+                &fixture.root_identity.name,
+                &fixture.root_identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled,
@@ -2150,7 +2231,8 @@ mod tests {
         let core = provider
             .acquire(
                 &fixture.core_locator,
-                &fixture.core.identity,
+                &fixture.core.identity.name,
+                &fixture.core.identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled,
@@ -2169,7 +2251,8 @@ mod tests {
         assert!(matches!(
             provider.workspace_provider().acquire(
                 &fixture.core_locator,
-                &fixture.core.identity,
+                &fixture.core.identity.name,
+                &fixture.core.identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled
@@ -2179,7 +2262,8 @@ mod tests {
         assert!(matches!(
             provider.toolchain_provider().acquire(
                 &fixture.root_locator,
-                &fixture.root_identity,
+                &fixture.root_identity.name,
+                &fixture.root_identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled
@@ -2191,7 +2275,8 @@ mod tests {
                 &PackageLocator::Toolchain {
                     component: "package".to_owned(),
                 },
-                &fixture.root_identity,
+                &fixture.root_identity.name,
+                &fixture.root_identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled
@@ -2203,7 +2288,8 @@ mod tests {
                 &PackageLocator::Workspace {
                     path: "wrela-core-0.1".to_owned(),
                 },
-                &fixture.core.identity,
+                &fixture.core.identity.name,
+                &fixture.core.identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled
@@ -2216,7 +2302,8 @@ mod tests {
                     provider: "cache".to_owned(),
                     key: "core".to_owned(),
                 },
-                &fixture.core.identity,
+                &fixture.core.identity.name,
+                &fixture.core.identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled
@@ -2232,7 +2319,8 @@ mod tests {
         assert!(matches!(
             provider.acquire(
                 &fixture.core_locator,
-                &fixture.core.identity,
+                &fixture.core.identity.name,
+                &fixture.core.identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled,
@@ -2273,7 +2361,8 @@ mod tests {
             .provider()
             .acquire(
                 &fixture.locator,
-                &fixture.identity,
+                &fixture.identity.name,
+                &fixture.identity.version,
                 fixture.total_package_bytes(),
                 u64::try_from(fixture.manifest_bytes.len()).expect("manifest byte count"),
                 &never_cancelled,
@@ -2301,7 +2390,8 @@ mod tests {
             .provider()
             .acquire(
                 &fixture.locator,
-                &fixture.identity,
+                &fixture.identity.name,
+                &fixture.identity.version,
                 fixture.total_package_bytes(),
                 u64::try_from(fixture.manifest_bytes.len()).expect("manifest byte count"),
                 &never_cancelled,
@@ -2317,7 +2407,8 @@ mod tests {
         assert!(matches!(
             invalid.provider().acquire(
                 &invalid.locator,
-                &invalid.identity,
+                &invalid.identity.name,
+                &invalid.identity.version,
                 invalid.total_package_bytes(),
                 u64::try_from(invalid.manifest_bytes.len()).expect("manifest byte count"),
                 &never_cancelled
@@ -2336,7 +2427,8 @@ mod tests {
         provider
             .acquire(
                 &fixture.locator,
-                &fixture.identity,
+                &fixture.identity.name,
+                &fixture.identity.version,
                 exact,
                 exact_manifest,
                 &never_cancelled,
@@ -2346,7 +2438,8 @@ mod tests {
         let aggregate_error = provider
             .acquire(
                 &fixture.locator,
-                &fixture.identity,
+                &fixture.identity.name,
+                &fixture.identity.version,
                 exact - 1,
                 exact_manifest,
                 &never_cancelled,
@@ -2362,7 +2455,8 @@ mod tests {
         let file_error = provider
             .acquire(
                 &fixture.locator,
-                &fixture.identity,
+                &fixture.identity.name,
+                &fixture.identity.version,
                 exact,
                 manifest_limit,
                 &never_cancelled,
@@ -2389,7 +2483,8 @@ mod tests {
             .provider()
             .acquire(
                 &fixture.locator,
-                &fixture.identity,
+                &fixture.identity.name,
+                &fixture.identity.version,
                 TEST_BYTES,
                 manifest_limit,
                 &never_cancelled,
@@ -2419,7 +2514,8 @@ mod tests {
             assert!(matches!(
                 provider.acquire(
                     &locator,
-                    &fixture.identity,
+                    &fixture.identity.name,
+                    &fixture.identity.version,
                     TEST_BYTES,
                     TEST_BYTES,
                     &never_cancelled
@@ -2442,7 +2538,8 @@ mod tests {
             assert!(matches!(
                 provider.acquire(
                     &locator,
-                    &fixture.identity,
+                    &fixture.identity.name,
+                    &fixture.identity.version,
                     TEST_BYTES,
                     TEST_BYTES,
                     &never_cancelled
@@ -2455,7 +2552,8 @@ mod tests {
         let error = provider
             .acquire(
                 &PackageLocator::Workspace { path: hostile },
-                &fixture.identity,
+                &fixture.identity.name,
+                &fixture.identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled,
@@ -2485,7 +2583,8 @@ mod tests {
                     &PackageLocator::Toolchain {
                         component: component.to_owned(),
                     },
-                    &fixture.core.identity,
+                    &fixture.core.identity.name,
+                    &fixture.core.identity.version,
                     TEST_BYTES,
                     TEST_BYTES,
                     &never_cancelled,
@@ -2498,7 +2597,8 @@ mod tests {
         let error = provider
             .acquire(
                 &PackageLocator::Toolchain { component: hostile },
-                &fixture.core.identity,
+                &fixture.core.identity.name,
+                &fixture.core.identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled,
@@ -2517,7 +2617,8 @@ mod tests {
         provider
             .acquire(
                 &fixture.core_locator,
-                &fixture.core.identity,
+                &fixture.core.identity.name,
+                &fixture.core.identity.version,
                 exact,
                 exact_manifest,
                 &never_cancelled,
@@ -2527,7 +2628,8 @@ mod tests {
             provider
                 .acquire(
                     &fixture.core_locator,
-                    &fixture.core.identity,
+                    &fixture.core.identity.name,
+                    &fixture.core.identity.version,
                     exact - 1,
                     exact_manifest,
                     &never_cancelled,
@@ -2539,7 +2641,8 @@ mod tests {
             provider
                 .acquire(
                     &fixture.core_locator,
-                    &fixture.core.identity,
+                    &fixture.core.identity.name,
+                    &fixture.core.identity.version,
                     TEST_BYTES,
                     TEST_BYTES,
                     &|| true,
@@ -2564,30 +2667,22 @@ mod tests {
 
     #[test]
     fn toolchain_acquisition_requires_exact_index_identity_locator_and_manifest() {
+        // There is no lockfile-supplied digest for a caller to request any
+        // more: the toolchain provider now matches its verified index by
+        // name and version alone, then independently verifies content
+        // against that index's own recorded digest -- a caller can no
+        // longer express "ask for a digest the index doesn't have."
         let fixture = ToolchainWorkspaceFixture::new();
         let provider = fixture.toolchain_provider();
 
-        let mut unindexed_identity = fixture.core.identity.clone();
-        unindexed_identity.source_digest = Sha256Digest::from_bytes([0x44; 32]);
-        assert_eq!(
-            provider
-                .acquire(
-                    &fixture.core_locator,
-                    &unindexed_identity,
-                    TEST_BYTES,
-                    TEST_BYTES,
-                    &never_cancelled,
-                )
-                .expect_err("unindexed source identity"),
-            ProviderError::IdentityMismatch
-        );
         assert_eq!(
             provider
                 .acquire(
                     &PackageLocator::Toolchain {
                         component: "secondary".to_owned(),
                     },
-                    &fixture.core.identity,
+                    &fixture.core.identity.name,
+                    &fixture.core.identity.version,
                     TEST_BYTES,
                     TEST_BYTES,
                     &never_cancelled,
@@ -2609,7 +2704,8 @@ mod tests {
             provider
                 .acquire(
                     &fixture.core_locator,
-                    &fixture.core.identity,
+                    &fixture.core.identity.name,
+                    &fixture.core.identity.version,
                     TEST_BYTES,
                     TEST_BYTES,
                     &never_cancelled,
@@ -2653,7 +2749,8 @@ mod tests {
         assert!(matches!(
             fixture.provider().acquire(
                 &fixture.locator,
-                &fixture.identity,
+                &fixture.identity.name,
+                &fixture.identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled
@@ -2686,7 +2783,8 @@ mod tests {
         assert!(matches!(
             provider.acquire(
                 &fixture.core_locator,
-                &fixture.core.identity,
+                &fixture.core.identity.name,
+                &fixture.core.identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled,
@@ -2770,7 +2868,8 @@ mod tests {
         let error = provider
             .acquire(
                 &fixture.core_locator,
-                &fixture.core.identity,
+                &fixture.core.identity.name,
+                &fixture.core.identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled,
@@ -2813,7 +2912,8 @@ mod tests {
             .provider()
             .acquire(
                 &fixture.locator,
-                &fixture.identity,
+                &fixture.identity.name,
+                &fixture.identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled,
@@ -2823,29 +2923,18 @@ mod tests {
     }
 
     #[test]
-    fn content_mutation_and_invalid_utf8_cannot_match_locked_identity() {
-        let fixture = WorkspaceFixture::new(SOURCE_TEXT.as_bytes());
-        fs::write(
-            &fixture.source_path,
-            b"fn mini() -> unit:\n    return ( )\n",
-        )
-        .expect("mutated source");
-        assert!(matches!(
-            fixture.provider().acquire(
-                &fixture.locator,
-                &fixture.identity,
-                TEST_BYTES,
-                TEST_BYTES,
-                &never_cancelled
-            ),
-            Err(ProviderError::Corrupt(_))
-        ));
-
+    fn invalid_utf8_source_content_is_rejected() {
+        // A workspace root's identity is no longer checked against any
+        // pre-recorded digest (there is no lockfile): mutated-but-valid
+        // source content just becomes a different computed identity, not an
+        // error. Non-UTF-8 source content is still rejected outright,
+        // independent of identity matching.
         let invalid = WorkspaceFixture::new(b"fn mini():\n    \xff\n");
         assert!(matches!(
             invalid.provider().acquire(
                 &invalid.locator,
-                &invalid.identity,
+                &invalid.identity.name,
+                &invalid.identity.version,
                 TEST_BYTES,
                 TEST_BYTES,
                 &never_cancelled
@@ -2855,19 +2944,21 @@ mod tests {
     }
 
     #[test]
-    fn package_identity_name_version_and_digest_are_all_enforced() {
+    fn package_identity_name_and_version_are_enforced() {
+        // There is no lockfile-recorded content digest any more, so a
+        // workspace root's `acquire` no longer takes or checks one -- its
+        // freshly computed digest simply becomes its identity. Only the
+        // requested name and version (known before any content is read) are
+        // enforced at this boundary.
         let fixture = WorkspaceFixture::new(SOURCE_TEXT.as_bytes());
         let provider = fixture.provider();
-        let wrong_name = PackageIdentity {
-            name: PackageName::new("other").expect("package name"),
-            version: fixture.identity.version.clone(),
-            source_digest: fixture.identity.source_digest,
-        };
+        let wrong_name = PackageName::new("other").expect("package name");
         assert_eq!(
             provider
                 .acquire(
                     &fixture.locator,
                     &wrong_name,
+                    &fixture.identity.version,
                     TEST_BYTES,
                     TEST_BYTES,
                     &never_cancelled,
@@ -2875,15 +2966,12 @@ mod tests {
                 .expect_err("name mismatch"),
             ProviderError::IdentityMismatch
         );
-        let wrong_version = PackageIdentity {
-            name: fixture.identity.name.clone(),
-            version: PackageVersion::new("1.0.1").expect("package version"),
-            source_digest: fixture.identity.source_digest,
-        };
+        let wrong_version = PackageVersion::new("1.0.1").expect("package version");
         assert_eq!(
             provider
                 .acquire(
                     &fixture.locator,
+                    &fixture.identity.name,
                     &wrong_version,
                     TEST_BYTES,
                     TEST_BYTES,
@@ -2892,21 +2980,6 @@ mod tests {
                 .expect_err("version mismatch"),
             ProviderError::IdentityMismatch
         );
-        let wrong_digest = PackageIdentity {
-            name: fixture.identity.name.clone(),
-            version: fixture.identity.version.clone(),
-            source_digest: Sha256Digest::from_bytes([0x55; 32]),
-        };
-        assert!(matches!(
-            provider.acquire(
-                &fixture.locator,
-                &wrong_digest,
-                TEST_BYTES,
-                TEST_BYTES,
-                &never_cancelled
-            ),
-            Err(ProviderError::Corrupt(_))
-        ));
     }
 
     #[test]
@@ -2952,7 +3025,17 @@ mod tests {
     #[test]
     fn parser_resource_limit_is_preserved_with_exact_file_identity() {
         let fixture = WorkspaceFixture::new(SOURCE_TEXT.as_bytes());
-        let service = LocalFrontendService::new(&fixture.directory.root).expect("frontend service");
+        let (standard_library_root, core) = write_core_package(
+            &fixture.directory,
+            b"module core\nfn core():\n    return \"core\"\n",
+        );
+        let workspace_provider =
+            LocalWorkspaceProvider::new(&fixture.directory.root).expect("workspace provider");
+        let toolchain_provider = core_toolchain_provider(&standard_library_root, &core);
+        let service = LocalFrontendService::with_package_provider(LocalPackageProvider::new(
+            workspace_provider,
+            toolchain_provider,
+        ));
         let mut parse_limits = ParseLimits::standard();
         parse_limits.tokens = 1;
         let error = service
@@ -2987,12 +3070,16 @@ mod tests {
             .replace("version = \"1.0.0\"", "version = \"1.0.1\"");
         fs::write(&fixture.manifest_path, mutated).expect("mutated root manifest");
 
+        // The root is acquired before the reserved `core` dependency, so this
+        // never needs `core_locator` to actually resolve.
         let error = CanonicalWorkspaceLoader::new()
             .load(
                 LoadRequest {
                     root_locator: fixture.locator.clone(),
                     root_manifest_bytes: &snapshot,
-                    lockfile_bytes: &fixture.lockfile_bytes,
+                    core_locator: PackageLocator::Toolchain {
+                        component: "unused".to_owned(),
+                    },
                     provider: &provider,
                     hasher: &SoftwareSha256,
                     codec: &CanonicalPackageCodec::new(),

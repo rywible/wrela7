@@ -899,7 +899,7 @@ pub enum BuildIntent<'a> {
 
 pub struct BuildPlanningRequest<'a> {
     /// Exact sealed package/source product; supplies language revision and
-    /// source-graph identity without re-reading either manifest or lockfile.
+    /// source-graph identity without re-reading the manifest.
     pub workspace: &'a LoadedWorkspace,
     /// Exact root-manifest image selected by the public command.
     pub image: &'a ImageDeclaration,

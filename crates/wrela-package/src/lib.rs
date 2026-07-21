@@ -22,8 +22,6 @@ pub const MAX_DEPENDENCIES_PER_PACKAGE: usize = 65_536;
 pub const MAX_MANIFEST_ERROR_VALUE_BYTES: usize = 256;
 /// Current TOML manifest schema.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
-/// Current canonical lockfile schema.
-pub const LOCKFILE_SCHEMA_VERSION: u32 = 1;
 
 /// Return whether `value` is exactly a revision 0.1 source identifier.
 ///
@@ -132,7 +130,9 @@ pub enum PackageLocator {
     Toolchain { component: String },
 }
 
-/// Dependency declaration before the canonical lockfile selects an identity.
+/// Dependency declaration before the loader resolves an identity directly
+/// from its locator (revision 0.1 has no lockfile: the manifest plus the
+/// toolchain-shipped core component fully determine the graph).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestDependency {
     pub alias: DependencyAlias,
@@ -278,105 +278,6 @@ impl PackageManifest {
     }
 }
 
-/// One resolved package in canonical lockfile order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LockedPackage {
-    pub identity: PackageIdentity,
-    pub locator: PackageLocator,
-    /// Aliases and exact identities of direct dependencies.
-    pub dependencies: Vec<LockedDependency>,
-    /// Digest of canonical manifest bytes within the acquired package.
-    pub manifest_digest: Sha256Digest,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LockedDependency {
-    pub alias: DependencyAlias,
-    pub identity: PackageIdentity,
-}
-
-/// Canonical `wrela.lock` model. The root entry is explicit and all transitive
-/// package bytes are pinned by digest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Lockfile {
-    pub schema: u32,
-    pub root: PackageIdentity,
-    pub packages: Vec<LockedPackage>,
-}
-
-impl Lockfile {
-    pub fn validate(&self) -> Result<(), ManifestError> {
-        if self.schema != LOCKFILE_SCHEMA_VERSION {
-            return Err(ManifestError::UnsupportedLockfileSchema(self.schema));
-        }
-        if self.packages.len() > MAX_PACKAGES {
-            return Err(ManifestError::TooManyLockedPackages {
-                count: self.packages.len(),
-                limit: MAX_PACKAGES,
-            });
-        }
-        if !self
-            .packages
-            .windows(2)
-            .all(|pair| pair[0].identity < pair[1].identity)
-        {
-            return Err(ManifestError::NonCanonicalOrder("locked package"));
-        }
-        let root_index = if let Ok(index) = self
-            .packages
-            .binary_search_by(|package| package.identity.cmp(&self.root))
-        {
-            index
-        } else {
-            return Err(ManifestError::MissingRootPackage);
-        };
-        for package in &self.packages {
-            validate_locator(&package.locator)?;
-            if !package
-                .dependencies
-                .windows(2)
-                .all(|pair| pair[0].alias < pair[1].alias)
-            {
-                return Err(ManifestError::NonCanonicalOrder("locked dependency"));
-            }
-            for dependency in &package.dependencies {
-                if self
-                    .packages
-                    .binary_search_by(|candidate| candidate.identity.cmp(&dependency.identity))
-                    .is_err()
-                {
-                    return Err(ManifestError::MissingLockedDependency {
-                        package: bounded_package_identity(&package.identity),
-                        dependency: bounded_package_identity(&dependency.identity),
-                    });
-                }
-            }
-        }
-        let mut reachable = vec![false; self.packages.len()];
-        let mut pending = VecDeque::with_capacity(self.packages.len());
-        reachable[root_index] = true;
-        pending.push_back(root_index);
-        while let Some(package_index) = pending.pop_front() {
-            for dependency in &self.packages[package_index].dependencies {
-                let dependency_index = self
-                    .packages
-                    .binary_search_by(|candidate| candidate.identity.cmp(&dependency.identity))
-                    .expect("locked dependency existence was validated above");
-                if !reachable[dependency_index] {
-                    reachable[dependency_index] = true;
-                    pending.push_back(dependency_index);
-                }
-            }
-        }
-        if let Some(unreachable_index) = reachable.iter().position(|reachable| !reachable) {
-            return Err(ManifestError::UnreachableLockedPackage {
-                package: bounded_package_identity(&self.packages[unreachable_index].identity),
-            });
-        }
-        Ok(())
-    }
-}
-
 /// Dense package identity within one build graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PackageId(pub u32);
@@ -498,8 +399,10 @@ impl ModulePath {
 }
 
 /// Revision 0.1 deliberately supports exact dependency requirements only.
-/// This keeps lockfile verification deterministic without an implicit package
-/// registry, range solver, prerelease policy, or update policy.
+/// This keeps direct resolution of the reserved `core` alias deterministic
+/// without an implicit package registry, range solver, prerelease policy, or
+/// update policy -- and, since there is no lockfile, without anything else to
+/// pin a choice a range could have left open.
 #[must_use]
 pub fn exact_requirement_version(requirement: &str) -> Option<PackageVersion> {
     let version = requirement.strip_prefix('=')?;
@@ -920,14 +823,6 @@ fn validate_declared_atom(value: &str, kind: &'static str) -> Result<(), Manifes
     Ok(())
 }
 
-fn bounded_package_identity(identity: &PackageIdentity) -> String {
-    bounded_manifest_error_value(&format!(
-        "{}@{}",
-        identity.name.as_str(),
-        identity.version.as_str()
-    ))
-}
-
 fn bounded_manifest_error_value(value: &str) -> String {
     if value.len() <= MAX_MANIFEST_ERROR_VALUE_BYTES {
         return value.to_owned();
@@ -943,13 +838,16 @@ fn bounded_manifest_error_value(value: &str) -> String {
     bounded
 }
 
-fn validate_locator(locator: &PackageLocator) -> Result<(), ManifestError> {
+/// Validate one locator's declared, driver-interpreted payload for portable
+/// well-formedness. This crate never dereferences a locator; the loader calls
+/// this before handing a locator to a provider.
+pub fn validate_locator(locator: &PackageLocator) -> Result<(), ManifestError> {
     match locator {
         // `.` is the sole canonical spelling for the package at the workspace
         // capability root (the ordinary public-CLI layout where `wrela.toml`
-        // and `wrela.lock` are siblings). It is handled as a marker, never as
-        // a path component. All other workspace locators use the portable
-        // relative-path contract and continue to reject dot components.
+        // lives). It is handled as a marker, never as a path component. All
+        // other workspace locators use the portable relative-path contract
+        // and continue to reject dot components.
         PackageLocator::Workspace { path } if path == "." => Ok(()),
         PackageLocator::Workspace { path } => validate_source_path(path),
         PackageLocator::Archive { provider, key } => {
@@ -965,12 +863,10 @@ fn validate_locator(locator: &PackageLocator) -> Result<(), ManifestError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestError {
     UnsupportedManifestSchema(u32),
-    UnsupportedLockfileSchema(u32),
     NonCanonicalOrder(&'static str),
     InvalidSourcePath(String),
     InvalidDependencyRequirement(String),
     TooManyDependencies,
-    TooManyLockedPackages { count: usize, limit: usize },
     InvalidProfile(String),
     InvalidSourceIdentifier { kind: &'static str, value: String },
     InvalidAtom { kind: &'static str, value: String },
@@ -978,9 +874,6 @@ pub enum ManifestError {
     UnsupportedImageTarget { image: String, target: String },
     InvalidTestLimits(String),
     UnknownTestImage(String),
-    MissingRootPackage,
-    MissingLockedDependency { package: String, dependency: String },
-    UnreachableLockedPackage { package: String },
 }
 
 impl fmt::Display for ManifestError {
@@ -988,9 +881,6 @@ impl fmt::Display for ManifestError {
         match self {
             Self::UnsupportedManifestSchema(schema) => {
                 write!(formatter, "unsupported manifest schema {schema}")
-            }
-            Self::UnsupportedLockfileSchema(schema) => {
-                write!(formatter, "unsupported lockfile schema {schema}")
             }
             Self::NonCanonicalOrder(kind) => {
                 write!(formatter, "{kind} entries are not strictly ordered")
@@ -1012,10 +902,6 @@ impl fmt::Display for ManifestError {
             Self::TooManyDependencies => write!(
                 formatter,
                 "manifest exceeds the dependency-count limit of {MAX_DEPENDENCIES_PER_PACKAGE}"
-            ),
-            Self::TooManyLockedPackages { count, limit } => write!(
-                formatter,
-                "lockfile contains {count} packages; limit is {limit}"
             ),
             Self::InvalidProfile(message) => write!(
                 formatter,
@@ -1060,23 +946,6 @@ impl fmt::Display for ManifestError {
                     bounded_manifest_error_value(image)
                 )
             }
-            Self::MissingRootPackage => {
-                formatter.write_str("lockfile does not contain its root package")
-            }
-            Self::MissingLockedDependency {
-                package,
-                dependency,
-            } => write!(
-                formatter,
-                "locked package {} refers to missing dependency {}",
-                bounded_manifest_error_value(package),
-                bounded_manifest_error_value(dependency)
-            ),
-            Self::UnreachableLockedPackage { package } => write!(
-                formatter,
-                "locked package {} is not reachable from the root package",
-                bounded_manifest_error_value(package)
-            ),
         }
     }
 }
@@ -1281,11 +1150,11 @@ mod tests {
 
     use super::{
         DependencyAlias, FORBIDDEN_IDENTIFIER_CODE_POINT_RANGES, GraphError, ImageDeclaration,
-        ImageTestDeclaration, LOCKFILE_SCHEMA_VERSION, LockedDependency, LockedPackage, Lockfile,
-        MANIFEST_SCHEMA_VERSION, MAX_MANIFEST_ERROR_VALUE_BYTES, ManifestError, ModulePath,
-        PackageGraphBuilder, PackageIdentity, PackageLocator, PackageManifest, PackageName,
-        PackageVersion, REVISION_0_1_KEYWORDS, bounded_manifest_error_value,
-        validate_declared_atom, validate_source_identifier, validate_source_path,
+        ImageTestDeclaration, MANIFEST_SCHEMA_VERSION, MAX_MANIFEST_ERROR_VALUE_BYTES,
+        ManifestError, ModulePath, PackageGraphBuilder, PackageIdentity, PackageLocator,
+        PackageManifest, PackageName, PackageVersion, REVISION_0_1_KEYWORDS,
+        bounded_manifest_error_value, validate_declared_atom, validate_locator,
+        validate_source_identifier, validate_source_path,
     };
 
     fn identity(name: &str) -> PackageIdentity {
@@ -1314,28 +1183,6 @@ mod tests {
                 profile: "development".to_owned(),
             }],
             image_tests: Vec::new(),
-        }
-    }
-
-    fn locked_package(
-        identity: PackageIdentity,
-        dependencies: Vec<LockedDependency>,
-    ) -> LockedPackage {
-        let path = format!("packages/{}", identity.name.as_str());
-        LockedPackage {
-            identity,
-            locator: PackageLocator::Workspace { path },
-            dependencies,
-            manifest_digest: Sha256Digest::from_bytes([0x42; 32]),
-        }
-    }
-
-    fn lockfile(root: PackageIdentity, mut packages: Vec<LockedPackage>) -> Lockfile {
-        packages.sort_by(|left, right| left.identity.cmp(&right.identity));
-        Lockfile {
-            schema: LOCKFILE_SCHEMA_VERSION,
-            root,
-            packages,
         }
     }
 
@@ -1491,56 +1338,6 @@ mod tests {
     }
 
     #[test]
-    fn lockfile_rejects_an_isolated_package() {
-        let root = identity("root");
-        let isolated = identity("isolated");
-        let lockfile = lockfile(
-            root.clone(),
-            vec![
-                locked_package(root, Vec::new()),
-                locked_package(isolated, Vec::new()),
-            ],
-        );
-        assert!(matches!(
-            lockfile.validate(),
-            Err(ManifestError::UnreachableLockedPackage { package })
-                if package == "isolated@1"
-        ));
-    }
-
-    #[test]
-    fn lockfile_rejects_a_disconnected_dependency_cycle() {
-        let root = identity("root");
-        let alpha = identity("alpha");
-        let beta = identity("beta");
-        let lockfile = lockfile(
-            root.clone(),
-            vec![
-                locked_package(root, Vec::new()),
-                locked_package(
-                    alpha.clone(),
-                    vec![LockedDependency {
-                        alias: DependencyAlias::new("beta").expect("beta alias"),
-                        identity: beta.clone(),
-                    }],
-                ),
-                locked_package(
-                    beta,
-                    vec![LockedDependency {
-                        alias: DependencyAlias::new("alpha").expect("alpha alias"),
-                        identity: alpha,
-                    }],
-                ),
-            ],
-        );
-        assert!(matches!(
-            lockfile.validate(),
-            Err(ManifestError::UnreachableLockedPackage { package })
-                if package == "alpha@1"
-        ));
-    }
-
-    #[test]
     fn every_revision_keyword_is_rejected_in_source_facing_manifest_names() {
         assert_eq!(REVISION_0_1_KEYWORDS.len(), 59);
         for keyword in REVISION_0_1_KEYWORDS {
@@ -1692,21 +1489,18 @@ mod tests {
 
     #[test]
     fn workspace_root_has_one_exact_locator_spelling() {
-        let root = identity("root");
-        let mut package = locked_package(root.clone(), Vec::new());
-        package.locator = PackageLocator::Workspace {
+        validate_locator(&PackageLocator::Workspace {
             path: ".".to_owned(),
-        };
-        lockfile(root.clone(), vec![package])
-            .validate()
-            .expect("exact workspace-root locator");
+        })
+        .expect("exact workspace-root locator");
 
         for path in ["", "..", "./child", "child/.", "child/../other"] {
-            let mut package = locked_package(root.clone(), Vec::new());
-            package.locator = PackageLocator::Workspace {
-                path: path.to_owned(),
-            };
-            assert!(lockfile(root.clone(), vec![package]).validate().is_err());
+            assert!(
+                validate_locator(&PackageLocator::Workspace {
+                    path: path.to_owned(),
+                })
+                .is_err()
+            );
         }
     }
 }

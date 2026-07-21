@@ -133,7 +133,6 @@ impl std::error::Error for OutcomeError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSelection {
     pub manifest: PathBuf,
-    pub lockfile: PathBuf,
     pub image: String,
     pub target: TargetIdentity,
     pub profile: String,

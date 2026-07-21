@@ -655,7 +655,6 @@ impl HeadlessCheckExecutor {
         let command = Command::Check {
             workspace: WorkspaceSelection {
                 manifest: sealed.root.join_path(&request.manifest)?,
-                lockfile: sealed.root.join_path(&request.lockfile)?,
                 image: try_copy_string(&request.image).map_err(|()| {
                     HeadlessCheckError::Materialization("image selection allocation failed")
                 })?,
@@ -2461,7 +2460,7 @@ mod tests {
     ) -> (CheckRequest, ClientHello, Vec<TreeRecord>, Vec<Vec<u8>>) {
         let path = format!("{}/data.wr", vec!["a"; depth].join("/"));
         let contents = vec![b"x".to_vec(), b"l".to_vec(), b"m".to_vec()];
-        let paths = [path.as_str(), "wrela.lock", "wrela.toml"];
+        let paths = [path.as_str(), "extra.bin", "wrela.toml"];
         let records = paths
             .into_iter()
             .zip(&contents)
@@ -2483,7 +2482,6 @@ mod tests {
                 engine_identity: sha256(b"deep engine", &|| false).expect("engine digest"),
                 payload_identity,
                 manifest: EnginePath::new("wrela.toml").expect("manifest path"),
-                lockfile: EnginePath::new("wrela.lock").expect("lock path"),
                 image: "bootstrap".to_owned(),
                 target: wrela_build_model::TargetIdentity::aarch64_qemu_virt_uefi(),
                 profile: "development".to_owned(),

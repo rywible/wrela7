@@ -23,8 +23,8 @@ use wrela_package::{
 };
 use wrela_package_loader::{
     CanonicalPackageCodec, CanonicalTreeLimits, CanonicalTreeRecord, ContentHasher,
-    LockfileCodecLimits, ManifestCodecLimits, PackageCodec, PackageContentKind,
-    PackageContentRecord, SoftwareSha256, canonical_tree_digest, package_content_digest,
+    ManifestCodecLimits, PackageCodec, PackageContentKind, PackageContentRecord, SoftwareSha256,
+    canonical_tree_digest, package_content_digest,
 };
 use wrela_toolchain::{
     CanonicalToolchainManifestCodec, ComponentKind, ComponentPath, REQUIRED_LLVM_PROJECT_REVISION,
@@ -42,8 +42,6 @@ const APPLICATION_MANIFEST: &[u8] =
     include_bytes!("../../../std/examples/minimal-image/wrela.toml");
 const APPLICATION_SOURCE: &[u8] =
     include_bytes!("../../../std/examples/minimal-image/src/bootstrap/image.wr");
-const APPLICATION_LOCKFILE: &[u8] =
-    include_bytes!("../../../std/examples/minimal-image/wrela.lock");
 const TARGET_MANIFEST: &[u8] =
     include_bytes!("../../../toolchain/targets/aarch64-qemu-virt-uefi/target.toml");
 const BACKEND_BYTES: &[u8] = b"headless check fixture backend";
@@ -75,10 +73,8 @@ fn real_headless_workspace_accepts_the_exact_declared_comptime_bound_determinist
     let toolchain = install_current_toolchain(&fixture);
     let staging = fixture.private_directory("staging");
     let identities = Identities::new();
-    let lockfile = current_application_lockfile(APPLICATION_SOURCE);
     let passing = CapturedRequest::new(
         APPLICATION_MANIFEST,
-        &lockfile,
         APPLICATION_SOURCE,
         exact_resources(),
         identities,
@@ -122,26 +118,14 @@ fn real_headless_workspace_accepts_the_exact_declared_comptime_bound_determinist
 }
 
 #[test]
-fn frozen_minimal_image_lockfile_matches_the_derived_current_identity_exactly() {
-    let derived = current_application_lockfile(APPLICATION_SOURCE);
-    assert_eq!(derived, APPLICATION_LOCKFILE);
-    assert_eq!(
-        digest(&derived).to_hex(),
-        "3de3624cdd4a9282551f9bb1f6cb06e84630061fbdb2c6e005d4948a8d31df6b"
-    );
-}
-
-#[test]
 fn real_headless_source_rejection_retains_stable_source_location() {
     let fixture = TestDirectory::new();
     let toolchain = install_current_toolchain(&fixture);
     let staging = fixture.private_directory("staging");
     let identities = Identities::new();
     let invalid_source = b"module bootstrap.image\n\nthis is not valid Wrela source\n";
-    let lockfile = current_application_lockfile(invalid_source);
     let rejected = CapturedRequest::new(
         APPLICATION_MANIFEST,
-        &lockfile,
         invalid_source,
         exact_resources(),
         identities,
@@ -190,10 +174,8 @@ fn callback_cancellation_returns_a_canonical_terminal_without_toolchain_io() {
     let fixture = TestDirectory::new();
     let staging = fixture.private_directory("staging");
     let identities = Identities::new();
-    let lockfile = current_application_lockfile(APPLICATION_SOURCE);
     let cancelled = CapturedRequest::new(
         APPLICATION_MANIFEST,
-        &lockfile,
         APPLICATION_SOURCE,
         exact_resources(),
         identities,
@@ -213,10 +195,8 @@ fn sealed_execution_and_exact_late_cancel_control_are_independent() {
     let fixture = TestDirectory::new();
     let staging = fixture.private_directory("staging");
     let identities = Identities::new();
-    let lockfile = current_application_lockfile(APPLICATION_SOURCE);
     let captured = CapturedRequest::new(
         APPLICATION_MANIFEST,
-        &lockfile,
         APPLICATION_SOURCE,
         exact_resources(),
         identities,
@@ -278,11 +258,9 @@ fn one_step_below_the_declared_profile_bound_is_a_resource_limit() {
     let fixture = TestDirectory::new();
     let staging = fixture.private_directory("staging");
     let identities = Identities::new();
-    let lockfile = current_application_lockfile(APPLICATION_SOURCE);
     let exact = exact_resources();
     let over_bound = CapturedRequest::new(
         APPLICATION_MANIFEST,
-        &lockfile,
         APPLICATION_SOURCE,
         EngineResourcePolicy {
             comptime_steps: exact.comptime_steps - 1,
@@ -301,15 +279,22 @@ fn one_step_below_the_declared_profile_bound_is_a_resource_limit() {
 }
 
 #[test]
-fn deliberately_stale_canonical_lockfile_fails_closed_as_workspace_input() {
+fn unavailable_declared_core_version_fails_closed_as_workspace_input() {
+    // There is no lockfile any more, so there is nothing recorded to go
+    // "stale": the equivalent revision-0.1 fail-closed workspace-input case
+    // is a manifest whose declared `core` version the installed toolchain
+    // does not ship (`docs/language/02-source-language.md` §2.1) -- the
+    // loader can never resolve it, regardless of what the sources say.
     let fixture = TestDirectory::new();
     let toolchain = install_current_toolchain(&fixture);
     let staging = fixture.private_directory("staging");
     let identities = Identities::new();
-    let stale_lockfile = deliberately_stale_application_lockfile(APPLICATION_SOURCE);
+    let unavailable_core_manifest = String::from_utf8(APPLICATION_MANIFEST.to_vec())
+        .expect("UTF-8 application manifest")
+        .replacen("requirement = \"=0.1.0\"", "requirement = \"=9.9.9\"", 1)
+        .into_bytes();
     let captured = CapturedRequest::new(
-        APPLICATION_MANIFEST,
-        &stale_lockfile,
+        &unavailable_core_manifest,
         APPLICATION_SOURCE,
         exact_resources(),
         identities,
@@ -330,7 +315,7 @@ fn deliberately_stale_canonical_lockfile_fails_closed_as_workspace_input() {
             } => Some((code, path, line, column)),
             _ => None,
         })
-        .expect("stale lockfile diagnostic");
+        .expect("unavailable core version diagnostic");
     assert_eq!(diagnostic.0, "engine-workspace-input");
     assert!(diagnostic.1.is_none());
     assert_eq!((*diagnostic.2, *diagnostic.3), (0, 0));
@@ -341,10 +326,8 @@ fn mid_input_protocol_cancel_discards_partial_tree_and_returns_canonical_termina
     let fixture = TestDirectory::new();
     let staging = fixture.private_directory("staging");
     let identities = Identities::new();
-    let lockfile = current_application_lockfile(APPLICATION_SOURCE);
     let captured = CapturedRequest::new(
         APPLICATION_MANIFEST,
-        &lockfile,
         APPLICATION_SOURCE,
         EngineResourcePolicy::check_standard(),
         identities,
@@ -404,10 +387,8 @@ fn corrupt_input_frame_poisoning_cleans_the_partial_private_tree() {
     let fixture = TestDirectory::new();
     let staging = fixture.private_directory("staging");
     let identities = Identities::new();
-    let lockfile = current_application_lockfile(APPLICATION_SOURCE);
     let captured = CapturedRequest::new(
         APPLICATION_MANIFEST,
-        &lockfile,
         APPLICATION_SOURCE,
         exact_resources(),
         identities,
@@ -558,18 +539,13 @@ struct CapturedRequest {
 impl CapturedRequest {
     fn new(
         manifest: &[u8],
-        lockfile: &[u8],
         source: &[u8],
         resources: EngineResourcePolicy,
         identities: Identities,
         nonce_byte: u8,
     ) -> Self {
         let limits = EngineProtocolLimits::standard();
-        let files = [
-            ("src/bootstrap/image.wr", source),
-            ("wrela.lock", lockfile),
-            ("wrela.toml", manifest),
-        ];
+        let files = [("src/bootstrap/image.wr", source), ("wrela.toml", manifest)];
         let records = files
             .iter()
             .map(|(path, bytes)| TreeRecord {
@@ -585,7 +561,6 @@ impl CapturedRequest {
                 engine_identity: identities.engine,
                 payload_identity: identities.payload,
                 manifest: EnginePath::new("wrela.toml").expect("manifest path"),
-                lockfile: EnginePath::new("wrela.lock").expect("lock path"),
                 image: "bootstrap".to_owned(),
                 target: TargetIdentity::aarch64_qemu_virt_uefi(),
                 profile: "development".to_owned(),
@@ -742,90 +717,6 @@ fn current_core_identity() -> PackageIdentity {
             ("time.wr", CORE_TIME_SOURCE),
         ],
     )
-}
-
-fn current_application_lockfile(source: &[u8]) -> Vec<u8> {
-    let codec = CanonicalPackageCodec::new();
-    let limits = LockfileCodecLimits {
-        bytes: MAX_FIXTURE_FILE_BYTES as u64,
-        string_bytes: MAX_FIXTURE_FILE_BYTES as u64,
-        packages: 16,
-        dependencies: 16,
-    };
-    let mut lockfile = codec
-        .decode_lockfile(APPLICATION_LOCKFILE, limits, &|| false)
-        .expect("checked-in application lockfile");
-    let core = current_core_identity();
-    let application_digest = application_source_digest(source);
-    lockfile.root.source_digest = application_digest;
-    for package in &mut lockfile.packages {
-        if package.identity.name == lockfile.root.name
-            && package.identity.version == lockfile.root.version
-        {
-            package.identity.source_digest = application_digest;
-        }
-        if package.identity.name == core.name && package.identity.version == core.version {
-            package.identity.source_digest = core.source_digest;
-        }
-        for dependency in &mut package.dependencies {
-            if dependency.identity.name == core.name && dependency.identity.version == core.version
-            {
-                dependency.identity.source_digest = core.source_digest;
-            }
-        }
-    }
-    let bytes = codec
-        .canonical_lockfile(&lockfile, limits, &|| false)
-        .expect("current canonical application lockfile");
-    let decoded = codec
-        .decode_lockfile(&bytes, limits, &|| false)
-        .expect("decode derived application lockfile");
-    assert_eq!(
-        codec
-            .canonical_lockfile(&decoded, limits, &|| false)
-            .expect("re-encode derived application lockfile"),
-        bytes
-    );
-    bytes
-}
-
-fn deliberately_stale_application_lockfile(source: &[u8]) -> Vec<u8> {
-    let codec = CanonicalPackageCodec::new();
-    let limits = LockfileCodecLimits {
-        bytes: MAX_FIXTURE_FILE_BYTES as u64,
-        string_bytes: MAX_FIXTURE_FILE_BYTES as u64,
-        packages: 16,
-        dependencies: 16,
-    };
-    let current = current_application_lockfile(source);
-    let mut lockfile = codec
-        .decode_lockfile(&current, limits, &|| false)
-        .expect("current application lockfile");
-    let stale = digest(b"deliberately stale application source identity");
-    lockfile.root.source_digest = stale;
-    for package in &mut lockfile.packages {
-        if package.identity.name == lockfile.root.name
-            && package.identity.version == lockfile.root.version
-        {
-            package.identity.source_digest = stale;
-        }
-    }
-    let bytes = codec
-        .canonical_lockfile(&lockfile, limits, &|| false)
-        .expect("deliberately stale canonical lockfile");
-    assert_eq!(
-        codec
-            .canonical_lockfile(
-                &codec
-                    .decode_lockfile(&bytes, limits, &|| false)
-                    .expect("decode deliberately stale lockfile"),
-                limits,
-                &|| false,
-            )
-            .expect("re-encode deliberately stale lockfile"),
-        bytes
-    );
-    bytes
 }
 
 fn application_source_digest(source: &[u8]) -> Sha256Digest {

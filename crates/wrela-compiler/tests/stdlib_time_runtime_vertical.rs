@@ -41,13 +41,10 @@ use wrela_link_efi::{
     CoffObjectInspector, CoffObjectKind, EfiLinker, LinkError, LinkLimits, LinkRequest,
     LldEfiLinker,
 };
-use wrela_package::{
-    DependencyAlias, LOCKFILE_SCHEMA_VERSION, LockedDependency, LockedPackage, Lockfile,
-    ModulePath, PackageGraphBuilder, PackageIdentity, PackageLocator,
-};
+use wrela_package::{DependencyAlias, ModulePath, PackageGraphBuilder, PackageIdentity};
 use wrela_package_loader::{
-    CanonicalPackageCodec, ContentHasher, LockfileCodecLimits, ManifestCodecLimits, PackageCodec,
-    PackageContentKind, PackageContentRecord, SoftwareSha256, package_content_digest,
+    CanonicalPackageCodec, ContentHasher, ManifestCodecLimits, PackageCodec, PackageContentKind,
+    PackageContentRecord, SoftwareSha256, package_content_digest,
 };
 use wrela_sema::{
     AnalysisChangeSet, AnalysisLimits, AnalysisMode, AnalysisRequest, CanonicalSemanticAnalyzer,
@@ -65,8 +62,6 @@ use wrela_toolchain::Toolchain;
 
 const WORKSPACE_MANIFEST: &[u8] =
     include_bytes!("../../../std/examples/stdlib-time-runtime/wrela.toml");
-const WORKSPACE_LOCKFILE: &[u8] =
-    include_bytes!("../../../std/examples/stdlib-time-runtime/wrela.lock");
 const APPLICATION_SOURCE: &str =
     include_str!("../../../std/examples/stdlib-time-runtime/src/runtime/time_test.wr");
 const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.toml");
@@ -100,22 +95,12 @@ struct SourceFixture {
 #[test]
 fn checked_in_runtime_workspace_is_canonical_and_names_two_exact_source_tests() {
     assert!(SOURCE_PATHS.windows(2).all(|pair| pair[0] < pair[1]));
-    let (manifest, root_identity, canonical_lockfile) = canonical_workspace();
+    let (manifest, _root_identity) = canonical_workspace();
     assert_eq!(manifest.name.as_str(), IMAGE_NAME);
     assert_eq!(manifest.images.len(), 1);
     assert_eq!(manifest.images[0].name, IMAGE_NAME);
     assert_eq!(manifest.images[0].entry, "boot");
     assert_eq!(manifest.images[0].module.dotted(), "runtime.time_test");
-    assert_eq!(
-        canonical_lockfile,
-        WORKSPACE_LOCKFILE,
-        "checked-in runtime lockfile is stale; canonical bytes were:\n{}",
-        String::from_utf8_lossy(&canonical_lockfile)
-    );
-    let decoded = CanonicalPackageCodec::new()
-        .decode_lockfile(WORKSPACE_LOCKFILE, lockfile_limits(), &never_cancelled)
-        .expect("checked-in runtime lockfile");
-    assert_eq!(decoded.root, root_identity);
 
     for selector in [PASS_SELECTOR, FAILURE_SELECTOR] {
         assert_eq!(
@@ -998,7 +983,6 @@ fn cancelled_public_test_driver_creates_no_output_or_artifact() {
     )
     .expect("canonical runtime manifest");
     let workspace = WorkspaceSelection {
-        lockfile: manifest.with_file_name("wrela.lock"),
         manifest,
         image: IMAGE_NAME.to_owned(),
         target: TargetIdentity::aarch64_qemu_virt_uefi(),
@@ -1303,7 +1287,7 @@ fn analysis_build(
     (build, TargetPackage::aarch64_qemu_virt_uefi(target_digest))
 }
 
-fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Vec<u8>) {
+fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity) {
     let codec = CanonicalPackageCodec::new();
     let manifest = codec
         .decode_manifest(WORKSPACE_MANIFEST, manifest_limits(), &never_cancelled)
@@ -1339,7 +1323,12 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
         )
         .expect("runtime package identity"),
     };
-    let core_identity = PackageIdentity {
+    // There is no lockfile to also cross-check against; computing the core
+    // package's identity still exercises that its checked-in manifest and
+    // sources hash without error, exactly as the loader itself would
+    // independently do when it resolves the reserved `core` alias via the
+    // toolchain rather than a recorded locator.
+    let _core_identity = PackageIdentity {
         name: core_manifest.name.clone(),
         version: core_manifest.version.clone(),
         source_digest: package_content_digest(
@@ -1355,43 +1344,7 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
         )
         .expect("core package identity"),
     };
-    let mut packages = vec![
-        LockedPackage {
-            identity: root_identity.clone(),
-            locator: PackageLocator::Workspace {
-                path: ".".to_owned(),
-            },
-            dependencies: vec![LockedDependency {
-                alias: DependencyAlias::new("core").expect("core alias"),
-                identity: core_identity.clone(),
-            }],
-            manifest_digest: HASHER.sha256(&canonical_manifest),
-        },
-        LockedPackage {
-            identity: core_identity,
-            locator: PackageLocator::Toolchain {
-                component: "wrela-core-0.1".to_owned(),
-            },
-            dependencies: Vec::new(),
-            manifest_digest: HASHER.sha256(&canonical_core_manifest),
-        },
-    ];
-    packages.sort_by(|left, right| left.identity.cmp(&right.identity));
-    let lockfile = Lockfile {
-        schema: LOCKFILE_SCHEMA_VERSION,
-        root: root_identity.clone(),
-        packages,
-    };
-    let canonical_lockfile = codec
-        .canonical_lockfile(&lockfile, lockfile_limits(), &never_cancelled)
-        .expect("canonical runtime lockfile");
-    assert_eq!(
-        codec
-            .decode_lockfile(&canonical_lockfile, lockfile_limits(), &never_cancelled)
-            .expect("round-trip runtime lockfile"),
-        lockfile
-    );
-    (manifest, root_identity, canonical_lockfile)
+    (manifest, root_identity)
 }
 
 fn add_source(sources: &mut SourceDatabase, path: &str, text: &str) -> FileId {
@@ -1421,15 +1374,6 @@ fn manifest_limits() -> ManifestCodecLimits {
         profiles: 16,
         images: 16,
         image_tests: 16,
-    }
-}
-
-fn lockfile_limits() -> LockfileCodecLimits {
-    LockfileCodecLimits {
-        bytes: 1024 * 1024,
-        string_bytes: 1024 * 1024,
-        packages: 16,
-        dependencies: 16,
     }
 }
 

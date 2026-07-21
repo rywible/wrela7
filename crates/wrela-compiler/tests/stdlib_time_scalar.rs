@@ -25,14 +25,14 @@ use wrela_hir_lower::{
     LoweringLimits as HirLoweringLimits,
 };
 use wrela_package::{
-    DependencyAlias, LOCKFILE_SCHEMA_VERSION, LockedDependency, LockedPackage, Lockfile,
-    ModulePath, PackageGraphBuilder, PackageIdentity, PackageLocator,
+    DependencyAlias, ModulePath, PackageGraphBuilder, PackageIdentity, PackageLocator, PackageName,
+    PackageVersion,
 };
 use wrela_package_loader::{
     CanonicalPackageCodec, CanonicalWorkspaceLoader, ContentHasher, LoadLimits, LoadRequest,
-    LoadedWorkspace, LockfileCodecLimits, ManifestCodecLimits, PackageBundle, PackageCodec,
-    PackageContentKind, PackageContentRecord, PackageSourceProvider, ProviderError, SoftwareSha256,
-    WorkspaceLoader, package_content_digest,
+    LoadedWorkspace, ManifestCodecLimits, PackageBundle, PackageCodec, PackageContentKind,
+    PackageContentRecord, PackageSourceProvider, ProviderError, SoftwareSha256, WorkspaceLoader,
+    package_content_digest,
 };
 use wrela_sema::{
     AnalysisChangeSet, AnalysisFailure, AnalysisLimits, AnalysisMode, AnalysisRequest,
@@ -50,8 +50,6 @@ use wrela_test_model::{FailurePhase, TestOutcome};
 
 const WORKSPACE_MANIFEST: &[u8] =
     include_bytes!("../../../std/examples/stdlib-time-scalar/wrela.toml");
-const WORKSPACE_LOCKFILE: &[u8] =
-    include_bytes!("../../../std/examples/stdlib-time-scalar/wrela.lock");
 const IMAGE_SOURCE: &str =
     include_str!("../../../std/examples/stdlib-time-scalar/src/conformance/image.wr");
 const PASSING_TEST_SOURCE: &str = include_str!(
@@ -165,16 +163,9 @@ struct SourceFixture {
 
 #[test]
 fn checked_in_time_scalar_workspace_is_canonical_and_exact_bounds_pass() {
-    let (manifest, root_identity, canonical_lockfile) = canonical_workspace();
-    assert_eq!(
-        canonical_lockfile,
-        WORKSPACE_LOCKFILE,
-        "checked-in workspace lockfile is stale; canonical bytes were:\n{}",
-        String::from_utf8_lossy(&canonical_lockfile)
-    );
+    let (manifest, root_identity) = canonical_workspace();
 
     let workspace = load_checked_in_workspace();
-    assert_eq!(workspace.canonical_lockfile(), WORKSPACE_LOCKFILE);
     assert_eq!(workspace.graph().packages().len(), 2);
     assert_eq!(workspace.graph().modules().len(), 6);
     assert_eq!(workspace.sources().len(), 6);
@@ -193,7 +184,6 @@ fn checked_in_time_scalar_workspace_is_canonical_and_exact_bounds_pass() {
         root_module_paths,
         ["conformance.duration_scalar_test", "conformance.image"]
     );
-    assert_eq!(workspace.lockfile().root, root_identity);
     let fixture = loaded_source_fixture(workspace, root_identity, manifest.profiles[0].clone());
     let first = analyze(&fixture, TestDiscoverySelection::Comptime);
     assert!(
@@ -331,7 +321,7 @@ fn installed_duration_arithmetic_rejects_exactly_one_over_bounds() {
     // representable bound now fails with a code-prefixed
     // `semantic-comptime-arithmetic` overflow, not an assertion-style
     // message.
-    let (manifest, root_identity, _) = canonical_workspace();
+    let (manifest, root_identity) = canonical_workspace();
     for (test_source, arithmetic, call) in [
         (
             ADD_OVER_BOUND_TEST_SOURCE,
@@ -377,7 +367,7 @@ fn installed_duration_arithmetic_rejects_exactly_one_over_bounds() {
 
 #[test]
 fn installed_duration_subtraction_rejects_underflow_without_wrapping() {
-    let (manifest, root_identity, _) = canonical_workspace();
+    let (manifest, root_identity) = canonical_workspace();
     let fixture = source_fixture(
         SUBTRACT_UNDERFLOW_TEST_SOURCE,
         root_identity,
@@ -417,7 +407,7 @@ fn installed_duration_subtraction_rejects_underflow_without_wrapping() {
 
 #[test]
 fn installed_duration_clamp_rejects_inverted_bounds() {
-    let (manifest, root_identity, _) = canonical_workspace();
+    let (manifest, root_identity) = canonical_workspace();
     let fixture = source_fixture(
         CLAMP_INVERTED_BOUNDS_TEST_SOURCE,
         root_identity,
@@ -455,7 +445,7 @@ fn installed_duration_clamp_rejects_inverted_bounds() {
 
 #[test]
 fn installed_duration_arithmetic_unsupported_operation_fails_closed() {
-    let (manifest, root_identity, _) = canonical_workspace();
+    let (manifest, root_identity) = canonical_workspace();
     let fixture = source_fixture(
         UNSUPPORTED_ARITHMETIC_TEST_SOURCE,
         root_identity,
@@ -494,7 +484,7 @@ fn real_imported_unit_conversions_reject_exactly_one_over_bound() {
     // exactly one nanosecond over the representable bound now fails with a
     // code-prefixed `semantic-comptime-arithmetic` overflow, not an
     // assertion-style message.
-    let (manifest, root_identity, _) = canonical_workspace();
+    let (manifest, root_identity) = canonical_workspace();
     for (test_source, arithmetic, call) in [
         (
             OVER_BOUND_TEST_SOURCE,
@@ -559,7 +549,7 @@ fn real_imported_unit_conversions_reject_exactly_one_over_bound() {
 
 #[test]
 fn installed_duration_arithmetic_has_exact_resources_and_cancellation() {
-    let (manifest, root_identity, _) = canonical_workspace();
+    let (manifest, root_identity) = canonical_workspace();
     let workspace = load_checked_in_workspace();
     let fixture = loaded_source_fixture(workspace, root_identity, manifest.profiles[0].clone());
 
@@ -726,7 +716,7 @@ fn subtraction_outcome(
 
 #[test]
 fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellation() {
-    let (manifest, root_identity, _) = canonical_workspace();
+    let (manifest, root_identity) = canonical_workspace();
     let fixture = loaded_source_fixture(
         load_checked_in_workspace(),
         root_identity.clone(),
@@ -846,7 +836,7 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
 
 #[test]
 fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
-    let (manifest, root_identity, _) = canonical_workspace();
+    let (manifest, root_identity) = canonical_workspace();
     let fixture = loaded_source_fixture(
         load_checked_in_workspace(),
         root_identity.clone(),
@@ -974,7 +964,7 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
 
 #[test]
 fn installed_runtime_duration_functions_reach_canonical_machine_and_native_object() {
-    let (manifest, root_identity, _) = canonical_workspace();
+    let (manifest, root_identity) = canonical_workspace();
     let workspace = load_checked_in_workspace();
     let fixture = loaded_source_fixture(workspace, root_identity, manifest.profiles[0].clone());
     let discovery = analyze(
@@ -1459,7 +1449,7 @@ fn expected_runtime_call_edges() -> Vec<(String, String)> {
     edges
 }
 
-fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Vec<u8>) {
+fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity) {
     let codec = CanonicalPackageCodec::new();
     let manifest = codec
         .decode_manifest(WORKSPACE_MANIFEST, manifest_limits(), &never_cancelled)
@@ -1498,7 +1488,12 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
         )
         .expect("time-scalar package identity"),
     };
-    let core_identity = PackageIdentity {
+    // There is no lockfile to also cross-check against; computing the core
+    // package's identity still exercises that its checked-in manifest and
+    // sources hash without error, exactly as the loader itself would
+    // independently do when it resolves the reserved `core` alias via the
+    // toolchain rather than a recorded locator.
+    let _core_identity = PackageIdentity {
         name: core_manifest.name.clone(),
         version: core_manifest.version.clone(),
         source_digest: package_content_digest(
@@ -1514,41 +1509,7 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
         )
         .expect("core package identity"),
     };
-    let mut packages = vec![
-        LockedPackage {
-            identity: root_identity.clone(),
-            locator: PackageLocator::Workspace {
-                path: ".".to_owned(),
-            },
-            dependencies: vec![LockedDependency {
-                alias: DependencyAlias::new("core").expect("core alias"),
-                identity: core_identity.clone(),
-            }],
-            manifest_digest: HASHER.sha256(&canonical_manifest),
-        },
-        LockedPackage {
-            identity: core_identity,
-            locator: PackageLocator::Toolchain {
-                component: "wrela-core-0.1".to_owned(),
-            },
-            dependencies: Vec::new(),
-            manifest_digest: HASHER.sha256(&canonical_core_manifest),
-        },
-    ];
-    packages.sort_by(|left, right| left.identity.cmp(&right.identity));
-    let lockfile = Lockfile {
-        schema: LOCKFILE_SCHEMA_VERSION,
-        root: root_identity.clone(),
-        packages,
-    };
-    let canonical_lockfile = codec
-        .canonical_lockfile(&lockfile, lockfile_limits(), &never_cancelled)
-        .expect("canonical time-scalar lockfile");
-    let decoded_lockfile = codec
-        .decode_lockfile(&canonical_lockfile, lockfile_limits(), &never_cancelled)
-        .expect("round-trip time-scalar lockfile");
-    assert_eq!(decoded_lockfile, lockfile);
-    (manifest, root_identity, canonical_lockfile)
+    (manifest, root_identity)
 }
 
 fn source_fixture(
@@ -1728,7 +1689,8 @@ impl PackageSourceProvider for CheckedInProvider {
     fn acquire(
         &self,
         locator: &PackageLocator,
-        expected: &PackageIdentity,
+        expected_name: &PackageName,
+        expected_version: &PackageVersion,
         maximum_bytes: u64,
         maximum_manifest_bytes: u64,
         is_cancelled: &dyn Fn() -> bool,
@@ -1741,7 +1703,7 @@ impl PackageSourceProvider for CheckedInProvider {
             .iter()
             .find(|bundle| &bundle.locator == locator)
             .ok_or_else(|| ProviderError::Unavailable("unknown fixture locator".to_owned()))?;
-        if &bundle.identity != expected {
+        if &bundle.identity.name != expected_name || &bundle.identity.version != expected_version {
             return Err(ProviderError::IdentityMismatch);
         }
         let manifest_bytes = u64::try_from(bundle.manifest_bytes.len()).unwrap_or(u64::MAX);
@@ -1765,55 +1727,83 @@ impl PackageSourceProvider for CheckedInProvider {
     }
 }
 
+/// Build a [`PackageBundle`] whose identity is exactly what the loader will
+/// independently recompute from `sources` and the manifest's canonical
+/// bytes -- there is no lockfile to instead read a recorded identity from.
+fn checked_in_bundle(
+    codec: &CanonicalPackageCodec,
+    manifest_bytes: &'static [u8],
+    locator: PackageLocator,
+    sources: Vec<SourceInput>,
+) -> PackageBundle {
+    let manifest = codec
+        .decode_manifest(manifest_bytes, manifest_limits(), &never_cancelled)
+        .expect("checked-in manifest");
+    let canonical_manifest = codec
+        .canonical_manifest(&manifest, manifest_limits(), &never_cancelled)
+        .expect("canonical checked-in manifest");
+    let mut records: Vec<PackageContentRecord<'_>> = sources
+        .iter()
+        .map(|source| PackageContentRecord {
+            kind: PackageContentKind::Source,
+            path: source.path.as_str(),
+            digest: source.digest,
+        })
+        .collect();
+    records.sort_by_key(|record| (record.kind, record.path));
+    let source_digest =
+        package_content_digest(&canonical_manifest, &records, &HASHER, &never_cancelled)
+            .expect("checked-in package content digest");
+    PackageBundle {
+        identity: PackageIdentity {
+            name: manifest.name,
+            version: manifest.version,
+            source_digest,
+        },
+        locator,
+        manifest_bytes: manifest_bytes.to_vec(),
+        sources,
+        scenarios: Vec::new(),
+    }
+}
+
 fn load_checked_in_workspace() -> LoadedWorkspace {
     let codec = CanonicalPackageCodec::new();
-    let lockfile = codec
-        .decode_lockfile(WORKSPACE_LOCKFILE, lockfile_limits(), &never_cancelled)
-        .expect("checked-in time-scalar lockfile");
-    let root = lockfile
-        .packages
-        .iter()
-        .find(|package| package.identity == lockfile.root)
-        .expect("locked time-scalar root");
-    let core = lockfile
-        .packages
-        .iter()
-        .find(|package| package.identity.name.as_str() == "wrela-core")
-        .expect("locked core package");
-    let provider = CheckedInProvider {
-        bundles: vec![
-            PackageBundle {
-                identity: root.identity.clone(),
-                locator: root.locator.clone(),
-                manifest_bytes: WORKSPACE_MANIFEST.to_vec(),
-                sources: vec![
-                    source_input("conformance/duration_scalar_test.wr", PASSING_TEST_SOURCE),
-                    source_input("conformance/image.wr", IMAGE_SOURCE),
-                ],
-                scenarios: Vec::new(),
-            },
-            PackageBundle {
-                identity: core.identity.clone(),
-                locator: core.locator.clone(),
-                manifest_bytes: CORE_MANIFEST.to_vec(),
-                sources: vec![
-                    source_input("image.wr", CORE_IMAGE_SOURCE),
-                    source_input("ops.wr", CORE_OPS_SOURCE),
-                    source_input("result.wr", CORE_RESULT_SOURCE),
-                    source_input("time.wr", CORE_TIME_SOURCE),
-                ],
-                scenarios: Vec::new(),
-            },
+    let root_locator = PackageLocator::Workspace {
+        path: ".".to_owned(),
+    };
+    let core_locator = PackageLocator::Toolchain {
+        component: "wrela-core-0.1".to_owned(),
+    };
+    let root_bundle = checked_in_bundle(
+        &codec,
+        WORKSPACE_MANIFEST,
+        root_locator.clone(),
+        vec![
+            source_input("conformance/duration_scalar_test.wr", PASSING_TEST_SOURCE),
+            source_input("conformance/image.wr", IMAGE_SOURCE),
         ],
+    );
+    let core_bundle = checked_in_bundle(
+        &codec,
+        CORE_MANIFEST,
+        core_locator.clone(),
+        vec![
+            source_input("image.wr", CORE_IMAGE_SOURCE),
+            source_input("ops.wr", CORE_OPS_SOURCE),
+            source_input("result.wr", CORE_RESULT_SOURCE),
+            source_input("time.wr", CORE_TIME_SOURCE),
+        ],
+    );
+    let provider = CheckedInProvider {
+        bundles: vec![root_bundle, core_bundle],
     };
     CanonicalWorkspaceLoader::new()
         .load(
             LoadRequest {
-                root_locator: PackageLocator::Workspace {
-                    path: ".".to_owned(),
-                },
+                root_locator,
                 root_manifest_bytes: WORKSPACE_MANIFEST,
-                lockfile_bytes: WORKSPACE_LOCKFILE,
+                core_locator,
                 provider: &provider,
                 hasher: &HASHER,
                 codec: &codec,
@@ -1956,15 +1946,6 @@ fn manifest_limits() -> ManifestCodecLimits {
         profiles: 16,
         images: 16,
         image_tests: 16,
-    }
-}
-
-fn lockfile_limits() -> LockfileCodecLimits {
-    LockfileCodecLimits {
-        bytes: 1024 * 1024,
-        string_bytes: 1024 * 1024,
-        packages: 16,
-        dependencies: 16,
     }
 }
 

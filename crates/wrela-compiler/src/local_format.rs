@@ -1,13 +1,11 @@
 //! Concrete local composition for the public `format` command.
 //!
-//! Formatting deliberately does not load the lockfile or a toolchain.  The
-//! command decodes the selected root manifest, admits only source files
-//! discovered by a walk of its `source_root` (modules are derived, not
-//! declared), parses the exact bytes that will be replaced, and publishes
-//! through a same-filesystem compare-and-replace transaction.
-//! This keeps formatting useful while a workspace is being edited: a stale
-//! package content digest in `wrela.lock` cannot prevent the formatter from
-//! repairing the source that made it stale.
+//! Formatting deliberately does not load a toolchain (there is no lockfile in
+//! revision 0.1 either, so there is nothing else to load beyond the manifest
+//! itself). The command decodes the selected root manifest, admits only
+//! source files discovered by a walk of its `source_root` (modules are
+//! derived, not declared), parses the exact bytes that will be replaced, and
+//! publishes through a same-filesystem compare-and-replace transaction.
 
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata, OpenOptions};

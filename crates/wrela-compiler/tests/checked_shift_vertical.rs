@@ -22,12 +22,11 @@ use wrela_hir_lower::{
     LoweringLimits as HirLoweringLimits,
 };
 use wrela_package::{
-    DependencyAlias, LOCKFILE_SCHEMA_VERSION, LockedDependency, LockedPackage, Lockfile,
-    ModulePath, PackageGraphBuilder, PackageIdentity, PackageLocator, PackageName, PackageVersion,
+    DependencyAlias, ModulePath, PackageGraphBuilder, PackageIdentity, PackageName, PackageVersion,
 };
 use wrela_package_loader::{
-    CanonicalPackageCodec, ContentHasher, LockfileCodecLimits, ManifestCodecLimits, PackageCodec,
-    PackageContentKind, PackageContentRecord, SoftwareSha256, package_content_digest,
+    CanonicalPackageCodec, ContentHasher, ManifestCodecLimits, PackageCodec, PackageContentKind,
+    PackageContentRecord, SoftwareSha256, package_content_digest,
 };
 use wrela_sema::{
     AnalysisChangeSet, AnalysisLimits, AnalysisMode, AnalysisRequest, CanonicalSemanticAnalyzer,
@@ -46,8 +45,6 @@ use wrela_test_model::{LanguageFatalCause, TestId, TestKind};
 
 const WORKSPACE_MANIFEST: &[u8] =
     include_bytes!("../../../std/examples/checked-shift-runtime/wrela.toml");
-const WORKSPACE_LOCKFILE: &[u8] =
-    include_bytes!("../../../std/examples/checked-shift-runtime/wrela.lock");
 const APPLICATION_SOURCE: &str =
     include_str!("../../../std/examples/checked-shift-runtime/src/checked_shift/image.wr");
 const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.toml");
@@ -144,7 +141,7 @@ fn collect_semantic_shifts(
     }
 }
 
-fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Vec<u8>) {
+fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity) {
     let codec = CanonicalPackageCodec::new();
     let manifest = codec
         .decode_manifest(WORKSPACE_MANIFEST, manifest_limits(), &never_cancelled)
@@ -180,7 +177,12 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
         )
         .expect("checked-shift package identity"),
     };
-    let core_identity = PackageIdentity {
+    // There is no lockfile to cross-check against; computing the core
+    // package's identity here still exercises that its checked-in manifest
+    // and sources hash without error, exactly as the loader itself would
+    // independently do when it resolves the reserved `core` alias via the
+    // toolchain rather than a recorded locator.
+    let _core_identity = PackageIdentity {
         name: core_manifest.name.clone(),
         version: core_manifest.version.clone(),
         source_digest: package_content_digest(
@@ -196,43 +198,7 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
         )
         .expect("core package identity"),
     };
-    let mut packages = vec![
-        LockedPackage {
-            identity: root_identity.clone(),
-            locator: PackageLocator::Workspace {
-                path: ".".to_owned(),
-            },
-            dependencies: vec![LockedDependency {
-                alias: DependencyAlias::new("core").expect("core alias"),
-                identity: core_identity.clone(),
-            }],
-            manifest_digest: HASHER.sha256(&canonical_manifest),
-        },
-        LockedPackage {
-            identity: core_identity,
-            locator: PackageLocator::Toolchain {
-                component: "wrela-core-0.1".to_owned(),
-            },
-            dependencies: Vec::new(),
-            manifest_digest: HASHER.sha256(&canonical_core_manifest),
-        },
-    ];
-    packages.sort_by(|left, right| left.identity.cmp(&right.identity));
-    let lockfile = Lockfile {
-        schema: LOCKFILE_SCHEMA_VERSION,
-        root: root_identity.clone(),
-        packages,
-    };
-    let canonical_lockfile = codec
-        .canonical_lockfile(&lockfile, lockfile_limits(), &never_cancelled)
-        .expect("canonical checked-shift lockfile");
-    assert_eq!(
-        codec
-            .decode_lockfile(&canonical_lockfile, lockfile_limits(), &never_cancelled)
-            .expect("round-trip checked-shift lockfile"),
-        lockfile
-    );
-    (manifest, root_identity, canonical_lockfile)
+    (manifest, root_identity)
 }
 
 fn content_record<'a>(path: &'a str, source: &str) -> PackageContentRecord<'a> {
@@ -255,34 +221,15 @@ fn manifest_limits() -> ManifestCodecLimits {
     }
 }
 
-fn lockfile_limits() -> LockfileCodecLimits {
-    LockfileCodecLimits {
-        bytes: 1024 * 1024,
-        string_bytes: 1024 * 1024,
-        packages: 16,
-        dependencies: 16,
-    }
-}
-
 #[test]
 fn checked_in_runtime_fixture_is_canonical_and_has_four_exact_selectors() {
-    let (manifest, root_identity, canonical_lockfile) = canonical_workspace();
+    let (manifest, _root_identity) = canonical_workspace();
     assert_eq!(manifest.name.as_str(), "checked-shift-runtime");
     assert_eq!(manifest.version.as_str(), "0.1.0");
     assert_eq!(manifest.images.len(), 1);
     assert_eq!(manifest.images[0].name, "checked-shift-runtime");
     assert_eq!(manifest.images[0].module.dotted(), "checked_shift.image");
     assert_eq!(manifest.images[0].entry, "boot");
-    assert_eq!(
-        canonical_lockfile,
-        WORKSPACE_LOCKFILE,
-        "checked-in checked-shift lockfile is stale; canonical bytes were:\n{}",
-        String::from_utf8_lossy(&canonical_lockfile)
-    );
-    let decoded_lockfile = CanonicalPackageCodec::new()
-        .decode_lockfile(WORKSPACE_LOCKFILE, lockfile_limits(), &never_cancelled)
-        .expect("checked-in checked-shift lockfile");
-    assert_eq!(decoded_lockfile.root, root_identity);
 
     for name in [
         "checked_shift_passes",

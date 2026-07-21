@@ -20,7 +20,9 @@ const REQUEST_MAGIC: &[u8; 8] = b"WRELRQB\0";
 const NONCE_PROOF_MAGIC: &[u8; 8] = b"WRELNPR\0";
 const CHECK_REPORT_MAGIC: &[u8; 8] = b"WRELCRP\0";
 const TREE_ENCODING_VERSION: u32 = 1;
-const REQUEST_ENCODING_VERSION: u32 = 1;
+// Bumped from 1: revision 0.1 has no lockfile, so `CheckRequest` no longer
+// carries a `lockfile` path (`docs/language/02-source-language.md` §2.1).
+const REQUEST_ENCODING_VERSION: u32 = 2;
 const NONCE_PROOF_VERSION: u32 = 1;
 const CHECK_REPORT_VERSION: u32 = 1;
 const DIGEST_BYTES: usize = 32;
@@ -202,7 +204,6 @@ pub struct CheckRequest {
     pub engine_identity: Sha256Digest,
     pub payload_identity: Sha256Digest,
     pub manifest: EnginePath,
-    pub lockfile: EnginePath,
     pub image: String,
     pub target: TargetIdentity,
     pub profile: String,
@@ -216,7 +217,6 @@ pub struct CheckRequestFields {
     pub engine_identity: Sha256Digest,
     pub payload_identity: Sha256Digest,
     pub manifest: EnginePath,
-    pub lockfile: EnginePath,
     pub image: String,
     pub target: TargetIdentity,
     pub profile: String,
@@ -238,7 +238,6 @@ impl CheckRequest {
             engine_identity: fields.engine_identity,
             payload_identity: fields.payload_identity,
             manifest: fields.manifest,
-            lockfile: fields.lockfile,
             image: fields.image,
             target: fields.target,
             profile: fields.profile,
@@ -259,7 +258,6 @@ impl CheckRequest {
             engine_identity: self.engine_identity,
             payload_identity: self.payload_identity,
             manifest: self.manifest.clone(),
-            lockfile: self.lockfile.clone(),
             image: self.image.clone(),
             target: self.target.clone(),
             profile: self.profile.clone(),
@@ -982,11 +980,10 @@ fn validate_request_fields(
     if !valid_atom(&fields.image)
         || !valid_atom(&fields.profile)
         || fields.manifest.as_str().len() > limits.text_bytes as usize
-        || fields.lockfile.as_str().len() > limits.text_bytes as usize
         || fields.image.len() > limits.text_bytes as usize
         || fields.target.as_str().len() > limits.text_bytes as usize
         || fields.profile.len() > limits.text_bytes as usize
-        || !canonical_check_paths(&fields.manifest, &fields.lockfile)
+        || !canonical_manifest_path(&fields.manifest)
         || fields.diagnostics.maximum_diagnostics == 0
         || fields.diagnostics.maximum_diagnostics > fields.resources.events
         || fields.input.records == 0
@@ -1000,14 +997,13 @@ fn validate_request_fields(
     Ok(())
 }
 
-fn canonical_check_paths(manifest: &EnginePath, lockfile: &EnginePath) -> bool {
+fn canonical_manifest_path(manifest: &EnginePath) -> bool {
     fn split(path: &str) -> (&str, &str) {
         path.rsplit_once('/').unwrap_or(("", path))
     }
 
-    let (manifest_parent, manifest_name) = split(manifest.as_str());
-    let (lock_parent, lock_name) = split(lockfile.as_str());
-    manifest_parent == lock_parent && manifest_name == "wrela.toml" && lock_name == "wrela.lock"
+    let (_, manifest_name) = split(manifest.as_str());
+    manifest_name == "wrela.toml"
 }
 
 fn request_identity(
@@ -1022,7 +1018,6 @@ fn request_identity(
     digest.update(fields.engine_identity.as_bytes());
     digest.update(fields.payload_identity.as_bytes());
     update_hashed_bytes(&mut digest, fields.manifest.as_str().as_bytes());
-    update_hashed_bytes(&mut digest, fields.lockfile.as_str().as_bytes());
     update_hashed_bytes(&mut digest, fields.image.as_bytes());
     update_hashed_bytes(&mut digest, fields.target.as_str().as_bytes());
     update_hashed_bytes(&mut digest, fields.profile.as_bytes());
@@ -1243,7 +1238,6 @@ fn encode_request(writer: &mut Writer, request: &CheckRequest) -> Result<(), Eng
     writer.digest(request.engine_identity)?;
     writer.digest(request.payload_identity)?;
     writer.string(request.manifest.as_str())?;
-    writer.string(request.lockfile.as_str())?;
     writer.string(&request.image)?;
     writer.string(request.target.as_str())?;
     writer.string(&request.profile)?;
@@ -1262,7 +1256,6 @@ fn decode_request(
         engine_identity: reader.digest()?,
         payload_identity: reader.digest()?,
         manifest: EnginePath::new(reader.string()?)?,
-        lockfile: EnginePath::new(reader.string()?)?,
         image: reader.string()?,
         target: TargetIdentity::new(reader.string()?)
             .map_err(|_| EngineProtocolError::InvalidText)?,
@@ -1867,7 +1860,6 @@ pub struct CheckRequestStream {
     hello: Option<ClientHello>,
     request: Option<CheckRequest>,
     manifest_seen: bool,
-    lockfile_seen: bool,
     phase: RequestPhase,
 }
 
@@ -1976,7 +1968,6 @@ impl CheckRequestStream {
             hello: None,
             request: None,
             manifest_seen: false,
-            lockfile_seen: false,
             phase: RequestPhase::ClientHello,
         })
     }
@@ -2132,7 +2123,6 @@ impl CheckRequestStream {
                             actual: "InputRecord",
                         })?;
                 self.manifest_seen |= record.path == request.manifest;
-                self.lockfile_seen |= record.path == request.lockfile;
                 tree.accept_record(index, &record)?;
                 (
                     RequestPhase::Input(tree),
@@ -2161,7 +2151,7 @@ impl CheckRequestStream {
             }
             (RequestPhase::Input(tree), EngineMessage::InputFinish(measurement)) => {
                 (*tree).finish(measurement, is_cancelled)?;
-                if !self.manifest_seen || !self.lockfile_seen {
+                if !self.manifest_seen {
                     return Err(EngineProtocolError::TreeMeasurementMismatch);
                 }
                 (

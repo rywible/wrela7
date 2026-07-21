@@ -16,13 +16,9 @@ use std::fs::File;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use wrela_build_model::{Sha256Digest, TargetIdentity};
-use wrela_package::{
-    DependencyAlias, LOCKFILE_SCHEMA_VERSION, LockedDependency, LockedPackage, Lockfile,
-    PackageIdentity, PackageLocator, PackageName, PackageVersion,
-};
 use wrela_package_loader::{
-    CanonicalPackageCodec, ContentHasher, LockfileCodecLimits, ManifestCodecLimits, PackageCodec,
-    PackageContentKind, PackageContentRecord, SoftwareSha256, package_content_digest,
+    CanonicalPackageCodec, ContentHasher, ManifestCodecLimits, PackageCodec, PackageContentKind,
+    PackageContentRecord, SoftwareSha256, package_content_digest,
 };
 use wrela_test_model::{
     CanonicalTestReportCodec, FailurePhase, GuestTestOutcome, LanguageFatalCause,
@@ -1428,8 +1424,6 @@ const CHECKED_SHIFT_MANIFEST: &[u8] =
     include_bytes!("../../../std/examples/checked-shift-runtime/wrela.toml");
 const CHECKED_SHIFT_SOURCE: &[u8] =
     include_bytes!("../../../std/examples/checked-shift-runtime/src/checked_shift/image.wr");
-const CHECKED_SHIFT_LOCKFILE: &[u8] =
-    include_bytes!("../../../std/examples/checked-shift-runtime/wrela.lock");
 const CHECKED_SHIFT_IMAGE: &str = "checked-shift-runtime";
 const CHECKED_SHIFT_TEST_PREFIX: &str = "checked-shift-runtime@0.1.0::checked_shift.image::";
 const CHECKED_SHIFT_EVIDENCE_PREFIX: &str = "WRELA_CHECKED_SHIFT_QEMU_EVIDENCE";
@@ -1438,8 +1432,6 @@ const RUNTIME_RESULT_MANIFEST: &[u8] =
     include_bytes!("../../../std/examples/runtime-result/wrela.toml");
 const RUNTIME_RESULT_SOURCE: &[u8] =
     include_bytes!("../../../std/examples/runtime-result/src/runtime_result/image.wr");
-const RUNTIME_RESULT_LOCKFILE: &[u8] =
-    include_bytes!("../../../std/examples/runtime-result/wrela.lock");
 const RUNTIME_RESULT_IMAGE: &str = "runtime-result";
 const RUNTIME_RESULT_TEST_PREFIX: &str = "runtime-result@0.1.0::runtime_result.image::";
 const RUNTIME_RESULT_EVIDENCE_PREFIX: &str = "WRELA_RUNTIME_RESULT_QEMU_EVIDENCE";
@@ -1448,8 +1440,6 @@ const RUNTIME_TIMEOUT_MANIFEST: &[u8] =
     include_bytes!("../../../std/examples/runtime-timeout/wrela.toml");
 const RUNTIME_TIMEOUT_SOURCE: &[u8] =
     include_bytes!("../../../std/examples/runtime-timeout/src/runtime_timeout/image.wr");
-const RUNTIME_TIMEOUT_LOCKFILE: &[u8] =
-    include_bytes!("../../../std/examples/runtime-timeout/wrela.lock");
 const RUNTIME_TIMEOUT_IMAGE: &str = "runtime-timeout";
 const RUNTIME_TIMEOUT_SELECTOR: &str = "checked_arithmetic_fatal_times_out";
 const RUNTIME_TIMEOUT_GROUP_TIMEOUT_NS: u64 = 65_000_000_000;
@@ -1674,8 +1664,6 @@ fn enrolled_bundle_executes_real_qemu_lifecycle() {
     );
     let temporary_directory = run_root.join("tmp");
     create_private_directory(&temporary_directory);
-    let lock = smoke_lockfile(verification.manifest());
-    write_new(&workspace.join("wrela.lock"), &lock);
 
     let output_directory = run_root.join("output");
     let launch = SmokeLaunch::new(
@@ -1804,7 +1792,6 @@ fn execute_runtime_timeout_case(
         &workspace.join("src/runtime_timeout/image.wr"),
         RUNTIME_TIMEOUT_SOURCE,
     );
-    write_new(&workspace.join("wrela.lock"), RUNTIME_TIMEOUT_LOCKFILE);
     let temporary_directory = run_root.join("tmp");
     create_private_directory(&temporary_directory);
     let output_directory = run_root.join("output");
@@ -1890,7 +1877,7 @@ fn completion_matches_runtime_timeout(
 
 /// Real checked-shift execution contract. Each selector receives a fresh
 /// private workspace/output/tmp root and must consume the checked-in source,
-/// lockfile, installed frontend/backend, published EFI, QEMU event stream, and
+/// installed frontend/backend, published EFI, QEMU event stream, and
 /// atomically published canonical report. A nonzero public command result is
 /// accepted only after the typed report proves the exact language-fatal cause.
 #[test]
@@ -2006,7 +1993,6 @@ fn execute_checked_shift_case(
         &workspace.join("src/checked_shift/image.wr"),
         CHECKED_SHIFT_SOURCE,
     );
-    write_new(&workspace.join("wrela.lock"), CHECKED_SHIFT_LOCKFILE);
     let temporary_directory = case_root.join("tmp");
     create_private_directory(&temporary_directory);
     let output_directory = case_root.join("output");
@@ -2103,7 +2089,6 @@ fn execute_runtime_result_case(
         &workspace.join("src/runtime_result/image.wr"),
         RUNTIME_RESULT_SOURCE,
     );
-    write_new(&workspace.join("wrela.lock"), RUNTIME_RESULT_LOCKFILE);
     let temporary_directory = case_root.join("tmp");
     create_private_directory(&temporary_directory);
     let output_directory = case_root.join("output");
@@ -2271,105 +2256,6 @@ fn runtime_timeout_evidence_line(
         ));
     }
     Ok(line)
-}
-
-fn smoke_lockfile(manifest: &wrela_toolchain::ToolchainManifest) -> Vec<u8> {
-    let codec = CanonicalPackageCodec::new();
-    let application = codec
-        .decode_manifest(
-            APPLICATION_MANIFEST,
-            ManifestCodecLimits {
-                bytes: 1024 * 1024,
-                string_bytes: 1024 * 1024,
-                modules: 16,
-                dependencies: 16,
-                profiles: 16,
-                images: 16,
-                image_tests: 16,
-            },
-            &never_cancelled,
-        )
-        .expect("decode embedded smoke manifest");
-    // The embedded manifest declares no `[[module]]` block (modules are
-    // derived, not decoded); canonicalize before hashing so this matches
-    // exactly what the production loader binds into package/manifest
-    // digests, independent of whether the literal above happens to already
-    // be byte-canonical.
-    let canonical_application_manifest = codec
-        .canonical_manifest(
-            &application,
-            ManifestCodecLimits {
-                bytes: 1024 * 1024,
-                string_bytes: 1024 * 1024,
-                modules: 16,
-                dependencies: 16,
-                profiles: 16,
-                images: 16,
-                image_tests: 16,
-            },
-            &never_cancelled,
-        )
-        .expect("canonicalize embedded smoke manifest");
-    let source_digest = package_content_digest(
-        &canonical_application_manifest,
-        &[PackageContentRecord {
-            kind: PackageContentKind::Source,
-            path: "bootstrap/image.wr",
-            digest: HASHER.sha256(APPLICATION_SOURCE),
-        }],
-        &HASHER,
-        &never_cancelled,
-    )
-    .expect("digest embedded smoke package");
-    let application_identity = PackageIdentity {
-        name: PackageName::new(application.name.as_str()).expect("smoke package name"),
-        version: PackageVersion::new(application.version.as_str()).expect("smoke package version"),
-        source_digest,
-    };
-    let core = manifest
-        .standard_library_packages
-        .iter()
-        .find(|package| {
-            package.identity.name.as_str() == "wrela-core"
-                && package.identity.version.as_str() == "0.1.0"
-        })
-        .expect("enrolled wrela-core 0.1 package");
-    assert!(matches!(core.locator, PackageLocator::Toolchain { .. }));
-    let root = LockedPackage {
-        identity: application_identity.clone(),
-        locator: PackageLocator::Workspace {
-            path: ".".to_owned(),
-        },
-        dependencies: vec![LockedDependency {
-            alias: DependencyAlias::new("core").expect("core dependency alias"),
-            identity: core.identity.clone(),
-        }],
-        manifest_digest: HASHER.sha256(&canonical_application_manifest),
-    };
-    let core = LockedPackage {
-        identity: core.identity.clone(),
-        locator: core.locator.clone(),
-        dependencies: Vec::new(),
-        manifest_digest: core.manifest_digest,
-    };
-    let mut packages = vec![root, core];
-    packages.sort_by(|left, right| left.identity.cmp(&right.identity));
-    codec
-        .canonical_lockfile(
-            &Lockfile {
-                schema: LOCKFILE_SCHEMA_VERSION,
-                root: application_identity,
-                packages,
-            },
-            LockfileCodecLimits {
-                bytes: 1024 * 1024,
-                string_bytes: 1024 * 1024,
-                packages: 16,
-                dependencies: 16,
-            },
-            &never_cancelled,
-        )
-        .expect("encode canonical smoke lockfile")
 }
 
 fn validate_canonical_smoke_report(
@@ -3802,12 +3688,6 @@ mod tests {
             images: 16,
             image_tests: 16,
         };
-        let lock_limits = LockfileCodecLimits {
-            bytes: 1024 * 1024,
-            string_bytes: 1024 * 1024,
-            packages: 16,
-            dependencies: 16,
-        };
         let manifest = codec
             .decode_manifest(RUNTIME_TIMEOUT_MANIFEST, manifest_limits, &never_cancelled)
             .expect("decode canonical runtime-timeout manifest");
@@ -3827,7 +3707,12 @@ mod tests {
                 .expect("redecode canonical runtime-timeout manifest"),
             manifest,
         );
-        let source_digest = package_content_digest(
+        // There is no lockfile to cross-check this package's identity
+        // against; computing its content digest still exercises that the
+        // checked-in manifest and source hash without error, exactly as the
+        // production loader independently does when it computes and trusts
+        // this as the package's identity.
+        let _source_digest = package_content_digest(
             &canonical_manifest,
             &[PackageContentRecord {
                 kind: PackageContentKind::Source,
@@ -3838,17 +3723,7 @@ mod tests {
             &never_cancelled,
         )
         .expect("measure runtime-timeout source package");
-        let lock = codec
-            .decode_lockfile(RUNTIME_TIMEOUT_LOCKFILE, lock_limits, &never_cancelled)
-            .expect("decode canonical runtime-timeout lockfile");
-        assert_eq!(lock.root.source_digest, source_digest);
-        assert_eq!(lock.root.name.as_str(), RUNTIME_TIMEOUT_IMAGE);
-        assert_eq!(
-            codec
-                .canonical_lockfile(&lock, lock_limits, &never_cancelled)
-                .expect("encode canonical runtime-timeout lockfile"),
-            RUNTIME_TIMEOUT_LOCKFILE,
-        );
+        assert_eq!(manifest.name.as_str(), RUNTIME_TIMEOUT_IMAGE);
         let source = std::str::from_utf8(RUNTIME_TIMEOUT_SOURCE).expect("UTF-8 timeout source");
         assert!(source.contains("@test\nfn checked_arithmetic_fatal_times_out():"));
         assert!(source.contains("return left + right"));

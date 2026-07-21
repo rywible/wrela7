@@ -8,16 +8,14 @@ use wrela_build_model::{
     Sha256Digest, TargetIdentity,
 };
 use wrela_package::{
-    DependencyAlias, ImageDeclaration, ImageTestDeclaration, LOCKFILE_SCHEMA_VERSION,
-    LockedDependency, LockedPackage, Lockfile, MANIFEST_SCHEMA_VERSION, ManifestDependency,
-    ModulePath, PackageIdentity, PackageLocator, PackageManifest, PackageName, PackageVersion,
+    DependencyAlias, ImageDeclaration, ImageTestDeclaration, MANIFEST_SCHEMA_VERSION,
+    ManifestDependency, ModulePath, PackageManifest, PackageName, PackageVersion,
 };
 
-use crate::{DecodeError, LockfileCodecLimits, ManifestCodecLimits, PackageCodec};
+use crate::{DecodeError, ManifestCodecLimits, PackageCodec};
 
 const CANCELLATION_POLL_BYTES: usize = 4096;
 const MAX_MANIFEST_TOML_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_LOCKFILE_TOML_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 const MAX_ERROR_FIELD_BYTES: usize = 256;
 
@@ -64,29 +62,6 @@ impl PackageCodec for CanonicalPackageCodec {
         Ok(manifest)
     }
 
-    fn decode_lockfile(
-        &self,
-        bytes: &[u8],
-        limits: LockfileCodecLimits,
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<Lockfile, DecodeError> {
-        check_cancelled(is_cancelled)?;
-        limits.validate()?;
-        let limits = bounded_lockfile_limits(limits);
-        let source = prepare_input(
-            bytes,
-            limits.bytes,
-            MAX_LOCKFILE_TOML_BYTES,
-            "lockfile TOML bytes",
-            is_cancelled,
-        )?;
-        let document = parse_document(source)?;
-        check_cancelled(is_cancelled)?;
-        let lockfile = project_lockfile(document.get_ref(), limits, is_cancelled)?;
-        check_cancelled(is_cancelled)?;
-        Ok(lockfile)
-    }
-
     fn canonical_manifest(
         &self,
         manifest: &PackageManifest,
@@ -109,29 +84,6 @@ impl PackageCodec for CanonicalPackageCodec {
             is_cancelled,
         )
     }
-
-    fn canonical_lockfile(
-        &self,
-        lockfile: &Lockfile,
-        limits: LockfileCodecLimits,
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<Vec<u8>, DecodeError> {
-        check_cancelled(is_cancelled)?;
-        limits.validate()?;
-        let limits = bounded_lockfile_limits(limits);
-        if lockfile.schema != LOCKFILE_SCHEMA_VERSION {
-            return Err(DecodeError::UnsupportedSchema(lockfile.schema));
-        }
-        validate_lockfile_resources(lockfile, limits, is_cancelled)?;
-        lockfile
-            .validate()
-            .map_err(|error| noncanonical(&error.to_string()))?;
-        encode_lockfile(
-            lockfile,
-            limits.bytes.min(MAX_LOCKFILE_TOML_BYTES),
-            is_cancelled,
-        )
-    }
 }
 
 fn bounded_manifest_limits(mut limits: ManifestCodecLimits) -> ManifestCodecLimits {
@@ -143,15 +95,6 @@ fn bounded_manifest_limits(mut limits: ManifestCodecLimits) -> ManifestCodecLimi
     limits.profiles = limits.profiles.min(entry_limit);
     limits.images = limits.images.min(entry_limit);
     limits.image_tests = limits.image_tests.min(entry_limit);
-    limits
-}
-
-fn bounded_lockfile_limits(mut limits: LockfileCodecLimits) -> LockfileCodecLimits {
-    limits.bytes = limits.bytes.min(MAX_LOCKFILE_TOML_BYTES);
-    limits.string_bytes = limits.string_bytes.min(MAX_LOCKFILE_TOML_BYTES);
-    let entry_limit = u32::try_from(MAX_LOCKFILE_TOML_BYTES).unwrap_or(u32::MAX);
-    limits.packages = limits.packages.min(entry_limit);
-    limits.dependencies = limits.dependencies.min(entry_limit);
     limits
 }
 
@@ -603,19 +546,6 @@ fn optional_u32(
             "integer does not fit u32",
         )
     })
-}
-
-fn required_digest(
-    table: &DeTable<'_>,
-    key: &str,
-    field: &'static str,
-    budget: &mut StringBudget,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<Sha256Digest, DecodeError> {
-    let value = required_value(table, key, field)?;
-    let text = string_value(value, field)?;
-    budget.account(text, is_cancelled)?;
-    parse_digest(text, value.span().start)
 }
 
 fn optional_digest(
@@ -1187,267 +1117,6 @@ fn project_image_tests(
     Ok(tests)
 }
 
-fn project_lockfile(
-    root: &DeTable<'_>,
-    limits: LockfileCodecLimits,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<Lockfile, DecodeError> {
-    check_allowed_fields(root, "", &["schema", "root", "package"], is_cancelled)?;
-    let schema = required_u32(root, "schema", "schema", is_cancelled)?;
-    if schema != LOCKFILE_SCHEMA_VERSION {
-        return Err(DecodeError::UnsupportedSchema(schema));
-    }
-    let mut budget = StringBudget::new(limits.string_bytes);
-    let root_identity = required_table(root, "root", "[root]")?;
-    let root_identity = project_identity(root_identity, "root", &mut budget, is_cancelled)?;
-
-    let Some(values) = optional_array(root, "package", "[[package]]")? else {
-        return Err(missing("[[package]]"));
-    };
-    check_count("locked packages", values.len(), limits.packages)?;
-    let mut packages = Vec::new();
-    reserve(
-        &mut packages,
-        values.len(),
-        "locked packages",
-        u64::from(limits.packages),
-    )?;
-    let mut dependency_count = 0usize;
-    for value in values {
-        check_cancelled(is_cancelled)?;
-        let table = table_item(value, "[[package]]")?;
-        packages.push(project_locked_package(
-            table,
-            limits,
-            &mut budget,
-            &mut dependency_count,
-            is_cancelled,
-        )?);
-    }
-    let lockfile = Lockfile {
-        schema,
-        root: root_identity,
-        packages,
-    };
-    lockfile
-        .validate()
-        .map_err(|error| noncanonical(&error.to_string()))?;
-    check_cancelled(is_cancelled)?;
-    Ok(lockfile)
-}
-
-fn project_identity(
-    table: &DeTable<'_>,
-    prefix: &'static str,
-    budget: &mut StringBudget,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<PackageIdentity, DecodeError> {
-    check_allowed_fields(
-        table,
-        prefix,
-        &["name", "version", "source_digest"],
-        is_cancelled,
-    )?;
-    let (name_field, version_field, digest_field) = match prefix {
-        "root" => ("root.name", "root.version", "root.source_digest"),
-        "package" => ("package.name", "package.version", "package.source_digest"),
-        _ => (
-            "package.dependency.name",
-            "package.dependency.version",
-            "package.dependency.source_digest",
-        ),
-    };
-    Ok(PackageIdentity {
-        name: required_package_name(table, "name", name_field, budget, is_cancelled)?,
-        version: required_package_version(table, "version", version_field, budget, is_cancelled)?,
-        source_digest: required_digest(table, "source_digest", digest_field, budget, is_cancelled)?,
-    })
-}
-
-fn project_locked_package(
-    table: &DeTable<'_>,
-    limits: LockfileCodecLimits,
-    budget: &mut StringBudget,
-    dependency_count: &mut usize,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<LockedPackage, DecodeError> {
-    check_allowed_fields(
-        table,
-        "package",
-        &[
-            "name",
-            "version",
-            "source_digest",
-            "manifest_digest",
-            "locator",
-            "locator_path",
-            "locator_provider",
-            "locator_key",
-            "locator_component",
-            "dependency",
-        ],
-        is_cancelled,
-    )?;
-    let identity = PackageIdentity {
-        name: required_package_name(table, "name", "package.name", budget, is_cancelled)?,
-        version: required_package_version(
-            table,
-            "version",
-            "package.version",
-            budget,
-            is_cancelled,
-        )?,
-        source_digest: required_digest(
-            table,
-            "source_digest",
-            "package.source_digest",
-            budget,
-            is_cancelled,
-        )?,
-    };
-    let manifest_digest = required_digest(
-        table,
-        "manifest_digest",
-        "package.manifest_digest",
-        budget,
-        is_cancelled,
-    )?;
-    let locator_kind = required_text(table, "locator", "package.locator", budget, is_cancelled)?;
-    let locator_path = optional_text(
-        table,
-        "locator_path",
-        "package.locator_path",
-        budget,
-        is_cancelled,
-    )?;
-    let locator_provider = optional_text(
-        table,
-        "locator_provider",
-        "package.locator_provider",
-        budget,
-        is_cancelled,
-    )?;
-    let locator_key = optional_text(
-        table,
-        "locator_key",
-        "package.locator_key",
-        budget,
-        is_cancelled,
-    )?;
-    let locator_component = optional_text(
-        table,
-        "locator_component",
-        "package.locator_component",
-        budget,
-        is_cancelled,
-    )?;
-    let locator = match locator_kind.as_str() {
-        "workspace" => {
-            if locator_provider.is_some() || locator_key.is_some() || locator_component.is_some() {
-                return Err(noncanonical(
-                    "workspace locator contains fields for another locator kind",
-                ));
-            }
-            PackageLocator::Workspace {
-                path: locator_path.ok_or_else(|| missing("package.locator_path"))?,
-            }
-        }
-        "archive" => {
-            if locator_path.is_some() || locator_component.is_some() {
-                return Err(noncanonical(
-                    "archive locator contains fields for another locator kind",
-                ));
-            }
-            PackageLocator::Archive {
-                provider: locator_provider.ok_or_else(|| missing("package.locator_provider"))?,
-                key: locator_key.ok_or_else(|| missing("package.locator_key"))?,
-            }
-        }
-        "toolchain" => {
-            if locator_path.is_some() || locator_provider.is_some() || locator_key.is_some() {
-                return Err(noncanonical(
-                    "toolchain locator contains fields for another locator kind",
-                ));
-            }
-            PackageLocator::Toolchain {
-                component: locator_component.ok_or_else(|| missing("package.locator_component"))?,
-            }
-        }
-        _ => {
-            return Err(unsupported(
-                "package.locator",
-                "workspace, archive, or toolchain",
-            ));
-        }
-    };
-
-    let mut dependencies = Vec::new();
-    if let Some(values) = optional_array(table, "dependency", "[[package.dependency]]")? {
-        *dependency_count = dependency_count
-            .checked_add(values.len())
-            .ok_or_else(|| resource_limit("locked dependencies", u64::from(limits.dependencies)))?;
-        check_count(
-            "locked dependencies",
-            *dependency_count,
-            limits.dependencies,
-        )?;
-        reserve(
-            &mut dependencies,
-            values.len(),
-            "locked dependencies",
-            u64::from(limits.dependencies),
-        )?;
-        for value in values {
-            check_cancelled(is_cancelled)?;
-            let table = table_item(value, "[[package.dependency]]")?;
-            check_allowed_fields(
-                table,
-                "package.dependency",
-                &["alias", "name", "version", "source_digest"],
-                is_cancelled,
-            )?;
-            dependencies.push(LockedDependency {
-                alias: required_dependency_alias(
-                    table,
-                    "alias",
-                    "package.dependency.alias",
-                    budget,
-                    is_cancelled,
-                )?,
-                identity: PackageIdentity {
-                    name: required_package_name(
-                        table,
-                        "name",
-                        "package.dependency.name",
-                        budget,
-                        is_cancelled,
-                    )?,
-                    version: required_package_version(
-                        table,
-                        "version",
-                        "package.dependency.version",
-                        budget,
-                        is_cancelled,
-                    )?,
-                    source_digest: required_digest(
-                        table,
-                        "source_digest",
-                        "package.dependency.source_digest",
-                        budget,
-                        is_cancelled,
-                    )?,
-                },
-            });
-        }
-    }
-    Ok(LockedPackage {
-        identity,
-        locator,
-        dependencies,
-        manifest_digest,
-    })
-}
-
 fn validate_manifest_resources(
     manifest: &PackageManifest,
     limits: ManifestCodecLimits,
@@ -1519,64 +1188,6 @@ fn validate_manifest_resources(
         budget_text(&mut budget, &test.scenario, is_cancelled)?;
     }
     check_cancelled(is_cancelled)
-}
-
-fn validate_lockfile_resources(
-    lockfile: &Lockfile,
-    limits: LockfileCodecLimits,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<(), DecodeError> {
-    check_count("locked packages", lockfile.packages.len(), limits.packages)?;
-    let dependency_count = lockfile
-        .packages
-        .iter()
-        .try_fold(0usize, |total, package| {
-            total
-                .checked_add(package.dependencies.len())
-                .ok_or_else(|| {
-                    resource_limit("locked dependencies", u64::from(limits.dependencies))
-                })
-        })?;
-    check_count("locked dependencies", dependency_count, limits.dependencies)?;
-
-    let mut budget = StringBudget::new(limits.string_bytes);
-    budget_identity(&mut budget, &lockfile.root, is_cancelled)?;
-    for package in &lockfile.packages {
-        check_cancelled(is_cancelled)?;
-        budget_identity(&mut budget, &package.identity, is_cancelled)?;
-        budget.add(64)?;
-        match &package.locator {
-            PackageLocator::Workspace { path } => {
-                budget_text(&mut budget, "workspace", is_cancelled)?;
-                budget_text(&mut budget, path, is_cancelled)?;
-            }
-            PackageLocator::Archive { provider, key } => {
-                budget_text(&mut budget, "archive", is_cancelled)?;
-                budget_text(&mut budget, provider, is_cancelled)?;
-                budget_text(&mut budget, key, is_cancelled)?;
-            }
-            PackageLocator::Toolchain { component } => {
-                budget_text(&mut budget, "toolchain", is_cancelled)?;
-                budget_text(&mut budget, component, is_cancelled)?;
-            }
-        }
-        for dependency in &package.dependencies {
-            check_cancelled(is_cancelled)?;
-            budget_text(&mut budget, dependency.alias.as_str(), is_cancelled)?;
-            budget_identity(&mut budget, &dependency.identity, is_cancelled)?;
-        }
-    }
-    check_cancelled(is_cancelled)
-}
-
-fn budget_identity(
-    budget: &mut StringBudget,
-    identity: &PackageIdentity,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<(), DecodeError> {
-    budget_text(budget, identity.name.as_str(), is_cancelled)?;
-    budget_text(budget, identity.version.as_str(), is_cancelled)?;
-    budget.add(64)
 }
 
 fn budget_module_path(
@@ -1840,60 +1451,12 @@ fn encode_manifest(
     writer.finish()
 }
 
-fn encode_lockfile(
-    lockfile: &Lockfile,
-    byte_limit: u64,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<Vec<u8>, DecodeError> {
-    let mut writer = CanonicalWriter::new(byte_limit, is_cancelled);
-    writer.assignment_u32("schema", lockfile.schema)?;
-    writer.raw("\n[root]\n")?;
-    encode_identity(&mut writer, &lockfile.root)?;
-    for package in &lockfile.packages {
-        writer.raw("\n[[package]]\n")?;
-        encode_identity(&mut writer, &package.identity)?;
-        writer.assignment_digest("manifest_digest", package.manifest_digest)?;
-        match &package.locator {
-            PackageLocator::Workspace { path } => {
-                writer.assignment_text("locator", "workspace")?;
-                writer.assignment_text("locator_path", path)?;
-            }
-            PackageLocator::Archive { provider, key } => {
-                writer.assignment_text("locator", "archive")?;
-                writer.assignment_text("locator_provider", provider)?;
-                writer.assignment_text("locator_key", key)?;
-            }
-            PackageLocator::Toolchain { component } => {
-                writer.assignment_text("locator", "toolchain")?;
-                writer.assignment_text("locator_component", component)?;
-            }
-        }
-        for dependency in &package.dependencies {
-            writer.raw("\n[[package.dependency]]\n")?;
-            writer.assignment_text("alias", dependency.alias.as_str())?;
-            encode_identity(&mut writer, &dependency.identity)?;
-        }
-    }
-    writer.finish()
-}
-
-fn encode_identity(
-    writer: &mut CanonicalWriter<'_>,
-    identity: &PackageIdentity,
-) -> Result<(), DecodeError> {
-    writer.assignment_text("name", identity.name.as_str())?;
-    writer.assignment_text("version", identity.version.as_str())?;
-    writer.assignment_digest("source_digest", identity.source_digest)
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::time::{Duration, Instant};
 
-    use wrela_package::{
-        LOCKFILE_SCHEMA_VERSION, LockedPackage, Lockfile, PackageIdentity, PackageLocator,
-    };
+    use wrela_package::{PackageIdentity, PackageLocator, PackageName, PackageVersion};
     use wrela_source::SourceInput;
 
     use super::*;
@@ -1911,20 +1474,10 @@ mod tests {
         include_bytes!("../../../tests/contracts/package/v1/noncanonical.toml");
     const EQUIVALENT_MANIFEST: &[u8] =
         include_bytes!("../../../tests/contracts/package/v1/equivalent.toml");
-    const MINIMAL_LOCKFILE: &[u8] =
-        include_bytes!("../../../tests/contracts/package/v1/minimal.lock");
-    const REPRESENTATIVE_LOCKFILE: &[u8] =
-        include_bytes!("../../../tests/contracts/package/v1/representative.lock");
-    const NONCANONICAL_LOCKFILE: &[u8] =
-        include_bytes!("../../../tests/contracts/package/v1/noncanonical.lock");
-    const EQUIVALENT_LOCKFILE: &[u8] =
-        include_bytes!("../../../tests/contracts/package/v1/equivalent.lock");
     const CHECKED_IN_CORE_MANIFEST: &[u8] =
         include_bytes!("../../../std/wrela-core-0.1/wrela.toml");
     const CHECKED_IN_MINIMUM_IMAGE_MANIFEST: &[u8] =
         include_bytes!("../../../std/examples/minimal-image/wrela.toml");
-    const CHECKED_IN_MINIMUM_IMAGE_LOCKFILE: &[u8] =
-        include_bytes!("../../../std/examples/minimal-image/wrela.lock");
     const CHECKED_IN_CORE_SOURCE: &[u8] =
         include_bytes!("../../../std/wrela-core-0.1/src/image.wr");
     const CHECKED_IN_CORE_OPS_SOURCE: &[u8] =
@@ -1952,15 +1505,6 @@ mod tests {
         }
     }
 
-    const fn lockfile_limits() -> LockfileCodecLimits {
-        LockfileCodecLimits {
-            bytes: MAX_LOCKFILE_TOML_BYTES,
-            string_bytes: 4 * 1024 * 1024,
-            packages: 16_384,
-            dependencies: 16_384,
-        }
-    }
-
     fn replace_manifest(needle: &str, replacement: &str) -> Vec<u8> {
         String::from_utf8(MINIMAL_MANIFEST.to_vec())
             .expect("fixture is UTF-8")
@@ -1982,40 +1526,17 @@ mod tests {
                 fixture
             );
         }
-        for fixture in [MINIMAL_LOCKFILE, REPRESENTATIVE_LOCKFILE] {
-            let lockfile = codec
-                .decode_lockfile(fixture, lockfile_limits(), &never_cancelled)
-                .expect("canonical lockfile decodes");
-            assert_eq!(
-                codec
-                    .canonical_lockfile(&lockfile, lockfile_limits(), &never_cancelled)
-                    .expect("lockfile canonicalizes"),
-                fixture
-            );
-        }
 
         let representative = codec
             .decode_manifest(REPRESENTATIVE_MANIFEST, manifest_limits(), &never_cancelled)
             .expect("representative manifest");
+        // The manifest schema itself stays forward-compatible with more than
+        // one declared dependency (this fixture pins codec fidelity only);
+        // revision 0.1's loader is the layer that requires the root to
+        // declare exactly one, aliased `core`.
         assert_eq!(representative.dependencies.len(), 2);
         assert_eq!(representative.images.len(), 1);
         assert_eq!(representative.image_tests.len(), 1);
-
-        let lockfile = codec
-            .decode_lockfile(REPRESENTATIVE_LOCKFILE, lockfile_limits(), &never_cancelled)
-            .expect("representative lockfile");
-        assert!(matches!(
-            lockfile.packages[0].locator,
-            PackageLocator::Workspace { .. }
-        ));
-        assert!(matches!(
-            lockfile.packages[1].locator,
-            PackageLocator::Archive { .. }
-        ));
-        assert!(matches!(
-            lockfile.packages[2].locator,
-            PackageLocator::Toolchain { .. }
-        ));
     }
 
     #[test]
@@ -2137,36 +1658,10 @@ mod tests {
             application_digest.to_hex(),
             "ca556c73183fe0c85b89515adf53d3f7afaa97dbbef353f2940040d8d69e8291"
         );
-
-        let lockfile = codec
-            .decode_lockfile(
-                CHECKED_IN_MINIMUM_IMAGE_LOCKFILE,
-                lockfile_limits(),
-                &never_cancelled,
-            )
-            .expect("checked-in minimum image lockfile");
-        assert_eq!(lockfile.root.source_digest, application_digest);
-        assert_eq!(lockfile.packages.len(), 2);
-        let locked_core = lockfile
-            .packages
-            .iter()
-            .find(|package| package.identity.name.as_str() == "wrela-core")
-            .expect("locked core package");
-        assert_eq!(locked_core.identity.source_digest, core_digest);
-        assert_eq!(
-            locked_core.manifest_digest,
-            SoftwareSha256.sha256(&core_canonical)
-        );
-        assert!(matches!(
-            &locked_core.locator,
-            PackageLocator::Toolchain { component } if component == "wrela-core-0.1"
-        ));
-        assert_eq!(
-            codec
-                .canonical_lockfile(&lockfile, lockfile_limits(), &never_cancelled)
-                .expect("canonical minimum image lockfile"),
-            CHECKED_IN_MINIMUM_IMAGE_LOCKFILE
-        );
+        // Without a lockfile, these package identities are exactly what the
+        // loader computes at load time (see
+        // `workspace_loader_seals_the_checked_in_minimum_image_and_toolchain_core`),
+        // not a recorded value read back from `wrela.lock`.
     }
 
     #[test]
@@ -2185,22 +1680,6 @@ mod tests {
                     .canonical_manifest(&decoded, manifest_limits(), &never_cancelled)
                     .expect("canonical manifest"),
                 MINIMAL_MANIFEST
-            );
-        }
-
-        let canonical_lockfile = codec
-            .decode_lockfile(MINIMAL_LOCKFILE, lockfile_limits(), &never_cancelled)
-            .expect("minimal lockfile");
-        for fixture in [NONCANONICAL_LOCKFILE, EQUIVALENT_LOCKFILE] {
-            let decoded = codec
-                .decode_lockfile(fixture, lockfile_limits(), &never_cancelled)
-                .expect("equivalent TOML lockfile");
-            assert_eq!(decoded, canonical_lockfile);
-            assert_eq!(
-                codec
-                    .canonical_lockfile(&decoded, lockfile_limits(), &never_cancelled)
-                    .expect("canonical lockfile"),
-                MINIMAL_LOCKFILE
             );
         }
     }
@@ -2222,8 +1701,6 @@ mod tests {
             include_bytes!("../../../tests/contracts/package/v1/invalid/signed-hex.toml");
         let excessive_depth =
             include_bytes!("../../../tests/contracts/package/v1/invalid/depth.toml");
-        let mixed_locator =
-            include_bytes!("../../../tests/contracts/package/v1/invalid/mixed-locator.lock");
 
         assert!(matches!(
             codec.decode_manifest(malformed_fixture, manifest_limits(), &never_cancelled),
@@ -2255,10 +1732,6 @@ mod tests {
         assert!(matches!(
             codec.decode_manifest(excessive_depth, manifest_limits(), &never_cancelled),
             Err(DecodeError::Malformed { .. })
-        ));
-        assert!(matches!(
-            codec.decode_lockfile(mixed_locator, lockfile_limits(), &never_cancelled),
-            Err(DecodeError::NonCanonical(_))
         ));
         assert_eq!(
             codec.decode_manifest(&[0xff], manifest_limits(), &never_cancelled),
@@ -2319,28 +1792,6 @@ mod tests {
         too_few_strings.string_bytes = 55;
         assert!(matches!(
             codec.decode_manifest(MINIMAL_MANIFEST, too_few_strings, &never_cancelled),
-            Err(DecodeError::ResourceLimit {
-                resource: "package TOML string bytes",
-                ..
-            })
-        ));
-
-        let lockfile_length = u64::try_from(MINIMAL_LOCKFILE.len()).expect("fixture length");
-        let mut exact_lockfile = lockfile_limits();
-        exact_lockfile.bytes = lockfile_length;
-        exact_lockfile.string_bytes = 232;
-        let lockfile = codec
-            .decode_lockfile(MINIMAL_LOCKFILE, exact_lockfile, &never_cancelled)
-            .expect("exact lockfile limits");
-        assert_eq!(
-            codec
-                .canonical_lockfile(&lockfile, exact_lockfile, &never_cancelled)
-                .expect("exact canonical lockfile"),
-            MINIMAL_LOCKFILE
-        );
-        exact_lockfile.string_bytes = 231;
-        assert!(matches!(
-            codec.decode_lockfile(MINIMAL_LOCKFILE, exact_lockfile, &never_cancelled),
             Err(DecodeError::ResourceLimit {
                 resource: "package TOML string bytes",
                 ..
@@ -2481,13 +1932,6 @@ mod tests {
                 limit: MAX_MANIFEST_TOML_BYTES
             })
         );
-        assert_eq!(
-            codec.decode_lockfile(&over_ceiling, lockfile_limits(), &never_cancelled),
-            Err(DecodeError::ResourceLimit {
-                resource: "lockfile TOML bytes",
-                limit: MAX_LOCKFILE_TOML_BYTES
-            })
-        );
     }
 
     #[test]
@@ -2563,66 +2007,21 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
+    /// Serves whichever acquired bundle matches a locator/name/version
+    /// triple. There is no lockfile-recorded identity to check acquisition
+    /// against; the loader independently recomputes and verifies each
+    /// bundle's content digest afterward (`verify_package_identity`).
     #[derive(Clone)]
-    struct OneBundleProvider {
-        bundle: PackageBundle,
-    }
-
-    impl PackageSourceProvider for OneBundleProvider {
-        fn acquire(
-            &self,
-            locator: &PackageLocator,
-            expected: &PackageIdentity,
-            maximum_bytes: u64,
-            maximum_manifest_bytes: u64,
-            is_cancelled: &dyn Fn() -> bool,
-        ) -> Result<PackageBundle, ProviderError> {
-            if is_cancelled() {
-                return Err(ProviderError::Unavailable("cancelled".to_owned()));
-            }
-            if locator != &self.bundle.locator || expected != &self.bundle.identity {
-                return Err(ProviderError::IdentityMismatch);
-            }
-            if u64::try_from(self.bundle.manifest_bytes.len()).unwrap_or(u64::MAX)
-                > maximum_manifest_bytes
-            {
-                return Err(ProviderError::TooLarge {
-                    limit: maximum_manifest_bytes,
-                });
-            }
-            let byte_count = self
-                .bundle
-                .manifest_bytes
-                .len()
-                .checked_add(
-                    self.bundle
-                        .sources
-                        .iter()
-                        .map(|source| source.text.len())
-                        .sum::<usize>(),
-                )
-                .ok_or(ProviderError::TooLarge {
-                    limit: maximum_bytes,
-                })?;
-            if u64::try_from(byte_count).unwrap_or(u64::MAX) > maximum_bytes {
-                return Err(ProviderError::TooLarge {
-                    limit: maximum_bytes,
-                });
-            }
-            Ok(self.bundle.clone())
-        }
-    }
-
-    #[derive(Clone)]
-    struct CheckedInBootstrapProvider {
+    struct BundleProvider {
         bundles: Vec<PackageBundle>,
     }
 
-    impl PackageSourceProvider for CheckedInBootstrapProvider {
+    impl PackageSourceProvider for BundleProvider {
         fn acquire(
             &self,
             locator: &PackageLocator,
-            expected: &PackageIdentity,
+            expected_name: &PackageName,
+            expected_version: &PackageVersion,
             maximum_bytes: u64,
             maximum_manifest_bytes: u64,
             is_cancelled: &dyn Fn() -> bool,
@@ -2633,13 +2032,12 @@ mod tests {
             let bundle = self
                 .bundles
                 .iter()
-                .find(|bundle| &bundle.locator == locator)
-                .ok_or_else(|| {
-                    ProviderError::Unavailable("unknown checked-in package locator".to_owned())
-                })?;
-            if &bundle.identity != expected {
-                return Err(ProviderError::IdentityMismatch);
-            }
+                .find(|bundle| {
+                    &bundle.locator == locator
+                        && &bundle.identity.name == expected_name
+                        && &bundle.identity.version == expected_version
+                })
+                .ok_or_else(|| ProviderError::Unavailable("unknown package locator".to_owned()))?;
             if u64::try_from(bundle.manifest_bytes.len()).unwrap_or(u64::MAX)
                 > maximum_manifest_bytes
             {
@@ -2680,15 +2078,6 @@ mod tests {
             CanonicalPackageCodec::new().decode_manifest(bytes, limits, is_cancelled)
         }
 
-        fn decode_lockfile(
-            &self,
-            bytes: &[u8],
-            limits: LockfileCodecLimits,
-            is_cancelled: &dyn Fn() -> bool,
-        ) -> Result<Lockfile, DecodeError> {
-            CanonicalPackageCodec::new().decode_lockfile(bytes, limits, is_cancelled)
-        }
-
         fn canonical_manifest(
             &self,
             manifest: &PackageManifest,
@@ -2696,15 +2085,6 @@ mod tests {
             is_cancelled: &dyn Fn() -> bool,
         ) -> Result<Vec<u8>, DecodeError> {
             CanonicalPackageCodec::new().canonical_manifest(manifest, limits, is_cancelled)
-        }
-
-        fn canonical_lockfile(
-            &self,
-            lockfile: &Lockfile,
-            limits: LockfileCodecLimits,
-            is_cancelled: &dyn Fn() -> bool,
-        ) -> Result<Vec<u8>, DecodeError> {
-            CanonicalPackageCodec::new().canonical_lockfile(lockfile, limits, is_cancelled)
         }
     }
 
@@ -2752,75 +2132,121 @@ mod tests {
         }
     }
 
+    /// Semantically identical to `ROOT_MANIFEST_CANONICAL_KEY_ORDER` except
+    /// its `[[dependency]]` and `[[profile]]` keys are reordered; TOML tables
+    /// are unordered, so both decode to the same [`PackageManifest`], but
+    /// only the first is the codec's canonical spelling. Revision 0.1's
+    /// checked-in `minimal.toml`/`equivalent.toml` fixtures declare no
+    /// dependency, so this loader-level test builds its own pair with the
+    /// reserved `core` dependency the loader now requires.
+    const ROOT_MANIFEST_CANONICAL_KEY_ORDER: &str = "schema = 1\nlanguage = \"0.1-design\"\n\n[package]\nname = \"mini\"\nversion = \"1.0.0\"\nsource_root = \"src\"\n\n[[dependency]]\nalias = \"core\"\npackage = \"wrela-core\"\nrequirement = \"=1.0.0\"\n\n[[profile]]\nname = \"development\"\nmode = \"development\"\n";
+    const ROOT_MANIFEST_NONCANONICAL_KEY_ORDER: &str = "schema = 1\nlanguage = \"0.1-design\"\n\n[package]\nname = \"mini\"\nversion = \"1.0.0\"\nsource_root = \"src\"\n\n[[dependency]]\npackage = \"wrela-core\"\nrequirement = \"=1.0.0\"\nalias = \"core\"\n\n[[profile]]\nmode = \"development\"\nname = \"development\"\n";
+    const TEST_CORE_MANIFEST: &str = "schema = 1\nlanguage = \"0.1-design\"\n\n[package]\nname = \"wrela-core\"\nversion = \"1.0.0\"\nsource_root = \"src\"\n\n[[profile]]\nname = \"development\"\nmode = \"development\"\n";
+
+    /// Build a [`PackageBundle`] whose identity is exactly what the loader
+    /// will independently recompute from `sources` and the manifest's
+    /// canonical bytes -- there is no lockfile to instead read a recorded
+    /// identity from.
+    fn build_test_bundle(
+        codec: &CanonicalPackageCodec,
+        hasher: &SoftwareSha256,
+        manifest_bytes: &[u8],
+        locator: PackageLocator,
+        sources: Vec<SourceInput>,
+    ) -> PackageBundle {
+        let manifest = codec
+            .decode_manifest(manifest_bytes, manifest_limits(), &never_cancelled)
+            .expect("test package manifest");
+        let canonical_manifest = codec
+            .canonical_manifest(&manifest, manifest_limits(), &never_cancelled)
+            .expect("canonical test package manifest");
+        let mut records: Vec<PackageContentRecord<'_>> = sources
+            .iter()
+            .map(|source| PackageContentRecord {
+                kind: PackageContentKind::Source,
+                path: source.path.as_str(),
+                digest: source.digest,
+            })
+            .collect();
+        records.sort_by_key(|record| (record.kind, record.path));
+        let source_digest =
+            package_content_digest(&canonical_manifest, &records, hasher, &never_cancelled)
+                .expect("test package content digest");
+        PackageBundle {
+            identity: PackageIdentity {
+                name: manifest.name,
+                version: manifest.version,
+                source_digest,
+            },
+            locator,
+            manifest_bytes: manifest_bytes.to_vec(),
+            sources,
+            scenarios: Vec::new(),
+        }
+    }
+
     #[test]
     fn workspace_loader_consumes_equivalent_noncanonical_manifest_toml() {
         let codec = CanonicalPackageCodec::new();
         let hasher = SoftwareSha256;
-        let manifest = codec
-            .decode_manifest(EQUIVALENT_MANIFEST, manifest_limits(), &never_cancelled)
-            .expect("equivalent root manifest");
-        let canonical_manifest = codec
-            .canonical_manifest(&manifest, manifest_limits(), &never_cancelled)
-            .expect("canonical root manifest");
-        assert_eq!(canonical_manifest, MINIMAL_MANIFEST);
+        let canonical_manifest_value = codec
+            .decode_manifest(
+                ROOT_MANIFEST_CANONICAL_KEY_ORDER.as_bytes(),
+                manifest_limits(),
+                &never_cancelled,
+            )
+            .expect("canonical-key-order root manifest");
+        let noncanonical_manifest_value = codec
+            .decode_manifest(
+                ROOT_MANIFEST_NONCANONICAL_KEY_ORDER.as_bytes(),
+                manifest_limits(),
+                &never_cancelled,
+            )
+            .expect("reordered-key root manifest");
+        assert_eq!(canonical_manifest_value, noncanonical_manifest_value);
 
-        let source_text = "fn mini() -> unit:\n    return ()\n";
-        let source_digest = hasher.sha256(source_text.as_bytes());
-        let records = [PackageContentRecord {
-            kind: PackageContentKind::Source,
-            path: "mini.wr",
-            digest: source_digest,
-        }];
-        let package_digest =
-            package_content_digest(&canonical_manifest, &records, &hasher, &never_cancelled)
-                .expect("package content digest");
-        let identity = PackageIdentity {
-            name: manifest.name.clone(),
-            version: manifest.version.clone(),
-            source_digest: package_digest,
-        };
-        let locator = PackageLocator::Workspace {
+        let root_locator = PackageLocator::Workspace {
             path: "packages/mini".to_owned(),
         };
-        let lockfile = Lockfile {
-            schema: LOCKFILE_SCHEMA_VERSION,
-            root: identity.clone(),
-            packages: vec![LockedPackage {
-                identity: identity.clone(),
-                locator: locator.clone(),
-                dependencies: Vec::new(),
-                manifest_digest: hasher.sha256(&canonical_manifest),
+        let core_locator = PackageLocator::Toolchain {
+            component: "wrela-core-test".to_owned(),
+        };
+        let root_source_text = "fn mini() -> unit:\n    return ()\n";
+        let root_bundle = build_test_bundle(
+            &codec,
+            &hasher,
+            ROOT_MANIFEST_NONCANONICAL_KEY_ORDER.as_bytes(),
+            root_locator.clone(),
+            vec![SourceInput {
+                path: "mini.wr".to_owned(),
+                text: root_source_text.to_owned(),
+                digest: hasher.sha256(root_source_text.as_bytes()),
             }],
+        );
+        let core_bundle = build_test_bundle(
+            &codec,
+            &hasher,
+            TEST_CORE_MANIFEST.as_bytes(),
+            core_locator.clone(),
+            Vec::new(),
+        );
+        let provider = BundleProvider {
+            bundles: vec![root_bundle, core_bundle],
         };
-        let canonical_lockfile = codec
-            .canonical_lockfile(&lockfile, lockfile_limits(), &never_cancelled)
-            .expect("canonical test lockfile");
-        let provider = OneBundleProvider {
-            bundle: PackageBundle {
-                identity,
-                locator: locator.clone(),
-                manifest_bytes: EQUIVALENT_MANIFEST.to_vec(),
-                sources: vec![SourceInput {
-                    path: "mini.wr".to_owned(),
-                    text: source_text.to_owned(),
-                    digest: source_digest,
-                }],
-                scenarios: Vec::new(),
-            },
-        };
+
         let events = RefCell::new(Vec::new());
         let recording_codec = RecordingCodec { events: &events };
         let recording_hasher = RecordingHasher {
             events: &events,
-            raw_manifest: EQUIVALENT_MANIFEST,
+            raw_manifest: ROOT_MANIFEST_NONCANONICAL_KEY_ORDER.as_bytes(),
         };
 
         let workspace = CanonicalWorkspaceLoader::new()
             .load(
                 LoadRequest {
-                    root_locator: locator,
-                    root_manifest_bytes: EQUIVALENT_MANIFEST,
-                    lockfile_bytes: &canonical_lockfile,
+                    root_locator,
+                    root_manifest_bytes: ROOT_MANIFEST_NONCANONICAL_KEY_ORDER.as_bytes(),
+                    core_locator,
                     provider: &provider,
                     hasher: &recording_hasher,
                     codec: &recording_codec,
@@ -2828,99 +2254,92 @@ mod tests {
                 },
                 &never_cancelled,
             )
-            .expect("loader accepts semantically equivalent manifest syntax");
-        assert_eq!(workspace.root_manifest(), &manifest);
+            .expect("loader accepts semantically equivalent root manifest syntax");
+        assert_eq!(workspace.root_manifest(), &noncanonical_manifest_value);
         assert_eq!(workspace.sources().len(), 1);
+        // The raw noncanonical root bytes are hashed before any decode
+        // observes them, independently at each of the loader's three root
+        // touchpoints (initial validation, acquisition, and the final seal).
+        let recorded = events.into_inner();
         assert_eq!(
-            events.into_inner(),
-            [
-                "raw-manifest-hash",
-                "decode-manifest",
-                "raw-manifest-hash",
-                "decode-manifest",
-                "raw-manifest-hash",
-                "decode-manifest",
-            ]
+            recorded
+                .iter()
+                .filter(|event| **event == "raw-manifest-hash")
+                .count(),
+            3
         );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|event| **event == "decode-manifest")
+                .count(),
+            4
+        );
+        assert_eq!(recorded.first(), Some(&"raw-manifest-hash"));
     }
 
     #[test]
     fn workspace_loader_seals_the_checked_in_minimum_image_and_toolchain_core() {
         let codec = CanonicalPackageCodec::new();
         let hasher = SoftwareSha256;
-        let lockfile = codec
-            .decode_lockfile(
-                CHECKED_IN_MINIMUM_IMAGE_LOCKFILE,
-                lockfile_limits(),
-                &never_cancelled,
-            )
-            .expect("checked-in lockfile");
-        let root = lockfile
-            .packages
-            .iter()
-            .find(|package| package.identity == lockfile.root)
-            .expect("locked root package");
-        let core = lockfile
-            .packages
-            .iter()
-            .find(|package| package.identity.name.as_str() == "wrela-core")
-            .expect("locked core package");
         let root_locator = PackageLocator::Workspace {
             path: ".".to_owned(),
         };
-        assert_eq!(root.locator, root_locator);
-        let provider = CheckedInBootstrapProvider {
-            bundles: vec![
-                PackageBundle {
-                    identity: root.identity.clone(),
-                    locator: root_locator.clone(),
-                    manifest_bytes: CHECKED_IN_MINIMUM_IMAGE_MANIFEST.to_vec(),
-                    sources: vec![SourceInput {
-                        path: "bootstrap/image.wr".to_owned(),
-                        text: std::str::from_utf8(CHECKED_IN_MINIMUM_IMAGE_SOURCE)
-                            .expect("application source UTF-8")
-                            .to_owned(),
-                        digest: hasher.sha256(CHECKED_IN_MINIMUM_IMAGE_SOURCE),
-                    }],
-                    scenarios: Vec::new(),
+        let core_locator = PackageLocator::Toolchain {
+            component: "wrela-core-0.1".to_owned(),
+        };
+        let root_bundle = build_test_bundle(
+            &codec,
+            &hasher,
+            CHECKED_IN_MINIMUM_IMAGE_MANIFEST,
+            root_locator.clone(),
+            vec![SourceInput {
+                path: "bootstrap/image.wr".to_owned(),
+                text: std::str::from_utf8(CHECKED_IN_MINIMUM_IMAGE_SOURCE)
+                    .expect("application source UTF-8")
+                    .to_owned(),
+                digest: hasher.sha256(CHECKED_IN_MINIMUM_IMAGE_SOURCE),
+            }],
+        );
+        let core_bundle = build_test_bundle(
+            &codec,
+            &hasher,
+            CHECKED_IN_CORE_MANIFEST,
+            core_locator.clone(),
+            vec![
+                SourceInput {
+                    path: "image.wr".to_owned(),
+                    text: std::str::from_utf8(CHECKED_IN_CORE_SOURCE)
+                        .expect("core image source UTF-8")
+                        .to_owned(),
+                    digest: hasher.sha256(CHECKED_IN_CORE_SOURCE),
                 },
-                PackageBundle {
-                    identity: core.identity.clone(),
-                    locator: core.locator.clone(),
-                    manifest_bytes: CHECKED_IN_CORE_MANIFEST.to_vec(),
-                    sources: vec![
-                        SourceInput {
-                            path: "image.wr".to_owned(),
-                            text: std::str::from_utf8(CHECKED_IN_CORE_SOURCE)
-                                .expect("core image source UTF-8")
-                                .to_owned(),
-                            digest: hasher.sha256(CHECKED_IN_CORE_SOURCE),
-                        },
-                        SourceInput {
-                            path: "ops.wr".to_owned(),
-                            text: std::str::from_utf8(CHECKED_IN_CORE_OPS_SOURCE)
-                                .expect("core ops source UTF-8")
-                                .to_owned(),
-                            digest: hasher.sha256(CHECKED_IN_CORE_OPS_SOURCE),
-                        },
-                        SourceInput {
-                            path: "result.wr".to_owned(),
-                            text: std::str::from_utf8(CHECKED_IN_CORE_RESULT_SOURCE)
-                                .expect("core result source UTF-8")
-                                .to_owned(),
-                            digest: hasher.sha256(CHECKED_IN_CORE_RESULT_SOURCE),
-                        },
-                        SourceInput {
-                            path: "time.wr".to_owned(),
-                            text: std::str::from_utf8(CHECKED_IN_CORE_TIME_SOURCE)
-                                .expect("core time source UTF-8")
-                                .to_owned(),
-                            digest: hasher.sha256(CHECKED_IN_CORE_TIME_SOURCE),
-                        },
-                    ],
-                    scenarios: Vec::new(),
+                SourceInput {
+                    path: "ops.wr".to_owned(),
+                    text: std::str::from_utf8(CHECKED_IN_CORE_OPS_SOURCE)
+                        .expect("core ops source UTF-8")
+                        .to_owned(),
+                    digest: hasher.sha256(CHECKED_IN_CORE_OPS_SOURCE),
+                },
+                SourceInput {
+                    path: "result.wr".to_owned(),
+                    text: std::str::from_utf8(CHECKED_IN_CORE_RESULT_SOURCE)
+                        .expect("core result source UTF-8")
+                        .to_owned(),
+                    digest: hasher.sha256(CHECKED_IN_CORE_RESULT_SOURCE),
+                },
+                SourceInput {
+                    path: "time.wr".to_owned(),
+                    text: std::str::from_utf8(CHECKED_IN_CORE_TIME_SOURCE)
+                        .expect("core time source UTF-8")
+                        .to_owned(),
+                    digest: hasher.sha256(CHECKED_IN_CORE_TIME_SOURCE),
                 },
             ],
+        );
+        let expected_root_identity = root_bundle.identity.clone();
+        let provider = BundleProvider {
+            bundles: vec![root_bundle, core_bundle],
         };
 
         let workspace = CanonicalWorkspaceLoader::new()
@@ -2928,7 +2347,7 @@ mod tests {
                 LoadRequest {
                     root_locator,
                     root_manifest_bytes: CHECKED_IN_MINIMUM_IMAGE_MANIFEST,
-                    lockfile_bytes: CHECKED_IN_MINIMUM_IMAGE_LOCKFILE,
+                    core_locator,
                     provider: &provider,
                     hasher: &hasher,
                     codec: &codec,
@@ -2937,10 +2356,6 @@ mod tests {
                 &never_cancelled,
             )
             .expect("checked-in bootstrap workspace loads and seals");
-        assert_eq!(
-            workspace.canonical_lockfile(),
-            CHECKED_IN_MINIMUM_IMAGE_LOCKFILE
-        );
         assert_eq!(workspace.graph().packages().len(), 2);
         assert_eq!(workspace.graph().modules().len(), 5);
         assert_eq!(workspace.sources().len(), 5);
@@ -2956,7 +2371,7 @@ mod tests {
             .graph()
             .package(workspace.graph().root())
             .expect("loaded root package");
-        assert_eq!(root_record.identity, lockfile.root);
+        assert_eq!(root_record.identity, expected_root_identity);
         assert_eq!(root_record.dependencies.len(), 1);
         assert_eq!(root_record.dependencies[0].alias.as_str(), "core");
         assert!(

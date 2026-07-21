@@ -1,5 +1,0 @@
-# TOML 1.0 inline tables equivalent to minimal.lock.
-schema = 0b1
-root = { name = 'mini', version = """1.0.0""", source_digest = "1111111111111111111111111111111111111111111111111111111111111111" }
-package = [{ "name" = 'mini', version = "1.0.0", source_digest = '1111111111111111111111111111111111111111111111111111111111111111', manifest_digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", locator = 'workspace', locator_path = """packages/mini""" }]
-

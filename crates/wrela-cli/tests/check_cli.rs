@@ -20,13 +20,12 @@ use wrela_driver::{
     EventSink, TestSelection, WorkspaceSelection,
 };
 use wrela_package::{
-    DependencyAlias, LOCKFILE_SCHEMA_VERSION, LockedDependency, LockedPackage, Lockfile,
     PackageIdentity, PackageLocator, PackageManifest, PackageName, PackageVersion,
 };
 use wrela_package_loader::{
     CanonicalPackageCodec, CanonicalTreeLimits, CanonicalTreeRecord, ContentHasher,
-    LockfileCodecLimits, ManifestCodecLimits, PackageCodec, PackageContentKind,
-    PackageContentRecord, SoftwareSha256, canonical_tree_digest, package_content_digest,
+    ManifestCodecLimits, PackageCodec, PackageContentKind, PackageContentRecord, SoftwareSha256,
+    canonical_tree_digest, package_content_digest,
 };
 use wrela_test_model::{
     CanonicalTestReportCodec, FailurePhase, TestOutcome as ModelTestOutcome, TestReport,
@@ -378,7 +377,6 @@ fn run_source_unit_driver_with_semantic_cancellation(
     let command = DriverCommand::Test {
         workspace: WorkspaceSelection {
             manifest: workspace.join("wrela.toml"),
-            lockfile: workspace.join("wrela.lock"),
             image: "bootstrap".to_owned(),
             target: TargetIdentity::aarch64_qemu_virt_uefi(),
             profile: "development".to_owned(),
@@ -1580,66 +1578,10 @@ fn install_workspace_package(
     for (path, bytes) in sources {
         directory.write(&format!("workspace/src/{path}"), bytes);
     }
-
-    let codec = CanonicalPackageCodec::new();
-    let application = codec
-        .decode_manifest(application_manifest, manifest_limits(), &never_cancelled)
-        .expect("application manifest");
-    let core = codec
-        .decode_manifest(CORE_MANIFEST, manifest_limits(), &never_cancelled)
-        .expect("core manifest");
-    let canonical_application = canonical_manifest_bytes(&application);
-    let canonical_core = canonical_manifest_bytes(&core);
-    let application_identity =
-        package_identity_with_sources(&application, &canonical_application, sources);
-    let core_identity = package_identity_with_sources(
-        &core,
-        &canonical_core,
-        &[
-            ("image.wr", CORE_SOURCE),
-            ("ops.wr", CORE_OPS_SOURCE),
-            ("result.wr", CORE_RESULT_SOURCE),
-            ("time.wr", CORE_TIME_SOURCE),
-        ],
-    );
-    let root = LockedPackage {
-        identity: application_identity.clone(),
-        locator: PackageLocator::Workspace {
-            path: ".".to_owned(),
-        },
-        dependencies: vec![LockedDependency {
-            alias: DependencyAlias::new("core").expect("core alias"),
-            identity: core_identity.clone(),
-        }],
-        manifest_digest: HASHER.sha256(&canonical_application),
-    };
-    let core = LockedPackage {
-        identity: core_identity,
-        locator: PackageLocator::Toolchain {
-            component: "wrela-core-0.1".to_owned(),
-        },
-        dependencies: Vec::new(),
-        manifest_digest: HASHER.sha256(&canonical_core),
-    };
-    let mut packages = vec![root, core];
-    packages.sort_by(|left, right| left.identity.cmp(&right.identity));
-    let lockfile = codec
-        .canonical_lockfile(
-            &Lockfile {
-                schema: LOCKFILE_SCHEMA_VERSION,
-                root: application_identity,
-                packages,
-            },
-            LockfileCodecLimits {
-                bytes: 1024 * 1024,
-                string_bytes: 1024 * 1024,
-                packages: 16,
-                dependencies: 16,
-            },
-            &never_cancelled,
-        )
-        .expect("canonical lockfile");
-    directory.write("workspace/wrela.lock", &lockfile);
+    // There is no lockfile: the reserved `core` alias always resolves
+    // against the installed toolchain's own standard-library index
+    // (`docs/language/02-source-language.md` §2.1), so nothing else needs
+    // recording here.
     workspace
 }
 

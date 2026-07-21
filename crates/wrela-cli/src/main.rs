@@ -240,7 +240,6 @@ fn resolve_command_paths(command: Command, base: &Path) -> Result<Command, Strin
     };
     let resolve_workspace = |mut workspace: WorkspaceSelection| {
         workspace.manifest = resolve(workspace.manifest, MAX_WORKSPACE_PATH_BYTES)?;
-        workspace.lockfile = resolve(workspace.lockfile, MAX_WORKSPACE_PATH_BYTES)?;
         Ok::<_, String>(workspace)
     };
     match command {
@@ -666,13 +665,8 @@ fn workspace_arguments(
         .next()
         .ok_or_else(|| format!("`{command}` requires an image name"))?;
     let image = selection_argument("image", image)?;
-    let lockfile = manifest
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("wrela.lock");
     Ok(WorkspaceSelection {
         manifest,
-        lockfile,
         image,
         target: wrela_build_model::TargetIdentity::aarch64_qemu_virt_uefi(),
         profile: "development".to_owned(),
@@ -863,7 +857,6 @@ mod tests {
             panic!("expected build command");
         };
         assert_eq!(workspace.target.as_str(), "aarch64-qemu-virt-uefi");
-        assert_eq!(workspace.lockfile, std::path::Path::new("wrela.lock"));
     }
 
     #[test]
@@ -893,10 +886,6 @@ mod tests {
         assert_eq!(
             workspace.manifest,
             PathBuf::from("/work/checkout/project/wrela.toml")
-        );
-        assert_eq!(
-            workspace.lockfile,
-            PathBuf::from("/work/checkout/project/wrela.lock")
         );
         assert_eq!(output_directory, PathBuf::from("/work/artifacts"));
     }
@@ -933,7 +922,6 @@ mod tests {
             panic!("expected check command")
         };
         assert_eq!(workspace.manifest, PathBuf::from("/wrela.toml"));
-        assert_eq!(workspace.lockfile, PathBuf::from("/wrela.lock"));
         assert!(
             super::normalize_absolute(Path::new("/"), super::MAX_WORKSPACE_PATH_BYTES, false)
                 .is_err()

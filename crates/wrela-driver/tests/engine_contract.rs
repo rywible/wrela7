@@ -23,7 +23,6 @@ fn input_files() -> Vec<(TreeRecord, Vec<u8>)> {
             b"module app.math\n\npub fn add(left: u32, right: u32) -> u32:\n    return left + right\n"
                 .as_slice(),
         ),
-        ("wrela.lock", b"lock-version = 1\n".as_slice()),
         (
             "wrela.toml",
             b"[package]\nname = \"app\"\nversion = \"0.1.0\"\n".as_slice(),
@@ -55,7 +54,6 @@ fn request_fixture() -> (CheckRequest, ClientHello, Vec<(TreeRecord, Vec<u8>)>) 
             engine_identity: digest(b"wrela-engine executable"),
             payload_identity,
             manifest: EnginePath::new("wrela.toml").expect("manifest path"),
-            lockfile: EnginePath::new("wrela.lock").expect("lock path"),
             image: "app".to_owned(),
             target: TargetIdentity::aarch64_qemu_virt_uefi(),
             profile: "dev".to_owned(),
@@ -427,10 +425,14 @@ fn paths_reject_host_and_noncanonical_spellings() {
     );
 
     let (request, _, _) = request_fixture();
-    let mut aliased_roles = request.to_fields();
-    aliased_roles.lockfile = aliased_roles.manifest.clone();
+    let mut wrong_manifest_name = request.to_fields();
+    wrong_manifest_name.manifest = EnginePath::new("workspace/other.toml").expect("sibling path");
     assert_eq!(
-        CheckRequest::seal(aliased_roles, EngineProtocolLimits::standard(), &|| false),
+        CheckRequest::seal(
+            wrong_manifest_name,
+            EngineProtocolLimits::standard(),
+            &|| false
+        ),
         Err(EngineProtocolError::InvalidResourcePolicy)
     );
 }

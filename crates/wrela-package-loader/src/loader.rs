@@ -1,21 +1,28 @@
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
-use wrela_package::{
-    LockedPackage, PackageGraphBuilder, PackageHandle, PackageIdentity, exact_requirement_version,
-};
+use wrela_build_model::Sha256Digest;
+use wrela_package::{PackageGraphBuilder, PackageIdentity, PackageManifest};
 use wrela_source::{MAX_SOURCE_PATH_BYTES, SourceDatabase, SourceInput};
 
 use crate::{
     DecodeError, LoadError, LoadRequest, LoadedManifestInput, LoadedWorkspace,
-    LoadedWorkspaceCandidate, LockfileCodecLimits, ManifestCodecLimits, PackageBundle,
-    PackageContentDigestError, PackageContentKind, PackageContentRecord, ProviderError,
-    ScenarioInput, WorkspaceLoader, bounded_decode_error, bounded_load_error_value,
-    bounded_provider_error, bounded_source_error, is_utf8_cancellable, package_content_digest,
-    qualified_source_path, seal_loaded_workspace, sha256_cancellable, try_loader_vec,
-    try_reserve_loader_vec,
+    LoadedWorkspaceCandidate, ManifestCodecLimits, PackageBundle, PackageContentDigestError,
+    PackageContentKind, PackageContentRecord, ProviderError, ScenarioInput, WorkspaceLoader,
+    bounded_load_error_value, bounded_provider_error, bounded_source_error, is_utf8_cancellable,
+    package_content_digest, qualified_source_path, seal_loaded_workspace, sha256_cancellable,
+    try_loader_vec, try_reserve_loader_vec,
 };
 
-/// Production workspace producer for the hermetic manifest/lock/provider boundary.
+/// Reserved alias binding the sole revision-0.1 dependency to the
+/// toolchain-shipped `core` component (`docs/language/02-source-language.md`
+/// §2.1). No other alias is resolvable: revision 0.1 cannot acquire
+/// third-party packages, so a lockfile would pin no choice.
+const CORE_ALIAS: &str = "core";
+
+/// Production workspace producer for the hermetic manifest/provider boundary.
+///
+/// There is no lockfile: the root manifest's sole dependency (the reserved
+/// `core` alias) resolves directly against `LoadRequest::core_locator`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CanonicalWorkspaceLoader;
 
@@ -34,56 +41,26 @@ impl WorkspaceLoader for CanonicalWorkspaceLoader {
     ) -> Result<LoadedWorkspace, LoadError> {
         check_cancelled(is_cancelled)?;
         request.limits.validate()?;
+        wrela_package::validate_locator(&request.root_locator).map_err(|error| {
+            LoadError::Manifest(bounded_load_error_value(&format!(
+                "invalid root locator: {error}"
+            )))
+        })?;
+        wrela_package::validate_locator(&request.core_locator).map_err(|error| {
+            LoadError::Manifest(bounded_load_error_value(&format!(
+                "invalid core locator: {error}"
+            )))
+        })?;
         let manifest_limits = manifest_codec_limits(&request);
-        let lockfile_limits = lockfile_codec_limits(&request);
-        check_input_bytes(
-            request.lockfile_bytes.len(),
-            request.limits.lockfile_bytes,
-            "lockfile bytes",
-        )?;
         check_input_bytes(
             request.root_manifest_bytes.len(),
             request.limits.manifest_bytes_per_package,
             "root manifest bytes",
         )?;
 
-        let lockfile = request
-            .codec
-            .decode_lockfile(request.lockfile_bytes, lockfile_limits, is_cancelled)
-            .map_err(map_lockfile_error)?;
-        let canonical_lockfile = request
-            .codec
-            .canonical_lockfile(&lockfile, lockfile_limits, is_cancelled)
-            .map_err(map_lockfile_error)?;
-        if canonical_lockfile.as_slice() != request.lockfile_bytes {
-            return Err(LoadError::Lock(
-                "caller-supplied lockfile bytes are not canonical schema-1 TOML".to_owned(),
-            ));
-        }
-        validate_locked_closure(&lockfile, is_cancelled)?;
-
-        let root_index = lockfile
-            .packages
-            .binary_search_by(|package| package.identity.cmp(&lockfile.root))
-            .map_err(|_| {
-                LoadError::Lock("lockfile does not contain its root package".to_owned())
-            })?;
-        let root_locked = lockfile
-            .packages
-            .get(root_index)
-            .ok_or_else(|| LoadError::Lock("lockfile root package index is invalid".to_owned()))?;
-        if root_locked.locator != request.root_locator {
-            return Err(LoadError::Lock(
-                "requested root locator differs from the exact locked root locator".to_owned(),
-            ));
-        }
-        let root_identity = root_locked.identity.clone();
-        let root_manifest_digest = root_locked.manifest_digest;
-
         // Snapshot the exact caller bytes under SHA-256 before any TOML parser
-        // observes them. The lock binds the independently encoded canonical
-        // digest below, so semantically equivalent noncanonical TOML remains
-        // accepted without making parsing precede integrity work.
+        // observes them. Semantic identity is checked independently below, so
+        // equivalent-but-noncanonical TOML remains accepted.
         let _raw_root_manifest_digest =
             sha256_cancellable(request.hasher, request.root_manifest_bytes, is_cancelled)
                 .map_err(|_| LoadError::Cancelled)?;
@@ -91,213 +68,122 @@ impl WorkspaceLoader for CanonicalWorkspaceLoader {
             .codec
             .decode_manifest(request.root_manifest_bytes, manifest_limits, is_cancelled)
             .map_err(map_root_manifest_error)?;
-        let requested_root_canonical = request
-            .codec
-            .canonical_manifest(&requested_root, manifest_limits, is_cancelled)
-            .map_err(map_root_manifest_error)?;
-        let requested_root_digest =
-            sha256_cancellable(request.hasher, &requested_root_canonical, is_cancelled)
-                .map_err(|_| LoadError::Cancelled)?;
-        if requested_root.name != root_identity.name
-            || requested_root.version != root_identity.version
-        {
+        requested_root.validate().map_err(|error| {
+            LoadError::Manifest(bounded_load_error_value(&format!(
+                "invalid root manifest: {error}"
+            )))
+        })?;
+        let core_dependency = one_core_dependency(&requested_root)?;
+        let core_version = wrela_package::exact_requirement_version(&core_dependency.requirement)
+            .ok_or_else(|| {
+            LoadError::Manifest(
+                "core dependency requirement must be one exact revision 0.1 requirement".to_owned(),
+            )
+        })?;
+
+        let root_bundle = acquire_package(
+            &request,
+            &request.root_locator,
+            &requested_root.name,
+            &requested_root.version,
+            is_cancelled,
+        )?;
+        let core_bundle = acquire_package(
+            &request,
+            &request.core_locator,
+            &core_dependency.package,
+            &core_version,
+            is_cancelled,
+        )?;
+
+        let (root_manifest, root_canonical_manifest, root_validated_sources, root_scenarios) =
+            acquire_manifest_content(&request, &root_bundle, manifest_limits, is_cancelled)?;
+        if root_manifest != requested_root {
             return Err(LoadError::Manifest(
-                "caller-supplied root manifest name or version differs from the lockfile root"
-                    .to_owned(),
+                "provider substituted a different root manifest".to_owned(),
             ));
         }
-        if requested_root_digest != root_manifest_digest {
-            return Err(LoadError::DigestMismatch {
-                subject: "caller-supplied root manifest".to_owned(),
-                expected: root_manifest_digest,
-                actual: requested_root_digest,
-            });
+        let (core_manifest, core_canonical_manifest, core_validated_sources, core_scenarios) =
+            acquire_manifest_content(&request, &core_bundle, manifest_limits, is_cancelled)?;
+        if core_manifest.name != core_dependency.package || core_manifest.version != core_version {
+            return Err(LoadError::Manifest(
+                "acquired core package does not match the declared core dependency".to_owned(),
+            ));
         }
 
-        let mut graph_builder = PackageGraphBuilder::new(root_identity.clone());
-        let mut package_handles = BTreeMap::<&PackageIdentity, PackageHandle>::new();
-        package_handles.insert(&lockfile.root, graph_builder.root());
-        for package in &lockfile.packages {
-            check_cancelled(is_cancelled)?;
-            if package.identity != root_identity {
-                let handle = graph_builder
-                    .add_package(package.identity.clone())
-                    .map_err(|error| {
-                        LoadError::Graph(bounded_load_error_value(&error.to_string()))
-                    })?;
-                package_handles.insert(&package.identity, handle);
-            }
-        }
-        for package in &lockfile.packages {
-            check_cancelled(is_cancelled)?;
-            let owner_handle = package_handle(&package_handles, &package.identity)?;
-            for dependency in &package.dependencies {
-                check_cancelled(is_cancelled)?;
-                let dependency_handle = package_handle(&package_handles, &dependency.identity)?;
-                graph_builder
-                    .add_dependency(owner_handle, dependency.alias.clone(), dependency_handle)
-                    .map_err(|error| {
-                        LoadError::Graph(bounded_load_error_value(&error.to_string()))
-                    })?;
-            }
-        }
+        verify_package_identity(
+            &root_bundle,
+            &root_canonical_manifest,
+            &root_validated_sources,
+            &root_scenarios,
+            &request,
+            is_cancelled,
+        )?;
+        verify_package_identity(
+            &core_bundle,
+            &core_canonical_manifest,
+            &core_validated_sources,
+            &core_scenarios,
+            &request,
+            is_cancelled,
+        )?;
 
-        let package_capacity = lockfile.packages.len();
+        let mut graph_builder = PackageGraphBuilder::new(root_bundle.identity.clone());
+        let root_handle = graph_builder.root();
+        let core_handle = graph_builder
+            .add_package(core_bundle.identity.clone())
+            .map_err(|error| LoadError::Graph(bounded_load_error_value(&error.to_string())))?;
+        graph_builder
+            .add_dependency(root_handle, core_dependency.alias.clone(), core_handle)
+            .map_err(|error| LoadError::Graph(bounded_load_error_value(&error.to_string())))?;
+
         let mut manifests = try_loader_vec(
-            package_capacity,
+            2,
             "loaded manifest records",
             u64::from(request.limits.packages),
         )?;
         let mut sources = SourceDatabase::default();
         let mut scenarios = Vec::new();
-        let mut provided_source_count = 0u64;
-        let mut declared_image_test_count = 0u64;
         let mut provided_scenario_count = 0u64;
-        let mut manifest_bytes = 0u64;
-        let mut source_bytes = 0u64;
-        let mut scenario_bytes = 0u64;
 
-        for package in &lockfile.packages {
+        for (bundle, manifest, canonical_manifest, validated_sources, validated_scenarios) in [
+            (
+                &root_bundle,
+                root_manifest,
+                root_canonical_manifest,
+                root_validated_sources,
+                root_scenarios,
+            ),
+            (
+                &core_bundle,
+                core_manifest,
+                core_canonical_manifest,
+                core_validated_sources,
+                core_scenarios,
+            ),
+        ] {
             check_cancelled(is_cancelled)?;
-            let bundle = acquire_package(&request, package, is_cancelled)?;
-            let PackageBundle {
-                identity: _,
-                locator: _,
-                manifest_bytes: package_manifest_bytes,
-                sources: provided_sources,
-                scenarios: provided_scenarios,
-            } = bundle;
-
-            add_count(
-                &mut provided_source_count,
-                provided_sources.len(),
-                u64::from(request.limits.sources),
-                "provided source files",
-            )?;
-            add_count(
-                &mut provided_scenario_count,
-                provided_scenarios.len(),
-                u64::from(request.limits.scenarios),
-                "provided scenario files",
-            )?;
-            let (package_source_bytes, package_scenario_bytes, acquired_package_bytes) =
-                preflight_package_bytes(
-                    &package_manifest_bytes,
-                    &provided_sources,
-                    &provided_scenarios,
-                    request.limits.bytes_per_package,
-                    is_cancelled,
-                )?;
-            add_bytes(
-                &mut source_bytes,
-                package_source_bytes,
-                request.limits.source_bytes,
-                "source bytes",
-            )?;
-            add_bytes(
-                &mut scenario_bytes,
-                package_scenario_bytes,
-                request.limits.scenario_bytes,
-                "scenario bytes",
-            )?;
-
-            // Hash the immutable acquired bytes before semantic TOML decode;
-            // the canonical digest is computed and lock-checked separately.
-            let _raw_acquired_manifest_digest =
-                sha256_cancellable(request.hasher, &package_manifest_bytes, is_cancelled)
-                    .map_err(|_| LoadError::Cancelled)?;
-            let manifest = request
-                .codec
-                .decode_manifest(&package_manifest_bytes, manifest_limits, is_cancelled)
-                .map_err(|error| map_package_manifest_error(&package.identity, error))?;
-            let canonical_manifest = request
-                .codec
-                .canonical_manifest(&manifest, manifest_limits, is_cancelled)
-                .map_err(|error| map_package_manifest_error(&package.identity, error))?;
-            add_bytes(
-                &mut manifest_bytes,
-                u64::try_from(canonical_manifest.len()).unwrap_or(u64::MAX),
-                request.limits.manifest_bytes,
-                "canonical manifest bytes",
-            )?;
-            add_count(
-                &mut declared_image_test_count,
-                manifest.image_tests.len(),
-                u64::from(request.limits.scenarios),
-                "declared image tests",
-            )?;
-            let canonical_package_bytes = u64::try_from(canonical_manifest.len())
-                .unwrap_or(u64::MAX)
-                .checked_add(package_source_bytes)
-                .and_then(|bytes| bytes.checked_add(package_scenario_bytes))
-                .ok_or_else(|| resource_limit("package bytes", request.limits.bytes_per_package))?;
-            if acquired_package_bytes > request.limits.bytes_per_package
-                || canonical_package_bytes > request.limits.bytes_per_package
-            {
-                return Err(resource_limit(
-                    "package bytes",
-                    request.limits.bytes_per_package,
-                ));
-            }
-
-            validate_manifest_identity_and_dependencies(&manifest, package, is_cancelled)?;
-            if package.identity == root_identity && manifest != requested_root {
-                return Err(LoadError::Manifest(
-                    "provider substituted a different root manifest".to_owned(),
-                ));
-            }
             let manifest_digest =
                 sha256_cancellable(request.hasher, &canonical_manifest, is_cancelled)
                     .map_err(|_| LoadError::Cancelled)?;
-            if manifest_digest != package.manifest_digest {
-                return Err(LoadError::DigestMismatch {
-                    subject: bounded_load_error_value(&format!(
-                        "manifest for {}@{}",
-                        package.identity.name.as_str(),
-                        package.identity.version.as_str()
-                    )),
-                    expected: package.manifest_digest,
-                    actual: manifest_digest,
-                });
-            }
-
-            let validated_sources = derive_modules(
-                &package.identity,
-                provided_sources,
-                request.hasher,
-                is_cancelled,
-            )?;
-            reject_unknown_image_modules(&manifest, &validated_sources)?;
-            let validated_scenarios = validate_scenarios(
-                &package.identity,
-                &manifest,
-                provided_scenarios,
-                request.hasher,
-                is_cancelled,
-            )?;
-            verify_package_identity(
-                package,
-                &canonical_manifest,
-                &validated_sources,
-                &validated_scenarios,
-                &request,
-                is_cancelled,
-            )?;
-
-            try_reserve_loader_vec(
-                &mut scenarios,
+            add_count(
+                &mut provided_scenario_count,
                 validated_scenarios.len(),
-                "loaded scenario records",
                 u64::from(request.limits.scenarios),
+                "provided scenario files",
             )?;
 
-            let handle = package_handle(&package_handles, &package.identity)?;
+            let handle = if bundle.identity == root_bundle.identity {
+                root_handle
+            } else {
+                core_handle
+            };
             for source in validated_sources {
                 check_cancelled(is_cancelled)?;
                 let source_id = sources
                     .add(SourceInput {
                         path: qualified_source_path(
-                            &package.identity,
+                            &bundle.identity,
                             &manifest.source_root,
                             &source.relative_path,
                         )?,
@@ -317,8 +203,8 @@ impl WorkspaceLoader for CanonicalWorkspaceLoader {
                 scenarios.push(scenario);
             }
             manifests.push(LoadedManifestInput {
-                identity: package.identity.clone(),
-                locator: package.locator.clone(),
+                identity: bundle.identity.clone(),
+                locator: bundle.locator.clone(),
                 manifest_digest,
                 manifest,
                 canonical_manifest,
@@ -331,42 +217,18 @@ impl WorkspaceLoader for CanonicalWorkspaceLoader {
             ));
         }
         check_cancelled(is_cancelled)?;
-        drop(package_handles);
         let graph = graph_builder
             .finish()
             .map_err(|error| LoadError::Graph(bounded_load_error_value(&error.to_string())))?;
         check_cancelled(is_cancelled)?;
 
-        let root_manifest = manifests.get(root_index).ok_or_else(|| {
-            LoadError::Manifest("root manifest acquisition is missing".to_owned())
-        })?;
-        if root_manifest.identity != root_identity {
-            return Err(LoadError::Manifest(
-                "root manifest acquisition is not at the locked root index".to_owned(),
-            ));
-        }
-        let root_manifest = manifests.remove(root_index);
-        let graph_manifest_count = manifests.len().checked_add(1).ok_or_else(|| {
-            resource_limit(
-                "loaded manifest records",
-                u64::from(request.limits.packages),
-            )
-        })?;
-        let mut graph_order_manifests = try_loader_vec(
-            graph_manifest_count,
-            "loaded manifest records",
-            u64::from(request.limits.packages),
-        )?;
-        graph_order_manifests.push(root_manifest);
-        graph_order_manifests.extend(manifests);
-
+        // Root is always graph package ID 0; `manifests` was pushed in that
+        // same [root, core] order above.
         let candidate = LoadedWorkspaceCandidate {
             graph,
             sources,
-            manifests: graph_order_manifests,
+            manifests,
             scenarios,
-            lockfile,
-            canonical_lockfile,
         };
         seal_loaded_workspace(&request, candidate, is_cancelled)
     }
@@ -392,12 +254,22 @@ fn manifest_codec_limits(request: &LoadRequest<'_>) -> ManifestCodecLimits {
     }
 }
 
-fn lockfile_codec_limits(request: &LoadRequest<'_>) -> LockfileCodecLimits {
-    LockfileCodecLimits {
-        bytes: request.limits.lockfile_bytes,
-        string_bytes: request.limits.lockfile_bytes,
-        packages: request.limits.packages,
-        dependencies: u32::try_from(request.limits.lockfile_bytes).unwrap_or(u32::MAX),
+/// Revision 0.1's root manifest declares exactly one dependency, aliased
+/// `core` (`docs/language/02-source-language.md` §2.1). There is no lockfile
+/// to instead resolve an arbitrary declared set, so this is a hard loader
+/// precondition rather than a general dependency-graph walk.
+fn one_core_dependency(
+    manifest: &PackageManifest,
+) -> Result<&wrela_package::ManifestDependency, LoadError> {
+    match manifest.dependencies.as_slice() {
+        [dependency] if dependency.alias.as_str() == CORE_ALIAS => Ok(dependency),
+        [dependency] => Err(LoadError::Manifest(bounded_load_error_value(&format!(
+            "root manifest's sole dependency must use the reserved alias `core`, not {}",
+            dependency.alias.as_str()
+        )))),
+        _ => Err(LoadError::Manifest(
+            "root manifest must declare exactly one dependency, the reserved core alias".to_owned(),
+        )),
     }
 }
 
@@ -454,19 +326,8 @@ fn add_bytes(
     }
 }
 
-fn map_lockfile_error(error: DecodeError) -> LoadError {
-    match bounded_decode_error(error) {
-        DecodeError::Cancelled => LoadError::Cancelled,
-        DecodeError::InvalidLimits => LoadError::InvalidLimits,
-        DecodeError::ResourceLimit { resource, limit } => {
-            LoadError::ResourceLimit { resource, limit }
-        }
-        error => LoadError::Lockfile(error),
-    }
-}
-
 fn map_root_manifest_error(error: DecodeError) -> LoadError {
-    match bounded_decode_error(error) {
+    match crate::bounded_decode_error(error) {
         DecodeError::Cancelled => LoadError::Cancelled,
         DecodeError::InvalidLimits => LoadError::InvalidLimits,
         DecodeError::ResourceLimit { resource, limit } => {
@@ -477,7 +338,7 @@ fn map_root_manifest_error(error: DecodeError) -> LoadError {
 }
 
 fn map_package_manifest_error(package: &PackageIdentity, error: DecodeError) -> LoadError {
-    match bounded_decode_error(error) {
+    match crate::bounded_decode_error(error) {
         DecodeError::Cancelled => LoadError::Cancelled,
         DecodeError::InvalidLimits => LoadError::InvalidLimits,
         DecodeError::ResourceLimit { resource, limit } => {
@@ -490,73 +351,32 @@ fn map_package_manifest_error(package: &PackageIdentity, error: DecodeError) -> 
     }
 }
 
-fn package_handle(
-    handles: &BTreeMap<&PackageIdentity, PackageHandle>,
-    identity: &PackageIdentity,
-) -> Result<PackageHandle, LoadError> {
-    handles
-        .get(identity)
-        .copied()
-        .ok_or_else(|| LoadError::Graph("locked dependency identity is missing".to_owned()))
-}
-
-fn validate_locked_closure(
-    lockfile: &wrela_package::Lockfile,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<(), LoadError> {
-    let package_count = lockfile.packages.len();
-    let package_limit = u64::try_from(package_count).unwrap_or(u64::MAX);
-    let root_index = lockfile
-        .packages
-        .binary_search_by(|package| package.identity.cmp(&lockfile.root))
-        .map_err(|_| LoadError::Lock("lockfile does not contain its root package".to_owned()))?;
-    let mut reachable = try_loader_vec(package_count, "locked closure bitmap", package_limit)?;
-    reachable.resize(package_count, false);
-    let mut pending = try_loader_vec(package_count, "locked closure traversal", package_limit)?;
-    let root_reachable = reachable
-        .get_mut(root_index)
-        .ok_or_else(|| LoadError::Lock("lockfile root package index is invalid".to_owned()))?;
-    *root_reachable = true;
-    pending.push(root_index);
-    while let Some(package_index) = pending.pop() {
-        check_cancelled(is_cancelled)?;
-        let package = lockfile
-            .packages
-            .get(package_index)
-            .ok_or_else(|| LoadError::Lock("locked package index is invalid".to_owned()))?;
-        for dependency in &package.dependencies {
-            check_cancelled(is_cancelled)?;
-            let dependency_index = lockfile
-                .packages
-                .binary_search_by(|package| package.identity.cmp(&dependency.identity))
-                .map_err(|_| LoadError::Lock("locked dependency identity is missing".to_owned()))?;
-            let dependency_reachable = reachable
-                .get_mut(dependency_index)
-                .ok_or_else(|| LoadError::Lock("locked dependency index is invalid".to_owned()))?;
-            if !std::mem::replace(dependency_reachable, true) {
-                pending.push(dependency_index);
-            }
-        }
+/// Placeholder identity for error display only, used before a package's real
+/// identity (whose digest depends on acquired content) is known. Never
+/// compared for equality; `LoadError::Provider`'s `Display` prints only the
+/// name and version.
+fn pending_identity(
+    name: &wrela_package::PackageName,
+    version: &wrela_package::PackageVersion,
+) -> PackageIdentity {
+    PackageIdentity {
+        name: name.clone(),
+        version: version.clone(),
+        source_digest: Sha256Digest::from_bytes([0; 32]),
     }
-    for is_reachable in reachable {
-        check_cancelled(is_cancelled)?;
-        if !is_reachable {
-            return Err(LoadError::Lock(
-                "lockfile contains a package outside the root dependency closure".to_owned(),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn acquire_package(
     request: &LoadRequest<'_>,
-    package: &LockedPackage,
+    locator: &wrela_package::PackageLocator,
+    expected_name: &wrela_package::PackageName,
+    expected_version: &wrela_package::PackageVersion,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<PackageBundle, LoadError> {
     let acquired = request.provider.acquire(
-        &package.locator,
-        &package.identity,
+        locator,
+        expected_name,
+        expected_version,
         request.limits.bytes_per_package,
         request.limits.manifest_bytes_per_package,
         is_cancelled,
@@ -565,22 +385,108 @@ fn acquire_package(
         return Err(LoadError::Cancelled);
     }
     let bundle = acquired.map_err(|error| LoadError::Provider {
-        package: package.identity.clone(),
+        package: pending_identity(expected_name, expected_version),
         error: bounded_provider_error(error),
     })?;
-    if bundle.identity != package.identity {
+    if &bundle.identity.name != expected_name || &bundle.identity.version != expected_version {
         return Err(LoadError::Provider {
-            package: package.identity.clone(),
+            package: pending_identity(expected_name, expected_version),
             error: ProviderError::IdentityMismatch,
         });
     }
-    if bundle.locator != package.locator {
+    if &bundle.locator != locator {
         return Err(LoadError::Provider {
-            package: package.identity.clone(),
+            package: bundle.identity.clone(),
             error: ProviderError::Corrupt("provider substituted the package locator".to_owned()),
         });
     }
     Ok(bundle)
+}
+
+type AcquiredManifest = (
+    PackageManifest,
+    Vec<u8>,
+    Vec<ValidatedSource>,
+    Vec<ScenarioInput>,
+);
+
+/// Decode, canonicalize, derive modules for, and validate scenarios of one
+/// acquired package's bundle. Shared by the root and the sole `core`
+/// dependency; there is no wider dependency walk in revision 0.1.
+fn acquire_manifest_content(
+    request: &LoadRequest<'_>,
+    bundle: &PackageBundle,
+    manifest_limits: ManifestCodecLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<AcquiredManifest, LoadError> {
+    check_input_bytes(
+        bundle.manifest_bytes.len(),
+        request.limits.manifest_bytes_per_package,
+        "package manifest bytes",
+    )?;
+    let (package_source_bytes, package_scenario_bytes, acquired_package_bytes) =
+        preflight_package_bytes(
+            &bundle.manifest_bytes,
+            &bundle.sources,
+            &bundle.scenarios,
+            request.limits.bytes_per_package,
+            is_cancelled,
+        )?;
+    let _ = (package_source_bytes, package_scenario_bytes);
+    if acquired_package_bytes > request.limits.bytes_per_package {
+        return Err(resource_limit(
+            "package bytes",
+            request.limits.bytes_per_package,
+        ));
+    }
+
+    let _raw_acquired_manifest_digest =
+        sha256_cancellable(request.hasher, &bundle.manifest_bytes, is_cancelled)
+            .map_err(|_| LoadError::Cancelled)?;
+    let manifest = request
+        .codec
+        .decode_manifest(&bundle.manifest_bytes, manifest_limits, is_cancelled)
+        .map_err(|error| map_package_manifest_error(&bundle.identity, error))?;
+    manifest.validate().map_err(|error| {
+        LoadError::Manifest(bounded_load_error_value(&format!(
+            "invalid manifest for {}@{}: {error}",
+            bundle.identity.name.as_str(),
+            bundle.identity.version.as_str()
+        )))
+    })?;
+    let canonical_manifest = request
+        .codec
+        .canonical_manifest(&manifest, manifest_limits, is_cancelled)
+        .map_err(|error| map_package_manifest_error(&bundle.identity, error))?;
+    if manifest.name != bundle.identity.name || manifest.version != bundle.identity.version {
+        return Err(LoadError::Manifest(bounded_load_error_value(&format!(
+            "manifest identity differs from the acquired package {}@{}",
+            bundle.identity.name.as_str(),
+            bundle.identity.version.as_str()
+        ))));
+    }
+
+    let validated_sources = derive_modules(
+        &bundle.identity,
+        bundle.sources.clone(),
+        request.hasher,
+        is_cancelled,
+    )?;
+    reject_unknown_image_modules(&manifest, &validated_sources)?;
+    let validated_scenarios = validate_scenarios(
+        &bundle.identity,
+        &manifest,
+        bundle.scenarios.clone(),
+        request.hasher,
+        is_cancelled,
+    )?;
+
+    Ok((
+        manifest,
+        canonical_manifest,
+        validated_sources,
+        validated_scenarios,
+    ))
 }
 
 fn preflight_package_bytes(
@@ -619,43 +525,6 @@ fn preflight_package_bytes(
         return Err(resource_limit("package bytes", limit));
     }
     Ok((source_bytes, scenario_bytes, package_bytes))
-}
-
-fn validate_manifest_identity_and_dependencies(
-    manifest: &wrela_package::PackageManifest,
-    package: &LockedPackage,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<(), LoadError> {
-    check_cancelled(is_cancelled)?;
-    if manifest.name != package.identity.name || manifest.version != package.identity.version {
-        return Err(LoadError::Manifest(bounded_load_error_value(&format!(
-            "manifest identity differs from locked package {}@{}",
-            package.identity.name.as_str(),
-            package.identity.version.as_str()
-        ))));
-    }
-    if manifest.dependencies.len() != package.dependencies.len() {
-        return Err(LoadError::Manifest(bounded_load_error_value(&format!(
-            "manifest dependency count differs for {}@{}",
-            package.identity.name.as_str(),
-            package.identity.version.as_str()
-        ))));
-    }
-    for (declared, locked) in manifest.dependencies.iter().zip(&package.dependencies) {
-        check_cancelled(is_cancelled)?;
-        let exact_version = exact_requirement_version(&declared.requirement);
-        if declared.alias != locked.alias
-            || declared.package != locked.identity.name
-            || exact_version.as_ref() != Some(&locked.identity.version)
-        {
-            return Err(LoadError::Manifest(bounded_load_error_value(&format!(
-                "manifest dependency {} differs from its exact locked identity",
-                declared.alias.as_str()
-            ))));
-        }
-    }
-    check_cancelled(is_cancelled)?;
-    Ok(())
 }
 
 const MODULE_SOURCE_SUFFIX: &str = ".wr";
@@ -868,8 +737,14 @@ fn validate_scenarios(
     Ok(validated)
 }
 
+/// Independently recompute this package's content digest from its
+/// (already digest-verified) sources and scenarios plus its canonical
+/// manifest, and confirm it equals the identity the provider returned. There
+/// is no lockfile-recorded digest to check against instead: a provider is
+/// trusted for which bytes it hands back, never for the identity it computes
+/// from them.
 fn verify_package_identity(
-    package: &LockedPackage,
+    bundle: &PackageBundle,
     canonical_manifest: &[u8],
     sources: &[ValidatedSource],
     scenarios: &[ScenarioInput],
@@ -906,14 +781,14 @@ fn verify_package_identity(
                 LoadError::Manifest("package content records are not canonical".to_owned())
             }
         })?;
-    if actual != package.identity.source_digest {
+    if actual != bundle.identity.source_digest {
         return Err(LoadError::DigestMismatch {
             subject: bounded_load_error_value(&format!(
                 "package {}@{} content",
-                package.identity.name.as_str(),
-                package.identity.version.as_str()
+                bundle.identity.name.as_str(),
+                bundle.identity.version.as_str()
             )),
-            expected: package.identity.source_digest,
+            expected: bundle.identity.source_digest,
             actual,
         });
     }

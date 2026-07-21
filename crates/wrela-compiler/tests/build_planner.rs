@@ -14,8 +14,9 @@ use wrela_backend::{
 use wrela_build_model::{Sha256Digest, TargetIdentity};
 use wrela_compiler::{
     AnalysisFactAssembler, AnalysisFactRequest, BuildIntent, BuildPlanner, BuildPlanningError,
-    BuildPlanningRequest, CanonicalAnalysisFactAssembler, CanonicalBuildPlanner, FrontendWorkspace,
-    FrontendWorkspaceRequest, LocalFrontendService, PipelineLimits, seal_build_plan,
+    BuildPlanningRequest, CanonicalAnalysisFactAssembler, CanonicalBuildPlanner,
+    FrontendInputError, FrontendWorkspace, FrontendWorkspaceRequest, LocalFrontendService,
+    PipelineLimits, seal_build_plan,
 };
 use wrela_flow_lower::{CanonicalFlowLowerer, FlowLowerer, LowerRequest as FlowLowerRequest};
 use wrela_flow_wir_codec::{CanonicalFlowWirCodec, EncodeRequest, encode_and_verify};
@@ -24,14 +25,11 @@ use wrela_hir_lower::{
     CanonicalHirLowerer, ChangeSet, HirLowerer, LowerRequest as HirLowerRequest,
     LoweringLimits as HirLoweringLimits,
 };
-use wrela_package::{
-    DependencyAlias, LOCKFILE_SCHEMA_VERSION, LockedDependency, LockedPackage, Lockfile,
-    PackageIdentity, PackageLocator, PackageManifest,
-};
+use wrela_package::{DependencyAlias, PackageIdentity, PackageLocator, PackageManifest};
 use wrela_package_loader::{
     CanonicalPackageCodec, CanonicalTreeLimits, CanonicalTreeRecord, ContentHasher, LoadLimits,
-    LockfileCodecLimits, ManifestCodecLimits, PackageCodec, PackageContentKind,
-    PackageContentRecord, SoftwareSha256, canonical_tree_digest, package_content_digest,
+    ManifestCodecLimits, PackageCodec, PackageContentKind, PackageContentRecord, SoftwareSha256,
+    canonical_tree_digest, package_content_digest,
 };
 use wrela_sema::{
     AnalysisChangeSet, AnalysisLimits, AnalysisMode, AnalysisRequest, CanonicalSemanticAnalyzer,
@@ -121,8 +119,6 @@ fn helper(x: u32) -> u32:
     widened: u64 = bit_not as u64
     return bit_not
 "#;
-const APPLICATION_LOCKFILE: &[u8] =
-    include_bytes!("../../../std/examples/minimal-image/wrela.lock");
 const TARGET_MANIFEST: &[u8] =
     include_bytes!("../../../toolchain/targets/aarch64-qemu-virt-uefi/target.toml");
 const RUNTIME_OBJECT: &[u8] = b"runtime-object";
@@ -136,7 +132,6 @@ enum FixtureKind {
     ScalarRuntimeTest,
     MissingCoreDependency,
     WrongCoreAlias,
-    WorkspaceCore,
 }
 
 #[derive(Debug)]
@@ -194,7 +189,6 @@ impl Drop for TestDirectory {
 
 #[derive(Debug)]
 struct CanonicalPackage {
-    manifest: PackageManifest,
     manifest_bytes: Vec<u8>,
     sources: Vec<(&'static str, &'static [u8])>,
     identity: PackageIdentity,
@@ -226,7 +220,6 @@ impl CanonicalPackage {
         };
         let manifest_digest = HASHER.sha256(&manifest_bytes);
         Self {
-            manifest,
             manifest_bytes,
             sources: sources.to_vec(),
             identity,
@@ -271,6 +264,14 @@ struct ToolchainMeasurements {
 
 impl Fixture {
     fn new(kind: FixtureKind) -> Self {
+        Self::try_new(kind).expect("real checked-in workspace and core package")
+    }
+
+    /// Unlike [`Self::new`], surfaces a workspace-load failure instead of
+    /// panicking -- there is no lockfile, so a malformed `core` dependency
+    /// declaration now fails during loading rather than during later build
+    /// planning (see `planner_rejects_invalid_standard_library_selection_and_stale_identity`).
+    fn try_new(kind: FixtureKind) -> Result<Self, FrontendInputError> {
         let directory = TestDirectory::new();
         let codec = CanonicalPackageCodec::new();
         let core_manifest = codec
@@ -291,9 +292,7 @@ impl Fixture {
             .decode_manifest(APPLICATION_MANIFEST, manifest_limits(), &never_cancelled)
             .expect("checked-in application manifest");
         match kind {
-            FixtureKind::Canonical
-            | FixtureKind::ScalarRuntimeTest
-            | FixtureKind::WorkspaceCore => {}
+            FixtureKind::Canonical | FixtureKind::ScalarRuntimeTest => {}
             FixtureKind::MissingCoreDependency => application_manifest.dependencies.clear(),
             FixtureKind::WrongCoreAlias => {
                 application_manifest.dependencies[0].alias =
@@ -313,60 +312,18 @@ impl Fixture {
             assert_eq!(application.manifest_bytes, APPLICATION_MANIFEST);
         }
 
+        // There is no lockfile: the reserved `core` alias always resolves
+        // against the verified toolchain's own standard-library index
+        // (`docs/language/02-source-language.md` §2.1), never a workspace-
+        // relative override, so there is no separate locator to record here.
         let root_locator = PackageLocator::Workspace {
             path: ".".to_owned(),
         };
-        let core_locator = if kind == FixtureKind::WorkspaceCore {
-            PackageLocator::Workspace {
-                path: "vendor/wrela-core-0.1".to_owned(),
-            }
-        } else {
-            PackageLocator::Toolchain {
-                component: "wrela-core-0.1".to_owned(),
-            }
-        };
-        let dependency = match kind {
-            FixtureKind::MissingCoreDependency => None,
-            FixtureKind::Canonical
-            | FixtureKind::ScalarRuntimeTest
-            | FixtureKind::WrongCoreAlias
-            | FixtureKind::WorkspaceCore => Some(LockedDependency {
-                alias: application.manifest.dependencies[0].alias.clone(),
-                identity: core.identity.clone(),
-            }),
-        };
-        let mut packages = vec![LockedPackage {
-            identity: application.identity.clone(),
-            locator: root_locator.clone(),
-            dependencies: dependency.into_iter().collect(),
-            manifest_digest: application.manifest_digest,
-        }];
-        if kind != FixtureKind::MissingCoreDependency {
-            packages.push(LockedPackage {
-                identity: core.identity.clone(),
-                locator: core_locator.clone(),
-                dependencies: Vec::new(),
-                manifest_digest: core.manifest_digest,
-            });
-        }
-        packages.sort_by(|left, right| left.identity.cmp(&right.identity));
-        let lockfile = Lockfile {
-            schema: LOCKFILE_SCHEMA_VERSION,
-            root: application.identity.clone(),
-            packages,
-        };
-        let lockfile_bytes = codec
-            .canonical_lockfile(&lockfile, lockfile_limits(), &never_cancelled)
-            .expect("canonical fixture lockfile");
-        if kind == FixtureKind::Canonical {
-            assert_eq!(lockfile_bytes, APPLICATION_LOCKFILE);
-        }
 
         directory.write("workspace/wrela.toml", &application.manifest_bytes);
         for (source_path, source_bytes) in &application.sources {
             directory.write(&format!("workspace/src/{source_path}"), source_bytes);
         }
-        directory.write("workspace/wrela.lock", &lockfile_bytes);
         let toolchain_core_base = "toolchain/share/wrela/std/wrela-core-0.1";
         directory.write(
             &format!("{toolchain_core_base}/wrela.toml"),
@@ -377,19 +334,6 @@ impl Fixture {
                 &format!("{toolchain_core_base}/src/{source_path}"),
                 source_bytes,
             );
-        }
-        if let PackageLocator::Workspace { path } = &core_locator {
-            let workspace_core_base = format!("workspace/{path}");
-            directory.write(
-                &format!("{workspace_core_base}/wrela.toml"),
-                &core.manifest_bytes,
-            );
-            for (source_path, source_bytes) in &core.sources {
-                directory.write(
-                    &format!("{workspace_core_base}/src/{source_path}"),
-                    source_bytes,
-                );
-            }
         }
         directory.create_directory("toolchain/share/wrela/std");
 
@@ -480,8 +424,7 @@ impl Fixture {
                     parse_limits: ParseLimits::standard(),
                 },
                 &never_cancelled,
-            )
-            .expect("real checked-in workspace and core package");
+            )?;
         assert!(
             frontend
                 .parsed_modules()
@@ -489,7 +432,7 @@ impl Fixture {
                 .all(|output| output.diagnostics().is_empty())
         );
 
-        Self {
+        Ok(Self {
             _directory: directory,
             frontend,
             toolchain,
@@ -497,7 +440,7 @@ impl Fixture {
             compiler_digest,
             standard_library_component_digest,
             core_package_digest: core.identity.source_digest,
-        }
+        })
     }
 
     fn request<'a>(
@@ -673,22 +616,12 @@ fn manifest_limits() -> ManifestCodecLimits {
     }
 }
 
-fn lockfile_limits() -> LockfileCodecLimits {
-    LockfileCodecLimits {
-        bytes: MAX_FIXTURE_FILE_BYTES as u64,
-        string_bytes: MAX_FIXTURE_FILE_BYTES as u64,
-        packages: 16,
-        dependencies: 16,
-    }
-}
-
 fn load_limits() -> LoadLimits {
     LoadLimits {
         packages: 16,
         sources: 16,
         manifest_bytes_per_package: MAX_FIXTURE_FILE_BYTES as u64,
         manifest_bytes: MAX_FIXTURE_FILE_BYTES as u64,
-        lockfile_bytes: MAX_FIXTURE_FILE_BYTES as u64,
         source_bytes: MAX_FIXTURE_FILE_BYTES as u64,
         scenarios: 16,
         scenario_bytes: MAX_FIXTURE_FILE_BYTES as u64,
@@ -1139,19 +1072,26 @@ fn source_scalar_runtime_test_reaches_the_private_backend_boundary() {
 
 #[test]
 fn planner_rejects_invalid_standard_library_selection_and_stale_identity() {
+    // There is no lockfile: the reserved `core` alias is now a loader-level
+    // precondition (`docs/language/02-source-language.md` §2.1), so a
+    // malformed core dependency declaration fails closed during workspace
+    // *loading* rather than reaching the build planner's own standard-
+    // library-selection check at all. `selected_standard_library_package`
+    // (in `wrela-compiler/src/lib.rs`) still guards a workspace assembled
+    // some other way (e.g. `sealer_*` fixtures directly constructing a
+    // `LoadedWorkspace`), so it remains live defense in depth.
     for kind in [
         FixtureKind::MissingCoreDependency,
         FixtureKind::WrongCoreAlias,
-        FixtureKind::WorkspaceCore,
     ] {
-        let fixture = Fixture::new(kind);
-        assert_eq!(
-            CanonicalBuildPlanner::new().plan(
-                fixture.request(&fixture.target, fixture.compiler_digest),
-                &never_cancelled,
+        assert!(
+            matches!(
+                Fixture::try_new(kind),
+                Err(FrontendInputError::Load(
+                    wrela_package_loader::LoadError::Manifest(_)
+                ))
             ),
-            Err(BuildPlanningError::StandardLibrarySelection),
-            "fixture kind {kind:?} must fail closed"
+            "fixture kind {kind:?} must fail closed during workspace loading"
         );
     }
 

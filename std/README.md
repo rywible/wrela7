@@ -15,12 +15,12 @@ recognizes these public declarations in the package selected by the reserved
 `core` dependency alias.
 
 The package manifest and source are production inputs, not generated test
-stubs. `examples/minimal-image` is a loadable two-package workspace: its
-canonical lockfile binds root locator `.` to the checked-in application and
-binds dependency alias `core` to toolchain component `wrela-core-0.1`. Its
-source shows the complete form currently accepted by the semantic evaluator: a
-public, zero-argument `@image comptime` function returning
-`Image(name=..., target=...)`.
+stubs. `examples/minimal-image` is a loadable two-package workspace: revision
+0.1 has no lockfile, so the checked-in application resolves at root locator
+`.` directly, and its `core` dependency alias resolves directly to toolchain
+component `wrela-core-0.1`. Its source shows the complete form currently
+accepted by the semantic evaluator: a public, zero-argument `@image comptime`
+function returning `Image(name=..., target=...)`.
 
 ## Implemented bounded Result specialization
 

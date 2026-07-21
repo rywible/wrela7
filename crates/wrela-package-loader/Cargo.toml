@@ -1,6 +1,6 @@
 [package]
 name = "wrela-package-loader"
-description = "Hermetic manifest, lockfile, and source graph loading for wrela"
+description = "Hermetic manifest and source graph loading for wrela"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

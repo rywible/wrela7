@@ -1,5 +1,13 @@
-//! Hermetic acquisition and loading boundary for TOML manifests, the canonical
-//! lockfile, and the complete content-addressed source graph.
+//! Hermetic acquisition and loading boundary for TOML manifests and the
+//! complete content-addressed source graph.
+//!
+//! Revision 0.1 has no lockfile: the dependency graph is fully determined by
+//! the root `wrela.toml` together with the toolchain-shipped `core` component
+//! (`docs/language/02-source-language.md` §2.1). The root manifest's sole
+//! dependency must use the reserved alias `core`; its package bytes come from
+//! whichever [`PackageLocator`] the driver resolves for that alias
+//! (`LoadRequest::core_locator`), never from a name- or digest-based lookup
+//! recorded on disk.
 
 #![forbid(unsafe_code)]
 
@@ -8,7 +16,7 @@ use std::fmt;
 
 use wrela_build_model::Sha256Digest;
 use wrela_package::{
-    Lockfile, PackageGraph, PackageIdentity, PackageLocator, PackageManifest,
+    PackageGraph, PackageIdentity, PackageLocator, PackageManifest, PackageName, PackageVersion,
     exact_requirement_version,
 };
 use wrela_source::{MAX_SOURCE_PATH_BYTES, SourceDatabase, SourceError, SourceInput};
@@ -55,7 +63,6 @@ pub struct LoadLimits {
     pub manifest_bytes_per_package: u64,
     /// Aggregate canonical manifest bytes across the complete package graph.
     pub manifest_bytes: u64,
-    pub lockfile_bytes: u64,
     pub source_bytes: u64,
     pub scenarios: u32,
     pub scenario_bytes: u64,
@@ -70,7 +77,6 @@ impl LoadLimits {
             sources: 16_000_000,
             manifest_bytes_per_package: 16 * 1024 * 1024,
             manifest_bytes: 4 * 1024 * 1024 * 1024,
-            lockfile_bytes: 256 * 1024 * 1024,
             source_bytes: 4 * 1024 * 1024 * 1024,
             scenarios: 1_000_000,
             scenario_bytes: 4 * 1024 * 1024 * 1024,
@@ -83,7 +89,6 @@ impl LoadLimits {
             || self.sources == 0
             || self.manifest_bytes_per_package == 0
             || self.manifest_bytes == 0
-            || self.lockfile_bytes == 0
             || self.source_bytes == 0
             || self.scenarios == 0
             || self.scenario_bytes == 0
@@ -121,11 +126,18 @@ pub struct ScenarioInput {
 /// resolve an undeclared locator or use ambient network configuration. The
 /// manifest ceiling is independent from the complete package ceiling and must
 /// be enforced before manifest decode or any declared source/scenario I/O.
+///
+/// `expected_name`/`expected_version` are the only identity known before
+/// acquisition (there is no lockfile to pre-record a content digest). The
+/// returned [`PackageBundle::identity`] carries the digest the provider
+/// itself computed or, for a toolchain component, already had verified; the
+/// loader never supplies a digest to check acquisition against.
 pub trait PackageSourceProvider {
     fn acquire(
         &self,
         locator: &PackageLocator,
-        expected: &PackageIdentity,
+        expected_name: &PackageName,
+        expected_version: &PackageVersion,
         maximum_bytes: u64,
         maximum_manifest_bytes: u64,
         is_cancelled: &dyn Fn() -> bool,
@@ -588,27 +600,9 @@ impl ManifestCodecLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LockfileCodecLimits {
-    pub bytes: u64,
-    pub string_bytes: u64,
-    pub packages: u32,
-    pub dependencies: u32,
-}
-
-impl LockfileCodecLimits {
-    pub fn validate(self) -> Result<(), DecodeError> {
-        if self.bytes == 0 || self.string_bytes == 0 {
-            Err(DecodeError::InvalidLimits)
-        } else {
-            Ok(())
-        }
-    }
-}
-
-/// Schema codec for `wrela.toml` and `wrela.lock`. The production loader owns a
-/// canonical TOML implementation; this trait permits isolated deterministic
-/// fixtures without filesystem or parser coupling.
+/// Schema codec for `wrela.toml`. The production loader owns a canonical TOML
+/// implementation; this trait permits isolated deterministic fixtures without
+/// filesystem or parser coupling.
 pub trait PackageCodec {
     fn decode_manifest(
         &self,
@@ -616,22 +610,10 @@ pub trait PackageCodec {
         limits: ManifestCodecLimits,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<PackageManifest, DecodeError>;
-    fn decode_lockfile(
-        &self,
-        bytes: &[u8],
-        limits: LockfileCodecLimits,
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<Lockfile, DecodeError>;
     fn canonical_manifest(
         &self,
         manifest: &PackageManifest,
         limits: ManifestCodecLimits,
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<Vec<u8>, DecodeError>;
-    fn canonical_lockfile(
-        &self,
-        lockfile: &Lockfile,
-        limits: LockfileCodecLimits,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<u8>, DecodeError>;
 }
@@ -639,7 +621,12 @@ pub trait PackageCodec {
 pub struct LoadRequest<'a> {
     pub root_locator: PackageLocator,
     pub root_manifest_bytes: &'a [u8],
-    pub lockfile_bytes: &'a [u8],
+    /// Locator for the reserved `core` alias's package bytes. The root
+    /// manifest names the package and exact version it requires; only which
+    /// concrete bytes back that alias is a driver decision (never inferred
+    /// from the package name), matching
+    /// `docs/language/02-source-language.md` §2.1.
+    pub core_locator: PackageLocator,
     pub provider: &'a dyn PackageSourceProvider,
     pub hasher: &'a dyn ContentHasher,
     pub codec: &'a dyn PackageCodec,
@@ -685,9 +672,9 @@ impl LoadedManifest {
     }
 }
 
-/// Complete immutable package-loading output. `source_graph_digest` covers the
-/// canonical lockfile, every manifest, and every source and scenario
-/// `(package, path, digest)` tuple.
+/// Complete immutable package-loading output. `source_graph_digest` covers
+/// every manifest and every source and scenario `(package, path, digest)`
+/// tuple.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedWorkspace {
     graph: PackageGraph,
@@ -696,8 +683,6 @@ pub struct LoadedWorkspace {
     /// Declared scenario files in canonical `(package, path)` order. Their
     /// digests and paths participate in `source_graph_digest`.
     scenarios: Vec<ScenarioInput>,
-    lockfile: Lockfile,
-    canonical_lockfile: Vec<u8>,
     source_graph_digest: Sha256Digest,
 }
 
@@ -748,16 +733,6 @@ impl LoadedWorkspace {
     }
 
     #[must_use]
-    pub fn lockfile(&self) -> &Lockfile {
-        &self.lockfile
-    }
-
-    #[must_use]
-    pub fn canonical_lockfile(&self) -> &[u8] {
-        &self.canonical_lockfile
-    }
-
-    #[must_use]
     pub fn source_graph_digest(&self) -> Sha256Digest {
         self.source_graph_digest
     }
@@ -771,8 +746,6 @@ impl LoadedWorkspace {
             sources: self.sources,
             manifests: self.manifests,
             scenarios: self.scenarios,
-            lockfile: self.lockfile,
-            canonical_lockfile: self.canonical_lockfile,
             source_graph_digest: self.source_graph_digest,
         }
     }
@@ -784,8 +757,6 @@ pub struct LoadedWorkspaceParts {
     pub sources: SourceDatabase,
     pub manifests: Vec<LoadedManifest>,
     pub scenarios: Vec<ScenarioInput>,
-    pub lockfile: Lockfile,
-    pub canonical_lockfile: Vec<u8>,
     pub source_graph_digest: Sha256Digest,
 }
 
@@ -797,40 +768,29 @@ pub struct LoadedWorkspaceCandidate {
     pub sources: SourceDatabase,
     pub manifests: Vec<LoadedManifestInput>,
     pub scenarios: Vec<ScenarioInput>,
-    pub lockfile: Lockfile,
-    pub canonical_lockfile: Vec<u8>,
 }
 
+/// Confirm a package's graph edges are exactly its manifest-declared
+/// dependencies (same alias, same target package name, and a target version
+/// satisfying the declared exact requirement). There is no lockfile to also
+/// cross-check against; the manifest is the sole source of truth.
 fn candidate_dependencies_match(
     graph: &PackageGraph,
     package: &wrela_package::PackageRecord,
     manifest: &PackageManifest,
-    locked: Option<&wrela_package::LockedPackage>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<bool, LoadError> {
-    let Some(locked) = locked else {
-        return Ok(false);
-    };
-    if package.dependencies.len() != locked.dependencies.len()
-        || locked.dependencies.len() != manifest.dependencies.len()
-    {
+    if package.dependencies.len() != manifest.dependencies.len() {
         return Ok(false);
     }
-    for ((graph_edge, locked_edge), manifest_edge) in package
-        .dependencies
-        .iter()
-        .zip(&locked.dependencies)
-        .zip(&manifest.dependencies)
-    {
+    for (graph_edge, manifest_edge) in package.dependencies.iter().zip(&manifest.dependencies) {
         if is_cancelled() {
             return Err(LoadError::Cancelled);
         }
         let Some(dependency) = graph.package(graph_edge.package) else {
             return Ok(false);
         };
-        if graph_edge.alias != locked_edge.alias
-            || manifest_edge.alias != locked_edge.alias
-            || dependency.identity != locked_edge.identity
+        if graph_edge.alias != manifest_edge.alias
             || manifest_edge.package != dependency.identity.name
             || exact_requirement_version(&manifest_edge.requirement)
                 .is_none_or(|version| version != dependency.identity.version)
@@ -959,8 +919,6 @@ pub fn seal_loaded_workspace(
         sources,
         manifests,
         scenarios,
-        lockfile,
-        canonical_lockfile,
     } = candidate;
     let limits = request.limits;
     let hasher = request.hasher;
@@ -976,21 +934,10 @@ pub fn seal_loaded_workspace(
         images: entry_limit,
         image_tests: limits.scenarios.min(entry_limit),
     };
-    let lockfile_codec_limits = LockfileCodecLimits {
-        bytes: limits.lockfile_bytes,
-        string_bytes: limits.lockfile_bytes,
-        packages: limits.packages,
-        dependencies: u32::try_from(limits.lockfile_bytes).unwrap_or(u32::MAX),
-    };
     let root_manifest_bytes =
         u64::try_from(request.root_manifest_bytes.len()).map_err(|_| LoadError::ResourceLimit {
             resource: "root manifest bytes",
             limit: limits.manifest_bytes_per_package,
-        })?;
-    let lockfile_bytes =
-        u64::try_from(request.lockfile_bytes.len()).map_err(|_| LoadError::ResourceLimit {
-            resource: "lockfile bytes",
-            limit: limits.lockfile_bytes,
         })?;
     if root_manifest_bytes > limits.manifest_bytes_per_package {
         return Err(LoadError::ResourceLimit {
@@ -998,12 +945,16 @@ pub fn seal_loaded_workspace(
             limit: limits.manifest_bytes_per_package,
         });
     }
-    if lockfile_bytes > limits.lockfile_bytes {
-        return Err(LoadError::ResourceLimit {
-            resource: "lockfile bytes",
-            limit: limits.lockfile_bytes,
-        });
-    }
+    wrela_package::validate_locator(&request.root_locator).map_err(|error| {
+        LoadError::Manifest(bounded_load_error_value(&format!(
+            "invalid root locator: {error}"
+        )))
+    })?;
+    wrela_package::validate_locator(&request.core_locator).map_err(|error| {
+        LoadError::Manifest(bounded_load_error_value(&format!(
+            "invalid core locator: {error}"
+        )))
+    })?;
     // The seal repeats the raw-byte snapshot immediately before it re-decodes
     // the original root request. Canonical semantic identity is checked
     // independently below, so equivalent TOML spellings remain valid.
@@ -1017,9 +968,6 @@ pub fn seal_loaded_workspace(
             is_cancelled,
         )
         .map_err(map_root_decode_error)?;
-    let requested_lockfile = codec
-        .decode_lockfile(request.lockfile_bytes, lockfile_codec_limits, is_cancelled)
-        .map_err(map_lockfile_decode_error)?;
     if is_cancelled() {
         return Err(LoadError::Cancelled);
     }
@@ -1032,7 +980,6 @@ pub fn seal_loaded_workspace(
         ("graph modules", graph.modules().len(), source_limit),
         ("source records", sources.len(), source_limit),
         ("manifest records", manifests.len(), package_limit),
-        ("locked packages", lockfile.packages.len(), package_limit),
         ("scenario records", scenarios.len(), scenario_limit),
     ] {
         let count =
@@ -1040,17 +987,6 @@ pub fn seal_loaded_workspace(
         if count > limit {
             return Err(LoadError::ResourceLimit { resource, limit });
         }
-    }
-    let candidate_lockfile_bytes =
-        u64::try_from(canonical_lockfile.len()).map_err(|_| LoadError::ResourceLimit {
-            resource: "canonical lockfile bytes",
-            limit: limits.lockfile_bytes,
-        })?;
-    if candidate_lockfile_bytes > limits.lockfile_bytes {
-        return Err(LoadError::ResourceLimit {
-            resource: "canonical lockfile bytes",
-            limit: limits.lockfile_bytes,
-        });
     }
     let mut candidate_source_bytes = 0u64;
     for source in sources.files() {
@@ -1130,68 +1066,17 @@ pub fn seal_loaded_workspace(
             });
         }
     }
-    let locked_dependency_limit = u64::from(lockfile_codec_limits.dependencies);
-    let mut locked_dependencies = 0u64;
-    for package in &lockfile.packages {
-        if is_cancelled() {
-            return Err(LoadError::Cancelled);
-        }
-        let dependencies =
-            u64::try_from(package.dependencies.len()).map_err(|_| LoadError::ResourceLimit {
-                resource: "locked dependencies",
-                limit: locked_dependency_limit,
-            })?;
-        locked_dependencies =
-            locked_dependencies
-                .checked_add(dependencies)
-                .ok_or(LoadError::ResourceLimit {
-                    resource: "locked dependencies",
-                    limit: locked_dependency_limit,
-                })?;
-        if locked_dependencies > locked_dependency_limit {
-            return Err(LoadError::ResourceLimit {
-                resource: "locked dependencies",
-                limit: locked_dependency_limit,
-            });
-        }
-    }
-    lockfile.validate().map_err(|error| {
-        LoadError::InvalidOutput(bounded_load_error_value(&format!(
-            "invalid lockfile: {error}"
-        )))
-    })?;
     let root_index = usize::try_from(graph.root().0)
         .map_err(|_| LoadError::InvalidOutput("root package ID does not fit usize".to_owned()))?;
     let root_input = manifests.get(root_index);
-    let encoded_lockfile = codec
-        .canonical_lockfile(&lockfile, lockfile_codec_limits, is_cancelled)
-        .map_err(map_candidate_lockfile_error)?;
-    let encoded_lockfile_bytes =
-        u64::try_from(encoded_lockfile.len()).map_err(|_| LoadError::ResourceLimit {
-            resource: "encoded canonical lockfile bytes",
-            limit: limits.lockfile_bytes,
-        })?;
-    if encoded_lockfile_bytes > limits.lockfile_bytes {
-        return Err(LoadError::ResourceLimit {
-            resource: "encoded canonical lockfile bytes",
-            limit: limits.lockfile_bytes,
-        });
-    }
     if graph.packages().is_empty()
         || manifests.len() != graph.packages().len()
-        || lockfile.packages.len() != graph.packages().len()
-        || encoded_lockfile != canonical_lockfile
-        || request.lockfile_bytes != canonical_lockfile
-        || requested_lockfile != lockfile
         || root_input.is_none_or(|root| {
             root.locator != request.root_locator || root.manifest != requested_manifest
         })
-        || graph
-            .package(graph.root())
-            .is_none_or(|root| root.identity != lockfile.root)
     {
         return Err(LoadError::InvalidOutput(
-            "package, source, manifest, root, or canonical lockfile set differs".to_owned(),
+            "package, source, manifest, or root set differs".to_owned(),
         ));
     }
 
@@ -1231,18 +1116,16 @@ pub fn seal_loaded_workspace(
         })?;
         let canonical_digest = sha256_cancellable(hasher, &canonical, is_cancelled)
             .map_err(|_| LoadError::Cancelled)?;
-        let locked = lockfile
-            .packages
-            .binary_search_by(|locked| locked.identity.cmp(&candidate.identity))
-            .ok()
-            .and_then(|index| lockfile.packages.get(index));
-        let dependency_sets_match = candidate_dependencies_match(
-            &graph,
-            package,
-            &candidate.manifest,
-            locked,
-            is_cancelled,
-        )?;
+        let dependency_sets_match =
+            candidate_dependencies_match(&graph, package, &candidate.manifest, is_cancelled)?;
+        // There is no lockfile to also cross-check the locator against; the
+        // package is either the root (bound to `root_locator`) or the sole
+        // `core` dependency (bound to `core_locator`), both caller-supplied.
+        let expected_locator = if package.id == graph.root() {
+            &request.root_locator
+        } else {
+            &request.core_locator
+        };
         total_manifest_bytes = total_manifest_bytes
             .checked_add(canonical_len)
             .ok_or_else(|| LoadError::InvalidOutput("manifest byte total overflow".to_owned()))?;
@@ -1254,14 +1137,11 @@ pub fn seal_loaded_workspace(
             || total_manifest_bytes > limits.manifest_bytes
             || canonical_digest != candidate.manifest_digest
             || !dependency_sets_match
-            || locked.is_none_or(|locked| {
-                locked.locator != candidate.locator
-                    || locked.manifest_digest != candidate.manifest_digest
-            })
+            || candidate.locator != *expected_locator
         {
             return Err(LoadError::InvalidOutput(bounded_load_error_value(
                 &format!(
-                    "manifest for {}@{} differs from graph, lockfile, canonical bytes, or digest",
+                    "manifest for {}@{} differs from graph, canonical bytes, digest, or locator",
                     candidate.identity.name.as_str(),
                     candidate.identity.version.as_str()
                 ),
@@ -1604,8 +1484,6 @@ pub fn seal_loaded_workspace(
             sources: &sources,
             manifests: &loaded_manifests,
             scenarios: &scenarios,
-            lockfile: &lockfile,
-            canonical_lockfile: &canonical_lockfile,
         },
         hasher,
         is_cancelled,
@@ -1615,8 +1493,6 @@ pub fn seal_loaded_workspace(
         sources,
         manifests: loaded_manifests,
         scenarios,
-        lockfile,
-        canonical_lockfile,
         source_graph_digest,
     })
 }
@@ -1698,8 +1574,6 @@ struct SourceGraphHashInput<'a> {
     sources: &'a SourceDatabase,
     manifests: &'a [LoadedManifest],
     scenarios: &'a [ScenarioInput],
-    lockfile: &'a Lockfile,
-    canonical_lockfile: &'a [u8],
 }
 
 fn hash_source_graph(
@@ -1712,8 +1586,6 @@ fn hash_source_graph(
         sources,
         manifests,
         scenarios,
-        lockfile,
-        canonical_lockfile,
     } = input;
     if is_cancelled() {
         return Err(LoadError::Cancelled);
@@ -1721,8 +1593,6 @@ fn hash_source_graph(
     let mut digest = hasher.begin_sha256();
     digest.update(SOURCE_GRAPH_MAGIC);
     digest.update(&SOURCE_GRAPH_DIGEST_VERSION.to_le_bytes());
-    update_bytes_cancellable(&mut *digest, canonical_lockfile, is_cancelled)
-        .map_err(|()| LoadError::Cancelled)?;
     let manifest_count = u64::try_from(manifests.len())
         .map_err(|_| LoadError::InvalidOutput("manifest count does not fit u64".to_owned()))?;
     update_u64(&mut *digest, manifest_count);
@@ -1775,36 +1645,12 @@ fn hash_source_graph(
     let module_count = u64::try_from(modules.len())
         .map_err(|_| LoadError::InvalidOutput("module count does not fit u64".to_owned()))?;
     update_u64(&mut *digest, module_count);
-    for locked in &lockfile.packages {
+    // There is no lockfile order to hash against; the graph's own package
+    // order (root first, then every other package in canonical identity
+    // order -- see `PackageGraphBuilder::finish`) is already deterministic.
+    for (package_index, package) in graph.packages().iter().enumerate() {
         if is_cancelled() {
             return Err(LoadError::Cancelled);
-        }
-        let package_index = if locked.identity == lockfile.root {
-            0
-        } else {
-            graph
-                .packages()
-                .get(1..)
-                .ok_or_else(|| {
-                    LoadError::InvalidOutput(
-                        "non-root lockfile package has no graph search range".to_owned(),
-                    )
-                })?
-                .binary_search_by(|package| package.identity.cmp(&locked.identity))
-                .map(|index| index + 1)
-                .map_err(|_| {
-                    LoadError::InvalidOutput(
-                        "lockfile package is missing from the package graph".to_owned(),
-                    )
-                })?
-        };
-        let package = graph.packages().get(package_index).ok_or_else(|| {
-            LoadError::InvalidOutput("source graph package index is missing".to_owned())
-        })?;
-        if package.identity != locked.identity {
-            return Err(LoadError::InvalidOutput(
-                "source graph package identity differs from the lockfile".to_owned(),
-            ));
         }
         let start = *module_starts.get(package_index).ok_or_else(|| {
             LoadError::InvalidOutput("source graph module range is missing".to_owned())
@@ -2061,17 +1907,6 @@ fn map_root_decode_error(error: DecodeError) -> LoadError {
     }
 }
 
-fn map_lockfile_decode_error(error: DecodeError) -> LoadError {
-    match bounded_decode_error(error) {
-        DecodeError::Cancelled => LoadError::Cancelled,
-        DecodeError::InvalidLimits => LoadError::InvalidLimits,
-        DecodeError::ResourceLimit { resource, limit } => {
-            LoadError::ResourceLimit { resource, limit }
-        }
-        error => LoadError::Lockfile(error),
-    }
-}
-
 fn map_candidate_manifest_error(error: DecodeError) -> LoadError {
     match error {
         DecodeError::Cancelled => LoadError::Cancelled,
@@ -2081,19 +1916,6 @@ fn map_candidate_manifest_error(error: DecodeError) -> LoadError {
         }
         _ => {
             LoadError::InvalidOutput("candidate manifest cannot be canonically encoded".to_owned())
-        }
-    }
-}
-
-fn map_candidate_lockfile_error(error: DecodeError) -> LoadError {
-    match error {
-        DecodeError::Cancelled => LoadError::Cancelled,
-        DecodeError::InvalidLimits => LoadError::InvalidLimits,
-        DecodeError::ResourceLimit { resource, limit } => {
-            LoadError::ResourceLimit { resource, limit }
-        }
-        _ => {
-            LoadError::InvalidOutput("candidate lockfile cannot be canonically encoded".to_owned())
         }
     }
 }
@@ -2121,7 +1943,6 @@ pub enum LoadError {
     Cancelled,
     InvalidLimits,
     RootManifest(DecodeError),
-    Lockfile(DecodeError),
     PackageManifest {
         package: PackageIdentity,
         error: DecodeError,
@@ -2131,7 +1952,6 @@ pub enum LoadError {
         error: ProviderError,
     },
     Manifest(String),
-    Lock(String),
     DigestMismatch {
         subject: String,
         expected: Sha256Digest,
@@ -2158,7 +1978,6 @@ impl fmt::Display for LoadError {
             Self::Cancelled => formatter.write_str("package loading was cancelled"),
             Self::InvalidLimits => formatter.write_str("package loading limits must be nonzero"),
             Self::RootManifest(error) => write!(formatter, "invalid root manifest: {error}"),
-            Self::Lockfile(error) => write!(formatter, "invalid lockfile: {error}"),
             Self::PackageManifest { package, error } => write!(
                 formatter,
                 "invalid manifest for {}@{}: {error}",
@@ -2174,11 +1993,6 @@ impl fmt::Display for LoadError {
             Self::Manifest(message) => write!(
                 formatter,
                 "invalid package manifest: {}",
-                bounded_load_error_value(message)
-            ),
-            Self::Lock(message) => write!(
-                formatter,
-                "invalid package lockfile: {}",
                 bounded_load_error_value(message)
             ),
             Self::DigestMismatch {
@@ -2500,27 +2314,22 @@ mod contract_tests {
 #[cfg(test)]
 mod loader_tests {
     use std::cell::{Cell, RefCell};
-    use std::collections::{BTreeMap, BTreeSet};
 
     use wrela_build_model::Sha256Digest;
     use wrela_package::{
-        DependencyAlias, LOCKFILE_SCHEMA_VERSION, LockedDependency, LockedPackage, Lockfile,
-        PackageIdentity, PackageLocator, PackageName,
+        DependencyAlias, PackageIdentity, PackageLocator, PackageName, PackageVersion,
     };
     use wrela_source::{SourceDatabase, SourceInput};
 
     use super::{
         CanonicalPackageCodec, CanonicalWorkspaceLoader, ContentHasher, DecodeError, LoadError,
         LoadLimits, LoadRequest, LoadedManifestInput, LoadedWorkspace, LoadedWorkspaceCandidate,
-        LockfileCodecLimits, MAX_LOAD_ERROR_VALUE_BYTES, ManifestCodecLimits, PackageBundle,
-        PackageCodec, PackageContentDigestError, PackageContentKind, PackageContentRecord,
-        PackageSourceProvider, ProviderError, ScenarioInput, SoftwareSha256, WorkspaceLoader,
-        bounded_decode_error, bounded_provider_error, candidate_dependencies_match,
-        is_utf8_cancellable, package_content_digest, seal_loaded_workspace,
+        MAX_LOAD_ERROR_VALUE_BYTES, ManifestCodecLimits, PackageBundle, PackageCodec,
+        PackageContentDigestError, PackageContentKind, PackageContentRecord, PackageSourceProvider,
+        ProviderError, ScenarioInput, SoftwareSha256, WorkspaceLoader, bounded_decode_error,
+        bounded_provider_error, candidate_dependencies_match, is_utf8_cancellable,
+        package_content_digest, seal_loaded_workspace,
     };
-
-    const REPRESENTATIVE_MANIFEST: &[u8] =
-        include_bytes!("../../../tests/contracts/package/v1/representative.toml");
 
     struct ScenarioFixture {
         path: String,
@@ -2531,7 +2340,6 @@ mod loader_tests {
     struct PackageFixture {
         identity: PackageIdentity,
         manifest_bytes: Vec<u8>,
-        manifest_digest: Sha256Digest,
         sources: Vec<SourceInput>,
         scenarios: Vec<ScenarioFixture>,
     }
@@ -2550,7 +2358,6 @@ mod loader_tests {
             let manifest_bytes = codec
                 .canonical_manifest(&manifest, test_manifest_limits(), &never_cancelled)
                 .expect("canonical test package manifest");
-            let manifest_digest = hasher.sha256(&manifest_bytes);
             let sources = sources
                 .iter()
                 .map(|(path, text)| SourceInput {
@@ -2591,7 +2398,6 @@ mod loader_tests {
                     source_digest,
                 },
                 manifest_bytes,
-                manifest_digest,
                 sources,
                 scenarios,
             }
@@ -2617,32 +2423,48 @@ mod loader_tests {
         }
     }
 
+    /// Serves exactly two fixed roles -- root and the reserved `core`
+    /// dependency -- routed by the *requested* locator, not by whatever a
+    /// test has corrupted on the returned bundle. There is no lockfile: the
+    /// loader independently recomputes and verifies each bundle's identity
+    /// after acquisition (`verify_package_identity`), so this provider need
+    /// not pre-validate anything beyond byte ceilings.
     struct InMemoryProvider {
-        bundles: BTreeMap<PackageIdentity, PackageBundle>,
-        acquisitions: RefCell<Vec<(PackageIdentity, u64, u64)>>,
+        root_locator: PackageLocator,
+        root_bundle: PackageBundle,
+        core_locator: PackageLocator,
+        core_bundle: PackageBundle,
+        acquisitions: RefCell<Vec<(PackageName, PackageVersion, u64, u64)>>,
     }
 
     impl PackageSourceProvider for InMemoryProvider {
         fn acquire(
             &self,
-            _locator: &PackageLocator,
-            expected: &PackageIdentity,
+            locator: &PackageLocator,
+            expected_name: &PackageName,
+            expected_version: &PackageVersion,
             maximum_bytes: u64,
             maximum_manifest_bytes: u64,
             is_cancelled: &dyn Fn() -> bool,
         ) -> Result<PackageBundle, ProviderError> {
             self.acquisitions.borrow_mut().push((
-                expected.clone(),
+                expected_name.clone(),
+                expected_version.clone(),
                 maximum_bytes,
                 maximum_manifest_bytes,
             ));
             if is_cancelled() {
                 return Err(ProviderError::Unavailable("cancelled".to_owned()));
             }
-            let bundle = self
-                .bundles
-                .get(expected)
-                .ok_or_else(|| ProviderError::Unavailable("missing in-memory bundle".to_owned()))?;
+            let bundle = if *locator == self.root_locator {
+                &self.root_bundle
+            } else if *locator == self.core_locator {
+                &self.core_bundle
+            } else {
+                return Err(ProviderError::Unavailable(
+                    "missing in-memory bundle".to_owned(),
+                ));
+            };
             if bundle.manifest_bytes.len() as u64 > maximum_manifest_bytes {
                 return Err(ProviderError::TooLarge {
                     limit: maximum_manifest_bytes,
@@ -2675,7 +2497,7 @@ mod loader_tests {
         root_identity: PackageIdentity,
         root_locator: PackageLocator,
         root_manifest: Vec<u8>,
-        lockfile: Vec<u8>,
+        core_locator: PackageLocator,
         provider: InMemoryProvider,
         limits: LoadLimits,
     }
@@ -2692,22 +2514,12 @@ mod loader_tests {
         }
     }
 
-    fn test_lockfile_limits() -> LockfileCodecLimits {
-        LockfileCodecLimits {
-            bytes: 1024 * 1024,
-            string_bytes: 1024 * 1024,
-            packages: 128,
-            dependencies: 1024,
-        }
-    }
-
     fn test_load_limits() -> LoadLimits {
         LoadLimits {
             packages: 128,
             sources: 1024,
             manifest_bytes_per_package: 1024 * 1024,
             manifest_bytes: 16 * 1024 * 1024,
-            lockfile_bytes: 1024 * 1024,
             source_bytes: 16 * 1024 * 1024,
             scenarios: 1024,
             scenario_bytes: 16 * 1024 * 1024,
@@ -2723,7 +2535,7 @@ mod loader_tests {
         let mut bytes_per_package = 0u64;
         let mut sources = 0u32;
         let mut scenarios = 0u32;
-        for bundle in fixture.provider.bundles.values() {
+        for bundle in [&fixture.provider.root_bundle, &fixture.provider.core_bundle] {
             let manifest = u64::try_from(bundle.manifest_bytes.len()).expect("manifest bytes");
             let package_sources = bundle.sources.iter().fold(0u64, |total, source| {
                 total + u64::try_from(source.text.len()).expect("source bytes")
@@ -2741,11 +2553,10 @@ mod loader_tests {
             scenarios += u32::try_from(bundle.scenarios.len()).expect("scenario count");
         }
         LoadLimits {
-            packages: u32::try_from(fixture.provider.bundles.len()).expect("package count"),
+            packages: 2,
             sources,
             manifest_bytes_per_package,
             manifest_bytes,
-            lockfile_bytes: u64::try_from(fixture.lockfile.len()).expect("lockfile bytes"),
             source_bytes,
             scenarios: scenarios.max(1),
             scenario_bytes: scenario_bytes.max(1),
@@ -2772,51 +2583,30 @@ mod loader_tests {
         manifest.into_bytes()
     }
 
-    fn locked_dependency(alias: &str, identity: &PackageIdentity) -> LockedDependency {
-        LockedDependency {
-            alias: DependencyAlias::new(alias).expect("dependency alias"),
-            identity: identity.clone(),
-        }
-    }
-
+    /// Assemble the only shape revision 0.1 can load: a root package plus its
+    /// sole `core` dependency. There is no lockfile to also record; the
+    /// caller supplies each locator directly, exactly as
+    /// `LoadRequest::core_locator` expects from a real driver.
     fn assemble_fixture(
-        root_identity: PackageIdentity,
-        entries: Vec<(PackageFixture, PackageLocator, Vec<LockedDependency>)>,
+        root: PackageFixture,
+        root_locator: PackageLocator,
+        core: PackageFixture,
+        core_locator: PackageLocator,
     ) -> WorkspaceFixture {
-        let codec = CanonicalPackageCodec::new();
-        let mut bundles = BTreeMap::new();
-        let mut packages = Vec::with_capacity(entries.len());
-        let mut root_manifest = None;
-        let mut root_locator = None;
-        for (fixture, locator, dependencies) in entries {
-            if fixture.identity == root_identity {
-                root_manifest = Some(fixture.manifest_bytes.clone());
-                root_locator = Some(locator.clone());
-            }
-            bundles.insert(fixture.identity.clone(), fixture.bundle(locator.clone()));
-            packages.push(LockedPackage {
-                identity: fixture.identity,
-                locator,
-                dependencies,
-                manifest_digest: fixture.manifest_digest,
-            });
-        }
-        packages.sort_by(|left, right| left.identity.cmp(&right.identity));
-        let lockfile = Lockfile {
-            schema: LOCKFILE_SCHEMA_VERSION,
-            root: root_identity.clone(),
-            packages,
-        };
-        let lockfile = codec
-            .canonical_lockfile(&lockfile, test_lockfile_limits(), &never_cancelled)
-            .expect("canonical test lockfile");
+        let root_identity = root.identity.clone();
+        let root_manifest = root.manifest_bytes.clone();
+        let root_bundle = root.bundle(root_locator.clone());
+        let core_bundle = core.bundle(core_locator.clone());
         WorkspaceFixture {
             root_identity,
-            root_locator: root_locator.expect("root locator"),
-            root_manifest: root_manifest.expect("root manifest"),
-            lockfile,
+            root_locator: root_locator.clone(),
+            root_manifest,
+            core_locator: core_locator.clone(),
             provider: InMemoryProvider {
-                bundles,
+                root_locator,
+                root_bundle,
+                core_locator,
+                core_bundle,
                 acquisitions: RefCell::new(Vec::new()),
             },
             limits: test_load_limits(),
@@ -2824,37 +2614,43 @@ mod loader_tests {
     }
 
     fn minimal_fixture() -> WorkspaceFixture {
-        let root = PackageFixture::new(
-            &manifest_bytes("mini", "1.0.0", &[]),
-            &[("mini.wr", "fn mini() -> unit:\n    return ()\n")],
-            &[],
-        );
-        let root_identity = root.identity.clone();
-        assemble_fixture(
-            root_identity,
-            vec![(
-                root,
-                PackageLocator::Workspace {
-                    path: "packages/mini".to_owned(),
-                },
-                Vec::new(),
-            )],
-        )
-    }
-
-    fn representative_fixture() -> WorkspaceFixture {
         let core = PackageFixture::new(
             &manifest_bytes("wrela-core", "0.1.0", &[]),
             &[("wrela_core.wr", "fn core() -> unit:\n    return ()\n")],
             &[],
         );
-        let network = PackageFixture::new(
-            &manifest_bytes("network", "2.3.4", &[]),
-            &[("network.wr", "fn network() -> unit:\n    return ()\n")],
+        let root = PackageFixture::new(
+            &manifest_bytes("mini", "1.0.0", &[("core", "wrela-core", "0.1.0")]),
+            &[("mini.wr", "fn mini() -> unit:\n    return ()\n")],
             &[],
         );
+        assemble_fixture(
+            root,
+            PackageLocator::Workspace {
+                path: "packages/mini".to_owned(),
+            },
+            core,
+            PackageLocator::Toolchain {
+                component: "wrela-core-0.1".to_owned(),
+            },
+        )
+    }
+
+    /// A root manifest that also declares an image and an image test, so
+    /// scenario-handling paths (declared, missing, duplicate, undeclared,
+    /// non-UTF-8) have something to exercise. Revision 0.1's loader accepts
+    /// only the reserved `core` dependency, so unlike the old
+    /// lockfile-era fixture this has exactly two packages, not three.
+    fn scenario_fixture() -> WorkspaceFixture {
+        let core = PackageFixture::new(
+            &manifest_bytes("wrela-core", "0.1.0", &[]),
+            &[("wrela_core.wr", "fn core() -> unit:\n    return ()\n")],
+            &[],
+        );
+        let root_manifest = "schema = 1\nlanguage = \"0.1-design\"\n\n[package]\nname = \"appliance\"\nversion = \"0.1.0\"\nsource_root = \"src\"\n\n[[dependency]]\nalias = \"core\"\npackage = \"wrela-core\"\nrequirement = \"=0.1.0\"\n\n[[profile]]\nname = \"development\"\nmode = \"development\"\n\n[[image]]\nname = \"appliance\"\nmodule = \"appliance.image\"\nentry = \"image\"\ntarget = \"aarch64-qemu-virt-uefi\"\nprofile = \"development\"\n\n[[image_test]]\nname = \"boots-and-serves\"\nimage = \"appliance\"\nscenario = \"fixtures/boots-and-serves.toml\"\nboot_timeout_ns = 30000000000\nshutdown_timeout_ns = 5000000000\nmaximum_events = 10000\nmaximum_output_bytes = 1048576\ndeterministic_seed = 42\n"
+            .to_owned();
         let root = PackageFixture::new(
-            REPRESENTATIVE_MANIFEST,
+            root_manifest.as_bytes(),
             &[
                 ("appliance/image.wr", "fn image() -> unit:\n    return ()\n"),
                 (
@@ -2867,119 +2663,15 @@ mod loader_tests {
                 "schema = 1\nname = \"boots-and-serves\"\n",
             )],
         );
-        let root_identity = root.identity.clone();
-        let root_dependencies = vec![
-            locked_dependency("core", &core.identity),
-            locked_dependency("net", &network.identity),
-        ];
         assemble_fixture(
-            root_identity,
-            vec![
-                (
-                    root,
-                    PackageLocator::Workspace {
-                        path: "packages/appliance".to_owned(),
-                    },
-                    root_dependencies,
-                ),
-                (
-                    network,
-                    PackageLocator::Archive {
-                        provider: "company-cache".to_owned(),
-                        key: "network-2.3.4".to_owned(),
-                    },
-                    Vec::new(),
-                ),
-                (
-                    core,
-                    PackageLocator::Toolchain {
-                        component: "wrela-core-0.1".to_owned(),
-                    },
-                    Vec::new(),
-                ),
-            ],
-        )
-    }
-
-    fn cycle_fixture() -> WorkspaceFixture {
-        let a = PackageFixture::new(
-            &manifest_bytes("a", "1.0.0", &[("b", "b", "1.0.0")]),
-            &[("a.wr", "fn a() -> unit:\n    return ()\n")],
-            &[],
-        );
-        let b = PackageFixture::new(
-            &manifest_bytes("b", "1.0.0", &[("a", "a", "1.0.0")]),
-            &[("b.wr", "fn b() -> unit:\n    return ()\n")],
-            &[],
-        );
-        let root_identity = a.identity.clone();
-        let a_dependencies = vec![locked_dependency("b", &b.identity)];
-        let b_dependencies = vec![locked_dependency("a", &a.identity)];
-        assemble_fixture(
-            root_identity,
-            vec![
-                (
-                    a,
-                    PackageLocator::Workspace {
-                        path: "packages/a".to_owned(),
-                    },
-                    a_dependencies,
-                ),
-                (
-                    b,
-                    PackageLocator::Workspace {
-                        path: "packages/b".to_owned(),
-                    },
-                    b_dependencies,
-                ),
-            ],
-        )
-    }
-
-    fn transitive_fixture() -> WorkspaceFixture {
-        let leaf = PackageFixture::new(
-            &manifest_bytes("leaf", "1.0.0", &[]),
-            &[("leaf.wr", "fn leaf() -> unit:\n    return ()\n")],
-            &[],
-        );
-        let middle = PackageFixture::new(
-            &manifest_bytes("middle", "1.0.0", &[("leaf", "leaf", "1.0.0")]),
-            &[("middle.wr", "fn middle() -> unit:\n    return ()\n")],
-            &[],
-        );
-        let root = PackageFixture::new(
-            &manifest_bytes("root", "1.0.0", &[("middle", "middle", "1.0.0")]),
-            &[("root.wr", "fn root() -> unit:\n    return ()\n")],
-            &[],
-        );
-        let root_identity = root.identity.clone();
-        let root_dependencies = vec![locked_dependency("middle", &middle.identity)];
-        let middle_dependencies = vec![locked_dependency("leaf", &leaf.identity)];
-        assemble_fixture(
-            root_identity,
-            vec![
-                (
-                    root,
-                    PackageLocator::Workspace {
-                        path: "packages/root".to_owned(),
-                    },
-                    root_dependencies,
-                ),
-                (
-                    middle,
-                    PackageLocator::Workspace {
-                        path: "packages/middle".to_owned(),
-                    },
-                    middle_dependencies,
-                ),
-                (
-                    leaf,
-                    PackageLocator::Workspace {
-                        path: "packages/leaf".to_owned(),
-                    },
-                    Vec::new(),
-                ),
-            ],
+            root,
+            PackageLocator::Workspace {
+                path: "packages/appliance".to_owned(),
+            },
+            core,
+            PackageLocator::Toolchain {
+                component: "wrela-core-0.1".to_owned(),
+            },
         )
     }
 
@@ -2993,7 +2685,7 @@ mod loader_tests {
             LoadRequest {
                 root_locator: fixture.root_locator.clone(),
                 root_manifest_bytes: &fixture.root_manifest,
-                lockfile_bytes: &fixture.lockfile,
+                core_locator: fixture.core_locator.clone(),
                 provider: &fixture.provider,
                 hasher: &hasher,
                 codec: &codec,
@@ -3023,8 +2715,6 @@ mod loader_tests {
             sources: workspace.sources().clone(),
             manifests,
             scenarios: workspace.scenarios().to_vec(),
-            lockfile: workspace.lockfile().clone(),
-            canonical_lockfile: workspace.canonical_lockfile().to_vec(),
         }
     }
 
@@ -3043,7 +2733,7 @@ mod loader_tests {
             &LoadRequest {
                 root_locator: fixture.root_locator.clone(),
                 root_manifest_bytes: &fixture.root_manifest,
-                lockfile_bytes: &fixture.lockfile,
+                core_locator: fixture.core_locator.clone(),
                 provider: &fixture.provider,
                 hasher: &hasher,
                 codec: &codec,
@@ -3073,130 +2763,42 @@ mod loader_tests {
     }
 
     fn root_bundle_mut(fixture: &mut WorkspaceFixture) -> &mut PackageBundle {
-        fixture
-            .provider
-            .bundles
-            .get_mut(&fixture.root_identity)
-            .expect("root bundle")
+        &mut fixture.provider.root_bundle
+    }
+
+    fn core_bundle_mut(fixture: &mut WorkspaceFixture) -> &mut PackageBundle {
+        &mut fixture.provider.core_bundle
     }
 
     #[test]
-    fn canonical_loader_seals_minimum_workspace() {
+    fn canonical_loader_seals_root_and_core_workspace() {
         let fixture = minimal_fixture();
         let workspace = load_fixture(&fixture, &never_cancelled).expect("minimum workspace");
-        assert_eq!(workspace.graph().packages().len(), 1);
-        assert_eq!(workspace.graph().modules().len(), 1);
-        assert_eq!(workspace.sources().len(), 1);
-        assert_eq!(workspace.manifests().len(), 1);
+        assert_eq!(workspace.graph().packages().len(), 2);
+        assert_eq!(workspace.graph().modules().len(), 2);
+        assert_eq!(workspace.sources().len(), 2);
+        assert_eq!(workspace.manifests().len(), 2);
         assert_eq!(workspace.root_manifest().name, fixture.root_identity.name);
-        assert_eq!(workspace.canonical_lockfile(), fixture.lockfile);
-        assert_eq!(fixture.provider.acquisitions.borrow().len(), 1);
-        assert_eq!(
-            fixture.provider.acquisitions.borrow()[0].1,
-            fixture.limits.bytes_per_package
-        );
-        assert_eq!(
-            fixture.provider.acquisitions.borrow()[0].2,
-            fixture.limits.manifest_bytes_per_package
-        );
-    }
-
-    #[test]
-    fn canonical_loader_seals_representative_workspace_once_in_lock_order() {
-        let fixture = representative_fixture();
-        let workspace = load_fixture(&fixture, &never_cancelled).expect("representative workspace");
-        assert_eq!(workspace.graph().packages().len(), 3);
-        assert_eq!(workspace.graph().modules().len(), 4);
-        assert_eq!(workspace.sources().len(), 4);
-        assert_eq!(workspace.scenarios().len(), 1);
-        assert_eq!(workspace.root_manifest().images.len(), 1);
-        assert!(
-            workspace
-                .sources()
-                .files()
-                .windows(2)
-                .all(|pair| pair[0].path() < pair[1].path())
-        );
-        let acquisitions = fixture.provider.acquisitions.borrow();
-        assert_eq!(acquisitions.len(), 3);
-        assert_eq!(
-            acquisitions
-                .iter()
-                .map(|(identity, _, _)| identity.clone())
-                .collect::<BTreeSet<_>>()
-                .len(),
-            3
-        );
-        assert!(acquisitions.iter().all(|(_, package, manifest)| {
-            *package == fixture.limits.bytes_per_package
-                && *manifest == fixture.limits.manifest_bytes_per_package
-        }));
-        assert!(acquisitions.windows(2).all(|pair| pair[0].0 < pair[1].0));
-    }
-
-    #[test]
-    fn canonical_loader_seals_transitive_dependency_chain() {
-        let fixture = transitive_fixture();
-        let workspace = load_fixture(&fixture, &never_cancelled).expect("transitive workspace");
-        assert_eq!(workspace.graph().packages().len(), 3);
-        assert_eq!(workspace.graph().modules().len(), 3);
-
-        let root = workspace
+        let root_record = workspace
             .graph()
             .package(workspace.graph().root())
-            .expect("root package");
-        assert_eq!(root.identity.name.as_str(), "root");
-        assert_eq!(root.dependencies.len(), 1);
-        let middle = workspace
-            .graph()
-            .package(root.dependencies[0].package)
-            .expect("middle package");
-        assert_eq!(middle.identity.name.as_str(), "middle");
-        assert_eq!(middle.dependencies.len(), 1);
-        let leaf = workspace
-            .graph()
-            .package(middle.dependencies[0].package)
-            .expect("leaf package");
-        assert_eq!(leaf.identity.name.as_str(), "leaf");
-        assert!(leaf.dependencies.is_empty());
-        assert_eq!(
-            workspace
-                .manifests()
-                .iter()
-                .map(|manifest| manifest.identity().name.as_str())
-                .collect::<Vec<_>>(),
-            ["root", "leaf", "middle"]
-        );
-        assert_eq!(
-            fixture
-                .provider
-                .acquisitions
-                .borrow()
-                .iter()
-                .map(|(identity, _, _)| identity.name.as_str())
-                .collect::<Vec<_>>(),
-            ["leaf", "middle", "root"]
-        );
-    }
-
-    #[test]
-    fn caller_lockfile_must_be_canonical_before_acquisition() {
-        let mut fixture = minimal_fixture();
-        fixture.lockfile = String::from_utf8(fixture.lockfile)
-            .expect("UTF-8 lockfile")
-            .replacen("schema = 1", "schema=1", 1)
-            .into_bytes();
-        assert!(matches!(
-            load_fixture(&fixture, &never_cancelled),
-            Err(LoadError::Lock(_))
+            .expect("loaded root package");
+        assert_eq!(root_record.identity, fixture.root_identity);
+        assert_eq!(root_record.dependencies.len(), 1);
+        assert_eq!(root_record.dependencies[0].alias.as_str(), "core");
+        assert_eq!(fixture.provider.acquisitions.borrow().len(), 2);
+        assert!(fixture.provider.acquisitions.borrow().iter().all(
+            |(_, _, package_bytes, manifest_bytes)| *package_bytes
+                == fixture.limits.bytes_per_package
+                && *manifest_bytes == fixture.limits.manifest_bytes_per_package
         ));
-        assert!(fixture.provider.acquisitions.borrow().is_empty());
     }
 
     #[test]
     fn provider_identity_substitution_is_rejected() {
         let mut fixture = minimal_fixture();
-        root_bundle_mut(&mut fixture).identity.source_digest = Sha256Digest::from_bytes([0x99; 32]);
+        root_bundle_mut(&mut fixture).identity.name =
+            PackageName::new("substituted").expect("substituted name");
         assert!(matches!(
             load_fixture(&fixture, &never_cancelled),
             Err(LoadError::Provider {
@@ -3222,31 +2824,13 @@ mod loader_tests {
     }
 
     #[test]
-    fn stale_locked_package_content_identity_is_rejected() {
+    fn stale_claimed_package_content_identity_is_rejected() {
+        // There is no lockfile-recorded digest to go stale; corrupting the
+        // identity the provider itself claims is the equivalent revision
+        // 0.1 failure mode -- the loader recomputes content and rejects the
+        // mismatch.
         let mut fixture = minimal_fixture();
-        let codec = CanonicalPackageCodec::new();
-        let mut lockfile = codec
-            .decode_lockfile(&fixture.lockfile, test_lockfile_limits(), &never_cancelled)
-            .expect("decode lockfile");
-        let old_identity = fixture.root_identity.clone();
-        let mut stale_identity = old_identity.clone();
-        stale_identity.source_digest = Sha256Digest::from_bytes([0x77; 32]);
-        lockfile.root = stale_identity.clone();
-        lockfile.packages[0].identity = stale_identity.clone();
-        fixture.lockfile = codec
-            .canonical_lockfile(&lockfile, test_lockfile_limits(), &never_cancelled)
-            .expect("stale canonical lockfile");
-        let mut bundle = fixture
-            .provider
-            .bundles
-            .remove(&old_identity)
-            .expect("root bundle");
-        bundle.identity = stale_identity.clone();
-        fixture
-            .provider
-            .bundles
-            .insert(stale_identity.clone(), bundle);
-        fixture.root_identity = stale_identity;
+        root_bundle_mut(&mut fixture).identity.source_digest = Sha256Digest::from_bytes([0x77; 32]);
         assert!(matches!(
             load_fixture(&fixture, &never_cancelled),
             Err(LoadError::DigestMismatch { .. })
@@ -3254,9 +2838,12 @@ mod loader_tests {
     }
 
     #[test]
-    fn malformed_acquired_manifest_is_package_scoped() {
+    fn malformed_acquired_root_manifest_is_package_scoped() {
         let mut fixture = minimal_fixture();
         root_bundle_mut(&mut fixture).manifest_bytes = b"schema =\n".to_vec();
+        // The root manifest is decoded before acquisition, so a corrupted
+        // *acquired* copy first fails the "provider returned the requested
+        // root manifest" cross-check.
         assert!(matches!(
             load_fixture(&fixture, &never_cancelled),
             Err(LoadError::PackageManifest {
@@ -3267,27 +2854,16 @@ mod loader_tests {
     }
 
     #[test]
-    fn malformed_non_root_manifest_reports_the_locked_package() {
-        let mut fixture = representative_fixture();
-        let non_root = fixture
-            .provider
-            .bundles
-            .keys()
-            .find(|identity| **identity != fixture.root_identity)
-            .cloned()
-            .expect("non-root package");
-        fixture
-            .provider
-            .bundles
-            .get_mut(&non_root)
-            .expect("non-root bundle")
-            .manifest_bytes = b"schema =\n".to_vec();
+    fn malformed_core_manifest_reports_the_core_package() {
+        let mut fixture = minimal_fixture();
+        let core_identity = fixture.provider.core_bundle.identity.clone();
+        core_bundle_mut(&mut fixture).manifest_bytes = b"schema =\n".to_vec();
         assert!(matches!(
             load_fixture(&fixture, &never_cancelled),
             Err(LoadError::PackageManifest {
                 package,
                 error: DecodeError::Malformed { .. },
-            }) if package == non_root
+            }) if package == core_identity
         ));
     }
 
@@ -3297,8 +2873,7 @@ mod loader_tests {
         // emptied or extended source set is not a distinct "missing" or
         // "undeclared" declared-source class any more: it silently derives a
         // different module set, and the package content digest computed over
-        // that set then mismatches the identity locked for the original
-        // source set.
+        // that set then mismatches the identity the provider claimed.
         let mut missing = minimal_fixture();
         root_bundle_mut(&mut missing).sources.clear();
         assert!(matches!(
@@ -3343,14 +2918,14 @@ mod loader_tests {
 
     #[test]
     fn scenario_set_rejects_missing_duplicate_and_undeclared_inputs() {
-        let mut missing = representative_fixture();
+        let mut missing = scenario_fixture();
         root_bundle_mut(&mut missing).scenarios.clear();
         assert!(matches!(
             load_fixture(&missing, &never_cancelled),
             Err(LoadError::MissingScenario(_))
         ));
 
-        let mut duplicate = representative_fixture();
+        let mut duplicate = scenario_fixture();
         let repeated = root_bundle_mut(&mut duplicate).scenarios[0].clone();
         root_bundle_mut(&mut duplicate).scenarios.push(repeated);
         assert!(matches!(
@@ -3358,7 +2933,7 @@ mod loader_tests {
             Err(LoadError::DuplicateScenario(_))
         ));
 
-        let mut undeclared = representative_fixture();
+        let mut undeclared = scenario_fixture();
         let bytes = b"schema = 1\nname = \"extra\"\n".to_vec();
         let identity = undeclared.root_identity.clone();
         let digest = SoftwareSha256.sha256(&bytes);
@@ -3375,7 +2950,7 @@ mod loader_tests {
             Err(LoadError::UndeclaredScenario(_))
         ));
 
-        let mut invalid_utf8 = representative_fixture();
+        let mut invalid_utf8 = scenario_fixture();
         let scenario = &mut root_bundle_mut(&mut invalid_utf8).scenarios[0];
         scenario.bytes = vec![0xff];
         scenario.digest = SoftwareSha256.sha256(&scenario.bytes);
@@ -3390,51 +2965,30 @@ mod loader_tests {
 
     #[test]
     fn sealer_dependency_binding_rejects_alias_identity_and_requirement_mutations() {
-        let fixture = representative_fixture();
+        let fixture = minimal_fixture();
         let candidate = candidate_from_fixture(&fixture);
+        // The root is always graph package 0 and `manifests[0]`; there is no
+        // lockfile-recorded dependency set to also cross-check, so this only
+        // exercises the manifest/graph comparison.
         let package = &candidate.graph.packages()[0];
-        let locked = candidate
-            .lockfile
-            .packages
-            .iter()
-            .find(|locked| locked.identity == package.identity)
-            .expect("locked root package");
         let manifest = &candidate.manifests[0].manifest;
         assert!(
-            candidate_dependencies_match(
-                &candidate.graph,
-                package,
-                manifest,
-                Some(locked),
-                &never_cancelled,
-            )
-            .expect("valid dependency binding")
+            candidate_dependencies_match(&candidate.graph, package, manifest, &never_cancelled)
+                .expect("valid dependency binding")
         );
 
         let mut alias = manifest.clone();
         alias.dependencies[0].alias = DependencyAlias::new("altered").expect("altered alias");
         assert!(
-            !candidate_dependencies_match(
-                &candidate.graph,
-                package,
-                &alias,
-                Some(locked),
-                &never_cancelled,
-            )
-            .expect("alias mismatch")
+            !candidate_dependencies_match(&candidate.graph, package, &alias, &never_cancelled)
+                .expect("alias mismatch")
         );
 
         let mut identity = manifest.clone();
         identity.dependencies[0].package = PackageName::new("substitute").expect("package name");
         assert!(
-            !candidate_dependencies_match(
-                &candidate.graph,
-                package,
-                &identity,
-                Some(locked),
-                &never_cancelled,
-            )
-            .expect("identity mismatch")
+            !candidate_dependencies_match(&candidate.graph, package, &identity, &never_cancelled)
+                .expect("identity mismatch")
         );
 
         let mut requirement = manifest.clone();
@@ -3444,42 +2998,28 @@ mod loader_tests {
                 &candidate.graph,
                 package,
                 &requirement,
-                Some(locked),
-                &never_cancelled,
+                &never_cancelled
             )
             .expect("requirement mismatch")
         );
         assert!(matches!(
-            candidate_dependencies_match(
-                &candidate.graph,
-                package,
-                manifest,
-                Some(locked),
-                &|| true,
-            ),
+            candidate_dependencies_match(&candidate.graph, package, manifest, &|| true),
             Err(LoadError::Cancelled)
         ));
     }
 
     #[test]
-    fn sealer_rebinds_request_lock_root_and_candidate_order() {
+    fn sealer_rebinds_request_root_and_candidate_order() {
         let mut changed_request = minimal_fixture();
         let candidate = candidate_from_fixture(&changed_request);
-        changed_request.root_manifest = manifest_bytes("other", "1.0.0", &[]);
+        changed_request.root_manifest =
+            manifest_bytes("other", "1.0.0", &[("core", "wrela-core", "0.1.0")]);
         assert!(matches!(
             seal_fixture_candidate(&changed_request, candidate),
             Err(LoadError::InvalidOutput(_))
         ));
 
-        let lock_fixture = minimal_fixture();
-        let mut candidate = candidate_from_fixture(&lock_fixture);
-        candidate.canonical_lockfile.push(b'\n');
-        assert!(matches!(
-            seal_fixture_candidate(&lock_fixture, candidate),
-            Err(LoadError::InvalidOutput(_))
-        ));
-
-        let order_fixture = transitive_fixture();
+        let order_fixture = minimal_fixture();
         let mut candidate = candidate_from_fixture(&order_fixture);
         candidate.manifests.swap(0, 1);
         assert!(matches!(
@@ -3487,7 +3027,7 @@ mod loader_tests {
             Err(LoadError::InvalidOutput(_))
         ));
 
-        let graph_fixture = representative_fixture();
+        let graph_fixture = scenario_fixture();
         let mut candidate = candidate_from_fixture(&graph_fixture);
         candidate.graph = candidate_from_fixture(&minimal_fixture()).graph;
         assert!(matches!(
@@ -3516,7 +3056,7 @@ mod loader_tests {
             Err(LoadError::InvalidOutput(_))
         ));
 
-        let digest_fixture = representative_fixture();
+        let digest_fixture = scenario_fixture();
         let mut candidate = candidate_from_fixture(&digest_fixture);
         candidate.scenarios[0].digest = Sha256Digest::from_bytes([0x33; 32]);
         assert!(matches!(
@@ -3524,7 +3064,7 @@ mod loader_tests {
             Err(LoadError::InvalidOutput(_))
         ));
 
-        let utf8_fixture = representative_fixture();
+        let utf8_fixture = scenario_fixture();
         let mut candidate = candidate_from_fixture(&utf8_fixture);
         candidate.scenarios[0].bytes = vec![0xff];
         assert!(matches!(
@@ -3532,7 +3072,7 @@ mod loader_tests {
             Err(LoadError::InvalidOutput(message)) if message.contains("not UTF-8")
         ));
 
-        let duplicate_fixture = representative_fixture();
+        let duplicate_fixture = scenario_fixture();
         let mut candidate = candidate_from_fixture(&duplicate_fixture);
         candidate.scenarios.push(candidate.scenarios[0].clone());
         assert!(matches!(
@@ -3543,18 +3083,6 @@ mod loader_tests {
 
     #[test]
     fn sealer_preflights_malicious_candidate_limits_and_manifest_shape() {
-        let mut lock_fixture = minimal_fixture();
-        lock_fixture.limits = exact_limits_for_fixture(&lock_fixture);
-        let mut candidate = candidate_from_fixture(&lock_fixture);
-        candidate.canonical_lockfile.push(b' ');
-        assert!(matches!(
-            seal_fixture_candidate(&lock_fixture, candidate),
-            Err(LoadError::ResourceLimit {
-                resource: "canonical lockfile bytes",
-                ..
-            })
-        ));
-
         let mut manifest_fixture = minimal_fixture();
         manifest_fixture.limits = exact_limits_for_fixture(&manifest_fixture);
         let mut candidate = candidate_from_fixture(&manifest_fixture);
@@ -3579,21 +3107,21 @@ mod loader_tests {
             })
         ));
 
-        let mut scenario_fixture = representative_fixture();
-        scenario_fixture.limits = exact_limits_for_fixture(&scenario_fixture);
-        let mut candidate = candidate_from_fixture(&scenario_fixture);
+        let mut scenario_test_fixture = scenario_fixture();
+        scenario_test_fixture.limits = exact_limits_for_fixture(&scenario_test_fixture);
+        let mut candidate = candidate_from_fixture(&scenario_test_fixture);
         candidate.scenarios.push(candidate.scenarios[0].clone());
         assert!(matches!(
-            seal_fixture_candidate(&scenario_fixture, candidate),
+            seal_fixture_candidate(&scenario_test_fixture, candidate),
             Err(LoadError::ResourceLimit {
                 resource: "scenario records",
                 ..
             })
         ));
 
-        let requirement_fixture = transitive_fixture();
+        let requirement_fixture = minimal_fixture();
         let mut candidate = candidate_from_fixture(&requirement_fixture);
-        candidate.manifests[2].manifest.dependencies[0].requirement =
+        candidate.manifests[0].manifest.dependencies[0].requirement =
             format!("={}", "1".repeat(256));
         assert!(matches!(
             seal_fixture_candidate(&requirement_fixture, candidate),
@@ -3671,40 +3199,30 @@ mod loader_tests {
     }
 
     #[test]
-    fn reachable_dependency_cycle_is_rejected_by_graph_construction() {
-        let fixture = cycle_fixture();
+    fn root_manifest_with_more_than_one_dependency_is_rejected() {
+        let mut fixture = minimal_fixture();
+        fixture.root_manifest = manifest_bytes(
+            "mini",
+            "1.0.0",
+            &[
+                ("core", "wrela-core", "0.1.0"),
+                ("extra", "wrela-extra", "1.0.0"),
+            ],
+        );
         assert!(matches!(
             load_fixture(&fixture, &never_cancelled),
-            Err(LoadError::Graph(_))
+            Err(LoadError::Manifest(_))
         ));
+        assert!(fixture.provider.acquisitions.borrow().is_empty());
     }
 
     #[test]
-    fn disconnected_canonical_lock_entry_is_rejected_before_acquisition() {
+    fn root_manifest_dependency_not_aliased_core_is_rejected() {
         let mut fixture = minimal_fixture();
-        let extra = PackageFixture::new(
-            &manifest_bytes("z-extra", "1.0.0", &[]),
-            &[("z_extra.wr", "fn extra() -> unit:\n    return ()\n")],
-            &[],
-        );
-        let locator = PackageLocator::Workspace {
-            path: "packages/z-extra".to_owned(),
-        };
-        let extra_block = format!(
-            "\n[[package]]\nname = \"{}\"\nversion = \"{}\"\nsource_digest = \"{}\"\nmanifest_digest = \"{}\"\nlocator = \"workspace\"\nlocator_path = \"packages/z-extra\"\n",
-            extra.identity.name.as_str(),
-            extra.identity.version.as_str(),
-            extra.identity.source_digest.to_hex(),
-            extra.manifest_digest.to_hex(),
-        );
-        fixture.lockfile.extend_from_slice(extra_block.as_bytes());
-        fixture
-            .provider
-            .bundles
-            .insert(extra.identity.clone(), extra.bundle(locator));
+        fixture.root_manifest = manifest_bytes("mini", "1.0.0", &[("std", "wrela-core", "0.1.0")]);
         assert!(matches!(
             load_fixture(&fixture, &never_cancelled),
-            Err(LoadError::Lock(_)) | Err(LoadError::Lockfile(DecodeError::NonCanonical(_)))
+            Err(LoadError::Manifest(_))
         ));
         assert!(fixture.provider.acquisitions.borrow().is_empty());
     }
@@ -3712,34 +3230,12 @@ mod loader_tests {
     #[test]
     fn exact_limits_succeed_and_one_byte_over_fails() {
         let mut exact = minimal_fixture();
-        let bundle = exact
-            .provider
-            .bundles
-            .get(&exact.root_identity)
-            .expect("root bundle");
-        let source_bytes = bundle.sources[0].text.len() as u64;
-        let manifest_bytes = bundle.manifest_bytes.len() as u64;
-        exact.limits = LoadLimits {
-            packages: 1,
-            sources: 1,
-            manifest_bytes_per_package: manifest_bytes,
-            manifest_bytes,
-            lockfile_bytes: exact.lockfile.len() as u64,
-            source_bytes,
-            scenarios: 1,
-            scenario_bytes: 1,
-            bytes_per_package: manifest_bytes + source_bytes,
-        };
+        exact.limits = exact_limits_for_fixture(&exact);
         load_fixture(&exact, &never_cancelled).expect("exact configured limits");
 
         let mut over = minimal_fixture();
-        over.limits.manifest_bytes = over
-            .provider
-            .bundles
-            .get(&over.root_identity)
-            .expect("root bundle")
-            .manifest_bytes
-            .len() as u64
+        over.limits.manifest_bytes = over.provider.root_bundle.manifest_bytes.len() as u64
+            + over.provider.core_bundle.manifest_bytes.len() as u64
             - 1;
         assert!(matches!(
             load_fixture(&over, &never_cancelled),
@@ -3748,12 +3244,12 @@ mod loader_tests {
     }
 
     #[test]
-    fn representative_count_and_byte_limits_are_exact_boundaries() {
-        let mut exact = representative_fixture();
+    fn scenario_workspace_count_and_byte_limits_are_exact_boundaries() {
+        let mut exact = scenario_fixture();
         exact.limits = exact_limits_for_fixture(&exact);
-        load_fixture(&exact, &never_cancelled).expect("exact representative limits");
+        load_fixture(&exact, &never_cancelled).expect("exact scenario workspace limits");
 
-        let mut packages = representative_fixture();
+        let mut packages = scenario_fixture();
         packages.limits = exact_limits_for_fixture(&packages);
         packages.limits.packages -= 1;
         assert!(matches!(
@@ -3761,7 +3257,7 @@ mod loader_tests {
             Err(LoadError::ResourceLimit { .. })
         ));
 
-        let mut sources = representative_fixture();
+        let mut sources = scenario_fixture();
         sources.limits = exact_limits_for_fixture(&sources);
         sources.limits.sources -= 1;
         assert!(matches!(
@@ -3769,7 +3265,7 @@ mod loader_tests {
             Err(LoadError::ResourceLimit { .. })
         ));
 
-        let mut scenarios = representative_fixture();
+        let mut scenarios = scenario_fixture();
         scenarios.limits = exact_limits_for_fixture(&scenarios);
         scenarios.limits.scenario_bytes -= 1;
         assert!(matches!(

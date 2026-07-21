@@ -40,7 +40,6 @@ use crate::{
 };
 
 const MANIFEST_FILE_NAME: &str = "wrela.toml";
-const LOCKFILE_FILE_NAME: &str = "wrela.lock";
 const ROOT_LOCATOR: &str = ".";
 const MAX_COMMAND_PATH_BYTES: usize = 64 * 1024;
 const MAX_SELECTION_BYTES: usize = 4096;
@@ -685,12 +684,10 @@ fn validate_selection<'a>(
         )));
     }
     if !normal_absolute_path(&workspace.manifest)
-        || !normal_absolute_path(&workspace.lockfile)
         || workspace.manifest.as_os_str().as_encoded_bytes().len() > MAX_COMMAND_PATH_BYTES
-        || workspace.lockfile.as_os_str().as_encoded_bytes().len() > MAX_COMMAND_PATH_BYTES
     {
         return Err(invalid_command(
-            "manifest and lockfile must be bounded, normalized absolute paths",
+            "manifest must be a bounded, normalized absolute path",
         ));
     }
     if workspace
@@ -707,12 +704,6 @@ fn validate_selection<'a>(
         .manifest
         .parent()
         .ok_or_else(|| invalid_command("manifest path does not identify a workspace directory"))?;
-    let expected_lockfile = root.join(LOCKFILE_FILE_NAME);
-    if workspace.lockfile != expected_lockfile {
-        return Err(invalid_command(format!(
-            "lockfile must be the manifest sibling `{LOCKFILE_FILE_NAME}`"
-        )));
-    }
     if !valid_selection_atom(&workspace.image) || !valid_selection_atom(&workspace.profile) {
         return Err(invalid_command(
             "image and profile selections must be nonempty bounded atoms",
@@ -1004,8 +995,6 @@ mod tests {
         include_bytes!("../../../std/examples/minimal-image/wrela.toml");
     const APPLICATION_SOURCE: &[u8] =
         include_bytes!("../../../std/examples/minimal-image/src/bootstrap/image.wr");
-    const APPLICATION_LOCKFILE: &[u8] =
-        include_bytes!("../../../std/examples/minimal-image/wrela.lock");
     const TARGET_MANIFEST: &[u8] =
         include_bytes!("../../../toolchain/targets/aarch64-qemu-virt-uefi/target.toml");
     const FRONTEND_BYTES: &[u8] = b"wrela check integration frontend";
@@ -1105,13 +1094,8 @@ mod tests {
     }
 
     fn selection(manifest: &str) -> WorkspaceSelection {
-        let manifest = PathBuf::from(manifest);
         WorkspaceSelection {
-            lockfile: manifest
-                .parent()
-                .expect("absolute fixture manifest parent")
-                .join(LOCKFILE_FILE_NAME),
-            manifest,
+            manifest: PathBuf::from(manifest),
             image: "bootstrap".to_owned(),
             target: TargetIdentity::aarch64_qemu_virt_uefi(),
             profile: "development".to_owned(),
@@ -1136,7 +1120,6 @@ mod tests {
         let directory = TestDirectory::new();
         let workspace_root = directory.root.join("workspace");
         directory.write("workspace/wrela.toml", APPLICATION_MANIFEST);
-        directory.write("workspace/wrela.lock", APPLICATION_LOCKFILE);
         directory.write("workspace/src/bootstrap/image.wr", APPLICATION_SOURCE);
 
         let toolchain_root = directory.root.join("toolchain");
@@ -1152,7 +1135,6 @@ mod tests {
                 &Command::Check {
                     workspace: WorkspaceSelection {
                         manifest: workspace_root.join(MANIFEST_FILE_NAME),
-                        lockfile: workspace_root.join(LOCKFILE_FILE_NAME),
                         image: "bootstrap".to_owned(),
                         target: TargetIdentity::aarch64_qemu_virt_uefi(),
                         profile: "development".to_owned(),
@@ -1202,10 +1184,10 @@ mod tests {
             Path::new("/workspace")
         );
 
-        let mut wrong_lock = valid.clone();
-        wrong_lock.lockfile = PathBuf::from("/workspace/other.lock");
+        let mut wrong_manifest_name = valid.clone();
+        wrong_manifest_name.manifest = PathBuf::from("/workspace/other.toml");
         assert!(matches!(
-            validate_selection(&wrong_lock, &options, limits),
+            validate_selection(&wrong_manifest_name, &options, limits),
             Err(DriverError::InvalidCommand(_))
         ));
         let relative = selection("workspace/wrela.toml");
@@ -1357,7 +1339,6 @@ mod tests {
     fn check_rejects_toolchain_frontend_that_is_not_the_running_compiler() {
         let directory = TestDirectory::new();
         directory.write("workspace/wrela.toml", APPLICATION_MANIFEST);
-        directory.write("workspace/wrela.lock", APPLICATION_LOCKFILE);
         directory.write("workspace/src/bootstrap/image.wr", APPLICATION_SOURCE);
         install_toolchain(&directory, FRONTEND_BYTES);
         let driver = LocalCheckDriver::new(

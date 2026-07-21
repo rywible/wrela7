@@ -32,8 +32,6 @@ const PASS_SELECTOR: &str = "installed_core_time_executes_in_qemu";
 const FAILURE_SELECTOR: &str = "typed_checked_failure_reaches_qemu";
 const WORKSPACE_MANIFEST: &[u8] =
     include_bytes!("../../../std/examples/stdlib-time-runtime/wrela.toml");
-const WORKSPACE_LOCKFILE: &[u8] =
-    include_bytes!("../../../std/examples/stdlib-time-runtime/wrela.lock");
 const APPLICATION_SOURCE: &[u8] =
     include_bytes!("../../../std/examples/stdlib-time-runtime/src/runtime/time_test.wr");
 const MAXIMUM_REPORT_BYTES: u64 = 16 * 1024 * 1024;
@@ -108,7 +106,6 @@ struct CaseEvidence {
 struct StdlibTimeEvidence {
     source: FileEvidence,
     manifest: FileEvidence,
-    lock: FileEvidence,
     pass: CaseEvidence,
     invalid_count: CaseEvidence,
 }
@@ -116,13 +113,11 @@ struct StdlibTimeEvidence {
 impl StdlibTimeEvidence {
     fn canonical_line(self) -> String {
         let line = format!(
-            "WRELA_STDLIB_TIME_QEMU_EVIDENCE schema=1 source_sha256={} source_bytes={} manifest_sha256={} manifest_bytes={} lock_sha256={} lock_bytes={} pass_image_sha256={} pass_image_bytes={} pass_report_sha256={} pass_report_bytes={} pass_event_stream_sha256={} pass_event_stream_bytes={} invalid_count_image_sha256={} invalid_count_image_bytes={} invalid_count_report_sha256={} invalid_count_report_bytes={} invalid_count_event_stream_sha256={} invalid_count_event_stream_bytes={}",
+            "WRELA_STDLIB_TIME_QEMU_EVIDENCE schema=1 source_sha256={} source_bytes={} manifest_sha256={} manifest_bytes={} pass_image_sha256={} pass_image_bytes={} pass_report_sha256={} pass_report_bytes={} pass_event_stream_sha256={} pass_event_stream_bytes={} invalid_count_image_sha256={} invalid_count_image_bytes={} invalid_count_report_sha256={} invalid_count_report_bytes={} invalid_count_event_stream_sha256={} invalid_count_event_stream_bytes={}",
             self.source.sha256.to_hex(),
             self.source.bytes,
             self.manifest.sha256.to_hex(),
             self.manifest.bytes,
-            self.lock.sha256.to_hex(),
-            self.lock.bytes,
             self.pass.image.sha256.to_hex(),
             self.pass.image.bytes,
             self.pass.report.sha256.to_hex(),
@@ -195,7 +190,6 @@ fn installed_core_time_source_executes_under_enrolled_qemu() {
         create_private_directory(&workspace.join("src"));
         create_private_directory(&workspace.join("src/runtime"));
         write_new(&workspace.join("wrela.toml"), WORKSPACE_MANIFEST);
-        write_new(&workspace.join("wrela.lock"), WORKSPACE_LOCKFILE);
         write_new(
             &workspace.join("src/runtime/time_test.wr"),
             APPLICATION_SOURCE,
@@ -392,7 +386,6 @@ fn installed_core_time_source_executes_under_enrolled_qemu() {
     let evidence = StdlibTimeEvidence {
         source: file_evidence(APPLICATION_SOURCE),
         manifest: file_evidence(WORKSPACE_MANIFEST),
-        lock: file_evidence(WORKSPACE_LOCKFILE),
         pass: pass_evidence.expect("pass selector evidence"),
         invalid_count: invalid_count_evidence.expect("typed invalid-count selector evidence"),
     };
