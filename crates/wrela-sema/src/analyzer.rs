@@ -7513,81 +7513,103 @@ fn analyze_closed_enum_constructor(
             "construct the exact enum named by the surrounding type",
         ));
     }
-    let payload_ty = partial
+    // `None` marks a unit variant (no payload slot); `Some` carries the shared
+    // scalar payload type. A missing variant/enum is a real internal invariant.
+    let variant_payload_ty = partial
         .types
         .get(ty.0 as usize)
         .and_then(|record| match &record.kind {
             SemanticTypeKind::Enumeration { variants, .. } => variants
                 .get(resolved.variant as usize)
-                .and_then(|variant| variant.fields.first())
-                .map(|field| field.ty),
+                .map(|variant| variant.fields.first().map(|field| field.ty)),
             _ => None,
         })
         .ok_or_else(|| {
             AnalysisFailure::InternalInvariant(
-                "runtime enum constructor payload type is missing".to_owned(),
+                "runtime enum constructor variant is missing".to_owned(),
             )
         })?;
-    let [argument] = call.arguments else {
-        return Err(runtime_type_diagnostic(
-            request,
-            call.source,
-            "semantic-runtime-enum-constructor-argument",
-            "runtime enum constructor requires exactly one positional payload",
-            "R1 variants have one shared scalar payload slot",
-            "supply one positional scalar argument",
-        ));
+    let payload_effects = match variant_payload_ty {
+        None => {
+            // Unit variants resolve as *types* in this slice; constructing one
+            // (a fieldless leading-dot variant) routes through the DotName
+            // machinery, which a later slice extends. Fail closed cleanly here
+            // rather than emitting a constructor fact the DotName validator
+            // rejects.
+            return Err(runtime_type_diagnostic(
+                request,
+                call.source,
+                "semantic-runtime-enum-unit-construction-pending",
+                "constructing a unit enum variant is not yet supported at the runtime tier",
+                "this slice admits unit variants into type resolution; their construction is a later slice",
+                "construct a payload-carrying variant, or match on the value",
+            ));
+        }
+        Some(payload_ty) => {
+            // The callee sub-expression fact precedes the payload it applies to.
+            append_expression_fact(
+                request,
+                partial,
+                RuntimeExpressionFact {
+                    function,
+                    expression: call.callee,
+                    ty,
+                    result: None,
+                    resolution: ExpressionResolution::Constructor {
+                        ty,
+                        variant: Some(resolved.variant),
+                    },
+                    effects: EffectSet(0),
+                    ownership_before: OwnershipState::Owned,
+                    ownership_after: OwnershipState::Owned,
+                },
+            )?;
+            let [argument] = call.arguments else {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    call.source,
+                    "semantic-runtime-enum-constructor-argument",
+                    "runtime enum constructor requires exactly one positional payload",
+                    "R1 variants have one shared scalar payload slot",
+                    "supply one positional scalar argument",
+                ));
+            };
+            if argument.name.is_some() {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    argument.source,
+                    "semantic-runtime-enum-constructor-argument",
+                    "runtime enum constructor payload must be positional",
+                    "named payload arguments are not part of the canonical R1 representation",
+                    "remove the argument name",
+                ));
+            }
+            let wrela_hir::CallArgumentValue::Value(payload_expression) = argument.value else {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    argument.source,
+                    "semantic-runtime-enum-constructor-access",
+                    "runtime enum constructor payload uses value access",
+                    "borrow, mutate, and take markers do not initialize the owned payload slot",
+                    "remove the access marker",
+                ));
+            };
+            let payload = analyze_runtime_expression(
+                request,
+                partial,
+                function,
+                payload_expression,
+                RuntimeExpressionRequest {
+                    expected: Some(payload_ty),
+                    desired_result: None,
+                    access: AccessMode::Value,
+                },
+                state,
+                is_cancelled,
+            )?;
+            payload.effects
+        }
     };
-    if argument.name.is_some() {
-        return Err(runtime_type_diagnostic(
-            request,
-            argument.source,
-            "semantic-runtime-enum-constructor-argument",
-            "runtime enum constructor payload must be positional",
-            "named payload arguments are not part of the canonical R1 representation",
-            "remove the argument name",
-        ));
-    }
-    let wrela_hir::CallArgumentValue::Value(payload_expression) = argument.value else {
-        return Err(runtime_type_diagnostic(
-            request,
-            argument.source,
-            "semantic-runtime-enum-constructor-access",
-            "runtime enum constructor payload uses value access",
-            "borrow, mutate, and take markers do not initialize the owned payload slot",
-            "remove the access marker",
-        ));
-    };
-    append_expression_fact(
-        request,
-        partial,
-        RuntimeExpressionFact {
-            function,
-            expression: call.callee,
-            ty,
-            result: None,
-            resolution: ExpressionResolution::Constructor {
-                ty,
-                variant: Some(resolved.variant),
-            },
-            effects: EffectSet(0),
-            ownership_before: OwnershipState::Owned,
-            ownership_after: OwnershipState::Owned,
-        },
-    )?;
-    let payload = analyze_runtime_expression(
-        request,
-        partial,
-        function,
-        payload_expression,
-        RuntimeExpressionRequest {
-            expected: Some(payload_ty),
-            desired_result: None,
-            access: AccessMode::Value,
-        },
-        state,
-        is_cancelled,
-    )?;
     let result = expression_result(
         request,
         partial,
@@ -7609,7 +7631,7 @@ fn analyze_closed_enum_constructor(
                 ty,
                 variant: Some(resolved.variant),
             },
-            effects: payload.effects,
+            effects: payload_effects,
             ownership_before: OwnershipState::Owned,
             ownership_after: OwnershipState::Owned,
         },
@@ -7618,7 +7640,7 @@ fn analyze_closed_enum_constructor(
         ty,
         result: Some(result),
         referenced: None,
-        effects: payload.effects,
+        effects: payload_effects,
     })
 }
 
@@ -9040,15 +9062,33 @@ fn ensure_closed_scalar_enum_type(
     let mut shared_payload = None;
     for variant in &enumeration.variants {
         charge_runtime_aggregate_lookup(request, &mut *aggregate_work, is_cancelled)?;
-        let [field] = variant.fields.as_slice() else {
-            return Err(runtime_type_diagnostic(
-                request,
-                variant.source,
-                "semantic-runtime-enum-payload-shape",
-                "runtime enum variants require exactly one positional payload",
-                "zero, multiple, and named payload fields are outside this bounded revision slice",
-                "give every variant one positional scalar payload",
-            ));
+        let field = match variant.fields.as_slice() {
+            [] => {
+                // Unit variant: no payload slot. Admitting the zero-field shape
+                // lets mixed-arity enums such as the actor `AdmissionResult`
+                // (`Admitted | Rejected(..)`) resolve at the runtime tier;
+                // multiple-field and nominal payloads remain a later slice.
+                variants.push(SemanticVariant {
+                    name: copy_analysis_text(
+                        variant.name.as_str(),
+                        request.limits.fact_bytes,
+                        is_cancelled,
+                    )?,
+                    fields: Vec::new(),
+                });
+                continue;
+            }
+            [field] => field,
+            _ => {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    variant.source,
+                    "semantic-runtime-enum-payload-shape",
+                    "runtime enum variant admits at most one positional payload",
+                    "multiple positional payload fields are outside this bounded revision slice",
+                    "give the variant zero or one positional scalar payload",
+                ));
+            }
         };
         if field.name.is_some() {
             return Err(runtime_type_diagnostic(
@@ -9127,22 +9167,29 @@ fn ensure_closed_scalar_enum_type(
             }],
         });
     }
-    let payload = shared_payload.ok_or(AnalysisFailure::RequestMismatch)?;
-    let payload_record = partial
-        .types
-        .get(payload.0 as usize)
-        .ok_or(AnalysisFailure::RequestMismatch)?;
-    let alignment = payload_record.alignment_lower_bound.max(1);
-    let offset = (1_u64 + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
-    let size = offset
-        .checked_add(
-            payload_record
-                .size_upper_bound
-                .ok_or(AnalysisFailure::RequestMismatch)?,
-        )
-        .and_then(|size| size.checked_add(u64::from(alignment) - 1))
-        .map(|size| size & !(u64::from(alignment) - 1))
-        .ok_or_else(|| fact_resource(request, "runtime enum layout"))?;
+    // All-unit enums carry only the one-byte discriminant; enums with any
+    // scalar payload reserve one shared aligned payload slot after the tag.
+    let (size, alignment) = match shared_payload {
+        None => (1_u64, 1_u32),
+        Some(payload) => {
+            let payload_record = partial
+                .types
+                .get(payload.0 as usize)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            let alignment = payload_record.alignment_lower_bound.max(1);
+            let offset = (1_u64 + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
+            let size = offset
+                .checked_add(
+                    payload_record
+                        .size_upper_bound
+                        .ok_or(AnalysisFailure::RequestMismatch)?,
+                )
+                .and_then(|size| size.checked_add(u64::from(alignment) - 1))
+                .map(|size| size & !(u64::from(alignment) - 1))
+                .ok_or_else(|| fact_resource(request, "runtime enum layout"))?;
+            (size, alignment)
+        }
+    };
     if partial.types.len() >= request.limits.types as usize {
         return Err(fact_resource(request, "semantic types").into());
     }
@@ -23751,6 +23798,88 @@ fn projection_fixture():
         assert_eq!(
             output.diagnostics()[0].code.as_deref(),
             Some("semantic-dot-variant-unknown-variant")
+        );
+        assert!(output.has_errors());
+    }
+
+    // --- T0.1a: general nongeneric ADTs (mixed-arity variants) ---
+
+    #[test]
+    fn runtime_enum_admits_mixed_arity_unit_and_scalar_variants() {
+        // Before T0.1a, a zero-field variant made the whole enum unresolvable
+        // at the runtime tier (`semantic-runtime-enum-payload-shape`). A mixed
+        // enum (one unit variant, one scalar-payload variant) must now resolve.
+        let source = dot_variant_actor_source(
+            "pub enum Signal:\n    idle\n    active(u32)\n\nasync fn checkpoint():\n    state: Signal = .active(5)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("mixed-arity enum should analyze");
+        assert!(
+            output.diagnostics().is_empty(),
+            "a unit variant alongside a scalar-payload variant must resolve: {:?}",
+            output.diagnostics()
+        );
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn runtime_enum_all_unit_type_resolves_and_construction_fails_closed() {
+        // Annotating `selected: Mode` forces resolution of an all-unit enum,
+        // exercising the tag-only (`shared_payload == None`) layout branch;
+        // constructing the unit variant then fails closed cleanly (a later
+        // slice extends unit-variant construction through DotName).
+        let source = dot_variant_actor_source(
+            "pub enum Mode:\n    fast\n    slow\n\nasync fn checkpoint():\n    selected: Mode = .fast\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("all-unit enum construction is a structured source diagnostic");
+        assert!(
+            output
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_deref()
+                    == Some("semantic-runtime-enum-unit-construction-pending")),
+            "the all-unit enum type must resolve, then unit construction must fail closed: {:?}",
+            output.diagnostics()
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn runtime_enum_still_rejects_multiple_payload_fields() {
+        // Multiple positional payload fields remain a later slice: the fail
+        // closed boundary moves from "not exactly one" to "at most one".
+        let source = dot_variant_actor_source(
+            "pub enum Pair:\n    both(u32, u32)\n\nasync fn checkpoint():\n    state: Pair = .both(1, 2)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("multi-field variant is a structured source diagnostic");
+        assert!(
+            output
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_deref()
+                    == Some("semantic-runtime-enum-payload-shape")),
+            "a two-field variant must still fail closed: {:?}",
+            output.diagnostics()
         );
         assert!(output.has_errors());
     }

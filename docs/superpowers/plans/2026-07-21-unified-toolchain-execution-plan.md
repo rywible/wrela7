@@ -189,7 +189,8 @@ D2 need this scope substantially complete; B10 needs F5.
 | 1 | B5b wait-for graph + diagnostics | — | running |
 | 1 | B2a promotion/region report schema | — | running |
 | 1 | B4a cleanup DAG sema analysis | — | dispatching |
-| 0 | T0.1 general nongeneric ADTs | — | queued (start after B1a/B5b integrate) |
+| 0 | T0.1a unit variants in type resolution | — | verifying (mixed-arity + all-unit type resolve; construction/multi-field deferred, fail-closed) |
+| 0 | T0.1b unit-variant construction (DotName) + multi-field payloads | T0.1a | queued |
 | 0 | T0.2 ephemeral type kind | T0.1 | queued |
 | 0 | T0.3 generics/monomorphization (A6) | T0.1 | queued (multi-session) |
 | 2 | L2.1 place-level aggregate mutation | T0 | queued |
