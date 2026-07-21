@@ -46,6 +46,7 @@ id_type!(DeviceId);
 id_type!(PoolId);
 id_type!(RegionId);
 id_type!(ProjectionProtocolId);
+id_type!(LexicalViewId);
 id_type!(ScopeProtocolId);
 id_type!(BrandId);
 id_type!(ProofId);
@@ -114,6 +115,7 @@ pub struct AnalysisLimits {
     pub expression_facts: u32,
     pub statement_facts: u32,
     pub projection_protocols: u32,
+    pub lexical_views: u32,
     pub scope_protocols: u32,
     pub scope_activations: u32,
     pub image_nodes: u32,
@@ -154,6 +156,7 @@ impl AnalysisLimits {
             expression_facts: 64_000_000,
             statement_facts: 64_000_000,
             projection_protocols: 4_000_000,
+            lexical_views: 64_000_000,
             scope_protocols: 4_000_000,
             scope_activations: 16_000_000,
             image_nodes: 16_000_000,
@@ -189,6 +192,7 @@ impl AnalysisLimits {
             || self.expression_facts == 0
             || self.statement_facts == 0
             || self.projection_protocols == 0
+            || self.lexical_views == 0
             || self.scope_protocols == 0
             || self.scope_activations == 0
             || self.image_nodes == 0
@@ -643,6 +647,9 @@ pub enum ExpressionResolution {
     /// `with` statement. It is deliberately not represented by a synthetic
     /// [`FunctionInstance`]: scope phases have their own protocol contract.
     Scope(ScopeProtocolId),
+    /// A source `projection` declaration. Projections are callable only to
+    /// introduce a regionless lexical view; they are not synthetic functions.
+    Projection(ProjectionProtocolId),
     Constructor {
         ty: SemanticTypeId,
         variant: Option<u32>,
@@ -666,6 +673,13 @@ pub enum ExpressionResolution {
         /// Exact source-to-scope-parameter permutation, canonical by
         /// `parameter_index` just like an ordinary direct call.
         arguments: Vec<ResolvedCallArgument>,
+    },
+    /// One call to a projection protocol and the exact lexical view it
+    /// introduces. `arguments` remains canonical by `parameter_index`.
+    ProjectionCall {
+        protocol: ProjectionProtocolId,
+        arguments: Vec<ResolvedCallArgument>,
+        view: LexicalViewId,
     },
     /// A binary/comparison operator desugared to a direct call on a
     /// `core.ops` interface impl method (chapter 10 §12). `source_index` 0
@@ -806,6 +820,9 @@ pub struct StatementFact {
     pub initialized_after: Vec<ValueId>,
     pub moved_after: Vec<ValueId>,
     pub live_loans_after: Vec<Loan>,
+    /// Regionless projection views live immediately after this statement.
+    /// IDs are strictly increasing and every record belongs to `function`.
+    pub live_lexical_views_after: Vec<LexicalViewId>,
     pub proofs: Vec<ProofId>,
 }
 
@@ -845,6 +862,33 @@ pub struct ProjectionParameter {
     pub parameter: wrela_hir::ParameterId,
     pub access: AccessMode,
     pub ty: SemanticTypeId,
+}
+
+/// One activation of a projection protocol inside a source function. This is
+/// deliberately a lexical model: its sources are semantic values, not forged
+/// allocation regions or loans. Statement post-states carry the exact liveness
+/// snapshots consumed by escape and mutation checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LexicalView {
+    pub id: LexicalViewId,
+    pub function: FunctionInstanceId,
+    pub protocol: ProjectionProtocolId,
+    pub expression: ExpressionId,
+    pub initialization: StatementId,
+    pub binding: wrela_hir::LocalId,
+    pub value: ValueId,
+    /// Conservative provenance in the protocol's canonical provenance order.
+    pub sources: Vec<LexicalViewSource>,
+    /// Final local-reference uses on all admitted control-flow paths.
+    pub terminal_uses: Vec<ExpressionId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LexicalViewSource {
+    pub parameter: wrela_hir::ParameterId,
+    pub value: ValueId,
+    pub access: AccessMode,
+    pub argument_source: Span,
 }
 
 /// Fully resolved contract for one source `scope` declaration. Lowering uses
@@ -1130,6 +1174,7 @@ pub struct PartialAnalysis {
     pub expressions: Vec<ExpressionFact>,
     pub statements: Vec<StatementFact>,
     pub projection_protocols: Vec<ProjectionProtocol>,
+    pub lexical_views: Vec<LexicalView>,
     pub scope_protocols: Vec<ScopeProtocol>,
     pub scope_activations: Vec<ScopeActivation>,
     pub graph: Option<ImageGraph>,
@@ -1160,6 +1205,7 @@ impl PartialAnalysis {
             || !dense(self.functions.iter().map(|item| item.id.0))
             || !dense(self.values.iter().map(|item| item.id.0))
             || !dense(self.projection_protocols.iter().map(|item| item.id.0))
+            || !dense(self.lexical_views.iter().map(|item| item.id.0))
             || !dense(self.scope_protocols.iter().map(|item| item.id.0))
             || !dense(self.proofs.iter().map(|item| item.id.0))
             || !dense(self.baked_artifacts.iter().map(|item| item.id.0))
@@ -1306,6 +1352,8 @@ impl PartialAnalysis {
                 || fact
                     .region
                     .is_some_and(|region| region.0 as usize >= graph.regions.len())
+                || (!matches!(fact.resolution, ExpressionResolution::Error)
+                    && !valid_expression_region(fact, self, graph))
                 || !fact.effects.is_valid()
                 || !valid_proof_set(&fact.proofs, self.proofs.len())
                 || (!matches!(fact.resolution, ExpressionResolution::Error)
@@ -1327,6 +1375,13 @@ impl PartialAnalysis {
             if !valid_projection_protocol_prefix(protocol, self) {
                 return Err(invalid(
                     "partial projection protocol contains a dangling or inexact fact",
+                ));
+            }
+        }
+        for view in &self.lexical_views {
+            if !valid_lexical_view_prefix(view, self) {
+                return Err(invalid(
+                    "partial lexical view contains a dangling or inexact fact",
                 ));
             }
         }
@@ -1467,6 +1522,7 @@ impl PartialAnalysis {
             || !dense(self.functions.iter().map(|item| item.id.0))
             || !dense(self.values.iter().map(|item| item.id.0))
             || !dense(self.projection_protocols.iter().map(|item| item.id.0))
+            || !dense(self.lexical_views.iter().map(|item| item.id.0))
             || !dense(self.scope_protocols.iter().map(|item| item.id.0))
             || !dense(self.proofs.iter().map(|item| item.id.0))
             || !dense(self.baked_artifacts.iter().map(|item| item.id.0))
@@ -1592,6 +1648,13 @@ impl PartialAnalysis {
             if !valid_projection_protocol_record(protocol, self, hir.as_program()) {
                 return Err(invalid(
                     "projection protocol differs from exact HIR semantics",
+                ));
+            }
+        }
+        for view in &self.lexical_views {
+            if !valid_lexical_view_record(view, self, hir.as_program(), is_cancelled)? {
+                return Err(invalid(
+                    "lexical view differs from exact HIR projection semantics",
                 ));
             }
         }
@@ -1897,7 +1960,8 @@ fn validate_exact_source_facts(
                     .ok_or_else(|| invalid("taken expression value is invalid"))? = true;
             }
             if let ExpressionResolution::DirectCall { arguments, .. }
-            | ExpressionResolution::ScopeCall { arguments, .. } = &fact.resolution
+            | ExpressionResolution::ScopeCall { arguments, .. }
+            | ExpressionResolution::ProjectionCall { arguments, .. } = &fact.resolution
             {
                 for argument in arguments {
                     check_analysis_cancelled(is_cancelled)?;
@@ -2061,10 +2125,15 @@ fn validate_exact_expression_local_values(
                             };
                             let resolved = match &fact.resolution {
                                 ExpressionResolution::DirectCall { arguments, .. }
-                                | ExpressionResolution::ScopeCall { arguments, .. } => arguments
-                                    .iter()
-                                    .find(|binding| binding.source_index as usize == source_index)
-                                    .map(|binding| binding.value),
+                                | ExpressionResolution::ScopeCall { arguments, .. }
+                                | ExpressionResolution::ProjectionCall { arguments, .. } => {
+                                    arguments
+                                        .iter()
+                                        .find(|binding| {
+                                            binding.source_index as usize == source_index
+                                        })
+                                        .map(|binding| binding.value)
+                                }
                                 _ => None,
                             };
                             if resolved != Some(expected) {
@@ -3132,6 +3201,31 @@ fn validate_exact_expression_fact(
             }) => {}
         (
             wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(source)),
+            ExpressionResolution::Projection(protocol),
+            None,
+        ) if analysis
+            .projection_protocols
+            .get(protocol.0 as usize)
+            .is_some_and(|protocol| {
+                protocol.declaration == source.declaration
+                    && analysis.types.get(fact.ty.0 as usize).is_some_and(|ty| {
+                        matches!(
+                            &ty.kind,
+                            SemanticTypeKind::Function {
+                                color: wrela_hir::FunctionColor::Sync,
+                                parameters,
+                                result,
+                            } if parameters.len() == protocol.parameters.len()
+                                && parameters.iter().zip(&protocol.parameters).all(
+                                    |(actual, expected)| actual.access == expected.access
+                                        && actual.ty == expected.ty
+                                )
+                                && *result == protocol.target
+                        )
+                    })
+            }) => {}
+        (
+            wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(source)),
             ExpressionResolution::Constructor { ty, variant: None },
             None,
         ) if *ty == fact.ty
@@ -3274,6 +3368,26 @@ fn validate_exact_expression_fact(
             arguments,
             *protocol,
             bindings,
+        ) => {}
+        (
+            wrela_hir::ExpressionKind::Call { callee, arguments },
+            ExpressionResolution::ProjectionCall {
+                protocol,
+                arguments: bindings,
+                view,
+            },
+            Some(result),
+        ) if exact_projection_call_bindings_match(
+            analysis,
+            program,
+            function.id,
+            fact,
+            *callee,
+            arguments,
+            *protocol,
+            bindings,
+            *view,
+            result,
         ) => {}
         (
             wrela_hir::ExpressionKind::Call { callee, arguments },
@@ -5173,6 +5287,28 @@ fn exact_call_bindings_match(
         })
 }
 
+fn exact_call_argument_access(argument: &wrela_hir::CallArgument, access: AccessMode) -> bool {
+    matches!(
+        (&argument.value, access),
+        (
+            wrela_hir::CallArgumentValue::Value(_),
+            AccessMode::Value | AccessMode::Read
+        ) | (
+            wrela_hir::CallArgumentValue::Exclusive {
+                access: wrela_hir::ExclusiveAccess::Mutate,
+                ..
+            },
+            AccessMode::Mutate,
+        ) | (
+            wrela_hir::CallArgumentValue::Exclusive {
+                access: wrela_hir::ExclusiveAccess::Take,
+                ..
+            },
+            AccessMode::Take,
+        )
+    )
+}
+
 fn exact_scope_call_bindings_match(
     analysis: &PartialAnalysis,
     program: &wrela_hir::Program,
@@ -5263,6 +5399,99 @@ fn exact_scope_call_bindings_match(
                     .get(binding.value.0 as usize)
                     .is_some_and(|value| value.function == caller && value.ty == parameter.ty)
         })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_projection_call_bindings_match(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    caller: FunctionInstanceId,
+    fact: &ExpressionFact,
+    callee_expression: ExpressionId,
+    source_arguments: &[wrela_hir::CallArgument],
+    protocol: ProjectionProtocolId,
+    bindings: &[ResolvedCallArgument],
+    view: LexicalViewId,
+    result: ValueId,
+) -> bool {
+    let Some(protocol_record) = analysis.projection_protocols.get(protocol.0 as usize) else {
+        return false;
+    };
+    let Some(wrela_hir::DeclarationKind::Projection(source_projection)) = program
+        .declaration(protocol_record.declaration)
+        .map(|declaration| &declaration.kind)
+    else {
+        return false;
+    };
+    let callee_matches =
+        exact_child_expression(analysis, caller, callee_expression).is_some_and(|callee| {
+            callee.result.is_none()
+                && callee.resolution == ExpressionResolution::Projection(protocol)
+        });
+    let expected_category = if protocol_record.mutable {
+        ValueCategory::MutableView
+    } else {
+        ValueCategory::SharedView
+    };
+    if !callee_matches
+        || fact.ty != protocol_record.target
+        || fact.category != expected_category
+        || fact.region.is_some()
+        || bindings.len() != source_arguments.len()
+        || bindings.len() != source_projection.parameters.len()
+        || bindings.len() != protocol_record.parameters.len()
+    {
+        return false;
+    }
+    let bindings_match = bindings
+        .iter()
+        .zip(&protocol_record.parameters)
+        .enumerate()
+        .all(|(parameter_index, (binding, parameter))| {
+            let Some(source) = source_arguments.get(binding.source_index as usize) else {
+                return false;
+            };
+            let Some(parameter_id) = source_projection.parameters.get(parameter_index) else {
+                return false;
+            };
+            let Some(hir_parameter) = program.parameters.get(parameter_id.0 as usize) else {
+                return false;
+            };
+            let name_matches = match &source.name {
+                Some(name) => hir_parameter.name.as_ref() == Some(name),
+                None => binding.source_index as usize == parameter_index,
+            };
+            binding.parameter_index as usize == parameter_index
+                && binding.access == parameter.access
+                && name_matches
+                && matches!(
+                    (&source.value, binding.access),
+                    (
+                        wrela_hir::CallArgumentValue::Value(_),
+                        AccessMode::Value | AccessMode::Read
+                    ) | (
+                        wrela_hir::CallArgumentValue::Exclusive {
+                            access: wrela_hir::ExclusiveAccess::Mutate,
+                            ..
+                        },
+                        AccessMode::Mutate,
+                    )
+                )
+                && analysis
+                    .values
+                    .get(binding.value.0 as usize)
+                    .is_some_and(|value| value.function == caller && value.ty == parameter.ty)
+        });
+    bindings_match
+        && analysis
+            .lexical_views
+            .get(view.0 as usize)
+            .is_some_and(|record| {
+                record.function == caller
+                    && record.protocol == protocol
+                    && record.expression == fact.expression
+                    && record.value == result
+            })
 }
 
 fn exact_actor_method_reference_matches(
@@ -6073,7 +6302,7 @@ fn valid_expression_fact(
     (fact.function.0 as usize) < analysis.functions.len()
         && fact.expression.0 < analysis.hir.expressions
         && (fact.ty.0 as usize) < analysis.types.len()
-        && valid_expression_region(fact, graph)
+        && valid_expression_region(fact, analysis, graph)
         && fact.effects.is_valid()
         && valid_proof_set(&fact.proofs, analysis.proofs.len())
         && result_valid
@@ -6102,6 +6331,9 @@ fn valid_expression_resolution(
         ExpressionResolution::Function(target) => function_id(*target),
         ExpressionResolution::Scope(protocol) => {
             (protocol.0 as usize) < analysis.scope_protocols.len()
+        }
+        ExpressionResolution::Projection(protocol) => {
+            (protocol.0 as usize) < analysis.projection_protocols.len()
         }
         ExpressionResolution::Constructor { ty, variant } => analysis
             .types
@@ -6168,6 +6400,29 @@ fn valid_expression_resolution(
                                 && value_id(actual.value)
                         },
                     )
+            }),
+        ExpressionResolution::ProjectionCall {
+            protocol,
+            arguments,
+            view,
+        } => analysis
+            .projection_protocols
+            .get(protocol.0 as usize)
+            .is_some_and(|protocol| {
+                arguments.len() == protocol.parameters.len()
+                    && arguments.iter().zip(&protocol.parameters).enumerate().all(
+                        |(parameter_index, (actual, expected))| {
+                            usize::try_from(actual.parameter_index) == Ok(parameter_index)
+                                && actual.access == expected.access
+                                && value_id(actual.value)
+                        },
+                    )
+                    && analysis
+                        .lexical_views
+                        .get(view.0 as usize)
+                        .is_some_and(|record| {
+                            record.function == function && record.protocol == protocol.id
+                        })
             }),
         ExpressionResolution::OperatorCall {
             function: target,
@@ -6296,6 +6551,428 @@ fn valid_projection_protocol_prefix(
             .is_some_and(|proof| {
                 proof.kind == ProofKind::ViewDoesNotEscape && proof.bound == Some(1)
             })
+}
+
+fn valid_lexical_view_prefix(view: &LexicalView, analysis: &PartialAnalysis) -> bool {
+    let Some(protocol) = analysis
+        .projection_protocols
+        .get(view.protocol.0 as usize)
+        .filter(|protocol| protocol.id == view.protocol)
+    else {
+        return false;
+    };
+    let expected_category = if protocol.mutable {
+        ValueCategory::MutableView
+    } else {
+        ValueCategory::SharedView
+    };
+    let value_matches = analysis
+        .values
+        .get(view.value.0 as usize)
+        .is_some_and(|value| {
+            value.function == view.function
+                && value.ty == protocol.target
+                && value.category == expected_category
+                && value.origin == SemanticValueOrigin::Local(view.binding)
+        });
+    let initialization_matches = analysis
+        .statements
+        .binary_search_by_key(&(view.function, view.initialization), |fact| {
+            (fact.function, fact.statement)
+        })
+        .ok()
+        .and_then(|index| analysis.statements.get(index))
+        .is_some_and(|statement| {
+            statement.definitions.as_slice()
+                == [LocalDefinition {
+                    local: view.binding,
+                    value: view.value,
+                }]
+                && statement
+                    .live_lexical_views_after
+                    .binary_search(&view.id)
+                    .is_ok()
+        });
+    let Some(expression) = analysis
+        .expressions
+        .binary_search_by_key(&(view.function, view.expression), |fact| {
+            (fact.function, fact.expression)
+        })
+        .ok()
+        .and_then(|index| analysis.expressions.get(index))
+    else {
+        return false;
+    };
+    let ExpressionResolution::ProjectionCall {
+        protocol: call_protocol,
+        arguments,
+        view: call_view,
+    } = &expression.resolution
+    else {
+        return false;
+    };
+    let sources_match = view.sources.len() == protocol.provenance.len()
+        && view
+            .sources
+            .iter()
+            .zip(&protocol.provenance)
+            .all(|(source, parameter)| {
+                source.parameter == *parameter
+                    && protocol
+                        .parameters
+                        .iter()
+                        .position(|candidate| candidate.parameter == *parameter)
+                        .and_then(|index| arguments.get(index))
+                        .is_some_and(|argument| {
+                            argument.value == source.value
+                                && argument.access == source.access
+                                && protocol
+                                    .parameters
+                                    .iter()
+                                    .find(|candidate| candidate.parameter == *parameter)
+                                    .is_some_and(|parameter| {
+                                        analysis.values.get(source.value.0 as usize).is_some_and(
+                                            |value| {
+                                                value.function == view.function
+                                                    && value.ty == parameter.ty
+                                            },
+                                        )
+                                    })
+                        })
+                    && valid_span(source.argument_source, analysis.hir.files)
+            });
+    let terminal_uses_match = strict_ids(&view.terminal_uses)
+        && view.terminal_uses.iter().all(|terminal| {
+            analysis
+                .expressions
+                .binary_search_by_key(&(view.function, *terminal), |fact| {
+                    (fact.function, fact.expression)
+                })
+                .ok()
+                .and_then(|index| analysis.expressions.get(index))
+                .is_some_and(|fact| {
+                    fact.ty == protocol.target
+                        && fact.category == expected_category
+                        && fact.region.is_none()
+                        && fact.resolution == ExpressionResolution::Value(view.value)
+                })
+        });
+    (view.function.0 as usize) < analysis.functions.len()
+        && view.expression.0 < analysis.hir.expressions
+        && view.initialization.0 < analysis.hir.statements
+        && view.binding.0 < analysis.hir.locals
+        && value_matches
+        && initialization_matches
+        && expression.result == Some(view.value)
+        && expression.ty == protocol.target
+        && expression.category == expected_category
+        && expression.region.is_none()
+        && *call_protocol == view.protocol
+        && *call_view == view.id
+        && sources_match
+        && terminal_uses_match
+}
+
+fn valid_lexical_view_record(
+    view: &LexicalView,
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, AnalysisFailure> {
+    check_analysis_cancelled(is_cancelled)?;
+    if !valid_lexical_view_prefix(view, analysis) {
+        return Ok(false);
+    }
+    let Some(expression) = program.expression(view.expression) else {
+        return Ok(false);
+    };
+    let wrela_hir::ExpressionKind::Call { callee, arguments } = &expression.kind else {
+        return Ok(false);
+    };
+    let Some(statement) = program.statement(view.initialization) else {
+        return Ok(false);
+    };
+    if !matches!(
+        statement.kind,
+        wrela_hir::StatementKind::Initialize { local, value }
+            if local == view.binding && value == view.expression
+    ) || program
+        .locals
+        .get(view.binding.0 as usize)
+        .is_none_or(|local| local.id != view.binding || local.body != statement.body)
+    {
+        return Ok(false);
+    }
+    let Some(fact) = exact_child_expression(analysis, view.function, view.expression) else {
+        return Ok(false);
+    };
+    let ExpressionResolution::ProjectionCall {
+        protocol,
+        arguments: bindings,
+        view: call_view,
+    } = &fact.resolution
+    else {
+        return Ok(false);
+    };
+    let call_matches = exact_projection_call_bindings_match(
+        analysis,
+        program,
+        view.function,
+        fact,
+        *callee,
+        arguments,
+        *protocol,
+        bindings,
+        *call_view,
+        view.value,
+    );
+    let sources_match = analysis
+        .projection_protocols
+        .get(protocol.0 as usize)
+        .is_some_and(|protocol| {
+            view.sources.iter().all(|source| {
+                protocol
+                    .parameters
+                    .iter()
+                    .position(|parameter| parameter.parameter == source.parameter)
+                    .and_then(|index| bindings.get(index))
+                    .and_then(|binding| arguments.get(binding.source_index as usize))
+                    .is_some_and(|argument| {
+                        argument.source == source.argument_source
+                            && exact_call_argument_access(argument, source.access)
+                    })
+            })
+        });
+    let mut terminal_uses_match = true;
+    for terminal in &view.terminal_uses {
+        check_analysis_cancelled(is_cancelled)?;
+        let Some(expression) = program.expression(*terminal) else {
+            return Ok(false);
+        };
+        if expression.kind
+            != wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(view.binding))
+            || expression.source.file != statement.source.file
+            || expression.source.range.start < statement.source.range.start
+        {
+            return Ok(false);
+        }
+        let mut containing = None;
+        let mut containing_width = None;
+        for fact in analysis
+            .statements
+            .iter()
+            .filter(|fact| fact.function == view.function)
+        {
+            check_analysis_cancelled(is_cancelled)?;
+            let Some(candidate) = program.statement(fact.statement) else {
+                return Ok(false);
+            };
+            if candidate.source.file == expression.source.file
+                && candidate.source.range.start <= expression.source.range.start
+                && expression.source.range.end <= candidate.source.range.end
+            {
+                let width = candidate.source.range.end - candidate.source.range.start;
+                if containing_width.is_none_or(|current| width < current) {
+                    containing = Some(fact);
+                    containing_width = Some(width);
+                }
+            }
+        }
+        terminal_uses_match &= containing.is_some_and(|fact| {
+            fact.live_lexical_views_after
+                .binary_search(&view.id)
+                .is_err()
+        });
+    }
+    let mut reference_count = 0_u32;
+    let mut exact_terminal = None;
+    for expression in &program.expressions {
+        check_analysis_cancelled(is_cancelled)?;
+        if expression.kind
+            == wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(view.binding))
+            && expression.source.file == statement.source.file
+            && expression.source.range.start > statement.source.range.end
+        {
+            reference_count =
+                reference_count
+                    .checked_add(1)
+                    .ok_or(AnalysisFailure::ResourceLimit {
+                        resource: "lexical view reference validation",
+                        limit: u64::from(u32::MAX),
+                    })?;
+            exact_terminal = Some(expression.id);
+        }
+    }
+    let exact_terminal_use = reference_count == 1
+        && exact_terminal.is_some_and(|terminal| view.terminal_uses.as_slice() == [terminal]);
+    let Some(terminal) = exact_terminal.and_then(|terminal| program.expression(terminal)) else {
+        return Ok(false);
+    };
+    let mut unary_consumers = 0_u32;
+    for candidate in &program.expressions {
+        check_analysis_cancelled(is_cancelled)?;
+        if let wrela_hir::ExpressionKind::Call { arguments, .. } = &candidate.kind
+            && matches!(
+                arguments.as_slice(),
+                [argument]
+                    if matches!(argument.value, wrela_hir::CallArgumentValue::Value(value) if value == terminal.id)
+            )
+        {
+            unary_consumers =
+                unary_consumers
+                    .checked_add(1)
+                    .ok_or(AnalysisFailure::ResourceLimit {
+                        resource: "lexical view terminal-consumer validation",
+                        limit: u64::from(u32::MAX),
+                    })?;
+        }
+    }
+    if unary_consumers != 1
+        || !matches!(
+            terminal.owner,
+            wrela_hir::ExpressionOwner::Body(body) if body == statement.body
+        )
+    {
+        return Ok(false);
+    }
+    let Some(body) = program.body(statement.body) else {
+        return Ok(false);
+    };
+    let mut initialization_index = None;
+    let mut terminal_index = None;
+    for (index, statement_id) in body.statements.iter().enumerate() {
+        check_analysis_cancelled(is_cancelled)?;
+        if *statement_id == view.initialization {
+            initialization_index = Some(index);
+        }
+        let Some(candidate) = program.statement(*statement_id) else {
+            return Ok(false);
+        };
+        if candidate.source.file == terminal.source.file
+            && candidate.source.range.start <= terminal.source.range.start
+            && terminal.source.range.end <= candidate.source.range.end
+        {
+            terminal_index = Some(index);
+        }
+    }
+    let (Some(initialization_index), Some(terminal_index)) = (initialization_index, terminal_index)
+    else {
+        return Ok(false);
+    };
+    if terminal_index <= initialization_index {
+        return Ok(false);
+    }
+    for statement_id in &body.statements[initialization_index + 1..=terminal_index] {
+        check_analysis_cancelled(is_cancelled)?;
+        let Some(candidate) = program.statement(*statement_id) else {
+            return Ok(false);
+        };
+        if matches!(
+            candidate.kind,
+            wrela_hir::StatementKind::If { .. }
+                | wrela_hir::StatementKind::For { .. }
+                | wrela_hir::StatementKind::While { .. }
+                | wrela_hir::StatementKind::Loop { .. }
+                | wrela_hir::StatementKind::Match { .. }
+                | wrela_hir::StatementKind::With { .. }
+                | wrela_hir::StatementKind::Return(_)
+                | wrela_hir::StatementKind::Break
+                | wrela_hir::StatementKind::Continue
+        ) {
+            return Ok(false);
+        }
+        if let wrela_hir::StatementKind::Assign { targets, .. } = &candidate.kind {
+            let rebinds_retained = targets.iter().any(|target| {
+                target.source.range.start < terminal.source.range.start
+                    && target.projections.is_empty()
+                    && match target.root {
+                        wrela_hir::Definition::Local(local) if local == view.binding => true,
+                        wrela_hir::Definition::Local(local) => view.sources.iter().any(|source| {
+                            analysis
+                                .values
+                                .get(source.value.0 as usize)
+                                .is_some_and(|value| {
+                                    value.origin == SemanticValueOrigin::Local(local)
+                                })
+                        }),
+                        _ => false,
+                    }
+            });
+            if rebinds_retained {
+                return Ok(false);
+            }
+        }
+    }
+    for candidate in &program.expressions {
+        check_analysis_cancelled(is_cancelled)?;
+        if candidate.source.file != statement.source.file
+            || candidate.source.range.start <= statement.source.range.end
+            || candidate.source.range.start >= terminal.source.range.start
+        {
+            continue;
+        }
+        if matches!(
+            candidate.kind,
+            wrela_hir::ExpressionKind::Unary {
+                operator: wrela_hir::UnaryOperator::Await,
+                ..
+            }
+        ) {
+            return Ok(false);
+        }
+        let wrela_hir::ExpressionKind::Call { arguments, .. } = &candidate.kind else {
+            continue;
+        };
+        for argument in arguments {
+            check_analysis_cancelled(is_cancelled)?;
+            let wrela_hir::CallArgumentValue::Exclusive { place, .. } = &argument.value else {
+                continue;
+            };
+            let mutates_retained = view.sources.iter().any(|source| {
+                analysis
+                    .values
+                    .get(source.value.0 as usize)
+                    .is_some_and(|value| match (value.origin, &place.root) {
+                        (
+                            SemanticValueOrigin::Local(expected),
+                            wrela_hir::Definition::Local(actual),
+                        ) => expected == *actual,
+                        (
+                            SemanticValueOrigin::Parameter(expected),
+                            wrela_hir::Definition::Parameter(actual),
+                        ) => expected == *actual,
+                        _ => false,
+                    })
+            });
+            if mutates_retained {
+                return Ok(false);
+            }
+        }
+    }
+    let mut liveness_is_contiguous = true;
+    for fact in analysis
+        .statements
+        .iter()
+        .filter(|fact| fact.function == view.function)
+    {
+        check_analysis_cancelled(is_cancelled)?;
+        let Some(candidate) = program.statement(fact.statement) else {
+            return Ok(false);
+        };
+        let expected_live = candidate.source.file == statement.source.file
+            && candidate.source.range.start >= statement.source.range.start
+            && candidate.source.range.end < terminal.source.range.end;
+        liveness_is_contiguous &= fact
+            .live_lexical_views_after
+            .binary_search(&view.id)
+            .is_ok()
+            == expected_live;
+    }
+    Ok(call_matches
+        && sources_match
+        && terminal_uses_match
+        && exact_terminal_use
+        && liveness_is_contiguous)
 }
 
 fn valid_scope_protocol_record(
@@ -6518,12 +7195,18 @@ fn valid_result_try_resolution(
         && value_matches(propagated, result_type)
 }
 
-fn valid_expression_region(fact: &ExpressionFact, graph: &ImageGraph) -> bool {
+fn valid_expression_region(
+    fact: &ExpressionFact,
+    analysis: &PartialAnalysis,
+    graph: &ImageGraph,
+) -> bool {
     let resolves = |region: RegionId| (region.0 as usize) < graph.regions.len();
     match fact.category {
-        ValueCategory::Place | ValueCategory::SharedView | ValueCategory::MutableView => {
-            fact.region.is_some_and(resolves)
-        }
+        ValueCategory::Place => fact.region.is_some_and(resolves),
+        ValueCategory::SharedView | ValueCategory::MutableView => match fact.region {
+            Some(region) => resolves(region),
+            None => exact_regionless_lexical_view_witness(fact, analysis),
+        },
         ValueCategory::Value | ValueCategory::TypeValue => match &fact.resolution {
             ExpressionResolution::Field { .. } => fact.region.is_none(),
             ExpressionResolution::Index { .. } => fact.region.is_some_and(resolves),
@@ -6538,10 +7221,12 @@ fn valid_expression_region(fact: &ExpressionFact, graph: &ImageGraph) -> bool {
             | ExpressionResolution::Value(_)
             | ExpressionResolution::Function(_)
             | ExpressionResolution::Scope(_)
+            | ExpressionResolution::Projection(_)
             | ExpressionResolution::Constructor { .. }
             | ExpressionResolution::ResultTry { .. }
             | ExpressionResolution::DirectCall { .. }
             | ExpressionResolution::ScopeCall { .. }
+            | ExpressionResolution::ProjectionCall { .. }
             | ExpressionResolution::OperatorCall { .. }
             | ExpressionResolution::ActorRequest { .. }
             | ExpressionResolution::Closure { .. }
@@ -6549,6 +7234,53 @@ fn valid_expression_region(fact: &ExpressionFact, graph: &ImageGraph) -> bool {
         },
         ValueCategory::Error => false,
     }
+}
+
+fn exact_regionless_lexical_view_witness(
+    fact: &ExpressionFact,
+    analysis: &PartialAnalysis,
+) -> bool {
+    let expected_mutable = match fact.category {
+        ValueCategory::SharedView => false,
+        ValueCategory::MutableView => true,
+        _ => return false,
+    };
+    let (view, value) = match &fact.resolution {
+        ExpressionResolution::ProjectionCall { view, .. } => (*view, fact.result),
+        ExpressionResolution::Value(value) => {
+            let Some(view) = analysis.lexical_views.iter().find(|view| {
+                view.function == fact.function
+                    && view.value == *value
+                    && analysis
+                        .projection_protocols
+                        .get(view.protocol.0 as usize)
+                        .is_some_and(|protocol| {
+                            protocol.mutable == expected_mutable && protocol.target == fact.ty
+                        })
+            }) else {
+                return false;
+            };
+            (view.id, Some(*value))
+        }
+        _ => return false,
+    };
+    let Some(value) = value else {
+        return false;
+    };
+    analysis
+        .lexical_views
+        .get(view.0 as usize)
+        .is_some_and(|record| {
+            record.id == view
+                && record.function == fact.function
+                && record.value == value
+                && analysis
+                    .projection_protocols
+                    .get(record.protocol.0 as usize)
+                    .is_some_and(|protocol| {
+                        protocol.mutable == expected_mutable && protocol.target == fact.ty
+                    })
+        })
 }
 
 fn valid_intrinsic(
@@ -6657,6 +7389,18 @@ fn valid_statement_fact(
             .all(|value| fact.moved_after.binary_search(value).is_err())
         && fact.initialized_after.iter().copied().all(value)
         && fact.moved_after.iter().copied().all(value)
+        && strict_ids(&fact.live_lexical_views_after)
+        && fact.live_lexical_views_after.iter().all(|view| {
+            analysis
+                .lexical_views
+                .get(view.0 as usize)
+                .is_some_and(|view| {
+                    view.function == fact.function
+                        && fact.initialized_after.binary_search(&view.value).is_ok()
+                        && fact.moved_after.binary_search(&view.value).is_err()
+                        && valid_lexical_view_prefix(view, analysis)
+                })
+        })
         && valid_proof_set(&fact.proofs, analysis.proofs.len())
         && {
             let mut seen = std::collections::HashSet::new();
@@ -7086,6 +7830,11 @@ fn validate_analysis_top_level_counts(
             "projection protocols",
             partial.projection_protocols.len(),
             limits.projection_protocols,
+        ),
+        (
+            "lexical views",
+            partial.lexical_views.len(),
+            limits.lexical_views,
         ),
         (
             "scope protocols",
@@ -7950,12 +8699,14 @@ fn validate_fact_resources(
             }
             ExpressionResolution::DirectCall { arguments, .. }
             | ExpressionResolution::ScopeCall { arguments, .. }
+            | ExpressionResolution::ProjectionCall { arguments, .. }
             | ExpressionResolution::OperatorCall { arguments, .. } => meter.edges(arguments),
             ExpressionResolution::Closure { captures, .. } => meter.edges(captures),
             ExpressionResolution::Error
             | ExpressionResolution::Value(_)
             | ExpressionResolution::Function(_)
             | ExpressionResolution::Scope(_)
+            | ExpressionResolution::Projection(_)
             | ExpressionResolution::Constructor { .. }
             | ExpressionResolution::ResultTry { .. }
             | ExpressionResolution::ActorRequest { .. }
@@ -7971,6 +8722,7 @@ fn validate_fact_resources(
         meter.edges(&fact.initialized_after);
         meter.edges(&fact.moved_after);
         meter.edges(&fact.live_loans_after);
+        meter.edges(&fact.live_lexical_views_after);
         meter.edges(&fact.proofs);
         meter.enforce(limits)?;
     }
@@ -7979,6 +8731,12 @@ fn validate_fact_resources(
         meter.text(&protocol.name);
         meter.edges(&protocol.parameters);
         meter.edges(&protocol.provenance);
+        meter.enforce(limits)?;
+    }
+    for view in &partial.lexical_views {
+        check_analysis_cancelled(is_cancelled)?;
+        meter.edges(&view.sources);
+        meter.edges(&view.terminal_uses);
         meter.enforce(limits)?;
     }
     for protocol in &partial.scope_protocols {
@@ -8444,6 +9202,13 @@ mod contract_tests {
             .expect("standard limits");
         let mut limits = AnalysisLimits::standard();
         limits.types = 0;
+        assert!(matches!(
+            limits.validate(),
+            Err(AnalysisFailure::InvalidLimits)
+        ));
+
+        let mut limits = AnalysisLimits::standard();
+        limits.lexical_views = 0;
         assert!(matches!(
             limits.validate(),
             Err(AnalysisFailure::InvalidLimits)

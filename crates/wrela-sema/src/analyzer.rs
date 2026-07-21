@@ -1164,6 +1164,7 @@ fn empty_partial(
         expressions: Vec::new(),
         statements: Vec::new(),
         projection_protocols: Vec::new(),
+        lexical_views: Vec::new(),
         scope_protocols: Vec::new(),
         scope_activations: Vec::new(),
         graph: None,
@@ -4106,6 +4107,7 @@ struct RuntimeCheckpoint {
     statements: usize,
     proofs: usize,
     projection_protocols: usize,
+    lexical_views: usize,
     scope_protocols: usize,
     scope_activations: usize,
 }
@@ -4120,6 +4122,7 @@ impl RuntimeCheckpoint {
             statements: partial.statements.len(),
             proofs: partial.proofs.len(),
             projection_protocols: partial.projection_protocols.len(),
+            lexical_views: partial.lexical_views.len(),
             scope_protocols: partial.scope_protocols.len(),
             scope_activations: partial.scope_activations.len(),
         }
@@ -4135,6 +4138,7 @@ impl RuntimeCheckpoint {
         partial
             .projection_protocols
             .truncate(self.projection_protocols);
+        partial.lexical_views.truncate(self.lexical_views);
         partial.scope_protocols.truncate(self.scope_protocols);
         partial.scope_activations.truncate(self.scope_activations);
     }
@@ -4630,21 +4634,72 @@ fn analyze_runtime_body(
                     .get(local.0 as usize)
                     .filter(|record| record.id == *local && record.body == body_id)
                     .ok_or(AnalysisFailure::RequestMismatch)?;
-                let ty = semantic_type_from_source(
-                    request,
-                    partial,
-                    local_record
-                        .ty
-                        .as_ref()
-                        .ok_or(AnalysisFailure::RequestMismatch)?,
-                    &mut *aggregate_work,
-                    is_cancelled,
-                )?;
-                let value_id = append_semantic_value(
+                let local_ty = local_record
+                    .ty
+                    .as_ref()
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                if matches!(local_ty.kind, TypeExpressionKind::View { .. })
+                    && !request
+                        .hir
+                        .as_program()
+                        .expression(*value)
+                        .and_then(|expression| match &expression.kind {
+                            ExpressionKind::Call { callee, .. } => {
+                                request.hir.as_program().expression(*callee)
+                            }
+                            _ => None,
+                        })
+                        .and_then(|callee| match &callee.kind {
+                            ExpressionKind::Reference(Definition::Declaration(resolved)) => {
+                                request.hir.as_program().declaration(resolved.declaration)
+                            }
+                            _ => None,
+                        })
+                        .is_some_and(|declaration| {
+                            matches!(declaration.kind, DeclarationKind::Projection(_))
+                        })
+                {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        local_ty.source,
+                        "semantic-view-escape",
+                        "borrowed view cannot escape into ordinary runtime value state",
+                        "a lexical view local must be introduced directly by an authenticated projection call",
+                        "bind a free projection call directly or use an owned value type",
+                    ));
+                }
+                let (ty, category) = match &local_ty.kind {
+                    TypeExpressionKind::View { mutable, target } => (
+                        semantic_type_from_source(
+                            request,
+                            partial,
+                            target,
+                            &mut *aggregate_work,
+                            is_cancelled,
+                        )?,
+                        if *mutable {
+                            ValueCategory::MutableView
+                        } else {
+                            ValueCategory::SharedView
+                        },
+                    ),
+                    _ => (
+                        semantic_type_from_source(
+                            request,
+                            partial,
+                            local_ty,
+                            &mut *aggregate_work,
+                            is_cancelled,
+                        )?,
+                        ValueCategory::Value,
+                    ),
+                };
+                let value_id = append_semantic_value_with_category(
                     request,
                     partial,
                     function,
                     ty,
+                    category,
                     (
                         SemanticValueOrigin::Local(*local),
                         Some(local_record.source),
@@ -4660,7 +4715,11 @@ fn analyze_runtime_body(
                     RuntimeExpressionRequest {
                         expected: Some(ty),
                         desired_result: Some(value_id),
-                        access: AccessMode::Value,
+                        access: if category == ValueCategory::Value {
+                            AccessMode::Value
+                        } else {
+                            AccessMode::Read
+                        },
                     },
                     &mut RuntimeState {
                         locals: &mut *locals,
@@ -4672,6 +4731,23 @@ fn analyze_runtime_body(
                     is_cancelled,
                 )?;
                 statement_effects = outcome.effects;
+                if matches!(
+                    category,
+                    ValueCategory::SharedView | ValueCategory::MutableView
+                ) {
+                    record_lexical_view_initialization(
+                        request,
+                        partial,
+                        function,
+                        statement_id,
+                        *local,
+                        *value,
+                        value_id,
+                        category,
+                        &mut *aggregate_work,
+                        is_cancelled,
+                    )?;
+                }
                 let slot = locals.get_mut(local.0 as usize).ok_or_else(|| {
                     AnalysisFailure::InternalInvariant(
                         "runtime initializer local slot is missing".to_owned(),
@@ -4750,6 +4826,15 @@ fn analyze_runtime_body(
                             "initialize the local before the conditional",
                         )
                     })?;
+                reject_live_lexical_rebind(
+                    request,
+                    partial,
+                    function,
+                    current.value,
+                    local,
+                    target.source,
+                    is_cancelled,
+                )?;
                 if current.state != OwnershipState::Owned
                     || current.authority != RuntimeAuthority::Own
                 {
@@ -7737,6 +7822,61 @@ fn analyze_await_expression(
             .push("make the enclosing function async or remove the await".to_owned());
         return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
     }
+    for view in &partial.lexical_views {
+        check_cancelled(is_cancelled)?;
+        if view.function != function {
+            continue;
+        }
+        let initialization = request
+            .hir
+            .as_program()
+            .statement(view.initialization)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let terminal = view
+            .terminal_uses
+            .last()
+            .and_then(|terminal| request.hir.as_program().expression(*terminal))
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if initialization.source.file == await_expression.source.file
+            && initialization.source.range.end <= await_expression.source.range.start
+            && await_expression.source.range.end <= terminal.source.range.start
+        {
+            let protocol = partial
+                .projection_protocols
+                .get(view.protocol.0 as usize)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            let mut diagnostic = Diagnostic::error(
+                Category::OWNERSHIP,
+                await_expression.source,
+                format!(
+                    "lexical view from projection `{}` remains live across await",
+                    protocol.name
+                ),
+            );
+            diagnostic.code = Some("semantic-view-across-await".to_owned());
+            diagnostic
+                .labels
+                .try_reserve_exact(2)
+                .map_err(|_| fact_resource(request, "view across await diagnostic labels"))?;
+            diagnostic.labels.push(wrela_diagnostics::Label {
+                span: initialization.source,
+                message: "the lexical view binding begins here".to_owned(),
+            });
+            diagnostic.labels.push(wrela_diagnostics::Label {
+                span: terminal.source,
+                message: "this terminal use keeps the view live across suspension".to_owned(),
+            });
+            diagnostic.notes.push(
+                "regionless views are second-class values and cannot be retained by an async frame"
+                    .to_owned(),
+            );
+            diagnostic.help.push(
+                "consume the view before awaiting, or create a new projection after resumption"
+                    .to_owned(),
+            );
+            return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
+        }
+    }
     if !matches!(
         expression_request.access,
         AccessMode::Value | AccessMode::Read
@@ -7838,6 +7978,12 @@ fn reference_operand(
         .expression(expression)
         .map(|expression| expression.source)
         .ok_or(AnalysisFailure::RequestMismatch)?;
+    let category = partial
+        .values
+        .get(binding.value.0 as usize)
+        .filter(|value| value.function == function)
+        .map(|value| value.category)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
     let (ty, before) = access_runtime_binding(
         request,
         partial,
@@ -7848,6 +7994,7 @@ fn reference_operand(
         expression_request.access,
         expression_request.desired_result.is_some(),
         slot,
+        is_cancelled,
     )?;
     let result = expression_request
         .desired_result
@@ -7863,7 +8010,7 @@ fn reference_operand(
             )
         })
         .transpose()?;
-    append_expression_fact(
+    append_expression_fact_with_category(
         request,
         partial,
         RuntimeExpressionFact {
@@ -7876,6 +8023,8 @@ fn reference_operand(
             ownership_before: before,
             ownership_after: binding.state,
         },
+        category,
+        None,
     )?;
     Ok(RuntimeExpression {
         ty,
@@ -7896,12 +8045,112 @@ fn access_runtime_binding(
     access: AccessMode,
     copy_requested: bool,
     slot: &mut Option<RuntimeBinding>,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> RuntimeResult<(SemanticTypeId, OwnershipState)> {
     let record = partial
         .values
         .get(binding.value.0 as usize)
         .filter(|record| record.function == function)
         .ok_or(AnalysisFailure::RequestMismatch)?;
+    if matches!(access, AccessMode::Mutate | AccessMode::Take) {
+        for view in &partial.lexical_views {
+            check_cancelled(is_cancelled)?;
+            let Some(retained) = view
+                .sources
+                .iter()
+                .find(|retained| retained.value == binding.value)
+            else {
+                continue;
+            };
+            let Some(terminal) = view
+                .terminal_uses
+                .last()
+                .and_then(|terminal| request.hir.as_program().expression(*terminal))
+            else {
+                return Err(AnalysisFailure::RequestMismatch.into());
+            };
+            if terminal.source.file == source.file
+                && source.range.start < terminal.source.range.start
+            {
+                let protocol = partial
+                    .projection_protocols
+                    .get(view.protocol.0 as usize)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                let parameter_name = request
+                    .hir
+                    .as_program()
+                    .parameters
+                    .get(retained.parameter.0 as usize)
+                    .and_then(|parameter| parameter.name.as_ref())
+                    .map_or("_", wrela_hir::Name::as_str);
+                let mut diagnostic = Diagnostic::error(
+                    Category::OWNERSHIP,
+                    source,
+                    copy_analysis_text(
+                        &format!(
+                            "cannot mutate frozen projection parameter `{parameter_name}` while view from `{}` remains live",
+                            protocol.name
+                        ),
+                        request.limits.fact_bytes,
+                        &|| false,
+                    )?,
+                );
+                diagnostic.code = Some("semantic-view-source-mutated".to_owned());
+                diagnostic.labels.try_reserve_exact(2).map_err(|_| {
+                    fact_resource(request, "view source mutation diagnostic labels")
+                })?;
+                diagnostic.labels.push(wrela_diagnostics::Label {
+                    span: retained.argument_source,
+                    message: format!(
+                        "`{parameter_name}` is conservatively retained by projection `{}`",
+                        protocol.name
+                    ),
+                });
+                diagnostic.labels.push(wrela_diagnostics::Label {
+                    span: terminal.source,
+                    message: "the blocking view's terminal use is here".to_owned(),
+                });
+                diagnostic.notes.push(
+                    "all declared projection sources remain frozen until the lexical view's final use"
+                        .to_owned(),
+                );
+                diagnostic.help.push(
+                    "move the source mutation after the terminal view use or shorten the view lifetime"
+                        .to_owned(),
+                );
+                return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
+            }
+        }
+    }
+    match record.category {
+        ValueCategory::SharedView | ValueCategory::MutableView
+            if copy_requested || access == AccessMode::Take =>
+        {
+            return Err(runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-view-escape",
+                "lexical view cannot be copied, moved, returned, or rebound as an owned value",
+                "a view is a regionless second-class projection whose lifetime is confined to its explicit binding",
+                "consume the view through a read parameter before its lexical lifetime ends",
+            ));
+        }
+        ValueCategory::SharedView if access == AccessMode::Mutate => {
+            return Err(runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-view-read-only",
+                "read-only view cannot grant mutable access",
+                "only a `mut view` projection carries exclusive mutation authority",
+                "use read access or bind a mutable projection",
+            ));
+        }
+        ValueCategory::SharedView | ValueCategory::MutableView => {}
+        ValueCategory::Value => {}
+        ValueCategory::Place | ValueCategory::TypeValue | ValueCategory::Error => {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        }
+    }
     if expected.is_some_and(|expected| expected != record.ty) {
         return Err(runtime_type_diagnostic(
             request,
@@ -7990,14 +8239,102 @@ fn access_runtime_binding(
     Ok((ty, before))
 }
 
+fn reject_live_lexical_rebind(
+    request: &AnalysisRequest<'_>,
+    partial: &PartialAnalysis,
+    function: FunctionInstanceId,
+    value: ValueId,
+    local: LocalId,
+    source: Span,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<()> {
+    let category = partial
+        .values
+        .get(value.0 as usize)
+        .filter(|record| record.function == function)
+        .map(|record| record.category)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    for view in &partial.lexical_views {
+        check_cancelled(is_cancelled)?;
+        if view.function != function {
+            continue;
+        }
+        let retained = view.sources.iter().find(|retained| retained.value == value);
+        let is_view_binding = view.binding == local
+            && matches!(
+                category,
+                ValueCategory::SharedView | ValueCategory::MutableView
+            );
+        if retained.is_none() && !is_view_binding {
+            continue;
+        }
+        let terminal = view
+            .terminal_uses
+            .last()
+            .and_then(|terminal| request.hir.as_program().expression(*terminal))
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if terminal.source.file != source.file || source.range.start >= terminal.source.range.start
+        {
+            continue;
+        }
+        let protocol = partial
+            .projection_protocols
+            .get(view.protocol.0 as usize)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let retained_name = retained
+            .and_then(|retained| {
+                request
+                    .hir
+                    .as_program()
+                    .parameters
+                    .get(retained.parameter.0 as usize)
+                    .and_then(|parameter| parameter.name.as_ref())
+            })
+            .map_or("view carrier", wrela_hir::Name::as_str);
+        let mut diagnostic = Diagnostic::error(
+            Category::OWNERSHIP,
+            source,
+            format!(
+                "cannot rebind `{retained_name}` while projection `{}` remains live",
+                protocol.name
+            ),
+        );
+        diagnostic.code = Some("semantic-projection-carrier-rebound".to_owned());
+        diagnostic
+            .labels
+            .try_reserve_exact(2)
+            .map_err(|_| fact_resource(request, "projection carrier rebound diagnostic labels"))?;
+        diagnostic.labels.push(wrela_diagnostics::Label {
+            span: retained.map_or(source, |retained| retained.argument_source),
+            message: format!(
+                "`{retained_name}` is retained by projection `{}`",
+                protocol.name
+            ),
+        });
+        diagnostic.labels.push(wrela_diagnostics::Label {
+            span: terminal.source,
+            message: "the blocking view's terminal use is here".to_owned(),
+        });
+        diagnostic.notes.push(
+            "neither a projection source nor its regionless view carrier may be replaced while the view is live"
+                .to_owned(),
+        );
+        diagnostic.help.push(
+            "move the assignment after the terminal use or initialize a distinct local".to_owned(),
+        );
+        return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
+    }
+    Ok(())
+}
+
 fn analyze_runtime_place(
     request: &AnalysisRequest<'_>,
     partial: &PartialAnalysis,
     function: FunctionInstanceId,
     place: &wrela_hir::PlaceTarget,
-    expected: SemanticTypeId,
-    access: AccessMode,
+    target: FunctionParameter,
     state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> RuntimeResult<RuntimeExpression> {
     if !place.projections.is_empty() {
         return Err(runtime_type_diagnostic(
@@ -8022,10 +8359,11 @@ fn analyze_runtime_place(
         function,
         place.source,
         &mut binding,
-        Some(expected),
-        access,
+        Some(target.ty),
+        target.access,
         false,
         slot,
+        is_cancelled,
     )?;
     Ok(RuntimeExpression {
         ty,
@@ -8475,9 +8813,15 @@ fn analyze_scope_direct_call(
                 state,
                 is_cancelled,
             )?,
-            wrela_hir::CallArgumentValue::Exclusive { place, .. } => {
-                analyze_runtime_place(request, partial, function, place, target.ty, access, state)?
-            }
+            wrela_hir::CallArgumentValue::Exclusive { place, .. } => analyze_runtime_place(
+                request,
+                partial,
+                function,
+                place,
+                target,
+                state,
+                is_cancelled,
+            )?,
         };
         effects.0 |= outcome.effects.0;
         let value = outcome
@@ -8564,6 +8908,280 @@ fn analyze_scope_direct_call(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn analyze_projection_direct_call(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    call: RuntimeDirectCall<'_>,
+    declaration: DeclarationId,
+    expression_request: RuntimeExpressionRequest,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<RuntimeExpression> {
+    let protocol_id = ensure_projection_protocol(
+        request,
+        partial,
+        declaration,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    let protocol = partial
+        .projection_protocols
+        .get(protocol_id.0 as usize)
+        .filter(|protocol| protocol.id == protocol_id)
+        .cloned()
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let expected_category = if protocol.mutable {
+        ValueCategory::MutableView
+    } else {
+        ValueCategory::SharedView
+    };
+    let Some(result_value) = expression_request.desired_result else {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-projection-carrier-rebound",
+            "projection result must initialize one explicit view binding",
+            "a regionless projection view has one lexical carrier and cannot exist as a temporary or owned value",
+            "bind the call directly as `name: view T = projection(...)`",
+        ));
+    };
+    if expression_request
+        .expected
+        .is_some_and(|expected| expected != protocol.target)
+        || call.arguments.len() != protocol.parameters.len()
+        || partial
+            .values
+            .get(result_value.0 as usize)
+            .is_none_or(|value| {
+                value.function != function
+                    || value.ty != protocol.target
+                    || value.category != expected_category
+            })
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-projection-call-signature",
+            "projection arguments or view binding do not match the declared protocol",
+            "projection calls preserve the declaration's exact access contract and carrier mutability",
+            "match every projection parameter and bind the declared view kind",
+        ));
+    }
+    let source_projection = request
+        .hir
+        .as_program()
+        .declaration(declaration)
+        .and_then(|record| match &record.kind {
+            DeclarationKind::Projection(projection) => Some(projection),
+            _ => None,
+        })
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let mut target_parameters = Vec::new();
+    target_parameters
+        .try_reserve_exact(protocol.parameters.len())
+        .map_err(|_| fact_resource(request, "projection call parameters"))?;
+    for (parameter, semantic) in source_projection
+        .parameters
+        .iter()
+        .zip(&protocol.parameters)
+    {
+        target_parameters.push(FunctionParameter {
+            parameter: *parameter,
+            value: ValueId(0),
+            access: semantic.access,
+            ty: semantic.ty,
+        });
+    }
+    let mut callable_parameters = Vec::new();
+    callable_parameters
+        .try_reserve_exact(protocol.parameters.len())
+        .map_err(|_| fact_resource(request, "projection callable parameters"))?;
+    for parameter in &protocol.parameters {
+        check_cancelled(is_cancelled)?;
+        callable_parameters.push(SemanticParameter {
+            access: parameter.access,
+            ty: parameter.ty,
+        });
+    }
+    let callable_ty = ensure_callable_type(
+        request,
+        partial,
+        FunctionColor::Sync,
+        callable_parameters,
+        protocol.target,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: call.callee,
+            ty: callable_ty,
+            result: None,
+            resolution: ExpressionResolution::Projection(protocol_id),
+            effects: EffectSet(0),
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    let mut resolved = optional_call_map(call.arguments.len(), request.limits.fact_edges)?;
+    let mut effects = EffectSet(0);
+    let mut accesses: Vec<(ValueId, AccessMode, Span)> = Vec::new();
+    accesses
+        .try_reserve_exact(call.arguments.len())
+        .map_err(|_| fact_resource(request, "projection call ownership accesses"))?;
+    for (source_index, argument) in call.arguments.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        let parameter_index = resolve_declaration_owned_argument(
+            request,
+            &target_parameters,
+            argument,
+            &resolved,
+            target_parameters.len(),
+            is_cancelled,
+        )?;
+        let target = target_parameters
+            .get(parameter_index)
+            .copied()
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let access = match (&argument.value, target.access) {
+            (wrela_hir::CallArgumentValue::Value(_), AccessMode::Value | AccessMode::Read) => {
+                target.access
+            }
+            (wrela_hir::CallArgumentValue::Exclusive { .. }, expected)
+                if lower_access(argument.access()) == expected =>
+            {
+                expected
+            }
+            _ => {
+                return Err(runtime_diagnostic(
+                    request,
+                    argument.source,
+                    "semantic-access-marker-mismatch",
+                    "projection argument access does not match the source parameter",
+                    None,
+                    "the call-site access marker must preserve the projection's source authority",
+                    "change the argument marker to match the projection declaration",
+                ));
+            }
+        };
+        let outcome = match &argument.value {
+            wrela_hir::CallArgumentValue::Value(value) => analyze_runtime_expression(
+                request,
+                partial,
+                function,
+                *value,
+                RuntimeExpressionRequest {
+                    expected: Some(target.ty),
+                    desired_result: None,
+                    access,
+                },
+                state,
+                is_cancelled,
+            )?,
+            wrela_hir::CallArgumentValue::Exclusive { place, .. } => analyze_runtime_place(
+                request,
+                partial,
+                function,
+                place,
+                target,
+                state,
+                is_cancelled,
+            )?,
+        };
+        effects.0 |= outcome.effects.0;
+        let value = outcome.referenced.ok_or_else(|| {
+            runtime_type_diagnostic(
+                request,
+                argument.source,
+                "semantic-projection-argument-place-pending",
+                "projection source must be a direct named place",
+                "temporary and projected arguments do not yet have exact retained-root overlap facts",
+                "bind the source to a local or pass a parameter directly",
+            )
+        })?;
+        if let Some((_, _, first_source)) = accesses.iter().find(|(prior, prior_access, _)| {
+            *prior == value && accesses_conflict(*prior_access, access)
+        }) {
+            let mut diagnostic = runtime_ownership_diagnostic(
+                request,
+                argument.source,
+                "semantic-overlapping-access",
+                "one projection activation requests overlapping exclusive access to one source",
+                runtime_binding_by_value(state.locals, state.parameters, value, is_cancelled)?,
+                "mutable projection sources are exclusive for the activation",
+                "use distinct source roots or read-only access",
+            )?;
+            diagnostic.labels.insert(
+                0,
+                wrela_diagnostics::Label {
+                    span: *first_source,
+                    message: "the first overlapping projection source begins here".to_owned(),
+                },
+            );
+            return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
+        }
+        accesses.push((value, access, argument.source));
+        let slot = resolved
+            .get_mut(parameter_index)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if slot
+            .replace(ResolvedCallArgument {
+                source_index: u32::try_from(source_index)
+                    .map_err(|_| fact_resource(request, "projection call arguments"))?,
+                parameter_index: u32::try_from(parameter_index)
+                    .map_err(|_| fact_resource(request, "projection call arguments"))?,
+                access,
+                value,
+            })
+            .is_some()
+        {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        }
+    }
+    let mut arguments = Vec::new();
+    arguments
+        .try_reserve_exact(resolved.len())
+        .map_err(|_| fact_resource(request, "projection call arguments"))?;
+    for argument in resolved {
+        arguments.push(argument.ok_or(AnalysisFailure::RequestMismatch)?);
+    }
+    let view = LexicalViewId(
+        u32::try_from(partial.lexical_views.len())
+            .map_err(|_| fact_resource(request, "lexical views"))?,
+    );
+    append_expression_fact_with_category(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: call.expression,
+            ty: protocol.target,
+            result: Some(result_value),
+            resolution: ExpressionResolution::ProjectionCall {
+                protocol: protocol_id,
+                arguments,
+                view,
+            },
+            effects,
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+        expected_category,
+        None,
+    )?;
+    Ok(RuntimeExpression {
+        ty: protocol.target,
+        result: Some(result_value),
+        referenced: None,
+        effects,
+    })
+}
+
 fn analyze_direct_call(
     request: &AnalysisRequest<'_>,
     partial: &mut PartialAnalysis,
@@ -8615,6 +9233,23 @@ fn analyze_direct_call(
     else {
         return Err(AnalysisFailure::RequestMismatch.into());
     };
+    if request
+        .hir
+        .as_program()
+        .declaration(resolved.declaration)
+        .is_some_and(|record| matches!(record.kind, DeclarationKind::Projection(_)))
+    {
+        return analyze_projection_direct_call(
+            request,
+            partial,
+            function,
+            call,
+            resolved.declaration,
+            expression_request,
+            state,
+            is_cancelled,
+        );
+    }
     if request
         .hir
         .as_program()
@@ -8844,9 +9479,9 @@ fn analyze_direct_call(
                 partial,
                 function,
                 place,
-                target_parameter.ty,
-                target_parameter.access,
+                target_parameter,
                 state,
+                is_cancelled,
             )?,
         };
         if let Some(value) = outcome.referenced {
@@ -10567,6 +11202,16 @@ fn append_expression_fact(
     partial: &mut PartialAnalysis,
     fact: RuntimeExpressionFact,
 ) -> Result<(), AnalysisFailure> {
+    append_expression_fact_with_category(request, partial, fact, ValueCategory::Value, None)
+}
+
+fn append_expression_fact_with_category(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    fact: RuntimeExpressionFact,
+    category: ValueCategory,
+    region: Option<RegionId>,
+) -> Result<(), AnalysisFailure> {
     if partial.expressions.len() >= request.limits.expression_facts as usize {
         return Err(fact_resource(request, "expression facts"));
     }
@@ -10579,8 +11224,8 @@ fn append_expression_fact(
         function: fact.function,
         expression: fact.expression,
         ty: fact.ty,
-        category: ValueCategory::Value,
-        region: None,
+        category,
+        region,
         effects: fact.effects,
         resolution: fact.resolution,
         result: fact.result,
@@ -10660,6 +11305,37 @@ fn append_statement_fact(
         .statements
         .try_reserve(1)
         .map_err(|_| fact_resource(request, "statement facts"))?;
+    let statement_record = request
+        .hir
+        .as_program()
+        .statement(statement)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let mut live_lexical_views_after = Vec::new();
+    for view in &partial.lexical_views {
+        check_cancelled(is_cancelled)?;
+        if view.function != function {
+            continue;
+        }
+        let initialization = request
+            .hir
+            .as_program()
+            .statement(view.initialization)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let terminal = view
+            .terminal_uses
+            .last()
+            .and_then(|terminal| request.hir.as_program().expression(*terminal))
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if statement_record.source.file == initialization.source.file
+            && statement_record.source.range.start >= initialization.source.range.start
+            && statement_record.source.range.end < terminal.source.range.end
+        {
+            live_lexical_views_after
+                .try_reserve(1)
+                .map_err(|_| fact_resource(request, "live lexical views"))?;
+            live_lexical_views_after.push(view.id);
+        }
+    }
     partial.statements.push(StatementFact {
         function,
         statement,
@@ -10668,7 +11344,242 @@ fn append_statement_fact(
         initialized_after,
         moved_after,
         live_loans_after: Vec::new(),
+        live_lexical_views_after,
         proofs,
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_lexical_view_initialization(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    initialization: StatementId,
+    binding: LocalId,
+    expression: ExpressionId,
+    value: ValueId,
+    category: ValueCategory,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<()> {
+    if partial.lexical_views.len() >= request.limits.lexical_views as usize {
+        return Err(fact_resource(request, "lexical views").into());
+    }
+    let (protocol_id, arguments, view_id) = partial
+        .expressions
+        .iter()
+        .find(|fact| fact.function == function && fact.expression == expression)
+        .and_then(|fact| match &fact.resolution {
+            ExpressionResolution::ProjectionCall {
+                protocol,
+                arguments,
+                view,
+            } if fact.result == Some(value) && fact.category == category => {
+                Some((*protocol, arguments.as_slice(), *view))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            runtime_type_diagnostic(
+                request,
+                request
+                    .hir
+                    .as_program()
+                    .expression(expression)
+                    .map_or(fallback_span(request.hir.as_program()), |record| record.source),
+                "semantic-projection-carrier-rebound",
+                "view binding must be initialized directly by a projection call",
+                "ordinary values and nested expressions cannot authenticate lexical view provenance",
+                "bind one free projection call directly to this view local",
+            )
+        })?;
+    if view_id.0 as usize != partial.lexical_views.len() {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    let protocol = partial
+        .projection_protocols
+        .get(protocol_id.0 as usize)
+        .filter(|protocol| protocol.id == protocol_id)
+        .cloned()
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let call = request
+        .hir
+        .as_program()
+        .expression(expression)
+        .and_then(|record| match &record.kind {
+            ExpressionKind::Call { arguments, .. } => Some(arguments),
+            _ => None,
+        })
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let mut sources = Vec::new();
+    sources
+        .try_reserve_exact(protocol.provenance.len())
+        .map_err(|_| fact_resource(request, "lexical view sources"))?;
+    for parameter in &protocol.provenance {
+        check_cancelled(is_cancelled)?;
+        let parameter_index = protocol
+            .parameters
+            .iter()
+            .position(|candidate| candidate.parameter == *parameter)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let argument = arguments
+            .get(parameter_index)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let source = call
+            .get(argument.source_index as usize)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        sources.push(LexicalViewSource {
+            parameter: *parameter,
+            value: argument.value,
+            access: argument.access,
+            argument_source: source.source,
+        });
+    }
+    let initialization_record = request
+        .hir
+        .as_program()
+        .statement(initialization)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let mut terminal_uses = Vec::new();
+    for candidate in &request.hir.as_program().expressions {
+        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+        if candidate.source.file == initialization_record.source.file
+            && candidate.source.range.start > initialization_record.source.range.end
+            && candidate.kind == ExpressionKind::Reference(Definition::Local(binding))
+        {
+            terminal_uses
+                .try_reserve(1)
+                .map_err(|_| fact_resource(request, "lexical view terminal uses"))?;
+            terminal_uses.push(candidate.id);
+        }
+    }
+    if terminal_uses.len() != 1 {
+        return Err(runtime_type_diagnostic(
+            request,
+            initialization_record.source,
+            "semantic-view-control-flow-pending",
+            "this lexical view does not have one exact straight-line terminal use",
+            "branching, repeated use, and unused-view release require the structured backward liveness increment",
+            "consume the view exactly once later in the same straight-line body",
+        ));
+    }
+    let terminal = request
+        .hir
+        .as_program()
+        .expression(terminal_uses[0])
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let mut unary_consumers = 0_u32;
+    for candidate in &request.hir.as_program().expressions {
+        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+        if let ExpressionKind::Call { arguments, .. } = &candidate.kind
+            && matches!(
+                arguments.as_slice(),
+                [argument]
+                    if matches!(argument.value, wrela_hir::CallArgumentValue::Value(value) if value == terminal.id)
+            )
+        {
+            unary_consumers = unary_consumers
+                .checked_add(1)
+                .ok_or_else(|| fact_resource(request, "lexical view terminal consumers"))?;
+        }
+    }
+    if unary_consumers != 1 {
+        return Err(runtime_type_diagnostic(
+            request,
+            terminal.source,
+            "semantic-view-terminal-use-pending",
+            "lexical view terminal use must be one unary call argument",
+            "operators, multi-argument calls, and nested expressions require broader ephemeral-consumption rules",
+            "pass the view directly to one unary consumer",
+        ));
+    }
+    let mut terminal_statement = None;
+    let mut terminal_width = None;
+    for candidate in &request.hir.as_program().statements {
+        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+        if candidate.source.file == terminal.source.file
+            && candidate.source.range.start <= terminal.source.range.start
+            && terminal.source.range.end <= candidate.source.range.end
+        {
+            let width = candidate.source.range.end - candidate.source.range.start;
+            if terminal_width.is_none_or(|current| width < current) {
+                terminal_statement = Some(candidate);
+                terminal_width = Some(width);
+            }
+        }
+    }
+    let terminal_statement = terminal_statement.ok_or(AnalysisFailure::RequestMismatch)?;
+    if terminal_statement.body != initialization_record.body {
+        return Err(runtime_type_diagnostic(
+            request,
+            terminal.source,
+            "semantic-view-control-flow-pending",
+            "lexical view use crosses a structured control-flow boundary",
+            "this increment authenticates one terminal use in the initializer's direct statement sequence",
+            "keep the projection binding and its one use in the same straight-line body",
+        ));
+    }
+    let direct_body = request
+        .hir
+        .as_program()
+        .body(initialization_record.body)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let mut initialization_index = None;
+    let mut terminal_index = None;
+    for (index, candidate) in direct_body.statements.iter().enumerate() {
+        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+        if *candidate == initialization {
+            initialization_index = Some(index);
+        }
+        if *candidate == terminal_statement.id {
+            terminal_index = Some(index);
+        }
+    }
+    let initialization_index = initialization_index.ok_or(AnalysisFailure::RequestMismatch)?;
+    let terminal_index = terminal_index.ok_or(AnalysisFailure::RequestMismatch)?;
+    if terminal_index <= initialization_index {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    for statement in &direct_body.statements[initialization_index + 1..=terminal_index] {
+        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+        let statement = request
+            .hir
+            .as_program()
+            .statement(*statement)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if matches!(
+            statement.kind,
+            StatementKind::If { .. }
+                | StatementKind::For { .. }
+                | StatementKind::While { .. }
+                | StatementKind::Loop { .. }
+                | StatementKind::Match { .. }
+                | StatementKind::With { .. }
+                | StatementKind::Return(_)
+                | StatementKind::Break
+                | StatementKind::Continue
+        ) {
+            return Err(runtime_type_diagnostic(
+                request,
+                statement.source,
+                "semantic-view-control-flow-pending",
+                "structured control flow occurs while a lexical view remains live",
+                "source-span order alone cannot prove a view lifetime across branches, loops, or early exits",
+                "consume the view before this statement or recreate it afterward",
+            ));
+        }
+    }
+    partial.lexical_views.push(LexicalView {
+        id: view_id,
+        function,
+        protocol: protocol_id,
+        expression,
+        initialization,
+        binding,
+        value,
+        sources,
+        terminal_uses,
     });
     Ok(())
 }
@@ -10722,6 +11633,27 @@ fn append_semantic_value(
     description: (SemanticValueOrigin, Option<Span>, Option<&str>),
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<ValueId, AnalysisFailure> {
+    append_semantic_value_with_category(
+        request,
+        partial,
+        function,
+        ty,
+        ValueCategory::Value,
+        description,
+        is_cancelled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_semantic_value_with_category(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    ty: SemanticTypeId,
+    category: ValueCategory,
+    description: (SemanticValueOrigin, Option<Span>, Option<&str>),
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<ValueId, AnalysisFailure> {
     let (origin, source, name) = description;
     if partial.values.len() >= request.limits.values as usize {
         return Err(fact_resource(request, "semantic values"));
@@ -10741,7 +11673,7 @@ fn append_semantic_value(
         id,
         function,
         ty,
-        category: ValueCategory::Value,
+        category,
         origin,
         source,
         source_name,
@@ -27255,6 +28187,481 @@ fn projection_contract_is_checked():
                 diagnostic.code.as_deref() == Some("semantic-projection-await")
             }),
             "expected semantic-projection-await: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn free_projection_call_builds_regionless_lexical_view_fact() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn projection_call_is_lexical():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    pass
+    consume(hdr)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "a directly bound bare projection call must analyze: {:?}",
+            output.diagnostics()
+        );
+        let analyzed = output.successful().expect("sealed lexical view analysis");
+        let facts = analyzed.facts();
+        let view = facts.lexical_views.first().expect("one lexical view fact");
+        assert_eq!(facts.lexical_views.len(), 1);
+        assert_eq!(view.sources.len(), 1);
+        assert_eq!(view.terminal_uses.len(), 1);
+        assert_eq!(
+            facts.values[view.value.0 as usize].category,
+            ValueCategory::SharedView
+        );
+        let call = facts
+            .expressions
+            .iter()
+            .find(|fact| fact.function == view.function && fact.expression == view.expression)
+            .expect("projection call fact");
+        assert_eq!(call.region, None);
+        assert!(matches!(
+            call.resolution,
+            ExpressionResolution::ProjectionCall { view: id, .. } if id == view.id
+        ));
+
+        let mut forged_terminal = facts.clone();
+        forged_terminal.lexical_views[0].terminal_uses.clear();
+        assert!(
+            forged_terminal
+                .validate_for_seal(analyzed.hir(), &|| false)
+                .is_err(),
+            "the exact sealer must reject an omitted terminal-use witness"
+        );
+
+        let mut forged_program = analyzed.hir().clone().into_program();
+        let body = forged_program
+            .body(
+                forged_program
+                    .statement(view.initialization)
+                    .expect("view initializer")
+                    .body,
+            )
+            .expect("view body")
+            .clone();
+        let initialization_index = body
+            .statements
+            .iter()
+            .position(|statement| *statement == view.initialization)
+            .expect("view initializer position");
+        let first = forged_program
+            .statement(body.statements[initialization_index - 1])
+            .expect("source initializer");
+        let StatementKind::Initialize {
+            local: source_local,
+            ..
+        } = &first.kind
+        else {
+            panic!("source initializer shape");
+        };
+        let source_local = *source_local;
+        let terminal = view.terminal_uses[0];
+        let replacement = forged_program
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(
+                    &expression.kind,
+                    ExpressionKind::Call { arguments, .. }
+                        if arguments.iter().any(|argument| {
+                            matches!(argument.value, wrela_hir::CallArgumentValue::Value(value) if value == terminal)
+                        })
+                )
+            })
+            .map(|expression| expression.id)
+            .expect("terminal unary consumer");
+        let intervening = body.statements[initialization_index + 1];
+        let terminal_statement = *body.statements.last().expect("terminal statement");
+        let intervening_source = forged_program
+            .statement(intervening)
+            .expect("intervening pass")
+            .source;
+        let (callee, terminal_argument) = forged_program
+            .expression(replacement)
+            .and_then(|expression| match &expression.kind {
+                ExpressionKind::Call { callee, arguments } => {
+                    let wrela_hir::CallArgumentValue::Value(argument) = &arguments[0].value else {
+                        return None;
+                    };
+                    Some((*callee, *argument))
+                }
+                _ => None,
+            })
+            .expect("terminal call shape");
+        forged_program.expressions[replacement.0 as usize].source = intervening_source;
+        forged_program.expressions[callee.0 as usize].source = intervening_source;
+        let mut terminal_source = intervening_source;
+        terminal_source.range.start = terminal_source.range.start.saturating_add(1);
+        forged_program.expressions[terminal_argument.0 as usize].source = terminal_source;
+        let ExpressionKind::Call { arguments, .. } =
+            &mut forged_program.expressions[replacement.0 as usize].kind
+        else {
+            panic!("terminal call shape");
+        };
+        arguments[0].source = terminal_source;
+        forged_program
+            .statements
+            .get_mut(intervening.0 as usize)
+            .expect("intervening statement")
+            .kind = StatementKind::Assign {
+            targets: vec![wrela_hir::PlaceTarget {
+                root: Definition::Local(source_local),
+                projections: Vec::new(),
+                source: intervening_source,
+            }],
+            operator: AssignmentOperator::Assign,
+            value: replacement,
+        };
+        forged_program
+            .statements
+            .get_mut(terminal_statement.0 as usize)
+            .expect("terminal statement")
+            .kind = StatementKind::Pass;
+        let forged_hir = forged_program
+            .validate()
+            .expect("structurally valid forged HIR");
+        assert!(
+            !valid_lexical_view_record(
+                &facts.lexical_views[0],
+                facts,
+                forged_hir.as_program(),
+                &|| false,
+            )
+            .expect("exact lexical-view validation"),
+            "the lexical-view validator itself must reject retained-source rebinding"
+        );
+        let mut forged_facts = facts.clone();
+        forged_facts.hir = HirSummary::from_validated(&forged_hir).expect("forged HIR summary");
+        assert!(
+            forged_facts
+                .validate_for_seal(&forged_hir, &|| false)
+                .is_err(),
+            "the exact sealer must independently reject retained-source rebinding"
+        );
+    }
+
+    #[test]
+    fn projection_call_without_direct_view_binding_fails_closed() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn projection_result_requires_direct_binding():
+    packet: Packet = Packet(header=7)
+    header(packet)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert_eq!(
+            output
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.as_deref()),
+            Some("semantic-projection-carrier-rebound"),
+            "projection temporaries must fail closed: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn retained_projection_source_cannot_be_mutated_before_terminal_use() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection choose(read left: Packet, read right: Packet) -> view u64:
+    yield left.header
+
+fn touch(mut packet: Packet):
+    pass
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn retained_source_is_frozen():
+    left: Packet = Packet(header=1)
+    right: Packet = Packet(header=2)
+    hdr: view u64 = choose(left=left, right=right)
+    touch(mut right)
+    consume(hdr)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert_eq!(
+            output
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.as_deref()),
+            Some("semantic-view-source-mutated"),
+            "all conservative projection sources stay frozen until the terminal use: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn lexical_projection_view_cannot_cross_await() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+async fn checkpoint():
+    pass
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+async fn view_cannot_cross_await():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    await checkpoint()
+    consume(hdr)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert_eq!(
+            output
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.as_deref()),
+            Some("semantic-view-across-await"),
+            "a regionless lexical view must not survive suspension: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn lexical_projection_control_flow_remains_named_and_fail_closed() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn view_control_flow_is_deferred():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    if true:
+        consume(hdr)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert_eq!(
+            output
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.as_deref()),
+            Some("semantic-view-control-flow-pending"),
+            "view-bearing control flow must not be mistaken for straight-line liveness: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn intervening_control_flow_while_view_is_live_fails_closed() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn intervening_branch_is_deferred():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    if true:
+        pass
+    consume(hdr)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert_eq!(
+            output
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.as_deref()),
+            Some("semantic-view-control-flow-pending"),
+            "an intervening branch must not be represented by source-span liveness: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn non_unary_projection_terminal_use_remains_named_and_fail_closed() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn binary_view_consumption_is_deferred():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    result: u64 = hdr + 1
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert_eq!(
+            output
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.as_deref()),
+            Some("semantic-view-terminal-use-pending"),
+            "broader ephemeral consumption must fail closed before operator analysis: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn live_projection_source_and_view_carrier_cannot_be_rebound() {
+        for assignment in ["    packet = Packet(header=8)\n", "    hdr = 3\n"] {
+            let source = format!(
+                r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn live_carrier_cannot_rebind():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+{assignment}    consume(hdr)
+"#
+            );
+            let output = compile_scope_fixture(&source);
+            assert_eq!(
+                output
+                    .diagnostics()
+                    .first()
+                    .and_then(|diagnostic| diagnostic.code.as_deref()),
+                Some("semantic-projection-carrier-rebound"),
+                "live source/view replacement must be named: {:?}",
+                output.diagnostics()
+            );
+        }
+    }
+
+    #[test]
+    fn projection_source_may_rebind_after_terminal_view_use() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn source_rebind_after_release():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    consume(hdr)
+    packet = Packet(header=8)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "source authority must release after the exact terminal use: {:?}",
             output.diagnostics()
         );
     }

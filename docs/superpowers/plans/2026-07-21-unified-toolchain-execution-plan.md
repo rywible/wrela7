@@ -187,7 +187,7 @@ D2 need this scope substantially complete; B10 needs F5.
 |---|---|---|---|
 | 1 | B2a promotion/region report schema | — | **landed** 3eb2cb69 |
 | 1 | B5b wait-for graph + diagnostics | — | **landed** 3e216d38 |
-| 1 | B1a view/provenance semantics | lexical provenance model | **sealed-boundary audit required** — `SemanticTypeKind::View`/`Loan` currently require real `RegionId`s, but B1a is analysis-only and L2.3 owns runtime region production; use a separate bounded lexical provenance fact or explicitly merge the region-producing work, never a placeholder/dangling region |
+| 1 | B1a view/provenance semantics | lexical provenance model | **B1a.2 narrow use-site slice landed** — a nongeneric module-level bare-view free projection call may directly initialize an explicit view local for one ordinary unary consumption in straight-line code. Regionless `LexicalView` facts preserve exact parameter/value/span provenance and one exact terminal-use liveness interval; a retained source cannot mutate before that use, and a live view cannot cross `await` (`free_projection_call_builds_regionless_lexical_view_fact`, `projection_call_without_direct_view_binding_fails_closed`, `retained_projection_source_cannot_be_mutated_before_terminal_use`, `lexical_projection_view_cannot_cross_await`). Receiver/wrapped/generic projections, mutation through views, control-flow liveness, general disjointness/ephemeral legality, and lowering remain fail-closed. |
 | 1 | B4a cleanup DAG sema analysis | — | **landed** 43d3e279 — free-call scope protocols/calls, lexical activations, reverse-source cleanup DAG + `CleanupAcyclic`, synthetic cycle detector, and named await/receiver/outside-`with` rejections; pass-only cleanup bodies and no lowering (`semantic-with-cleanup-lowering-pending`) |
 | 0 | **T0.1 general nongeneric ADTs — COMPLETE** | — | **landed** — enum type resolution: unit + mixed-arity + heterogeneous-scalar + flat-struct + nongeneric-enum payloads, tagged-union max-slot layout, structural cycle rejection |
 | 0 | · T0.1a unit variants | — | landed ce8385e6 |
@@ -196,6 +196,7 @@ D2 need this scope substantially complete; B10 needs F5.
 | 0 | · T0.1d enum payloads + cycle rejection | T0.1c | landed 0b953537 |
 | 0 | T0.1 deferred tails (fail-closed) | T0.1 | nominal/enum **construction** + **lowering**, generic/view/tuple/array payloads, unit-variant DotName construction — all named-diagnostic fail-closed |
 | 0 | T0.2 ephemeral type kind | T0.1 + a **producer** | **producer-gated** — needs views (B1) or `try send` (B5c) to exercise the `?`-vs-`match`/`is` rule end to end |
+
 | 0 | T0.3 generics/monomorphization (A6) | T0.1 | **scope correction required** — start with type-only generic flat-struct specialization; preserve existing parsed/HIR `region` generics unchanged but exclude region substitution until the source spec (which says no surface region parameter) and normative syntax fixture are reconciled |
 | — | General `match`/`is` over ADTs (consumer; uses T0.1, needed for AdmissionResult consumption) | T0.1 | **landed** 69188c6b — mixed-arity/per-variant-type exhaustive statement match; unit/payload-wildcard `is`; success-dominated `is` binding remains named fail-closed |
 | 2 | L2.1a local aggregate mutation | T0 | queued — local `agg.field` can use root-SSA replacement, then `InsertField`; persistent `self.field` is not part of this increment |
@@ -206,6 +207,15 @@ D2 need this scope substantially complete; B10 needs F5.
 | 2 | L2.4 reply-slot + scheduler (B5c) | L2.2,T0.1 | queued |
 | 2 | L2.5 scope-op lowering (B4b/c) | L2.2,B4a | queued |
 | 3 | feature verticals (B1b,B2b/c,B3,B5c,B6–B10,A1/3/4/5/7/8) | tiers 0–2 | queued |
+
+B1a.2 retention and straight-line boundary evidence also includes
+`intervening_control_flow_while_view_is_live_fails_closed`,
+`live_projection_source_and_view_carrier_cannot_be_rebound`, and
+`projection_source_may_rebind_after_terminal_view_use`;
+`non_unary_projection_terminal_use_remains_named_and_fail_closed` covers the
+broader-consumption boundary. Exact sealing is
+covered by a valid-HIR retained-source-rebinding forgery in
+`free_projection_call_builds_regionless_lexical_view_fact`.
 
 **Sequencing note (2026-07-21):** T0.1 (ADT type resolution) is complete. T0.2
 (ephemeral kind) turned out **producer-gated** — the `?`-rejection rule can't be

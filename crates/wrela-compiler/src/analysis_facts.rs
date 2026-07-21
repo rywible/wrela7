@@ -3616,6 +3616,7 @@ pub fn boot() -> Image:
             expressions: Vec::new(),
             statements: Vec::new(),
             projection_protocols: Vec::new(),
+            lexical_views: Vec::new(),
             scope_protocols: Vec::new(),
             scope_activations: Vec::new(),
             graph: Some(ImageGraph {
