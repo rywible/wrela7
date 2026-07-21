@@ -9962,13 +9962,50 @@ fn analyze_flat_structure_constructor(
     is_cancelled: &dyn Fn() -> bool,
 ) -> RuntimeResult<RuntimeExpression> {
     check_cancelled(is_cancelled)?;
-    let ty = ensure_flat_structure_type(
-        request,
-        partial,
-        declaration,
-        &mut *state.aggregate_work,
-        is_cancelled,
-    )?;
+    let program = request.hir.as_program();
+    let record = program
+        .declaration(declaration)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let DeclarationKind::Structure(aggregate) = &record.kind else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    let ty = if aggregate.generics.is_empty() {
+        ensure_flat_structure_type(
+            request,
+            partial,
+            declaration,
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )?
+    } else if let Some(expected) = expression_request.expected {
+        let exact_specialization = partial.types.get(expected.0 as usize).is_some_and(|ty| {
+            matches!(&ty.kind, SemanticTypeKind::Structure {
+                declaration: candidate,
+                arguments,
+                ..
+            } if *candidate == declaration && arguments.len() == aggregate.generics.len())
+        });
+        if !exact_specialization {
+            return Err(runtime_type_diagnostic(
+                request,
+                call.source,
+                "semantic-constructor-result-type",
+                "generic structure constructor does not produce the required specialization",
+                "expected-type-directed construction preserves the exact nominal type arguments",
+                "construct the generic structure in a context requiring its exact specialization",
+            ));
+        }
+        expected
+    } else {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-runtime-generic-structure-inference-required",
+            "generic structure constructor requires an expected specialized type",
+            "this first monomorphization slice does not infer type arguments from constructor values",
+            "add a local, parameter, or result type that names the complete structure specialization",
+        ));
+    };
     if expression_request
         .expected
         .is_some_and(|expected| expected != ty)
@@ -9982,13 +10019,6 @@ fn analyze_flat_structure_constructor(
             "construct the exact structure named by the surrounding type",
         ));
     }
-    let program = request.hir.as_program();
-    let record = program
-        .declaration(declaration)
-        .ok_or(AnalysisFailure::RequestMismatch)?;
-    let DeclarationKind::Structure(aggregate) = &record.kind else {
-        return Err(AnalysisFailure::RequestMismatch.into());
-    };
     if call.arguments.len() != aggregate.fields.len() {
         return Err(runtime_type_diagnostic(
             request,
@@ -11863,30 +11893,21 @@ fn semantic_type_from_source(
                     )
                 };
             }
-            if !arguments.is_empty() {
-                return Err(runtime_type_diagnostic(
-                    request,
-                    source.source,
-                    "semantic-runtime-generic-type-not-supported",
-                    "runtime generic type is outside the authenticated core Result specialization",
-                    "revision R2 admits only core.result.Result[T, E] under its exact scalar contract",
-                    "use core.result.Result with two identical supported copy-scalar arguments",
-                ));
-            }
             if !matches!(declaration.kind, DeclarationKind::Structure(_)) {
                 return Err(runtime_type_diagnostic(
                     request,
                     source.source,
                     "semantic-runtime-type-not-supported",
                     "nominal runtime type is outside the flat structure subset",
-                    "revision 0.1 admits only nongeneric structures whose fields are supported scalars",
+                    "revision 0.1 admits structures specialized over supported copy-scalar type arguments",
                     "use a flat scalar-backed structure or a supported primitive type",
                 ));
             }
-            ensure_flat_structure_type(
+            ensure_flat_structure_type_from_source_arguments(
                 request,
                 partial,
                 declaration.id,
+                arguments,
                 &mut *aggregate_work,
                 is_cancelled,
             )
@@ -12477,6 +12498,143 @@ fn ensure_flat_structure_type(
     aggregate_work: &mut RuntimeAggregateWork,
     is_cancelled: &dyn Fn() -> bool,
 ) -> RuntimeResult<SemanticTypeId> {
+    ensure_flat_structure_type_specialized(
+        request,
+        partial,
+        declaration,
+        &[],
+        aggregate_work,
+        is_cancelled,
+    )
+}
+
+fn ensure_flat_structure_type_from_source_arguments(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    declaration: DeclarationId,
+    source_arguments: &[wrela_hir::GenericArgument],
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
+    let record = request
+        .hir
+        .as_program()
+        .declaration(declaration)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let DeclarationKind::Structure(aggregate) = &record.kind else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    if source_arguments.len() != aggregate.generics.len() {
+        return Err(runtime_type_diagnostic(
+            request,
+            record.source,
+            "semantic-runtime-generic-structure-argument-count",
+            "runtime generic structure specialization has the wrong number of arguments",
+            "every declared type parameter must receive one exact type argument",
+            "supply one supported copy-scalar type argument for every type parameter",
+        ));
+    }
+    let mut arguments = Vec::new();
+    arguments
+        .try_reserve_exact(source_arguments.len())
+        .map_err(|_| fact_resource(request, "runtime structure arguments"))?;
+    for (generic_id, argument) in aggregate.generics.iter().zip(source_arguments) {
+        charge_runtime_aggregate_lookup(request, &mut *aggregate_work, is_cancelled)?;
+        let generic = request
+            .hir
+            .as_program()
+            .generic_parameter(*generic_id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if generic.owner != declaration
+            || !matches!(
+                generic.kind,
+                wrela_hir::GenericParameterKind::Type { bound: None }
+            )
+        {
+            return Err(runtime_type_diagnostic(
+                request,
+                generic.source,
+                "semantic-runtime-generic-structure-parameter",
+                "runtime generic structure parameter is outside the bounded type-only subset",
+                "constant, region, and bounded type parameters require later specialization semantics",
+                "use an unbounded type parameter specialized with a supported copy scalar",
+            ));
+        }
+        arguments.push(SemanticArgument::Type(generic_structure_scalar_argument(
+            request,
+            partial,
+            argument,
+            aggregate_work,
+            is_cancelled,
+        )?));
+    }
+    ensure_flat_structure_type_specialized(
+        request,
+        partial,
+        declaration,
+        &arguments,
+        aggregate_work,
+        is_cancelled,
+    )
+}
+
+fn generic_structure_scalar_argument(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    argument: &wrela_hir::GenericArgument,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
+    let wrela_hir::GenericArgumentKind::Type(source) = &argument.kind else {
+        return Err(runtime_type_diagnostic(
+            request,
+            argument.source,
+            "semantic-runtime-generic-structure-argument-type",
+            "runtime generic structure argument must be a type",
+            "constant, region, capacity, and unresolved arguments are not runtime type specializations",
+            "supply a primitive boolean, integer, or floating-point type",
+        ));
+    };
+    if !matches!(&source.kind, TypeExpressionKind::Named {
+        definition: Definition::Builtin(_),
+        arguments,
+    } if arguments.is_empty())
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            source.source,
+            "semantic-runtime-generic-structure-argument-type",
+            "runtime generic structure argument is not a supported copy scalar",
+            "nested nominal, generic, view, tuple, and function arguments require later monomorphization semantics",
+            "use bool, an integer type, or f32/f64",
+        ));
+    }
+    let ty = semantic_type_from_source(request, partial, source, aggregate_work, is_cancelled)?;
+    let record = partial
+        .types
+        .get(ty.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if !is_stored_copy_scalar_type(record) {
+        return Err(runtime_type_diagnostic(
+            request,
+            source.source,
+            "semantic-runtime-generic-structure-argument-type",
+            "runtime generic structure argument is not a supported stored copy scalar",
+            "unit and non-runtime builtins have no canonical stored field representation",
+            "use bool, an integer type, or f32/f64",
+        ));
+    }
+    Ok(ty)
+}
+
+fn ensure_flat_structure_type_specialized(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    declaration: DeclarationId,
+    semantic_arguments: &[SemanticArgument],
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
     for existing in &partial.types {
         charge_runtime_aggregate_lookup(request, &mut *aggregate_work, is_cancelled)?;
         if matches!(
@@ -12485,7 +12643,7 @@ fn ensure_flat_structure_type(
                 declaration: candidate,
                 arguments,
                 ..
-            } if *candidate == declaration && arguments.is_empty()
+            } if *candidate == declaration && arguments.as_slice() == semantic_arguments
         ) {
             return Ok(existing.id);
         }
@@ -12498,14 +12656,14 @@ fn ensure_flat_structure_type(
     let DeclarationKind::Structure(aggregate) = &record.kind else {
         return Err(AnalysisFailure::RequestMismatch.into());
     };
-    if !aggregate.generics.is_empty() || !aggregate.implements.is_empty() {
+    if aggregate.generics.len() != semantic_arguments.len() || !aggregate.implements.is_empty() {
         return Err(runtime_type_diagnostic(
             request,
             record.source,
             "semantic-runtime-aggregate-not-supported",
             "runtime structure is outside the flat scalar-backed subset",
-            "generic arguments and interface specializations require aggregate monomorphization support",
-            "use a nongeneric structure with scalar fields",
+            "every generic must be specialized exactly and interface specializations require later monomorphization support",
+            "supply supported copy-scalar type arguments and remove interface specializations",
         ));
     }
     if u64::try_from(aggregate.fields.len()).map_or(true, |count| count > request.limits.fact_edges)
@@ -12541,6 +12699,28 @@ fn ensure_flat_structure_type(
                 &mut *aggregate_work,
                 is_cancelled,
             )?,
+            TypeExpressionKind::Named {
+                definition: Definition::Generic(generic),
+                arguments,
+            } if arguments.is_empty() => {
+                let mut position = None;
+                for (index, candidate) in aggregate.generics.iter().enumerate() {
+                    charge_runtime_aggregate_lookup(request, &mut *aggregate_work, is_cancelled)?;
+                    if candidate == generic {
+                        position = Some(index);
+                        break;
+                    }
+                }
+                let Some(position) = position else {
+                    return Err(AnalysisFailure::RequestMismatch.into());
+                };
+                match semantic_arguments.get(position) {
+                    Some(SemanticArgument::Type(ty)) => *ty,
+                    _ => {
+                        return Err(AnalysisFailure::RequestMismatch.into());
+                    }
+                }
+            }
             _ => {
                 return Err(runtime_type_diagnostic(
                     request,
@@ -12556,14 +12736,7 @@ fn ensure_flat_structure_type(
             .types
             .get(field_ty.0 as usize)
             .ok_or(AnalysisFailure::RequestMismatch)?;
-        if field_record.linearity != Linearity::ScalarCopy
-            || !matches!(
-                field_record.kind,
-                SemanticTypeKind::Bool
-                    | SemanticTypeKind::Integer { .. }
-                    | SemanticTypeKind::Float { bits: 32 | 64 }
-            )
-        {
+        if !is_stored_copy_scalar_type(field_record) {
             return Err(runtime_type_diagnostic(
                 request,
                 field.ty.source,
@@ -12613,7 +12786,7 @@ fn ensure_flat_structure_type(
         id,
         kind: SemanticTypeKind::Structure {
             declaration,
-            arguments: Vec::new(),
+            arguments: semantic_arguments.to_vec(),
             fields,
         },
         linearity: if aggregate.copy {
@@ -12626,6 +12799,16 @@ fn ensure_flat_structure_type(
         source: Some(record.source),
     });
     Ok(id)
+}
+
+fn is_stored_copy_scalar_type(record: &SemanticType) -> bool {
+    record.linearity == Linearity::ScalarCopy
+        && matches!(
+            record.kind,
+            SemanticTypeKind::Bool
+                | SemanticTypeKind::Integer { .. }
+                | SemanticTypeKind::Float { bits: 32 | 64 }
+        )
 }
 
 fn ensure_primitive_type(
@@ -27251,6 +27434,218 @@ fn projection_fixture():
             output.diagnostics()
         );
         assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn generic_flat_structure_specializes_copy_scalar_type_arguments() {
+        let source = dot_variant_actor_source(
+            "pub struct Cell[T]:\n    pub value: T\n\nasync fn checkpoint():\n    small: Cell[u8] = Cell(1)\n    wide: Cell[u64] = Cell(2)\n    small_again: Cell[u8] = Cell(3)\n    small_value: u8 = small.value\n    wide_value: u64 = wide.value\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("generic flat-structure specialization should analyze");
+        assert!(
+            output.diagnostics().is_empty(),
+            "copy-scalar generic structures must specialize: {:?}",
+            output.diagnostics()
+        );
+        let successful = output.successful().expect("sealed specialization");
+        let facts = successful.facts();
+        let cell = fixture
+            .fixture
+            .hir
+            .as_program()
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name.as_ref().map(Name::as_str) == Some("Cell"))
+            .expect("Cell declaration")
+            .id;
+        let specializations: Vec<_> = facts
+            .types
+            .iter()
+            .filter(|ty| {
+                matches!(
+                    &ty.kind,
+                    SemanticTypeKind::Structure { declaration, .. } if *declaration == cell
+                )
+            })
+            .collect();
+        assert_eq!(specializations.len(), 2);
+        let matches_specialization = |ty: &SemanticType, bits, size, alignment| {
+            let SemanticTypeKind::Structure {
+                arguments, fields, ..
+            } = &ty.kind
+            else {
+                return false;
+            };
+            let [SemanticArgument::Type(argument)] = arguments.as_slice() else {
+                return false;
+            };
+            facts.types[argument.0 as usize].kind
+                == (SemanticTypeKind::Integer {
+                    signed: false,
+                    bits,
+                    pointer_sized: false,
+                })
+                && fields.as_slice()
+                    == [SemanticField {
+                        name: "value".to_owned(),
+                        ty: *argument,
+                        public: true,
+                    }]
+                && ty.size_upper_bound == Some(size)
+                && ty.alignment_lower_bound == alignment
+        };
+        assert!(
+            specializations
+                .iter()
+                .any(|ty| matches_specialization(ty, 8, 1, 1))
+        );
+        assert!(
+            specializations
+                .iter()
+                .any(|ty| matches_specialization(ty, 64, 8, 8))
+        );
+
+        let mut forged = facts.clone();
+        let forged_cell = forged
+            .types
+            .iter_mut()
+            .find(|ty| {
+                matches!(
+                    &ty.kind,
+                    SemanticTypeKind::Structure { declaration, arguments, .. }
+                        if *declaration == cell && !arguments.is_empty()
+                )
+            })
+            .expect("one specialized Cell type");
+        let SemanticTypeKind::Structure { fields, .. } = &mut forged_cell.kind else {
+            unreachable!("selected structure specialization")
+        };
+        fields[0].public = false;
+        forged
+            .validate_partial_structure()
+            .expect("visibility forgery remains prefix-safe");
+        assert!(
+            forged
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err(),
+            "full sealing must authenticate specialized fields against exact HIR"
+        );
+
+        let mut forged_layout = facts.clone();
+        let (specialization_index, scalar_index) = forged_layout
+            .types
+            .iter()
+            .enumerate()
+            .find_map(|(index, ty)| {
+                let SemanticTypeKind::Structure {
+                    declaration,
+                    arguments,
+                    ..
+                } = &ty.kind
+                else {
+                    return None;
+                };
+                let [SemanticArgument::Type(argument)] = arguments.as_slice() else {
+                    return None;
+                };
+                (*declaration == cell
+                    && matches!(
+                        forged_layout
+                            .types
+                            .get(argument.0 as usize)
+                            .map(|ty| &ty.kind),
+                        Some(SemanticTypeKind::Integer {
+                            signed: false,
+                            bits: 8,
+                            pointer_sized: false,
+                        })
+                    ))
+                .then_some((index, argument.0 as usize))
+            })
+            .expect("u8 Cell specialization");
+        forged_layout.types[scalar_index].size_upper_bound = Some(2);
+        forged_layout.types[scalar_index].alignment_lower_bound = 2;
+        forged_layout.types[specialization_index].size_upper_bound = Some(2);
+        forged_layout.types[specialization_index].alignment_lower_bound = 2;
+        forged_layout
+            .validate_partial_structure()
+            .expect("coupled scalar and specialization layout forgery remains prefix-safe");
+        assert!(
+            forged_layout
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err(),
+            "full sealing must derive primitive and specialized layouts independently"
+        );
+    }
+
+    #[test]
+    fn generic_flat_structure_rejects_constant_parameters_by_name() {
+        let source = dot_variant_actor_source(
+            "pub struct Fixed[const N: u8]:\n    pub value: u8\n\nasync fn checkpoint():\n    fixed: Fixed[1] = Fixed(1)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("constant generic structures should fail with a source diagnostic");
+        assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-runtime-generic-structure-parameter")
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn generic_flat_structure_rejects_nominal_type_arguments_by_name() {
+        let source = dot_variant_actor_source(
+            "pub struct Payload:\n    pub word: u8\n\npub struct Cell[T]:\n    pub value: T\n\nasync fn checkpoint():\n    item: Cell[Payload] = Cell(Payload(1))\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("nominal generic arguments should fail with a source diagnostic");
+        assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-runtime-generic-structure-argument-type")
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn generic_flat_structure_constructor_requires_expected_specialization() {
+        let source = dot_variant_actor_source(
+            "pub struct Cell[T]:\n    pub value: T\n\nasync fn checkpoint():\n    Cell(1)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("unconstrained generic construction should fail with a source diagnostic");
+        assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-runtime-generic-structure-inference-required")
+        );
+        assert!(output.has_errors());
     }
 
     #[test]

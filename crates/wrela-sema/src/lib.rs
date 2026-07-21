@@ -1584,6 +1584,13 @@ impl PartialAnalysis {
                     "semantic type is invalid or contains a dangling reference",
                 ));
             }
+            if matches!(ty.kind, SemanticTypeKind::Structure { .. })
+                && !exact_flat_structure_type_matches(self, hir.as_program(), ty)
+            {
+                return Err(invalid(
+                    "semantic structure type differs from its exact HIR specialization",
+                ));
+            }
         }
         for value in &self.values {
             if value.function.0 as usize >= self.functions.len()
@@ -3286,8 +3293,10 @@ fn validate_exact_expression_fact(
                     SemanticTypeKind::Structure {
                         declaration,
                         arguments,
+                        fields,
                         ..
-                    } if *declaration == source.declaration && arguments.is_empty()
+                    } if *declaration == source.declaration
+                        && runtime_structure_arguments_supported(analysis, arguments, fields)
                 )
             }) => {}
         (
@@ -4104,7 +4113,9 @@ fn exact_flat_constructor_matches(
     else {
         return Ok(false);
     };
-    if !type_arguments.is_empty() || arguments.len() != fields.len() {
+    if !runtime_structure_arguments_supported(analysis, type_arguments, fields)
+        || arguments.len() != fields.len()
+    {
         return Ok(false);
     }
     let callee_matches = program.expression(callee).is_some_and(|expression| {
@@ -4211,7 +4222,7 @@ fn exact_flat_field_matches(
         SemanticTypeKind::Structure {
             arguments, fields, ..
         } => {
-            if !arguments.is_empty() {
+            if !runtime_structure_arguments_supported(analysis, arguments, fields) {
                 return Ok(false);
             }
             let Some(field) = fields.get(index as usize) else {
@@ -4764,6 +4775,134 @@ fn exact_runtime_source_type(
         });
     let result = matches.next()?.id;
     matches.next().is_none().then_some(result)
+}
+
+fn exact_flat_structure_type_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    semantic: &SemanticType,
+) -> bool {
+    let SemanticTypeKind::Structure {
+        declaration,
+        arguments,
+        fields,
+    } = &semantic.kind
+    else {
+        return false;
+    };
+    let Some(source) = program.declaration(*declaration) else {
+        return false;
+    };
+    let wrela_hir::DeclarationKind::Structure(aggregate) = &source.kind else {
+        return false;
+    };
+    if semantic.source != Some(source.source)
+        || !aggregate.implements.is_empty()
+        || aggregate.generics.len() != arguments.len()
+        || aggregate.fields.len() != fields.len()
+        || !runtime_structure_arguments_supported(analysis, arguments, fields)
+    {
+        return false;
+    }
+    for (generic_id, argument) in aggregate.generics.iter().zip(arguments) {
+        let Some(generic) = program.generic_parameter(*generic_id) else {
+            return false;
+        };
+        if generic.owner != *declaration
+            || !matches!(
+                generic.kind,
+                wrela_hir::GenericParameterKind::Type { bound: None }
+            )
+            || !matches!(argument, SemanticArgument::Type(ty)
+                if exact_stored_copy_scalar_layout(analysis, *ty).is_some())
+        {
+            return false;
+        }
+    }
+
+    let mut size = 0_u64;
+    let mut alignment = 1_u32;
+    for (source_field, semantic_field) in aggregate.fields.iter().zip(fields) {
+        if source_field.default.is_some()
+            || !source_field.attributes.is_empty()
+            || semantic_field.name != source_field.name.as_str()
+            || semantic_field.public != (source_field.visibility != wrela_hir::Visibility::Private)
+        {
+            return false;
+        }
+        let expected = match &source_field.ty.kind {
+            wrela_hir::TypeExpressionKind::Named {
+                definition: wrela_hir::Definition::Builtin(_),
+                arguments,
+            } if arguments.is_empty() => exact_scalar_source_type(analysis, &source_field.ty),
+            wrela_hir::TypeExpressionKind::Named {
+                definition: wrela_hir::Definition::Generic(generic),
+                arguments: source_arguments,
+            } if source_arguments.is_empty() => aggregate
+                .generics
+                .iter()
+                .position(|candidate| candidate == generic)
+                .and_then(|position| arguments.get(position))
+                .and_then(|argument| match argument {
+                    SemanticArgument::Type(ty) => Some(*ty),
+                    SemanticArgument::Constant(_) | SemanticArgument::Region(_) => None,
+                }),
+            _ => None,
+        };
+        if expected != Some(semantic_field.ty) {
+            return false;
+        }
+        let Some((field_size, field_alignment)) =
+            exact_stored_copy_scalar_layout(analysis, semantic_field.ty)
+        else {
+            return false;
+        };
+        let Some(mask) = u64::from(field_alignment).checked_sub(1) else {
+            return false;
+        };
+        let Some(aligned) = size.checked_add(mask).map(|value| value & !mask) else {
+            return false;
+        };
+        let Some(next) = aligned.checked_add(field_size) else {
+            return false;
+        };
+        size = next;
+        alignment = alignment.max(field_alignment);
+    }
+    let Some(mask) = u64::from(alignment).checked_sub(1) else {
+        return false;
+    };
+    let Some(size) = size.checked_add(mask).map(|value| value & !mask) else {
+        return false;
+    };
+    semantic.linearity
+        == if aggregate.copy {
+            Linearity::ScalarCopy
+        } else {
+            Linearity::ExplicitCopy
+        }
+        && semantic.size_upper_bound == Some(size)
+        && semantic.alignment_lower_bound == alignment
+}
+
+fn exact_stored_copy_scalar_layout(
+    analysis: &PartialAnalysis,
+    ty: SemanticTypeId,
+) -> Option<(u64, u32)> {
+    let record = analysis.types.get(ty.0 as usize)?;
+    if record.linearity != Linearity::ScalarCopy || record.source.is_some() {
+        return None;
+    }
+    let bytes = match record.kind {
+        SemanticTypeKind::Bool => 1_u64,
+        SemanticTypeKind::Integer { bits, .. } => u64::from(bits.div_ceil(8)),
+        SemanticTypeKind::Float { bits: 32 } => 4,
+        SemanticTypeKind::Float { bits: 64 } => 8,
+        _ => return None,
+    };
+    let alignment = u32::try_from(bytes).ok()?;
+    (record.size_upper_bound == Some(bytes) && record.alignment_lower_bound == alignment)
+        .then_some((bytes, alignment))
 }
 
 fn exact_integer_kind(
@@ -6271,6 +6410,30 @@ fn valid_semantic_type(ty: &SemanticType, analysis: &PartialAnalysis, graph: &Im
     }
 }
 
+fn stored_copy_scalar_type(analysis: &PartialAnalysis, ty: SemanticTypeId) -> bool {
+    analysis.types.get(ty.0 as usize).is_some_and(|record| {
+        record.linearity == Linearity::ScalarCopy
+            && matches!(
+                record.kind,
+                SemanticTypeKind::Bool
+                    | SemanticTypeKind::Integer { .. }
+                    | SemanticTypeKind::Float { bits: 32 | 64 }
+            )
+    })
+}
+
+fn runtime_structure_arguments_supported(
+    analysis: &PartialAnalysis,
+    arguments: &[SemanticArgument],
+    fields: &[SemanticField],
+) -> bool {
+    arguments.iter().all(|argument| {
+        matches!(argument, SemanticArgument::Type(ty) if stored_copy_scalar_type(analysis, *ty))
+    }) && fields
+        .iter()
+        .all(|field| stored_copy_scalar_type(analysis, field.ty))
+}
+
 fn valid_fields(fields: &[SemanticField], type_count: usize) -> bool {
     unique_nonempty(fields.iter().map(|field| field.name.as_str()))
         && fields
@@ -6422,7 +6585,12 @@ fn valid_expression_resolution(
             .types
             .get(ty.0 as usize)
             .is_some_and(|record| match (&record.kind, variant) {
-                (SemanticTypeKind::Structure { arguments, .. }, None) => arguments.is_empty(),
+                (
+                    SemanticTypeKind::Structure {
+                        arguments, fields, ..
+                    },
+                    None,
+                ) => runtime_structure_arguments_supported(analysis, arguments, fields),
                 (
                     SemanticTypeKind::Enumeration {
                         arguments,

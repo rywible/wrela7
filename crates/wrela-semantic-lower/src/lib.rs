@@ -1787,6 +1787,11 @@ fn validate_supported_source_type(
             arguments,
             fields,
         } => {
+            if !arguments.is_empty() {
+                return Err(unsupported(
+                    "semantic-generic-structure-lowering-pending (generic structure specialization)",
+                ));
+            }
             matches!(
                 ty.linearity,
                 sema::Linearity::ExplicitCopy | sema::Linearity::ScalarCopy
@@ -15299,6 +15304,52 @@ pub fn boot() -> Image:
             supported_minimum(&facts),
             Err(LowerError::UnsupportedInput {
                 feature: "source function bodies"
+            })
+        ));
+    }
+
+    #[test]
+    fn generic_structure_specialization_stops_at_named_lowering_boundary() {
+        let (image, _target) = analyze_minimum();
+        let mut facts = image.into_facts();
+        let scalar = sema::SemanticTypeId(
+            u32::try_from(facts.types.len()).expect("fixture semantic type count"),
+        );
+        facts.types.push(sema::SemanticType {
+            id: scalar,
+            kind: sema::SemanticTypeKind::Integer {
+                signed: false,
+                bits: 32,
+                pointer_sized: false,
+            },
+            linearity: sema::Linearity::ScalarCopy,
+            size_upper_bound: Some(4),
+            alignment_lower_bound: 4,
+            source: Some(span(0, 0, 1)),
+        });
+        let specialization = sema::SemanticType {
+            id: sema::SemanticTypeId(
+                u32::try_from(facts.types.len()).expect("fixture semantic type count"),
+            ),
+            kind: sema::SemanticTypeKind::Structure {
+                declaration: DeclarationId(0),
+                arguments: vec![sema::SemanticArgument::Type(scalar)],
+                fields: vec![sema::SemanticField {
+                    name: "value".to_owned(),
+                    ty: scalar,
+                    public: true,
+                }],
+            },
+            linearity: sema::Linearity::ExplicitCopy,
+            size_upper_bound: Some(4),
+            alignment_lower_bound: 4,
+            source: Some(span(0, 0, 1)),
+        };
+
+        assert!(matches!(
+            validate_supported_source_type(&specialization, &facts),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-generic-structure-lowering-pending (generic structure specialization)"
             })
         ));
     }
