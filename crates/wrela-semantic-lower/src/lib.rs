@@ -128,8 +128,9 @@ pub trait SemanticLowerer {
 /// descriptor identities and emit codec-sealed guest protocol frames around
 /// real source test calls. Bounded stateless app/service graphs retain exact
 /// actor turns, static task entries, mailbox/frame regions, direct async waits,
-/// and their ownership/capacity/cleanup proofs. Other actor messaging, async
-/// test scheduling, scopes, devices, pools, and artifacts remain explicit
+/// and their ownership/capacity/cleanup proofs. Pass-only free-call scopes are
+/// retained through exact normal-exit SemanticWir cleanup markers. Other actor messaging, async
+/// test scheduling, scope abnormal exits, devices, pools, and artifacts remain explicit
 /// rejections until their operation-level lowering exists.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CanonicalSemanticLowerer;
@@ -210,6 +211,27 @@ struct ActorImageFacts<'a> {
     entry: &'a sema::FunctionInstance,
     constructor: wrela_hir::DeclarationId,
     wait_proof: sema::ProofId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScopeActivationLowering {
+    statement: wrela_hir::StatementId,
+    protocol: sema::ScopeProtocolId,
+    scope: wir::ScopeId,
+}
+
+#[derive(Debug)]
+struct ScopeLoweringContext {
+    activations: Vec<ScopeActivationLowering>,
+}
+
+impl ScopeLoweringContext {
+    fn activation(&self, statement: wrela_hir::StatementId) -> Option<ScopeActivationLowering> {
+        self.activations
+            .iter()
+            .find(|activation| activation.statement == statement)
+            .copied()
+    }
 }
 
 fn supported_input<'a>(
@@ -557,11 +579,7 @@ fn supported_actor_image<'a>(
     {
         return Err(unsupported("test metadata in actor images"));
     }
-    if !facts.scope_protocols.is_empty() || !facts.scope_activations.is_empty() {
-        return Err(unsupported(
-            "semantic-with-cleanup-lowering-pending (scope protocols and activations in actor images)",
-        ));
-    }
+    validate_actor_scope_subset(input, is_cancelled)?;
     if !facts.projection_protocols.is_empty() || !facts.lexical_views.is_empty() {
         return Err(unsupported(
             "semantic-projection-lowering-pending (projection protocols in actor images)",
@@ -634,6 +652,174 @@ fn supported_actor_image<'a>(
         constructor,
         wait_proof,
     })
+}
+
+fn validate_actor_scope_subset(
+    input: &AnalyzedImage,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), LowerError> {
+    let facts = input.facts();
+    if facts.scope_protocols.is_empty() && facts.scope_activations.is_empty() {
+        return Ok(());
+    }
+    if facts.scope_protocols.is_empty() || facts.scope_activations.is_empty() {
+        return Err(LowerError::InternalInvariant(
+            "scope protocols and activations are not a closed pair".to_owned(),
+        ));
+    }
+    if facts.scope_protocols.len() != 1 {
+        return Err(unsupported(
+            "semantic-scope-protocol-lowering-pending (multiple scope protocols)",
+        ));
+    }
+    let program = input.hir().as_program();
+    for protocol in &facts.scope_protocols {
+        check_cancelled(is_cancelled)?;
+        let source = program
+            .declaration(protocol.declaration)
+            .and_then(|declaration| match &declaration.kind {
+                wrela_hir::DeclarationKind::Scope(scope) => Some(scope),
+                _ => None,
+            })
+            .ok_or(LowerError::MissingSemanticFact {
+                subject: protocol.name.clone(),
+                fact: "free-call scope declaration",
+            })?;
+        if !protocol.parameters.is_empty() || source.parameters.len() != 1 {
+            return Err(unsupported(
+                "semantic-scope-parameter-lowering-pending (parameterized acquisition)",
+            ));
+        }
+        if protocol.abort.is_some() {
+            return Err(unsupported(
+                "semantic-with-abnormal-cleanup-lowering-pending (scope abort phase)",
+            ));
+        }
+        if protocol.suspend_safe
+            || protocol.abort_effects.0 != 0
+            || protocol.exit_effects.0 != 0
+            || !scope_body_is_pass_only(program, protocol.setup)
+            || !scope_body_is_pass_only(program, protocol.exit)
+        {
+            return Err(unsupported(
+                "semantic-scope-cleanup-form-lowering-pending (non-pass scope phase)",
+            ));
+        }
+    }
+    for activation in &facts.scope_activations {
+        check_cancelled(is_cancelled)?;
+        let statement =
+            program
+                .statement(activation.statement)
+                .ok_or(LowerError::MissingSemanticFact {
+                    subject: "scope activation".to_owned(),
+                    fact: "with statement",
+                })?;
+        let wrela_hir::StatementKind::With { body, region, .. } = statement.kind else {
+            return Err(LowerError::InternalInvariant(
+                "scope activation no longer names a with statement".to_owned(),
+            ));
+        };
+        if region.is_some() {
+            return Err(unsupported(
+                "semantic-with-region-lowering-pending (branded scope region)",
+            ));
+        }
+        let function = facts
+            .functions
+            .get(activation.function.0 as usize)
+            .filter(|function| function.id == activation.function)
+            .ok_or(LowerError::MissingSemanticFact {
+                subject: "scope activation".to_owned(),
+                fact: "owning function",
+            })?;
+        if !matches!(function.role, sema::FunctionRole::ActorTurn(_)) {
+            return Err(unsupported(
+                "semantic-with-owner-lowering-pending (non-actor source function)",
+            ));
+        }
+        validate_scope_normal_body(facts, program, activation.function, body, is_cancelled)?;
+    }
+    Ok(())
+}
+
+fn scope_body_is_pass_only(program: &wrela_hir::Program, body: wrela_hir::BodyId) -> bool {
+    program.body(body).is_some_and(|body| {
+        body.statements.iter().all(|statement| {
+            program
+                .statement(*statement)
+                .is_some_and(|statement| matches!(statement.kind, wrela_hir::StatementKind::Pass))
+        })
+    })
+}
+
+fn validate_scope_normal_body(
+    facts: &sema::PartialAnalysis,
+    program: &wrela_hir::Program,
+    function: sema::FunctionInstanceId,
+    root: wrela_hir::BodyId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), LowerError> {
+    let mut pending = vec![root];
+    while let Some(body) = pending.pop() {
+        check_cancelled(is_cancelled)?;
+        let body = program.body(body).ok_or(LowerError::MissingSemanticFact {
+            subject: "scope activation".to_owned(),
+            fact: "with body",
+        })?;
+        for statement in &body.statements {
+            check_cancelled(is_cancelled)?;
+            let effects = facts
+                .statements
+                .binary_search_by_key(&(function, *statement), |fact| {
+                    (fact.function, fact.statement)
+                })
+                .ok()
+                .and_then(|index| facts.statements.get(index))
+                .map(|fact| fact.effects)
+                .ok_or(LowerError::MissingSemanticFact {
+                    subject: "scope activation".to_owned(),
+                    fact: "with body statement effects",
+                })?;
+            if effects.0 & (sema::EffectSet::SUSPEND | sema::EffectSet::MAY_FAIL) != 0 {
+                return Err(unsupported(
+                    "semantic-with-abnormal-cleanup-lowering-pending (await, failure, or question exit)",
+                ));
+            }
+            match &program
+                .statement(*statement)
+                .ok_or(LowerError::MissingSemanticFact {
+                    subject: "scope activation".to_owned(),
+                    fact: "with body statement",
+                })?
+                .kind
+            {
+                wrela_hir::StatementKind::Return(_)
+                | wrela_hir::StatementKind::Break
+                | wrela_hir::StatementKind::Continue => {
+                    return Err(unsupported(
+                        "semantic-with-abnormal-cleanup-lowering-pending (early control-flow exit)",
+                    ));
+                }
+                wrela_hir::StatementKind::With { body, .. }
+                | wrela_hir::StatementKind::While { body, .. }
+                | wrela_hir::StatementKind::Loop { body }
+                | wrela_hir::StatementKind::For { body, .. } => pending.push(*body),
+                wrela_hir::StatementKind::If {
+                    branches,
+                    else_body,
+                } => {
+                    pending.extend(branches.iter().map(|(_, body)| *body));
+                    pending.extend(*else_body);
+                }
+                wrela_hir::StatementKind::Match { arms, .. } => {
+                    pending.extend(arms.iter().map(|arm| arm.body));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_actor_source_type(
@@ -2620,12 +2806,194 @@ fn lower_minimum(
     })
 }
 
+fn lower_scope_context(
+    actor: &ActorImageFacts<'_>,
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<ScopeLoweringContext, LowerError> {
+    let mut activations = try_vec(
+        actor.facts.scope_activations.len(),
+        "SemanticWir scope activations",
+        limits.model_edges,
+    )?;
+    for (index, activation) in actor.facts.scope_activations.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        if activation.statement.0 as usize >= actor.input.hir().as_program().statements.len() {
+            return Err(LowerError::MissingSemanticFact {
+                subject: "scope activation".to_owned(),
+                fact: "with statement",
+            });
+        }
+        activations.push(ScopeActivationLowering {
+            statement: activation.statement,
+            protocol: activation.protocol,
+            scope: wir::ScopeId(u32::try_from(index).map_err(|_| LowerError::ResourceLimit {
+                resource: "SemanticWir scope activations",
+                limit: limits.model_edges,
+            })?),
+        });
+    }
+    Ok(ScopeLoweringContext { activations })
+}
+
+fn lower_scope_plans_and_helpers(
+    actor: &ActorImageFacts<'_>,
+    context: &ScopeLoweringContext,
+    functions: &mut Vec<wir::SemanticFunction>,
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<wir::ScopePlan>, LowerError> {
+    let mut exit_functions = try_vec(
+        actor.facts.scope_protocols.len(),
+        "SemanticWir scope exit functions",
+        limits.model_edges,
+    )?;
+    for protocol in &actor.facts.scope_protocols {
+        check_cancelled(is_cancelled)?;
+        let source = actor
+            .input
+            .hir()
+            .as_program()
+            .body(protocol.exit)
+            .map(|body| body.source)
+            .ok_or(LowerError::MissingSemanticFact {
+                subject: protocol.name.clone(),
+                fact: "scope exit body",
+            })?;
+        let function_id = wir::FunctionId(u32::try_from(functions.len()).map_err(|_| {
+            LowerError::ResourceLimit {
+                resource: "SemanticWir functions",
+                limit: u64::from(limits.functions),
+            }
+        })?);
+        let parameter = wir::ValueId(0);
+        let helper = wir::SemanticFunction {
+            id: function_id,
+            // This bounded slice admits exactly one scope protocol. Reuse the
+            // already authenticated build-profile SHA-256 as its synthetic
+            // helper identity, and fail closed below on any function-key
+            // collision instead of inventing an unauthenticated digest.
+            instance_key: actor.facts.build.profile,
+            name: copy_text(
+                &format!("{}.__scope_exit", protocol.name),
+                limits.payload_bytes,
+            )?,
+            origin: wir::FunctionOrigin::Source,
+            role: wir::FunctionRole::Cleanup,
+            color: wir::FunctionColor::Sync,
+            parameters: vec![parameter],
+            result: wir::TypeId(0),
+            values: vec![wir::SemanticValue {
+                id: parameter,
+                ty: wir::TypeId(protocol.result.0),
+                origin: Some(source),
+                name: Some("state".to_owned()),
+            }],
+            body: wir::SemanticRegion {
+                parameters: vec![parameter],
+                statements: vec![wir::SemanticStatement::Return(Vec::new())],
+            },
+            effects: wir::EffectSet(0),
+            proofs: vec![wir::ProofId(protocol.proof.0)],
+            source: Some(source),
+            stack_bound: 0,
+            frame_bound: 0,
+            uninterrupted_bound: Some(1),
+            recursive_depth_bound: Some(1),
+        };
+        if functions
+            .iter()
+            .any(|function| function.instance_key == helper.instance_key)
+        {
+            return Err(unsupported("semantic-scope-cleanup-helper-key-collision"));
+        }
+        push_bounded_id(
+            functions,
+            helper,
+            "SemanticWir functions",
+            u64::from(limits.functions),
+        )?;
+        exit_functions.push(function_id);
+    }
+
+    let mut scopes = try_vec(
+        actor.facts.scope_activations.len(),
+        "SemanticWir scope plans",
+        limits.model_edges,
+    )?;
+    for (index, activation) in actor.facts.scope_activations.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        let lowered = context
+            .activation(activation.statement)
+            .filter(|lowered| lowered.scope.0 as usize == index)
+            .ok_or_else(|| {
+                LowerError::InternalInvariant(
+                    "scope activation lowering identity changed".to_owned(),
+                )
+            })?;
+        let protocol = actor
+            .facts
+            .scope_protocols
+            .get(activation.protocol.0 as usize)
+            .filter(|protocol| protocol.id == activation.protocol)
+            .ok_or(LowerError::MissingSemanticFact {
+                subject: "scope activation".to_owned(),
+                fact: "scope protocol",
+            })?;
+        let mut dependencies = try_vec(
+            activation.cleanup_dependencies.len(),
+            "SemanticWir scope dependencies",
+            limits.model_edges,
+        )?;
+        for dependency in &activation.cleanup_dependencies {
+            check_cancelled(is_cancelled)?;
+            dependencies.push(
+                context
+                    .activation(*dependency)
+                    .map(|activation| activation.scope)
+                    .ok_or(LowerError::MissingSemanticFact {
+                        subject: protocol.name.clone(),
+                        fact: "scope cleanup dependency",
+                    })?,
+            );
+        }
+        scopes.push(wir::ScopePlan {
+            id: lowered.scope,
+            name: copy_text(&protocol.name, limits.payload_bytes)?,
+            state_type: wir::TypeId(activation.state_type.0),
+            abort: None,
+            exit: *exit_functions.get(activation.protocol.0 as usize).ok_or(
+                LowerError::MissingSemanticFact {
+                    subject: protocol.name.clone(),
+                    fact: "scope exit helper",
+                },
+            )?,
+            suspend_safe: false,
+            dependencies,
+            reverse_source_order: activation.reverse_source_order,
+            cleanup_proof: wir::ProofId(activation.proof.0),
+            source: actor
+                .input
+                .hir()
+                .as_program()
+                .statement(activation.statement)
+                .map(|statement| statement.source)
+                .ok_or(LowerError::MissingSemanticFact {
+                    subject: protocol.name.clone(),
+                    fact: "with statement source",
+                })?,
+        });
+    }
+    Ok(scopes)
+}
+
 fn lower_actor_image(
     actor: &ActorImageFacts<'_>,
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(SemanticWir, LoweringReport), LowerError> {
     check_cancelled(is_cancelled)?;
+    let scope_context = lower_scope_context(actor, limits, is_cancelled)?;
     let types = lower_actor_types(actor.input, limits, is_cancelled)?;
     let mut proofs = lower_proofs(actor.facts, limits, is_cancelled)?;
     if proofs.get(actor.wait_proof.0 as usize).is_none_or(|proof| {
@@ -2648,7 +3016,13 @@ fn lower_actor_image(
         let (lowered, function_operations) = if function.id == actor.entry.id {
             (lower_actor_entry_function(actor, limits, is_cancelled)?, 0)
         } else {
-            lower_source_function(actor.input, function, limits, is_cancelled)?
+            lower_source_function(
+                actor.input,
+                function,
+                Some(&scope_context),
+                limits,
+                is_cancelled,
+            )?
         };
         if lowered.id.0 as usize != functions.len() {
             return Err(unsupported("noncanonical actor function identity order"));
@@ -2685,6 +3059,8 @@ fn lower_actor_image(
         }
         functions.push(lowered);
     }
+    let scopes =
+        lower_scope_plans_and_helpers(actor, &scope_context, &mut functions, limits, is_cancelled)?;
     let actors = lower_actor_instances(actor.graph, limits, is_cancelled)?;
     let tasks = lower_task_instances(actor.graph, limits, is_cancelled)?;
     let mut regions = lower_actor_regions(actor.graph, limits, is_cancelled)?;
@@ -2760,7 +3136,7 @@ fn lower_actor_image(
         pools: Vec::new(),
         regions,
         activations,
-        scopes: Vec::new(),
+        scopes,
         proofs,
         tests: Vec::new(),
         compiled_test_group: None,
@@ -3940,6 +4316,7 @@ fn actor_reachable_declarations(
         .functions
         .len()
         .checked_add(actor.facts.types.len())
+        .and_then(|count| count.checked_add(actor.facts.scope_protocols.len()))
         .and_then(|count| count.checked_add(1))
         .ok_or(LowerError::ResourceLimit {
             resource: "actor reachable declarations",
@@ -3958,6 +4335,10 @@ fn actor_reachable_declarations(
         if let sema::SemanticTypeKind::Class { declaration, .. } = ty.kind {
             declarations.push(declaration);
         }
+    }
+    for protocol in &actor.facts.scope_protocols {
+        check_cancelled(is_cancelled)?;
+        declarations.push(protocol.declaration);
     }
     cancellable_sort(
         &mut declarations,
@@ -4518,7 +4899,7 @@ fn lower_generated_tests(
             continue;
         }
         let (lowered, operations) =
-            lower_source_function(generated.input, function, limits, is_cancelled)?;
+            lower_source_function(generated.input, function, None, limits, is_cancelled)?;
         source_operations =
             source_operations
                 .checked_add(operations)
@@ -4731,6 +5112,7 @@ fn lower_proofs(
 fn lower_source_function(
     input: &AnalyzedImage,
     function: &sema::FunctionInstance,
+    scope_context: Option<&ScopeLoweringContext>,
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(wir::SemanticFunction, u64), LowerError> {
@@ -4758,7 +5140,8 @@ fn lower_source_function(
         ));
     }
 
-    let (values, value_map) = lower_source_values(input.facts(), function, limits, is_cancelled)?;
+    let (mut values, value_map) =
+        lower_source_values(input.facts(), function, limits, is_cancelled)?;
     let mut parameters = try_vec(
         function.parameters.len(),
         "SemanticWir function parameters",
@@ -4812,6 +5195,7 @@ fn lower_source_function(
     let mut lowerer = SourceFunctionLowerer {
         input,
         function,
+        scope_context,
         root_body: body,
         value_map: &value_map,
         limits,
@@ -4822,6 +5206,11 @@ fn lower_source_function(
         operations: 0,
         statement_edges: 0,
         aggregate_name_work: 0,
+        next_value: u32::try_from(values.len()).map_err(|_| LowerError::ResourceLimit {
+            resource: "SemanticWir source values",
+            limit: limits.values,
+        })?,
+        synthetic_values: Vec::new(),
     };
     let mut local_state = SourceLocalState::empty(input.hir().as_program().locals.len(), limits)?;
     let mut lowered_body = lowerer.lower_body(body, 1, &mut local_state)?;
@@ -4891,6 +5280,7 @@ fn lower_source_function(
     body_parameters.extend_from_slice(&parameters);
     lowered_body.parameters = body_parameters;
     lowerer.validate_exact_closure()?;
+    values.append(&mut lowerer.synthetic_values);
 
     let mut function_proofs = try_vec(
         function.proofs.len(),
@@ -5169,6 +5559,12 @@ enum SourceStatementPlan {
         condition: wrela_hir::ExpressionId,
         body: wrela_hir::BodyId,
     },
+    With {
+        value: wrela_hir::ExpressionId,
+        binding: Option<wrela_hir::LocalId>,
+        body: wrela_hir::BodyId,
+        activation: ScopeActivationLowering,
+    },
     Break,
     Continue,
 }
@@ -5241,6 +5637,7 @@ struct InlineIfInput {
 struct SourceFunctionLowerer<'a> {
     input: &'a AnalyzedImage,
     function: &'a sema::FunctionInstance,
+    scope_context: Option<&'a ScopeLoweringContext>,
     root_body: wrela_hir::BodyId,
     value_map: &'a SourceValueMap,
     limits: LoweringLimits,
@@ -5251,6 +5648,8 @@ struct SourceFunctionLowerer<'a> {
     operations: u64,
     statement_edges: u64,
     aggregate_name_work: u64,
+    next_value: u32,
+    synthetic_values: Vec<wir::SemanticValue>,
 }
 
 struct SourceLocalState {
@@ -5283,6 +5682,14 @@ impl SourceLocalState {
             LowerError::InternalInvariant("source local SSA slot is missing".to_owned())
         })?;
         *slot = Some(value);
+        Ok(())
+    }
+
+    fn set_empty(&mut self, local: wrela_hir::LocalId) -> Result<(), LowerError> {
+        let slot = self.values.get_mut(local.0 as usize).ok_or_else(|| {
+            LowerError::InternalInvariant("source local SSA slot is missing".to_owned())
+        })?;
+        *slot = None;
         Ok(())
     }
 }
@@ -5484,6 +5891,20 @@ impl SourceFunctionLowerer<'_> {
                             body: *body,
                         }
                     }
+                    wrela_hir::StatementKind::With {
+                        value,
+                        binding,
+                        region: None,
+                        body,
+                    } => SourceStatementPlan::With {
+                        value: *value,
+                        binding: *binding,
+                        body: *body,
+                        activation: self
+                            .scope_context
+                            .and_then(|context| context.activation(statement_id))
+                            .ok_or_else(|| self.fact_mismatch("scope activation plan"))?,
+                    },
                     wrela_hir::StatementKind::Break => SourceStatementPlan::Break,
                     wrela_hir::StatementKind::Continue => SourceStatementPlan::Continue,
                     _ => {
@@ -5536,6 +5957,11 @@ impl SourceFunctionLowerer<'_> {
                 }
                 SourceStatementPlan::While { condition, body } => {
                     let mut effects = self.expression_fact(*condition)?.effects;
+                    effects.0 |= self.body_statement_effects(*body)?.0;
+                    effects
+                }
+                SourceStatementPlan::With { value, body, .. } => {
+                    let mut effects = self.expression_fact(*value)?.effects;
                     effects.0 |= self.body_statement_effects(*body)?.0;
                     effects
                 }
@@ -6281,6 +6707,82 @@ impl SourceFunctionLowerer<'_> {
                         },
                     )?;
                 }
+                SourceStatementPlan::With {
+                    value,
+                    binding,
+                    body,
+                    activation,
+                } => {
+                    let state = match binding {
+                        Some(local) => {
+                            let [definition] = statement_definitions.as_slice() else {
+                                return Err(self.fact_mismatch("with binding definition"));
+                            };
+                            if definition.local != local
+                                || self.expression_fact(value)?.result != Some(definition.value)
+                                || local_state.get(local).is_some()
+                            {
+                                return Err(self.fact_mismatch("with binding identity"));
+                            }
+                            local_state.set(local, definition.value)?;
+                            self.lower_scope_acquisition(
+                                value,
+                                activation,
+                                self.value_map.get(definition.value)?,
+                                &mut statements,
+                            )?
+                        }
+                        None => {
+                            if !statement_definitions.is_empty() {
+                                return Err(self.fact_mismatch("unbound with definitions"));
+                            }
+                            let result = self
+                                .expression_fact(value)?
+                                .result
+                                .ok_or_else(|| self.fact_mismatch("with acquisition result"))?;
+                            self.lower_scope_acquisition(
+                                value,
+                                activation,
+                                self.value_map.get(result)?,
+                                &mut statements,
+                            )?
+                        }
+                    };
+                    let mut lowered_body = self.lower_body(body, depth + 1, local_state)?;
+                    if lowered_body.statements.iter().any(|statement| {
+                        matches!(
+                            statement,
+                            wir::SemanticStatement::Return(_)
+                                | wir::SemanticStatement::Break(_)
+                                | wir::SemanticStatement::Continue(_)
+                        )
+                    }) {
+                        return Err(unsupported(
+                            "semantic-with-abnormal-cleanup-lowering-pending (lowered early exit)",
+                        ));
+                    }
+                    for nested in lowered_body.statements.drain(..) {
+                        self.push_statement(&mut statements, nested)?;
+                    }
+                    self.push_effect(
+                        &mut statements,
+                        wir::SemanticOperation::CommitScope {
+                            scope: activation.scope,
+                            value: state,
+                        },
+                        Some(statement_source),
+                    )?;
+                    self.push_effect(
+                        &mut statements,
+                        wir::SemanticOperation::ExitScope {
+                            scope: activation.scope,
+                        },
+                        Some(statement_source),
+                    )?;
+                    if let Some(local) = binding {
+                        local_state.set_empty(local)?;
+                    }
+                }
                 SourceStatementPlan::Break | SourceStatementPlan::Continue => {
                     if !statement_definitions.is_empty() {
                         return Err(self.fact_mismatch("loop control definitions"));
@@ -6480,6 +6982,203 @@ impl SourceFunctionLowerer<'_> {
             parameters: Vec::new(),
             statements,
         })
+    }
+
+    fn lower_scope_acquisition(
+        &mut self,
+        expression_id: wrela_hir::ExpressionId,
+        activation: ScopeActivationLowering,
+        result: wir::ValueId,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<wir::ValueId, LowerError> {
+        check_cancelled(self.is_cancelled)?;
+        self.push_seen_expression(expression_id)?;
+        let program = self.input.hir().as_program();
+        let expression = program
+            .expression(expression_id)
+            .ok_or_else(|| self.fact_mismatch("scope acquisition expression"))?;
+        let wrela_hir::ExpressionKind::Call { callee, arguments } = &expression.kind else {
+            return Err(self.fact_mismatch("scope acquisition call"));
+        };
+        if !arguments.is_empty() {
+            return Err(unsupported(
+                "semantic-scope-parameter-lowering-pending (parameterized acquisition)",
+            ));
+        }
+        let (fact_ty, fact_result, fact_protocol, bindings_empty) = {
+            let fact = self.expression_fact(expression_id)?;
+            let sema::ExpressionResolution::ScopeCall {
+                protocol,
+                arguments: bindings,
+            } = &fact.resolution
+            else {
+                return Err(self.fact_mismatch("scope call resolution"));
+            };
+            (fact.ty, fact.result, *protocol, bindings.is_empty())
+        };
+        if fact_protocol != activation.protocol
+            || !bindings_empty
+            || fact_result
+                .map(|value| self.value_map.get(value))
+                .transpose()?
+                != Some(result)
+        {
+            return Err(self.fact_mismatch("scope call activation identity"));
+        }
+        self.push_seen_expression(*callee)?;
+        if !matches!(
+            self.expression_fact(*callee)?.resolution,
+            sema::ExpressionResolution::Scope(protocol) if protocol == activation.protocol
+        ) {
+            return Err(self.fact_mismatch("scope callee identity"));
+        }
+        let protocol = self
+            .input
+            .facts()
+            .scope_protocols
+            .get(activation.protocol.0 as usize)
+            .filter(|protocol| protocol.id == activation.protocol && protocol.result == fact_ty)
+            .ok_or_else(|| self.fact_mismatch("scope protocol result"))?;
+        let enter = program
+            .expression(protocol.enter)
+            .ok_or_else(|| self.fact_mismatch("scope enter expression"))?;
+        let wrela_hir::ExpressionKind::Call {
+            callee: constructor,
+            arguments: initializers,
+        } = &enter.kind
+        else {
+            return Err(unsupported(
+                "semantic-scope-enter-lowering-pending (non-aggregate state)",
+            ));
+        };
+        let declaration = program
+            .expression(*constructor)
+            .and_then(|constructor| match &constructor.kind {
+                wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(
+                    declaration,
+                )) => program.declaration(declaration.declaration),
+                _ => None,
+            })
+            .ok_or_else(|| self.fact_mismatch("scope state constructor"))?;
+        let wrela_hir::DeclarationKind::Structure(source_structure) = &declaration.kind else {
+            return Err(self.fact_mismatch("scope state structure"));
+        };
+        let semantic_fields = self
+            .input
+            .facts()
+            .types
+            .get(fact_ty.0 as usize)
+            .and_then(|ty| match &ty.kind {
+                sema::SemanticTypeKind::Structure {
+                    declaration: candidate,
+                    arguments,
+                    fields,
+                } if *candidate == declaration.id && arguments.is_empty() => Some(fields),
+                _ => None,
+            })
+            .ok_or_else(|| self.fact_mismatch("scope state semantic structure"))?;
+        if semantic_fields.len() != source_structure.fields.len()
+            || initializers.len() != semantic_fields.len()
+        {
+            return Err(self.fact_mismatch("scope state field arity"));
+        }
+        let mut fields = try_vec(
+            semantic_fields.len(),
+            "SemanticWir scope state fields",
+            self.limits.model_edges,
+        )?;
+        for (source_index, initializer) in initializers.iter().enumerate() {
+            check_cancelled(self.is_cancelled)?;
+            let field_index = initializer
+                .name
+                .as_ref()
+                .and_then(|name| {
+                    source_structure
+                        .fields
+                        .iter()
+                        .position(|field| field.name == *name)
+                })
+                .unwrap_or(source_index);
+            let semantic_field = semantic_fields
+                .get(field_index)
+                .ok_or_else(|| self.fact_mismatch("scope state field index"))?;
+            let wrela_hir::CallArgumentValue::Value(value) = initializer.value else {
+                return Err(self.fact_mismatch("scope state field access"));
+            };
+            let literal = program
+                .expression(value)
+                .and_then(|expression| match &expression.kind {
+                    wrela_hir::ExpressionKind::Literal(literal) => {
+                        Some((literal, expression.source))
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    unsupported(
+                        "semantic-scope-enter-lowering-pending (nested or parameter state field)",
+                    )
+                })?;
+            let constant = lower_scope_literal(self.input.facts(), semantic_field.ty, literal.0)?;
+            let field_value = self.allocate_synthetic_value(semantic_field.ty, literal.1)?;
+            self.push_let(
+                statements,
+                field_value,
+                wir::SemanticOperation::Constant(constant),
+                Some(literal.1),
+            )?;
+            fields.push(field_value);
+        }
+        self.push_let(
+            statements,
+            result,
+            wir::SemanticOperation::Aggregate {
+                ty: wir::TypeId(fact_ty.0),
+                fields,
+            },
+            Some(enter.source),
+        )?;
+        self.push_effect(
+            statements,
+            wir::SemanticOperation::EnterScope {
+                scope: activation.scope,
+                state: result,
+            },
+            Some(expression.source),
+        )?;
+        Ok(result)
+    }
+
+    fn allocate_synthetic_value(
+        &mut self,
+        ty: sema::SemanticTypeId,
+        source: Span,
+    ) -> Result<wir::ValueId, LowerError> {
+        if u64::from(self.next_value) >= self.limits.values {
+            return Err(LowerError::ResourceLimit {
+                resource: "SemanticWir scope state values",
+                limit: self.limits.values,
+            });
+        }
+        let id = wir::ValueId(self.next_value);
+        self.next_value = self
+            .next_value
+            .checked_add(1)
+            .ok_or(LowerError::ResourceLimit {
+                resource: "SemanticWir scope state values",
+                limit: self.limits.values,
+            })?;
+        push_bounded_id(
+            &mut self.synthetic_values,
+            wir::SemanticValue {
+                id,
+                ty: wir::TypeId(ty.0),
+                origin: Some(source),
+                name: None,
+            },
+            "SemanticWir scope state values",
+            self.limits.values,
+        )?;
+        Ok(id)
     }
 
     fn lower_expression(
@@ -9260,6 +9959,64 @@ fn lower_constant(constant: &sema::ConstantValue) -> Result<wir::Constant, Lower
     }
 }
 
+fn lower_scope_literal(
+    facts: &sema::PartialAnalysis,
+    ty: sema::SemanticTypeId,
+    literal: &wrela_hir::Literal,
+) -> Result<wir::Constant, LowerError> {
+    let kind = facts
+        .types
+        .get(ty.0 as usize)
+        .map(|ty| &ty.kind)
+        .ok_or_else(|| unsupported("scope state literal type"))?;
+    match (literal, kind) {
+        (wrela_hir::Literal::Unit, sema::SemanticTypeKind::Unit) => Ok(wir::Constant::Unit),
+        (wrela_hir::Literal::Boolean(value), sema::SemanticTypeKind::Bool) => {
+            Ok(wir::Constant::Bool(*value))
+        }
+        (
+            wrela_hir::Literal::Integer(source),
+            sema::SemanticTypeKind::Integer {
+                signed: false,
+                bits,
+                ..
+            },
+        ) => Ok(wir::Constant::Unsigned {
+            bits: u8::try_from(*bits).map_err(|_| unsupported("scope integer constant width"))?,
+            value: parse_integer(source)
+                .ok_or_else(|| unsupported("scope unsigned integer constant"))?,
+        }),
+        (
+            wrela_hir::Literal::Integer(source),
+            sema::SemanticTypeKind::Integer {
+                signed: true, bits, ..
+            },
+        ) => Ok(wir::Constant::Signed {
+            bits: u8::try_from(*bits).map_err(|_| unsupported("scope integer constant width"))?,
+            value: parse_integer(source)
+                .and_then(|value| i128::try_from(value).ok())
+                .ok_or_else(|| unsupported("scope signed integer constant"))?,
+        }),
+        (wrela_hir::Literal::Float(source), sema::SemanticTypeKind::Float { bits: 32 }) => {
+            let value = parse_source_float(source)
+                .and_then(|source| source.parse::<f32>().ok())
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| unsupported("scope finite f32 constant"))?;
+            Ok(wir::Constant::Float32(value.to_bits()))
+        }
+        (wrela_hir::Literal::Float(source), sema::SemanticTypeKind::Float { bits: 64 }) => {
+            let value = parse_source_float(source)
+                .and_then(|source| source.parse::<f64>().ok())
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| unsupported("scope finite f64 constant"))?;
+            Ok(wir::Constant::Float64(value.to_bits()))
+        }
+        _ => Err(unsupported(
+            "semantic-scope-enter-lowering-pending (non-scalar state field)",
+        )),
+    }
+}
+
 fn constant_matches_literal(
     facts: &sema::PartialAnalysis,
     ty: sema::SemanticTypeId,
@@ -11321,6 +12078,7 @@ fn semantic_actor_wir_matches(
         || left.tasks.len() != right.tasks.len()
         || left.regions.len() != right.regions.len()
         || left.activations.len() != right.activations.len()
+        || left.scopes.len() != right.scopes.len()
         || left.proofs.len() != right.proofs.len()
         || left.startup_order.len() != right.startup_order.len()
         || left.shutdown_order.len() != right.shutdown_order.len()
@@ -11330,14 +12088,18 @@ fn semantic_actor_wir_matches(
         || !right.devices.is_empty()
         || !left.pools.is_empty()
         || !right.pools.is_empty()
-        || !left.scopes.is_empty()
-        || !right.scopes.is_empty()
         || !left.tests.is_empty()
         || !right.tests.is_empty()
         || left.compiled_test_group.is_some()
         || right.compiled_test_group.is_some()
     {
         return Ok(false);
+    }
+    for (left, right) in left.scopes.iter().zip(&right.scopes) {
+        check_cancelled(is_cancelled)?;
+        if left != right {
+            return Ok(false);
+        }
     }
     for (left, right) in left.types.iter().zip(&right.types) {
         check_cancelled(is_cancelled)?;
@@ -11862,6 +12624,30 @@ fn actor_operations_match(
                 proof: rp,
             },
         ) => la == ra && lr == rr && lv == rv && lp == rp,
+        (
+            wir::SemanticOperation::EnterScope {
+                scope: left_scope,
+                state: left_state,
+            },
+            wir::SemanticOperation::EnterScope {
+                scope: right_scope,
+                state: right_state,
+            },
+        ) => left_scope == right_scope && left_state == right_state,
+        (
+            wir::SemanticOperation::CommitScope {
+                scope: left_scope,
+                value: left_value,
+            },
+            wir::SemanticOperation::CommitScope {
+                scope: right_scope,
+                value: right_value,
+            },
+        ) => left_scope == right_scope && left_value == right_value,
+        (
+            wir::SemanticOperation::ExitScope { scope: left },
+            wir::SemanticOperation::ExitScope { scope: right },
+        ) => left == right,
         _ => false,
     })
 }
@@ -12244,6 +13030,34 @@ pub fn boot() -> Image:
     installed = img.service(Worker, mailbox=2)
     return img
 "#;
+    const PASS_ONLY_SCOPE_ACTOR_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Masked:
+    token: u32
+
+scope irqs_masked() -> Masked:
+    enter Masked(token=1)
+    exit state:
+        pass
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        with irqs_masked() as mask:
+            pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#;
 
     struct Fixture {
         hir: Arc<ValidatedProgram>,
@@ -12253,6 +13067,10 @@ pub fn boot() -> Image:
 
     fn analyze_parsed_actor() -> wrela_sema::AnalyzedImage {
         analyze_parsed_actor_source(BOUNDED_ACTOR_SOURCE)
+    }
+
+    fn analyze_pass_only_scope_actor() -> wrela_sema::AnalyzedImage {
+        analyze_parsed_actor_source(PASS_ONLY_SCOPE_ACTOR_SOURCE)
     }
 
     fn analyze_parsed_actor_source(application_source: &str) -> wrela_sema::AnalyzedImage {
@@ -17213,28 +18031,246 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn scope_semantics_stop_at_named_cleanup_lowering_boundary() {
-        let (image, _target) = analyze_minimum();
-        let mut facts = image.into_facts();
-        facts.scope_protocols.push(sema::ScopeProtocol {
-            id: sema::ScopeProtocolId(0),
-            declaration: DeclarationId(0),
-            name: "synthetic_scope_boundary".to_owned(),
-            parameters: Vec::new(),
-            result: sema::SemanticTypeId(0),
-            setup: BodyId(0),
-            enter: ExpressionId(0),
-            abort: None,
-            exit: BodyId(0),
-            suspend_safe: false,
-            abort_effects: sema::EffectSet(0),
-            exit_effects: sema::EffectSet(0),
-            proof: sema::ProofId(0),
+    fn free_scope_normal_exit_lowers_exact_semantic_cleanup_sequence() {
+        let image = analyze_pass_only_scope_actor();
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("pass-only free scope should lower through SemanticWir");
+        let wir = lowered.wir().as_wir();
+        let [scope] = wir.scopes.as_slice() else {
+            panic!("one exact scope activation plan")
+        };
+        assert_eq!(scope.name, "irqs_masked");
+        assert!(scope.dependencies.is_empty());
+        assert_eq!(scope.reverse_source_order, 0);
+        assert_eq!(
+            wir.functions[scope.exit.0 as usize].role,
+            wir::FunctionRole::Cleanup
+        );
+
+        let turn = wir
+            .functions
+            .iter()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .expect("actor turn containing the scope");
+        let operations: Vec<_> = turn
+            .body
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(statement) => Some(&statement.operation),
+                _ => None,
+            })
+            .collect();
+        let enter = operations.iter().position(|operation| {
+            matches!(operation, wir::SemanticOperation::EnterScope { scope: id, .. } if *id == scope.id)
         });
+        let commit = operations.iter().position(|operation| {
+            matches!(operation, wir::SemanticOperation::CommitScope { scope: id, .. } if *id == scope.id)
+        });
+        let exit = operations.iter().position(|operation| {
+            matches!(operation, wir::SemanticOperation::ExitScope { scope: id } if *id == scope.id)
+        });
+        assert!(
+            matches!((enter, commit, exit), (Some(enter), Some(commit), Some(exit)) if enter < commit && commit < exit)
+        );
+
+        let mut forged = wir.clone();
+        forged.scopes[0].cleanup_proof = wir::ProofId(0);
         assert!(matches!(
-            supported_minimum(&facts),
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                forged,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn nested_free_scopes_preserve_proved_reverse_cleanup_order() {
+        let source = PASS_ONLY_SCOPE_ACTOR_SOURCE.replace(
+            "        with irqs_masked() as mask:\n            pass",
+            "        with irqs_masked() as outer:\n            with irqs_masked() as inner:\n                pass",
+        );
+        let image = analyze_parsed_actor_source(&source);
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("nested pass-only scopes should lower");
+        let wir = lowered.wir().as_wir();
+        assert_eq!(wir.scopes.len(), 2);
+        assert!(wir.scopes[0].dependencies.is_empty());
+        assert_eq!(wir.scopes[1].dependencies, [wir::ScopeId(0)]);
+        assert_eq!(wir.scopes[0].reverse_source_order, 0);
+        assert_eq!(wir.scopes[1].reverse_source_order, 1);
+        let turn = wir
+            .functions
+            .iter()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .expect("actor turn");
+        let markers: Vec<_> = turn
+            .body
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::EnterScope { scope, .. },
+                    ..
+                }) => Some(("enter", *scope)),
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::CommitScope { scope, .. },
+                    ..
+                }) => Some(("commit", *scope)),
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::ExitScope { scope },
+                    ..
+                }) => Some(("exit", *scope)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            markers,
+            [
+                ("enter", wir::ScopeId(1)),
+                ("enter", wir::ScopeId(0)),
+                ("commit", wir::ScopeId(0)),
+                ("exit", wir::ScopeId(0)),
+                ("commit", wir::ScopeId(1)),
+                ("exit", wir::ScopeId(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn scope_lowering_has_exact_operation_limit_and_late_cancellation() {
+        let image = analyze_pass_only_scope_actor();
+        let baseline = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("scope lowering baseline");
+        let exact_operations = baseline.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact scope operation limit");
+        let mut one_under = exact;
+        one_under.operations = exact_operations - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == exact_operations - 1
+        ));
+
+        let polls = Cell::new(0_u64);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            )
+            .expect("count exact scope cancellation polls");
+        let cancel_at = polls.get();
+        let polls = Cell::new(0_u64);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next == cancel_at
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), cancel_at);
+    }
+
+    #[test]
+    fn scope_lowering_tails_fail_closed_by_name() {
+        let parameterized = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub struct Masked:
+    token: u32
+
+scope irqs_masked(token: u32) -> Masked:
+    enter Masked(token=token)
+    exit state:
+        pass
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        with irqs_masked(1) as mask:
+            pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: parameterized,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
             Err(LowerError::UnsupportedInput {
-                feature: "semantic-with-cleanup-lowering-pending (scope protocols and activations)"
+                feature: "semantic-scope-parameter-lowering-pending (parameterized acquisition)",
             })
         ));
     }

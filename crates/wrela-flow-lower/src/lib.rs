@@ -417,10 +417,14 @@ fn supported_actor_image<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<ActorImageSemantic<'a>, LowerError> {
+    if !input.scopes.is_empty() {
+        return Err(unsupported(
+            "flow-scope-cleanup-lowering-pending (normal-exit cleanup calls)",
+        ));
+    }
     if !input.globals.is_empty()
         || !input.devices.is_empty()
         || !input.pools.is_empty()
-        || !input.scopes.is_empty()
         || !input.tests.is_empty()
         || input.compiled_test_group.is_some()
         || input.actors.is_empty()
@@ -7462,7 +7466,8 @@ mod contract_tests {
     use super::{
         CanonicalFlowLowerer, FlowLowerer, LowerError, LowerRequest, LoweringLimits,
         LoweringReport, actor_flow_program_matches, lower_proof_kind,
-        measure_actor_flow_output_resources, preflight_input, seal, supported_source_value_type,
+        measure_actor_flow_output_resources, preflight_input, seal, supported_actor_image,
+        supported_source_value_type,
     };
     use wrela_build_model::{BuildIdentity, LanguageRevision, Sha256Digest, TargetIdentity};
     use wrela_flow_wir as flow;
@@ -9724,6 +9729,29 @@ mod contract_tests {
         assert!(matches!(
             seal(&request, wrong_owner, report, diagnostics, &|| false),
             Err(LowerError::InvalidOutput(_))
+        ));
+    }
+
+    #[test]
+    fn semantic_scope_plans_stop_at_named_flow_cleanup_boundary() {
+        let mut input = actor_fixture().into_wir();
+        input.scopes.push(semantic::ScopePlan {
+            id: semantic::ScopeId(0),
+            name: "irqs_masked".to_owned(),
+            state_type: semantic::TypeId(1),
+            abort: None,
+            exit: semantic::FunctionId(3),
+            suspend_safe: false,
+            dependencies: Vec::new(),
+            reverse_source_order: 0,
+            cleanup_proof: semantic::ProofId(2),
+            source: span(0, 50, 60),
+        });
+        assert!(matches!(
+            supported_actor_image(&input, LoweringLimits::standard(), &|| false),
+            Err(LowerError::UnsupportedInput {
+                feature: "flow-scope-cleanup-lowering-pending (normal-exit cleanup calls)",
+            })
         ));
     }
 
