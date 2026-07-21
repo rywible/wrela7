@@ -9736,6 +9736,493 @@ fn infer_generic_function_arguments(
     Ok(arguments)
 }
 
+fn method_is_visible_from(
+    program: &wrela_hir::Program,
+    method: DeclarationId,
+    caller_module: wrela_package::ModuleId,
+) -> bool {
+    let Some(record) = program.declaration(method) else {
+        return false;
+    };
+    if record.module == caller_module {
+        return true;
+    }
+    let wrela_hir::DeclarationOwner::Declaration(owner) = record.owner else {
+        return false;
+    };
+    match program.declaration(owner).map(|record| &record.kind) {
+        Some(DeclarationKind::Structure(_)) => record.visibility == wrela_hir::Visibility::Public,
+        Some(DeclarationKind::Implementation(implementation)) => {
+            let visible_nominal = |ty: &wrela_hir::TypeExpression| {
+                let TypeExpressionKind::Named {
+                    definition: Definition::Declaration(resolved),
+                    arguments,
+                } = &ty.kind
+                else {
+                    return false;
+                };
+                arguments.is_empty()
+                    && program
+                        .declaration(resolved.declaration)
+                        .is_some_and(|record| record.visibility == wrela_hir::Visibility::Public)
+            };
+            visible_nominal(&implementation.interface)
+                && visible_nominal(&implementation.implementing_type)
+        }
+        _ => false,
+    }
+}
+
+fn method_caller_module(
+    partial: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    caller: FunctionInstanceId,
+) -> Option<wrela_package::ModuleId> {
+    let FunctionOrigin::Source { declaration, .. } =
+        partial.functions.get(caller.0 as usize)?.origin
+    else {
+        return None;
+    };
+    program.declaration(declaration).map(|record| record.module)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_concrete_method_call(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    call: RuntimeDirectCall<'_>,
+    receiver_expression: ExpressionId,
+    method_name: &wrela_hir::Name,
+    expression_request: RuntimeExpressionRequest,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<RuntimeExpression> {
+    let program = request.hir.as_program();
+    let receiver_source = program
+        .expression(receiver_expression)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if !matches!(
+        receiver_source.kind,
+        ExpressionKind::Reference(Definition::Local(_) | Definition::Parameter(_))
+    ) {
+        return Err(runtime_type_diagnostic(
+            request,
+            receiver_source.source,
+            "semantic-method-call-receiver-expression-pending",
+            "method receiver is not a live named local or parameter",
+            "the concrete method-call substrate does not extend receiver authority through temporaries, fields, indexes, or associated names",
+            "bind the complete receiver value to a local before calling a read-receiver method",
+        ));
+    }
+    let receiver = analyze_runtime_expression(
+        request,
+        partial,
+        function,
+        receiver_expression,
+        RuntimeExpressionRequest {
+            expected: None,
+            desired_result: None,
+            access: AccessMode::Read,
+        },
+        state,
+        is_cancelled,
+    )?;
+    let receiver_value = receiver
+        .referenced
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let receiver_declaration = match partial
+        .types
+        .get(receiver.ty.0 as usize)
+        .map(|record| &record.kind)
+    {
+        Some(SemanticTypeKind::Structure {
+            declaration,
+            arguments,
+            fields,
+        }) if arguments.is_empty()
+            && fields.iter().all(|field| {
+                partial
+                    .types
+                    .get(field.ty.0 as usize)
+                    .is_some_and(is_stored_copy_scalar_type)
+            }) =>
+        {
+            *declaration
+        }
+        _ => {
+            return Err(runtime_type_diagnostic(
+                request,
+                receiver_source.source,
+                "semantic-method-call-not-found",
+                "no concrete read-receiver method applies to this value",
+                "this increment resolves methods only on nongeneric flat stored-copy structures",
+                "call a free function or use a supported concrete structure receiver",
+            ));
+        }
+    };
+    if let Some(DeclarationKind::Structure(structure)) = program
+        .declaration(receiver_declaration)
+        .map(|record| &record.kind)
+    {
+        for member in &structure.members {
+            check_cancelled(is_cancelled)?;
+            let Some(member) = program.declaration(*member) else {
+                continue;
+            };
+            if member.name.as_ref() != Some(method_name) {
+                continue;
+            }
+            match member.kind {
+                DeclarationKind::Projection(_) => {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        call.source,
+                        "semantic-projection-receiver-call-pending",
+                        "receiver projection calls are not yet supported",
+                        "projection protocols retain a distinct lexical-view contract and take precedence over ordinary method lookup",
+                        "use a supported free projection until receiver projection binding lands",
+                    ));
+                }
+                DeclarationKind::Scope(_) => {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        call.source,
+                        "semantic-with-receiver-scope-pending",
+                        "receiver-form scope acquisition is not yet supported",
+                        "scope protocols retain a distinct cleanup contract and take precedence over ordinary method lookup",
+                        "use a supported free scope until receiver scope binding lands",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    let caller_module =
+        method_caller_module(partial, program, function).ok_or(AnalysisFailure::RequestMismatch)?;
+    let mut candidates = Vec::new();
+    for declaration in &program.declarations {
+        check_cancelled(is_cancelled)?;
+        if declaration.name.as_ref() != Some(method_name)
+            || !matches!(declaration.kind, DeclarationKind::Function(_))
+            || crate::interfaces::receiver_concrete_struct(program, declaration.id)
+                != Some(receiver_declaration)
+            || !method_is_visible_from(program, declaration.id, caller_module)
+        {
+            continue;
+        }
+        candidates
+            .try_reserve(1)
+            .map_err(|_| fact_resource(request, "method-call candidates"))?;
+        candidates.push(declaration.id);
+    }
+    let target_declaration = match candidates.as_slice() {
+        [] => {
+            return Err(runtime_type_diagnostic(
+                request,
+                call.source,
+                "semantic-method-call-not-found",
+                "no visible method with this name applies to the receiver",
+                "method lookup considers visible inherent members and concrete interface implementations",
+                "declare one visible read-receiver method or correct the method name",
+            ));
+        }
+        [target] => *target,
+        _ => {
+            let mut diagnostic = Diagnostic::error(
+                Category::TYPE,
+                call.source,
+                "more than one visible method with this name applies to the receiver",
+            );
+            diagnostic.code = Some("semantic-method-call-ambiguous".to_owned());
+            diagnostic.help.push(
+                "rename one method or call an unambiguous free function until qualified method selection is specified"
+                    .to_owned(),
+            );
+            return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
+        }
+    };
+    let target_source = match &program
+        .declaration(target_declaration)
+        .ok_or(AnalysisFailure::RequestMismatch)?
+        .kind
+    {
+        DeclarationKind::Function(source) => source,
+        _ => return Err(AnalysisFailure::RequestMismatch.into()),
+    };
+    if target_source.color != FunctionColor::Sync || !target_source.generics.is_empty() {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-method-call-shape-pending",
+            "generic or asynchronous method calls are not in the concrete method-call substrate",
+            "this increment admits only nongeneric synchronous methods with a concrete receiver",
+            "use a nongeneric synchronous read-receiver method or a supported free call",
+        ));
+    }
+    let receiver_parameter = target_source
+        .parameters
+        .first()
+        .and_then(|parameter| program.parameter(*parameter))
+        .filter(|parameter| parameter.receiver)
+        .ok_or_else(|| {
+            runtime_type_diagnostic(
+                request,
+                call.source,
+                "semantic-method-call-shape-pending",
+                "selected method does not have one leading receiver parameter",
+                "method-call syntax requires the declaration's first parameter to be `self`",
+                "declare a leading `read self` receiver",
+            )
+        })?;
+    if receiver_parameter.access != wrela_hir::AccessMode::Read {
+        return Err(runtime_type_diagnostic(
+            request,
+            receiver_parameter.source,
+            "semantic-method-call-receiver-access-pending",
+            "mutable and take receiver method calls are not yet supported",
+            "the concrete method-call substrate preserves only a shared read loan for the complete call",
+            "use a `read self` method until receiver mutation/take lowering lands",
+        ));
+    }
+    let target = ensure_ordinary_source_function(
+        request,
+        partial,
+        target_declaration,
+        &[],
+        state.allow_assertions,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    if target == function {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-runtime-recursive-call-pending",
+            "recursive runtime method call is outside the bounded subset",
+            "a source method may not re-enter its active analysis instance",
+            "rewrite the recursion as a statically bounded loop or helper",
+        ));
+    }
+    let target_record = partial
+        .functions
+        .get(target.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let target_result = target_record.result;
+    let target_effects = target_record.effects;
+    let target_parameters = target_record.parameters.clone();
+    let Some(receiver_semantic) = target_parameters.first() else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    if receiver_semantic.access != AccessMode::Read || receiver_semantic.ty != receiver.ty {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    let explicit_parameters = target_parameters
+        .get(1..)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let function_ty = ensure_function_type(
+        request,
+        partial,
+        FunctionColor::Sync,
+        explicit_parameters,
+        target_result,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: call.callee,
+            ty: function_ty,
+            result: None,
+            resolution: ExpressionResolution::Function(target),
+            effects: EffectSet(0),
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    if expression_request
+        .expected
+        .is_some_and(|expected| expected != target_result)
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-method-call-result-type",
+            "method result does not match the type required at this call site",
+            "the selected concrete method has one exact declared result type",
+            "change the destination type or call a method with the required result",
+        ));
+    }
+    if call.arguments.len() != explicit_parameters.len() {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-method-call-argument-count",
+            "method call has the wrong number of explicit arguments",
+            "the implicit receiver does not count as a written argument",
+            "supply exactly the method's non-receiver parameters",
+        ));
+    }
+    let mut resolved_arguments =
+        optional_call_map(call.arguments.len(), request.limits.fact_edges)?;
+    let non_receiver_count = explicit_parameters.len();
+    let mut accesses = vec![(receiver_value, AccessMode::Read, receiver_source.source)];
+    for (source_index, argument) in call.arguments.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        let relative_parameter = resolve_declaration_owned_argument(
+            request,
+            explicit_parameters,
+            argument,
+            &resolved_arguments,
+            non_receiver_count,
+            is_cancelled,
+        )?;
+        let parameter_index = relative_parameter
+            .checked_add(1)
+            .ok_or_else(|| fact_resource(request, "method-call parameter index"))?;
+        let parameter = target_parameters
+            .get(parameter_index)
+            .copied()
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let access = match (&argument.value, parameter.access) {
+            (wrela_hir::CallArgumentValue::Value(_), AccessMode::Value | AccessMode::Read) => {
+                parameter.access
+            }
+            (wrela_hir::CallArgumentValue::Exclusive { .. }, expected)
+                if lower_access(argument.access()) == expected =>
+            {
+                expected
+            }
+            _ => {
+                return Err(runtime_diagnostic(
+                    request,
+                    argument.source,
+                    "semantic-access-marker-mismatch",
+                    "call argument access does not match the method parameter contract",
+                    None,
+                    "the source access marker must exactly name the method parameter access",
+                    "change the argument marker to match the declaration",
+                ));
+            }
+        };
+        let outcome = match &argument.value {
+            wrela_hir::CallArgumentValue::Value(value) => analyze_runtime_expression(
+                request,
+                partial,
+                function,
+                *value,
+                RuntimeExpressionRequest {
+                    expected: Some(parameter.ty),
+                    desired_result: None,
+                    access,
+                },
+                state,
+                is_cancelled,
+            )?,
+            wrela_hir::CallArgumentValue::Exclusive { place, .. } => analyze_runtime_place(
+                request,
+                partial,
+                function,
+                place,
+                parameter,
+                state,
+                is_cancelled,
+            )?,
+        };
+        let value = outcome
+            .referenced
+            .or(outcome.result)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if let Some((_, _, previous_source)) = accesses
+            .iter()
+            .find(|previous| previous.0 == value && accesses_conflict(previous.1, access))
+        {
+            let mut diagnostic = runtime_ownership_diagnostic(
+                request,
+                argument.source,
+                "semantic-overlapping-access",
+                "method call requests overlapping exclusive access to its receiver or another argument",
+                runtime_binding_by_value(state.locals, state.parameters, value, is_cancelled)?,
+                "the read receiver remains borrowed for the complete call",
+                "move the argument into a distinct local or use read access only",
+            )?;
+            diagnostic
+                .labels
+                .try_reserve(1)
+                .map_err(|_| fact_resource(request, "method-call ownership labels"))?;
+            diagnostic.labels.insert(
+                0,
+                wrela_diagnostics::Label {
+                    span: *previous_source,
+                    message: "the earlier overlapping access begins here".to_owned(),
+                },
+            );
+            return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
+        }
+        accesses.push((value, access, argument.source));
+        let slot = resolved_arguments
+            .get_mut(relative_parameter)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if slot
+            .replace(ResolvedCallArgument {
+                source_index: u32::try_from(source_index)
+                    .map_err(|_| fact_resource(request, "method-call arguments"))?,
+                parameter_index: u32::try_from(parameter_index)
+                    .map_err(|_| fact_resource(request, "method-call arguments"))?,
+                access,
+                value,
+            })
+            .is_some()
+        {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        }
+    }
+    let mut exact_arguments = Vec::new();
+    exact_arguments
+        .try_reserve_exact(resolved_arguments.len())
+        .map_err(|_| fact_resource(request, "method-call arguments"))?;
+    for argument in resolved_arguments {
+        exact_arguments.push(argument.ok_or(AnalysisFailure::RequestMismatch)?);
+    }
+    let result = expression_result(
+        request,
+        partial,
+        function,
+        (call.expression, call.source),
+        target_result,
+        expression_request.desired_result,
+        is_cancelled,
+    )?;
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: call.expression,
+            ty: target_result,
+            result: Some(result),
+            resolution: ExpressionResolution::MethodCall {
+                function: target,
+                receiver: receiver_value,
+                receiver_access: AccessMode::Read,
+                arguments: exact_arguments,
+            },
+            effects: EffectSet(receiver.effects.0 | target_effects.0),
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    Ok(RuntimeExpression {
+        ty: target_result,
+        result: Some(result),
+        referenced: None,
+        effects: EffectSet(receiver.effects.0 | target_effects.0),
+    })
+}
+
 fn analyze_direct_call(
     request: &AnalysisRequest<'_>,
     partial: &mut PartialAnalysis,
@@ -9778,6 +10265,19 @@ fn analyze_direct_call(
             function,
             call,
             &resolved,
+            expression_request,
+            state,
+            is_cancelled,
+        );
+    }
+    if let ExpressionKind::Field { base, name } = &callee_expression.kind {
+        return analyze_concrete_method_call(
+            request,
+            partial,
+            function,
+            call,
+            *base,
+            name,
             expression_request,
             state,
             is_cancelled,
@@ -28578,6 +29078,183 @@ fn projection_fixture():
             Some("semantic-runtime-recursive-call-pending")
         );
         assert!(output.has_errors());
+    }
+
+    #[test]
+    fn concrete_read_receiver_method_call_is_exactly_sealed() {
+        let source = dot_variant_actor_source(
+            "pub struct Pair:\n    pub left: u32\n    pub right: u32\n\n    pub fn sum(read self, left: u32, right: u32) -> u32:\n        return self.left + left + right\n\n    pub fn difference(read self, left: u32, right: u32) -> u32:\n        return self.left + left - right\n\nasync fn checkpoint():\n    pair: Pair = Pair(left=20, right=22)\n    spare: Pair = Pair(left=1, right=2)\n    total: u32 = pair.sum(left=10, right=12)\n    ignored: u32 = spare.difference(left=4, right=3)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("concrete read-receiver method analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "{:?}",
+            output.diagnostics()
+        );
+        let successful = output.successful().expect("sealed method call");
+        let facts = successful.facts();
+        let method = facts
+            .expressions
+            .iter()
+            .find_map(|fact| match &fact.resolution {
+                ExpressionResolution::MethodCall {
+                    function,
+                    receiver,
+                    receiver_access,
+                    arguments,
+                } if facts.functions[function.0 as usize].name.ends_with("sum") => {
+                    Some((*function, *receiver, *receiver_access, arguments))
+                }
+                _ => None,
+            })
+            .expect("method call fact");
+        assert_eq!(method.2, crate::AccessMode::Read);
+        assert_eq!(method.3.len(), 2);
+        assert_eq!(facts.functions[method.0.0 as usize].parameters.len(), 3);
+
+        let mut forged = facts.clone();
+        let call = forged
+            .expressions
+            .iter_mut()
+            .find_map(|fact| match &mut fact.resolution {
+                ExpressionResolution::MethodCall {
+                    function, receiver, ..
+                } if facts.functions[function.0 as usize].name.ends_with("sum") => Some(receiver),
+                _ => None,
+            })
+            .expect("mutable method call fact");
+        let original = *call;
+        let original_record = facts.values[original.0 as usize].clone();
+        let alternate = facts
+            .values
+            .iter()
+            .find(|value| {
+                value.id != original
+                    && value.function == original_record.function
+                    && value.ty == original_record.ty
+            })
+            .expect("second same-typed receiver value")
+            .id;
+        *call = alternate;
+        forged
+            .validate_partial_structure()
+            .expect("receiver forgery stays prefix-valid");
+        assert!(
+            forged
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err()
+        );
+
+        let difference = facts
+            .functions
+            .iter()
+            .find(|function| function.name.ends_with("difference"))
+            .expect("difference method instance")
+            .id;
+        let mut forged_target = facts.clone();
+        let target = forged_target
+            .expressions
+            .iter_mut()
+            .find_map(|fact| match &mut fact.resolution {
+                ExpressionResolution::MethodCall { function, .. } if *function == method.0 => {
+                    Some(function)
+                }
+                _ => None,
+            })
+            .expect("sum method target");
+        *target = difference;
+        forged_target
+            .validate_partial_structure()
+            .expect("compatible target forgery stays prefix-valid");
+        assert!(
+            forged_target
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn concrete_interface_impl_method_call_analyzes() {
+        let source = dot_variant_actor_source(
+            "pub interface Readable:\n    fn inspect(read self) -> u32\n\npub struct Cell:\n    pub value: u32\n\nimpl Readable for Cell:\n    fn inspect(read self) -> u32:\n        return self.value\n\nasync fn checkpoint():\n    cell: Cell = Cell(7)\n    observed: u32 = cell.inspect()\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("concrete impl method analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "{:?}",
+            output.diagnostics()
+        );
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn method_call_tails_fail_closed_by_name() {
+        let cases = [
+            (
+                "pub struct Cell:\n    pub value: u32\n\n    pub fn inspect[T](read self) -> u32:\n        return self.value\n\nasync fn checkpoint():\n    cell: Cell = Cell(7)\n    cell.inspect()\n    pass\n\n",
+                "semantic-method-call-shape-pending",
+            ),
+            (
+                "pub struct Cell:\n    pub value: u32\n\n    pub fn clear(mut self):\n        pass\n\nasync fn checkpoint():\n    cell: Cell = Cell(7)\n    cell.clear()\n    pass\n\n",
+                "semantic-method-call-receiver-access-pending",
+            ),
+            (
+                "pub struct Cell:\n    pub value: u32\n\n    pub fn consume(take self):\n        pass\n\nasync fn checkpoint():\n    cell: Cell = Cell(7)\n    cell.consume()\n    pass\n\n",
+                "semantic-method-call-receiver-access-pending",
+            ),
+            (
+                "pub struct Cell:\n    pub value: u32\n\n    pub async fn inspect(read self) -> u32:\n        return self.value\n\nasync fn checkpoint():\n    cell: Cell = Cell(7)\n    cell.inspect()\n    pass\n\n",
+                "semantic-method-call-shape-pending",
+            ),
+            (
+                "pub struct Cell:\n    pub value: u32\n\n    pub fn inspect(read self) -> u32:\n        return self.value\n\npub fn make() -> Cell:\n    return Cell(7)\n\nasync fn checkpoint():\n    make().inspect()\n    pass\n\n",
+                "semantic-method-call-receiver-expression-pending",
+            ),
+            (
+                "pub struct Cell:\n    pub value: u32\n\nasync fn checkpoint():\n    cell: Cell = Cell(7)\n    cell.missing()\n    pass\n\n",
+                "semantic-method-call-not-found",
+            ),
+            (
+                "pub struct Cell:\n    pub value: u32\n\n    pub fn inspect(read self) -> u32:\n        return self.value\n\nasync fn checkpoint():\n    cell: Cell = Cell(7)\n    cell.inspect(1)\n    pass\n\n",
+                "semantic-method-call-argument-count",
+            ),
+            (
+                "pub struct Cell:\n    pub value: u32\n\n    pub fn inspect(read self) -> u32:\n        return self.value\n\nasync fn checkpoint():\n    cell: Cell = Cell(7)\n    observed: bool = cell.inspect()\n    pass\n\n",
+                "semantic-method-call-result-type",
+            ),
+            (
+                "pub interface First:\n    fn inspect(read self) -> u32\n\npub interface Second:\n    fn inspect(read self) -> u32\n\npub struct Cell:\n    pub value: u32\n\nimpl First for Cell:\n    fn inspect(read self) -> u32:\n        return self.value\n\nimpl Second for Cell:\n    fn inspect(read self) -> u32:\n        return self.value\n\nasync fn checkpoint():\n    cell: Cell = Cell(7)\n    cell.inspect()\n    pass\n\n",
+                "semantic-method-call-ambiguous",
+            ),
+        ];
+        for (source, expected) in cases {
+            let source = dot_variant_actor_source(source);
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("method tail diagnostic");
+            assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+            assert_eq!(output.diagnostics()[0].code.as_deref(), Some(expected));
+            assert!(output.has_errors());
+        }
     }
 
     #[test]

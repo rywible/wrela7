@@ -712,6 +712,17 @@ pub enum ExpressionResolution {
         /// `parameter_index`; `source_index` indexes the HIR call arguments.
         arguments: Vec<ResolvedCallArgument>,
     },
+    /// A concrete, non-generic method selected from a named local or
+    /// parameter receiver. The receiver is implicit in source argument
+    /// syntax and therefore has its own exact identity/access fields;
+    /// `arguments` contains only the explicitly written arguments and is
+    /// canonical by the target parameter index after the receiver.
+    MethodCall {
+        function: FunctionInstanceId,
+        receiver: ValueId,
+        receiver_access: AccessMode,
+        arguments: Vec<ResolvedCallArgument>,
+    },
     ScopeCall {
         protocol: ScopeProtocolId,
         /// Exact source-to-scope-parameter permutation, canonical by
@@ -3587,6 +3598,14 @@ fn validate_exact_expression_fact(
             *base,
             name,
             *target,
+        ) || exact_concrete_method_reference_matches(
+            analysis,
+            program,
+            function.id,
+            fact,
+            *base,
+            name,
+            *target,
         ) => {}
         (
             wrela_hir::ExpressionKind::Call { callee, arguments },
@@ -3602,6 +3621,26 @@ fn validate_exact_expression_fact(
             *callee,
             arguments,
             *target,
+            bindings,
+        ) => {}
+        (
+            wrela_hir::ExpressionKind::Call { callee, arguments },
+            ExpressionResolution::MethodCall {
+                function: target,
+                receiver,
+                receiver_access,
+                arguments: bindings,
+            },
+            Some(_),
+        ) if exact_method_call_bindings_match(
+            analysis,
+            program,
+            function,
+            *callee,
+            arguments,
+            *target,
+            *receiver,
+            *receiver_access,
             bindings,
         ) => {}
         (
@@ -5848,6 +5887,206 @@ fn exact_call_bindings_match(
         })
 }
 
+fn exact_method_is_visible_from(
+    program: &wrela_hir::Program,
+    method: DeclarationId,
+    caller_module: wrela_package::ModuleId,
+) -> bool {
+    let Some(record) = program.declaration(method) else {
+        return false;
+    };
+    if record.module == caller_module {
+        return true;
+    }
+    let wrela_hir::DeclarationOwner::Declaration(owner) = record.owner else {
+        return false;
+    };
+    match program.declaration(owner).map(|record| &record.kind) {
+        Some(wrela_hir::DeclarationKind::Structure(_)) => {
+            record.visibility == wrela_hir::Visibility::Public
+        }
+        Some(wrela_hir::DeclarationKind::Implementation(implementation)) => {
+            let visible_nominal = |ty: &wrela_hir::TypeExpression| {
+                let wrela_hir::TypeExpressionKind::Named {
+                    definition: wrela_hir::Definition::Declaration(resolved),
+                    arguments,
+                } = &ty.kind
+                else {
+                    return false;
+                };
+                arguments.is_empty()
+                    && program
+                        .declaration(resolved.declaration)
+                        .is_some_and(|record| record.visibility == wrela_hir::Visibility::Public)
+            };
+            visible_nominal(&implementation.interface)
+                && visible_nominal(&implementation.implementing_type)
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_method_call_bindings_match(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    caller: &FunctionInstance,
+    callee_expression: ExpressionId,
+    source_arguments: &[wrela_hir::CallArgument],
+    target: FunctionInstanceId,
+    receiver: ValueId,
+    receiver_access: AccessMode,
+    bindings: &[ResolvedCallArgument],
+) -> bool {
+    let Some(wrela_hir::Expression {
+        kind: wrela_hir::ExpressionKind::Field { base, name },
+        ..
+    }) = program.expression(callee_expression)
+    else {
+        return false;
+    };
+    let Some(receiver_fact) = exact_child_expression(analysis, caller.id, *base) else {
+        return false;
+    };
+    if receiver_fact.resolution != ExpressionResolution::Value(receiver) {
+        return false;
+    }
+    let Some(SemanticTypeKind::Structure {
+        declaration: receiver_declaration,
+        arguments: receiver_arguments,
+        fields: receiver_fields,
+    }) = analysis
+        .types
+        .get(receiver_fact.ty.0 as usize)
+        .map(|record| &record.kind)
+    else {
+        return false;
+    };
+    if !receiver_arguments.is_empty()
+        || !runtime_structure_arguments_supported(analysis, receiver_arguments, receiver_fields)
+    {
+        return false;
+    }
+    let Some(target_function) = analysis.functions.get(target.0 as usize) else {
+        return false;
+    };
+    let FunctionOrigin::Source {
+        declaration: target_declaration,
+        ..
+    } = target_function.origin
+    else {
+        return false;
+    };
+    let FunctionOrigin::Source {
+        declaration: caller_declaration,
+        ..
+    } = caller.origin
+    else {
+        return false;
+    };
+    let Some(caller_module) = program
+        .declaration(caller_declaration)
+        .map(|record| record.module)
+    else {
+        return false;
+    };
+    let unique_visible_target = program
+        .declarations
+        .iter()
+        .filter(|candidate| {
+            candidate.name.as_ref() == Some(name)
+                && matches!(candidate.kind, wrela_hir::DeclarationKind::Function(_))
+                && crate::interfaces::receiver_concrete_struct(program, candidate.id)
+                    == Some(*receiver_declaration)
+                && exact_method_is_visible_from(program, candidate.id, caller_module)
+        })
+        .try_fold(None, |selected, candidate| match selected {
+            None => Ok(Some(candidate.id)),
+            Some(_) => Err(()),
+        });
+    if unique_visible_target != Ok(Some(target_declaration))
+        || target_function.color != wrela_hir::FunctionColor::Sync
+        || !target_function.generic_arguments.is_empty()
+        || receiver_access != AccessMode::Read
+        || target_function.parameters.len() != bindings.len().saturating_add(1)
+        || source_arguments.len() != bindings.len()
+    {
+        return false;
+    }
+    let Some(receiver_parameter) = target_function.parameters.first() else {
+        return false;
+    };
+    if receiver_parameter.access != receiver_access
+        || receiver_parameter.ty != receiver_fact.ty
+        || analysis
+            .values
+            .get(receiver.0 as usize)
+            .is_none_or(|value| value.function != caller.id || value.ty != receiver_parameter.ty)
+    {
+        return false;
+    }
+    bindings
+        .iter()
+        .enumerate()
+        .all(|(relative_index, binding)| {
+            let parameter_index = relative_index + 1;
+            let Some(source) = source_arguments.get(binding.source_index as usize) else {
+                return false;
+            };
+            let Some(parameter) = target_function.parameters.get(parameter_index) else {
+                return false;
+            };
+            let name_matches = match &source.name {
+                Some(name) => {
+                    program
+                        .parameter(parameter.parameter)
+                        .and_then(|parameter| parameter.name.as_ref())
+                        == Some(name)
+                }
+                None => binding.source_index as usize == relative_index,
+            };
+            binding.parameter_index as usize == parameter_index
+                && name_matches
+                && exact_call_argument_access(source, binding.access)
+                && binding.access == parameter.access
+                && analysis
+                    .values
+                    .get(binding.value.0 as usize)
+                    .is_some_and(|value| value.function == caller.id && value.ty == parameter.ty)
+                && match &source.value {
+                    wrela_hir::CallArgumentValue::Value(expression) => {
+                        exact_child_expression(analysis, caller.id, *expression).is_some_and(
+                            |fact| {
+                                fact.result == Some(binding.value)
+                                    || fact.resolution == ExpressionResolution::Value(binding.value)
+                            },
+                        )
+                    }
+                    wrela_hir::CallArgumentValue::Exclusive { place, .. } => {
+                        place.projections.is_empty()
+                            && analysis
+                                .values
+                                .get(binding.value.0 as usize)
+                                .is_some_and(|value| {
+                                    matches!(
+                                        (&place.root, &value.origin),
+                                        (
+                                            wrela_hir::Definition::Local(source),
+                                            SemanticValueOrigin::Local(candidate)
+                                        ) if source == candidate
+                                    ) || matches!(
+                                        (&place.root, &value.origin),
+                                        (
+                                            wrela_hir::Definition::Parameter(source),
+                                            SemanticValueOrigin::Parameter(candidate)
+                                        ) if source == candidate
+                                    )
+                                })
+                    }
+                }
+        })
+}
+
 fn exact_call_argument_access(argument: &wrela_hir::CallArgument, access: AccessMode) -> bool {
     matches!(
         (&argument.value, access),
@@ -6145,6 +6384,76 @@ fn exact_actor_method_reference_matches(
         && target_record.parameters.len() == 1
         && target_record.result == SemanticTypeId(0)
         && method_type_matches
+}
+
+fn exact_concrete_method_reference_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    caller: FunctionInstanceId,
+    fact: &ExpressionFact,
+    base: ExpressionId,
+    name: &wrela_hir::Name,
+    target: FunctionInstanceId,
+) -> bool {
+    if fact.effects != EffectSet(0)
+        || fact.result.is_some()
+        || fact.ownership_before != OwnershipState::Owned
+        || fact.ownership_after != OwnershipState::Owned
+    {
+        return false;
+    }
+    let Some(base_fact) = exact_child_expression(analysis, caller, base) else {
+        return false;
+    };
+    if !matches!(base_fact.resolution, ExpressionResolution::Value(_)) {
+        return false;
+    }
+    let Some(SemanticTypeKind::Structure {
+        declaration: receiver_declaration,
+        arguments,
+        fields,
+    }) = analysis
+        .types
+        .get(base_fact.ty.0 as usize)
+        .map(|ty| &ty.kind)
+    else {
+        return false;
+    };
+    if !arguments.is_empty() || !runtime_structure_arguments_supported(analysis, arguments, fields)
+    {
+        return false;
+    }
+    let Some(target_record) = analysis.functions.get(target.0 as usize) else {
+        return false;
+    };
+    let FunctionOrigin::Source { declaration, .. } = target_record.origin else {
+        return false;
+    };
+    if crate::interfaces::receiver_concrete_struct(program, declaration)
+        != Some(*receiver_declaration)
+        || crate::interfaces::declaration_name(program, declaration) != Some(name.as_str())
+        || target_record.color != FunctionColor::Sync
+        || !target_record.generic_arguments.is_empty()
+        || target_record.parameters.first().is_none_or(|parameter| {
+            parameter.access != AccessMode::Read || parameter.ty != base_fact.ty
+        })
+    {
+        return false;
+    }
+    analysis.types.get(fact.ty.0 as usize).is_some_and(|ty| {
+        matches!(
+            &ty.kind,
+            SemanticTypeKind::Function {
+                color: FunctionColor::Sync,
+                parameters,
+                result,
+            } if parameters.len() == target_record.parameters.len().saturating_sub(1)
+                && parameters.iter().zip(&target_record.parameters[1..]).all(
+                    |(actual, expected)| actual.access == expected.access && actual.ty == expected.ty
+                )
+                && *result == target_record.result
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6974,6 +7283,39 @@ fn valid_expression_resolution(
                                 && actual.access == expected.access
                         },
                     )
+            }),
+        ExpressionResolution::MethodCall {
+            function: target,
+            receiver,
+            receiver_access,
+            arguments,
+        } => analysis
+            .functions
+            .get(target.0 as usize)
+            .is_some_and(|target| {
+                let Some(receiver_parameter) = target.parameters.first() else {
+                    return false;
+                };
+                *receiver_access == AccessMode::Read
+                    && receiver_parameter.access == *receiver_access
+                    && analysis
+                        .values
+                        .get(receiver.0 as usize)
+                        .is_some_and(|value| {
+                            value.function == function && value.ty == receiver_parameter.ty
+                        })
+                    && arguments.len().saturating_add(1) == target.parameters.len()
+                    && arguments.iter().enumerate().all(|(relative, actual)| {
+                        let parameter_index = relative.saturating_add(1);
+                        target
+                            .parameters
+                            .get(parameter_index)
+                            .is_some_and(|expected| {
+                                usize::try_from(actual.parameter_index) == Ok(parameter_index)
+                                    && actual.access == expected.access
+                                    && value_id(actual.value)
+                            })
+                    })
             }),
         ExpressionResolution::ScopeCall {
             protocol,
@@ -7880,6 +8222,7 @@ fn valid_expression_region(
             | ExpressionResolution::Constructor { .. }
             | ExpressionResolution::ResultTry { .. }
             | ExpressionResolution::DirectCall { .. }
+            | ExpressionResolution::MethodCall { .. }
             | ExpressionResolution::ScopeCall { .. }
             | ExpressionResolution::ProjectionCall { .. }
             | ExpressionResolution::OperatorCall { .. }
@@ -9369,6 +9712,7 @@ fn validate_fact_resources(
                 push_fact_constant(&mut constants, (value, 1), limits)?;
             }
             ExpressionResolution::DirectCall { arguments, .. }
+            | ExpressionResolution::MethodCall { arguments, .. }
             | ExpressionResolution::ScopeCall { arguments, .. }
             | ExpressionResolution::ProjectionCall { arguments, .. }
             | ExpressionResolution::OperatorCall { arguments, .. } => meter.edges(arguments),

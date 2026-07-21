@@ -218,6 +218,7 @@ fn supported_input<'a>(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedInput<'a>, LowerError> {
     validate_generic_function_lowering_boundary(input.facts())?;
+    validate_method_call_lowering_boundary(input.facts())?;
     match input.facts().root {
         sema::AnalysisRoot::DeclaredImage { .. } => {
             if input
@@ -235,6 +236,21 @@ fn supported_input<'a>(
             supported_generated_tests(input, limits, is_cancelled)
                 .map(SupportedInput::GeneratedTests)
         }
+    }
+}
+
+fn validate_method_call_lowering_boundary(facts: &sema::PartialAnalysis) -> Result<(), LowerError> {
+    if facts.expressions.iter().any(|fact| {
+        matches!(
+            fact.resolution,
+            sema::ExpressionResolution::MethodCall { .. }
+        )
+    }) {
+        Err(unsupported(
+            "semantic-method-call-lowering-pending (concrete receiver method calls)",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -15520,6 +15536,31 @@ pub fn boot() -> Image:
             validate_generic_function_lowering_boundary(&facts),
             Err(LowerError::UnsupportedInput {
                 feature: "semantic-generic-function-lowering-pending (generic function specialization)"
+            })
+        ));
+    }
+
+    #[test]
+    fn concrete_method_call_stops_at_named_lowering_boundary() {
+        let mut facts = analyze_parsed_actor().into_facts();
+        let template = facts
+            .expressions
+            .first()
+            .expect("actor fixture expression")
+            .clone();
+        let mut method = template;
+        method.resolution = sema::ExpressionResolution::MethodCall {
+            function: sema::FunctionInstanceId(0),
+            receiver: sema::ValueId(0),
+            receiver_access: sema::AccessMode::Read,
+            arguments: Vec::new(),
+        };
+        facts.expressions.push(method);
+
+        assert!(matches!(
+            validate_method_call_lowering_boundary(&facts),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-method-call-lowering-pending (concrete receiver method calls)"
             })
         ));
     }
