@@ -1658,6 +1658,11 @@ impl PartialAnalysis {
                 ));
             }
         }
+        if !lexical_view_accesses_are_disjoint(self, hir.as_program(), is_cancelled)? {
+            return Err(invalid(
+                "lexical view source accesses overlap exclusive authority",
+            ));
+        }
         for protocol in &self.scope_protocols {
             if protocol.declaration.0 >= self.hir.declarations
                 || protocol.result.0 as usize >= self.types.len()
@@ -7005,6 +7010,71 @@ fn valid_lexical_view_record(
         && terminal_uses_match
         && exact_terminal_use
         && liveness_is_contiguous)
+}
+
+fn lexical_view_accesses_are_disjoint(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, AnalysisFailure> {
+    for (index, left) in analysis.lexical_views.iter().enumerate() {
+        check_analysis_cancelled(is_cancelled)?;
+        let Some(left_initialization) = program.statement(left.initialization) else {
+            return Ok(false);
+        };
+        let Some(left_terminal) = left
+            .terminal_uses
+            .last()
+            .and_then(|terminal| program.expression(*terminal))
+        else {
+            return Ok(false);
+        };
+        for right in &analysis.lexical_views[index + 1..] {
+            check_analysis_cancelled(is_cancelled)?;
+            if left.function != right.function {
+                continue;
+            }
+            let mut conflicting_source = false;
+            for left_source in &left.sources {
+                check_analysis_cancelled(is_cancelled)?;
+                for right_source in &right.sources {
+                    check_analysis_cancelled(is_cancelled)?;
+                    conflicting_source |= left_source.value == right_source.value
+                        && semantic_accesses_conflict(left_source.access, right_source.access);
+                }
+            }
+            if !conflicting_source {
+                continue;
+            }
+            let Some(right_initialization) = program.statement(right.initialization) else {
+                return Ok(false);
+            };
+            let Some(right_terminal) = right
+                .terminal_uses
+                .last()
+                .and_then(|terminal| program.expression(*terminal))
+            else {
+                return Ok(false);
+            };
+            if left_initialization.source.file == right_initialization.source.file
+                && left_initialization.source.range.end < right_terminal.source.range.start
+                && right_initialization.source.range.end < left_terminal.source.range.start
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn semantic_accesses_conflict(first: AccessMode, second: AccessMode) -> bool {
+    !matches!(
+        (first, second),
+        (
+            AccessMode::Value | AccessMode::Read,
+            AccessMode::Value | AccessMode::Read
+        )
+    )
 }
 
 fn valid_scope_protocol_record(

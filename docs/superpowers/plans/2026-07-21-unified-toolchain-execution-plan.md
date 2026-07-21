@@ -187,7 +187,7 @@ D2 need this scope substantially complete; B10 needs F5.
 |---|---|---|---|
 | 1 | B2a promotion/region report schema | — | **landed** 3eb2cb69 |
 | 1 | B5b wait-for graph + diagnostics | — | **landed** 3e216d38 |
-| 1 | B1a view/provenance semantics | lexical provenance model | **B1a.2 narrow use-site slice landed** — a nongeneric module-level bare-view free projection call may directly initialize an explicit view local for one ordinary unary consumption in straight-line code. Regionless `LexicalView` facts preserve exact parameter/value/span provenance and one exact terminal-use liveness interval; a retained source cannot mutate before that use, and a live view cannot cross `await` (`free_projection_call_builds_regionless_lexical_view_fact`, `projection_call_without_direct_view_binding_fails_closed`, `retained_projection_source_cannot_be_mutated_before_terminal_use`, `lexical_projection_view_cannot_cross_await`). Receiver/wrapped/generic projections, mutation through views, control-flow liveness, general disjointness/ephemeral legality, and lowering remain fail-closed. |
+| 1 | B1a view/provenance semantics | lexical provenance model | **B1a.3 direct-root disjointness landed in this slice** — B1a.2's regionless straight-line `LexicalView` now enforces symmetric access exclusion: shared/shared views may coexist, while any live mutable view excludes later access to the same direct named root; distinct roots and post-terminal reborrows remain legal (`live_mut_projection_excludes_later_read_projection`, `shared_projection_views_may_coexist_on_one_source`, `projection_views_on_distinct_roots_may_overlap`, `projection_root_may_be_reborrowed_after_mut_view_terminal_use`). Full sealing independently rejects forged overlapping exclusive intervals. Receiver/wrapped/generic projections, mutation through views, structured control-flow liveness, projected-path disjointness, general ephemeral legality, and lowering remain fail-closed. |
 | 1 | B4a cleanup DAG sema analysis | — | **landed** 43d3e279 — free-call scope protocols/calls, lexical activations, reverse-source cleanup DAG + `CleanupAcyclic`, synthetic cycle detector, and named await/receiver/outside-`with` rejections; pass-only cleanup bodies and no lowering (`semantic-with-cleanup-lowering-pending`) |
 | 0 | **T0.1 general nongeneric ADTs — COMPLETE** | — | **landed** — enum type resolution: unit + mixed-arity + heterogeneous-scalar + flat-struct + nongeneric-enum payloads, tagged-union max-slot layout, structural cycle rejection |
 | 0 | · T0.1a unit variants | — | landed ce8385e6 |
@@ -217,6 +217,9 @@ B1a.2 retention and straight-line boundary evidence also includes
 broader-consumption boundary. Exact sealing is
 covered by a valid-HIR retained-source-rebinding forgery in
 `free_projection_call_builds_regionless_lexical_view_fact`.
+B1a.3's cross-view boundary is covered by a distinct-root positive whose HIR
+and exact call facts are forged into individually valid same-root views; the
+full sealer rejects their overlapping exclusive intervals.
 
 **Sequencing note (2026-07-21):** T0.1 (ADT type resolution) is complete. T0.2
 (ephemeral kind) turned out **producer-gated** — the `?`-rejection rule can't be

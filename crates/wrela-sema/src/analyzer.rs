@@ -8052,75 +8052,85 @@ fn access_runtime_binding(
         .get(binding.value.0 as usize)
         .filter(|record| record.function == function)
         .ok_or(AnalysisFailure::RequestMismatch)?;
-    if matches!(access, AccessMode::Mutate | AccessMode::Take) {
-        for view in &partial.lexical_views {
-            check_cancelled(is_cancelled)?;
-            let Some(retained) = view
-                .sources
-                .iter()
-                .find(|retained| retained.value == binding.value)
-            else {
-                continue;
-            };
-            let Some(terminal) = view
-                .terminal_uses
-                .last()
-                .and_then(|terminal| request.hir.as_program().expression(*terminal))
-            else {
-                return Err(AnalysisFailure::RequestMismatch.into());
-            };
-            if terminal.source.file == source.file
-                && source.range.start < terminal.source.range.start
-            {
-                let protocol = partial
-                    .projection_protocols
-                    .get(view.protocol.0 as usize)
-                    .ok_or(AnalysisFailure::RequestMismatch)?;
-                let parameter_name = request
-                    .hir
-                    .as_program()
-                    .parameters
-                    .get(retained.parameter.0 as usize)
-                    .and_then(|parameter| parameter.name.as_ref())
-                    .map_or("_", wrela_hir::Name::as_str);
-                let mut diagnostic = Diagnostic::error(
-                    Category::OWNERSHIP,
-                    source,
-                    copy_analysis_text(
-                        &format!(
-                            "cannot mutate frozen projection parameter `{parameter_name}` while view from `{}` remains live",
-                            protocol.name
-                        ),
-                        request.limits.fact_bytes,
-                        &|| false,
-                    )?,
-                );
-                diagnostic.code = Some("semantic-view-source-mutated".to_owned());
-                diagnostic.labels.try_reserve_exact(2).map_err(|_| {
-                    fact_resource(request, "view source mutation diagnostic labels")
-                })?;
-                diagnostic.labels.push(wrela_diagnostics::Label {
-                    span: retained.argument_source,
-                    message: format!(
-                        "`{parameter_name}` is conservatively retained by projection `{}`",
-                        protocol.name
-                    ),
-                });
-                diagnostic.labels.push(wrela_diagnostics::Label {
-                    span: terminal.source,
-                    message: "the blocking view's terminal use is here".to_owned(),
-                });
-                diagnostic.notes.push(
-                    "all declared projection sources remain frozen until the lexical view's final use"
-                        .to_owned(),
-                );
-                diagnostic.help.push(
-                    "move the source mutation after the terminal view use or shorten the view lifetime"
-                        .to_owned(),
-                );
-                return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
-            }
+    for view in &partial.lexical_views {
+        check_cancelled(is_cancelled)?;
+        let Some(retained) = view.sources.iter().find(|retained| {
+            retained.value == binding.value && accesses_conflict(retained.access, access)
+        }) else {
+            continue;
+        };
+        let Some(terminal) = view
+            .terminal_uses
+            .last()
+            .and_then(|terminal| request.hir.as_program().expression(*terminal))
+        else {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        };
+        if terminal.source.file != source.file || source.range.start >= terminal.source.range.start
+        {
+            continue;
         }
+        let protocol = partial
+            .projection_protocols
+            .get(view.protocol.0 as usize)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let parameter_name = request
+            .hir
+            .as_program()
+            .parameters
+            .get(retained.parameter.0 as usize)
+            .and_then(|parameter| parameter.name.as_ref())
+            .map_or("_", wrela_hir::Name::as_str);
+        let source_mutation = matches!(retained.access, AccessMode::Value | AccessMode::Read)
+            && matches!(access, AccessMode::Mutate | AccessMode::Take);
+        let message = if source_mutation {
+            format!(
+                "cannot mutate frozen projection parameter `{parameter_name}` while view from `{}` remains live",
+                protocol.name
+            )
+        } else {
+            format!(
+                "access to projection parameter `{parameter_name}` overlaps the live exclusive view from `{}`",
+                protocol.name
+            )
+        };
+        let mut diagnostic = Diagnostic::error(
+            Category::OWNERSHIP,
+            source,
+            copy_analysis_text(&message, request.limits.fact_bytes, &|| false)?,
+        );
+        diagnostic.code = Some(
+            if source_mutation {
+                "semantic-view-source-mutated"
+            } else {
+                "semantic-overlapping-access"
+            }
+            .to_owned(),
+        );
+        diagnostic
+            .labels
+            .try_reserve_exact(2)
+            .map_err(|_| fact_resource(request, "view access conflict diagnostic labels"))?;
+        diagnostic.labels.push(wrela_diagnostics::Label {
+            span: retained.argument_source,
+            message: format!(
+                "`{parameter_name}` is conservatively retained by projection `{}`",
+                protocol.name
+            ),
+        });
+        diagnostic.labels.push(wrela_diagnostics::Label {
+            span: terminal.source,
+            message: "the blocking view's terminal use is here".to_owned(),
+        });
+        diagnostic.notes.push(
+            "all declared projection sources remain frozen until the lexical view's final use"
+                .to_owned(),
+        );
+        diagnostic.help.push(
+            "move the conflicting access after the terminal view use or use a distinct source root"
+                .to_owned(),
+        );
+        return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
     }
     match record.category {
         ValueCategory::SharedView | ValueCategory::MutableView
@@ -28448,6 +28458,251 @@ fn retained_source_is_frozen():
                 .and_then(|diagnostic| diagnostic.code.as_deref()),
             Some("semantic-view-source-mutated"),
             "all conservative projection sources stay frozen until the terminal use: {:?}",
+            output.diagnostics()
+        );
+        let diagnostic = &output.diagnostics()[0];
+        assert!(diagnostic.message.contains("right"));
+        assert!(diagnostic.message.contains("choose"));
+        assert!(
+            diagnostic.labels.iter().any(|label| {
+                label.message.contains("right") && label.message.contains("choose")
+            })
+        );
+    }
+
+    #[test]
+    fn live_mut_projection_excludes_later_read_projection() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection edit(mut packet: Packet) -> mut view u64:
+    yield packet.header
+
+projection inspect(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn mut_view_excludes_read_view():
+    packet: Packet = Packet(header=7)
+    edit_view: mut view u64 = edit(mut packet)
+    inspect_view: view u64 = inspect(packet)
+    consume(inspect_view)
+    consume(edit_view)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        let diagnostic = output
+            .diagnostics()
+            .first()
+            .expect("overlapping projection diagnostic");
+        assert_eq!(
+            diagnostic.code.as_deref(),
+            Some("semantic-overlapping-access")
+        );
+        assert!(diagnostic.message.contains("packet"));
+        assert!(diagnostic.message.contains("edit"));
+        assert!(
+            diagnostic.labels.iter().any(|label| {
+                label.message.contains("packet") && label.message.contains("edit")
+            })
+        );
+        assert!(
+            diagnostic
+                .labels
+                .iter()
+                .any(|label| label.message.contains("terminal use"))
+        );
+    }
+
+    #[test]
+    fn shared_projection_views_may_coexist_on_one_source() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection inspect(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn shared_views_coexist():
+    packet: Packet = Packet(header=7)
+    first: view u64 = inspect(packet)
+    second: view u64 = inspect(packet)
+    consume(second)
+    consume(first)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "shared projections may overlap: {:?}",
+            output.diagnostics()
+        );
+        assert_eq!(
+            output
+                .successful()
+                .expect("sealed shared projections")
+                .facts()
+                .lexical_views
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn projection_views_on_distinct_roots_may_overlap() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection edit(mut packet: Packet) -> mut view u64:
+    yield packet.header
+
+projection inspect(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn distinct_roots_do_not_overlap():
+    left: Packet = Packet(header=1)
+    right: Packet = Packet(header=2)
+    edit_view: mut view u64 = edit(mut left)
+    inspect_view: view u64 = inspect(right)
+    consume(inspect_view)
+    consume(edit_view)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "distinct projection roots may overlap: {:?}",
+            output.diagnostics()
+        );
+        let analyzed = output.successful().expect("sealed distinct-root views");
+        let facts = analyzed.facts();
+        let [exclusive, shared] = facts.lexical_views.as_slice() else {
+            panic!("expected two lexical views");
+        };
+        assert!(facts.projection_protocols[exclusive.protocol.0 as usize].mutable);
+        assert!(!facts.projection_protocols[shared.protocol.0 as usize].mutable);
+        let exclusive_source = exclusive.sources[0].value;
+        let exclusive_local = match facts.values[exclusive_source.0 as usize].origin {
+            SemanticValueOrigin::Local(local) => local,
+            _ => panic!("exclusive source must be a local"),
+        };
+        let mut forged_program = analyzed.hir().clone().into_program();
+        let shared_call = forged_program
+            .expression(shared.expression)
+            .expect("shared projection call");
+        let ExpressionKind::Call { arguments, .. } = &shared_call.kind else {
+            panic!("shared projection call shape");
+        };
+        let wrela_hir::CallArgumentValue::Value(shared_argument) = arguments[0].value else {
+            panic!("shared projection argument shape");
+        };
+        forged_program.expressions[shared_argument.0 as usize].kind =
+            ExpressionKind::Reference(Definition::Local(exclusive_local));
+        let forged_hir = forged_program
+            .validate()
+            .expect("structurally valid overlapping-root HIR");
+        let mut forged_facts = facts.clone();
+        forged_facts.hir = HirSummary::from_validated(&forged_hir).expect("forged HIR summary");
+        forged_facts.lexical_views[shared.id.0 as usize].sources[0].value = exclusive_source;
+        let argument_fact = forged_facts
+            .expressions
+            .iter_mut()
+            .find(|fact| fact.function == shared.function && fact.expression == shared_argument)
+            .expect("shared source expression fact");
+        argument_fact.resolution = ExpressionResolution::Value(exclusive_source);
+        let call_fact = forged_facts
+            .expressions
+            .iter_mut()
+            .find(|fact| fact.function == shared.function && fact.expression == shared.expression)
+            .expect("shared projection call fact");
+        let ExpressionResolution::ProjectionCall { arguments, .. } = &mut call_fact.resolution
+        else {
+            panic!("shared projection resolution");
+        };
+        arguments[0].value = exclusive_source;
+        assert!(
+            valid_lexical_view_record(
+                &forged_facts.lexical_views[shared.id.0 as usize],
+                &forged_facts,
+                forged_hir.as_program(),
+                &|| false,
+            )
+            .expect("individual forged view validation"),
+            "the forged record must remain individually exact so the cross-view invariant is tested"
+        );
+        assert!(
+            forged_facts
+                .validate_for_seal(&forged_hir, &|| false)
+                .is_err(),
+            "the full sealer must reject overlapping exclusive direct-root views"
+        );
+    }
+
+    #[test]
+    fn projection_root_may_be_reborrowed_after_mut_view_terminal_use() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection edit(mut packet: Packet) -> mut view u64:
+    yield packet.header
+
+projection inspect(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn reborrow_after_terminal_use():
+    packet: Packet = Packet(header=7)
+    edit_view: mut view u64 = edit(mut packet)
+    consume(edit_view)
+    inspect_view: view u64 = inspect(packet)
+    consume(inspect_view)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "projection authority releases at terminal use: {:?}",
             output.diagnostics()
         );
     }
