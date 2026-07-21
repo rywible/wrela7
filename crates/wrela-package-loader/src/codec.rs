@@ -1480,6 +1480,8 @@ mod tests {
         include_bytes!("../../../std/examples/minimal-image/wrela.toml");
     const CHECKED_IN_CORE_SOURCE: &[u8] =
         include_bytes!("../../../std/wrela-core-0.1/src/image.wr");
+    const CHECKED_IN_CORE_ACTOR_SOURCE: &[u8] =
+        include_bytes!("../../../std/wrela-core-0.1/src/actor.wr");
     const CHECKED_IN_CORE_OPS_SOURCE: &[u8] =
         include_bytes!("../../../std/wrela-core-0.1/src/ops.wr");
     const CHECKED_IN_CORE_RESULT_SOURCE: &[u8] =
@@ -1620,6 +1622,11 @@ mod tests {
             &[
                 PackageContentRecord {
                     kind: PackageContentKind::Source,
+                    path: "actor.wr",
+                    digest: SoftwareSha256.sha256(CHECKED_IN_CORE_ACTOR_SOURCE),
+                },
+                PackageContentRecord {
+                    kind: PackageContentKind::Source,
                     path: "image.wr",
                     digest: SoftwareSha256.sha256(CHECKED_IN_CORE_SOURCE),
                 },
@@ -1655,7 +1662,7 @@ mod tests {
         .expect("canonical core package content digest");
         assert_eq!(
             core_digest.to_hex(),
-            "16416e5e3711255f0440c5681ea407277e69d20325bddfdaa91db08cbe9597e8"
+            "24074c71215b7242b1f8ac979c48a36e85cbb1c2df6eab5971d1e4a90a29c432"
         );
         let application_digest = package_content_digest(
             &application_canonical,
@@ -2322,6 +2329,13 @@ mod tests {
             core_locator.clone(),
             vec![
                 SourceInput {
+                    path: "actor.wr".to_owned(),
+                    text: std::str::from_utf8(CHECKED_IN_CORE_ACTOR_SOURCE)
+                        .expect("core actor source UTF-8")
+                        .to_owned(),
+                    digest: hasher.sha256(CHECKED_IN_CORE_ACTOR_SOURCE),
+                },
+                SourceInput {
                     path: "image.wr".to_owned(),
                     text: std::str::from_utf8(CHECKED_IN_CORE_SOURCE)
                         .expect("core image source UTF-8")
@@ -2385,8 +2399,8 @@ mod tests {
             )
             .expect("checked-in bootstrap workspace loads and seals");
         assert_eq!(workspace.graph().packages().len(), 2);
-        assert_eq!(workspace.graph().modules().len(), 7);
-        assert_eq!(workspace.sources().len(), 7);
+        assert_eq!(workspace.graph().modules().len(), 8);
+        assert_eq!(workspace.sources().len(), 8);
         assert_eq!(workspace.root_manifest().name.as_str(), "bootstrap-image");
         assert_eq!(
             workspace

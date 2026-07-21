@@ -217,6 +217,7 @@ fn supported_input<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedInput<'a>, LowerError> {
+    validate_admission_result_lowering_boundary(input.facts())?;
     validate_generic_function_lowering_boundary(input.facts())?;
     validate_method_call_lowering_boundary(input.facts())?;
     match input.facts().root {
@@ -236,6 +237,23 @@ fn supported_input<'a>(
             supported_generated_tests(input, limits, is_cancelled)
                 .map(SupportedInput::GeneratedTests)
         }
+    }
+}
+
+fn validate_admission_result_lowering_boundary(
+    facts: &sema::PartialAnalysis,
+) -> Result<(), LowerError> {
+    if facts.expressions.iter().any(|fact| {
+        matches!(
+            fact.resolution,
+            sema::ExpressionResolution::Builtin(sema::IntrinsicOperation::ActorTrySend { .. })
+        )
+    }) {
+        Err(unsupported(
+            "semantic-admission-result-lowering-pending (try-send outcome dispatch)",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -16414,6 +16432,29 @@ pub fn boot() -> Image:
             validate_method_call_lowering_boundary(&facts),
             Err(LowerError::UnsupportedInput {
                 feature: "semantic-method-call-lowering-pending (concrete receiver method calls)"
+            })
+        ));
+    }
+
+    #[test]
+    fn admission_result_stops_at_named_try_send_lowering_boundary() {
+        let mut facts = analyze_parsed_actor().into_facts();
+        let template = facts
+            .expressions
+            .first()
+            .expect("actor fixture expression")
+            .clone();
+        let mut try_send = template;
+        try_send.resolution =
+            sema::ExpressionResolution::Builtin(sema::IntrinsicOperation::ActorTrySend {
+                actor: sema::ActorId(0),
+            });
+        facts.expressions.push(try_send);
+
+        assert!(matches!(
+            validate_admission_result_lowering_boundary(&facts),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-admission-result-lowering-pending (try-send outcome dispatch)"
             })
         ));
     }

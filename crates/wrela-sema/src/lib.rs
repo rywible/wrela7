@@ -1332,7 +1332,7 @@ impl PartialAnalysis {
             if value.function.0 as usize >= self.functions.len()
                 || value.ty.0 as usize >= self.types.len()
                 || !valid_value_origin(value.origin, self.hir)
-                || !valid_semantic_value_class(value)
+                || !valid_semantic_value_class(value, self)
                 || value
                     .source_name
                     .as_ref()
@@ -1644,7 +1644,7 @@ impl PartialAnalysis {
             if value.function.0 as usize >= self.functions.len()
                 || value.ty.0 as usize >= self.types.len()
                 || !valid_value_origin(value.origin, self.hir)
-                || !valid_semantic_value_class(value)
+                || !valid_semantic_value_class(value, self)
                 || value
                     .source_name
                     .as_ref()
@@ -2283,7 +2283,8 @@ fn validate_exact_expression_local_values(
                 reserve_validation_scratch(&mut pending, 1, program.expressions.len() as u64)?;
                 pending.push(*operand);
             }
-            wrela_hir::ExpressionKind::Try(operand) => {
+            wrela_hir::ExpressionKind::Try(operand)
+            | wrela_hir::ExpressionKind::TrySend(operand) => {
                 reserve_validation_scratch(&mut pending, 1, program.expressions.len() as u64)?;
                 pending.push(*operand);
             }
@@ -2402,7 +2403,8 @@ fn expression_references_local(
                 reserve_validation_scratch(&mut pending, 1, program.expressions.len() as u64)?;
                 pending.push(*operand);
             }
-            wrela_hir::ExpressionKind::Try(operand) => {
+            wrela_hir::ExpressionKind::Try(operand)
+            | wrela_hir::ExpressionKind::TrySend(operand) => {
                 reserve_validation_scratch(&mut pending, 1, program.expressions.len() as u64)?;
                 pending.push(*operand);
             }
@@ -3312,7 +3314,8 @@ fn collect_source_body_closure(
                 )?;
                 pending_expressions.push(*operand);
             }
-            wrela_hir::ExpressionKind::Try(operand) => {
+            wrela_hir::ExpressionKind::Try(operand)
+            | wrela_hir::ExpressionKind::TrySend(operand) => {
                 reserve_validation_scratch(
                     &mut pending_expressions,
                     1,
@@ -3979,6 +3982,13 @@ fn validate_exact_expression_fact(
             increment_definition(definitions, *err_payload)?;
             increment_definition(definitions, *propagated)?;
         }
+        (
+            wrela_hir::ExpressionKind::TrySend(operand),
+            ExpressionResolution::Builtin(IntrinsicOperation::ActorTrySend { actor }),
+            Some(result),
+        ) if exact_admission_try_send_matches(
+            analysis, program, function, *operand, fact, *actor, result,
+        ) => {}
         (
             wrela_hir::ExpressionKind::If {
                 condition,
@@ -6884,6 +6894,174 @@ fn exact_actor_request_matches(
     })
 }
 
+fn exact_admission_try_send_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    function: &FunctionInstance,
+    operand: ExpressionId,
+    fact: &ExpressionFact,
+    actor: ActorId,
+    result: ValueId,
+) -> bool {
+    let Some(request) = exact_child_expression(analysis, function.id, operand) else {
+        return false;
+    };
+    let ExpressionResolution::ActorRequest {
+        actor: request_actor,
+        method: _,
+        permit,
+    } = request.resolution
+    else {
+        return false;
+    };
+    if request_actor != actor
+        || request.effects != EffectSet(EffectSet::ACTOR)
+        || request.ownership_before != OwnershipState::Owned
+        || request.ownership_after != OwnershipState::Taken
+        || fact.effects != request.effects
+        || fact.ownership_before != OwnershipState::Owned
+        || fact.ownership_after != OwnershipState::Owned
+        || fact.proofs != request.proofs
+        || !fact.proofs.contains(&permit)
+    {
+        return false;
+    }
+    let Some(value) = analysis.values.get(result.0 as usize) else {
+        return false;
+    };
+    if value.function != function.id
+        || value.ty != fact.ty
+        || value.category != ValueCategory::Value
+        || value.class != SemanticValueClass::Ephemeral(EphemeralKind::AdmissionResult)
+        || value.origin != SemanticValueOrigin::Expression(fact.expression)
+        || value.source
+            != program
+                .expression(fact.expression)
+                .map(|expression| expression.source)
+    {
+        return false;
+    }
+    let direct_match = program.statements.iter().any(|statement| {
+        matches!(statement.kind, wrela_hir::StatementKind::Match { scrutinee, .. }
+            if scrutinee == fact.expression)
+    });
+    let direct_is = program.expressions.iter().any(|expression| {
+        matches!(expression.kind, wrela_hir::ExpressionKind::IsPattern { value, .. }
+            if value == fact.expression)
+    });
+    if direct_match == direct_is
+        || program.expressions.iter().any(|expression| {
+            matches!(expression.kind, wrela_hir::ExpressionKind::Try(operand)
+            if operand == fact.expression)
+        })
+    {
+        return false;
+    }
+    exact_core_admission_result_type_matches(analysis, program, fact.ty)
+}
+
+fn exact_core_admission_result_type_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    result_ty: SemanticTypeId,
+) -> bool {
+    let Some(core_package) = program
+        .packages
+        .package(program.packages.root())
+        .and_then(|root| {
+            root.dependencies
+                .iter()
+                .find(|dependency| dependency.alias.as_str() == "core")
+                .map(|dependency| dependency.package)
+        })
+    else {
+        return false;
+    };
+    let mut error = None;
+    let mut result = None;
+    for declaration in &program.declarations {
+        let Some(module) = program.modules.get(declaration.module.0 as usize) else {
+            return false;
+        };
+        if module.package != core_package || module.path.dotted() != "actor" {
+            continue;
+        }
+        match declaration.name.as_ref().map(wrela_hir::Name::as_str) {
+            Some("AdmissionError") if error.replace(declaration).is_some() => return false,
+            Some("AdmissionResult") if result.replace(declaration).is_some() => return false,
+            _ => {}
+        }
+    }
+    let (Some(error), Some(result)) = (error, result) else {
+        return false;
+    };
+    let unit = |variant: &wrela_hir::EnumVariant, name: &str| {
+        variant.name.as_str() == name && variant.fields.is_empty()
+    };
+    let exact_error = error.visibility == wrela_hir::Visibility::Public
+        && matches!(&error.kind, wrela_hir::DeclarationKind::Enumeration(enumeration)
+            if enumeration.generics.is_empty()
+                && enumeration.members.is_empty()
+                && enumeration.deriving.is_empty()
+                && matches!(enumeration.variants.as_slice(), [full, restarting, stale, cancelled, deadline]
+                    if unit(full, "Full")
+                        && unit(restarting, "Restarting")
+                        && unit(stale, "StaleRequest")
+                        && unit(cancelled, "Cancelled")
+                        && unit(deadline, "DeadlineRejected")));
+    let exact_result = result.visibility == wrela_hir::Visibility::Public
+        && matches!(&result.kind, wrela_hir::DeclarationKind::Enumeration(enumeration)
+            if enumeration.generics.is_empty()
+                && enumeration.members.is_empty()
+                && enumeration.deriving.is_empty()
+                && matches!(enumeration.variants.as_slice(), [admitted, rejected]
+                    if unit(admitted, "Admitted")
+                        && rejected.name.as_str() == "Rejected"
+                        && matches!(rejected.fields.as_slice(), [field]
+                            if field.name.is_none()
+                                && matches!(&field.ty.kind, wrela_hir::TypeExpressionKind::Named {
+                                    definition: wrela_hir::Definition::Declaration(resolved),
+                                    arguments,
+                                } if arguments.is_empty()
+                                    && resolved.package == core_package
+                                    && resolved.module == error.module
+                                    && resolved.declaration == error.id))));
+    if !exact_error || !exact_result {
+        return false;
+    }
+    let mut error_types = analysis.types.iter().filter(|ty| {
+        matches!(&ty.kind, SemanticTypeKind::Enumeration { declaration, arguments, variants }
+            if *declaration == error.id
+                && arguments.is_empty()
+                && variants.len() == 5
+                && variants.iter().zip(["Full", "Restarting", "StaleRequest", "Cancelled", "DeadlineRejected"])
+                    .all(|(variant, name)| variant.name == name && variant.fields.is_empty()))
+    });
+    let Some(error_ty) = error_types.next() else {
+        return false;
+    };
+    if error_types.next().is_some() {
+        return false;
+    }
+    analysis.types.get(result_ty.0 as usize).is_some_and(|ty| {
+        ty.linearity == Linearity::ExplicitCopy
+            && matches!(&ty.kind, SemanticTypeKind::Enumeration {
+                declaration,
+                arguments,
+                variants,
+            } if *declaration == result.id
+                && arguments.is_empty()
+                && matches!(variants.as_slice(), [admitted, rejected]
+                    if admitted.name == "Admitted"
+                        && admitted.fields.is_empty()
+                        && rejected.name == "Rejected"
+                        && matches!(rejected.fields.as_slice(), [field]
+                            if field.name.is_empty()
+                                && field.public
+                                && field.ty == error_ty.id)))
+    })
+}
+
 fn constant_matches_literal(
     analysis: &PartialAnalysis,
     ty: SemanticTypeId,
@@ -9176,8 +9354,8 @@ fn valid_value_origin(origin: SemanticValueOrigin, hir: HirSummary) -> bool {
     }
 }
 
-fn valid_semantic_value_class(value: &SemanticValue) -> bool {
-    matches!(
+fn valid_semantic_value_class(value: &SemanticValue, analysis: &PartialAnalysis) -> bool {
+    if matches!(
         (value.category, value.class),
         (
             ValueCategory::SharedView | ValueCategory::MutableView,
@@ -9189,6 +9367,26 @@ fn valid_semantic_value_class(value: &SemanticValue) -> bool {
                 | ValueCategory::Error,
             SemanticValueClass::FirstClass
         )
+    ) {
+        return true;
+    }
+    matches!(
+        (value.category, value.class, value.origin),
+        (
+            ValueCategory::Value,
+            SemanticValueClass::Ephemeral(EphemeralKind::AdmissionResult),
+            SemanticValueOrigin::Expression(expression),
+        ) if analysis.expressions.iter().any(|fact| {
+            fact.function == value.function
+                && fact.expression == expression
+                && fact.ty == value.ty
+                && fact.category == ValueCategory::Value
+                && fact.result == Some(value.id)
+                && matches!(
+                    fact.resolution,
+                    ExpressionResolution::Builtin(IntrinsicOperation::ActorTrySend { .. })
+                )
+        })
     )
 }
 

@@ -3558,7 +3558,7 @@ fn inspect_runtime_expression_shape(
                 reserve_runtime_shape(&mut pending, 1, limit, "runtime expression scratch")?;
                 pending.push(*operand);
             }
-            ExpressionKind::Try(operand) => {
+            ExpressionKind::Try(operand) | ExpressionKind::TrySend(operand) => {
                 reserve_runtime_shape(&mut pending, 1, limit, "runtime expression scratch")?;
                 pending.push(*operand);
             }
@@ -6722,6 +6722,17 @@ fn analyze_runtime_expression(
             state,
             is_cancelled,
         ),
+        ExpressionKind::TrySend(operand) => analyze_actor_try_send_expression(
+            request,
+            partial,
+            function,
+            expression_id,
+            expression.source,
+            *operand,
+            expression_request,
+            state,
+            is_cancelled,
+        ),
         ExpressionKind::IsPattern {
             value,
             negated: _,
@@ -7089,6 +7100,18 @@ fn analyze_result_try_expression(
         state,
         is_cancelled,
     )?;
+    if let Some(kind) = operand_outcome
+        .result
+        .and_then(|value| partial.values.get(value.0 as usize))
+        .and_then(|value| match value.class {
+            SemanticValueClass::Ephemeral(kind) if !kind.permits(EphemeralUse::Question) => {
+                Some(kind)
+            }
+            _ => None,
+        })
+    {
+        return Err(ephemeral_question_diagnostic(request, source, kind));
+    }
     if operand_outcome.result.is_none() || operand_outcome.referenced.is_some() {
         return Err(runtime_type_diagnostic(
             request,
@@ -7270,6 +7293,138 @@ fn ephemeral_question_diagnostic(
         "ephemeral carriers have an explicit, closed consumption policy",
         "consume this carrier with one of its permitted immediate forms",
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_actor_try_send_expression(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    expression: ExpressionId,
+    source: Span,
+    operand: ExpressionId,
+    expression_request: RuntimeExpressionRequest,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<RuntimeExpression> {
+    check_cancelled(is_cancelled)?;
+    let usage = exact_admission_result_use(request, expression, is_cancelled)?;
+    if !matches!(
+        usage,
+        EphemeralUse::PatternMatch | EphemeralUse::TypeTest | EphemeralUse::Question
+    ) {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-admission-result-consumer-pending",
+            "try send AdmissionResult is not consumed by an admitted immediate form",
+            "this bounded slice accepts the producer only as the direct scrutinee of match or is; postfix question reaches its dedicated ephemeral rejection",
+            "consume `try send` directly with exhaustive match or an is-pattern",
+        ));
+    }
+    if !matches!(
+        expression_request.access,
+        AccessMode::Value | AccessMode::Read
+    ) || expression_request.desired_result.is_some()
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-admission-result-consumer-pending",
+            "try send AdmissionResult cannot be stored or granted place access",
+            "AdmissionResult is an ephemeral control-flow carrier without persistent storage",
+            "consume `try send` directly with exhaustive match or an is-pattern",
+        ));
+    }
+    let resolved = resolve_self_actor_send(request, partial, function, operand, is_cancelled)?;
+    let request_outcome =
+        analyze_actor_send_expression(request, partial, function, operand, state, is_cancelled)?;
+    if request_outcome.effects != EffectSet(EffectSet::ACTOR) {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    let ty = ensure_core_admission_result_type(
+        request,
+        partial,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    if expression_request
+        .expected
+        .is_some_and(|expected| expected != ty)
+    {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    let result = expression_result(
+        request,
+        partial,
+        function,
+        (expression, source),
+        ty,
+        None,
+        is_cancelled,
+    )?;
+    partial
+        .values
+        .get_mut(result.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?
+        .class = SemanticValueClass::Ephemeral(EphemeralKind::AdmissionResult);
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression,
+            ty,
+            result: Some(result),
+            resolution: ExpressionResolution::Builtin(IntrinsicOperation::ActorTrySend {
+                actor: resolved.actor,
+            }),
+            effects: EffectSet(EffectSet::ACTOR),
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    Ok(RuntimeExpression {
+        ty,
+        result: Some(result),
+        referenced: None,
+        effects: EffectSet(EffectSet::ACTOR),
+    })
+}
+
+fn exact_admission_result_use(
+    request: &AnalysisRequest<'_>,
+    expression: ExpressionId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<EphemeralUse, AnalysisFailure> {
+    let program = request.hir.as_program();
+    let mut usage = None;
+    let mut record = |candidate| -> Result<(), AnalysisFailure> {
+        if usage.replace(candidate).is_some() {
+            return Err(AnalysisFailure::RequestMismatch);
+        }
+        Ok(())
+    };
+    for statement in &program.statements {
+        check_cancelled(is_cancelled)?;
+        if matches!(statement.kind, StatementKind::Match { scrutinee, .. } if scrutinee == expression)
+        {
+            record(EphemeralUse::PatternMatch)?;
+        }
+    }
+    for parent in &program.expressions {
+        check_cancelled(is_cancelled)?;
+        match parent.kind {
+            ExpressionKind::IsPattern { value, .. } if value == expression => {
+                record(EphemeralUse::TypeTest)?;
+            }
+            ExpressionKind::Try(operand) if operand == expression => {
+                record(EphemeralUse::Question)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(usage.unwrap_or(EphemeralUse::DirectBinding))
 }
 
 fn analyze_actor_send_expression(
@@ -13794,6 +13949,134 @@ fn is_exact_core_result_declaration(
     exact_variant(ok, "Ok", *ok_generic) && exact_variant(err, "Err", *err_generic)
 }
 
+fn ensure_core_admission_result_type(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
+    let program = request.hir.as_program();
+    let mut admission_error = None;
+    let mut admission_result = None;
+    for declaration in &program.declarations {
+        charge_runtime_aggregate_lookup(request, &mut *aggregate_work, is_cancelled)?;
+        let Some(module) = program.modules.get(declaration.module.0 as usize) else {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        };
+        if module.package != request.standard_library_package || module.path.dotted() != "actor" {
+            continue;
+        }
+        match declaration.name.as_ref().map(wrela_hir::Name::as_str) {
+            Some("AdmissionError") if admission_error.replace(declaration.id).is_some() => {
+                return Err(AnalysisFailure::RequestMismatch.into());
+            }
+            Some("AdmissionResult") if admission_result.replace(declaration.id).is_some() => {
+                return Err(AnalysisFailure::RequestMismatch.into());
+            }
+            _ => {}
+        }
+    }
+    let error_id = admission_error.ok_or_else(|| {
+        runtime_type_diagnostic(
+            request,
+            fallback_span(program),
+            "semantic-admission-result-core-shape",
+            "the authenticated core.actor AdmissionError declaration is missing",
+            "try send has one standard-library-owned admission failure taxonomy",
+            "restore the exact core.actor AdmissionError and AdmissionResult declarations",
+        )
+    })?;
+    let result_id = admission_result.ok_or_else(|| {
+        runtime_type_diagnostic(
+            request,
+            fallback_span(program),
+            "semantic-admission-result-core-shape",
+            "the authenticated core.actor AdmissionResult declaration is missing",
+            "try send has one standard-library-owned admission outcome taxonomy",
+            "restore the exact core.actor AdmissionError and AdmissionResult declarations",
+        )
+    })?;
+    let error = program
+        .declaration(error_id)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let result = program
+        .declaration(result_id)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let exact_unit_variant = |variant: &wrela_hir::EnumVariant, name: &str| {
+        variant.name.as_str() == name && variant.fields.is_empty()
+    };
+    let exact_error = error.visibility == wrela_hir::Visibility::Public
+        && matches!(&error.kind, DeclarationKind::Enumeration(enumeration)
+            if enumeration.generics.is_empty()
+                && enumeration.members.is_empty()
+                && enumeration.deriving.is_empty()
+                && matches!(enumeration.variants.as_slice(), [full, restarting, stale, cancelled, deadline]
+                    if exact_unit_variant(full, "Full")
+                        && exact_unit_variant(restarting, "Restarting")
+                        && exact_unit_variant(stale, "StaleRequest")
+                        && exact_unit_variant(cancelled, "Cancelled")
+                        && exact_unit_variant(deadline, "DeadlineRejected")));
+    let exact_result = result.visibility == wrela_hir::Visibility::Public
+        && matches!(&result.kind, DeclarationKind::Enumeration(enumeration)
+            if enumeration.generics.is_empty()
+                && enumeration.members.is_empty()
+                && enumeration.deriving.is_empty()
+                && matches!(enumeration.variants.as_slice(), [admitted, rejected]
+                    if exact_unit_variant(admitted, "Admitted")
+                        && rejected.name.as_str() == "Rejected"
+                        && matches!(rejected.fields.as_slice(), [field]
+                            if field.name.is_none()
+                                && matches!(&field.ty.kind, TypeExpressionKind::Named {
+                                    definition: Definition::Declaration(resolved),
+                                    arguments,
+                                } if arguments.is_empty()
+                                    && resolved.package == request.standard_library_package
+                                    && resolved.module == error.module
+                                    && resolved.declaration == error_id))));
+    if !exact_error || !exact_result {
+        return Err(runtime_type_diagnostic(
+            request,
+            result.source,
+            "semantic-admission-result-core-shape",
+            "core.actor admission taxonomy differs from its sealed declaration contract",
+            "variant order, unit shapes, and the Rejected payload identity are compiler-authenticated",
+            "restore the exact public AdmissionError and AdmissionResult declarations",
+        ));
+    }
+    let error_ty = ensure_closed_scalar_enum_type(
+        request,
+        partial,
+        error_id,
+        &mut *aggregate_work,
+        is_cancelled,
+    )?;
+    let result_ty = ensure_closed_scalar_enum_type(
+        request,
+        partial,
+        result_id,
+        &mut *aggregate_work,
+        is_cancelled,
+    )?;
+    let exact_semantic = partial.types.get(result_ty.0 as usize).is_some_and(|ty| {
+        matches!(&ty.kind, SemanticTypeKind::Enumeration {
+                declaration,
+                arguments,
+                variants,
+            } if *declaration == result_id
+                && arguments.is_empty()
+                && matches!(variants.as_slice(), [admitted, rejected]
+                    if admitted.name == "Admitted"
+                        && admitted.fields.is_empty()
+                        && rejected.name == "Rejected"
+                        && matches!(rejected.fields.as_slice(), [field]
+                            if field.name.is_empty() && field.public && field.ty == error_ty)))
+    });
+    if !exact_semantic {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    Ok(result_ty)
+}
+
 fn ensure_closed_scalar_enum_type(
     request: &AnalysisRequest<'_>,
     partial: &mut PartialAnalysis,
@@ -20254,6 +20537,11 @@ fn prepare_actor_sends(
         .try_reserve_exact(actor_count)
         .map_err(|_| fact_resource(request, "actor send admission counts"))?;
     admitted.resize(actor_count, 0u32);
+    let mut attempted = Vec::new();
+    attempted
+        .try_reserve_exact(actor_count)
+        .map_err(|_| fact_resource(request, "actor try-send attempt counts"))?;
+    attempted.resize(actor_count, 0u32);
     let mut any_send = false;
     for plan in plans {
         for method in &plan.methods {
@@ -20302,51 +20590,62 @@ fn prepare_actor_sends(
                         "keep one startup send until recurring mailbox scheduling is implemented",
                     ));
                 }
-                if partial.proofs.len() >= request.limits.proofs as usize {
-                    return Err(fact_resource(request, "actor send admission proof").into());
+                append_actor_send_permit(
+                    request,
+                    partial,
+                    caller,
+                    resolved,
+                    "one-way admission: ",
+                    "the startup-once producer contributes one message to an initially empty bounded mailbox before FIFO dispatch",
+                    is_cancelled,
+                )?;
+            }
+
+            let program = request.hir.as_program();
+            for expression in &program.expressions {
+                check_cancelled(is_cancelled)?;
+                let wrela_hir::ExpressionOwner::Body(body) = expression.owner else {
+                    continue;
+                };
+                let belongs_to_method = body == method.body
+                    || method.runtime_statements.iter().any(|statement| {
+                        program
+                            .statement(*statement)
+                            .is_some_and(|statement| statement.body == body)
+                    });
+                let ExpressionKind::TrySend(call) = expression.kind else {
+                    continue;
+                };
+                if !belongs_to_method {
+                    continue;
                 }
-                let permit = ProofId(
-                    u32::try_from(partial.proofs.len())
-                        .map_err(|_| fact_resource(request, "actor send admission proof"))?,
-                );
-                let target_name = partial
-                    .functions
-                    .get(resolved.method.0 as usize)
-                    .map(|function| function.name.as_str())
+                any_send = true;
+                let resolved =
+                    resolve_self_actor_send(request, partial, caller, call, is_cancelled)?;
+                let count = attempted
+                    .get_mut(resolved.actor.0 as usize)
                     .ok_or(AnalysisFailure::RequestMismatch)?;
-                partial
-                    .proofs
-                    .try_reserve(1)
-                    .map_err(|_| fact_resource(request, "actor send admission proof"))?;
-                partial.proofs.push(Proof {
-                    id: permit,
-                    kind: ProofKind::CapacityBound,
-                    subject: bounded_actor_text(
-                        request,
-                        "one-way admission: ",
-                        "",
-                        target_name,
-                        is_cancelled,
-                    )?,
-                    sources: vec![resolved.source],
-                    depends_on: vec![resolved.mailbox_proof],
-                    bound: Some(1),
-                    explanation: vec![
-                        "the startup-once producer contributes one message to an initially empty bounded mailbox before FIFO dispatch"
-                            .to_owned(),
-                    ],
-                });
-                let caller_record = partial
-                    .functions
-                    .get_mut(caller.0 as usize)
-                    .ok_or(AnalysisFailure::RequestMismatch)?;
-                caller_record
-                    .proofs
-                    .try_reserve(1)
-                    .map_err(|_| fact_resource(request, "actor send proof references"))?;
-                caller_record.proofs.push(permit);
-                caller_record.proofs.sort_unstable();
-                caller_record.proofs.dedup();
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| fact_resource(request, "actor try-send attempt count"))?;
+                if *count > 1 {
+                    return Err(actor_runtime_diagnostic(
+                        Category::ACTOR,
+                        expression.source,
+                        "semantic-actor-try-send-single-attempt-bound",
+                        "the implemented admission-result subset permits one startup try-send attempt per actor",
+                        "keep one direct try-send consumer until recurring admission scheduling is implemented",
+                    ));
+                }
+                append_actor_send_permit(
+                    request,
+                    partial,
+                    caller,
+                    resolved,
+                    "try-send admission attempt: ",
+                    "the startup-once producer makes at most one nonblocking admission attempt against the actor's finite mailbox",
+                    is_cancelled,
+                )?;
             }
         }
     }
@@ -20354,6 +20653,61 @@ fn prepare_actor_sends(
         let _ = ensure_actor_reservation_type(request, partial)?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_actor_send_permit(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    caller: FunctionInstanceId,
+    resolved: ResolvedActorSend,
+    subject_prefix: &str,
+    explanation: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<ProofId> {
+    if partial.proofs.len() >= request.limits.proofs as usize {
+        return Err(fact_resource(request, "actor send admission proof").into());
+    }
+    let permit = ProofId(
+        u32::try_from(partial.proofs.len())
+            .map_err(|_| fact_resource(request, "actor send admission proof"))?,
+    );
+    let target_name = partial
+        .functions
+        .get(resolved.method.0 as usize)
+        .map(|function| function.name.as_str())
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    partial
+        .proofs
+        .try_reserve(1)
+        .map_err(|_| fact_resource(request, "actor send admission proof"))?;
+    partial.proofs.push(Proof {
+        id: permit,
+        kind: ProofKind::CapacityBound,
+        subject: bounded_actor_text(request, subject_prefix, "", target_name, is_cancelled)?,
+        sources: vec![resolved.source],
+        depends_on: vec![resolved.mailbox_proof],
+        bound: Some(1),
+        explanation: vec![bounded_actor_text(
+            request,
+            explanation,
+            "",
+            "",
+            is_cancelled,
+        )?],
+    });
+    let caller_record = partial
+        .functions
+        .get_mut(caller.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    caller_record
+        .proofs
+        .try_reserve(1)
+        .map_err(|_| fact_resource(request, "actor send proof references"))?;
+    caller_record.proofs.push(permit);
+    caller_record.proofs.sort_unstable();
+    caller_record.proofs.dedup();
+    Ok(permit)
 }
 
 fn populate_actor_image(
@@ -22118,6 +22472,7 @@ mod tests {
     }
 
     const PARSED_CORE_IMAGE_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
+    const PARSED_CORE_ACTOR_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/actor.wr");
     const PARSED_COMPTIME_IMAGE_SOURCE: &str = "module app.image\n\nfrom core.image import Image, Target\n\n@image\npub fn boot() -> Image:\n    return Image(name=\"bootstrap\", target=Target.aarch64_qemu_virt_uefi)\n";
     const PARSED_COMPTIME_MATH_SOURCE: &str = "module app.math\n\npub fn add(left: u32, right: u32) -> u32:\n    return left + right\n\npub fn leaf(value: u32) -> u32:\n    return add(left=value, right=1)\n\npub fn middle(value: u32) -> u32:\n    return leaf(value)\n";
     const PARSED_COMPTIME_TEST_SOURCE: &str = "module app.math_test\n\nfrom app.math import add, middle\n\n@test\nfn imported_scalars_work():\n    caller: u32 = 40\n    nested: u32 = middle(caller)\n    caller = add(left=caller, right=2)\n    valid: bool = nested == 41 and not false\n    if valid:\n        comptime assert caller == 42, \"caller local was not preserved\"\n    else:\n        comptime assert false, \"nested scalar call failed\"\n";
@@ -22160,7 +22515,28 @@ pub struct Packet:
     }
 
     fn parsed_actor_fixture(application_source: &str) -> ParsedActorFixture {
+        parsed_actor_fixture_with_core_actor(application_source, false)
+    }
+
+    fn parsed_actor_admission_fixture(application_source: &str) -> ParsedActorFixture {
+        parsed_actor_fixture_with_core_actor(application_source, true)
+    }
+
+    fn parsed_actor_fixture_with_core_actor(
+        application_source: &str,
+        include_actor: bool,
+    ) -> ParsedActorFixture {
         let mut sources = SourceDatabase::default();
+        let actor_file = include_actor
+            .then(|| {
+                sources.add(SourceInput {
+                    path: "actor.wr".to_owned(),
+                    text: PARSED_CORE_ACTOR_SOURCE.to_owned(),
+                    digest: Sha256Digest::from_bytes([0xc2; 32]),
+                })
+            })
+            .transpose()
+            .expect("core actor source");
         let application_file = sources
             .add(SourceInput {
                 path: "app.wr".to_owned(),
@@ -22177,9 +22553,12 @@ pub struct Packet:
             .expect("core image source");
         let mut parsed_files = Vec::new();
         parsed_files
-            .try_reserve_exact(2)
-            .expect("two parsed actor files");
-        for file in [application_file, core_file] {
+            .try_reserve_exact(2 + usize::from(actor_file.is_some()))
+            .expect("bounded parsed actor files");
+        for file in [actor_file, Some(application_file), Some(core_file)]
+            .into_iter()
+            .flatten()
+        {
             let (parsed, diagnostics) = WrelaSyntaxParser::new()
                 .parse(
                     ParseRequest {
@@ -22218,6 +22597,15 @@ pub struct Packet:
                 application_file,
             )
             .expect("app module");
+        if let Some(actor_file) = actor_file {
+            graph
+                .add_module(
+                    core,
+                    ModulePath::new(["actor".to_owned()]).expect("core actor module path"),
+                    actor_file,
+                )
+                .expect("core actor module");
+        }
         graph
             .add_module(
                 core,
@@ -23890,6 +24278,340 @@ pub fn boot() -> Image:
     installed = img.service(Worker, mailbox=2)
     return img
 "#;
+
+    fn admission_actor_source(task_body: &str) -> String {
+        let task_tail = if task_body.contains("return ") {
+            ""
+        } else {
+            "        await checkpoint()\n"
+        };
+        format!(
+            r#"module app
+
+from core.actor import AdmissionError, AdmissionResult
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        await checkpoint()
+
+    pub async fn pong(mut self):
+        await checkpoint()
+
+    @task
+    async fn publish(mut self):
+{task_body}
+{task_tail}
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#
+        )
+    }
+
+    #[test]
+    fn admission_result_try_send_matches_exhaustively_with_exact_ephemeral_facts() {
+        let source = admission_actor_source(
+            "        match try send self.ping():\n            case AdmissionResult.Admitted:\n                pass\n            case AdmissionResult.Rejected(reason):\n                pass\n",
+        );
+        let fixture = parsed_actor_admission_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("try-send analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "canonical AdmissionResult match must analyze: {:?}",
+            output.diagnostics()
+        );
+        let image = output.successful().expect("sealed admission-result image");
+        let facts = image.facts();
+        let try_send = facts
+            .expressions
+            .iter()
+            .find(|fact| {
+                matches!(
+                    fact.resolution,
+                    ExpressionResolution::Builtin(IntrinsicOperation::ActorTrySend {
+                        actor: ActorId(0)
+                    })
+                )
+            })
+            .expect("outer try-send fact");
+        assert_eq!(try_send.effects, EffectSet(EffectSet::ACTOR));
+        assert_eq!(try_send.ownership_before, OwnershipState::Owned);
+        assert_eq!(try_send.ownership_after, OwnershipState::Owned);
+        let result = try_send.result.expect("try-send outcome value");
+        let outcome = facts
+            .values
+            .get(result.0 as usize)
+            .expect("try-send outcome record");
+        assert_eq!(
+            outcome.class,
+            SemanticValueClass::Ephemeral(EphemeralKind::AdmissionResult)
+        );
+        assert!(matches!(
+            facts.types.get(outcome.ty.0 as usize).map(|ty| &ty.kind),
+            Some(SemanticTypeKind::Enumeration { variants, .. })
+                if matches!(variants.as_slice(), [admitted, rejected]
+                    if admitted.name == "Admitted"
+                        && admitted.fields.is_empty()
+                        && rejected.name == "Rejected"
+                        && rejected.fields.len() == 1)
+        ));
+        let request = facts
+            .expressions
+            .iter()
+            .find(|fact| matches!(fact.resolution, ExpressionResolution::ActorRequest { .. }))
+            .expect("inner actor request fact");
+        assert_ne!(request.expression, try_send.expression);
+        assert_eq!(request.proofs, try_send.proofs);
+        let ExpressionResolution::ActorRequest { permit, .. } = request.resolution else {
+            unreachable!();
+        };
+        assert!(try_send.proofs.contains(&permit));
+
+        let try_index = facts
+            .expressions
+            .iter()
+            .position(|fact| fact.expression == try_send.expression)
+            .expect("try-send fact index");
+        let request_index = facts
+            .expressions
+            .iter()
+            .position(|fact| fact.expression == request.expression)
+            .expect("request fact index");
+
+        let mut forged_class = facts.clone();
+        forged_class.values[result.0 as usize].class = SemanticValueClass::FirstClass;
+        forged_class
+            .validate_partial_structure()
+            .expect("first-class substitution remains prefix-valid");
+        assert!(
+            forged_class
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let error_ty = facts
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(&ty.kind, SemanticTypeKind::Enumeration { variants, .. }
+                    if variants.iter().any(|variant| variant.name == "DeadlineRejected"))
+            })
+            .map(|ty| ty.id)
+            .expect("AdmissionError type");
+        let mut forged_type = facts.clone();
+        forged_type.expressions[try_index].ty = error_ty;
+        forged_type.values[result.0 as usize].ty = error_ty;
+        forged_type
+            .validate_partial_structure()
+            .expect("nominal type substitution remains prefix-valid");
+        assert!(
+            forged_type
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let replacement_proof = facts
+            .proofs
+            .iter()
+            .map(|proof| proof.id)
+            .find(|candidate| *candidate != permit)
+            .expect("another valid proof");
+        let mut forged_proof = facts.clone();
+        forged_proof.expressions[try_index]
+            .proofs
+            .retain(|proof| *proof != permit);
+        forged_proof.expressions[try_index]
+            .proofs
+            .push(replacement_proof);
+        forged_proof.expressions[try_index].proofs.sort_unstable();
+        forged_proof
+            .validate_partial_structure()
+            .expect("valid proof substitution remains prefix-valid");
+        assert!(
+            forged_proof
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let pong = facts
+            .functions
+            .iter()
+            .find(|function| {
+                function.role == FunctionRole::ActorTurn(ActorId(0))
+                    && matches!(function.origin, FunctionOrigin::Source { declaration, .. }
+                        if image.hir().as_program().declaration(declaration)
+                            .and_then(|record| record.name.as_ref())
+                            .is_some_and(|name| name.as_str() == "pong"))
+            })
+            .map(|function| function.id)
+            .expect("alternate actor turn");
+        let mut forged_method = facts.clone();
+        let ExpressionResolution::ActorRequest { method, .. } =
+            &mut forged_method.expressions[request_index].resolution
+        else {
+            unreachable!();
+        };
+        *method = pong;
+        forged_method
+            .validate_partial_structure()
+            .expect("valid method substitution remains prefix-valid");
+        assert!(
+            forged_method
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn admission_result_try_send_supports_direct_is_for_both_tags() {
+        for pattern in ["AdmissionResult.Admitted", "AdmissionResult.Rejected(_)"] {
+            let source = admission_actor_source(&format!(
+                "        admitted: bool = try send self.ping() is {pattern}\n"
+            ));
+            let fixture = parsed_actor_admission_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("try-send is analysis");
+            assert!(
+                output.diagnostics().is_empty(),
+                "direct is pattern {pattern} must analyze: {:?}",
+                output.diagnostics()
+            );
+            assert!(output.successful().is_some());
+        }
+    }
+
+    #[test]
+    fn admission_result_try_send_question_and_other_consumers_fail_closed() {
+        for (task_body, code) in [
+            (
+                "        outcome: AdmissionResult = (try send self.ping())?\n",
+                "semantic-ephemeral-question-forbidden",
+            ),
+            (
+                "        outcome: AdmissionResult = try send self.ping()\n",
+                "semantic-admission-result-consumer-pending",
+            ),
+            (
+                "        try send self.ping()\n",
+                "semantic-admission-result-consumer-pending",
+            ),
+            (
+                "        return try send self.ping()\n",
+                "semantic-admission-result-consumer-pending",
+            ),
+        ] {
+            let source = admission_actor_source(task_body);
+            let fixture = parsed_actor_admission_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("unsupported admission consumer is a diagnostic");
+            assert_eq!(
+                output
+                    .diagnostics()
+                    .first()
+                    .and_then(|diagnostic| diagnostic.code.as_deref()),
+                Some(code),
+                "{task_body}: {:?}",
+                output.diagnostics()
+            );
+            assert!(output.successful().is_none());
+        }
+    }
+
+    #[test]
+    fn admission_result_try_send_payload_attempt_bound_and_cancellation_fail_closed() {
+        let payload = admission_actor_source(
+            "        match try send self.ping(1):\n            case AdmissionResult.Admitted:\n                pass\n            case AdmissionResult.Rejected(reason):\n                pass\n",
+        )
+        .replacen(
+            "pub async fn ping(mut self):",
+            "pub async fn ping(mut self, value: u64):",
+            1,
+        );
+        let fixture = parsed_actor_admission_fixture(&payload);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("payload rejection");
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-actor-send-payload-not-supported")
+        );
+
+        let attempts = admission_actor_source(
+            "        first: bool = try send self.ping() is AdmissionResult.Admitted\n        second: bool = try send self.ping() is AdmissionResult.Rejected(_)\n",
+        );
+        let fixture = parsed_actor_admission_fixture(&attempts);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("attempt bound rejection");
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-actor-try-send-single-attempt-bound")
+        );
+
+        let source = admission_actor_source(
+            "        admitted: bool = try send self.ping() is AdmissionResult.Admitted\n",
+        );
+        let fixture = parsed_actor_admission_fixture(&source);
+        let changes = no_changes();
+        let polls = Cell::new(0u32);
+        let baseline = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("counted admission analysis");
+        assert!(baseline.successful().is_some());
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
 
     #[test]
     fn zero_initialized_actor_state_has_exact_owned_storage() {

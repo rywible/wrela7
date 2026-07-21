@@ -1,0 +1,12 @@
+module actor
+
+pub enum AdmissionError:
+    Full
+    Restarting
+    StaleRequest
+    Cancelled
+    DeadlineRejected
+
+pub enum AdmissionResult:
+    Admitted
+    Rejected(AdmissionError,)
