@@ -109,6 +109,19 @@ surface**, resolved at integration, not a blocker:
 The reverse direction *does* exist and is worth remembering: `E4` and `D2` gate
 on Lane A, so Lane A paces convergence — but not B1–B9.
 
+**Cross-cutting: the place-lowering track (discovered 2026-07-21).** B1's and
+B5's investigations converged on one shared blocker: *non-scalar values do not
+flow through the sealed WIR stack + codegen yet*, and `mut` on a projected
+aggregate place is unimplemented (`+=` is scalar-locals only;
+`analyzer.rs:3997`/`7730`). This gates the *lowering half* of B1 (B1b), B5 (B5c
+reply-slot), and any B2/B3 case that needs a promoted aggregate to reach native
+COFF. It **overlaps Lane A's aggregate-ownership work**. Decision: land every
+Lane B task's **analysis/diagnostic tier first** (the differentiators, all
+sema-side and genuinely completable now); treat "values-through-WIR +
+place-level aggregate mutation" as one shared lowering track sequenced with Lane
+A, feeding the `*b`/`*c` lowering sub-tasks afterward. This does **not** block
+the analysis tier and is where the lane's real value lands earliest.
+
 ---
 
 ## 3. Intra-lane dependency DAG and wave schedule
@@ -234,6 +247,31 @@ runtime Option/Result; do not collide with A1's module bodies).
 COFF with byte-ident repeat; rows 3.4–3.4.6 + 2.3.5 updated with
 `view_projection_vertical.rs` evidence.
 
+### B1 re-scope (2026-07-21) — split at the lowering boundary
+
+Investigation (clean, no code) confirmed no `view` value reaches lowering: every
+binding/param/result passes the runtime-type-resolution gate at
+`analyzer.rs:8603` which hard-fails `view` with `semantic-view-escape`. Reaching
+native COFF for even a scalar read-only view requires (a) a new view/place
+analysis concept bypassing that gate, (b) view representation through the three
+sealed WIR formats + codecs + LLVM codegen, and (c) — for `mut view` RMW —
+place-level aggregate mutation (blocked at `analyzer.rs:3997`/`7730`; `+=` today
+is scalar-locals only). Split:
+
+- **B1a — View/projection static semantics (analysis tier, landable now).** The
+  §4.3 view/place concept in `wrela-sema`: implicit conservative provenance,
+  lexical lifetime interval, disjointness. Delivers the differentiating
+  **negatives + provenance** with named diagnostics — reuse `semantic-view-escape`
+  / `semantic-view-across-await`; add `semantic-view-source-mutated`,
+  `semantic-projection-multiple-yields`, `semantic-projection-carrier-rebound`;
+  and the §4.3 retention diagnostic naming **both** the frozen parameter and the
+  blocking projection. Positive = "projection + view binding + consumption
+  *analyzes cleanly* with correct single-yield / provenance / lifetime facts."
+  Native-COFF view lowering stays fail-closed. Rows 3.4–3.4.6 / 2.3.5 cite only
+  analysis-tier evidence (no native-COFF overclaim).
+- **B1b — View lowering to native COFF (deferred).** Needs the shared
+  place-lowering track (below).
+
 ---
 
 ## Task B2 — Region classes + inference
@@ -270,6 +308,35 @@ promoted allocation and the profile.
 
 **AC:** promotion appears in the sealed `wrela-image-report`; forbidden-promotion
 profile rejects; rows 3.6–3.9 updated with named evidence.
+
+### B2 re-scope (2026-07-21) — schema → producer → arena
+
+Investigation (clean, no code) confirmed region *vocabulary* exists but has no
+producer: `SemanticOperation::{Allocate,ResetRegion,Promote}` are validated
+(`wrela-semantic-wir/src/lib.rs:415-431`) but only appear in exhaustive match
+arms — nothing lowers source into them; regions are synthesized only for actor
+mailboxes/turn frames. `@no_promote`/`@budget` hard-error today
+(`semantic-builtin-attribute-not-implemented`, `analyzer.rs:693-757`) — live
+rejections that must not be weakened until a promotion analysis exists to
+trigger them. Both promotion-expressing constructs are blocked (compilable
+actors are "bounded stateless" `analysis_facts.rs:15-21`; `with`/arena is B4).
+Split:
+
+- **B2a — Promotion report schema (landable now, self-contained).** Add a
+  validated `PromotionFact` / `RegionAssignmentFact` to `AnalysisFacts`, wired
+  through measure/canonicalize/validate/render/`to_json`/`decode.rs`, with
+  byte-ident + cancellation unit tests in `wrela-image-report`. This is exactly
+  the surface F5 completes and B10 consumes; touches no rejection. (Lands schema
+  ahead of a producer — acceptable for a versioned public schema crate.)
+- **B2b — Escape→promotion producer.** Compile one **stateful** actor that
+  stores a value into `self.<field>`, run whole-image escape analysis, classify
+  the allocation, emit WIR `Promote`, widen the `analysis_facts` actor
+  projection to carry the promotion fact → the real positive vertical (no B4
+  needed). Then give `@no_promote` its real contract (named rejection naming
+  allocation + profile) on top. Needs B2a.
+- **B2c — Arena / `@budget` / exact-limit + abnormal-exit reset.** The §9
+  `with arena(...)` example — depends on **B4** (`with` runtime). Sequence after
+  B4.
 
 ---
 
@@ -337,6 +404,31 @@ a cleanup that could fail without a handler → named rejection.
 **AC:** vertical covering normal + abnormal teardown ordering, both observed in
 the event stream; rows 3.11 + 1.5.2 updated.
 
+### B4 re-scope (2026-07-21) — sema → normal-path lowering → abnormal paths
+
+Investigation (clean, no code) confirmed `with`/`scope` is parsed + modelled at
+every layer but **dormant downstream**: `scope_protocols`/`scope_activations`
+are hardcoded `Vec::new()` (`analyzer.rs:1158-1159`); `With` →
+`RuntimeShapeFailure::Unsupported` (`analyzer.rs:2734`); semantic-lower rejects
+(`~:4648`); flow-lower rejects (`:5453`); machine-lower has no scope-op handling.
+Fail-closed boundary is already clean and named
+(`semantic-runtime-test-body-not-supported`, `analyzer.rs:2188`). Event stream is
+observed via `FlowOperation::TestEmit` ordering (`stdlib_time_runtime_vertical.rs:180`).
+Spec §11 is implementable as written. Split:
+
+- **B4a — Sema scope analysis (landable now, no lowering).** Populate
+  `ScopeProtocol`/`ScopeActivation`, build + prove the cleanup DAG, emit
+  `CleanupAcyclic`, cycle → named diagnostic naming the cycle; effect legality
+  (no `await` in exit/abort), abort-coverage, reverse-topo order. Vertical
+  asserts facts + the **negative cycle rejection** (the sub-case fully doable at
+  sema tier). Keep lowering fail-closed with a named
+  `semantic-with-cleanup-lowering-pending`.
+- **B4b — Lowering to FlowWir (normal path).** semantic-lower scope ops +
+  `ScopePlan`; flow-lower the cleanup DAG on the normal exit path; assert
+  reverse-topo `TestEmit` order + byte-ident.
+- **B4c — Abnormal/cancellation paths.** exit actions on `return`/`?`/abort/
+  cancel, exactly-once; assert identical order on the abort path.
+
 ---
 
 ## Task B5 — Recurring actor runtime
@@ -397,6 +489,39 @@ ephemeral `AdmissionResult` sharing one `AdmissionError` (from `try send`,
 **AC:** recurring cross-actor typed call with reply proven under the test tier;
 scheduler is per-core; rows 4.3, 4.3.2, 4.3.3–4.3.4, 4.3.5, 4.4 updated with
 named evidence.
+
+### B5 re-scope (2026-07-21) — verified irreducible, split into landable increments
+
+Investigation (clean, no code) confirmed the "minimal" positive is not
+decomposable below the whole reply backend: no `AsyncExit`/`ActorCallError`/
+`AdmissionResult` types exist in any layer; `ReplyResolve`
+(`wrela-flow-wir/src/lib.rs:317`) is defined but never *produced* by
+`flow-lower`/`semantic-lower`; `wrela-machine-wir` (8437 lines) has zero reply
+support; `runtime.S` (1699 lines) has no scheduler. The reference commit
+`516b0ec5` was 2788 insertions/15 files. So B5 splits:
+
+- **B5a — Outcome taxonomy types.** Row 4.3.5. Define `AsyncExit[E]`,
+  `ActorCallError[E]` (`Exit`/`PeerFailed`/`NotAdmitted`), `AdmissionResult`
+  sharing one `AdmissionError` — once, in the type system + sealed stdlib.
+  Proven by a type-resolution vertical. **BLOCKED (verified 2026-07-21) — now a
+  Tier-0 floor dependency, not a front-end slice.** The runtime type subset
+  routes every enum-with-args to `ensure_core_result_type` (`analyzer.rs:8543`,
+  reject `8640`), rejects non-scalar variant payloads (`8927`/`8949`), and
+  rejects mixed-arity/unit variants (`8892-8901`); there is no ephemeral/
+  second-class type kind in the compiler at all. So the taxonomy needs general
+  ADTs + an ephemeral kind + A6 generics first. See the unified plan
+  `2026-07-21-unified-toolchain-execution-plan.md`.
+- **B5b — Unified wait-for graph + diagnostics.** Rows 4.3/4.3.1. Acyclic
+  unified wait graph over the closed image graph; `wait-cycle` and
+  driver-self-wait named rejections. Sema-only, negative tests, fail-closed.
+  Green, no backend.
+- **B5c — Reply runtime through native COFF.** The ~2000-line core: reply-slot
+  in `machine-wir` + ABI records + `ReplyResolve` production in
+  `semantic-lower`/`flow-lower` + reply-await + `machine-lower` codegen +
+  per-core scheduler entry in `runtime.S`; positive typed-call+reply,
+  exactly-once, non-reentrant-across-await. **This is the real long pole and
+  gates B6/B8/B9.** Needs B5a's taxonomy types. Dedicated multi-session build,
+  not a single-agent increment.
 
 ---
 
@@ -586,10 +711,15 @@ the same change; new/updated rows cite `inferred_placement_vertical.rs`.
 
 | Task | Wave | Deps | Status |
 |---|---|---|---|
-| B1 Views/projections | 1 | L0 | not started |
-| B2 Regions + inference | 1 | L0 | not started |
+| B1a View/projection semantics | 1 | L0 | dispatched |
+| B1b View lowering (native COFF) | later | place-lowering track | deferred |
+| B2a Promotion report schema | 1 | L0 | dispatched |
+| B2b Escape→promotion producer | 2 | B2a | queued |
+| B2c Arena / @budget | 3 | B4 | queued |
 | B4 with + cleanup | 1 | L0 | not started |
-| B5 Recurring actor runtime | 1 | L0 (harvest ref-only) | not started |
+| B5a Outcome taxonomy types | 1 | L0 (maybe A6) | dispatched |
+| B5b Wait-for graph + diagnostics | 1 | L0 | dispatched |
+| B5c Reply runtime (native COFF) | 2 | B5a | queued (long pole; gates B6/B8/B9) |
 | B3 iso pool brands | 2 | B2 | not started |
 | B6 General async lowering | 2 | B5 | not started |
 | B8 Supervision | 2 | B5 | not started |
