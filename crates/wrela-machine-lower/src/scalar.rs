@@ -686,6 +686,19 @@ fn preflight(
     if input.functions.is_empty() {
         return Err(unsupported("an empty FlowWir function table"));
     }
+    // Public lowering has already validated limits, build/target identity,
+    // target policy, cancellation, and the nonempty function floor. Stop
+    // before v11 activation planning interprets this exact v10 region as one
+    // of its closed mailbox/frame storage variants.
+    for region in &input.regions {
+        check_cancelled(is_cancelled)?;
+        if region.class == flow::RegionClass::Image
+            && matches!(region.owner, flow::PlanOwner::Actor(_))
+            && joined_name_has_suffix(&region.name, ".state", is_cancelled)?
+        {
+            return Err(unsupported("machine-actor-state-storage-lowering-pending"));
+        }
+    }
     let flow_actor_dispatch = discover_actor_dispatch(input, is_cancelled)?;
     let activations = lower_activation_subset(
         input,

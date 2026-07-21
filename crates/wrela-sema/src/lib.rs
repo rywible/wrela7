@@ -1816,6 +1816,11 @@ impl PartialAnalysis {
                 "image graph contains invalid references, bounds, or order",
             ));
         }
+        if !valid_actor_state_contracts(self, hir.as_program(), graph) {
+            return Err(invalid(
+                "actor state storage differs from its exact HIR declaration",
+            ));
+        }
         if self.baked_artifacts.iter().any(|artifact| {
             artifact.name.trim().is_empty()
                 || artifact.media_type.trim().is_empty()
@@ -8533,6 +8538,119 @@ fn valid_image_graph(graph: &ImageGraph, analysis: &PartialAnalysis) -> bool {
         && graph.shutdown_order.len() == shutdown.len()
         && startup == required
         && shutdown == required
+}
+
+fn valid_actor_state_contracts(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    graph: &ImageGraph,
+) -> bool {
+    for actor in &graph.actors {
+        let Some(SemanticType {
+            kind:
+                SemanticTypeKind::Class {
+                    declaration,
+                    arguments,
+                    fields,
+                },
+            linearity,
+            size_upper_bound,
+            alignment_lower_bound,
+            source,
+            ..
+        }) = analysis.types.get(actor.class.0 as usize)
+        else {
+            return false;
+        };
+        let Some(declaration_record) = program.declaration(*declaration) else {
+            return false;
+        };
+        let wrela_hir::DeclarationKind::Structure(class) = &declaration_record.kind else {
+            return false;
+        };
+        if !arguments.is_empty()
+            || !fields.is_empty()
+            || *linearity != Linearity::ReclaimableLinear
+            || *size_upper_bound != Some(0)
+            || *alignment_lower_bound != 1
+            || *source != Some(declaration_record.source)
+        {
+            return false;
+        }
+        let state_source = match class.fields.as_slice() {
+            [] => None,
+            [field]
+                if matches!(
+                    field.ty.kind,
+                    wrela_hir::TypeExpressionKind::Named {
+                        definition: wrela_hir::Definition::Builtin(wrela_hir::Builtin::Actor),
+                        ..
+                    }
+                ) =>
+            {
+                None
+            }
+            [field]
+                if field.name.as_str() == "value"
+                    && matches!(
+                        field.ty.kind,
+                        wrela_hir::TypeExpressionKind::Named {
+                            definition: wrela_hir::Definition::Builtin(wrela_hir::Builtin::U64),
+                            ref arguments,
+                        } if arguments.is_empty()
+                    ) =>
+            {
+                let Some(default) = field.default else {
+                    return false;
+                };
+                let Some(expression) = program.expression(default) else {
+                    return false;
+                };
+                if !matches!(
+                    &expression.kind,
+                    wrela_hir::ExpressionKind::Literal(wrela_hir::Literal::Integer(value))
+                        if value == "0"
+                ) {
+                    return false;
+                }
+                Some(field.source)
+            }
+            _ => return false,
+        };
+        let mut state_regions = graph.regions.iter().filter(|region| {
+            region
+                .name
+                .strip_suffix(".state")
+                .is_some_and(|prefix| prefix == actor.name)
+        });
+        match (state_source, state_regions.next(), state_regions.next()) {
+            (None, None, None) => {}
+            (Some(source), Some(region), None) => {
+                let proof_matches =
+                    analysis
+                        .proofs
+                        .get(region.proof.0 as usize)
+                        .is_some_and(|proof| {
+                            proof.id == region.proof
+                                && proof.kind == ProofKind::CapacityBound
+                                && proof.bound == Some(1)
+                                && proof.sources.as_slice() == [source]
+                                && proof.depends_on.is_empty()
+                        });
+                if region.class != RegionClass::Image
+                    || region.capacity_bytes != 8
+                    || region.alignment != 8
+                    || region.owner != ImageOwner::Actor(actor.id)
+                    || region.source != source
+                    || !proof_matches
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn valid_owner(owner: ImageOwner, graph: &ImageGraph, artifacts: usize) -> bool {

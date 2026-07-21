@@ -17798,13 +17798,40 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             let DeclarationKind::Structure(actor_class) = &declaration.kind else {
                 return Err(self.unsupported(class_argument.source));
             };
-            if !actor_class.fields.is_empty() {
-                return Err(self.diagnostic_category(
-                    Category::ACTOR,
-                    actor_class.fields[0].source,
-                    "semantic-actor-wiring-missing",
-                    "an actor handle field requires one matching image installation argument",
-                ));
+            match actor_state_shape(program, actor_class) {
+                ActorStateShape::Stateless | ActorStateShape::CanonicalZeroU64 { .. } => {}
+                ActorStateShape::WiringField { source } => {
+                    return Err(self.diagnostic_category(
+                        Category::ACTOR,
+                        source,
+                        "semantic-actor-wiring-missing",
+                        "an actor handle field requires one matching image installation argument",
+                    ));
+                }
+                ActorStateShape::InitializerRequired { source } => {
+                    return Err(self.diagnostic_category(
+                        Category::ACTOR,
+                        source,
+                        "semantic-actor-state-initializer-required",
+                        "the admitted actor state field requires an explicit initializer",
+                    ));
+                }
+                ActorStateShape::InitializerPending { source } => {
+                    return Err(self.diagnostic_category(
+                        Category::ACTOR,
+                        source,
+                        "semantic-actor-state-initializer-pending",
+                        "actor state initialization currently admits only canonical zero",
+                    ));
+                }
+                ActorStateShape::ShapePending { source } => {
+                    return Err(self.diagnostic_category(
+                        Category::ACTOR,
+                        source,
+                        "semantic-actor-state-shape-pending",
+                        "actor state storage currently admits exactly `value: u64 = 0`",
+                    ));
+                }
             }
             None
         };
@@ -18789,7 +18816,76 @@ struct ActorPlan {
     id: ActorId,
     evaluated: EvaluatedActor,
     class_source: Span,
+    state_source: Option<Span>,
     methods: Vec<ActorMethodPlan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorStateShape {
+    Stateless,
+    CanonicalZeroU64 { source: Span },
+    WiringField { source: Span },
+    InitializerRequired { source: Span },
+    InitializerPending { source: Span },
+    ShapePending { source: Span },
+}
+
+fn actor_state_shape(
+    program: &wrela_hir::Program,
+    class: &wrela_hir::AggregateDeclaration,
+) -> ActorStateShape {
+    let [] = class.fields.as_slice() else {
+        let [field] = class.fields.as_slice() else {
+            return ActorStateShape::ShapePending {
+                source: class.fields[1].source,
+            };
+        };
+        if matches!(
+            field.ty.kind,
+            TypeExpressionKind::Named {
+                definition: Definition::Builtin(Builtin::Actor),
+                ..
+            }
+        ) {
+            return ActorStateShape::WiringField {
+                source: field.source,
+            };
+        }
+        if field.name.as_str() != "value"
+            || !matches!(
+                field.ty.kind,
+                TypeExpressionKind::Named {
+                    definition: Definition::Builtin(Builtin::U64),
+                    ref arguments,
+                } if arguments.is_empty()
+            )
+        {
+            return ActorStateShape::ShapePending {
+                source: field.source,
+            };
+        }
+        let Some(default) = field.default else {
+            return ActorStateShape::InitializerRequired {
+                source: field.source,
+            };
+        };
+        let Some(expression) = program.expression(default) else {
+            return ActorStateShape::InitializerPending {
+                source: field.source,
+            };
+        };
+        return if matches!(&expression.kind, ExpressionKind::Literal(wrela_hir::Literal::Integer(value)) if value == "0")
+        {
+            ActorStateShape::CanonicalZeroU64 {
+                source: field.source,
+            }
+        } else {
+            ActorStateShape::InitializerPending {
+                source: expression.source,
+            }
+        };
+    };
+    ActorStateShape::Stateless
 }
 
 fn populate_evaluated_image(
@@ -18900,15 +18996,50 @@ fn inspect_actor_plans(
                 "remove generic and interface specialization from the installed actor struct",
             ));
         }
-        if !class.fields.is_empty() && actor.dependency.is_none() {
-            return Err(actor_runtime_diagnostic(
-                Category::ACTOR,
-                class.fields[0].source,
-                "semantic-actor-state-not-supported",
-                "actor field initialization is outside the exact image-wired handle subset",
-                "use a stateless actor or the single Actor[Service] field on the installed app",
-            ));
-        }
+        let state_source = if actor.dependency.is_none() {
+            match actor_state_shape(program, class) {
+                ActorStateShape::Stateless => None,
+                ActorStateShape::CanonicalZeroU64 { source } => Some(source),
+                ActorStateShape::WiringField { source } => {
+                    return Err(actor_runtime_diagnostic(
+                        Category::ACTOR,
+                        source,
+                        "semantic-actor-wiring-missing",
+                        "an actor handle field requires one matching image installation argument",
+                        "pass the unique installed service handle by the declared field name",
+                    ));
+                }
+                ActorStateShape::InitializerRequired { source } => {
+                    return Err(actor_runtime_diagnostic(
+                        Category::ACTOR,
+                        source,
+                        "semantic-actor-state-initializer-required",
+                        "the admitted actor state field requires an explicit initializer",
+                        "initialize the exact field as `value: u64 = 0`",
+                    ));
+                }
+                ActorStateShape::InitializerPending { source } => {
+                    return Err(actor_runtime_diagnostic(
+                        Category::ACTOR,
+                        source,
+                        "semantic-actor-state-initializer-pending",
+                        "actor state initialization currently admits only canonical zero",
+                        "initialize the exact field as `value: u64 = 0`",
+                    ));
+                }
+                ActorStateShape::ShapePending { source } => {
+                    return Err(actor_runtime_diagnostic(
+                        Category::ACTOR,
+                        source,
+                        "semantic-actor-state-shape-pending",
+                        "actor state storage currently admits exactly `value: u64 = 0`",
+                        "use one private u64 field named `value` with a zero initializer",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         let mut actor_attribute = None;
         let mut duplicate_actor_attribute = false;
         for attribute in &declaration.attributes {
@@ -19185,6 +19316,7 @@ fn inspect_actor_plans(
             ),
             evaluated: actor,
             class_source: declaration.source,
+            state_source,
             methods,
         });
     }
@@ -20379,12 +20511,20 @@ fn append_actor_regions_and_capacity_proofs(
         .actors
         .len()
         .checked_add(
-            graph
-                .actors
+            plans
                 .iter()
-                .filter(|actor| !actor.turn_functions.is_empty())
+                .filter(|plan| plan.state_source.is_some())
                 .count(),
         )
+        .and_then(|count| {
+            count.checked_add(
+                graph
+                    .actors
+                    .iter()
+                    .filter(|actor| !actor.turn_functions.is_empty())
+                    .count(),
+            )
+        })
         .and_then(|count| count.checked_add(graph.tasks.len()))
         .ok_or_else(|| fact_resource(request, "image capacity regions"))?;
     if region_count > request.limits.image_nodes as usize {
@@ -20430,6 +20570,32 @@ fn append_actor_regions_and_capacity_proofs(
         static_bytes = static_bytes
             .checked_add(mailbox_bytes)
             .ok_or_else(|| fact_resource(request, "image static bytes"))?;
+        if let Some(state_source) = plan.state_source {
+            let state_proof = append_capacity_proof(
+                request,
+                partial,
+                bounded_actor_text(request, "actor state: ", "", &actor.name, is_cancelled)?,
+                vec![state_source],
+                1,
+                "the exact `value: u64 = 0` declaration reserves one actor-owned eight-byte state cell with a canonical zero initializer",
+            )?;
+            graph.regions.push(Region {
+                id: RegionId(
+                    u32::try_from(graph.regions.len())
+                        .map_err(|_| fact_resource(request, "image capacity regions"))?,
+                ),
+                name: bounded_actor_text(request, &actor.name, ".", "state", is_cancelled)?,
+                class: RegionClass::Image,
+                capacity_bytes: 8,
+                alignment: 8,
+                owner: ImageOwner::Actor(actor.id),
+                proof: state_proof,
+                source: state_source,
+            });
+            static_bytes = static_bytes
+                .checked_add(8)
+                .ok_or_else(|| fact_resource(request, "image static bytes"))?;
+        }
         if !actor.turn_functions.is_empty() {
             let turn_frame_bytes = actor
                 .turn_functions
@@ -23115,6 +23281,158 @@ pub fn boot() -> Image:
     installed = img.service(Worker, mailbox=2)
     return img
 "#;
+
+    const ZERO_STATE_ACTOR_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    value: u64 = 0
+
+    pub async fn ping(mut self):
+        await checkpoint()
+
+    @task
+    async fn pulse(mut self):
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#;
+
+    #[test]
+    fn zero_initialized_actor_state_has_exact_owned_storage() {
+        let fixture = parsed_actor_fixture(ZERO_STATE_ACTOR_SOURCE);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("actor state analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "canonical zero state must analyze: {:?}",
+            output.diagnostics()
+        );
+        let image = output.successful().expect("sealed actor state image");
+        let facts = image.facts();
+        let graph = facts.graph.as_ref().expect("actor state graph");
+        assert_eq!(graph.regions.len(), 4);
+        let state = graph
+            .regions
+            .iter()
+            .find(|region| region.name == format!("{}.state", graph.actors[0].name))
+            .expect("actor state region");
+        assert_eq!(state.class, RegionClass::Image);
+        assert_eq!(state.owner, ImageOwner::Actor(ActorId(0)));
+        assert_eq!(state.capacity_bytes, 8);
+        assert_eq!(state.alignment, 8);
+        assert!(
+            facts
+                .proofs
+                .get(state.proof.0 as usize)
+                .is_some_and(|proof| {
+                    proof.id == state.proof
+                        && proof.kind == ProofKind::CapacityBound
+                        && proof.bound == Some(1)
+                        && proof.sources.as_slice() == [state.source]
+                })
+        );
+        assert_eq!(graph.static_bytes, 72);
+        assert_eq!(graph.peak_bytes, 72);
+
+        let mut forged_size = facts.clone();
+        let state = forged_size
+            .graph
+            .as_mut()
+            .expect("forged graph")
+            .regions
+            .iter_mut()
+            .find(|region| region.name.ends_with(".state"))
+            .expect("forged state");
+        state.capacity_bytes = 16;
+        forged_size.graph.as_mut().expect("graph").static_bytes = 80;
+        forged_size.graph.as_mut().expect("graph").peak_bytes = 80;
+        forged_size
+            .validate_partial_structure()
+            .expect("forged state size remains prefix-valid");
+        assert!(
+            forged_size
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut forged_owner = facts.clone();
+        forged_owner
+            .graph
+            .as_mut()
+            .expect("forged graph")
+            .regions
+            .iter_mut()
+            .find(|region| region.name.ends_with(".state"))
+            .expect("forged state")
+            .owner = ImageOwner::Runtime;
+        forged_owner
+            .validate_partial_structure()
+            .expect("forged state owner remains prefix-valid");
+        assert!(
+            forged_owner
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut forged_type = facts.clone();
+        let actor_class = graph.actors[0].class;
+        forged_type.types[actor_class.0 as usize].size_upper_bound = Some(8);
+        forged_type
+            .validate_partial_structure()
+            .expect("forged erased receiver type remains prefix-valid");
+        assert!(
+            forged_type
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn actor_state_tails_fail_closed_by_name() {
+        for (field, code) in [
+            ("value: u64", "semantic-actor-state-initializer-required"),
+            ("value: u64 = 1", "semantic-actor-state-initializer-pending"),
+            ("value: u32 = 0", "semantic-actor-state-shape-pending"),
+            (
+                "value: u64 = 0\n    extra: u64 = 0",
+                "semantic-actor-state-shape-pending",
+            ),
+        ] {
+            let source = format!(
+                "module app\n\nfrom core.image import Image, Target\n\n@service\npub struct Worker:\n    {field}\n\n    pub async fn ping(mut self):\n        pass\n\n@image\npub fn boot() -> Image:\n    img = Image(name=\"actor-image\", target=Target.aarch64_qemu_virt_uefi)\n    installed = img.service(Worker, mailbox=1)\n    return img\n"
+            );
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("unsupported state is a source diagnostic");
+            assert_eq!(output.diagnostics().len(), 1, "{field}");
+            assert_eq!(
+                output.diagnostics()[0].code.as_deref(),
+                Some(code),
+                "{field}"
+            );
+            assert!(output.partial().graph.is_none(), "{field}");
+        }
+    }
 
     #[test]
     fn parsed_actor_image_proves_non_reentrancy_async_frames_and_capacities() {

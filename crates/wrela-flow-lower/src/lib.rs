@@ -531,16 +531,37 @@ fn validate_actor_plan_contract(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), LowerError> {
+    let mut state_region_count = 0usize;
+    for actor in &input.actors {
+        check_cancelled(is_cancelled)?;
+        for region in &input.regions {
+            check_cancelled(is_cancelled)?;
+            if region.owner == semantic::ImageOwner::Actor(actor.id)
+                && polled_joined_name_matches(&region.name, &actor.name, ".state", is_cancelled)?
+            {
+                state_region_count =
+                    state_region_count
+                        .checked_add(1)
+                        .ok_or(LowerError::ResourceLimit {
+                            resource: "actor region plan",
+                            limit: limits.model_edges,
+                        })?;
+            }
+        }
+    }
     let expected_regions = input
         .actors
         .len()
-        .checked_add(
-            input
-                .actors
-                .iter()
-                .filter(|actor| !actor.turn_functions.is_empty())
-                .count(),
-        )
+        .checked_add(state_region_count)
+        .and_then(|count| {
+            count.checked_add(
+                input
+                    .actors
+                    .iter()
+                    .filter(|actor| !actor.turn_functions.is_empty())
+                    .count(),
+            )
+        })
         .and_then(|count| count.checked_add(input.tasks.len()))
         .and_then(|count| count.checked_add(input.activations.len()))
         .ok_or(LowerError::ResourceLimit {
@@ -602,6 +623,42 @@ fn validate_actor_plan_contract(
                     resource: "actor static bytes",
                     limit: limits.model_edges,
                 })?;
+        let has_state = if let Some(region) = input.regions.get(region_cursor) {
+            region.owner == semantic::ImageOwner::Actor(actor.id)
+                && polled_joined_name_matches(&region.name, &actor.name, ".state", is_cancelled)?
+        } else {
+            false
+        };
+        if has_state {
+            let state = input
+                .regions
+                .get(region_cursor)
+                .ok_or(unsupported("actor state region identity"))?;
+            region_cursor = region_cursor
+                .checked_add(1)
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "actor region identity",
+                    limit: limits.model_edges,
+                })?;
+            if state.class != semantic::RegionClass::Image
+                || state.capacity_bytes != 8
+                || state.alignment != 8
+                || state.owner != semantic::ImageOwner::Actor(actor.id)
+                || !capacity_proof_matches(state, 1, true)
+                || input
+                    .proofs
+                    .get(state.proof.0 as usize)
+                    .is_none_or(|proof| !proof.depends_on.is_empty())
+            {
+                return Err(unsupported("noncanonical actor state capacity plan"));
+            }
+            static_bytes = static_bytes
+                .checked_add(8)
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "actor static bytes",
+                    limit: limits.model_edges,
+                })?;
+        }
         if !actor.turn_functions.is_empty() {
             let turn = input
                 .regions
@@ -7671,6 +7728,54 @@ mod contract_tests {
             .expect("valid producer-shaped stateless actor SemanticWir")
     }
 
+    fn actor_state_fixture() -> semantic::ValidatedSemanticWir {
+        let mut module = actor_fixture().into_wir();
+        let state_source = span(0, 45, 49);
+        let mut closed = module.proofs.pop().expect("closed actor proof");
+        assert_eq!(closed.id, semantic::ProofId(9));
+        module.proofs.push(semantic::ProofRecord {
+            id: semantic::ProofId(9),
+            kind: semantic::ProofKind::CapacityBound,
+            subject: "actor state: Worker".to_owned(),
+            bound: Some(1),
+            sources: vec![state_source],
+            depends_on: Vec::new(),
+            explanation: vec!["one canonical zero u64 actor state cell".to_owned()],
+        });
+        closed.id = semantic::ProofId(10);
+        closed.bound = Some(72);
+        closed.depends_on.push(semantic::ProofId(9));
+        closed.depends_on.sort_unstable();
+        module.proofs.push(closed);
+        let entry = &mut module.functions[3];
+        entry.proofs.retain(|proof| *proof != semantic::ProofId(9));
+        entry
+            .proofs
+            .extend([semantic::ProofId(9), semantic::ProofId(10)]);
+        entry.proofs.sort_unstable();
+        module.regions.insert(
+            1,
+            semantic::RegionRecord {
+                id: semantic::RegionId(1),
+                name: "Worker.state".to_owned(),
+                class: semantic::RegionClass::Image,
+                capacity_bytes: 8,
+                alignment: 8,
+                owner: semantic::ImageOwner::Actor(semantic::ActorId(0)),
+                proof: semantic::ProofId(9),
+                source: state_source,
+            },
+        );
+        for (index, region) in module.regions.iter_mut().enumerate() {
+            region.id = semantic::RegionId(u32::try_from(index).expect("region id"));
+        }
+        module.static_bytes = 72;
+        module.peak_bytes = 72;
+        module
+            .validate()
+            .expect("valid producer-shaped actor state SemanticWir")
+    }
+
     fn actor_async_fixture() -> semantic::ValidatedSemanticWir {
         let mut module = actor_fixture().into_wir();
         let helper = &mut module.functions[0];
@@ -9278,6 +9383,69 @@ mod contract_tests {
                 output_proofs: 3,
             }
         );
+    }
+
+    #[test]
+    fn actor_zero_state_region_reaches_flow_and_is_exactly_sealed() {
+        let input = actor_state_fixture();
+        let output = CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("actor state reaches FlowWir");
+        let (validated, report, diagnostics) = output.into_parts();
+        let baseline = validated.into_wir();
+        let state = baseline
+            .regions
+            .iter()
+            .find(|region| region.name.ends_with(".state"))
+            .expect("FlowWir state region");
+        assert_eq!(state.class, flow::RegionClass::Image);
+        assert_eq!(state.owner, flow::PlanOwner::Actor(flow::ActorId(0)));
+        assert_eq!(state.capacity_bytes, 8);
+        assert_eq!(state.alignment, 8);
+        assert_eq!(baseline.static_bytes, 72);
+        assert_eq!(baseline.peak_bytes, 72);
+
+        let request = LowerRequest {
+            input,
+            limits: LoweringLimits::standard(),
+        };
+        let mut wrong_size = baseline.clone();
+        wrong_size
+            .regions
+            .iter_mut()
+            .find(|region| region.name.ends_with(".state"))
+            .expect("state region")
+            .capacity_bytes = 16;
+        wrong_size.static_bytes = 80;
+        wrong_size.peak_bytes = 80;
+        assert!(matches!(
+            seal(
+                &request,
+                wrong_size,
+                report.clone(),
+                diagnostics.clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidOutput(_))
+        ));
+
+        let mut wrong_owner = baseline;
+        wrong_owner
+            .regions
+            .iter_mut()
+            .find(|region| region.name.ends_with(".state"))
+            .expect("state region")
+            .owner = flow::PlanOwner::Runtime;
+        assert!(matches!(
+            seal(&request, wrong_owner, report, diagnostics, &|| false),
+            Err(LowerError::InvalidOutput(_))
+        ));
     }
 
     #[test]

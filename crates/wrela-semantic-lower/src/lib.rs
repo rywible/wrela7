@@ -498,7 +498,7 @@ fn supported_actor_image<'a>(
     {
         return Err(unsupported("noncanonical generated actor image entry"));
     }
-    validate_actor_graph_contract(facts, graph, limits, is_cancelled)?;
+    validate_actor_graph_contract(input, facts, graph, limits, is_cancelled)?;
     validate_actor_source_functions(input, graph, entry.id, limits, is_cancelled)?;
     let wait_proof = validate_actor_wait_contract(input, graph, entry, limits, is_cancelled)?;
     validate_actor_proof_contract(facts, graph, entry, wait_proof, is_cancelled)?;
@@ -603,21 +603,37 @@ fn validate_actor_source_type(
 }
 
 fn validate_actor_graph_contract(
+    input: &AnalyzedImage,
     facts: &sema::PartialAnalysis,
     graph: &sema::ImageGraph,
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), LowerError> {
+    let mut state_actor_count = 0usize;
+    for actor in &graph.actors {
+        check_cancelled(is_cancelled)?;
+        state_actor_count = state_actor_count
+            .checked_add(usize::from(
+                actor_state_source(input, facts, actor)?.is_some(),
+            ))
+            .ok_or(LowerError::ResourceLimit {
+                resource: "actor graph regions",
+                limit: limits.model_edges,
+            })?;
+    }
     let expected_regions = graph
         .actors
         .len()
-        .checked_add(
-            graph
-                .actors
-                .iter()
-                .filter(|actor| !actor.turn_functions.is_empty())
-                .count(),
-        )
+        .checked_add(state_actor_count)
+        .and_then(|count| {
+            count.checked_add(
+                graph
+                    .actors
+                    .iter()
+                    .filter(|actor| !actor.turn_functions.is_empty())
+                    .count(),
+            )
+        })
         .and_then(|count| count.checked_add(graph.tasks.len()))
         .ok_or(LowerError::ResourceLimit {
             resource: "actor graph regions",
@@ -723,6 +739,49 @@ fn validate_actor_graph_contract(
                     resource: "actor static bytes",
                     limit: limits.payload_bytes,
                 })?;
+        if let Some(state_source) = actor_state_source(input, facts, actor)? {
+            let state = graph
+                .regions
+                .get(region_cursor)
+                .ok_or_else(|| unsupported("missing actor state region"))?;
+            let state_id = region_cursor;
+            region_cursor = region_cursor
+                .checked_add(1)
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "actor region identity",
+                    limit: limits.model_edges,
+                })?;
+            let state_name_matches =
+                joined_name_matches(&state.name, &actor.name, ".state", is_cancelled)?;
+            let state_proof_matches =
+                facts
+                    .proofs
+                    .get(state.proof.0 as usize)
+                    .is_some_and(|proof| {
+                        proof.id == state.proof
+                            && proof.kind == sema::ProofKind::CapacityBound
+                            && proof.bound == Some(1)
+                            && proof.sources.as_slice() == [state_source]
+                            && proof.depends_on.is_empty()
+                    });
+            if state.id.0 as usize != state_id
+                || state.class != sema::RegionClass::Image
+                || state.owner != sema::ImageOwner::Actor(actor.id)
+                || state.capacity_bytes != 8
+                || state.alignment != 8
+                || state.source != state_source
+                || !state_name_matches
+                || !state_proof_matches
+            {
+                return Err(unsupported("actor state region substitution"));
+            }
+            static_bytes = static_bytes
+                .checked_add(8)
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "actor static bytes",
+                    limit: limits.payload_bytes,
+                })?;
+        }
         if !actor.turn_functions.is_empty() {
             let turn = graph
                 .regions
@@ -831,6 +890,68 @@ fn validate_actor_graph_contract(
         ));
     }
     Ok(())
+}
+
+fn actor_state_source(
+    input: &AnalyzedImage,
+    facts: &sema::PartialAnalysis,
+    actor: &sema::ActorNode,
+) -> Result<Option<Span>, LowerError> {
+    let declaration = facts
+        .types
+        .get(actor.class.0 as usize)
+        .and_then(|ty| match ty.kind {
+            sema::SemanticTypeKind::Class { declaration, .. } => Some(declaration),
+            _ => None,
+        })
+        .ok_or_else(|| unsupported("actor class state identity"))?;
+    let class = input
+        .hir()
+        .as_program()
+        .declaration(declaration)
+        .and_then(|declaration| match &declaration.kind {
+            wrela_hir::DeclarationKind::Structure(class) => Some(class),
+            _ => None,
+        })
+        .ok_or_else(|| unsupported("actor class state declaration"))?;
+    match class.fields.as_slice() {
+        [] => Ok(None),
+        [field]
+            if matches!(
+                field.ty.kind,
+                wrela_hir::TypeExpressionKind::Named {
+                    definition: wrela_hir::Definition::Builtin(wrela_hir::Builtin::Actor),
+                    ..
+                }
+            ) =>
+        {
+            Ok(None)
+        }
+        [field]
+            if field.name.as_str() == "value"
+                && matches!(
+                    field.ty.kind,
+                    wrela_hir::TypeExpressionKind::Named {
+                        definition: wrela_hir::Definition::Builtin(wrela_hir::Builtin::U64),
+                        ref arguments,
+                    } if arguments.is_empty()
+                )
+                && field.default.is_some_and(|default| {
+                    input.hir().as_program().expression(default).is_some_and(|expression| {
+                        matches!(
+                            &expression.kind,
+                            wrela_hir::ExpressionKind::Literal(wrela_hir::Literal::Integer(value))
+                                if value == "0"
+                        )
+                    })
+                }) =>
+        {
+            Ok(Some(field.source))
+        }
+        _ => Err(unsupported(
+            "actor state declaration outside the sealed zero-u64 subset",
+        )),
+    }
 }
 
 fn capacity_proof_matches(facts: &sema::PartialAnalysis, id: sema::ProofId, bound: u64) -> bool {
@@ -11182,6 +11303,30 @@ pub fn boot() -> Image:
     installed = img.service(Worker, mailbox=2)
     return img
 "#;
+    const ZERO_STATE_ACTOR_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    value: u64 = 0
+
+    pub async fn ping(mut self):
+        await checkpoint()
+
+    @task
+    async fn pulse(mut self):
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#;
 
     struct Fixture {
         hir: Arc<ValidatedProgram>,
@@ -11190,12 +11335,16 @@ pub fn boot() -> Image:
     }
 
     fn analyze_parsed_actor() -> wrela_sema::AnalyzedImage {
+        analyze_parsed_actor_source(BOUNDED_ACTOR_SOURCE)
+    }
+
+    fn analyze_parsed_actor_source(application_source: &str) -> wrela_sema::AnalyzedImage {
         let base = fixture();
         let mut sources = SourceDatabase::default();
         let application_file = sources
             .add(SourceInput {
                 path: "app.wr".to_owned(),
-                text: BOUNDED_ACTOR_SOURCE.to_owned(),
+                text: application_source.to_owned(),
                 digest: Sha256Digest::from_bytes([0xa1; 32]),
             })
             .expect("actor application source");
@@ -13372,6 +13521,63 @@ pub fn boot() -> Image:
                 &|| false,
             ),
             Err(LowerError::ResourceLimit { limit, .. }) if limit == one_byte_under.payload_bytes
+        ));
+    }
+
+    #[test]
+    fn actor_zero_state_region_lowers_and_is_exactly_sealed() {
+        let image = analyze_parsed_actor_source(ZERO_STATE_ACTOR_SOURCE);
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("canonical actor state region lowers");
+        let baseline = output.wir().as_wir().clone();
+        let state = baseline
+            .regions
+            .iter()
+            .find(|region| region.name.ends_with(".state"))
+            .expect("SemanticWir actor state region");
+        assert_eq!(state.class, wir::RegionClass::Image);
+        assert_eq!(state.owner, wir::ImageOwner::Actor(wir::ActorId(0)));
+        assert_eq!(state.capacity_bytes, 8);
+        assert_eq!(state.alignment, 8);
+        assert_eq!(baseline.static_bytes, 104);
+        assert_eq!(baseline.peak_bytes, 104);
+
+        let request = LowerRequest {
+            input: image,
+            limits: LoweringLimits::standard(),
+        };
+        let report = output.report().clone();
+        let mut wrong_size = baseline.clone();
+        wrong_size
+            .regions
+            .iter_mut()
+            .find(|region| region.name.ends_with(".state"))
+            .expect("state region")
+            .capacity_bytes = 16;
+        wrong_size.static_bytes = 112;
+        wrong_size.peak_bytes = 112;
+        assert!(matches!(
+            seal(&request, wrong_size, report.clone(), &|| false),
+            Err(LowerError::InvalidOutput(_))
+        ));
+
+        let mut wrong_owner = baseline.clone();
+        wrong_owner
+            .regions
+            .iter_mut()
+            .find(|region| region.name.ends_with(".state"))
+            .expect("state region")
+            .owner = wir::ImageOwner::Runtime;
+        assert!(matches!(
+            seal(&request, wrong_owner, report, &|| false),
+            Err(LowerError::InvalidOutput(_))
         ));
     }
 

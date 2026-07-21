@@ -3438,6 +3438,86 @@ mod contract_tests {
         (optimize(validated), target, build)
     }
 
+    fn actor_state_activation_fixture()
+    -> (OptimizedFlowWir, TargetPackage, ValidatedBuildConfiguration) {
+        let (optimized, target, build) = async_activation_fixture();
+        let (validated, _) = optimized.into_parts();
+        let mut flow = validated.into_wir();
+        let state_proof = FlowProofId(6);
+        for proof in &mut flow.proofs {
+            if proof.id.0 >= state_proof.0 {
+                proof.id.0 += 1;
+            }
+            for dependency in &mut proof.depends_on {
+                if dependency.0 >= state_proof.0 {
+                    dependency.0 += 1;
+                }
+            }
+        }
+        for function in &mut flow.functions {
+            for proof in &mut function.proofs {
+                if proof.0 >= state_proof.0 {
+                    proof.0 += 1;
+                }
+            }
+        }
+        for region in &mut flow.regions {
+            if region.capacity_proof.0 >= state_proof.0 {
+                region.capacity_proof.0 += 1;
+            }
+        }
+        for activation in &mut flow.activations {
+            if activation.capacity_proof.0 >= state_proof.0 {
+                activation.capacity_proof.0 += 1;
+            }
+        }
+        let source = span(0, 21, 22);
+        flow.proofs.push(FlowProof {
+            id: state_proof,
+            kind: ProofKind::CapacityBound,
+            subject: "actor state: actor".to_owned(),
+            sources: vec![source],
+            depends_on: Vec::new(),
+            bound: Some(1),
+            explanation: vec!["one canonical zero u64 actor state cell".to_owned()],
+        });
+        flow.proofs.sort_unstable_by_key(|proof| proof.id);
+        let base = &mut flow.proofs[7];
+        assert_eq!(base.id, FlowProofId(7));
+        base.depends_on.push(state_proof);
+        base.depends_on.sort_unstable();
+        base.bound = Some(32);
+        let closed = &mut flow.proofs[9];
+        assert_eq!(closed.id, FlowProofId(9));
+        closed.bound = Some(40);
+        flow.functions[0].proofs.push(state_proof);
+        flow.functions[0].proofs.sort_unstable();
+        flow.regions.insert(
+            1,
+            RegionPlan {
+                id: RegionId(1),
+                name: "actor.state".to_owned(),
+                class: RegionClass::Image,
+                capacity_bytes: 8,
+                alignment: 8,
+                reset_function: None,
+                owner: PlanOwner::Actor(ActorId(0)),
+                capacity_proof: state_proof,
+                source,
+            },
+        );
+        for (index, region) in flow.regions.iter_mut().enumerate() {
+            region.id = RegionId(u32::try_from(index).expect("region id"));
+        }
+        flow.activations[0].region = RegionId(3);
+        flow.static_bytes = 40;
+        flow.peak_bytes = 40;
+        let validated = flow
+            .validate()
+            .expect("valid Flow v10 actor-state boundary fixture");
+        (optimize(validated), target, build)
+    }
+
     fn generated_test_fixture() -> (OptimizedFlowWir, TargetPackage, ValidatedBuildConfiguration) {
         production_generated_test_fixture()
     }
@@ -5440,6 +5520,38 @@ mod contract_tests {
         )
         .expect("repeated lowering");
         assert_eq!(first, repeated);
+    }
+
+    #[test]
+    fn actor_state_storage_stops_at_named_machine_boundary() {
+        let (optimized, target, build) = actor_state_activation_fixture();
+        assert!(
+            optimized
+                .wir()
+                .as_wir()
+                .regions
+                .iter()
+                .any(|region| region.name == "actor.state")
+        );
+        assert_eq!(
+            lower(
+                &optimized,
+                &target,
+                &build,
+                MachineLoweringLimits::standard(),
+                &|| false,
+            ),
+            Err(MachineLowerError::UnsupportedInput {
+                feature: "machine-actor-state-storage-lowering-pending",
+            })
+        );
+        let mut invalid_limits = MachineLoweringLimits::standard();
+        invalid_limits.types = 0;
+        assert_eq!(
+            lower(&optimized, &target, &build, invalid_limits, &|| false,),
+            Err(MachineLowerError::InvalidLimits),
+            "public machine policy validation must retain precedence over the pending state boundary"
+        );
     }
 
     #[test]

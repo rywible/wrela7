@@ -2655,16 +2655,30 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
         }
         return;
     }
+    let state_region_count = module
+        .actors
+        .iter()
+        .filter(|actor| {
+            module.regions.iter().any(|region| {
+                region.owner == ImageOwner::Actor(actor.id)
+                    && polled_joined_name_matches(&region.name, &actor.name, ".state", errors)
+                        == Some(true)
+            })
+        })
+        .count();
     let base_region_count = module
         .actors
         .len()
-        .checked_add(
-            module
-                .actors
-                .iter()
-                .filter(|actor| !actor.turn_functions.is_empty())
-                .count(),
-        )
+        .checked_add(state_region_count)
+        .and_then(|count| {
+            count.checked_add(
+                module
+                    .actors
+                    .iter()
+                    .filter(|actor| !actor.turn_functions.is_empty())
+                    .count(),
+            )
+        })
         .and_then(|count| count.checked_add(module.tasks.len()));
     let expected_regions =
         base_region_count.and_then(|count| count.checked_add(module.activations.len()));
@@ -2677,11 +2691,19 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
         }
         let mailbox_index = Some(region_cursor);
         region_cursor = region_cursor.saturating_add(1);
+        let state_index = module.regions.get(region_cursor).and_then(|region| {
+            (polled_joined_name_matches(&region.name, &actor.name, ".state", errors) == Some(true))
+                .then_some(region_cursor)
+        });
+        if state_index.is_some() {
+            region_cursor = region_cursor.saturating_add(1);
+        }
         let turn_index = (!actor.turn_functions.is_empty()).then_some(region_cursor);
         if turn_index.is_some() {
             region_cursor = region_cursor.saturating_add(1);
         }
         let mailbox = mailbox_index.and_then(|index| module.regions.get(index));
+        let state = state_index.and_then(|index| module.regions.get(index));
         let turn = turn_index.and_then(|index| module.regions.get(index));
         let mailbox_bytes = u64::from(actor.mailbox_capacity).checked_mul(16);
         let mut turn_bytes = u64::from(!actor.turn_functions.is_empty());
@@ -2705,6 +2727,25 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
         }) else {
             return;
         };
+        let state_matches = state.is_none_or(|region| {
+            state_index
+                .and_then(|index| u32::try_from(index).ok())
+                .is_some_and(|index| region.id == RegionId(index))
+                && region.class == RegionClass::Image
+                && region.capacity_bytes == 8
+                && region.alignment == 8
+                && region.owner == ImageOwner::Actor(actor.id)
+                && module
+                    .proofs
+                    .get(region.proof.0 as usize)
+                    .is_some_and(|proof| {
+                        proof.id == region.proof
+                            && proof.kind == ProofKind::CapacityBound
+                            && proof.bound == Some(1)
+                            && proof.sources.as_slice() == [region.source]
+                            && proof.depends_on.is_empty()
+                    })
+        });
         valid &= mailbox_bytes.is_some()
             && mailbox.is_some_and(|region| {
                 mailbox_index
@@ -2747,9 +2788,17 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
                                     && proof.bound == Some(1)
                                     && proof.sources.as_slice() == [region.source]
                             })
-                }));
+                }))
+            && state_matches;
         base_bytes = base_bytes
             .and_then(|bytes| mailbox_bytes.and_then(|mailbox| bytes.checked_add(mailbox)))
+            .and_then(|bytes| {
+                if state.is_some() {
+                    bytes.checked_add(8)
+                } else {
+                    Some(bytes)
+                }
+            })
             .and_then(|bytes| bytes.checked_add(turn_bytes));
         valid &= base_bytes.is_some();
     }
@@ -2916,14 +2965,16 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
         } else {
             valid = false;
         }
-        for index in 0..module.actors.len() {
+        for (index, actor) in module.actors.iter().enumerate() {
             if errors.poll() {
                 return;
             }
-            let expected = index
-                .checked_mul(2)
-                .and_then(|region| module.regions.get(region))
-                .map(|region| region.source);
+            let expected = module.regions.iter().find_map(|region| {
+                (region.owner == ImageOwner::Actor(actor.id)
+                    && polled_joined_name_matches(&region.name, &actor.name, ".mailbox", errors)
+                        == Some(true))
+                .then_some(region.source)
+            });
             valid &= base_proof.sources.get(index.saturating_add(1)).copied() == expected;
         }
     } else {
