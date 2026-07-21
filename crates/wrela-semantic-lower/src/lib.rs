@@ -218,7 +218,7 @@ fn supported_input<'a>(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedInput<'a>, LowerError> {
     validate_admission_result_lowering_boundary(input.facts())?;
-    validate_generic_function_lowering_boundary(input.facts())?;
+    validate_generic_function_lowering_boundary(input)?;
     validate_method_call_lowering_boundary(input.facts())?;
     match input.facts().root {
         sema::AnalysisRoot::DeclaredImage { .. } => {
@@ -272,19 +272,125 @@ fn validate_method_call_lowering_boundary(facts: &sema::PartialAnalysis) -> Resu
     }
 }
 
-fn validate_generic_function_lowering_boundary(
+fn validate_generic_function_lowering_boundary(input: &AnalyzedImage) -> Result<(), LowerError> {
+    validate_generic_function_lowering_boundary_parts(input.facts(), input.hir().as_program())
+}
+
+fn validate_generic_function_lowering_boundary_parts(
     facts: &sema::PartialAnalysis,
+    program: &wrela_hir::Program,
 ) -> Result<(), LowerError> {
-    if facts.functions.iter().any(|function| {
-        matches!(function.origin, sema::FunctionOrigin::Source { .. })
-            && !function.generic_arguments.is_empty()
-    }) {
-        Err(unsupported(
-            "semantic-generic-function-lowering-pending (generic function specialization)",
-        ))
-    } else {
-        Ok(())
+    for function in &facts.functions {
+        if function.generic_arguments.is_empty() {
+            continue;
+        }
+        let sema::FunctionOrigin::Source { declaration, body } = function.origin else {
+            return Err(unsupported(
+                "semantic-generic-function-kind-lowering-pending (methods, interfaces, async, or generated specialization)",
+            ));
+        };
+        let Some(declaration_record) = program.declaration(declaration) else {
+            return Err(LowerError::MissingSemanticFact {
+                subject: function.name.clone(),
+                fact: "generic source function declaration",
+            });
+        };
+        let wrela_hir::DeclarationKind::Function(source) = &declaration_record.kind else {
+            return Err(unsupported(
+                "semantic-generic-function-kind-lowering-pending (methods, interfaces, async, or generated specialization)",
+            ));
+        };
+        if !matches!(
+            declaration_record.owner,
+            wrela_hir::DeclarationOwner::Module(_)
+        ) || source.color != wrela_hir::FunctionColor::Sync
+            || function.color != wrela_hir::FunctionColor::Sync
+            || function.role != sema::FunctionRole::Ordinary
+            || source.body != Some(body)
+            || function.source != Some(declaration_record.source)
+        {
+            return Err(unsupported(
+                "semantic-generic-function-kind-lowering-pending (methods, interfaces, async, or generated specialization)",
+            ));
+        }
+        if source.generics.is_empty()
+            || source.generics.len() != function.generic_arguments.len()
+            || source.parameters.len() != function.parameters.len()
+        {
+            return Err(unsupported(
+                "semantic-generic-function-parameter-lowering-pending (const, region, bounded, or unauthenticated specialization)",
+            ));
+        }
+        for (generic, argument) in source.generics.iter().zip(&function.generic_arguments) {
+            let Some(record) = program.generic_parameter(*generic) else {
+                return Err(unsupported(
+                    "semantic-generic-function-parameter-lowering-pending (const, region, bounded, or unauthenticated specialization)",
+                ));
+            };
+            if record.owner != declaration
+                || !matches!(
+                    record.kind,
+                    wrela_hir::GenericParameterKind::Type { bound: None }
+                )
+            {
+                return Err(unsupported(
+                    "semantic-generic-function-parameter-lowering-pending (const, region, bounded, or unauthenticated specialization)",
+                ));
+            }
+            let sema::SemanticArgument::Type(argument) = argument else {
+                return Err(unsupported(
+                    "semantic-generic-function-argument-lowering-pending (non-type or non-scalar specialization)",
+                ));
+            };
+            if !is_stored_copy_scalar(facts, *argument) {
+                return Err(unsupported(
+                    "semantic-generic-function-argument-lowering-pending (non-type or non-scalar specialization)",
+                ));
+            }
+        }
+        let expected_result = source.result.as_ref().map_or_else(
+            || Some(sema::SemanticTypeId(0)),
+            |result| {
+                generic_function_source_type_matches(
+                    facts,
+                    source,
+                    &function.generic_arguments,
+                    result,
+                )
+            },
+        );
+        if expected_result != Some(function.result) {
+            return Err(unsupported(
+                "semantic-generic-function-signature-lowering-pending (unsupported or unauthenticated substitution)",
+            ));
+        }
+        for (source_parameter, semantic_parameter) in
+            source.parameters.iter().zip(&function.parameters)
+        {
+            let Some(parameter) = program.parameter(*source_parameter) else {
+                return Err(unsupported(
+                    "semantic-generic-function-signature-lowering-pending (unsupported or unauthenticated substitution)",
+                ));
+            };
+            if parameter.owner != wrela_hir::CallableOwner::Declaration(declaration)
+                || parameter.receiver
+                || semantic_parameter.parameter != *source_parameter
+                || parameter.ty.as_ref().and_then(|ty| {
+                    generic_function_source_type_matches(
+                        facts,
+                        source,
+                        &function.generic_arguments,
+                        ty,
+                    )
+                }) != Some(semantic_parameter.ty)
+            {
+                return Err(unsupported(
+                    "semantic-generic-function-signature-lowering-pending (unsupported or unauthenticated substitution)",
+                ));
+            }
+        }
     }
+    Ok(())
 }
 
 fn supported_minimum(facts: &sema::PartialAnalysis) -> Result<MinimumFacts<'_>, LowerError> {
@@ -1259,7 +1365,6 @@ fn validate_actor_source_functions(
                 function.color,
                 wrela_hir::FunctionColor::Sync | wrela_hir::FunctionColor::Async
             )
-            || !function.generic_arguments.is_empty()
             || !role_matches
             || function.effects.0 != expected_effects
             || function.recursive_depth_bound != Some(1)
@@ -2331,7 +2436,6 @@ fn validate_reachable_source_functions(
             || source.color != function.color
             || function.source != Some(declaration_record.source)
             || function.color != wrela_hir::FunctionColor::Sync
-            || !function.generic_arguments.is_empty()
             || !matches!(
                 function.role,
                 sema::FunctionRole::Test | sema::FunctionRole::Ordinary
@@ -4238,6 +4342,33 @@ fn generic_structure_source_field_matches(
                 matches!(argument, sema::SemanticArgument::Type(argument) if *argument == ty)
             }),
         _ => source_type_matches_semantic(facts, source, ty),
+    }
+}
+
+fn generic_function_source_type_matches(
+    facts: &sema::PartialAnalysis,
+    source_function: &wrela_hir::FunctionDeclaration,
+    arguments: &[sema::SemanticArgument],
+    source: &wrela_hir::TypeExpression,
+) -> Option<sema::SemanticTypeId> {
+    match &source.kind {
+        wrela_hir::TypeExpressionKind::Named {
+            definition: wrela_hir::Definition::Generic(candidate),
+            arguments: nested,
+        } if nested.is_empty() => source_function
+            .generics
+            .iter()
+            .position(|generic| generic == candidate)
+            .and_then(|index| arguments.get(index))
+            .and_then(|argument| match argument {
+                sema::SemanticArgument::Type(argument) => Some(*argument),
+                sema::SemanticArgument::Constant(_) | sema::SemanticArgument::Region(_) => None,
+            }),
+        _ => facts
+            .types
+            .iter()
+            .find(|semantic| source_type_matches_semantic(facts, source, semantic.id))
+            .map(|semantic| semantic.id),
     }
 }
 
@@ -16658,21 +16789,222 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn generic_function_specialization_stops_at_named_lowering_boundary() {
-        let mut facts = analyze_parsed_actor().into_facts();
-        let scalar = facts.types.first().expect("actor fixture unit type").id;
-        let function = facts
+    fn generic_function_lowering_tails_fail_closed_by_name() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub fn identity[T](value: T) -> T:
+    return value
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        small: u8 = identity(1)
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let (hir, facts) = image.into_parts();
+        let identity = facts
+            .functions
+            .iter()
+            .position(|function| !function.generic_arguments.is_empty())
+            .expect("generic identity specialization");
+
+        let mut non_type = facts.clone();
+        non_type.functions[identity].generic_arguments[0] =
+            sema::SemanticArgument::Constant(sema::ConstantValue::Unit);
+        assert!(matches!(
+            validate_generic_function_lowering_boundary_parts(&non_type, hir.as_program()),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-generic-function-argument-lowering-pending (non-type or non-scalar specialization)"
+            })
+        ));
+
+        let mut non_scalar = facts.clone();
+        non_scalar.functions[identity].generic_arguments[0] =
+            sema::SemanticArgument::Type(sema::SemanticTypeId(0));
+        assert!(matches!(
+            validate_generic_function_lowering_boundary_parts(&non_scalar, hir.as_program()),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-generic-function-argument-lowering-pending (non-type or non-scalar specialization)"
+            })
+        ));
+
+        let mut wrong_result = facts;
+        wrong_result.functions[identity].result = sema::SemanticTypeId(0);
+        assert!(matches!(
+            validate_generic_function_lowering_boundary_parts(&wrong_result, hir.as_program()),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-generic-function-signature-lowering-pending (unsupported or unauthenticated substitution)"
+            })
+        ));
+    }
+
+    #[test]
+    fn generic_copy_scalar_function_specializations_lower_exactly() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub fn identity[T](value: T) -> T:
+    return value
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        small: u8 = identity(1)
+        wide: u64 = identity(2)
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let facts = image.facts();
+        let identity_declaration = image
+            .hir()
+            .as_program()
+            .declarations
+            .iter()
+            .find(|declaration| {
+                declaration
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.as_str() == "identity")
+            })
+            .expect("identity declaration")
+            .id;
+        let semantic_identities: Vec<_> = facts
+            .functions
+            .iter()
+            .filter(|function| {
+                matches!(function.origin, sema::FunctionOrigin::Source { declaration, .. }
+                    if declaration == identity_declaration)
+            })
+            .collect();
+        assert_eq!(semantic_identities.len(), 2);
+
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("copy-scalar generic function specializations should lower");
+        let wir = lowered.wir().as_wir();
+        for semantic in &semantic_identities {
+            let [sema::SemanticArgument::Type(argument)] = semantic.generic_arguments.as_slice()
+            else {
+                panic!("identity must retain one concrete type argument")
+            };
+            let lowered_function = wir
+                .functions
+                .get(semantic.id.0 as usize)
+                .filter(|function| function.id == wir::FunctionId(semantic.id.0))
+                .expect("identity specialization retains dense identity");
+            assert_eq!(lowered_function.instance_key, semantic.key.0);
+            assert_eq!(lowered_function.parameters.len(), 1);
+            assert_eq!(lowered_function.result, wir::TypeId(argument.0));
+            assert_eq!(
+                lowered_function.body.parameters,
+                lowered_function.parameters
+            );
+            assert!(matches!(lowered_function.body.statements.as_slice(),
+                [wir::SemanticStatement::Return(values)]
+                    if values.as_slice() == lowered_function.parameters.as_slice()));
+        }
+        let call_targets: Vec<_> = wir
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation:
+                        wir::SemanticOperation::Call {
+                            function,
+                            arguments,
+                            ..
+                        },
+                    ..
+                }) if arguments.len() == 1 => Some(*function),
+                _ => None,
+            })
+            .filter(|target| {
+                semantic_identities
+                    .iter()
+                    .any(|identity| target.0 == identity.id.0)
+            })
+            .collect();
+        assert_eq!(call_targets.len(), 2);
+        assert!(
+            semantic_identities
+                .iter()
+                .all(|identity| call_targets.contains(&wir::FunctionId(identity.id.0)))
+        );
+
+        let mut forged_key = wir.clone();
+        forged_key.functions[semantic_identities[0].id.0 as usize].instance_key =
+            Sha256Digest::from_bytes([0x51; 32]);
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                forged_key,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
+        ));
+
+        let mut forged_call = wir.clone();
+        let first = wir::FunctionId(semantic_identities[0].id.0);
+        let second = wir::FunctionId(semantic_identities[1].id.0);
+        let operation = forged_call
             .functions
             .iter_mut()
-            .find(|function| matches!(function.origin, sema::FunctionOrigin::Source { .. }))
-            .expect("actor fixture source function");
-        function.generic_arguments = vec![sema::SemanticArgument::Type(scalar)];
-
-        assert!(matches!(
-            validate_generic_function_lowering_boundary(&facts),
-            Err(LowerError::UnsupportedInput {
-                feature: "semantic-generic-function-lowering-pending (generic function specialization)"
+            .flat_map(|function| &mut function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::Call { function, .. },
+                    ..
+                }) if *function == first => Some(function),
+                _ => None,
             })
+            .expect("call to first specialization");
+        *operation = second;
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                forged_call,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
         ));
     }
 
