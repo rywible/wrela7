@@ -417,11 +417,6 @@ fn supported_actor_image<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<ActorImageSemantic<'a>, LowerError> {
-    if !input.scopes.is_empty() {
-        return Err(unsupported(
-            "flow-scope-cleanup-lowering-pending (normal-exit cleanup calls)",
-        ));
-    }
     if !input.globals.is_empty()
         || !input.devices.is_empty()
         || !input.pools.is_empty()
@@ -444,11 +439,15 @@ fn supported_actor_image<'a>(
             semantic::TypeKind::Array { .. }
                 if ty.linearity == semantic::Linearity::ExplicitCopy => {}
             semantic::TypeKind::Struct { fields }
-                if fields.is_empty()
+                if (fields.is_empty()
                     && matches!(
                         ty.linearity,
                         semantic::Linearity::Reclaimable | semantic::Linearity::Strict
-                    ) => {}
+                    ))
+                    || (ty.linearity == semantic::Linearity::ExplicitCopy
+                        && fields.iter().all(|field| {
+                            scalar_primitive(input, field.ty).is_some() && !field.name.is_empty()
+                        })) => {}
             semantic::TypeKind::ActorHandle { actor_type }
                 if ty.linearity == semantic::Linearity::ExplicitCopy
                     && ty.source.is_none()
@@ -483,6 +482,7 @@ fn supported_actor_image<'a>(
             }
         }
     }
+    validate_actor_scope_contract(input, limits, is_cancelled)?;
     validate_actor_plan_contract(input, limits, is_cancelled)?;
 
     let entry = input
@@ -520,14 +520,98 @@ fn supported_actor_image<'a>(
         return Err(unsupported("noncanonical stateless actor image entry"));
     }
 
+    let mut scope_uses = try_vec(input.scopes.len(), "actor scope uses", limits.model_edges)?;
+    scope_uses.resize(input.scopes.len(), 0_u8);
     for function in &input.functions {
         check_cancelled(is_cancelled)?;
         if function.id == entry.id {
             continue;
         }
-        validate_actor_source_function(input, function, limits, is_cancelled)?;
+        validate_actor_source_function(input, function, &mut scope_uses, limits, is_cancelled)?;
+    }
+    if scope_uses.iter().any(|uses| *uses != 1) {
+        return Err(unsupported("actor scope activation census"));
     }
     Ok(ActorImageSemantic { input })
+}
+
+fn validate_actor_scope_contract(
+    input: &semantic::SemanticWir,
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), LowerError> {
+    let mut exit_helpers = try_vec(
+        input.functions.len(),
+        "actor scope exit helpers",
+        limits.model_edges,
+    )?;
+    exit_helpers.resize(input.functions.len(), false);
+    for scope in &input.scopes {
+        check_cancelled(is_cancelled)?;
+        if scope.abort.is_some() || scope.suspend_safe {
+            return Err(unsupported(
+                "flow-with-abnormal-cleanup-lowering-pending (abort or suspension-safe scope)",
+            ));
+        }
+        let proof = input
+            .proofs
+            .get(scope.cleanup_proof.0 as usize)
+            .filter(|proof| {
+                proof.id == scope.cleanup_proof && proof.kind == semantic::ProofKind::CleanupAcyclic
+            })
+            .ok_or(unsupported("flow scope cleanup proof identity"))?;
+        let helper = input
+            .functions
+            .get(scope.exit.0 as usize)
+            .filter(|helper| helper.id == scope.exit)
+            .ok_or(unsupported("flow scope exit helper identity"))?;
+        let parameter_matches = matches!(helper.parameters.as_slice(), [parameter]
+            if helper.values.get(parameter.0 as usize).is_some_and(|value| {
+                value.id == *parameter && value.ty == scope.state_type
+            }) && helper.body.parameters.as_slice() == [*parameter]);
+        let helper_proof_matches = matches!(helper.proofs.as_slice(), [helper_proof]
+        if input.proofs.get(helper_proof.0 as usize).is_some_and(|proof| {
+            proof.id == *helper_proof && proof.kind == semantic::ProofKind::CleanupAcyclic
+        }));
+        if helper.origin != semantic::FunctionOrigin::Source
+            || helper.role != semantic::FunctionRole::Cleanup
+            || helper.color != semantic::FunctionColor::Sync
+            || helper.result != semantic::TypeId(0)
+            || !parameter_matches
+            || helper.values.len() != 1
+            || !matches!(
+                helper.body.statements.as_slice(),
+                [semantic::SemanticStatement::Return(values)] if values.is_empty()
+            )
+            || helper.effects != semantic::EffectSet(0)
+            || !helper_proof_matches
+            || helper.source.is_none()
+            || helper.stack_bound != 0
+            || helper.frame_bound != 0
+            || helper.uninterrupted_bound != Some(1)
+            || helper.recursive_depth_bound != Some(1)
+            || !proof.sources.contains(&scope.source)
+        {
+            return Err(unsupported(
+                "flow-scope-cleanup-form-lowering-pending (non-pass exit helper)",
+            ));
+        }
+        let registered = exit_helpers
+            .get_mut(scope.exit.0 as usize)
+            .ok_or(unsupported("flow scope exit helper identity"))?;
+        *registered = true;
+    }
+    for function in &input.functions {
+        check_cancelled(is_cancelled)?;
+        let registered = exit_helpers
+            .get(function.id.0 as usize)
+            .copied()
+            .unwrap_or(false);
+        if (function.role == semantic::FunctionRole::Cleanup) != registered {
+            return Err(unsupported("unregistered actor cleanup helper"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_actor_plan_contract(
@@ -862,6 +946,7 @@ fn validate_actor_plan_contract(
 fn validate_actor_source_function(
     input: &semantic::SemanticWir,
     function: &semantic::SemanticFunction,
+    scope_uses: &mut [u8],
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), LowerError> {
@@ -871,12 +956,11 @@ fn validate_actor_source_function(
         is_cancelled,
     )?;
     let role_effects = match function.role {
-        semantic::FunctionRole::Ordinary => 0,
+        semantic::FunctionRole::Ordinary | semantic::FunctionRole::Cleanup => 0,
         semantic::FunctionRole::ActorTurn(_) => semantic::EffectSet::ACTOR_CALL,
         semantic::FunctionRole::TaskEntry(_) => semantic::EffectSet::TASK_SPAWN,
         semantic::FunctionRole::Test
         | semantic::FunctionRole::Isr(_)
-        | semantic::FunctionRole::Cleanup
         | semantic::FunctionRole::ImageEntry => u64::MAX,
     };
     let one_way_effect = if matches!(function.role, semantic::FunctionRole::TaskEntry(_))
@@ -899,11 +983,14 @@ fn validate_actor_source_function(
             semantic::FunctionRole::Ordinary
                 | semantic::FunctionRole::ActorTurn(_)
                 | semantic::FunctionRole::TaskEntry(_)
+                | semantic::FunctionRole::Cleanup
         )
         || !matches!(
             function.color,
             semantic::FunctionColor::Sync | semantic::FunctionColor::Async
         )
+        || (function.role == semantic::FunctionRole::Cleanup
+            && function.color != semantic::FunctionColor::Sync)
         || function.effects != semantic::EffectSet(expected_effects)
         || function.source.is_none()
         || function.uninterrupted_bound.is_none_or(|bound| bound == 0)
@@ -946,10 +1033,15 @@ fn validate_actor_source_function(
                 && ty.linearity == semantic::Linearity::ExplicitCopy
                 && ty.source.is_none()
         });
+        let is_scope_state = input
+            .scopes
+            .iter()
+            .any(|scope| scope.state_type == value.ty);
         if scalar_primitive(input, value.ty).is_none()
             && !is_parameter
             && !is_reservation
             && !is_capability
+            && !is_scope_state
         {
             return Err(unsupported("non-scalar actor temporaries"));
         }
@@ -958,6 +1050,26 @@ fn validate_actor_source_function(
     let mut actor_capabilities = 0_u32;
     let mut actor_reserves = 0_u32;
     let mut mailbox_receives = 0_u32;
+    let mut active_scopes: Vec<semantic::ScopeId> = try_vec(
+        input.scopes.len(),
+        "actor active scope stack",
+        limits.model_edges,
+    )?;
+    let mut scope_states = try_vec(
+        input.scopes.len(),
+        "actor scope state map",
+        limits.model_edges,
+    )?;
+    scope_states.resize(input.scopes.len(), None::<(semantic::ValueId, bool)>);
+    let mut scope_children = try_vec(
+        input.scopes.len(),
+        "actor scope cleanup edges",
+        limits.model_edges,
+    )?;
+    for _ in &input.scopes {
+        scope_children.push(Vec::<semantic::ScopeId>::new());
+    }
+    let mut saw_scope_marker = false;
     let mut regions = try_vec(1, "actor source region validation", limits.model_edges)?;
     regions.push((&function.body, true, 1_u32));
     while let Some((region, is_root, depth)) = regions.pop() {
@@ -1031,6 +1143,108 @@ fn validate_actor_source_function(
                         *destination,
                         *checked,
                     )?,
+                    semantic::SemanticOperation::Aggregate { ty, fields } => {
+                        let [result] = statement.results.as_slice() else {
+                            return Err(unsupported("actor scope state aggregate result"));
+                        };
+                        let result_ty = function
+                            .values
+                            .get(result.0 as usize)
+                            .filter(|value| value.id == *result)
+                            .map(|value| value.ty);
+                        let Some(semantic::TypeKind::Struct {
+                            fields: type_fields,
+                        }) = input.types.get(ty.0 as usize).map(|ty| &ty.kind)
+                        else {
+                            return Err(unsupported("actor scope state aggregate type"));
+                        };
+                        let is_scope_state =
+                            input.scopes.iter().any(|scope| scope.state_type == *ty);
+                        if !is_scope_state
+                            || result_ty != Some(*ty)
+                            || fields.len() != type_fields.len()
+                            || fields.iter().zip(type_fields).any(|(value, field)| {
+                                scalar_value_type(function, *value) != Some(field.ty)
+                            })
+                        {
+                            return Err(unsupported("actor scope state aggregate shape"));
+                        }
+                    }
+                    semantic::SemanticOperation::EnterScope { scope, state } => {
+                        saw_scope_marker = true;
+                        let plan = input
+                            .scopes
+                            .get(scope.0 as usize)
+                            .filter(|plan| plan.id == *scope)
+                            .ok_or(unsupported("actor entered scope identity"))?;
+                        let state_ty = function
+                            .values
+                            .get(state.0 as usize)
+                            .filter(|value| value.id == *state)
+                            .map(|value| value.ty);
+                        let slot = scope_states
+                            .get_mut(scope.0 as usize)
+                            .ok_or(unsupported("actor entered scope identity"))?;
+                        if !statement.results.is_empty()
+                            || !is_root
+                            || state_ty != Some(plan.state_type)
+                            || slot.is_some()
+                            || scope_uses.get(scope.0 as usize).copied() != Some(0)
+                        {
+                            return Err(unsupported("actor scope enter marker"));
+                        }
+                        if let Some(parent) = active_scopes.last().copied() {
+                            push_bounded(
+                                scope_children
+                                    .get_mut(parent.0 as usize)
+                                    .ok_or(unsupported("actor parent scope identity"))?,
+                                *scope,
+                                "actor scope cleanup edges",
+                                limits.model_edges,
+                            )?;
+                        }
+                        *slot = Some((*state, false));
+                        push_bounded(
+                            &mut active_scopes,
+                            *scope,
+                            "actor active scope stack",
+                            limits.model_edges,
+                        )?;
+                    }
+                    semantic::SemanticOperation::CommitScope { scope, value } => {
+                        let slot = scope_states
+                            .get_mut(scope.0 as usize)
+                            .ok_or(unsupported("actor committed scope identity"))?;
+                        if !statement.results.is_empty()
+                            || !is_root
+                            || active_scopes.last() != Some(scope)
+                            || !matches!(slot, Some((state, false)) if state == value)
+                        {
+                            return Err(unsupported("actor scope commit marker"));
+                        }
+                        *slot = Some((*value, true));
+                    }
+                    semantic::SemanticOperation::ExitScope { scope } => {
+                        let slot = scope_states
+                            .get_mut(scope.0 as usize)
+                            .ok_or(unsupported("actor exited scope identity"))?;
+                        if !statement.results.is_empty()
+                            || !is_root
+                            || active_scopes.last() != Some(scope)
+                            || !matches!(slot, Some((_, true)))
+                        {
+                            return Err(unsupported("actor scope exit marker"));
+                        }
+                        active_scopes.pop();
+                        *slot = None;
+                        let uses = scope_uses
+                            .get_mut(scope.0 as usize)
+                            .ok_or(unsupported("actor exited scope identity"))?;
+                        *uses = uses.checked_add(1).ok_or(LowerError::ResourceLimit {
+                            resource: "actor scope uses",
+                            limit: limits.model_edges,
+                        })?;
+                    }
                     semantic::SemanticOperation::Assert { condition, failure } => {
                         if !statement.results.is_empty()
                             || scalar_value_type(function, *condition).is_none_or(|ty| {
@@ -1492,6 +1706,19 @@ fn validate_actor_source_function(
         || mailbox_receives != u32::from(expects_receive)
     {
         return Err(unsupported("one-way actor operation census"));
+    }
+    if !active_scopes.is_empty() {
+        return Err(unsupported(
+            "flow-with-abnormal-cleanup-lowering-pending (scope leaves function active)",
+        ));
+    }
+    if saw_scope_marker {
+        for (plan, children) in input.scopes.iter().zip(&scope_children) {
+            check_cancelled(is_cancelled)?;
+            if !polled_slices_equal(&plan.dependencies, children, is_cancelled)? {
+                return Err(unsupported("actor scope cleanup dependency order"));
+            }
+        }
     }
     Ok(())
 }
@@ -3788,8 +4015,17 @@ fn lower_actor_type(
             element: flow::TypeId(element.0),
             length: *length,
         },
-        semantic::TypeKind::Struct { fields } if fields.is_empty() => {
-            flow::FlowTypeKind::Struct { fields: Vec::new() }
+        semantic::TypeKind::Struct { fields } => {
+            let mut lowered = try_vec(
+                fields.len(),
+                "FlowWir actor structure fields",
+                limits.model_edges,
+            )?;
+            for field in fields {
+                check_cancelled(is_cancelled)?;
+                lowered.push(flow::TypeId(field.ty.0));
+            }
+            flow::FlowTypeKind::Struct { fields: lowered }
         }
         semantic::TypeKind::Function(function) => {
             let mut parameters = try_vec(
@@ -4112,7 +4348,14 @@ fn measure_actor_flow_output_resources(
                     limit: limits.model_edges,
                 },
             )?,
-            input.functions.len(),
+            input
+                .functions
+                .len()
+                .checked_add(input.scopes.len())
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "FlowWir actor output model edges",
+                    limit: limits.model_edges,
+                })?,
             input.actors.len(),
             input.tasks.len(),
             input.regions.len(),
@@ -4199,13 +4442,18 @@ fn measure_actor_flow_output_resources(
                             )?;
                             continue;
                         }
-                        instruction_count =
-                            instruction_count
-                                .checked_add(1)
-                                .ok_or(LowerError::ResourceLimit {
+                        if !matches!(
+                            statement.operation,
+                            semantic::SemanticOperation::EnterScope { .. }
+                                | semantic::SemanticOperation::CommitScope { .. }
+                        ) {
+                            instruction_count = instruction_count.checked_add(1).ok_or(
+                                LowerError::ResourceLimit {
                                     resource: "FlowWir actor output model edges",
                                     limit: limits.model_edges,
-                                })?;
+                                },
+                            )?;
+                        }
                         if matches!(
                             statement.operation,
                             semantic::SemanticOperation::ActorStateLoad { .. }
@@ -4225,6 +4473,10 @@ fn measure_actor_flow_output_resources(
                             | semantic::SemanticOperation::ActorCommit { arguments, .. } => {
                                 meter.edges(arguments)
                             }
+                            semantic::SemanticOperation::Aggregate { fields, .. } => {
+                                meter.edges(fields)
+                            }
+                            semantic::SemanticOperation::ExitScope { .. } => meter.add_edges(1),
                             semantic::SemanticOperation::Constant(semantic::Constant::Bytes(
                                 bytes,
                             )) => meter.bytes(bytes),
@@ -4241,7 +4493,9 @@ fn measure_actor_flow_output_resources(
                             | semantic::SemanticOperation::ActorReserve { .. }
                             | semantic::SemanticOperation::MailboxReceive { .. }
                             | semantic::SemanticOperation::ActorStateLoad { .. }
-                            | semantic::SemanticOperation::ActorStateStore { .. } => {}
+                            | semantic::SemanticOperation::ActorStateStore { .. }
+                            | semantic::SemanticOperation::EnterScope { .. }
+                            | semantic::SemanticOperation::CommitScope { .. } => {}
                             _ => {
                                 return Err(unsupported(
                                     "actor operation changed after shape validation",
@@ -4298,6 +4552,29 @@ fn measure_actor_flow_output_resources(
         meter.add_edges(block_count);
         meter.add_edges(instruction_count);
         meter.add_edges(block_parameter_count);
+    }
+
+    for scope in &input.scopes {
+        check_cancelled(is_cancelled)?;
+        let helper = input
+            .functions
+            .get(scope.exit.0 as usize)
+            .filter(|helper| helper.id == scope.exit)
+            .ok_or(unsupported("FlowWir cleanup helper identity"))?;
+        meter.text(&helper.name);
+        meter.edges(&helper.parameters);
+        meter.edges(&helper.values);
+        meter.edges(&helper.proofs);
+        if !helper.proofs.contains(&scope.cleanup_proof) {
+            meter.add_edges(1);
+        }
+        for value in &helper.values {
+            check_cancelled(is_cancelled)?;
+            if let Some(name) = &value.name {
+                meter.text(name);
+            }
+        }
+        meter.add_edges(1);
     }
 
     for actor in &input.actors {
@@ -4379,8 +4656,16 @@ fn lower_actor_image(
     };
     let activation_types = append_activation_types(input, &mut types, limits, is_cancelled)?;
     let proofs = lower_proofs(input, limits, is_cancelled)?;
+    let function_capacity = input
+        .functions
+        .len()
+        .checked_add(input.scopes.len())
+        .ok_or(LowerError::ResourceLimit {
+            resource: "FlowWir actor functions",
+            limit: limits.model_edges,
+        })?;
     let mut functions = try_vec(
-        input.functions.len(),
+        function_capacity,
         "FlowWir actor functions",
         limits.model_edges,
     )?;
@@ -4394,6 +4679,38 @@ fn lower_actor_image(
             limits,
             is_cancelled,
         )?);
+    }
+    for scope in &input.scopes {
+        check_cancelled(is_cancelled)?;
+        let base = functions
+            .get(scope.exit.0 as usize)
+            .filter(|function| {
+                function.id.0 == scope.exit.0 && function.role == flow::FunctionRole::Cleanup
+            })
+            .cloned()
+            .ok_or(unsupported("FlowWir cleanup helper identity"))?;
+        let mut generated = base;
+        generated.id = generated_cleanup_function_id(input, scope.id, limits)?;
+        generated.origin = flow::FunctionOrigin::GeneratedCleanup {
+            semantic_function: scope.exit.0,
+            scope: scope.id.0,
+        };
+        let cleanup_proof = flow::ProofId(scope.cleanup_proof.0);
+        if !generated.proofs.contains(&cleanup_proof) {
+            push_bounded(
+                &mut generated.proofs,
+                cleanup_proof,
+                "FlowWir cleanup function proofs",
+                limits.model_edges,
+            )?;
+            generated.proofs.sort_unstable();
+        }
+        push_bounded(
+            &mut functions,
+            generated,
+            "FlowWir actor functions",
+            limits.model_edges,
+        )?;
     }
 
     let mut actors = try_vec(
@@ -4822,6 +5139,12 @@ fn lower_generated_function(
         depth: 1,
     });
     let mut next_async_state = 0_u32;
+    let mut scope_states = try_vec(
+        input.scopes.len(),
+        "FlowWir active scope states",
+        limits.model_edges,
+    )?;
+    scope_states.resize(input.scopes.len(), None::<(flow::ValueId, bool)>);
     while let Some(mut item) = work.pop() {
         check_cancelled(is_cancelled)?;
         if item.depth > limits.region_depth {
@@ -4835,6 +5158,62 @@ fn lower_generated_function(
             check_cancelled(is_cancelled)?;
             match statement {
                 semantic::SemanticStatement::Let(statement) => {
+                    if let semantic::SemanticOperation::EnterScope { scope, state } =
+                        &statement.operation
+                    {
+                        let slot = scope_states
+                            .get_mut(scope.0 as usize)
+                            .ok_or(unsupported("FlowWir entered scope identity"))?;
+                        if slot.replace((flow::ValueId(state.0), false)).is_some() {
+                            return Err(unsupported("FlowWir duplicate scope enter"));
+                        }
+                        item.next_statement += 1;
+                        continue;
+                    }
+                    if let semantic::SemanticOperation::CommitScope { scope, value } =
+                        &statement.operation
+                    {
+                        let slot = scope_states
+                            .get_mut(scope.0 as usize)
+                            .ok_or(unsupported("FlowWir committed scope identity"))?;
+                        if !matches!(slot, Some((state, false)) if *state == flow::ValueId(value.0))
+                        {
+                            return Err(unsupported("FlowWir scope commit state"));
+                        }
+                        *slot = Some((flow::ValueId(value.0), true));
+                        item.next_statement += 1;
+                        continue;
+                    }
+                    if let semantic::SemanticOperation::ExitScope { scope } = &statement.operation {
+                        let plan = input
+                            .scopes
+                            .get(scope.0 as usize)
+                            .filter(|plan| plan.id == *scope)
+                            .ok_or(unsupported("FlowWir exited scope identity"))?;
+                        let state = scope_states
+                            .get_mut(scope.0 as usize)
+                            .and_then(Option::take)
+                            .filter(|(_, committed)| *committed)
+                            .map(|(state, _)| state)
+                            .ok_or(unsupported("FlowWir scope exit without commit"))?;
+                        push_bounded(
+                            &mut pending_block_mut(&mut pending_blocks, item.block)?.instructions,
+                            PendingInstruction {
+                                results: Vec::new(),
+                                operation: flow::FlowOperation::Call {
+                                    function: generated_cleanup_function_id(
+                                        input, plan.id, limits,
+                                    )?,
+                                    arguments: vec![state],
+                                },
+                                source: statement.source,
+                            },
+                            "FlowWir instructions",
+                            limits.instructions,
+                        )?;
+                        item.next_statement += 1;
+                        continue;
+                    }
                     if let semantic::SemanticOperation::ActorStateLoad {
                         actor,
                         region,
@@ -5485,6 +5864,9 @@ fn lower_generated_function(
             source: pending.source,
         });
     }
+    if scope_states.iter().any(Option::is_some) {
+        return Err(unsupported("FlowWir function returns with an active scope"));
+    }
     let origin = match function.origin {
         semantic::FunctionOrigin::Source => flow::FunctionOrigin::SourceSemantic {
             semantic_function: function.id.0,
@@ -5512,7 +5894,8 @@ fn lower_generated_function(
         }
         semantic::FunctionRole::Test => flow::FunctionRole::Test,
         semantic::FunctionRole::ImageEntry => flow::FunctionRole::ImageEntry,
-        semantic::FunctionRole::Isr(_) | semantic::FunctionRole::Cleanup => {
+        semantic::FunctionRole::Cleanup => flow::FunctionRole::Cleanup,
+        semantic::FunctionRole::Isr(_) => {
             return Err(unsupported(
                 "generated test function role changed after validation",
             ));
@@ -5555,6 +5938,23 @@ fn lower_generated_function(
         proofs: function_proofs,
         source: function.source,
     })
+}
+
+fn generated_cleanup_function_id(
+    input: &semantic::SemanticWir,
+    scope: semantic::ScopeId,
+    limits: LoweringLimits,
+) -> Result<flow::FunctionId, LowerError> {
+    let id = input
+        .functions
+        .len()
+        .checked_add(scope.0 as usize)
+        .and_then(|id| u32::try_from(id).ok())
+        .ok_or(LowerError::ResourceLimit {
+            resource: "FlowWir cleanup functions",
+            limit: limits.model_edges,
+        })?;
+    Ok(flow::FunctionId(id))
 }
 
 fn lower_generated_operation(
@@ -5841,6 +6241,7 @@ fn report_for(
     let mut blocks = 0u64;
     let mut instructions = 0u64;
     let mut async_states = 0u64;
+    let mut cleanup_edges = 0u64;
     for function in &wir.functions {
         check_cancelled(is_cancelled)?;
         blocks = blocks
@@ -5875,6 +6276,35 @@ fn report_for(
                     resource: "FlowWir instructions",
                     limit: limits.instructions,
                 })?;
+            for instruction in &block.instructions {
+                if matches!(
+                    instruction.operation,
+                    flow::FlowOperation::Call { function, .. }
+                        if wir.functions.get(function.0 as usize)
+                            .is_some_and(|callee| callee.role == flow::FunctionRole::Cleanup)
+                ) {
+                    cleanup_edges =
+                        cleanup_edges
+                            .checked_add(1)
+                            .ok_or(LowerError::ResourceLimit {
+                                resource: "FlowWir cleanup edges",
+                                limit: limits.model_edges,
+                            })?;
+                }
+            }
+            if matches!(
+                block.terminator,
+                flow::Terminator::TailCall { function, .. }
+                    if wir.functions.get(function.0 as usize)
+                        .is_some_and(|callee| callee.role == flow::FunctionRole::Cleanup)
+            ) {
+                cleanup_edges = cleanup_edges
+                    .checked_add(1)
+                    .ok_or(LowerError::ResourceLimit {
+                        resource: "FlowWir cleanup edges",
+                        limit: limits.model_edges,
+                    })?;
+            }
         }
     }
     Ok(LoweringReport {
@@ -5883,7 +6313,7 @@ fn report_for(
         blocks,
         instructions,
         async_states,
-        cleanup_edges: 0,
+        cleanup_edges,
         output_proofs: u64::try_from(wir.proofs.len()).map_err(|_| LowerError::ResourceLimit {
             resource: "FlowWir proofs",
             limit: limits.model_edges,
@@ -6901,6 +7331,19 @@ fn actor_flow_operation_matches(
             flow::FlowOperation::Copy { value: expected },
             flow::FlowOperation::Copy { value: output },
         ) => expected == output,
+        (
+            flow::FlowOperation::MakeAggregate {
+                ty: expected_ty,
+                fields: expected_fields,
+            },
+            flow::FlowOperation::MakeAggregate {
+                ty: output_ty,
+                fields: output_fields,
+            },
+        ) => {
+            expected_ty == output_ty
+                && polled_slices_equal(expected_fields, output_fields, is_cancelled)?
+        }
         (
             flow::FlowOperation::Call {
                 function: expected_function,
@@ -8058,6 +8501,252 @@ mod contract_tests {
         module
             .validate()
             .expect("valid producer-shaped actor state SemanticWir")
+    }
+
+    fn actor_scope_fixture() -> semantic::ValidatedSemanticWir {
+        let mut module = actor_fixture().into_wir();
+        let scope_source = span(0, 70, 79);
+        let cleanup_source = span(0, 41, 49);
+        module.types.push(semantic::TypeRecord {
+            id: semantic::TypeId(5),
+            source_name: "Masked".to_owned(),
+            kind: semantic::TypeKind::Struct {
+                fields: vec![semantic::FieldType {
+                    name: "token".to_owned(),
+                    ty: semantic::TypeId(1),
+                    public: true,
+                }],
+            },
+            linearity: semantic::Linearity::ExplicitCopy,
+            source: Some(cleanup_source),
+        });
+        module.proofs.push(semantic::ProofRecord {
+            id: semantic::ProofId(10),
+            kind: semantic::ProofKind::CleanupAcyclic,
+            subject: "scope protocol cleanup: irqs_masked".to_owned(),
+            bound: Some(1),
+            sources: vec![scope_source],
+            depends_on: Vec::new(),
+            explanation: vec!["one pass-only exit helper".to_owned()],
+        });
+        module.proofs.push(semantic::ProofRecord {
+            id: semantic::ProofId(11),
+            kind: semantic::ProofKind::CleanupAcyclic,
+            subject: "scope activation cleanup: irqs_masked".to_owned(),
+            bound: Some(0),
+            sources: vec![scope_source],
+            depends_on: vec![semantic::ProofId(10)],
+            explanation: vec!["one normal-exit activation".to_owned()],
+        });
+        let image_entry = module.functions.pop().expect("actor image entry");
+        assert_eq!(image_entry.id, semantic::FunctionId(3));
+        module.functions.push(semantic::SemanticFunction {
+            id: semantic::FunctionId(3),
+            instance_key: Sha256Digest::from_bytes([0x74; 32]),
+            name: "irqs_masked.__scope_exit".to_owned(),
+            origin: semantic::FunctionOrigin::Source,
+            role: semantic::FunctionRole::Cleanup,
+            color: semantic::FunctionColor::Sync,
+            parameters: vec![semantic::ValueId(0)],
+            result: semantic::TypeId(0),
+            values: vec![semantic::SemanticValue {
+                id: semantic::ValueId(0),
+                ty: semantic::TypeId(5),
+                origin: Some(cleanup_source),
+                name: Some("state".to_owned()),
+            }],
+            body: semantic::SemanticRegion {
+                parameters: vec![semantic::ValueId(0)],
+                statements: vec![semantic::SemanticStatement::Return(Vec::new())],
+            },
+            effects: semantic::EffectSet(0),
+            proofs: vec![semantic::ProofId(10)],
+            source: Some(cleanup_source),
+            stack_bound: 0,
+            frame_bound: 0,
+            uninterrupted_bound: Some(1),
+            recursive_depth_bound: Some(1),
+        });
+        let mut image_entry = image_entry;
+        image_entry.id = semantic::FunctionId(4);
+        module.functions.push(image_entry);
+        module.image_entry = semantic::FunctionId(4);
+
+        let turn = &mut module.functions[1];
+        turn.values.extend([
+            semantic::SemanticValue {
+                id: semantic::ValueId(3),
+                ty: semantic::TypeId(1),
+                origin: Some(scope_source),
+                name: None,
+            },
+            semantic::SemanticValue {
+                id: semantic::ValueId(4),
+                ty: semantic::TypeId(5),
+                origin: Some(scope_source),
+                name: Some("mask".to_owned()),
+            },
+        ]);
+        turn.body.statements.pop();
+        turn.body.statements.extend([
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                results: vec![semantic::ValueId(3)],
+                operation: semantic::SemanticOperation::Constant(semantic::Constant::Unsigned {
+                    bits: 32,
+                    value: 1,
+                }),
+                source: Some(scope_source),
+            }),
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                results: vec![semantic::ValueId(4)],
+                operation: semantic::SemanticOperation::Aggregate {
+                    ty: semantic::TypeId(5),
+                    fields: vec![semantic::ValueId(3)],
+                },
+                source: Some(scope_source),
+            }),
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                results: Vec::new(),
+                operation: semantic::SemanticOperation::EnterScope {
+                    scope: semantic::ScopeId(0),
+                    state: semantic::ValueId(4),
+                },
+                source: Some(scope_source),
+            }),
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                results: Vec::new(),
+                operation: semantic::SemanticOperation::CommitScope {
+                    scope: semantic::ScopeId(0),
+                    value: semantic::ValueId(4),
+                },
+                source: Some(scope_source),
+            }),
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                results: Vec::new(),
+                operation: semantic::SemanticOperation::ExitScope {
+                    scope: semantic::ScopeId(0),
+                },
+                source: Some(scope_source),
+            }),
+            semantic::SemanticStatement::Return(Vec::new()),
+        ]);
+        turn.uninterrupted_bound = Some(8);
+        module.scopes.push(semantic::ScopePlan {
+            id: semantic::ScopeId(0),
+            name: "irqs_masked".to_owned(),
+            state_type: semantic::TypeId(5),
+            abort: None,
+            exit: semantic::FunctionId(3),
+            suspend_safe: false,
+            dependencies: Vec::new(),
+            reverse_source_order: 0,
+            cleanup_proof: semantic::ProofId(11),
+            source: scope_source,
+        });
+        module.source_summary.reachable_declarations = 5;
+        module.source_summary.monomorphized_instantiations = 5;
+        module
+            .validate()
+            .expect("valid pass-only normal scope SemanticWir")
+    }
+
+    fn nested_actor_scope_fixture() -> semantic::ValidatedSemanticWir {
+        let mut module = actor_scope_fixture().into_wir();
+        let outer_source = span(0, 61, 69);
+        module.proofs.push(semantic::ProofRecord {
+            id: semantic::ProofId(12),
+            kind: semantic::ProofKind::CleanupAcyclic,
+            subject: "scope activation cleanup: outer irqs_masked".to_owned(),
+            bound: Some(1),
+            sources: vec![outer_source],
+            depends_on: vec![semantic::ProofId(10), semantic::ProofId(11)],
+            explanation: vec!["outer cleanup follows its inner activation".to_owned()],
+        });
+        module.scopes.push(semantic::ScopePlan {
+            id: semantic::ScopeId(1),
+            name: "irqs_masked".to_owned(),
+            state_type: semantic::TypeId(5),
+            abort: None,
+            exit: semantic::FunctionId(3),
+            suspend_safe: false,
+            dependencies: vec![semantic::ScopeId(0)],
+            reverse_source_order: 1,
+            cleanup_proof: semantic::ProofId(12),
+            source: outer_source,
+        });
+        let turn = &mut module.functions[1];
+        turn.values.extend([
+            semantic::SemanticValue {
+                id: semantic::ValueId(5),
+                ty: semantic::TypeId(1),
+                origin: Some(outer_source),
+                name: None,
+            },
+            semantic::SemanticValue {
+                id: semantic::ValueId(6),
+                ty: semantic::TypeId(5),
+                origin: Some(outer_source),
+                name: Some("outer_mask".to_owned()),
+            },
+        ]);
+        turn.body.statements.splice(
+            4..4,
+            [
+                semantic::SemanticStatement::Let(semantic::LetStatement {
+                    results: vec![semantic::ValueId(5)],
+                    operation: semantic::SemanticOperation::Constant(
+                        semantic::Constant::Unsigned { bits: 32, value: 2 },
+                    ),
+                    source: Some(outer_source),
+                }),
+                semantic::SemanticStatement::Let(semantic::LetStatement {
+                    results: vec![semantic::ValueId(6)],
+                    operation: semantic::SemanticOperation::Aggregate {
+                        ty: semantic::TypeId(5),
+                        fields: vec![semantic::ValueId(5)],
+                    },
+                    source: Some(outer_source),
+                }),
+                semantic::SemanticStatement::Let(semantic::LetStatement {
+                    results: Vec::new(),
+                    operation: semantic::SemanticOperation::EnterScope {
+                        scope: semantic::ScopeId(1),
+                        state: semantic::ValueId(6),
+                    },
+                    source: Some(outer_source),
+                }),
+            ],
+        );
+        let return_index = turn
+            .body
+            .statements
+            .len()
+            .checked_sub(1)
+            .expect("nested turn return");
+        turn.body.statements.splice(
+            return_index..return_index,
+            [
+                semantic::SemanticStatement::Let(semantic::LetStatement {
+                    results: Vec::new(),
+                    operation: semantic::SemanticOperation::CommitScope {
+                        scope: semantic::ScopeId(1),
+                        value: semantic::ValueId(6),
+                    },
+                    source: Some(outer_source),
+                }),
+                semantic::SemanticStatement::Let(semantic::LetStatement {
+                    results: Vec::new(),
+                    operation: semantic::SemanticOperation::ExitScope {
+                        scope: semantic::ScopeId(1),
+                    },
+                    source: Some(outer_source),
+                }),
+            ],
+        );
+        turn.uninterrupted_bound = Some(13);
+        module
+            .validate()
+            .expect("valid nested pass-only normal scope SemanticWir")
     }
 
     fn actor_async_fixture() -> semantic::ValidatedSemanticWir {
@@ -9733,24 +10422,183 @@ mod contract_tests {
     }
 
     #[test]
-    fn semantic_scope_plans_stop_at_named_flow_cleanup_boundary() {
-        let mut input = actor_fixture().into_wir();
-        input.scopes.push(semantic::ScopePlan {
-            id: semantic::ScopeId(0),
-            name: "irqs_masked".to_owned(),
-            state_type: semantic::TypeId(1),
-            abort: None,
-            exit: semantic::FunctionId(3),
-            suspend_safe: false,
-            dependencies: Vec::new(),
-            reverse_source_order: 0,
-            cleanup_proof: semantic::ProofId(2),
-            source: span(0, 50, 60),
-        });
+    fn pass_only_scope_lowers_to_authenticated_normal_cleanup_call() {
+        let input = actor_scope_fixture();
+        let request_input = input.clone();
+        let output = CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("pass-only scope should reach FlowWir");
+        let wir = output.wir().as_wir();
+        let cleanup = &wir.functions[5];
+        assert_eq!(cleanup.role, flow::FunctionRole::Cleanup);
+        assert_eq!(
+            cleanup.origin,
+            flow::FunctionOrigin::GeneratedCleanup {
+                semantic_function: 3,
+                scope: 0,
+            }
+        );
+        assert_eq!(
+            cleanup.proofs,
+            [flow::ProofId(10), flow::ProofId(11)],
+            "the generated function retains both helper authority and activation cleanup proof"
+        );
+        let turn = &wir.functions[1];
+        let cleanup_calls: Vec<_> = turn
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match &instruction.operation {
+                flow::FlowOperation::Call {
+                    function,
+                    arguments,
+                } if *function == cleanup.id => Some(arguments.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cleanup_calls, [(&[flow::ValueId(4)][..])]);
+        assert_eq!(output.report().cleanup_edges, 1);
+
+        let (validated, report, diagnostics) = output.into_parts();
+        let baseline = validated.into_wir();
+        let request = LowerRequest {
+            input: request_input,
+            limits: LoweringLimits::standard(),
+        };
+        let mut wrong_scope_origin = baseline.clone();
+        wrong_scope_origin.functions[5].origin = flow::FunctionOrigin::GeneratedCleanup {
+            semantic_function: 3,
+            scope: 1,
+        };
         assert!(matches!(
-            supported_actor_image(&input, LoweringLimits::standard(), &|| false),
+            seal(
+                &request,
+                wrong_scope_origin,
+                report.clone(),
+                diagnostics.clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
+        ));
+
+        let mut erased_cleanup = baseline;
+        let turn = &mut erased_cleanup.functions[1];
+        let call = turn
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction.operation,
+                    flow::FlowOperation::Call {
+                        function: flow::FunctionId(5),
+                        ..
+                    }
+                )
+            })
+            .expect("normal cleanup call");
+        call.operation = flow::FlowOperation::Copy {
+            value: flow::ValueId(4),
+        };
+        call.results = vec![flow::ValueId(4)];
+        assert!(matches!(
+            seal(&request, erased_cleanup, report, diagnostics, &|| false),
+            Err(LowerError::InvalidOutput(_)) | Err(LowerError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn scope_abnormal_and_non_pass_tails_remain_named_fail_closed() {
+        let mut abnormal = actor_scope_fixture().into_wir();
+        abnormal.scopes[0].abort = Some(semantic::FunctionId(3));
+        assert!(matches!(
+            supported_actor_image(&abnormal, LoweringLimits::standard(), &|| false),
             Err(LowerError::UnsupportedInput {
-                feature: "flow-scope-cleanup-lowering-pending (normal-exit cleanup calls)",
+                feature: "flow-with-abnormal-cleanup-lowering-pending (abort or suspension-safe scope)"
+            })
+        ));
+
+        let mut non_pass = actor_scope_fixture().into_wir();
+        let cleanup_source = non_pass.functions[3].source;
+        non_pass.functions[3].body.statements.insert(
+            0,
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                results: Vec::new(),
+                operation: semantic::SemanticOperation::Constant(semantic::Constant::Unit),
+                source: cleanup_source,
+            }),
+        );
+        assert!(matches!(
+            supported_actor_image(&non_pass, LoweringLimits::standard(), &|| false),
+            Err(LowerError::UnsupportedInput {
+                feature: "flow-scope-cleanup-form-lowering-pending (non-pass exit helper)"
+            })
+        ));
+    }
+
+    #[test]
+    fn nested_scope_cleanup_calls_follow_proved_inner_before_outer_order() {
+        let input = nested_actor_scope_fixture();
+        let output = CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("nested pass-only scopes should reach FlowWir");
+        let wir = output.wir().as_wir();
+        assert_eq!(
+            wir.functions[5].origin,
+            flow::FunctionOrigin::GeneratedCleanup {
+                semantic_function: 3,
+                scope: 0,
+            }
+        );
+        assert_eq!(
+            wir.functions[6].origin,
+            flow::FunctionOrigin::GeneratedCleanup {
+                semantic_function: 3,
+                scope: 1,
+            }
+        );
+        let calls: Vec<_> = wir.functions[1]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match &instruction.operation {
+                flow::FlowOperation::Call {
+                    function,
+                    arguments,
+                } if matches!(function, flow::FunctionId(5) | flow::FunctionId(6)) => {
+                    Some((*function, arguments.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                (flow::FunctionId(5), vec![flow::ValueId(4)]),
+                (flow::FunctionId(6), vec![flow::ValueId(6)]),
+            ]
+        );
+        assert_eq!(output.report().cleanup_edges, 2);
+
+        let mut reversed = nested_actor_scope_fixture().into_wir();
+        reversed.scopes[0].dependencies = vec![semantic::ScopeId(1)];
+        reversed.scopes[1].dependencies.clear();
+        assert!(matches!(
+            supported_actor_image(&reversed, LoweringLimits::standard(), &|| false),
+            Err(LowerError::UnsupportedInput {
+                feature: "actor scope cleanup dependency order"
             })
         ));
     }
