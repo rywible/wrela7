@@ -185,6 +185,18 @@ impl LocalToolchainVerification {
                 path: PathBuf::from("<current-executable>"),
                 kind: error.kind(),
             })?;
+        // The running executable's location is host-controlled (build
+        // directories routinely live under symlinked roots such as macOS's
+        // `/var` -> `private/var`), so resolve it to its canonical,
+        // symlink-free form before applying the stable-read policy. The
+        // binding guarantee is the byte/digest equality against the installed
+        // frontend component, which canonicalization does not weaken.
+        let executable =
+            fs::canonicalize(&executable).map_err(|error| LocalToolchainVerificationError::Io {
+                operation: "running executable canonicalization",
+                path: executable.clone(),
+                kind: error.kind(),
+            })?;
         let observed = read_stable_file(&executable, maximum_bytes, false, true, is_cancelled)?;
         if observed.bytes != installed.bytes() || observed.digest != installed.digest() {
             return Err(LocalToolchainVerificationError::RunningFrontendMismatch(

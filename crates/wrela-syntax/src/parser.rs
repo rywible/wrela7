@@ -5335,8 +5335,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
                     "syntax-tail-if-suite",
                     span.range.start as usize,
                     span.range.end as usize,
-                    "a tail-position `if` arm suite must end in a bare expression value"
-                        .to_owned(),
+                    "a tail-position `if` arm suite must end in a bare expression value".to_owned(),
                 )?;
                 self.error_expression(self.position, self.position, depth + 1)
             }

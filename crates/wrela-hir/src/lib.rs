@@ -3436,9 +3436,7 @@ fn validate_entry_candidate_coverage(program: &Program, errors: &mut ValidationE
                 }
                 // Lowering admits only bare `@test` or `@test(runtime)`; a
                 // single retained argument is therefore the runtime force.
-                AttributeIdentity::Builtin(BuiltinAttribute::Test) => {
-                    attribute.arguments.len() > 1
-                }
+                AttributeIdentity::Builtin(BuiltinAttribute::Test) => attribute.arguments.len() > 1,
                 _ => false,
             }
         });
@@ -5871,7 +5869,7 @@ mod tests {
                     access: AccessMode::Mutate,
                     ty: None,
                     receiver: true,
-            positional_only: false,
+                    positional_only: false,
                     source: span(24, 28),
                 });
                 let DeclarationKind::Initializer(initializer) = &mut value.declarations[1].kind
@@ -6062,8 +6060,8 @@ mod tests {
                         fields: Vec::new(),
                         members: vec![DeclarationId(1)],
                         linear: false,
-                    copy: false,
-                    deriving: Vec::new(),
+                        copy: false,
+                        deriving: Vec::new(),
                     }),
                     source,
                 },
@@ -6097,7 +6095,7 @@ mod tests {
                 access: AccessMode::Read,
                 ty: None,
                 receiver: true,
-            positional_only: false,
+                positional_only: false,
                 source: span(24, 28),
             }],
             bodies: Vec::new(),
@@ -6283,7 +6281,7 @@ mod tests {
                 access: AccessMode::Mutate,
                 ty: None,
                 receiver: false,
-            positional_only: false,
+                positional_only: false,
                 source: span(75, 86),
             }],
             bodies: vec![

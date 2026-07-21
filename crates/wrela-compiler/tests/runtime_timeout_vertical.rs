@@ -178,6 +178,8 @@ fn checked_in_runtime_timeout_retains_reachable_checked_u8_add_and_fatal_edge() 
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
                 content_record("ops.wr", CORE_OPS_SOURCE),
+                content_record("option.wr", CORE_OPTION_SOURCE),
+                content_record("panic.wr", CORE_PANIC_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
                 content_record("time.wr", CORE_TIME_SOURCE),
             ],

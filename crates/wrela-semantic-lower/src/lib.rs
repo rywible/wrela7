@@ -6715,8 +6715,7 @@ impl SourceFunctionLowerer<'_> {
         else {
             return Err(self.fact_mismatch("inline if condition value"));
         };
-        let mut then_statements =
-            try_vec(2, "inline if then region", self.limits.model_edges)?;
+        let mut then_statements = try_vec(2, "inline if then region", self.limits.model_edges)?;
         let LoweredExpression::Value(then_value) = self.lower_expression(
             inline_if.then_branch,
             sema::AccessMode::Value,
@@ -6729,8 +6728,7 @@ impl SourceFunctionLowerer<'_> {
             &mut then_statements,
             wir::SemanticStatement::Yield(one_value_vec(then_value, self.limits.model_edges)?),
         )?;
-        let mut else_statements =
-            try_vec(2, "inline if else region", self.limits.model_edges)?;
+        let mut else_statements = try_vec(2, "inline if else region", self.limits.model_edges)?;
         let LoweredExpression::Value(else_value) = self.lower_expression(
             inline_if.else_branch,
             sema::AccessMode::Value,
@@ -11397,8 +11395,8 @@ pub fn boot() -> Image:
                         fields: Vec::new(),
                         members: Vec::new(),
                         linear: false,
-                    copy: false,
-                    deriving: Vec::new(),
+                        copy: false,
+                        deriving: Vec::new(),
                     }),
                     source: span(1, 10, 60),
                 },
@@ -11780,7 +11778,7 @@ pub fn boot() -> Image:
                     access: AccessMode::Value,
                     ty: Some(u32_ty(span(0, 176, 179))),
                     receiver: false,
-            positional_only: false,
+                    positional_only: false,
                     source: span(0, 174, 179),
                 },
                 Parameter {
@@ -11790,7 +11788,7 @@ pub fn boot() -> Image:
                     access: AccessMode::Value,
                     ty: Some(u32_ty(span(0, 182, 185))),
                     receiver: false,
-            positional_only: false,
+                    positional_only: false,
                     source: span(0, 180, 185),
                 },
             ]);

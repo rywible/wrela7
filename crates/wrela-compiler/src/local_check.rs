@@ -1400,6 +1400,14 @@ mod tests {
             CORE_OPS_SOURCE,
         );
         directory.write(
+            "toolchain/share/wrela/std/wrela-core-0.1/src/option.wr",
+            CORE_OPTION_SOURCE,
+        );
+        directory.write(
+            "toolchain/share/wrela/std/wrela-core-0.1/src/panic.wr",
+            CORE_PANIC_SOURCE,
+        );
+        directory.write(
             "toolchain/share/wrela/std/wrela-core-0.1/src/result.wr",
             CORE_RESULT_SOURCE,
         );
@@ -1424,6 +1432,8 @@ mod tests {
         let standard_library = tree_measurement(&[
             tree_record("wrela-core-0.1/src/image.wr", CORE_SOURCE),
             tree_record("wrela-core-0.1/src/ops.wr", CORE_OPS_SOURCE),
+            tree_record("wrela-core-0.1/src/option.wr", CORE_OPTION_SOURCE),
+            tree_record("wrela-core-0.1/src/panic.wr", CORE_PANIC_SOURCE),
             tree_record("wrela-core-0.1/src/result.wr", CORE_RESULT_SOURCE),
             tree_record("wrela-core-0.1/src/time.wr", CORE_TIME_SOURCE),
             tree_record("wrela-core-0.1/wrela.toml", CORE_MANIFEST),

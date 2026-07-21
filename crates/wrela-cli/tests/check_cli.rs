@@ -56,7 +56,7 @@ pub fn distance(left: u32, right: u32) -> u32:
     return right - left
 
 pub fn add_two(value: u32) -> u32:
-    return add(add(value, 1), 1)
+    return add(left=add(left=value, right=1), right=1)
 
 pub fn scaled_remainder(value: u32) -> u32:
     scaled: u32 = value * 6
@@ -147,7 +147,7 @@ from app.math import add, add_two, bitwise_edges, both, comptime_branch_edge, di
 
 @test
 fn imported_add_works():
-    inferred = add(20, 22)
+    inferred = add(left=20, right=22)
     adjusted = inferred + 8
     named: u32 = add(right=22, left=20)
     comptime assert inferred == 42 and adjusted == 50 and named == 42, "imported add returned the wrong value"
@@ -159,9 +159,9 @@ fn nested_import_works():
 
 @test
 fn scalar_branching_works():
-    distance_result: u32 = distance(20, 62)
+    distance_result: u32 = distance(left=20, right=62)
     arithmetic_result: u32 = scaled_remainder(7)
-    boolean_result: bool = both(distance_result == 42, not false) and either(false, arithmetic_result == 12)
+    boolean_result: bool = both(left=distance_result == 42, right=not false) and either(left=false, right=arithmetic_result == 12)
     bitwise_result: bool = bitwise_edges(42)
     ordinary_result: bool = ordinary_branch_edge(5) == 1 and ordinary_branch_edge(41) == 2 and ordinary_branch_edge(42) == 3
     comptime_result: bool = comptime_branch_edge(true) == 7 and comptime_branch_edge(false) == 9
@@ -177,7 +177,7 @@ fn target_integer_edges_work():
     defaulted: i64 = unconstrained_default()
     comptime assert signed_edges() and unconstrained_signed_minimum() and target_word_edges() and wrapped == 0 and defaulted == 42, "target integer edge semantics were wrong"
 "#;
-const FAILING_SOURCE_UNIT_TEST: &[u8] = b"module app.math_test\n\nfrom app.math import add\n\n@test\nfn imported_add_failure_is_reported():\n    result: u32 = add(20, 22)\n    comptime assert result == 41, \"imported add failure\"\n";
+const FAILING_SOURCE_UNIT_TEST: &[u8] = b"module app.math_test\n\nfrom app.math import add\n\n@test\nfn imported_add_failure_is_reported():\n    result: u32 = add(left=20, right=22)\n    comptime assert result == 41, \"imported add failure\"\n";
 const DEPTH_SOURCE_UNIT_MATH: &[u8] = b"module app.math\n\npub fn leaf() -> u32:\n    return 42\n\npub fn middle() -> u32:\n    return leaf()\n";
 const DEPTH_SOURCE_UNIT_TEST: &[u8] = b"module app.math_test\n\nfrom app.math import middle\n\n@test\nfn imported_call_depth_is_bounded():\n    result: u32 = middle()\n    comptime assert result == 42, \"nested imported call returned the wrong value\"\n";
 const UNSUPPORTED_SOURCE_UNIT_TEST: &[u8] = b"module app.math_test\n\nfrom app.math import unsupported_loop\n\n@test\nfn unsupported_loop_is_diagnostic():\n    unsupported_loop()\n";
@@ -1612,8 +1612,12 @@ fn install_toolchain_with_frontend(directory: &TestDirectory, frontend_bytes: &[
     directory.write(
         "toolchain/share/wrela/std/wrela-core-0.1/src/result.wr",
         CORE_RESULT_SOURCE,
+    );
+    directory.write(
         "toolchain/share/wrela/std/wrela-core-0.1/src/option.wr",
         CORE_OPTION_SOURCE,
+    );
+    directory.write(
         "toolchain/share/wrela/std/wrela-core-0.1/src/panic.wr",
         CORE_PANIC_SOURCE,
     );
@@ -1667,8 +1671,8 @@ fn install_toolchain_with_frontend(directory: &TestDirectory, frontend_bytes: &[
                     ("image.wr", CORE_SOURCE),
                     ("ops.wr", CORE_OPS_SOURCE),
                     ("result.wr", CORE_RESULT_SOURCE),
-            ("option.wr", CORE_OPTION_SOURCE),
-            ("panic.wr", CORE_PANIC_SOURCE),
+                    ("option.wr", CORE_OPTION_SOURCE),
+                    ("panic.wr", CORE_PANIC_SOURCE),
                     ("time.wr", CORE_TIME_SOURCE),
                 ],
             ),

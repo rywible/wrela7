@@ -1050,8 +1050,11 @@ impl<'a> Checker<'a> {
                         "call argument label does not name a declared parameter",
                     )
                 })?;
-                let parameter =
-                    self.parameter(function.parameters[parameter_index], target_id, target.source)?;
+                let parameter = self.parameter(
+                    function.parameters[parameter_index],
+                    target_id,
+                    target.source,
+                )?;
                 if (!parameter.receiver && non_receiver_count <= 1) || parameter.positional_only {
                     return Err(self.diagnostic(
                         argument.source,
@@ -2570,13 +2573,13 @@ from app.math import make
 
 @test
 fn every_path_reinitializes():
-    value = make(20, 22)
+    value = make(left=20, right=22)
     if true:
         moved = value
-        value = make(moved.left, 1)
+        value = make(left=moved.left, right=1)
     else:
         moved = value
-        value = make(moved.right, 2)
+        value = make(left=moved.right, right=2)
     comptime assert value.left == 20, "joined value"
 "#;
         let hir = lower(VALUES, VALID);
@@ -2624,7 +2627,7 @@ from app.math import make
 
 @test
 fn one_path_leaves_value_moved():
-    value = make(20, 22)
+    value = make(left=20, right=22)
     if true:
         moved = value
         comptime assert moved.left == 20, "moved path"

@@ -773,8 +773,12 @@ fn install_toolchain(directory: &TestDirectory, frontend_bytes: &[u8]) {
     directory.write(
         "toolchain/share/wrela/std/wrela-core-0.1/src/result.wr",
         CORE_RESULT_SOURCE,
+    );
+    directory.write(
         "toolchain/share/wrela/std/wrela-core-0.1/src/option.wr",
         CORE_OPTION_SOURCE,
+    );
+    directory.write(
         "toolchain/share/wrela/std/wrela-core-0.1/src/panic.wr",
         CORE_PANIC_SOURCE,
     );

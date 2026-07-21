@@ -192,6 +192,8 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity) {
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
                 content_record("ops.wr", CORE_OPS_SOURCE),
+                content_record("option.wr", CORE_OPTION_SOURCE),
+                content_record("panic.wr", CORE_PANIC_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
                 content_record("time.wr", CORE_TIME_SOURCE),
             ],

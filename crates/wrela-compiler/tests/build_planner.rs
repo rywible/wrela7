@@ -279,8 +279,8 @@ impl Fixture {
                 ("image.wr", CORE_SOURCE),
                 ("ops.wr", CORE_OPS_SOURCE),
                 ("result.wr", CORE_RESULT_SOURCE),
-            ("option.wr", CORE_OPTION_SOURCE),
-            ("panic.wr", CORE_PANIC_SOURCE),
+                ("option.wr", CORE_OPTION_SOURCE),
+                ("panic.wr", CORE_PANIC_SOURCE),
                 ("time.wr", CORE_TIME_SOURCE),
             ],
         );
@@ -973,7 +973,11 @@ fn source_scalar_runtime_test_reaches_the_private_backend_boundary() {
         .filter(|block| block.parameters.len() == 1)
         .copied()
         .collect::<Vec<_>>();
-    assert_eq!(scalar_joins.len(), join_blocks.len(), "every join is a scalar join");
+    assert_eq!(
+        scalar_joins.len(),
+        join_blocks.len(),
+        "every join is a scalar join"
+    );
     assert_eq!(scalar_joins.len(), 2, "inner and outer scalar SSA joins");
     let join_blocks = scalar_joins;
     for join in &join_blocks {

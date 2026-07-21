@@ -48,13 +48,13 @@ pub fn forward(value: Measurement) -> Measurement:
 
 pub fn nested(left: u32, right: u32, accepted: bool) -> Measurement:
     combined: u32 = left + right
-    candidate = make_measurement(combined, accepted)
+    candidate = make_measurement(magnitude=combined, accepted=accepted)
     if candidate.accepted:
         return forward(candidate)
-    return make_measurement(0, false)
+    return make_measurement(magnitude=0, accepted=false)
 
 pub fn failing_leaf() -> Measurement:
-    value = nested(20, 22, true)
+    value = nested(left=20, right=22, accepted=true)
     comptime assert value.magnitude == 0, "production aggregate failure"
     return value
 
@@ -68,12 +68,12 @@ from app.values import failing_outer, nested
 
 @test
 fn imported_aggregate_branch_and_nested_calls():
-    result = nested(20, 22, true)
+    result = nested(left=20, right=22, accepted=true)
     comptime assert result.magnitude == 42 and result.accepted, "aggregate branch result"
 
 @test
 fn aggregate_name_filter_uses_production_code():
-    result = nested(99, 1, false)
+    result = nested(left=99, right=1, accepted=false)
     comptime assert result.magnitude == 0 and not result.accepted, "aggregate false branch"
 
 @test
@@ -101,7 +101,7 @@ from app.values import make_and_forward
 
 @test
 fn aggregate_bound():
-    result = make_and_forward(20, 22)
+    result = make_and_forward(left=20, right=22)
     comptime assert result.left + result.right == 42, "aggregate result"
 "#;
 
@@ -227,7 +227,7 @@ fn failed_production_assertion_is_classified_and_retains_nested_source_stack() {
 #[test]
 fn flat_structure_evaluator_admits_exact_bounds_and_classifies_plus_one() {
     let standard_fixture = fixture(EXACT_PRODUCTION, EXACT_TEST, BuildProfile::development());
-    for (steps, passes) in [(163, true), (162, false)] {
+    for (steps, passes) in [(184, true), (183, false)] {
         let mut limits = AnalysisLimits::standard();
         limits.evaluator_steps = steps;
         let output = analyze(
@@ -252,7 +252,7 @@ fn flat_structure_evaluator_admits_exact_bounds_and_classifies_plus_one() {
                 &TestOutcome::Failed {
                     phase: FailurePhase::Comptime,
                     message: format!(
-                        "comptime test exceeded comptime evaluator steps limit 162 [source {}]",
+                        "comptime test exceeded comptime evaluator steps limit 183 [source {}]",
                         source_span(2, EXACT_TEST, "42")
                     ),
                 }
@@ -287,7 +287,7 @@ fn flat_structure_evaluator_admits_exact_bounds_and_classifies_plus_one() {
                         "comptime test exceeded comptime evaluator bytes limit 607 [source {}; comptime calls <- {} <- {}]",
                         source_span_nth(1, EXACT_PRODUCTION, "value", 2),
                         source_span(1, EXACT_PRODUCTION, "forward(pair)"),
-                        source_span(2, EXACT_TEST, "make_and_forward(20, 22)"),
+                        source_span(2, EXACT_TEST, "make_and_forward(left=20, right=22)"),
                     ),
                 }
             );
@@ -398,9 +398,9 @@ from app.values import boxed, copied, make, read_left
 
 @test
 fn aggregate_moves_copy_and_reinitialize():
-    first = make(20, 22)
+    first = make(left=20, right=22)
     second = first
-    first = make(1, 2)
+    first = make(left=1, right=2)
     duplicate = copy second
     comptime assert read_left(first) == 1 and read_left(second) == 20 and copied(duplicate).right == 22 and boxed().value == 42, "ownership result"
 "#;
@@ -436,13 +436,13 @@ from app.values import make
 
 @test
 fn every_continuing_branch_reinitializes():
-    value = make(20, 22)
+    value = make(left=20, right=22)
     if true:
         moved = value
-        value = make(moved.left, 1)
+        value = make(left=moved.left, right=1)
     else:
         moved = value
-        value = make(moved.right, 2)
+        value = make(left=moved.right, right=2)
     comptime assert value.left == 20, "branch ownership"
 "#;
     let valid_branch = analyze(
@@ -480,7 +480,7 @@ from app.values import make
 
 @test
 fn moved_local_cannot_be_read():
-    first = make(20, 22)
+    first = make(left=20, right=22)
     second = first
     comptime assert first.left == second.left, "moved local"
 "#,
@@ -505,7 +505,7 @@ from app.values import invalid_forward, make
 
 @test
 fn read_parameter_cannot_become_owned():
-    invalid_forward(make(20, 22))
+    invalid_forward(make(left=20, right=22))
 "#,
             "semantic-comptime-borrowed-value-move",
         ),
@@ -517,7 +517,7 @@ from app.values import make
 
 @test
 fn one_branch_move_poison_joins():
-    value = make(20, 22)
+    value = make(left=20, right=22)
     if true:
         moved = value
         comptime assert moved.left == 20, "moved branch"

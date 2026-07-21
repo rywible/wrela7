@@ -1451,6 +1451,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn allocate_parameter(
         &mut self,
         owner: hir::DeclarationId,
@@ -1572,9 +1573,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
     }
 
     fn inject_fixed_prelude(&mut self) -> Result<(), LowerFailure> {
-        const PRELUDE_NAMES: &[&str] = &[
-            "Option", "Some", "None", "Result", "Ok", "Err", "panic",
-        ];
+        const PRELUDE_NAMES: &[&str] = &["Option", "Some", "None", "Result", "Ok", "Err", "panic"];
         let mut core_packages = Vec::new();
         for package in self.request.packages.packages() {
             poll_cancellation(self.is_cancelled)?;
@@ -1601,7 +1600,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                 SymbolTarget::Declaration(resolved) => resolved.package,
                 SymbolTarget::Variant(resolved) => resolved.enumeration.package,
             };
-            if !core_packages.iter().any(|candidate| *candidate == package) {
+            if !core_packages.contains(&package) {
                 continue;
             }
             push64(

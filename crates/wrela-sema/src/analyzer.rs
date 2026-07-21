@@ -5731,15 +5731,14 @@ fn analyze_scalar_unary(
             matches!(scalar, Some(RuntimeScalarType::Integer { .. }))
         }
         wrela_hir::UnaryOperator::BoolNot => scalar == Some(RuntimeScalarType::Bool),
-        wrela_hir::UnaryOperator::Copy => partial
-            .types
-            .get(operand.ty.0 as usize)
-            .is_some_and(|ty| {
+        wrela_hir::UnaryOperator::Copy => {
+            partial.types.get(operand.ty.0 as usize).is_some_and(|ty| {
                 matches!(
                     ty.linearity,
                     Linearity::ExplicitCopy | Linearity::ScalarCopy
                 )
-            }),
+            })
+        }
         wrela_hir::UnaryOperator::Await
         | wrela_hir::UnaryOperator::Take
         | wrela_hir::UnaryOperator::Comptime => false,
@@ -6658,10 +6657,7 @@ fn resolve_declaration_owned_argument(
             let mut found = None;
             for (index, parameter) in target_parameters.iter().enumerate() {
                 check_cancelled(is_cancelled)?;
-                if resolved_arguments
-                    .get(index)
-                    .is_some_and(Option::is_some)
-                {
+                if resolved_arguments.get(index).is_some_and(Option::is_some) {
                     continue;
                 }
                 let hir_parameter = request
@@ -6691,6 +6687,7 @@ fn resolve_declaration_owned_argument(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_inline_if_expression(
     request: &AnalysisRequest<'_>,
     partial: &mut PartialAnalysis,
@@ -16513,8 +16510,8 @@ mod tests {
 
     const PARSED_CORE_IMAGE_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
     const PARSED_COMPTIME_IMAGE_SOURCE: &str = "module app.image\n\nfrom core.image import Image, Target\n\n@image\npub fn boot() -> Image:\n    return Image(name=\"bootstrap\", target=Target.aarch64_qemu_virt_uefi)\n";
-    const PARSED_COMPTIME_MATH_SOURCE: &str = "module app.math\n\npub fn add(left: u32, right: u32) -> u32:\n    return left + right\n\npub fn leaf(value: u32) -> u32:\n    return add(value, 1)\n\npub fn middle(value: u32) -> u32:\n    return leaf(value)\n";
-    const PARSED_COMPTIME_TEST_SOURCE: &str = "module app.math_test\n\nfrom app.math import add, middle\n\n@test\nfn imported_scalars_work():\n    caller: u32 = 40\n    nested: u32 = middle(caller)\n    caller = add(caller, 2)\n    valid: bool = nested == 41 and not false\n    if valid:\n        comptime assert caller == 42, \"caller local was not preserved\"\n    else:\n        comptime assert false, \"nested scalar call failed\"\n";
+    const PARSED_COMPTIME_MATH_SOURCE: &str = "module app.math\n\npub fn add(left: u32, right: u32) -> u32:\n    return left + right\n\npub fn leaf(value: u32) -> u32:\n    return add(left=value, right=1)\n\npub fn middle(value: u32) -> u32:\n    return leaf(value)\n";
+    const PARSED_COMPTIME_TEST_SOURCE: &str = "module app.math_test\n\nfrom app.math import add, middle\n\n@test\nfn imported_scalars_work():\n    caller: u32 = 40\n    nested: u32 = middle(caller)\n    caller = add(left=caller, right=2)\n    valid: bool = nested == 41 and not false\n    if valid:\n        comptime assert caller == 42, \"caller local was not preserved\"\n    else:\n        comptime assert false, \"nested scalar call failed\"\n";
     const PARSED_UNIMPLEMENTED_ATTRIBUTES_SOURCE: &str = r#"module app.math
 
 @layout_assert
@@ -16960,8 +16957,8 @@ pub struct Packet:
                         fields: Vec::new(),
                         members: Vec::new(),
                         linear: false,
-                    copy: false,
-                    deriving: Vec::new(),
+                        copy: false,
+                        deriving: Vec::new(),
                     }),
                     source: span(1, 10, 60),
                 },
@@ -17246,7 +17243,7 @@ pub struct Packet:
                 access: AccessMode::Value,
                 ty: Some(u32_ty(span(0, 411, 414))),
                 receiver: false,
-            positional_only: false,
+                positional_only: false,
                 source: span(0, 408, 414),
             });
             let DeclarationKind::Function(runtime) = &mut program.declarations[4].kind else {
@@ -17413,7 +17410,7 @@ pub struct Packet:
                     kind: ExpressionKind::Call {
                         callee: ExpressionId(9),
                         arguments: vec![CallArgument {
-                            name: Some(name("x")),
+                            name: None,
                             value: wrela_hir::CallArgumentValue::Value(ExpressionId(10)),
                             source: span(0, 363, 367),
                         }],
@@ -17739,7 +17736,7 @@ pub struct Packet:
                 kind: ExpressionKind::Call {
                     callee: callee_id,
                     arguments: vec![CallArgument {
-                        name: Some(name("x")),
+                        name: None,
                         value: wrela_hir::CallArgumentValue::Exclusive {
                             access: wrela_hir::ExclusiveAccess::Take,
                             place: wrela_hir::PlaceTarget {
@@ -18059,7 +18056,7 @@ pub struct Packet:
                 kind: ExpressionKind::Call {
                     callee: ExpressionId(14),
                     arguments: vec![CallArgument {
-                        name: Some(name("target")),
+                        name: None,
                         value: wrela_hir::CallArgumentValue::Exclusive {
                             access: wrela_hir::ExclusiveAccess::Mutate,
                             place: wrela_hir::PlaceTarget {
@@ -18112,6 +18109,8 @@ pub struct Packet:
         let ExpressionKind::Call { arguments, .. } = &mut program.expressions[8].kind else {
             unreachable!();
         };
+        // With two non-receiver parameters every argument needs its label.
+        arguments[0].name = Some(name("x"));
         arguments.insert(
             0,
             CallArgument {
@@ -18980,29 +18979,29 @@ from app.math import checked_u8, checked_i8
 
 @test
 fn safe_shifts():
-    checked_unsigned: u8 = checked_u8(1, 7)
-    checked_signed: i8 = checked_i8(-64, 1)
+    checked_unsigned: u8 = checked_u8(value=1, count=7)
+    checked_signed: i8 = checked_i8(value=-64, count=1)
     comptime assert checked_unsigned == 128 and checked_signed == -128, "target-width left shifts"
 
 @test
 fn checked_unsigned_result_loss():
-    value: u8 = checked_u8(128, 1)
+    value: u8 = checked_u8(value=128, count=1)
 
 @test
 fn checked_signed_positive_result_loss():
-    value: i8 = checked_i8(64, 1)
+    value: i8 = checked_i8(value=64, count=1)
 
 @test
 fn checked_signed_negative_result_loss():
-    value: i8 = checked_i8(-65, 1)
+    value: i8 = checked_i8(value=-65, count=1)
 
 @test
 fn checked_count_out_of_range():
-    value: u8 = checked_u8(1, 8)
+    value: u8 = checked_u8(value=1, count=8)
 
 @test
 fn negative_count_out_of_range():
-    value: i8 = checked_i8(1, -1)
+    value: i8 = checked_i8(value=1, count=-1)
 "#;
         let fixture = parsed_comptime_fixture(MATH, TEST);
         let changes = no_changes();
@@ -19623,7 +19622,7 @@ from app.math import make_and_forward
 
 @test
 fn aggregate_bound():
-    result = make_and_forward(20, 22)
+    result = make_and_forward(left=20, right=22)
     comptime assert result.left + result.right == 42, "aggregate result"
 "#;
         let mut fixture = parsed_comptime_fixture(VALUES, TEST);
@@ -19633,10 +19632,10 @@ fn aggregate_bound():
             parsed_comptime_discovery_request(&fixture, &changes, AnalysisLimits::standard());
         let mut evaluator = ImageEvaluator::new(&request, &|| false).expect("aggregate evaluator");
         assert!(evaluator.evaluate_test(test).is_ok());
-        assert_eq!(evaluator.steps, 163);
+        assert_eq!(evaluator.steps, 184);
         assert_eq!(evaluator.peak_bytes, 608);
 
-        for (steps, passes) in [(163, true), (162, false)] {
+        for (steps, passes) in [(184, true), (183, false)] {
             let mut limits = AnalysisLimits::standard();
             limits.evaluator_steps = steps;
             let request = parsed_comptime_discovery_request(&fixture, &changes, limits);
@@ -19651,7 +19650,7 @@ fn aggregate_bound():
                         if diagnostic.code.as_deref()
                             == Some("semantic-comptime-resource-limit")
                             && diagnostic.message
-                                == "comptime test exceeded comptime evaluator steps limit 162"
+                                == "comptime test exceeded comptime evaluator steps limit 183"
                 ));
             }
         }
@@ -19675,7 +19674,7 @@ fn aggregate_bound():
             }
         }
 
-        for (resource, limit) in [("steps", 76_u64), ("bytes", 511_u64)] {
+        for (resource, limit) in [("steps", 97_u64), ("bytes", 511_u64)] {
             let mut limits = AnalysisLimits::standard();
             if resource == "steps" {
                 limits.evaluator_steps = limit;
@@ -20764,9 +20763,13 @@ fn projection_fixture():
         let failing_source = test_source(31);
         let passing = parsed_comptime_fixture(MATH, &passing_source);
         let failing = parsed_comptime_fixture(MATH, &failing_source);
+        // The small stack keeps the evaluator's host recursion honest: the
+        // 32-deep comptime call cap must fit comfortably inside a bounded
+        // host thread even in unoptimized builds. Argument-label resolution
+        // enlarged debug-mode evaluator frames, so the budget is 1.5 MiB.
         std::thread::Builder::new()
             .name("bounded-comptime-recursion".to_owned())
-            .stack_size(1024 * 1024)
+            .stack_size(1536 * 1024)
             .spawn(move || {
                 let changes = no_changes();
                 let test = passing.fixture.hir.as_program().test_candidates[0];
@@ -21567,7 +21570,11 @@ fn projection_fixture():
         let discovery_output = CanonicalSemanticAnalyzer::new()
             .analyze(discovery_request(&fixture, &changes), &|| false)
             .expect("scalar test discovery");
-        assert!(discovery_output.diagnostics().is_empty());
+        assert!(
+            discovery_output.diagnostics().is_empty(),
+            "{:?}",
+            discovery_output.diagnostics()
+        );
         let plan = discovery_output
             .successful()
             .and_then(|image| image.facts().test_plan.as_ref())
@@ -22411,7 +22418,7 @@ fn projection_fixture():
             program.expressions[10].kind = ExpressionKind::Call {
                 callee: ExpressionId(13),
                 arguments: vec![CallArgument {
-                    name: Some(name("x")),
+                    name: None,
                     value: wrela_hir::CallArgumentValue::Exclusive {
                         access: wrela_hir::ExclusiveAccess::Mutate,
                         place: wrela_hir::PlaceTarget {
@@ -22843,7 +22850,11 @@ fn projection_fixture():
         let discovery = CanonicalSemanticAnalyzer::new()
             .analyze(discovery_request(&fixture, &changes), &|| false)
             .expect("mutate discovery");
-        assert!(discovery.diagnostics().is_empty());
+        assert!(
+            discovery.diagnostics().is_empty(),
+            "{:?}",
+            discovery.diagnostics()
+        );
         let plan = discovery
             .successful()
             .and_then(|image| image.facts().test_plan.as_ref())
@@ -23250,7 +23261,7 @@ fn projection_fixture():
                             kind: ExpressionKind::Call {
                                 callee,
                                 arguments: vec![CallArgument {
-                                    name: Some(name("x")),
+                                    name: None,
                                     value: wrela_hir::CallArgumentValue::Exclusive {
                                         access: wrela_hir::ExclusiveAccess::Take,
                                         place: wrela_hir::PlaceTarget {
