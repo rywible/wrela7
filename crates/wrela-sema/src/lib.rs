@@ -6241,7 +6241,7 @@ fn exact_method_is_visible_from(
             record.visibility == wrela_hir::Visibility::Public
         }
         Some(wrela_hir::DeclarationKind::Implementation(implementation)) => {
-            let visible_nominal = |ty: &wrela_hir::TypeExpression| {
+            let visible_nominal = |ty: &wrela_hir::TypeExpression, applied: bool| {
                 let wrela_hir::TypeExpressionKind::Named {
                     definition: wrela_hir::Definition::Declaration(resolved),
                     arguments,
@@ -6249,13 +6249,13 @@ fn exact_method_is_visible_from(
                 else {
                     return false;
                 };
-                arguments.is_empty()
+                (applied || arguments.is_empty())
                     && program
                         .declaration(resolved.declaration)
                         .is_some_and(|record| record.visibility == wrela_hir::Visibility::Public)
             };
-            visible_nominal(&implementation.interface)
-                && visible_nominal(&implementation.implementing_type)
+            visible_nominal(&implementation.interface, true)
+                && visible_nominal(&implementation.implementing_type, false)
         }
         _ => false,
     }

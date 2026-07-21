@@ -3,14 +3,15 @@
 //! by chapter 02 §3.4 ("Interfaces") and chapter 10 §12 ("Operator
 //! interfaces").
 //!
-//! Scope is deliberately narrow: non-generic `interface` declarations,
-//! `impl Interface for ConcreteStruct` blocks whose method bodies are
-//! ordinary ideas, alpha-equivalent ordered unbounded type parameters owned by
-//! an interface requirement and its concrete impl method, and desugaring of
-//! `+ - < <= > >=` on a nominal struct type with a unique visible
-//! implementation. Everything else (generic interfaces/impl targets, generic
-//! bounds, enum/non-struct targets) fails closed with a stable diagnostic from
-//! this module.
+//! Scope is deliberately narrow: non-generic interfaces and one exact
+//! primitive-copy-scalar specialization of an unbounded type-only interface
+//! per concrete receiver, `impl Interface for ConcreteStruct` blocks whose
+//! method bodies are ordinary ideas, alpha-equivalent ordered unbounded type
+//! parameters owned by an interface requirement and its concrete impl method,
+//! and desugaring of `+ - < <= > >=` on a nominal struct type with a unique
+//! visible implementation. Generic bounds, nested/nominal interface arguments,
+//! generic impl targets, and enum/non-struct targets fail closed with stable
+//! diagnostics from this module.
 //!
 //! This module is a pure function of the whole-image HIR: it never consults
 //! or mutates analysis state, so both the runtime tier (`analyzer.rs`) and
@@ -22,8 +23,9 @@ use std::collections::BTreeMap;
 use wrela_diagnostics::{Category, Diagnostic, Label};
 use wrela_hir::{
     BinaryOperator, ComparisonOperator, Declaration, DeclarationId, DeclarationKind,
-    DeclarationOwner, Definition, FunctionDeclaration, ImplementationDeclaration, Name, Program,
-    ResolvedDeclaration, TypeExpression, TypeExpressionKind, Visibility,
+    DeclarationOwner, Definition, FunctionDeclaration, GenericArgument, GenericArgumentKind,
+    GenericParameterId, ImplementationDeclaration, Name, Program, ResolvedDeclaration,
+    TypeExpression, TypeExpressionKind, Visibility,
 };
 use wrela_package::PackageId;
 
@@ -238,6 +240,11 @@ struct NominalRef {
     resolved: ResolvedDeclaration,
 }
 
+struct AppliedNominalRef<'a> {
+    resolved: ResolvedDeclaration,
+    arguments: &'a [GenericArgument],
+}
+
 fn nominal_ref(ty: &TypeExpression) -> Option<NominalRef> {
     match &ty.kind {
         TypeExpressionKind::Named {
@@ -245,6 +252,19 @@ fn nominal_ref(ty: &TypeExpression) -> Option<NominalRef> {
             arguments,
         } if arguments.is_empty() => Some(NominalRef {
             resolved: resolved.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn applied_nominal_ref(ty: &TypeExpression) -> Option<AppliedNominalRef<'_>> {
+    match &ty.kind {
+        TypeExpressionKind::Named {
+            definition: Definition::Declaration(resolved),
+            arguments,
+        } => Some(AppliedNominalRef {
+            resolved: resolved.clone(),
+            arguments,
         }),
         _ => None,
     }
@@ -282,6 +302,8 @@ fn concrete_type_ref(
     self_owner: DeclarationId,
     implementing_type: DeclarationId,
     method_generics: &[wrela_hir::GenericParameterId],
+    interface_generics: &[GenericParameterId],
+    interface_arguments: &[ConcreteTypeRef],
 ) -> Option<ConcreteTypeRef> {
     match &ty.kind {
         TypeExpressionKind::SelfType { owner } if *owner == self_owner => {
@@ -301,9 +323,52 @@ fn concrete_type_ref(
         } if arguments.is_empty() => method_generics
             .iter()
             .position(|candidate| candidate == generic)
-            .map(ConcreteTypeRef::MethodTypeParameter),
+            .map(ConcreteTypeRef::MethodTypeParameter)
+            .or_else(|| {
+                interface_generics
+                    .iter()
+                    .position(|candidate| candidate == generic)
+                    .and_then(|position| interface_arguments.get(position).copied())
+            }),
         _ => None,
     }
+}
+
+fn copy_scalar_builtin_argument(argument: &GenericArgument) -> Option<ConcreteTypeRef> {
+    let GenericArgumentKind::Type(TypeExpression {
+        kind:
+            TypeExpressionKind::Named {
+                definition: Definition::Builtin(builtin),
+                arguments,
+            },
+        ..
+    }) = &argument.kind
+    else {
+        return None;
+    };
+    if !arguments.is_empty()
+        || !matches!(
+            builtin,
+            wrela_hir::Builtin::Bool
+                | wrela_hir::Builtin::U8
+                | wrela_hir::Builtin::U16
+                | wrela_hir::Builtin::U32
+                | wrela_hir::Builtin::U64
+                | wrela_hir::Builtin::U128
+                | wrela_hir::Builtin::Usize
+                | wrela_hir::Builtin::I8
+                | wrela_hir::Builtin::I16
+                | wrela_hir::Builtin::I32
+                | wrela_hir::Builtin::I64
+                | wrela_hir::Builtin::I128
+                | wrela_hir::Builtin::Isize
+                | wrela_hir::Builtin::F32
+                | wrela_hir::Builtin::F64
+        )
+    {
+        return None;
+    }
+    Some(ConcreteTypeRef::Builtin(*builtin))
 }
 
 fn function_shape(program: &Program, id: DeclarationId) -> Option<&FunctionDeclaration> {
@@ -313,12 +378,19 @@ fn function_shape(program: &Program, id: DeclarationId) -> Option<&FunctionDecla
     }
 }
 
+#[derive(Clone, Copy)]
+struct InterfaceSpecialization<'a> {
+    declaration: DeclarationId,
+    generics: &'a [GenericParameterId],
+    arguments: &'a [ConcreteTypeRef],
+}
+
 /// An implementation's declared access effects MUST match the interface
 /// exactly (chapter 02 §3.4), and `Self` in either signature must denote the
 /// same concrete implementing type.
 fn implementation_signature_matches(
     program: &Program,
-    interface_declaration: DeclarationId,
+    interface: InterfaceSpecialization<'_>,
     impl_declaration: DeclarationId,
     implementing_type: DeclarationId,
     requirement: DeclarationId,
@@ -399,15 +471,19 @@ fn implementation_signature_matches(
         match (
             concrete_type_ref(
                 interface_ty,
-                interface_declaration,
+                interface.declaration,
                 implementing_type,
                 &interface_function.generics,
+                interface.generics,
+                interface.arguments,
             ),
             concrete_type_ref(
                 impl_ty,
                 impl_declaration,
                 implementing_type,
                 &impl_function.generics,
+                &[],
+                &[],
             ),
         ) {
             (Some(left), Some(right)) if left == right => {}
@@ -420,15 +496,19 @@ fn implementation_signature_matches(
             (
                 concrete_type_ref(
                     interface_ty,
-                    interface_declaration,
+                    interface.declaration,
                     implementing_type,
                     &interface_function.generics,
+                    interface.generics,
+                    interface.arguments,
                 ),
                 concrete_type_ref(
                     impl_ty,
                     impl_declaration,
                     implementing_type,
                     &impl_function.generics,
+                    &[],
+                    &[],
                 ),
             ),
             (Some(left), Some(right)) if left == right
@@ -465,12 +545,12 @@ fn validate_one_implementation(
         ));
         return;
     }
-    let Some(interface_ref) = nominal_ref(&implementation.interface) else {
+    let Some(interface_ref) = applied_nominal_ref(&implementation.interface) else {
         diagnostics.push(unsupported_diagnostic(
             implementation.interface.source,
             "semantic-interface-unsupported",
             "this implementation's interface reference is outside the supported concrete subset",
-            "revision 0.1 supports only a bare non-generic interface name after `impl`",
+            "use a direct interface name with exact primitive copy-scalar type arguments",
         ));
         return;
     };
@@ -486,14 +566,44 @@ fn validate_one_implementation(
         ));
         return;
     };
-    if !interface_body.generics.is_empty() {
+    if interface_body.generics.len() != interface_ref.arguments.len() {
         diagnostics.push(unsupported_diagnostic(
             implementation.interface.source,
-            "semantic-interface-unsupported",
-            "generic interfaces are outside the supported concrete subset",
-            "revision 0.1's bounded interface support admits only non-generic interfaces",
+            "semantic-generic-interface-argument-count",
+            "generic interface specialization has the wrong number of type arguments",
+            "supply exactly one supported primitive copy-scalar argument for every declared interface parameter",
         ));
         return;
+    }
+    let mut interface_arguments = Vec::new();
+    for (generic_id, argument) in interface_body.generics.iter().zip(interface_ref.arguments) {
+        let Some(generic) = program.generic_parameter(*generic_id) else {
+            return;
+        };
+        if generic.owner != interface_ref.resolved.declaration
+            || !matches!(
+                generic.kind,
+                wrela_hir::GenericParameterKind::Type { bound: None }
+            )
+        {
+            diagnostics.push(unsupported_diagnostic(
+                generic.source,
+                "semantic-generic-interface-parameter-kind",
+                "generic interface parameter is outside the unbounded type-only subset",
+                "use an unbounded type parameter specialized by a primitive stored copy scalar",
+            ));
+            return;
+        }
+        let Some(argument) = copy_scalar_builtin_argument(argument) else {
+            diagnostics.push(unsupported_diagnostic(
+                argument.source,
+                "semantic-generic-interface-argument-type",
+                "generic interface specialization has an unsupported type argument",
+                "use bool, an integer type, or f32/f64 until nominal and nested interface specialization lands",
+            ));
+            return;
+        };
+        interface_arguments.push(argument);
     }
 
     let Some(type_ref) = nominal_ref(&implementation.implementing_type) else {
@@ -564,7 +674,11 @@ fn validate_one_implementation(
         };
         if !implementation_signature_matches(
             program,
-            interface_ref.resolved.declaration,
+            InterfaceSpecialization {
+                declaration: interface_ref.resolved.declaration,
+                generics: &interface_body.generics,
+                arguments: &interface_arguments,
+            },
             declaration.id,
             type_ref.resolved.declaration,
             *requirement,

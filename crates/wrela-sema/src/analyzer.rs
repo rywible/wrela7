@@ -10027,7 +10027,7 @@ fn method_is_visible_from(
     match program.declaration(owner).map(|record| &record.kind) {
         Some(DeclarationKind::Structure(_)) => record.visibility == wrela_hir::Visibility::Public,
         Some(DeclarationKind::Implementation(implementation)) => {
-            let visible_nominal = |ty: &wrela_hir::TypeExpression| {
+            let visible_nominal = |ty: &wrela_hir::TypeExpression, applied: bool| {
                 let TypeExpressionKind::Named {
                     definition: Definition::Declaration(resolved),
                     arguments,
@@ -10035,13 +10035,13 @@ fn method_is_visible_from(
                 else {
                     return false;
                 };
-                arguments.is_empty()
+                (applied || arguments.is_empty())
                     && program
                         .declaration(resolved.declaration)
                         .is_some_and(|record| record.visibility == wrela_hir::Visibility::Public)
             };
-            visible_nominal(&implementation.interface)
-                && visible_nominal(&implementation.implementing_type)
+            visible_nominal(&implementation.interface, true)
+                && visible_nominal(&implementation.implementing_type, false)
         }
         _ => false,
     }
@@ -31746,6 +31746,77 @@ fn projection_fixture():
             1,
             "result- and argument-inferred calls must deduplicate"
         );
+    }
+
+    #[test]
+    fn concrete_generic_interface_specialization_dispatches() {
+        let source = dot_variant_actor_source(
+            "pub interface Convert[T]:\n    fn convert(read self, value: T) -> T\n\npub struct Cell:\n    pub value: u32\n\nimpl Convert[u16] for Cell:\n    fn convert(read self, value: u16) -> u16:\n        return value\n\nasync fn checkpoint():\n    cell: Cell = Cell(7)\n    source: u16 = 3\n    observed: u16 = cell.convert(source)\n    cell.convert(source)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("generic interface specialization analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "{:?}",
+            output.diagnostics()
+        );
+        let successful = output
+            .successful()
+            .expect("sealed generic interface method call");
+        let instances: Vec<_> = successful
+            .facts()
+            .functions
+            .iter()
+            .filter(|function| function.name.ends_with("convert"))
+            .collect();
+        assert_eq!(
+            instances.len(),
+            1,
+            "repeated calls must share the impl method"
+        );
+        assert!(instances[0].generic_arguments.is_empty());
+    }
+
+    #[test]
+    fn generic_interface_specialization_tails_fail_closed_by_name() {
+        let cases = [
+            (
+                "pub interface Marker:\n    fn mark(read self)\n\npub interface Convert[T: Marker]:\n    fn convert(read self, value: T) -> T\n\npub struct Cell:\n    pub value: u32\n\nimpl Convert[u8] for Cell:\n    fn convert(read self, value: u8) -> u8:\n        return value\n\nasync fn checkpoint():\n    pass\n\n",
+                "semantic-generic-interface-parameter-kind",
+            ),
+            (
+                "pub interface Convert[T]:\n    fn convert(read self, value: T) -> T\n\npub struct Payload:\n    pub value: u8\n\npub struct Cell:\n    pub value: u32\n\nimpl Convert[Payload] for Cell:\n    fn convert(read self, value: Payload) -> Payload:\n        return value\n\nasync fn checkpoint():\n    pass\n\n",
+                "semantic-generic-interface-argument-type",
+            ),
+            (
+                "pub interface Convert[T]:\n    fn convert(read self, value: T) -> T\n\npub struct Cell:\n    pub value: u32\n\nimpl Convert[u8] for Cell:\n    fn convert(read self, value: u16) -> u16:\n        return value\n\nasync fn checkpoint():\n    pass\n\n",
+                "semantic-interface-signature-mismatch",
+            ),
+            (
+                "pub interface Convert[const N: u8]:\n    fn convert(read self, value: u8) -> u8\n\npub struct Cell:\n    pub value: u32\n\nimpl Convert[1] for Cell:\n    fn convert(read self, value: u8) -> u8:\n        return value\n\nasync fn checkpoint():\n    pass\n\n",
+                "semantic-generic-interface-parameter-kind",
+            ),
+        ];
+        for (source, expected) in cases {
+            let source = dot_variant_actor_source(source);
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("generic interface tail diagnostic");
+            assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+            assert_eq!(output.diagnostics()[0].code.as_deref(), Some(expected));
+            assert!(output.has_errors());
+        }
     }
 
     #[test]
