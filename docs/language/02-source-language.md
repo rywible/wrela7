@@ -23,7 +23,10 @@ These diagnostics are warnings in the base profile and errors in the sealed
 deployment profile; no conforming profile may suppress them silently.
 
 `#` begins a comment outside a string and continues to the end of the physical
-line. Blocks use a trailing `:` and significant indentation. Tabs in leading
+line. `##` begins a documentation comment attached to the immediately
+following declaration — module, top-level declaration, or member — and is
+surfaced by tooling; ordinary `#` carries no such attachment. Blocks use a
+trailing `:` and significant indentation. Tabs in leading
 indentation are a compile error. Every block indentation level is exactly four
 spaces deeper than its parent; other increases and inconsistent dedents are
 errors. A formatter MUST use the same four-space form.
@@ -63,7 +66,8 @@ text/character literals. Surrogates, out-of-range scalars, malformed escapes,
 and `\xNN` in a text literal are build errors.
 
 Text, byte, character, and interpolated literals do not contain raw physical
-newlines; revision 0.1 has no multiline/raw literal. A byte string permits only
+newlines. `"""` is reserved for a future multiline/raw literal and is a syntax
+error in revision 0.1. A byte string permits only
 ASCII source characters plus escapes, so every decoded element is unambiguously
 one byte. In an interpolated string, `{{` and `}}` emit literal braces and a
 single `{` begins `{ expression [ : format_spec ] }`. The expression follows
@@ -136,10 +140,10 @@ or ASCII case folding is rejected on every host.
 The manifest sees only declarations reachable through imports from the module
 containing `@image`. Closed-world linkage does not bypass visibility.
 
-### 2.1 Package manifest and lockfile
+### 2.1 Package manifest
 
-Package configuration uses UTF-8 TOML. The root files are named `wrela.toml`
-and `wrela.lock`. Duplicate keys, unknown fields, invalid UTF-8, non-NFC text in
+Package configuration uses UTF-8 TOML. The root file is named `wrela.toml`.
+Duplicate keys, unknown fields, invalid UTF-8, non-NFC text in
 names/paths, absolute or parent paths, and an unsupported schema are errors;
 implementations do not silently ignore configuration from a newer schema.
 
@@ -149,8 +153,8 @@ implementations do not silently ignore configuration from a newer schema.
 - package `name`, `version`, and one portable relative `source_root`;
 - dependency local alias, nominal package name, and version requirement;
 - exactly one direct dependency under the reserved alias `core`; this selects
-  the semantic standard-library package, while its locked toolchain locator
-  selects the package bytes inside the verified standard-library component;
+  the semantic standard-library package, whose package bytes are the
+  toolchain-shipped `core` component;
 - one or more finite named build profiles, each stating only its overrides of
   the language-defined defaults for comptime, memory, recovery, DMA,
   record/replay, optimization, and diagnostic policy;
@@ -230,26 +234,19 @@ maximum_output_bytes = 1048576
 deterministic_seed = 1
 ```
 
-`wrela.lock` schema 1 is generated canonical TOML. It names the exact root
-identity and strictly orders the complete transitive package closure by
-`(name, version, source_digest)`. Each entry records that identity, an explicit
-workspace/archive/toolchain locator, the canonical manifest digest, and its
-strictly ordered `(alias, exact dependency identity)` edges. An archive locator
-names an explicitly configured provider and opaque key; it is not an implicit
-registry URL. A toolchain locator names a shipped component such as the standard
-library. Every listed package MUST be reachable from the root through those
-edges; isolated packages and disconnected subgraphs, including disconnected
-cycles, are invalid rather than additional lockfile inputs. The exact raw bytes
-of every acquired manifest are hashed before TOML decoding, and every source is
-hashed before source-language parsing. A raw manifest digest is an
-acquisition-integrity artifact, distinct from the lockfile's canonical
-manifest digest: after semantic TOML decoding, the manifest is canonically
-encoded and that canonical digest is checked against the lock. Equivalent
-noncanonical TOML spellings therefore remain valid without weakening the raw
-acquisition boundary. A digest, identity, alias, dependency, missing/extra
-source, or canonical-lock mismatch is a build error. Package acquisition may
-use a driver-selected local or network provider, but undeclared resolution and
-ambient registry configuration are not part of the build.
+Revision 0.1 has no lockfile. The dependency graph is fully determined by
+`wrela.toml` together with the toolchain-shipped `core` component — the only
+package revision 0.1 can acquire — so no separate locked closure is recorded.
+A lockfile naming third-party package identities and locators returns once
+third-party package acquisition is introduced.
+
+### 2.2 Prelude
+
+A fixed prelude is always in scope without an import: `Option`, `Some`,
+`None`, `Result`, `Ok`, `Err`, and `panic`. Prelude names are ordinary
+bindings — an import or a module-scope declaration may shadow one — and every
+other name requires an explicit import. Scalar type spellings (`u8`, `bool`,
+`char`, ...) are builtin and already in scope; they are not prelude bindings.
 
 ## 3. Declaration forms
 
@@ -295,6 +292,13 @@ comptime call boundary; a violation is diagnosed with the call path that
 reaches it. Compile-time evaluation itself is governed by
 [Comptime and images](06-comptime-and-images.md).
 
+A cross-package comptime call additionally requires an explicit contract: a
+`pub fn` marked `@comptime` declares, and the compiler verifies, that its
+transitive closure is comptime-legal, and a comptime context may call a
+`pub fn` from another package only when it carries that mark. An in-package
+comptime call keeps the inferred legality check above; an unmarked `pub fn`
+carries no comptime contract for outside callers.
+
 A `fn`/`async fn` body whose result type is `unit` may fall off the end of its
 suite without a trailing `return`; doing so returns `unit`.
 
@@ -328,11 +332,14 @@ The earlier postfix spelling `call().await` is not part of this revision.
 
 A `struct` is a product value. A `linear struct` is additionally non-copyable
 and uniquely owned regardless of its fields; this is the sole way to declare a
-uniquely owned aggregate in revision 0.1. Neither form has observable object
-identity beyond its fields.
+uniquely owned aggregate in revision 0.1. A `copy struct` (`Point` below) is
+additionally implicitly copyable, like a scalar; this is legal only when every
+field is a scalar or itself a copy struct, recursively — no linear, `iso`,
+`view`, brand, or shape-typed content anywhere in it. Neither `linear` nor
+`copy` gives a struct observable object identity beyond its fields.
 
 ```wrela
-pub struct Point:
+pub copy struct Point:
     x: i32
     y: i32
 ```
@@ -342,11 +349,13 @@ struct may define methods and may carry an `implements` clause naming
 interfaces it implements in the struct body; see
 [3.4](#34-interfaces). A non-linear struct is copyable exactly when every
 field is copyable and it owns no linear resource; a `linear struct` is never
-copyable. Except for scalar values, duplication of a copyable value is always
-written `copy value`; assignment without `copy` moves a non-scalar value even
-when that value is copyable. This makes the cost of large aggregate duplication
-source-visible. Physical copies and moves may be elided so long as value behavior
-and teardown are preserved.
+copyable. A `copy` struct's values duplicate implicitly exactly like scalars;
+an explicit `copy expr` on one is legal but lint-flagged as redundant. Every
+other copyable value's duplication is written `copy value`; assignment
+without `copy` moves a non-scalar value even when that value is copyable.
+This makes the cost of large aggregate duplication source-visible. Physical
+copies and moves may be elided so long as value behavior and teardown are
+preserved.
 An empty struct uses `pass` and is an ordinary zero-sized value. It is not a
 pool, request, device, or vector brand; those identities are generative. Map
 instance IDs are likewise minted by `SlotMap`, not supplied by a zero-sized
@@ -403,15 +412,17 @@ is called as `Type.method(...)`. It has no implicit receiver authority.
 
 ### 3.3 Enums and matching
 
-An `enum` is a closed sum. Variants may carry values. The canonical formatter
-writes a one-payload variant as `Ok(T)`, never `Ok(T,)`; the grammar accepts
-both spellings.
+An `enum` is a closed sum. Variants may carry values. Variant names are
+constructors and use CamelCase (`Found`, `Absent`, `Ok`); a lint, not the
+formatter, flags a lowercase variant name. The canonical formatter writes a
+one-payload variant as `Ok(T)`, never `Ok(T,)`; the grammar accepts both
+spellings.
 
 ```wrela
 enum Lookup[T]:
-    found(T)
-    absent
-    failed(IoError)
+    Found(T)
+    Absent
+    Failed(IoError)
 ```
 
 `match` is exhaustive. A wildcard arm is allowed only when it covers at least
@@ -420,18 +431,22 @@ require, and the formatter does not invent, a default arm.
 
 ```wrela
 match lookup(key):
-    case .found(value):
+    case .Found(value):
         use(value)
-    case .absent:
+    case .Absent:
         return None
-    case .failed(error):
+    case .Failed(error):
         return Err(error)
 ```
 
 Exhaustiveness is checked after comptime specialization.
 
-In a pattern, an enum variant is written with a leading dot — `.found(value)`,
-`.absent` — or, fully qualified, `Enum.variant(...)`. A bare identifier in a
+The same arms above produce a value, instead of running `use`/`return` for
+effect, when the match sits in the tail position of an assignment, `return`,
+or `yield` (§7.1).
+
+In a pattern, an enum variant is written with a leading dot — `.Found(value)`,
+`.Absent` — or, fully qualified, `Enum.variant(...)`. A bare identifier in a
 pattern is always a binding, never a variant reference, whatever its payload
 position or the expected type; removing or renaming a variant therefore cannot
 silently turn a pattern into a binding or vice versa. Patterns also include
@@ -446,13 +461,17 @@ Fixed-array patterns have exactly the statically known array length; revision
 
 ```wrela
 match state:
-    case .clean(found) if found == lba:
+    case .Clean(found) if found == lba:
         use(found)
-    case .dirty(found) if found == lba:
+    case .Dirty(found) if found == lba:
         use(found)
-    case .clean(_) | .dirty(_) | .invalid:
+    case .Clean(_) | .Dirty(_) | .Invalid:
         pass
 ```
+
+The wildcard arm above ends in `pass`, which neither diverges nor produces a
+value; a match containing such an arm is therefore only a statement, never
+eligible for tail-expression use (§7.1).
 
 `is` performs a refutable pattern test. Bindings introduced by the pattern are
 available only in the success-dominated right operand of `and` and in the
@@ -512,7 +531,7 @@ pub interface From[Source]:
 
 impl From[ParseError] for FsError:
     fn from(take error: ParseError) -> FsError:
-        return FsError.invalid_input(error.kind)
+        return FsError.InvalidInput(error.kind)
 ```
 
 A struct's `implements` clause is declaration-local shorthand for the same
@@ -531,8 +550,8 @@ closed enum:
 
 ```wrela
 enum Backend:
-    memory(MemoryBackend)
-    block(BlockBackend)
+    Memory(MemoryBackend)
+    Block(BlockBackend)
 ```
 
 This rule guarantees that dispatch is a direct specialized call or an explicit
@@ -603,18 +622,37 @@ scope replace(mut self, index: usize) -> Replacement:
         self.finish_or_rollback(mut replacement)
 ```
 
+### 3.6 Deriving
+
+A `deriving(...)` clause on a `struct` or `enum` declaration requests
+compiler-generated implementations from a closed, compiler-known list:
+`Eq`, `Format`, and, for an enum with exactly one payload-carrying variant,
+`From` — which generates `impl From[Payload] for Self` for that variant's
+payload type. `deriving` is not a macro system; a name outside this list is a
+build error. Semantics for each derived member are specified in
+[Standard library contracts](10-standard-library-contracts.md).
+
+```wrela
+enum ConfigError deriving(From):
+    Invalid(String[..64])
+```
+
+This declaration generates `ConfigError.from(take value: String[..64])`, so
+postfix `?` can convert a `String[..64]` error into `ConfigError` without a
+hand-written `impl`.
+
 ## 4. Parameter access effects
 
 Every parameter has one access mode:
 
 ```wrela
-fn inspect(packet: Packet):             # read is the default
+fn inspect(_ packet: Packet):             # read is the default; `_` makes it positional-only
     ...
 
-fn fill(mut buffer: Bytes):             # exclusive in-place mutation
+fn fill(mut buffer: Bytes):             # exclusive in-place mutation; label-required
     ...
 
-fn enqueue(take packet: iso[NetPackets] Packet):  # ownership transfer
+fn enqueue(take packet: iso[NetPackets] Packet):  # ownership transfer; label-required
     ...
 ```
 
@@ -625,12 +663,25 @@ A receiver, when present, is the first parameter and appears exactly once. It is
 legal only in a declaration nested in a nominal type or its `impl`; module
 functions and receiver-free associated functions have no implicit receiver.
 
+A parameter is label-required at its call sites by default. Writing `_`
+before the parameter name in its declaration — as with `packet` above —
+declares it positional-only instead, and the call must then omit the label.
+Writing a label on a positional-only parameter, or omitting the label on a
+label-required parameter, is a compile error, so exactly one spelling is
+legal per call site. Receiver `self` is never labeled and `_` does not apply
+to it. A parameter may be supplied exactly once; labels/positions are
+resolved against the selected declaration before evaluation, and revision 0.1
+has no variadic or runtime keyword-argument collection. Struct constructor
+fields already followed this named-required rule (subject to the one-field
+positional exception) and are unaffected. Named arguments affect binding
+only, never source evaluation order.
+
 Non-receiver `mut` and `take` effects MUST be mirrored at the call site:
 
 ```wrela
 inspect(packet)
-fill(mut buffer)
-enqueue(take packet)
+fill(buffer=mut buffer)
+enqueue(packet=take packet)
 
 # Named arguments place the effect after `=`.
 driver.submit(queue=0, payload=take packet)
@@ -644,19 +695,20 @@ parenthesized place. Literals, calls, operators, and every other rvalue form are
 rejected by syntax before HIR lowering. An unmarked argument remains an
 ordinary expression; this revision does not add implicit move semantics.
 
-Arguments bind positionally until the first named argument; every later argument
-must be named. A parameter may be supplied exactly once, names are resolved
-against the selected declaration before evaluation, and revision 0.1 has no
-variadic or runtime keyword-argument collection. Constructor fields follow the
-same duplicate/order rule. Named arguments affect binding only, never source
-evaluation order.
-
 For parameters, bare `T` under the default `read` mode means whole-value read
-access for the call; it does not copy `T`. `mut T` means whole-value exclusive
-access. The spellings `view T` and `mut view T` are therefore forbidden as
-parameter types: `view` is reserved for projection results and lexical
-bindings. A caller may pass an existing view to a compatible read parameter,
-and the call cannot extend that view's lifetime.
+access for the call. This is a loan, never a copy: the callee borrows the
+caller's value for the call and the value is never duplicated, so a call site
+almost never writes `copy` —
+
+```wrela
+inspect(packet)   # `packet` is loaned by `read`; the call does not copy it
+```
+
+— `mut T` means whole-value exclusive access. The spellings `view T` and
+`mut view T` are therefore forbidden as parameter types: `view` is reserved
+for projection results and lexical bindings. A caller may pass an existing
+view to a compatible read parameter, and the call cannot extend that view's
+lifetime.
 
 For an explicit ownership transfer of a linear local outside a call, `take` is
 an expression. A copyable non-scalar used by assignment or value construction
@@ -703,9 +755,8 @@ API-breaking change.
 The core scalar types are:
 
 - `bool`;
-- unsigned integers `u8`, `u16`, `u32`, `u64`, `u128`, and target-width
-  `usize`;
-- signed integers `i8`, `i16`, `i32`, `i64`, `i128`, and `isize`;
+- unsigned integers `u8`, `u16`, `u32`, `u64`, and target-width `usize`;
+- signed integers `i8`, `i16`, `i32`, `i64`, and `isize`;
 - `f32` and `f64` where the target enables floating point;
 - `char`, a Unicode scalar value;
 - `unit`, written as the value `unit`; and
@@ -724,6 +775,10 @@ be nonnegative and less than the left operand's bit width or the operation
 abandons; right shift is logical for unsigned values and sign-extending for
 signed values. Checked standard-library forms return `Result` instead of
 abandoning.
+
+On a signed type, a left shift that changes the sign bit is overflow and
+abandons: `1 << 31` on `i32` abandons rather than producing `i32::MIN`.
+Bit-mask code should use an unsigned type.
 
 Apart from contextual typing of literals, there are no implicit numeric
 conversions, including widening. `value as T` is a checked
@@ -754,13 +809,16 @@ Core spellings include:
 - `Result[T, E]` — `Ok(T)` or `Err(E)`;
 - `Bytes[N]` — exactly `N` bytes;
 - `Bytes[..N]` — a byte value with runtime length at most `N`;
-- `List[T, N]` — at most `N` region-homogeneous values;
+- `List[T, ..N]` — at most `N` region-homogeneous values;
 - `String[..N]` — owned, validated UTF-8 with capacity `N`;
 - `Bytes` and `Str` — unsized byte and validated UTF-8 **shape types**;
 - `Static[T]` — a copyable read-only handle to immutable image data of shape
   `T`;
 - `view T` and `mut view T` — lexical projections; and
 - `iso[P] T` — a movable, uniquely owned region handle branded by pool `P`.
+
+The `..N` prefix consistently spells bounded runtime occupancy up to `N`; a
+plain `N` spells exact, non-varying extent, as in `Bytes[N]` and `[T; N]`.
 
 Shape types have no standalone field or local layout. They may occur only as a
 whole-value `read`/`mut` parameter, behind `view`/`mut view`, or as the payload
@@ -809,12 +867,14 @@ struct Ring[T, const N: usize]:
 
 Every ordinary type/constant instantiation is concrete and monomorphized.
 Runtime type variables, variance through subtyping, and erased generic
-containers do not exist. The one proof-only exception is a `region R` parameter:
-it is universally quantified, has no runtime representation, and may occur only
-as the brand of `RequestContext[R]`, `iso[R] T`, or another sealed
-request-scoped type. Source cannot choose its value; request creation mints it
-and actor admission preserves it. A function generic only over region brands is
-compiled once because the brands are erased after static checking.
+containers do not exist. Region brands are a compiler-managed exception, not a
+user-facing generic parameter: a request mints a proof-only brand and sealed
+request-scoped types such as `iso[R] T` carry it internally, but revision
+0.1's surface syntax has no `region R` entry in `generic_params` — a
+declaration cannot take or name one. Source cannot choose a region brand's
+value; request creation mints it and actor admission preserves it under the
+ambient request lineage every `async fn` already carries — see
+[Actors and async](04-actors-and-async.md) §12.
 
 A constant generic argument has type `bool`, `char`, an integer type, or a
 fieldless enum with a fixed representation. It is evaluated by the comptime
@@ -868,6 +928,12 @@ or reclaim the remaining elements according to their linear category.
 Revision 0.1 provides `if`/`else`, `match`, `for`, `while`, `loop`, `break`,
 `continue`, `return`, `pass`, `assert`, `send`, and `with`.
 
+`for` iterates a closed, compiler-known set of forms: ranges, fixed arrays
+(including the consuming `take` form below), and the standard containers'
+iteration operations specified in
+[Standard library contracts](10-standard-library-contracts.md). Revision 0.1
+deliberately excludes a general user-defined iteration protocol.
+
 Ranges use `start .. end` for a half-open range and `start ..= end` for an
 inclusive range. Bounds have the same integer type after literal
 contextualization. A half-open range is empty when `start >= end`; an inclusive
@@ -883,7 +949,7 @@ for take buffer in take buffers:
     install(take buffer)
 
 with request(deadline=now() + ms(50)) as req:
-    result = await disk.read(req, lba)?
+    result = await disk.read(lba)?  # lineage is ambient; `req` is only needed for an explicit override
 ```
 
 `pass` is an explicit no-op. `send actor.method(...)` enqueues a one-way actor
@@ -906,6 +972,58 @@ iteration. `break`, `continue`, `return`, and `?` run all exited cleanup
 nodes before transferring control. Loop `else` clauses and value-producing
 `break` are not in revision 0.1.
 
+### 7.1 Match and if as tail expressions
+
+`match scrutinee:` and a block `if`/`elif`/`else` chain may also appear as a
+**tail-position block expression** — the entire right-hand side of an
+assignment or initialization, a `return` operand, or a `yield` operand —
+because each of those is a simple statement whose value slot is exactly one
+`expression` (§11's `tail_value`). `send`'s operand is a `call_expression`,
+not a general expression, so a block match/if can never be the whole `send`
+operand; it may still appear as an ordinary call argument through the inline
+`if`-expression of §8, but not as a fresh block form there.
+
+Each arm's suite is unchanged from statement `match`/`if` (§3.3, §7): it
+already may end in a bare `expression`, because `expression` is itself a
+`simple_stmt`. In tail position that existing rule becomes load-bearing: an
+arm suite must either DIVERGE — end in `return`, a `?` that propagates,
+`panic(...)`, or an operation that abandons — or end with exactly one tail
+expression, and every non-diverging arm's tail expression must agree on one
+type after contextual typing. An arm ending in some other statement (a bare
+call for its effect, `pass`, an assignment) neither diverges nor produces a
+value, so a match/if containing one is not eligible for tail-expression use
+and remains only a statement.
+
+Block `if`/`elif`/`else` follows the identical rule in the same tail
+position, with one difference from statement `if`: `else` is mandatory
+whenever the chain is used as an expression (§11's `if_tail_expression`),
+since a missing branch would leave no value on that path.
+
+Definite-initialization and linear-consumption convergence across arms follow
+the control-flow join rule already stated for arms in §8 (every arm must
+agree a source is initialized or uninitialized); exhaustiveness for `match`
+follows §3.3 unchanged. Tail-position use changes nothing about either rule —
+it only adds a value to arms that were already required to converge.
+
+```wrela
+value = match lookup(key):
+    case .Found(item):
+        item
+    case .Absent:
+        return None
+```
+
+`?` inside an arm propagates from the enclosing `fn`/`async fn` exactly as it
+does anywhere else in that function; the match/if expression introduces no
+new propagation boundary. A match expression's temporaries follow the
+full-expression teardown rule of §8: each arm's tail expression is its own
+full expression, so only the executed arm's temporaries exist, and they tear
+down at the end of that expression rather than at the end of the whole
+match/if. Ephemeral/carrier consumption — a projection carrier consumed by an
+immediate `match` (§3.5), or the admission carrier consumed by `match`/`is`
+(§8) — keeps its existing consumption rule; tail-position use does not relax
+the requirement that the carrier be consumed immediately by that same match.
+
 ## 8. Expressions and precedence
 
 From tightest to loosest binding, the relevant operators are:
@@ -921,11 +1039,31 @@ From tightest to loosest binding, the relevant operators are:
 9. ranges `..` and `..=`;
 10. comparisons, membership, and identity-pattern tests;
 11. boolean `not`;
-12. boolean `and`; and
-13. boolean `or`.
+12. boolean `and`;
+13. boolean `or`; and
+14. the inline `if`/`elif`/`else` conditional expression.
 
 This ordering makes `await operation()?` mean `(await operation())?`, while a
 plain `operation()?` still propagates the call's result.
+
+The inline conditional `if condition: consequent else: alternative` is the
+loosest-binding expression form (item 14): it may be written directly as an
+assignment right-hand side, a call argument, or any other complete expression
+position, but using its result as the operand of a tighter operator requires
+enclosing parentheses, exactly as with a comparison or boolean operator —
+`(if flag: 2 else: 3) * scale`, never `if flag: 2 else: 3 * scale` to mean the
+same thing. `elif` is sugar for a nested `else`: `if c1: a elif c2: b else: c`
+means `if c1: a else: (if c2: b else: c)`. The condition, consequent, each
+`elif` condition/branch, and the alternative are ordinary expressions, never
+suites, and may themselves be a further inline conditional; because `else` is
+mandatory, an inner conditional always resolves its own `else` before an
+enclosing one can claim it, so nesting is unambiguous without special-casing.
+The condition must be `bool`; the consequent, every `elif` branch, and the
+alternative must agree on one type after the usual contextual typing. A
+statement beginning with the keyword `if` is always the compound `if_stmt` of
+§7, never this expression form; writing the inline conditional as a bare
+expression-statement — evaluated for a side effect, its value discarded —
+requires enclosing parentheses: `(if flag: log_a() else: log_b())`.
 
 This is the only use of `&` in revision 0.1: binary bitwise AND. There is no
 reference declarator.
@@ -955,25 +1093,27 @@ evaluates an arm guard only after that arm's pattern bindings are established.
 Comparisons do not chain in revision 0.1; write `a < b and b < c` explicitly.
 
 A call through `Actor[T]` is the one admission-aware call form. It evaluates
-the actor receiver and reads any designated `RequestContext[R]` bare binding,
-reserves/validates a logical mailbox and request-child slot,
-and only after successful reservation evaluates argument expressions left to
-right and atomically commits the message. Rejection, cancellation, or deadline
+the actor receiver, admits under the call site's ambient request lineage or an
+explicit `request=` override argument when one is written (see
+[Actors and async](04-actors-and-async.md) §12), reserves/validates a logical
+mailbox and request-child slot, and only after successful reservation
+evaluates argument expressions left to right and atomically commits the
+message. Rejection, cancellation, or deadline
 failure before reservation therefore evaluates no argument and moves no value.
 There is no suspension/checkpoint between argument evaluation and commit.
 `send` uses the same order with build-proven reservation. The expression
 `try send actor.method(...)` performs a nonblocking reservation and returns
 the second-class `AdmissionResult` carrier without evaluating arguments when
 unavailable; on success it evaluates/commits. The carrier must be consumed by an
-immediate `match`/`is` test. In `admitted`, moved sources are uninitialized;
-in `rejected(reason)`, they remain initialized. At a control-flow join a source
+immediate `match`/`is` test. In `.Admitted`, moved sources are uninitialized;
+in `.Rejected(reason)`, they remain initialized. At a control-flow join a source
 is initialized only if every incoming arm restores it. For a linear source, all
 joining arms must agree that it is initialized or uninitialized (or leave the
 control flow); otherwise the match is rejected rather than creating a hidden
 runtime drop flag.
 
 An awaited actor call with `take` arguments uses the same immediate
-ownership-conditioned carrier rule: `not_admitted` leaves sources initialized;
+ownership-conditioned carrier rule: `.NotAdmitted` leaves sources initialized;
 every other actor-call result consumes them. It must be consumed immediately by
 `?` or `match`, whose arms obey the same convergence rule.
 
@@ -995,6 +1135,11 @@ Lexical views end at their last use as specified by chapter 03; source exit
 actions and strict-linear obligations run before reclaimable temporary teardown
 when dependency order requires it. These orders are observable and part of
 record/replay.
+
+When a `match`/`if` tail-position block expression (§7.1) occupies one of
+these positions, each arm's tail expression is itself the full expression, not
+the match/if as a whole: only the executed arm's temporaries exist, and they
+tear down at the end of that arm's tail expression.
 
 Postfix `?` applies to `Result`; it also unwraps a second-class fallible
 projection result in an immediate view binding. `Ok(value)?` yields `value`;
@@ -1043,6 +1188,7 @@ Built-in revision 0.1 attributes include:
 | Attribute | Meaning |
 |---|---|
 | `@image` | The unique compile-time image constructor; evaluated only at build time. |
+| `@comptime` | On a `pub fn`, declares and verifies its transitive closure is comptime-legal; required before a compile-time context in another package may call it. |
 | `@app` | An application actor root. |
 | `@service` | A service actor root. |
 | `@driver` | A hardware-authorized driver actor root. |
@@ -1054,10 +1200,9 @@ Built-in revision 0.1 attributes include:
 | `@mmio` | A typed MMIO register layout checked by the target ABI. |
 | `@offset` | A target-ABI field offset inside an MMIO or device layout. |
 | `@layout_assert` | A read-only assertion evaluated after image layout, at build time only. |
-| `@test` | Declares a test on a plain function. A comptime-legal test runs in the build evaluator; other tests run as generated runtime tests per the test plan in chapter 06. |
+| `@test` / `@test(runtime)` | Declares a test on a plain function. A comptime-legal test runs in the build evaluator; other tests run as generated runtime tests per the test plan in chapter 06. The optional `runtime` argument forces runtime-tier execution even when the test would otherwise be comptime-legal; tier selection is chapter 06's concern. |
 | `@no_promote` | Reject image-region promotion at the annotated allocation or scope. |
-| `@budget(...)` | Require a build-proven uninterrupted-work or memory bound. |
-| `@uninterrupted(bound=...)` | Replace an async loop checkpoint, or document a sync loop, with a proven finite uninterrupted bound. |
+| `@budget(...)` | Require a build-proven work or memory bound: at fn level, a call-graph bound; in statement position immediately before a loop, a proven finite uninterrupted-iteration bound. |
 
 Attributes do not expand arbitrary source text or introduce unhygienic names.
 They attach typed metadata consumed in the fixed build phases. Unknown
@@ -1073,10 +1218,10 @@ It is not legal on an `isr fn`, method requiring a receiver, generic function
 without manifest-supplied concrete arguments, `@image` function, or function
 whose test activation/resource bounds cannot be proved.
 
-Of the built-ins, only `@uninterrupted(bound=...)` may be a statement attribute,
-and it must immediately precede `for`, `while`, or `loop` at the same
-indentation. Other statement attributes and an uninterrupted attribute on a
-non-loop are errors.
+Of the built-ins, only `@budget(...)` may be a statement attribute, and in
+that position it must immediately precede `for`, `while`, or `loop` at the
+same indentation. Other statement attributes, and a loop-position `@budget`
+on a non-loop, are errors.
 
 Target packages may define additional semantic ABI attributes under their
 qualified namespace. Such attributes are type-checked and are part of the
@@ -1089,9 +1234,11 @@ field.
 ## 11. Normative grammar
 
 The following EBNF is normative. The UTF-8 scanner performs escape validation,
-removes comments, converts semicolons outside delimiters to `NEWLINE`, suppresses
-physical newlines inside delimiters, and emits `NEWLINE`, `INDENT`, `DEDENT`,
-and `EOF`. Blank/comment-only lines emit no layout token. Indentation must
+removes ordinary `#` comments while preserving each `##` comment as a doc
+comment attached to its immediately following declaration, converts
+semicolons outside delimiters to `NEWLINE`, suppresses physical newlines
+inside delimiters, and emits `NEWLINE`, `INDENT`, `DEDENT`, and `EOF`.
+Blank/comment-only lines emit no layout token. Indentation must
 match a previous level on dedent; an inconsistent dedent is an error. `{x}`
 means zero or more, `[x]` means optional, and terminals are quoted. A trailing
 comma is accepted exactly where `[ "," ]` appears below.
@@ -1136,13 +1283,15 @@ fn_decl          = fn_prefix, "fn", IDENT, [ generic_params ],
                    "(", [ parameters ], ")", [ "->", type ], ":", suite ;
 fn_prefix        = [ "async" | "isr" ] ;
 parameters       = parameter, { ",", parameter }, [ "," ] ;
-parameter        = receiver | [ access_mode ], IDENT, ":", type ;
+parameter        = receiver | [ access_mode ], [ "_" ], IDENT, ":", type ;
 receiver         = [ access_mode ], "self" ;
 access_mode      = "read" | "mut" | "take" ;
 
-struct_decl      = [ "linear" ], "struct", IDENT, [ generic_params ],
-                   [ "implements", type_list ], ":", type_suite ;
-enum_decl        = "enum", IDENT, [ generic_params ], ":", enum_suite ;
+struct_decl      = [ "copy" | "linear" ], "struct", IDENT, [ generic_params ],
+                   [ "implements", type_list ],
+                   [ "deriving", "(", deriving_list, ")" ], ":", type_suite ;
+enum_decl        = "enum", IDENT, [ generic_params ],
+                   [ "deriving", "(", deriving_list, ")" ], ":", enum_suite ;
 interface_decl   = "interface", IDENT, [ generic_params ], ":", interface_suite ;
 impl_decl        = "impl", type, "for", type, ":", impl_suite ;
 projection_decl  = "projection", IDENT, [ generic_params ],
@@ -1200,9 +1349,9 @@ scope_suite      = NEWLINE, INDENT, { statement, NEWLINE },
 
 generic_params   = "[", generic_param, { ",", generic_param }, [ "," ], "]" ;
 generic_param    = IDENT, [ ":", type ]
-                 | "const", IDENT, ":", type
-                 | "region", IDENT ;
+                 | "const", IDENT, ":", type ;
 type_list        = type, { ",", type }, [ "," ] ;
+deriving_list    = IDENT, { ",", IDENT }, [ "," ] ;
 
 type             = qualified_name, [ "[", type_args, "]" ]
                  | "[", type, ";", expression, "]"
@@ -1226,6 +1375,9 @@ suite            = NEWLINE, INDENT, statement, { NEWLINE, statement },
                    [ NEWLINE ], DEDENT ;
 statement        = { statement_attribute, NEWLINE },
                    ( simple_stmt | compound_stmt ) ;
+                   (* a statement beginning with "if" is always compound_stmt's
+                      if_stmt; the inline if_expression in statement-initial
+                      position requires enclosing parentheses — see §8 *)
 statement_attribute = attribute ;
 compound_stmt    = if_stmt | match_stmt | for_stmt | while_stmt | loop_stmt
                  | with_stmt | comptime_if ;
@@ -1234,23 +1386,31 @@ simple_stmt      = assignment | return_stmt | break_stmt | continue_stmt
                  | expression ;
 
 assignment       = local_assignment | place_assignment ;
-local_assignment = [ "shadow" ], IDENT, [ ":", type ], "=", expression ;
-place_assignment = assignment_target, assignment_op, expression ;
+local_assignment = [ "shadow" ], IDENT, [ ":", type ], "=", tail_value ;
+place_assignment = assignment_target, assignment_op, tail_value ;
 assignment_target = place_expression
                   | "(", assignment_target, ",",
                     [ assignment_target, { ",", assignment_target },
                       [ "," ] ], ")" ;
 assignment_op    = "=" | "+=" | "-=" | "*=" | "/=" | "%="
                  | "&=" | "|=" | "^=" | "<<=" | ">>=" ;
-return_stmt      = "return", [ expression ] ;
+return_stmt      = "return", [ tail_value ] ;
 break_stmt       = "break" ;
 continue_stmt    = "continue" ;
 pass_stmt        = "pass" ;
 assert_stmt      = "assert", expression, [ ",", STRING_LITERAL ] ;
 send_stmt        = "send", call_expression ;
-yield_stmt       = "yield", expression ;
+yield_stmt       = "yield", tail_value ;
 comptime_assert  = "comptime", "assert", expression,
                    [ ",", STRING_LITERAL ] ;
+
+(* §7.1: a tail_value is the value slot of an assignment/return/yield; it may
+   be an ordinary expression or a block match/if used as an expression. *)
+tail_value       = expression | match_stmt | if_tail_expression ;
+if_tail_expression = "if", expression, ":", suite,
+                     { "elif", expression, ":", suite },
+                     "else", ":", suite ;
+                     (* identical to if_stmt except `else` is mandatory *)
 
 if_stmt          = "if", expression, ":", suite,
                    { "elif", expression, ":", suite },
@@ -1258,6 +1418,10 @@ if_stmt          = "if", expression, ":", suite,
 match_stmt       = "match", expression, ":", NEWLINE, INDENT,
                    match_arm, { NEWLINE, match_arm }, DEDENT ;
 match_arm        = "case", pattern, [ "if", expression ], ":", suite ;
+                   (* an arm's suite already may end in a bare `expression`
+                      (expression is one alternative of simple_stmt); in
+                      tail_value position that final statement becomes the
+                      arm's value unless the arm diverges instead — §7.1 *)
 pattern          = primary_pattern, { "|", primary_pattern } ;
 primary_pattern  = "_" | literal_pattern | qualified_name,
                    [ "(", [ pattern_arguments ], ")" ]
@@ -1270,17 +1434,21 @@ for_stmt         = "for", [ "take" ], IDENT, "in", [ "take" ],
                    expression, ":", suite ;
 while_stmt       = "while", expression, ":", suite ;
 loop_stmt        = "loop", ":", suite ;
-with_stmt        = "with", expression, [ "as", with_binding ], ":", suite ;
-with_binding     = IDENT, [ "[", "region", IDENT, "]" ] ;
+with_stmt        = "with", expression, [ "as", IDENT ], ":", suite ;
 comptime_if      = "comptime", "if", expression, ":", suite,
                    [ "comptime", "else", ":", suite ] ;
 
 arguments        = argument, { ",", argument }, [ "," ] ;
 argument         = [ IDENT, "=" ],
                    ( ( "mut" | "take" ), place_expression | expression ) ;
+                   (* IDENT "=" is required or forbidden per the matching
+                      parameter's own "_" marking; see §4 *)
 qualified_name   = IDENT, { ".", IDENT } ;
 
-expression       = closure_expression | or_expression ;
+expression       = if_expression | closure_expression | or_expression ;
+if_expression    = "if", expression, ":", expression,
+                   { "elif", expression, ":", expression },
+                   "else", ":", expression ;
 closure_expression = [ "async" ], [ "take" ], "|",
                      [ closure_parameters ], "|",
                      ( expression | ":", suite ) ;
@@ -1334,6 +1502,29 @@ literal          = INTEGER_LITERAL | FLOAT_LITERAL | STRING_LITERAL
                  | "true" | "false" | "unit" ;
 literal_pattern  = literal | "-", ( INTEGER_LITERAL | FLOAT_LITERAL ) ;
 ```
+
+The `if_expression` alternative of `expression` is reachable only where
+`expression` itself is reachable; since `additive_expression` and every
+tighter production takes only its own tier (never a fresh `expression`) as an
+operand, an `if_expression` cannot appear as the operand of `+`, `*`, or any
+other operator without the enclosing parentheses that reach `expression`
+through `primary_expression`. Because `else` is mandatory, a nested
+`if_expression` inside a branch always resolves its own `else` before an
+enclosing one can claim it, so recursive branches parse without ambiguity.
+`statement`'s `simple_stmt | compound_stmt` choice is genuinely ambiguous when
+the next token is `if`: the grammar resolves it by fixed rule rather than
+lookahead — a statement beginning with `if` is always `compound_stmt`'s
+`if_stmt`; reaching the `if_expression` alternative of `expression` in
+statement-initial position requires enclosing parentheses.
+
+`tail_value`'s `match_stmt` and `if_tail_expression` alternatives reuse the
+ordinary statement suite grammar; no separate arm-suite production exists
+because a suite's last statement may already be a bare `expression`
+(`expression` is one alternative of `simple_stmt`). The distinction between a
+statement match/if and a tail-position match/if expression is therefore not
+grammatical but positional (is the match/if reached through `tail_value`?)
+and semantic (does every arm either diverge or end in that already-legal tail
+expression?) — see §7.1.
 
 The `type_arg = type | expression | .. expression` choice is resolved contextually from the
 declared generic parameter at the named type constructor. Parsing produces an

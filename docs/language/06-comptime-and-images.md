@@ -31,7 +31,10 @@ const RING_BYTES = ring_bytes(QDEPTH)
 Legality is checked at the comptime call boundary — the point where a comptime
 context calls a plain `fn` — against that function's complete transitive call
 closure. A violation is diagnosed with the offending call path from the
-boundary to the illegal operation.
+boundary to the illegal operation. Within one package, legality is inferred
+without any annotation. A comptime context may call another package's `pub
+fn` only when that function declares the verified `@comptime` marker (§2.1);
+crossing a package boundary without one is a build error naming the boundary.
 
 ## 2. Comptime legality: purity and determinism
 
@@ -58,6 +61,30 @@ atlas = comptime rasterize(font_source, sizes=[12, 16, 24])
 Comptime evaluation emulates the **target**, not the host. Integer widths,
 endianness, layout, alignment, and floating-point behavior are target semantics.
 Cross-compilation must produce the same result on different build hosts.
+
+### 2.1 Cross-package legality
+
+Comptime legality is inferred purely from a function's body when the calling
+comptime context and the callee share one package. A comptime context outside
+the callee's package may call its `pub fn` only if the declaring package
+attaches `@comptime` to that function:
+
+```wrela
+# declared in package `fontlib`
+@comptime
+pub fn rasterize(source: FontSource, sizes: [usize]) -> Atlas:
+    ...
+```
+
+`@comptime` is a contract the declaring package signs, not a promise the
+caller makes on its behalf. The compiler verifies it by checking the
+function's complete transitive call closure for comptime-legality — the same
+rules as this section — at the *declaring* package, not merely at each call
+site. A change inside `fontlib` that breaks that closure is diagnosed as a
+build error in `fontlib` itself, before it can silently break every
+downstream comptime caller. An unmarked `pub fn` remains comptime-legal for
+in-package callers; it is simply invisible to comptime contexts outside its
+own package.
 
 ## 3. Finite evaluation budget
 
@@ -127,7 +154,7 @@ Generic type arguments, generic constant arguments, `comptime if`, and
 attribute arguments are resolved before runtime code generation.
 
 ```wrela
-comptime if MODE == DriverMode.irq:
+comptime if MODE == DriverMode.Irq:
     bind_interrupts()
 comptime else:
     suppress_interrupts()
@@ -176,7 +203,7 @@ from drivers.virtio.block import BlkDriver, VirtioBlock
 from storage.service import DmaBlock, Storage
 from apps.notes import Notes
 
-const BLOCK_MODE: DriverMode = DriverMode.irq
+const BLOCK_MODE: DriverMode = DriverMode.Irq
 
 @image
 pub fn build() -> Image:
@@ -188,8 +215,8 @@ pub fn build() -> Image:
     block_device = img.device(
         VirtioBlock,
         transport=VirtioMmioTransport(base=0x0a00_0000, irq=0x30),
-        required_features=[VirtioFeature.flush],
-        optional_features=[VirtioFeature.ring_reset],
+        required_features=[VirtioFeature.Flush],
+        optional_features=[VirtioFeature.RingReset],
     )
 
     disk = img.driver(
@@ -220,7 +247,7 @@ pub fn build() -> Image:
 
     img.supervise(
         children=[disk, storage, notes],
-        strategy=Restart.one_for_one,
+        strategy=Restart.OneForOne,
         intensity=RestartIntensity(max=3, within=seconds(10)),
     )
 
@@ -285,7 +312,7 @@ provision contract.
 The builder normally derives these entries from `device=`, DMA/`iso` pool, and
 actor dependency arguments, but the resulting manifest is explicit and shown by
 tooling. A linear constructor argument without one recovery source is a build
-error. `one_for_all` and `rest_for_one` provisioning is ordered so all affected
+error. `OneForAll` and `RestForOne` provisioning is ordered so all affected
 owners tear down before any handle is redrawn; a capability or pool slot is
 never duplicated across actor epochs.
 
@@ -417,7 +444,12 @@ a declared hashed input.
 
 `@test` attaches to a plain `fn`. wrela has two test execution tiers: a
 comptime-tier test, whose closure may run in the build evaluator, and a
-runtime/image test, which runs as a generated image test (section 12.2).
+runtime/image test, which runs as a generated image test (section 12.2). Tier
+selection follows the closure's comptime-legality (section 2): a
+comptime-legal closure runs comptime-tier (section 12.1) unless the test
+declares `@test(runtime)`, which forces the runtime/image tier regardless of
+legality. Bare `@test` is unchanged: it runs comptime-tier whenever legality
+allows it.
 
 ### 12.1 Comptime-tier tests
 
@@ -450,9 +482,10 @@ fn add_combines_two_values():
 Discovery selects `@test fn` declarations from manifest-declared modules in
 the root package; it does not run `@test` declarations from dependencies. A
 selected test whose complete transitive call closure is comptime-legal
-(section 2) evaluates in the build evaluator against the ordinary resolved
-declarations — the compiler does not substitute a fixture, host callback, or
-second evaluator implementation. A test whose closure is not comptime-legal
+(section 2) and that does not declare `@test(runtime)` evaluates in the build
+evaluator against the ordinary resolved declarations — the compiler does not
+substitute a fixture, host callback, or second evaluator implementation. A
+test whose closure is not comptime-legal, or that declares `@test(runtime)`,
 is a runtime/image test instead (section 12.2).
 
 Evaluation is deterministic and left-to-right, uses only the sealed source
@@ -482,7 +515,8 @@ independent of the invoking workspace or output path.
 ### 12.2 Runtime and image test design
 
 A zero-argument `@test fn` or `@test async fn` whose closure is not
-comptime-legal is a runtime/image (integration) test. Discovery constructs a
+comptime-legal, or that declares `@test(runtime)`, is a runtime/image
+(integration) test. Discovery constructs a
 generated, bounded `@image` harness containing the selected tests under the
 same runtime/standard-library/target semantics as an ordinary image. Each
 test has a statically allocated activation, stack/frame, event, output, and

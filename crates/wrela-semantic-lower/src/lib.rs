@@ -10783,6 +10783,7 @@ mod contract_tests {
     const TARGET_DIGEST: Sha256Digest = Sha256Digest::from_bytes([3; 32]);
     const PARSED_CORE_IMAGE_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
     const PARSED_CORE_TIME_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/time.wr");
+    const PARSED_CORE_OPS_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/ops.wr");
     const PARSED_STDLIB_TIME_RUNTIME_SOURCE: &str =
         include_str!("../../../std/examples/stdlib-time-runtime/src/runtime/time_test.wr");
     const BOUNDED_ACTOR_SOURCE: &str = r#"module app
@@ -10951,6 +10952,13 @@ pub fn boot() -> Image:
                 digest: Sha256Digest::from_bytes([0xc2; 32]),
             })
             .expect("core image source");
+        let core_ops_file = sources
+            .add(SourceInput {
+                path: "core/ops.wr".to_owned(),
+                text: PARSED_CORE_OPS_SOURCE.to_owned(),
+                digest: Sha256Digest::from_bytes([0xc7; 32]),
+            })
+            .expect("core ops source");
         let core_time_file = sources
             .add(SourceInput {
                 path: "core/time.wr".to_owned(),
@@ -10967,9 +10975,14 @@ pub fn boot() -> Image:
             .expect("stdlib time runtime application source");
         let mut parsed_files = Vec::new();
         parsed_files
-            .try_reserve_exact(3)
-            .expect("three parsed stdlib time files");
-        for file in [core_image_file, core_time_file, application_file] {
+            .try_reserve_exact(4)
+            .expect("four parsed stdlib time files");
+        for file in [
+            core_image_file,
+            core_ops_file,
+            core_time_file,
+            application_file,
+        ] {
             let output = WrelaSyntaxParser::new()
                 .parse(
                     ParseRequest {
@@ -11017,6 +11030,13 @@ pub fn boot() -> Image:
                 core_image_file,
             )
             .expect("core image module");
+        packages
+            .add_module(
+                core,
+                ModulePath::new(["ops".to_owned()]).expect("core ops module path"),
+                core_ops_file,
+            )
+            .expect("core ops module");
         packages
             .add_module(
                 core,

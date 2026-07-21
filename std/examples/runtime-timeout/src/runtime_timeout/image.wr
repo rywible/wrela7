@@ -12,6 +12,9 @@ fn checked_arithmetic_fatal_times_out():
     one: u8 = 1
     value: u8 = checked_add(left=maximum, right=one)
     consume_u8(value=value)
+    guard: u32 = 0
+    while guard < 1:
+        guard += 1
     return
 
 fn checked_add(left: u8, right: u8) -> u8:

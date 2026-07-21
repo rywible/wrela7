@@ -110,7 +110,10 @@ Before emitting an artifact, the compiler MUST establish all of the following.
 Every successful build emits a machine-readable report and a readable summary.
 The report contains at least:
 
-- compiler, language revision, target, profile, and input hashes;
+- compiler, language revision, target, profile, and build identity — the
+  manifest and a content digest of every source input plus the toolchain
+  `core` component's version; revision 0.1 has no lockfile, so no locked
+  dependency closure is or can be part of this identity;
 - reachable module/declaration counts;
 - every monomorphized instantiation and resolved interface call summary;
 - static and peak memory by owner, region, and allocation site;
@@ -396,8 +399,8 @@ A conforming toolchain test suite includes, at minimum:
     capacity limits;
 16. wake-before-park, wake-during-park, duplicate-wake, and static task identity;
 17. async semantic loop checkpoints/cancellation, illegal live views/scopes,
-    proved `@uninterrupted` elision, and rejection of unbounded synchronous/ISR
-    loops without hidden suspension;
+    proved `@budget(bound=...)` checkpoint replacement, and rejection of
+    unbounded synchronous/ISR loops without hidden suspension;
 18. IRQ and poll builds from the same const-generic driver source;
 19. MSI-X multi-vector/virtio-MMIO demultiplexing, interrupt nesting bounds, and
     same-vector non-reentry;
@@ -426,15 +429,24 @@ A conforming toolchain test suite includes, at minimum:
     case-sensitive and case-insensitive hosts;
 32. state-sensitive frame overlay with cancellation/abandonment at every state;
 33. logical versus physical mailbox accounting and actor-chatter diagnostics;
-    and
 34. emitted section sizes and target-runtime reservations matching the report;
 35. compiler-evaluated `@test fn` quota/cache/failure reporting,
     generated integration-test image isolation and bounds, declared image-test
     scenarios, framed-event corruption/sequence/terminal rejection, boot/crash/
     timeout/protocol failure classification, and evidence that no runtime test
-    executes through a hosted target or ambient QEMU/firmware; and
+    executes through a hosted target or ambient QEMU/firmware;
 36. AArch64 PE/COFF machine/entry/subsystem inspection plus boot under the
-    digest-pinned versioned QEMU `virt`/UEFI runner profile.
+    digest-pinned versioned QEMU `virt`/UEFI runner profile;
+37. declaration-header continuation lexing: the suppressed physical newline
+    after a header's closing `)` only when the next nonblank line is indented
+    beyond the declaration and begins with `->`, plus rejection of every other
+    outside-delimiter continuation attempt;
+38. `##` doc-comment attachment to the immediately following module,
+    top-level declaration, or member, its exposure through tooling, and
+    non-attachment of ordinary `#` comments; and
+39. cleanup-dependency-graph node ordering and completion visibility under
+    the deterministic record/replay profile, mirroring chapter 07's
+    replay-visibility requirement for every other sealed boundary.
 
 The corrected virtio appliance in
 [`examples/virtio-storage.wr`](examples/virtio-storage.wr) is a required

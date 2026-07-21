@@ -24,10 +24,10 @@ Capabilities are linear. Their constructors are not source-visible. A numeric
 address, an imported type name, or a cast cannot create one.
 
 ```wrela
-@driver(device="virtio-blk")
+@driver
 pub struct BlkDriver:
     irq_regs: Mmio[VirtioIrqMmio]
-    queue: VirtQueue[128]
+    queue: VirtQueue[..128]
 
     init(mut self, take cap: DeviceCap[VirtioBlock],
                 take pool: DmaPool[BlockDma, 256.KiB]):
@@ -35,6 +35,11 @@ pub struct BlkDriver:
         self.irq_regs = claimed.map_partition(VirtioIrqMmio)
         ...
 ```
+
+`@driver` takes no device argument; it only marks the constructor eligible to
+receive capabilities. The bound device is named once, at the image binding
+(§13), by `img.driver(BlkDriver, device=blk_device)` — the single source of
+truth for that association.
 
 ## 2. Role checking
 
@@ -138,7 +143,7 @@ the fresh brand of a device-bound DMA payload pool and `T` has an `@dma`
 layout. `DmaBuffer` is not a second ownership type in revision 0.1. While the
 CPU owns the handle, code may read or mutate its payload through call-local
 access. Publishing it to a device consumes the handle. Source no longer has a
-readable buffer; instead it owns `IoReceipt[iso[P] T]`.
+readable buffer; instead it owns `Receipt[iso[P] T]`.
 
 ```wrela
 prepared = queue.prepare(
@@ -277,7 +282,19 @@ A custom queue library MAY replace the standard implementation only by
 implementing the sealed target ordering interface. It cannot bypass the DMA
 ownership transitions.
 
-## 8. Untrusted device values
+## 8. Evidence wrappers
+
+An **evidence wrapper** is a sealed generic type that gates a
+capability-relevant use of a value until an explicit check clears it. It adds
+no field beyond what the check requires; narrowing either succeeds into a
+plain value or fails with a typed error, and the wrapper itself grants no
+capability. wrela has two instances of this family: `Untrusted[T]`, defined
+below, gates a value coming in from outside the trust boundary until it is
+checked-narrowed; `Validated[F, T]` (defined in
+[Standard library contracts](10-standard-library-contracts.md)) gates
+downstream use of a value that has passed a declared format's parser. A build
+report or conformance ledger that counts evidence wrappers counts these two as
+one family.
 
 Device **protocol/control** values that can influence an index, length,
 allocation, completion identity, or control-flow bound have type
@@ -446,7 +463,7 @@ ISR, actor, task, or effect graph:
 
 ```wrela
 blk = img.driver(
-    BlkDriver[DriverMode.irq],
+    BlkDriver[DriverMode.Irq],
     device=blk_device,
 )
 ```
@@ -529,16 +546,16 @@ unknown outcome. Recovery reports this explicitly:
 
 ```wrela
 enum CompletionOutcome:
-    completed
-    not_completed
-    unknown
+    Completed
+    NotCompleted
+    Unknown
 
 struct IoTimeout:
     outcome: CompletionOutcome
 ```
 
-Source MUST NOT automatically retry a non-idempotent operation with `unknown`
-outcome.
+Source MUST NOT automatically retry a non-idempotent operation with
+`CompletionOutcome.Unknown`.
 
 No arbitrary source async destructor is introduced: the canceled source frame
 does not resume or execute cleanup code after handing off the receipt. Recovery

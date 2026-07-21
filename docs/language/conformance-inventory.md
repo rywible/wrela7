@@ -62,23 +62,25 @@ and versioned boundary fixtures are described in
 
 | Spec | Contract inventory | Layers/evidence | Status / delivery owner |
 |---|---|---|---|
-| 2.1 | UTF-8/Unicode 16 XID+NFC/security, comments, four-space blocks, continuations, literals/escapes/interpolation and bounded formatting. | Syntax and formatter crates plus `tests/contracts/syntax/v3`; Unicode/security and full literal corpus not complete. | partial — req-02,13 |
+| 2.1 | UTF-8/Unicode 16 XID+NFC/security, `#` comments and `##` doc-comment attachment to the following declaration, four-space blocks, header continuations, literals/escapes/interpolation (`"""` reserved as a syntax error) and bounded formatting. | Syntax and formatter crates plus `tests/contracts/syntax/v3`; Unicode/security and full literal corpus not complete; `##` doc comments and the `"""` reservation are not implemented. | partial — req-02,13 |
 | 2.2 | Module declaration/path identity, absolute imports/re-exports, visibility, SCC imports and semantic-cycle diagnostics. | Package/source/HIR pipeline exists; complete cycle/visibility matrix unproven. | partial — req-02,09 |
-| 2.2.1 | Exact schema-1 manifest/lock; modules derived by sorted `source_root` walk with verified module-declaration bijection (no `[[module]]` list); explicit dependencies/profiles/images/tests; default profile keys except `name`/`mode`; canonical acquisition and sole target. | `wrela-package*`, `tests/contracts/package/v1`. | partial — req-09,16 |
+| 2.2.1 | Exact schema-1 manifest with no lockfile (dependency graph fully determined by `wrela.toml` plus the toolchain-shipped `core` component); modules derived by sorted `source_root` walk with verified module-declaration bijection (no `[[module]]` list); explicit dependencies/profiles/images/tests; default profile keys except `name`/`mode`; canonical acquisition and sole target. | `wrela-package*`, `tests/contracts/package/v1`. Divergence: the current loader still consumes/regenerates `wrela.lock` (`wrela-package-loader`, `std/examples/*/wrela.lock`), which the updated §2.1 contract removes. | partial — req-09,16 |
+| 2.2.2 | Fixed shadowable prelude — `Option`, `Some`, `None`, `Result`, `Ok`, `Err`, `panic` — resolving without import via ordinary name resolution; every other name explicitly imported; scalar spellings builtin, not prelude bindings. | Not implemented; existing verticals resolve these names through explicit `std` declarations, not an ambient prelude scope. | gap — req-02,11 |
 | 2.3, 2.3.1 | All declarations and the three function colors, including phase-neutral `fn` whose comptime legality is checked at each comptime call boundary; explicit async/task outcomes and prefix `await`. | Parser models much of the surface; general executable functions/async absent. | partial — req-02,04 |
-| 2.3.2 | Struct construction/privacy/copy, the `linear` modifier as the sole uniquely-owned-aggregate form, optional `init` with partial-initialization/fallible-rollback, `implements`, actor-root structs, generative brands and zero-sized values (unifies the former separate class declaration). | Flat nongeneric structs execute in bounded subsets: `runtime_flat_structure_vertical.rs`, `comptime_aggregate_vertical.rs`; the `linear`/`init`/actor-root obligations folded in from the former class form have no general runtime. | partial — req-02,05 |
-| 2.3.3 | Closed enums, exhaustive guarded patterns, leading-dot variant patterns with bare identifiers always binding, alternatives, `is`, payload access, `.variant` expression shorthand and fixed-array patterns. | Local 1–256 variant copy-scalar subset; `runtime_result_vertical.rs`. | partial — req-02,06 |
+| 2.3.2 | Struct construction/privacy/copy, the `linear` modifier as the sole uniquely-owned-aggregate form, the `copy struct` implicit-copy POD modifier (legal only for recursively scalar/copy-struct fields; explicit `copy` on one is a redundancy lint), optional `init` with partial-initialization/fallible-rollback, `implements`, actor-root structs, generative brands and zero-sized values (unifies the former separate class declaration). | Flat nongeneric structs execute in bounded subsets: `runtime_flat_structure_vertical.rs`, `comptime_aggregate_vertical.rs`; the `linear`/`init`/actor-root obligations folded in from the former class form have no general runtime; the `copy struct` modifier is not implemented. | partial — req-02,05 |
+| 2.3.3 | Closed enums, exhaustive guarded patterns, leading-dot variant patterns with bare identifiers always binding, CamelCase variant constructors (lint, not formatter, flags lowercase), alternatives, `is`, payload access, `.variant` expression shorthand, tail-position value arms per §7.1, and fixed-array patterns. | Local 1–256 variant copy-scalar subset; `runtime_result_vertical.rs`. | partial — req-02,06 |
 | 2.3.4 | Static interfaces, orphan/non-overlap/coherence, direct dispatch, operators and unique `From` propagation. | Concrete non-generic `interface`/`impl I for T` subset with `core.ops` operator desugaring to direct impl calls: `analyze_operator_interface_binary`/`evaluate_operator_interface_binary` in `wrela-sema`, exercised through `core.time` Duration impls by `stdlib_time_scalar.rs`, `check_cli.rs`, and `local_check` tests. Generic interfaces/bounds, `implements`-clause bodies, method-call syntax, `Eq` impls, and native/runtime execution of desugared impl calls remain absent (`stdlib_time_runtime_vertical.rs` still compiles a pre-operator inline source). | partial — req-02,06,09 |
 | 2.3.5 | Projection carrier/implicit-conservative-provenance and scope enter/abort/exit; scopes cannot hold state across `await`. | Surface/model only. | gap — req-05 |
-| 2.4, 2.4.1 | Exact read/mut/take call markers, place operands, binding/evaluation order and explicit receiver effects. | Scalar/aggregate call fragments; general access analysis absent. | partial — req-02,05 |
+| 2.3.6 | Closed `deriving(Eq, Format, From)` clause on struct/enum declarations; a name outside the compiler-known list is a build error; `From` legal only for a single payload-carrying variant; generated semantics per chapter 10 §14. | Not implemented. | gap — req-02,11 |
+| 2.4, 2.4.1 | Exact read/mut/take call markers, declaration-owned argument labels (label-required default, `_` declares positional-only, exactly one legal spelling per call site), read-parameter-as-loan (never a copy), place operands, binding/evaluation order and explicit receiver effects. | Scalar/aggregate call fragments; general access analysis absent; label enforcement is not implemented. | partial — req-02,05 |
 | 2.5.1 | Primitive integer/float/unit/never semantics, checked/wrapping arithmetic/conversions, canonical NaN and target widths. | Integer verticals: `checked_shift_vertical.rs`, `compound_assignment_vertical.rs`; float completeness absent. | partial — req-02 |
-| 2.5.2 | Tuples, fixed arrays, bounded collections/strings/bytes, Static/Option/Result/Actor/iso/view/capability legality. | Flat structures and restricted `Result[S,S]`; general types absent. | partial — req-02,06 |
-| 2.5.3 | Type/const/brand generics, inference and monomorphization without runtime generics. | Restricted core Result authentication only. | partial — req-09 |
+| 2.5.2 | Tuples, fixed arrays, bounded collections/strings/bytes with the `..N` bounded-occupancy spelling (plain `N` spells exact extent), Static/Option/Result/Actor/iso/view/capability legality. | Flat structures and restricted `Result[S,S]`; general types absent. | partial — req-02,06 |
+| 2.5.3 | Type/const generics, inference and monomorphization without runtime generics; region brands are compiler-managed with no surface `region` parameter in `generic_params`. | Restricted core Result authentication only. | partial — req-09 |
 | 2.6 | Let/inferred bindings, move/copy, definite initialization, assignment and partial-field state on all CFG edges. | Locals/branches in selected verticals only. | partial — req-02,05 |
-| 2.7 | If/match/for/while/loop, return/break/continue/pass, bounded sync loops and async checkpoints. | `elif_vertical.rs` and `bounded_while_vertical.rs` prove the canonical unsigned finite `while local < literal` slice with mutation, nested `if`, `continue`, `break`, cyclic SSA, and machine CFG; `for`, general `loop`, non-canonical bounds, cleanup edges, and async checkpoints remain absent. | partial — req-02,04 |
-| 2.8 | Complete precedence/evaluation/place/call/assignment/temporary teardown/arithmetic contract. | Several scalar expression verticals; general expression and teardown execution absent. | partial — req-02,05 |
+| 2.7, 2.7.1 | If/match/for/while/loop, return/break/continue/pass, the closed compiler-known iteration set (ranges, fixed arrays, standard-container operations; no user-defined iteration protocol), bounded sync loops, async checkpoints, and `match`/`if` as tail-position block expressions whose arms each diverge or produce one agreeing value. | `elif_vertical.rs` and `bounded_while_vertical.rs` prove the canonical unsigned finite `while local < literal` slice with mutation, nested `if`, `continue`, `break`, cyclic SSA, and machine CFG; `for`, general `loop`, non-canonical bounds, cleanup edges, async checkpoints, and tail-position match/if expressions remain absent. | partial — req-02,04 |
+| 2.8 | Complete precedence/evaluation/place/call/assignment/temporary teardown/arithmetic contract, including the loosest-binding inline `if`/`elif`/`else` expression with mandatory `else` and parenthesization rules. | Several scalar expression verticals; general expression and teardown execution absent; the inline conditional expression is not implemented. | partial — req-02,05 |
 | 2.9 | Non-escaping/escaping closure capture modes, regions, bounds and async legality. | Surface only. | gap — req-02,05 |
-| 2.10 | Complete attribute legality/phase/effects, including image/actor/task/hardware/layout/test/budget attributes. | Test and selected runtime attributes only. | partial — req-08,09,13 |
+| 2.10 | Complete attribute legality/phase/effects, including image/actor/task/hardware/layout/test/budget attributes, the verified cross-package `@comptime` marker, `@test(runtime)` tier forcing, and statement-position loop `@budget` (which absorbs the former `@uninterrupted`). | Test and selected runtime attributes only; `@comptime`, `@test(runtime)`, and statement-position `@budget` are not implemented. | partial — req-08,09,13 |
 | 2.11 | Normative grammar accepts all legal forms and rejects all illegal productions with canonical formatting. | Syntax v3 fixtures exist; chapter-wide corpus incomplete. | partial — req-13,14 |
 
 ## Chapter 03 — Values, views, and regions
@@ -86,37 +88,38 @@ and versioned boundary fixtures are described in
 | Spec | Contract inventory | Layers/evidence | Status / delivery owner |
 |---|---|---|---|
 | 3.1–3.3 | Read/mut/take semantics, structural copy/linear classes and path-based exclusivity. | Restricted scalar/flat aggregate ownership only. | partial — req-05 |
-| 3.4–3.4.4 | Lexical second-class views, projection provenance/carriers/disjointness, no escape/suspension and iterator access. | Parsed/modelled only. | gap — req-05 |
+| 3.4–3.4.6 | Ephemeral-type baseline (produced only by specific operations, consumed immediately, never stored/returned/captured/sent/held across suspension or checkpoint), lexical second-class views, projection carriers, implicit conservative provenance with named provenance diagnostics, disjointness, no escape/suspension and iterator access. | Parsed/modelled only. | gap — req-05 |
 | 3.5 | Generative branded `iso`, durable/request brands, actor transfer and ownership-conditioned recovery. | No general iso/pool runtime. | gap — req-05,07 |
 | 3.6–3.6.5 | Image/task/call/request/iso region classes and exact lifetime/slot/reset rules. | Frame/layout data structures exist; general inference/runtime absent. | gap — req-05 |
 | 3.7–3.9 | Whole-image region inference, reported promotion/budgets and bounded allocation/capacity errors. | Report/build models only. | gap — req-05,09 |
-| 3.10 | SlotMap graph model with fresh IDs, generation retirement, checked lexical access. | Not implemented end to end. | gap — req-06 |
+| 3.10 | `SlotMap[T, ..N]` graph model with fresh non-wrapping instance IDs, `Key` as a `copy struct` over `(map_id, index, generation)`, generation retirement, checked lexical access. | Not implemented end to end. | gap — req-06 |
 | 3.11 | Universal `with`, abort/exit, deterministic cleanup dependency graph and all normal/abnormal teardown paths. | Not implemented end to end. | gap — req-05,10 |
 
 ## Chapter 04 — Actors and async
 
 | Spec | Contract inventory | Layers/evidence | Status / delivery owner |
 |---|---|---|---|
-| 4.1–4.2 | Actor roots/typed handles and legal fixed-layout payloads; handles remain image-wired. | Image-wired typed handles and unit payloads: `actor_flow_vertical.rs`, `actor_one_way_send_vertical.rs`, `actor_cross_send_vertical.rs`. Typed call payloads remain absent. | partial — req-03 |
+| 4.1–4.2 | Actor roots/typed handles and legal fixed-layout payloads; handles remain image-wired; actor-associated `brand` aliases (`Owner.Brand`) bound exactly once by image construction. | Image-wired typed handles and unit payloads: `actor_flow_vertical.rs`, `actor_one_way_send_vertical.rs`, `actor_cross_send_vertical.rs`. Typed call payloads and brand aliases remain absent. | partial — req-03 |
 | 4.3, 4.3.1 | Non-reentrant turns and concrete unified wait graph including resources/producers; driver handlers never self-wait. | General recurring turns and wait graph absent. | gap — req-03,07 |
 | 4.3.2 | One-way `send`/`try send`, reserve-before-evaluation, arm-sensitive ownership, restart capacity/FIFO. | Bounded first slice of self-send: `actor_one_way_send_vertical.rs` and diagnostics test. Cross-actor unit send: `actor_cross_send_vertical.rs`, proven end-to-end through native AArch64 COFF emission; the cross-actor edge is exactly one image-wired `@app`→`@service` unit send via `service.handle()`. Typed payloads, replies, recurrence absent. | partial — req-03,07 |
 | 4.3.3–4.3.4 | Observable admission/FIFO/turn/replay semantics and exactly-once typed replies/peer failures/take outcomes. | Initial actor flow model; no recurring failure/runtime proof. | partial — req-03,07,10 |
+| 4.3.5 | Single outcome taxonomy defined once: sealed `AsyncExit[E]`, composing `ActorCallError[E]` (`Exit`/`PeerFailed`/`NotAdmitted`), and ephemeral `AdmissionResult` sharing one `AdmissionError`; no other section restates the variants. | Not implemented; no outcome-carrier type exists in any layer. | gap — req-03,04,07 |
 | 4.4 | Derived finite mailbox/turn bounds and logical-vs-physical reporting. | Build models only. | gap — req-03,09 |
 | 4.5–4.5.1 | Ahead-of-time bounded async machines, static tasks, explicit exits, recursion/frame/stack bounds. | General async lowering absent. | gap — req-04 |
 | 4.6–4.7 | Suspension legality, consuming awaitables, completions, idempotent wake and mask-arm-recheck park. | Runtime timeout slice is not general async: `runtime_timeout_vertical.rs`. | gap — req-04 |
 | 4.8–4.10 | Normative deterministic scheduler, priorities/fairness proof, budgets/checkpoints and inherited deadlines. | No complete runtime scheduler. | gap — req-04 |
 | 4.11 | Bounded nursery/structured task creation and teardown. | Not implemented. | gap — req-07 |
-| 4.12–4.12.3 | Fresh request lineage, atomic child registration, cancellation cleanup, permit backpressure and sealed race/select. | Not implemented. | gap — req-07 |
-| 4.13–4.14 | Device receipt throughput accounting and IRQ/poll idle behavior. | Not implemented end to end. | gap — req-07,08 |
-| 4.15 | Single-core APIs remain future-multicore-compatible without providing multicore semantics. | Design constraint; multicore itself is excluded. | partial — req-18 |
+| 4.12–4.12.3 | Ambient request lineage implicitly carried by every `async fn` (no signature threading; explicit `request=` override and `@detached` opt-out; tooling displays the inferred lineage), fresh lineage/brand minting, atomic child registration, cancellation cleanup, permit backpressure and sealed race/select. | Not implemented. | gap — req-07 |
+| 4.13–4.14 | Single merged sealed `Receipt[P]` state machine (`Submitted`/`Committed`/`Resolved`/`Recovery`, replacing the former `TransferReceipt`/`IoReceipt` split) with the `@receipt_handoff` proxy contract, device receipt throughput accounting and IRQ/poll idle behavior; service-level interleaving mechanisms are deliberately unspecified (see exclusion ledger), with the required head-of-line diagnostic shape. | Not implemented end to end. | gap — req-07,08 |
+| 4.15 | Single-core APIs remain future-multicore-compatible without providing multicore semantics; an explicitly tracked bet (chapter 01 §8; design-decisions bets register), not a guarantee. | Design constraint; multicore itself is excluded. | partial — req-18 |
 
 ## Chapter 05 — Hardware safety
 
 | Spec | Contract inventory | Layers/evidence | Status / delivery owner |
 |---|---|---|---|
-| 5.1–5.3 | Manifest-minted linear authority, role/effect checking and nonoverlapping typed MMIO with volatile ordering. | Target/runtime ABI models only. | gap — req-08 |
+| 5.1–5.3 | Manifest-minted linear authority (`@driver` takes no device argument; the device is named once at the image binding), role/effect checking and nonoverlapping typed MMIO with volatile ordering. | Target/runtime ABI models only. | gap — req-08 |
 | 5.4–5.5 | Exact DMA/wire layout, transfer vs shared-control memory, pool provenance/coherency/confinement. | Layout structures exist; ownership protocol execution absent. | gap — req-08 |
-| 5.6–5.8 | Complete queue reservation, nonwrapping IDs/epochs, protocol ordering and checked Untrusted control values. | Not implemented end to end. | gap — req-08 |
+| 5.6–5.8 | Complete queue reservation, nonwrapping IDs/epochs, protocol ordering and the evidence-wrapper family — `Untrusted[T]` (taint-in) with `Validated[F, T]` (proof-out, chapter 10) counted as one family — gating checked control values. | Not implemented end to end. | gap — req-08 |
 | 5.9–5.11 | Exclusive vector topology/GICv3 route, restricted ISR effects, InterruptCell ordering/masking and stack bounds. | Runtime ABI cross-contract test: `crates/wrela-runtime-abi/tests/cross_contract.rs`; source/effect/runtime completeness absent. | partial — req-08 |
 | 5.12–5.14 | Bounded bottom halves, const-generic IRQ/poll/hybrid specialization and typed virtio protocol states. | Not implemented end to end. | gap — req-08 |
 | 5.15 | Cancellation transfers receipts to bounded recovery, resets/quiesces, quarantines DMA and reports unknown outcomes. | Not implemented end to end. | gap — req-08,10 |
@@ -126,15 +129,15 @@ and versioned boundary fixtures are described in
 
 | Spec | Contract inventory | Layers/evidence | Status / delivery owner |
 |---|---|---|---|
-| 6.1–6.5 | Typed target-emulated comptime, deterministic/no ambient I/O, finite quotas, safe phase crossing and nonobservable Secret taint. | Bounded scalar/flat-struct evaluator vertical; Secret/general value surface absent. `comptime_unit_vertical.rs`, `comptime_aggregate_vertical.rs`. | partial — req-09 |
+| 6.1–6.5 | Typed target-emulated comptime, deterministic/no ambient I/O, finite quotas, safe phase crossing and nonobservable Secret taint; cross-package comptime calls require the `@comptime` marker, verified against the declaring package's transitive closure. | Bounded scalar/flat-struct evaluator vertical; Secret/general value surface and the `@comptime` marker absent. `comptime_unit_vertical.rs`, `comptime_aggregate_vertical.rs`. | partial — req-09 |
 | 6.6–6.7 | Complete specialization, direct closed dispatch, graph-changing const configuration and phased hygienic attributes. | Restricted specialization only. | partial — req-09 |
 | 6.8–6.9 | Unique typed image construction, graph roles/order/brands/restart provisions and exclusive capability minting. | Image/build models exist; complete source construction/runtime boot absent. | partial — req-09 |
 | 6.10 phases 1–3 | Parse/collect, resolve/type comptime, evaluate image root under quotas. | Implemented for bounded subsets. | partial — req-09 |
 | 6.10 phases 4–6 | Fixed-point specialized checking, graph invariant closure and exact resource inference. | Models/subsets only. | gap — req-09 |
 | 6.10 phases 7–9 | Seal SW, optimize verified FW, lower MW/layout/report, read-only assertions, emit/link/reconcile. | Pipeline exists for selected verticals; general semantic and report reconciliation absent. | partial — req-09,15 |
 | 6.11 | Content-addressed comptime caching with identical diagnostics and no unstable host input. | Cache tests: `artifact_cache_reuse.rs`, `change_set_reuse.rs`, `incremental_session.rs`; general evaluator equivalence incomplete. | partial — req-09,17 |
-| 6.12.1 | Genuine bounded comptime-tier `@test fn`, exact-limit/cancellation diagnostics and canonical CLI reports for the documented subset. | `comptime_unit_vertical.rs`, CLI/test-model infrastructure. Implemented subset: a non-generic, module-level, zero-argument `@test fn` returning `unit` that calls scalar/flat-nongeneric-struct `fn`s using typed/inferred locals, scalar-field projection, named construction, flat-aggregate move/copy, branch-definite-init, returns, nested calls, integer/boolean operations, comparisons, and `comptime assert`; excludes linear/actor-root construction, receiver/associated methods, generics, non-flat aggregates, floating point, `Result`/`Ok`/`Err`, and generated runtime-image execution. | partial — section itself explicitly narrows delivery; req-13 expands it |
-| 6.12.2 | Generated bounded runtime/image test harness, protocol and pinned target execution. | Test protocol/runner and QEMU smoke exist; general source tests absent. | partial — req-13,14 |
+| 6.12.1 | Genuine bounded comptime-tier `@test fn` with tier selection by comptime-legality (`@test(runtime)` forces the runtime tier), exact-limit/cancellation diagnostics and canonical CLI reports for the documented subset. | `comptime_unit_vertical.rs`, CLI/test-model infrastructure. Implemented subset: a non-generic, module-level, zero-argument `@test fn` returning `unit` that calls scalar/flat-nongeneric-struct `fn`s using typed/inferred locals, scalar-field projection, named construction, flat-aggregate move/copy, branch-definite-init, returns, nested calls, integer/boolean operations, comparisons, and `comptime assert`; excludes linear/actor-root construction, receiver/associated methods, generics, non-flat aggregates, floating point, `Result`/`Ok`/`Err`, `@test(runtime)` tier forcing, and generated runtime-image execution. | partial — section itself explicitly narrows delivery; req-13 expands it |
+| 6.12.2 | Generated bounded runtime/image test harness (including tests routed there by `@test(runtime)`), protocol and pinned target execution. | Test protocol/runner and QEMU smoke exist; general source tests and `@test(runtime)` routing absent. | partial — req-13,14 |
 | 6.13 | Deterministic ARM64 PE32+ EFI, exact UEFI transition/runtime entry and artifact/report match. | Native/link/test runner slices exist; complete current-tuple proof absent. | partial — req-15 |
 | 6.14 | Atomic compiler/target/library contract and exact target rejection. | Toolchain/target crates and contract fixtures. | partial — req-15,16 |
 
@@ -145,7 +148,7 @@ and versioned boundary fixtures are described in
 | 7.1–7.4 | Exact failure taxonomy, Result/task/async values, uncatchable abandonment and build-time assertions. | Restricted Result and assertions only. | partial — req-06,10 |
 | 7.5–7.7 | Complete supervision tree, bounded restart intensity, zero-allocation teardown/provisioning and partial-state recovery. | Build models only; runtime absent. | gap — req-10 |
 | 7.8 | Reset outcome precision and sibling invalidation. | Not implemented. | gap — req-10 |
-| 7.9–7.9.2 | Optional advertised record/replay logs every nondeterministic input/injection/output, bounded policy and divergence; time-travel is tooling over it. | No complete record/replay profile. | gap — req-10 |
+| 7.9–7.9.3 | Optional advertised record/replay logs every nondeterministic input/injection/output, bounded policy and divergence; time-travel is tooling over it; cleanup-dependency-graph states (child registration, quarantine, pending/ready cleanup nodes, receipt/recovery transfer, mailbox reopening) exposed as first-class replay events for recovery debugging. | No complete record/replay profile. | gap — req-10 |
 | 7.10 | Sealed A/B deployment and versioned persistent migrations; no hot/runtime installation. | Distribution/update proof absent. | gap — req-10,16 |
 | 7.11 | Required executable checks/proofs without claiming a general user proof language. | Individual validators exist; complete protocol proofs absent. | partial — req-08,09 |
 
@@ -158,7 +161,7 @@ and versioned boundary fixtures are described in
 | 8.2.3 | Complete actor/async capacity, ordering, wait, receipt, request, checkpoint and priority proof. | Initial actor send slice only. | gap — req-03,04,07 |
 | 8.2.4 | Complete hardware provenance/layout/queue/untrusted/cancellation proof. | Missing general implementation. | gap — req-08 |
 | 8.2.5 | Concrete specialization, verified WIR transformations, exact placement and emitted/report reconciliation. | Selected verticals only. | partial — req-09,15 |
-| 8.3 | Machine/readable report contains every listed compiler/input/reachability/memory/actor/async/device/recovery/artifact fact. | `wrela-image-report` exists; required schema is incomplete. | gap — req-09,13 |
+| 8.3 | Machine/readable report contains every listed compiler/input/reachability/memory/actor/async/device/recovery/artifact fact; build identity is manifest plus source digests plus the toolchain `core` component version, with no lockfile closure. | `wrela-image-report` exists; required schema is incomplete. | gap — req-09,13 |
 | 8.4–8.4.9 | Stable source diagnostics with facts/why paths/repairs for every illustrated category. | Diagnostics infrastructure and selected snapshots; full category coverage absent. | partial — req-13 |
 | 8.5 | Tooling exposes all inferred effects and advisory performance shapes. | Partial reports; no complete expanded-effects surface. | gap — req-13 |
 | 8.6–8.7 | Byte reproducibility and immutable safety rules across exact build profiles. | Determinism tests exist for slices; full artifacts/distribution unproven. | partial — req-17 |
@@ -167,6 +170,7 @@ and versioned boundary fixtures are described in
 | 8.8 items 18–25 | IRQ/poll/vector/ISR/virtio/DMA/reset/wire corpus. | Runtime ABI contract only. | gap — req-14 |
 | 8.8 items 26–33 | Comptime/secret/supervision/UEFI/replay/optimization/Unicode/frame/mailbox corpus. | Comptime/cache and some native tests only. | gap — req-14 |
 | 8.8 items 34–36 | Report reconciliation, all test modes/protocol failures, ARM64 COFF inspection and pinned QEMU boot. | QEMU smoke/native lanes exist but complete feature corpus absent. | partial — req-14,15 |
+| 8.8 items 37–39 | Declaration-header continuation lexing, `##` doc-comment attachment/exposure (and `#` non-attachment), and cleanup-dependency-graph replay-visibility corpus. | Not implemented. | gap — req-13,14 |
 | 8.9 | Performance claims require named measured compiler/target/workload and never substitute for semantic proof. | Documentation constraint. | verified — req-13 maintains |
 | 8.10 | Conformance requires every applicable chapter 01–10 obligation, not modeled/parsed support. | This inventory records current nonconformance. | verified — documentation |
 
@@ -189,17 +193,21 @@ and versioned boundary fixtures are described in
 | Spec | Contract inventory | Layers/evidence | Status / delivery owner |
 |---|---|---|---|
 | 10.1 | Alternative implementations preserve exact typed effects/bounds/events/diagnostics with no hidden behavior. | Architecture policy; complete library absent. | partial — req-11 |
-| 10.2 | General Option/Result payload ownership, projection carriers, `?`, unique From and mut Option take. | Restricted `Result[S,S]` only; `runtime_result_vertical.rs`, `std/core/result.wr`. | partial — req-06 |
-| 10.3 | Image-wired Actor/Static and exactly-once typed calls/admission/peer failure/ownership-conditioned outcomes. | Unit send across actors: `actor_cross_send_vertical.rs`. Typed payloads, replies, peer failure, ownership-conditioned outcomes absent. | partial — req-03,07,11 |
-| 10.4 | Completion, transfer/IO receipts, receipt handoff and request lineage implement strict exactly-once recovery. | Not implemented end to end. | gap — req-07,11 |
-| 10.5 | Complete phase-neutral Duration/Instant/now semantics — one surface, not a runtime/comptime twin pair — including record/replay and checked APIs. | Phase-neutral operator-based Duration surface: `std/wrela-core-0.1/src/time.wr` (constructors, `as_nanoseconds`, `scale`, `min`/`max`/`clamp`, `Add`/`Sub`/`Ord` impls; no twins), proven by `stdlib_time_scalar.rs`; `Instant`, `now`, record/replay, and checked-`Result` forms remain absent. | partial — req-11 |
-| 10.6 | Static task identities, explicit AsyncExit, idempotent wake and supervised TaskFailed. | Not implemented generally. | gap — req-04,11 |
-| 10.7 | Bounded nurseries/joins and capacity-proved race with complete loser teardown. | Not implemented. | gap — req-07,11 |
-| 10.8 | Fixed arrays/List/SlotMap exact capacities, ownership iteration, fresh IDs/generations and exhaustion. | Not implemented generally. | gap — req-06,11 |
-| 10.9–10.9.1 | Bounded formatting/Secret/panic plus validated external formats and exact wire decoding. | Not implemented generally. | gap — req-11 |
-| 10.10 | InterruptCell/MMIO/DMA/VirtQueue sealed contracts preserve authority/order/ownership/recovery. | Runtime ABI fragments only. | gap — req-08,11 |
-| 10.11 | Image/request/nursery/pool semantic intrinsics preserve exact graph/generativity/cleanup contracts. | Build models only. | gap — req-09,11 |
-| 10.12 | `core.ops` operator interfaces (`Add`/`Sub`/`Ord` shapes, read operands, exact desugaring incl. swapped-mapping comparisons with left-to-right evaluation). | `std/wrela-core-0.1/src/ops.wr` and the Duration impls in `time.wr`; comptime-tier operator evaluation proven by `duration_scalar_test.wr` through `stdlib_time_scalar.rs`; native/runtime execution of desugared operator calls and the `Eq`/`Mul` peers remain absent. | partial — req-11 |
+| 10.2 | Fixed shadowable prelude (`Option`, `Some`, `None`, `Result`, `Ok`, `Err`, `panic`) resolving without import; every other standard name explicitly imported; the set cannot grow without a language revision. | Not implemented; see row 2.2.2. | gap — req-02,11 |
+| 10.3 | General Option/Result payload ownership, projection carriers, `?`, unique From and mut Option take. | Restricted `Result[S,S]` only; `runtime_result_vertical.rs`, `std/core/result.wr`. | partial — req-06 |
+| 10.4 | Image-wired Actor/Static, exactly-once typed calls/admission/peer failure/ownership-conditioned outcomes composed through the `ActorCallError`/`AdmissionResult` taxonomy, and the `iso[Owner.Brand]` alias spelling. | Unit send across actors: `actor_cross_send_vertical.rs`. Typed payloads, replies, peer failure, ownership-conditioned outcomes, and brand-alias spelling absent. | partial — req-03,07,11 |
+| 10.5 | Completion, the single merged sealed `Receipt[P]` state machine with the `@receipt_handoff` calling convention, and ambient `RequestContext[R]` lineage (override-only `request=`; `@detached` opt-out) implement strict exactly-once recovery. | Not implemented end to end. | gap — req-07,11 |
+| 10.6 | Complete phase-neutral Duration/Instant/now semantics — one surface, not a runtime/comptime twin pair — with the `as_nanoseconds` method accessor, including record/replay and checked APIs. | Phase-neutral operator-based Duration surface: `std/wrela-core-0.1/src/time.wr` (constructors, `as_nanoseconds`, `scale`, `min`/`max`/`clamp`, `Add`/`Sub`/`Ord` impls; no twins), proven by `stdlib_time_scalar.rs`; `Instant`, `now`, record/replay, and checked-`Result` forms remain absent. | partial — req-11 |
+| 10.7 | Static task identities, explicit AsyncExit, idempotent wake and supervised TaskFailed. | Not implemented generally. | gap — req-04,11 |
+| 10.8 | Bounded nurseries/joins and capacity-proved race with complete loser teardown. | Not implemented. | gap — req-07,11 |
+| 10.9, 10.9.1 | Fixed arrays/List/SlotMap exact capacities, ownership iteration, fresh IDs/generations, exhaustion, and the closed builtin iteration operations (`items`/`items_mut`, `keys`/`values`/`pairs` and `_mut` forms with at most one live element view; no user-defined iteration protocol). | Not implemented generally. | gap — req-06,11 |
+| 10.10–10.10.1 | Bounded formatting/Secret/panic plus validated external formats — `Validated[F, T]` as the proof-out instance of the evidence-wrapper family — and exact wire decoding. | Not implemented generally. | gap — req-11 |
+| 10.11 | InterruptCell/MMIO/DMA/VirtQueue sealed contracts preserve authority/order/ownership/recovery. | Runtime ABI fragments only. | gap — req-08,11 |
+| 10.12 | Image/request/nursery/pool semantic intrinsics preserve exact graph/generativity/cleanup contracts. | Build models only. | gap — req-09,11 |
+| 10.13 | `core.ops` operator interfaces (`Add`/`Sub`/`Ord` shapes, read operands, exact desugaring incl. swapped-mapping comparisons with left-to-right evaluation). | `std/wrela-core-0.1/src/ops.wr` and the Duration impls in `time.wr`; comptime-tier operator evaluation proven by `duration_scalar_test.wr` through `stdlib_time_scalar.rs`; native/runtime execution of desugared operator calls and the `Eq`/`Mul` peers remain absent. | partial — req-11 |
+| 10.14 | Deriving contracts: `deriving(Eq)` structural equality for non-copy types, `deriving(Format)` bounded formatting, single-variant/single-field `deriving(From)`; hand-implementation permitted under the same obligations. | Not implemented. | gap — req-11 |
+| 10.15 | `*_proven` naming convention: every statically-proved variant of a possibly-failing operation carries the suffix and requires its build-time proof context. | Not implemented; no `_proven` API exists in `std/wrela-core-0.1`. | gap — req-11 |
+| 10.16 | API naming: CamelCase variant constructors, snake_case functions/methods, `..N` bounded-occupancy versus plain-`N` exact-extent spelling, and `_`-labeled single-operand parameters. | Not enforced; no lint or check exists, and the `_` label spelling itself is unimplemented (row 2.4). | gap — req-11,13 |
 
 ## Normative exclusion ledger
 
@@ -215,19 +223,23 @@ the tables above remains a gap even if it is difficult or scheduled later.
 | Shared legacy PCI INTx | 01 §8; 05 §9 |
 | Arbitrary privileged/top-half ISR escape hatches and ISR nesting on the advertised profile | 01 §8; 05 §11 |
 | Install-time verified bytecode and hot in-memory migration | 01 §8; 07 §10 |
-| Hex floating literals; multiline/raw literals | 02 §1 |
+| Hex floating literals; multiline/raw literals (`"""` is reserved and a syntax error) | 02 §1 |
+| 128-bit integers `u128`/`i128` (cut; GUID-shaped data is `Bytes[16]`) | 02 §5.1 fixes the closed scalar set; reversal recorded in design-decisions |
 | `class` as a distinct declaration form (merged into `struct` + `linear`) | 02 §3; 02 §3.2 |
 | A comptime function color (e.g. `comptime fn`); `fn` is phase-neutral instead | 02 §3.1; 06 §1 |
 | `bind` pattern keyword (bare identifiers always bind) | 02 §3.3 |
 | Rest/slice patterns | 02 §3.3 |
 | Interface specialization, negative impls and overlapping blanket impls | 02 §3.4 |
-| Multi-leaf/tuple projection carriers and explicit `from` provenance clauses (provenance is implicit and conservative instead) | 02 §3.5; 03 §4.1 |
+| Multi-leaf/tuple projection carriers and explicit `from` provenance clauses (provenance is implicit and conservative instead) | 02 §3.5; 03 §4.3 |
 | Suspend-safe scope repair tokens and restoration obligations across `await` (scopes cannot hold state across `await`) | 02 §3.5 |
 | Variadics/runtime keyword-argument collections | 02 §4 |
 | Runtime-indexed fixed-array `take`; loop `else`; labeled `break` | 02 §§6–7 |
+| General user-defined iteration protocol (`for` iterates a closed compiler-known set) | 02 §7; 10 §9.1 |
 | Wrapping left-shift operator `<<%` (wrapping `+%`/`-%`/`*%` remain) | 02 §8 |
 | Arbitrary AST macros | 06 §7 |
-| `race` as a grammar/expression form (a sealed stdlib call contract instead) | 04 §12.3; 10 §7 |
+| `race` as a grammar/expression form (a sealed stdlib call contract instead) | 04 §12.3; 10 §8 |
+| Lockfiles / a locked dependency closure (returns with third-party package acquisition) | 02 §2.1; 08 §3 |
+| Service-level interleaving mechanisms (declared interleaving contracts, canonized sharding, beyond the required head-of-line diagnostic) | 04 §13 open-problem subsection leaves them deliberately unspecified |
 | General session-type language | 05 §14 |
 | General user-facing design-by-contract/proof language | 07 §11 |
 | CST and LSP (product objective; syntax remains a lossless typed AST) | `crates/README.md` and project scope; neither is promised by chapters 01–10 |

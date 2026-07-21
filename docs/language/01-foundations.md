@@ -224,5 +224,9 @@ Revision 0.1 deliberately excludes:
 - install-time verified bytecode.
 
 The actor/message semantics, `iso` transfer, and per-vector IRQ ownership are
-chosen so a future per-core actor scheduler does not change application APIs.
-That future is not part of the current safety or determinism claim.
+chosen to make it plausible that a future per-core actor scheduler would not
+change application APIs. This is an explicitly tracked bet, not a guarantee:
+its falsifier is the absence of a 2-core semantic sketch that validates
+non-reentrancy and deterministic replay under these same actor/message/`iso`
+rules. That future scheduler, and this bet about it, are not part of the
+current safety or determinism claim.

@@ -2709,7 +2709,13 @@ fn inspect_runtime_expression_shape(
                 | Definition::Parameter(_)
                 | Definition::Declaration(_)
                 | Definition::Variant(_),
-            ) => {}
+            )
+            // A leading-dot variant (`.name`, bare or as a call callee) is a
+            // resolved-candidate leaf with no further sub-expressions to
+            // walk, exactly like the qualified `Reference(Variant(_))` case
+            // above; its expected-type intersection happens later, in the
+            // full runtime expression analyzer.
+            | ExpressionKind::DotName { .. } => {}
             ExpressionKind::Call { callee, arguments } => {
                 if let Some(ExpressionKind::Reference(Definition::Declaration(declaration))) =
                     program
@@ -5038,6 +5044,30 @@ fn analyze_runtime_expression(
             state,
             is_cancelled,
         ),
+        ExpressionKind::DotName { candidates, .. } => {
+            let resolved = resolve_dot_variant_candidate(
+                request,
+                partial,
+                candidates,
+                expression_request.expected,
+                expression.source,
+            )?;
+            analyze_closed_enum_constructor(
+                request,
+                partial,
+                function,
+                RuntimeDirectCall {
+                    expression: expression_id,
+                    source: expression.source,
+                    callee: expression_id,
+                    arguments: &[],
+                },
+                &resolved,
+                expression_request,
+                state,
+                is_cancelled,
+            )
+        }
         _ => Err(AnalysisFailure::RequestMismatch.into()),
     }
 }
@@ -5862,11 +5892,17 @@ fn analyze_operator_interface_binary(
     } else {
         (&left, 0u32, &right, 1u32)
     };
+    // A reference operand (parameter or local read) carries its value in
+    // `referenced` rather than materializing an expression result; both
+    // operand shapes are legal `read` arguments, matching the direct-call
+    // argument path.
     let self_value = self_operand
-        .result
+        .referenced
+        .or(self_operand.result)
         .ok_or(AnalysisFailure::RequestMismatch)?;
     let other_value = other_operand
-        .result
+        .referenced
+        .or(other_operand.result)
         .ok_or(AnalysisFailure::RequestMismatch)?;
     let arguments = vec![
         ResolvedCallArgument {
@@ -6424,6 +6460,25 @@ fn analyze_direct_call(
             is_cancelled,
         );
     }
+    if let ExpressionKind::DotName { candidates, .. } = &callee_expression.kind {
+        let resolved = resolve_dot_variant_candidate(
+            request,
+            partial,
+            candidates,
+            expression_request.expected,
+            call.source,
+        )?;
+        return analyze_closed_enum_constructor(
+            request,
+            partial,
+            function,
+            call,
+            &resolved,
+            expression_request,
+            state,
+            is_cancelled,
+        );
+    }
     let ExpressionKind::Reference(Definition::Declaration(resolved)) = &callee_expression.kind
     else {
         return Err(AnalysisFailure::RequestMismatch.into());
@@ -6741,6 +6796,69 @@ fn analyze_direct_call(
         referenced: None,
         effects: target_effects,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Resolves an expression-position leading-dot variant (`.name` / `.name(args)`,
+/// lowered to HIR as `DotName { spelling, candidates }`) against the expected
+/// type flowing from its surrounding context.
+///
+/// Per docs/language/02-source-language.md §3.3, `.name` in expression
+/// position denotes an enum variant only when the expected type at that
+/// position is a known enum; resolution intersects the HIR-resolved
+/// same-spelling candidate set with that one enum. No expected enum type
+/// available, or an expected enum that does not declare a same-spelling
+/// variant, are both stable diagnostics rather than silent fallback to the
+/// qualified form.
+fn resolve_dot_variant_candidate(
+    request: &AnalysisRequest<'_>,
+    partial: &PartialAnalysis,
+    candidates: &[wrela_hir::ResolvedVariant],
+    expected: Option<SemanticTypeId>,
+    source: Span,
+) -> RuntimeResult<wrela_hir::ResolvedVariant> {
+    let Some(expected) = expected else {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-dot-variant-context-required",
+            "leading-dot variant has no contextual enum type",
+            "expression-position `.name` resolves only against a known enum type from its surrounding context",
+            "use the fully qualified `Enum.variant` form, or give this position an explicit enum-typed annotation",
+        ));
+    };
+    let declaration =
+        partial
+            .types
+            .get(expected.0 as usize)
+            .and_then(|record| match &record.kind {
+                SemanticTypeKind::Enumeration { declaration, .. } => Some(*declaration),
+                _ => None,
+            });
+    let Some(declaration) = declaration else {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-dot-variant-context-required",
+            "leading-dot variant's contextual type is not an enum",
+            "expression-position `.name` resolves only against a known enum type from its surrounding context",
+            "use the fully qualified `Enum.variant` form, or give this position an explicit enum-typed annotation",
+        ));
+    };
+    candidates
+        .iter()
+        .find(|candidate| candidate.enumeration.declaration == declaration)
+        .cloned()
+        .ok_or_else(|| {
+            runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-dot-variant-unknown-variant",
+                "the contextual enum does not declare this leading-dot variant",
+                "leading-dot variant resolution requires the contextual enum to declare a same-spelling variant",
+                "use one of the contextual enum's declared variant names",
+            )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7654,7 +7772,14 @@ fn ensure_ordinary_source_function(
             (
                 SemanticValueOrigin::Parameter(*parameter_id),
                 Some(parameter.source),
-                parameter.name.as_ref().map(wrela_hir::Name::as_str),
+                // An unnamed parameter is a `self` receiver; the request
+                // consistency checks apply the same fallback convention.
+                Some(
+                    parameter
+                        .name
+                        .as_ref()
+                        .map_or("self", wrela_hir::Name::as_str),
+                ),
             ),
             is_cancelled,
         )?;
@@ -10149,6 +10274,19 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                     Err(self.unsupported(expression.source))
                 }
             }
+            // A resolved leading-dot variant (`.name`) is equivalent to the
+            // qualified variant reference above once HIR lowering has
+            // narrowed it to one same-spelling candidate: this evaluator has
+            // no contextual-enum-type mechanism to disambiguate a genuinely
+            // ambiguous candidate set, so only the unambiguous case resolves
+            // here and everything else stays the stable unsupported
+            // diagnostic.
+            ExpressionKind::DotName { candidates, .. } => match candidates.as_slice() {
+                [variant] if self.is_selected_target_variant(variant) => {
+                    Ok(ComptimeValue::SelectedTarget)
+                }
+                _ => Err(self.unsupported(expression.source)),
+            },
             ExpressionKind::Field { base, name } => {
                 let base = self.evaluate_expression(*base, None, depth + 1)?;
                 if base == ComptimeValue::TargetType && name.as_str() == "aarch64_qemu_virt_uefi" {
@@ -10406,7 +10544,6 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             | ExpressionKind::Index { .. }
             | ExpressionKind::Tuple(_)
             | ExpressionKind::Array(_)
-            | ExpressionKind::DotName { .. }
             | ExpressionKind::TrySend(_)
             | ExpressionKind::Interpolate(_)
             | ExpressionKind::Error => Err(self.unsupported(expression.source)),
@@ -22713,5 +22850,172 @@ fn projection_fixture():
             Err(AnalysisFailure::Cancelled)
         ));
         assert_eq!(polls.get(), final_poll);
+    }
+
+    // Expression-position leading-dot enum-variant shorthand (`.name` /
+    // `.name(args)`, docs/language/02-source-language.md §3.3). HIR already
+    // lowers this to `ExpressionKind::DotName { spelling, candidates }` with
+    // candidates resolved by the same visible-variant lookup patterns use;
+    // these tests exercise sema's expected-type intersection over that
+    // candidate set in the three wired expression-position contexts.
+
+    const DOT_VARIANT_LOOKUP_ENUM: &str = "pub enum Lookup:\n    found(u32)\n    failed(u32)\n";
+
+    fn dot_variant_actor_source(app_body: &str) -> String {
+        format!(
+            "module app\n\nfrom core.image import Image, Target\n\n{DOT_VARIANT_LOOKUP_ENUM}\n{app_body}\n@service\npub struct Worker:\n    pub async fn ping(mut self):\n        await checkpoint()\n\n@image\npub fn boot() -> Image:\n    img = Image(name=\"actor-image\", target=Target.aarch64_qemu_virt_uefi)\n    installed = img.service(Worker, mailbox=2)\n    return img\n"
+        )
+    }
+
+    #[test]
+    fn dot_variant_annotated_local_resolves_payload_variant() {
+        let source = dot_variant_actor_source(
+            "async fn checkpoint():\n    state: Lookup = .found(7)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("dot-variant annotated local should analyze");
+        assert!(
+            output.diagnostics().is_empty(),
+            "annotated-local `.found(7)` must resolve against its declared enum type: {:?}",
+            output.diagnostics()
+        );
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn dot_variant_return_position_resolves_payload_variant() {
+        let source = dot_variant_actor_source(
+            "fn classify(value: u32) -> Lookup:\n    return .found(value)\n\nasync fn checkpoint():\n    result: Lookup = classify(9)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("dot-variant return position should analyze");
+        assert!(
+            output.diagnostics().is_empty(),
+            "`return .found(value)` must resolve against the function result type: {:?}",
+            output.diagnostics()
+        );
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn dot_variant_named_argument_resolves_payload_variant() {
+        let source = dot_variant_actor_source(
+            "fn accept(value: Lookup):\n    pass\n\nasync fn checkpoint():\n    accept(value=.found(11))\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("dot-variant named argument should analyze");
+        assert!(
+            output.diagnostics().is_empty(),
+            "named argument `value=.found(11)` must resolve against the parameter type: {:?}",
+            output.diagnostics()
+        );
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn dot_variant_named_argument_resolves_payload_free_variant() {
+        // The one place a fieldless leading-dot variant already round-trips
+        // is the comptime image-build evaluator's `Target` selection, so this
+        // doubles as the comptime-evaluator verification: a resolved
+        // `DotName` must be treated identically to the existing qualified
+        // `Target.aarch64_qemu_virt_uefi` form it replaces here.
+        const SOURCE: &str = "module app\n\nfrom core.image import Image, Target\n\n@service\npub struct Worker:\n    pub async fn ping(mut self):\n        await checkpoint()\n\nasync fn checkpoint():\n    pass\n\n@image\npub fn boot() -> Image:\n    img = Image(name=\"actor-image\", target=.aarch64_qemu_virt_uefi)\n    installed = img.service(Worker, mailbox=2)\n    return img\n";
+        let fixture = parsed_actor_fixture(SOURCE);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("dot-variant Image target argument should analyze");
+        assert!(
+            output.diagnostics().is_empty(),
+            "named argument `target=.aarch64_qemu_virt_uefi` must resolve like the qualified form: {:?}",
+            output.diagnostics()
+        );
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn dot_variant_comptime_annotated_local_resolves_payload_free_variant() {
+        // The comptime image-build evaluator's own `Initialize` statement
+        // handling threads an expected type exactly like the runtime tier
+        // does (`self.local_value_type(local)`); a fieldless leading-dot
+        // variant assigned to an annotated local inside the `@image` entry
+        // exercises that path end to end, not just a literal call argument.
+        const SOURCE: &str = "module app\n\nfrom core.image import Image, Target\n\n@service\npub struct Worker:\n    pub async fn ping(mut self):\n        await checkpoint()\n\nasync fn checkpoint():\n    pass\n\n@image\npub fn boot() -> Image:\n    selected: Target = .aarch64_qemu_virt_uefi\n    img = Image(name=\"actor-image\", target=selected)\n    installed = img.service(Worker, mailbox=2)\n    return img\n";
+        let fixture = parsed_actor_fixture(SOURCE);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("dot-variant comptime annotated local should analyze");
+        assert!(
+            output.diagnostics().is_empty(),
+            "`selected: Target = .aarch64_qemu_virt_uefi` must resolve inside the comptime evaluator: {:?}",
+            output.diagnostics()
+        );
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn dot_variant_without_expected_type_is_rejected() {
+        let source =
+            dot_variant_actor_source("async fn checkpoint():\n    .found(3)\n    pass\n\n");
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("dot-variant without contextual type is a structured source diagnostic");
+        assert_eq!(output.diagnostics().len(), 1);
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-dot-variant-context-required")
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn dot_variant_unknown_variant_for_expected_enum_is_rejected() {
+        let source = dot_variant_actor_source(
+            "pub enum Signal:\n    bogus(u32)\n\nasync fn checkpoint():\n    state: Lookup = .bogus(5)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("dot-variant naming another enum's variant is a structured source diagnostic");
+        assert_eq!(output.diagnostics().len(), 1);
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-dot-variant-unknown-variant")
+        );
+        assert!(output.has_errors());
     }
 }

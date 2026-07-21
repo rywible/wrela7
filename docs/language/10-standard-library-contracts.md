@@ -16,7 +16,18 @@ hidden failure, copy, allocation, authority, suspension, or ownership transition
 Proof-only generated parameters have no source value and do not create ambient
 allocation or authority.
 
-## 2. `Option`, `Result`, and conversions
+## 2. Prelude
+
+Revision 0.1 fixes one always-in-scope prelude: `Option`, `Some`, `None`,
+`Result`, `Ok`, `Err`, and `panic`. These names resolve without an import in
+every module. An explicit declaration or `from`/`import` in the same module
+MAY shadow a prelude name for that module; shadowing is ordinary name
+resolution, not a language exception. Every other standard name — including
+every type named later in this chapter — MUST be imported explicitly. A
+standard library MAY grow, but it cannot enlarge this fixed set without a
+language revision.
+
+## 3. `Option`, `Result`, and conversions
 
 `Option[T]` is the closed sum `Some(T) | None`. `Result[T, E]` is
 `Ok(T) | Err(E)`. Ownership of a payload follows ordinary enum rules. When the
@@ -48,7 +59,7 @@ the element remains initialized as `None`, so it does not create a dynamic
 partially moved place. It is the standard way to move a non-`Copy` payload out
 of a runtime-selected slot before later restoring that slot.
 
-## 3. Actor handles and replies
+## 4. Actor handles and replies
 
 `Actor[T]` identifies one concrete image actor instance and exposes only `T`'s
 public actor methods. It is minted by image construction, installed only as an
@@ -71,13 +82,13 @@ declared R             → Result[R, ActorCallError[never]]
 declared Result[T, E]  → Result[T, ActorCallError[E]]
 
 ActorCallError[E] =
-    exit(AsyncExit[E])
-  | peer_failed(PeerFailed)
-  | not_admitted(AdmissionError)
+    Exit(AsyncExit[E])
+  | PeerFailed(PeerFailed)
+  | NotAdmitted(AdmissionError)
 ```
 
-`ActorCallError` composes the task/async exit sum defined in §6 rather than
-duplicating its `operation`/`cancelled`/`deadline_rejected`/`deadline_exceeded`
+`ActorCallError` composes the task/async exit sum defined in §7 rather than
+duplicating its `Operation`/`Cancelled`/`DeadlineRejected`/`DeadlineExceeded`
 variants.
 
 `PeerFailed` contains a static actor identity, non-wrapping supervision epoch,
@@ -91,11 +102,11 @@ reservation therefore moves no argument. Successful commit irrevocably consumes
 every `take` argument. No implicit
 restoration bundle exists. An API promising return of an input places it in every
 success/failure result that preserves it or returns a sealed
-`TransferReceipt[P]`.
+`Receipt[P]`.
 
 When a call has a `take` argument, its effective result is a second-class
 ownership-conditioned carrier until immediate `?`/`match` consumption:
-`not_admitted` leaves every source initialized and every other variant means
+`NotAdmitted` leaves every source initialized and every other variant means
 they were moved. Match arms must converge linear initialization before joining.
 With no `take` argument the result is an ordinary storable `Result`.
 
@@ -103,9 +114,9 @@ Nonblocking one-way admission is sealed expression syntax:
 
 ```text
 try send actor.method(arguments...) -> AdmissionResult
-AdmissionResult = admitted | rejected(AdmissionError)
+AdmissionResult = Admitted | Rejected(AdmissionError)
 AdmissionError =
-    full | restarting | stale_request | cancelled | deadline_rejected
+    Full | Restarting | StaleRequest | Cancelled | DeadlineRejected
 ```
 
 All variants remain in the source type; whole-image optimization may erase
@@ -116,40 +127,64 @@ arguments and consumes their explicit moves atomically with enqueue.
 definite initialization can refine moved sources in each arm; it cannot be
 stored, returned, captured, sent, awaited, or propagated with `?`.
 
-## 4. `Completion`, receipts, and request lineage
+A source brand's public spelling may use the actor-associated alias form
+`iso[Owner.Brand]` — for example `iso[Storage.Payloads]` — where `Owner` is the
+actor whose image wiring declared the brand and `Brand` is the brand name
+itself. The alias denotes the identical proof-only brand as the bare
+identifier (§12); it exists so a signature reads which actor's pool a handle
+belongs to, not to create a second identity or an implicit coercion.
+
+## 5. `Completion`, receipts, and request lineage
 
 `Completion[T]` is a sealed strict-linear, single-resolution awaitable. Awaiting
 it consumes it. The producer resolves it once with ownership of `T`; duplicate
 resolution is abandonment. Its wake is level-triggered and idempotent.
 
-`TransferReceipt[P]` is a sealed strict-linear state machine. Before its typed
-`commit`, rejection/cancellation returns `P`; commit consumes that state and
-produces the protocol-specific committed receipt. `IoReceipt[P]` is such a
-committed strict completion whose state owns a published device operation,
-non-wrapping queue/reset epoch, cleanup dependency, and eventual payload `P`.
-Awaiting it consumes it and yields `IoCompletion[P]` with owned `payload: P`
-before `status: Result[unit, IoError]` is propagated. Cancellation transfers it
-only to the generated driver recovery node; ordinary drop is illegal.
+`Receipt[P]` is the single sealed strict-linear receipt state machine for
+protocols requiring recovery after publication; it replaces the former
+separate `TransferReceipt[P]`/`IoReceipt[P]` split with one state machine:
+
+```text
+Receipt[P] =
+    Submitted
+  | Committed
+  | Resolved(payload: P)
+  | Recovery
+```
+
+Before the typed `commit` boundary, rejection or cancellation resolves
+`Submitted` directly to `Resolved(payload: P)`, returning ownership of `P`. A
+successful `commit` instead advances `Submitted` to `Committed`, the
+protocol-specific state that owns a published device operation, non-wrapping
+queue/reset epoch, cleanup dependency, and the eventual payload `P`. Awaiting a
+`Committed` receipt consumes it and yields `IoCompletion[P]` with owned
+`payload: P` before `status: Result[unit, IoError]` is propagated.
+Cancellation of a `Committed` receipt transfers it only to the generated
+driver recovery node, reaching `Recovery`; ordinary drop is illegal in every
+state. `Recovery` resolves the caller's original endpoint exactly once with
+recovered ownership of `P`. The compiler verifies the receipt implementation,
+not an implicit whole-program value-tracing promise.
 
 A public synchronous `@driver` method annotated
 `@receipt_handoff(input=p)` has a special, compiler-sealed calling convention.
 It must take exactly one parameter `take p: P` and declare return type
-`IoReceipt[P]`. Admission commit atomically creates a paired receipt state:
-the caller owns the `IoReceipt[P]`, while the admitted message owns `P` and its
+`Receipt[P]`. Admission commit atomically creates a paired receipt state:
+the caller owns the `Receipt[P]`, while the admitted message owns `P` and its
 single-resolution producer. The actor call completes with the caller endpoint
 at admission commit, before the handler runs. Within the handler, an expression
-of apparent type `IoReceipt[P]` is a second-class producer transition, not a
-second caller endpoint: `return queue.publish(...)` commits the existing pair,
-and `return queue.reject(payload=take p, ...)` resolves the same pair with
-owned payload plus error. The value cannot be stored, copied, sent, or returned
-by a nested function. Every normal handler path must perform exactly one such
-transition. Abandonment, cancellation, actor failure, or restart before that
-transition transfers the producer and payload to the generated supervisor
-recovery node, which resolves the caller endpoint. No execution can create a
-second receipt, strand `P`, or expose an error before returning ownership.
-The annotation is forbidden on non-drivers, async handlers, multiple moved
-inputs, mismatched brands/types, and methods whose bodies can finish without a
-terminal producer transition.
+of apparent type `Receipt[P]` is a second-class producer transition, not a
+second caller endpoint: `return queue.publish(...)` commits the existing pair
+(`Submitted -> Committed`), and `return queue.reject(payload=take p, ...)`
+resolves the same pair with owned payload plus error
+(`Submitted -> Resolved`). The value cannot be stored, copied, sent, or
+returned by a nested function. Every normal handler path must perform exactly
+one such transition. Abandonment, cancellation, actor failure, or restart
+before that transition transfers the producer and payload to the generated
+supervisor recovery node (`Recovery`), which resolves the caller endpoint. No
+execution can create a second receipt, strand `P`, or expose an error before
+returning ownership. The annotation is forbidden on non-drivers, async
+handlers, multiple moved inputs, mismatched brands/types, and methods whose
+bodies can finish without a terminal producer transition.
 
 `RequestContext[R]` is a sealed second-class admission descriptor with
 proof-only region brand `R`, request identity/epoch, ancestry, deadline, and
@@ -157,12 +192,21 @@ priority. It has no ordinary storable layout and cannot be returned, captured,
 formatted, or placed in a message except through an admission operation that
 atomically creates a strict child registration before enqueue. Stale, canceled,
 and expired admission returns a typed error without consuming other payloads.
-`RequestContext[R]` must be supplied as a bare binding so admission may inspect
-it before ordinary argument evaluation.
-`RequestMetadata` is the separate explicitly copyable bounded diagnostic value;
-it carries no admission authority or region brand.
 
-## 5. Time
+Within the dynamic extent of a `with request(...) as req:` scope,
+`RequestContext[R]` is ambient: an ordinary actor call or request-consuming
+operation implicitly carries the lexically enclosing request's admission
+descriptor without declaring it as a formal parameter. `[region R]` and
+`RequestContext[R]` therefore leave an ordinary method signature; only the
+scope that mints one (`request(...)`, §12) names it. Code that needs a
+*different* lineage than the ambient one overrides it exactly once per call
+with an explicit `request=` argument, for example `request=req.context()`; an
+activation marked `@detached` opts out of ambient inheritance entirely instead
+of overriding it. Tooling displays the inferred ambient lineage at every call
+site. `RequestMetadata` is the separate explicitly copyable bounded diagnostic
+value; it carries no admission authority or region brand.
+
+## 6. Time
 
 `Duration` is a nonnegative checked span represented by a target-independent
 integer number of nanoseconds. Named constructors `ns`, `us`, `ms`, `seconds`,
@@ -173,7 +217,7 @@ at runtime. There is one surface, not a runtime/comptime twin pair.
 Arithmetic and comparison on `Duration` are the standard `Add`, `Sub`, and
 `Ord` interface implementations rather than named methods; `min`, `max`, and
 `clamp` follow from `Ord`, and `clamp(value, lower, upper)` requires
-`lower <= upper`. `as_nanoseconds() -> u64` is the sole accessor into the
+`lower <= upper`. `d.as_nanoseconds() -> u64` is the sole accessor into the
 backing scalar. Overflow and underflow use ordinary checked arithmetic: a
 comptime evaluation that overflows is a build error, and a runtime evaluation
 abandons. The contract does not separately specify a bound assertion beyond
@@ -193,7 +237,7 @@ Record mode records every observed value, and replay supplies the recorded
 sequence. Wall time is a separate optional capability and is not used for
 scheduling, deadlines, or restart intensity.
 
-## 6. Tasks, wake, and task failure
+## 7. Tasks, wake, and task failure
 
 Every local or nursery-installed async activation resolves once with:
 
@@ -201,13 +245,13 @@ Every local or nursery-installed async activation resolves once with:
 declared R             -> Result[R, AsyncExit[never]]
 declared Result[T, E]  -> Result[T, AsyncExit[E]]
 AsyncExit[E] =
-    operation(E) | cancelled(Cancelled)
-  | deadline_rejected(DeadlineRejected)
-  | deadline_exceeded(DeadlineExceeded)
+    Operation(E) | Cancelled(Cancelled)
+  | DeadlineRejected(DeadlineRejected)
+  | DeadlineExceeded(DeadlineExceeded)
 ```
 
 Awaiting consumes the activation's completion. Actor transport composes these
-exact causes into `ActorCallError[E]` as `exit(AsyncExit[E])` rather than
+exact causes into `ActorCallError[E]` as `Exit(AsyncExit[E])` rather than
 duplicating their variants.
 
 Each `@task` method has one or more statically reserved task slots determined by
@@ -222,18 +266,18 @@ interacts with parking.
 
 An image-installed task returns `unit` or `Result[unit, E]`. `Err(E)` becomes a
 bounded owned `TaskFailed[E]` supervisor event after lexical teardown. The image
-declares `stop`, `restart_actor`, or `escalate` for that event. Absence of a
+declares `Stop`, `RestartActor`, or `Escalate` for that event. Absence of a
 policy is a build error; `Err` is never discarded.
 
-## 7. Nurseries, joins, and races
+## 8. Nurseries, joins, and races
 
-`Nursery[N]` owns at most `N` child activations. `start` consumes or copies its
-arguments according to the child signature. Exiting the nursery waits for or
-cancels and tears down every child.
+`Nursery[..N]` owns at most `N` child activations. `start` consumes or copies
+its arguments according to the child signature. Exiting the nursery waits for
+or cancels and tears down every child.
 
 For a statically heterogeneous set of children, `join_all` returns a fixed tuple
 in start order. Tuple element ownership follows the language tuple rules. A
-homogeneous dynamic count returns `List[T, N]` with an explicit maximum.
+homogeneous dynamic count returns `List[T, ..N]` with an explicit maximum.
 
 `race(a, b, ...)` is a sealed stdlib contract, not grammar: its surface is an
 ordinary call expression, but the compiler build-proves and reserves all child
@@ -246,7 +290,7 @@ recovery completions, and proves that no loser retains a restoration obligation
 or quarantined mutable region. Winner selection among simultaneously ready
 alternatives uses argument order after the scheduler's recorded readiness set.
 
-## 8. Bounded arrays and collections
+## 9. Bounded arrays, collections, and iteration
 
 `[T; N]` supports constant-index element moves. Runtime-indexed `take` is
 forbidden. `for take element in take array` consumes the array as a whole and
@@ -266,18 +310,39 @@ available only when both element classes have compiler-known reclaim actions.
 Strict-linear elements require an explicit consuming loop whose error paths name
 their protocol-specific cleanup.
 
-`List[T, N]` and `SlotMap[T, N]` never exceed `N`. Construction mints a fresh
-non-wrapping map instance ID. `SlotMap.Key` is the explicitly copyable
+`List[T, ..N]` and `SlotMap[T, ..N]` never exceed `N`. Construction mints a
+fresh non-wrapping map instance ID. `SlotMap.Key` is the explicitly copyable
 `(map_id, index, generation)` value. `get` and `get_mut` validate all parts
 and return second-class
 `Option[view T]`/`Option[mut view T]`. `remove` increments before reuse and
 permanently retires a slot rather than wrapping; insertion may return
 `GenerationExhausted`. Image-resident instances receive compile-time IDs;
 runtime construction draws from a bounded ID pool and may return
-`MapIdExhausted` rather than wrapping. Iteration holds the corresponding
-lexical access.
+`MapIdExhausted` rather than wrapping.
 
-## 9. Bounded formatting
+### 9.1 Iteration
+
+Revision 0.1 iterates over a closed builtin set: integer ranges (`0 .. n`),
+fixed arrays including the consuming `take` form above, and the per-container
+operations named below for `List[T, ..N]` and `SlotMap[T, ..N]`. A general
+user-defined `Iterable` protocol is deliberately excluded from revision 0.1;
+its exclusion and the evidence bar for revisiting it are tracked in the
+conformance inventory, not restated here.
+
+`List[T, ..N]` iterates with `for element in list.items()` (`read view T` in
+index order) or, for exclusive access, `for element in list.items_mut()`
+(`mut view T`). `SlotMap[T, ..N]` iterates with `keys()` (owned, copyable
+`Key` values), `values()`/`values_mut()` (`read view T`/`mut view T` by
+occupied index order), and `pairs()`/`pairs_mut()`
+(`(Key, read view T)`/`(Key, mut view T)`).
+
+A `_mut` iteration form's view lives only inside the loop body: the `mut view
+T` (or `mut view T` component of a pair) produced by one step cannot be
+stored, returned, or retained past that step, and at most one such view is
+live at a time. Iteration holds the corresponding lexical access to the
+container itself for the loop's duration.
+
+## 10. Bounded formatting
 
 Types implementing the static `Format` contract provide a compile-time
 `max_formatted_len(spec)` and a writer operation that cannot exceed it. Core
@@ -294,7 +359,7 @@ bound. `Secret` has no formatting implementation. ISR formatting is forbidden.
 profile maximum. A panic expression whose maximum does not fit is a build error,
 not an invitation to allocate.
 
-### 9.1 External formats and wire values
+### 10.1 External formats and wire values
 
 `Validated[F, T]` is a sealed owned wrapper minted only by the declared
 `FormatValidator[F, T]` operation:
@@ -304,6 +369,9 @@ validate(data: Bytes) -> Result[Validated[F, T], F.Error]
 Validated[F, T].into_value(take self) -> T
 ```
 
+`Validated[F, T]` is one instantiation of the evidence-wrapper family
+unified elsewhere (`Untrusted[T]` taint-in, `Validated[F, T]` proof-out); this
+chapter does not restate that unification, only this wrapper's own contract.
 The compiler enforces use of the wrapper when an API declares that precondition;
 it proves memory/bounds/ownership safety of the validator but does not claim a
 theorem that arbitrary user validation matches an external prose format.
@@ -314,7 +382,7 @@ encoded extent and decodes the declared endian/version/layout into an owned
 `Result[W, WireError]`. There is no `read_struct` operation for ordinary or
 `@dma` structs.
 
-## 10. `InterruptCell`, MMIO, and virtqueues
+## 11. `InterruptCell`, MMIO, and virtqueues
 
 `InterruptCell[T]` is only for ordinary/ISR-visible state and exposes the operation
 set in [Hardware safety](05-hardware-safety.md). RMW methods are
@@ -325,11 +393,13 @@ by masking.
 operations, and receipts are sealed protocol types. Their public contracts must
 encode the authority partitions, ordering, ownership transitions, complete
 descriptor reservation, epochs, untrusted control validation, and deferred
-recovery rules of chapter 05. A replacement implementation cannot expose a raw
-address, ordinary view of shared control memory, droppable receipt, or
-unpartitioned register mapping.
+recovery rules of chapter 05. Untrusted control validation is exactly where the
+evidence-wrapper family (§10.1) applies on the device side. `P` may be spelled
+with the actor-associated alias form defined in §4. A replacement
+implementation cannot expose a raw address, ordinary view of shared control
+memory, droppable receipt, or unpartitioned register mapping.
 
-## 11. Construction and scope intrinsics
+## 12. Construction and scope intrinsics
 
 `Image`, `request`, `nursery`, actor admission, and pool construction are
 compiler-recognized semantic intrinsics even when a standard package supplies
@@ -357,7 +427,8 @@ their surface declarations.
   returns the sole `Image`; any incomplete, duplicate, cyclic construction, or
   unused strict declaration is a build error.
 - `request(...)` is a suspend-safe scope that mints `RequestContext[R]` and a
-  bounded request region for fresh `R`; `nursery(capacity=N)` is a suspend-safe
+  bounded request region for fresh `R`; every call inside it ambiently
+  inherits that context (§5). `nursery(capacity=N)` is a suspend-safe
   scope owning exactly `N` child slots. Their cleanup contracts are chapters 03
   and 04, not replaceable destructor conventions.
 
@@ -365,7 +436,7 @@ An alternative standard library may rename wrappers around these intrinsics but
 cannot alter their graph nodes, generativity, phase, access effects, failure
 points, or cleanup/wait-for edges.
 
-## 12. Operator interfaces
+## 13. Operator interfaces
 
 The closed operator interfaces named by
 [Source language](02-source-language.md) are declared in the standard-library
@@ -397,12 +468,63 @@ of chapter 02:
   `not Ord::less_than(a, b)`.
 
 Both operands are evaluated as written before the call regardless of the
-argument mapping. Structural `==`/`!=` on copyable structs and enums remain
-compiler-generated and do not consult an interface. `Eq` for non-structural
-equality, heterogeneous `Mul`, and the remaining named peers follow the same
-declaration pattern and are specified when their first standard implementation
-lands. Core scalar operators are built in and never desugar through these
-interfaces.
+argument mapping. Compound assignment desugars through the same interface: on
+a nominal type, `a += b` is `a = a + b` through the visible `Add`
+implementation, and `a -= b` is `a = a - b` through `Sub`, in both cases with
+the destination place `a` evaluated exactly once. Compound assignment
+introduces no interface of its own.
+
+Structural `==`/`!=` on copyable structs and enums remain compiler-generated and
+do not consult an interface. `Eq` for non-structural equality, heterogeneous
+`Mul`, and the remaining named peers follow the same declaration pattern and are
+specified when their first standard implementation lands. Core scalar operators
+are built in and never desugar through these interfaces.
 
 `Duration` implements `Add`, `Sub`, and `Ord`; its checked overflow contract
-in section 5 is unchanged by the desugaring.
+in section 6 is unchanged by the desugaring.
+
+## 14. Deriving contracts
+
+The closed derivable set is exactly `Eq`, `Format`, and single-variant/single-
+field `From`, invoked with the sealed `deriving(...)` clause fixed by
+[Source language](02-source-language.md); this chapter specifies only what
+each name generates, not the clause's grammar.
+
+- `deriving(Eq)` extends the compiler-generated structural `==`/`!=` (§13) to
+  a type that is not itself `Copy`: every field must itself satisfy the same
+  structural-equality obligation, and the generated comparison reads both
+  operands without moving or duplicating them.
+- `deriving(Format)` generates the bounded formatting contract of §10: a
+  compile-time `max_formatted_len(spec)` summed from each field's own bound,
+  and a writer that cannot exceed it.
+- `deriving(From)` requires the type carry exactly one variant or one field
+  and generates the unique `From` implementation that postfix `?` consumes
+  (§3); deriving it on any other shape is a build error.
+
+An alternative library MAY hand-implement any of these three interfaces
+instead of deriving them, subject to the same obligations.
+
+## 15. The `_proven` naming convention
+
+A `*_proven` name requires an additional build-time proof argument or context
+— a reservation, capacity, or admission proof already established earlier in
+the same scope — and is the canonical name for the statically-proved variant
+of an otherwise possibly-failing operation. `VirtQueue.reserve_proven` and
+`IsoPool.allocate_proven`/`from_str_proven` in the worked example follow this
+convention. A standard or alternative library MUST name every statically-proved
+variant this way rather than inventing an unrelated name or silently changing
+an existing method's failure mode.
+
+## 16. API naming
+
+- Enum variants are CamelCase constructors; ordinary functions and methods are
+  snake_case.
+- A statically-proved variant follows the `*_proven` convention (§15).
+- A capacity/occupancy generic parameter that names a bound rather than an
+  exact extent is spelled `..N` in a type's public signature — `List[T, ..N]`,
+  `SlotMap[T, ..N]`, `Nursery[..N]` (§8–§9) — while a fixed exact extent stays
+  plain `N`/`[T; N]`.
+- A function or method with exactly one non-receiver operand SHOULD declare
+  that parameter with the `_` declaration-owned label
+  ([Source language](02-source-language.md)) so calls are positional, for
+  example `ns(42)` rather than `ns(value=42)`.

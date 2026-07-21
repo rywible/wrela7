@@ -12,9 +12,8 @@
 module examples.virtio_storage
 
 from core.bytes import Bytes
-from core.result import Result, Ok, Err
 from runtime.actor import Actor
-from runtime.request import RequestContext, request
+from runtime.request import request
 from runtime.image import Image, ImageReport, Target
 from runtime.pool import IsoPool
 from runtime.scheduling import now, seconds, us, ms, wake
@@ -26,7 +25,7 @@ from target.mmio import Mmio, ReadOnly, WriteOnly
 from drivers.virtio.core import (
     DeviceCap,
     DriverMode,
-    IoReceipt,
+    Receipt,
     RunningDevice,
     VirtQueue,
     VirtioBlock,
@@ -44,7 +43,7 @@ const INT_CONFIG: u32 = 2
 const SECTOR: usize = 512
 const QDEPTH: usize = 128
 const CACHE_BLOCKS: usize = 64
-const BLOCK_MODE: DriverMode = DriverMode.irq
+const BLOCK_MODE: DriverMode = DriverMode.Irq
 
 const BLK_T_IN: u32 = 0
 const BLK_T_OUT: u32 = 1
@@ -91,11 +90,11 @@ struct DmaBlock:
 # Driver actor
 # ---------------------------------------------------------------------------
 
-@driver(device="virtio-blk")
+@driver
 pub struct BlkDriver[const MODE: DriverMode]:
     device: RunningDevice[VirtioBlock]
     irq_regs: Mmio[VirtioIrqMmio]
-    queue: VirtQueue[QDEPTH, DmaBlock]
+    queue: VirtQueue[..QDEPTH]
     capacity_sectors: u64
     pending: InterruptCell[u32]
     irq: Option[IrqCap[BlkQueueVector]]
@@ -115,8 +114,8 @@ pub struct BlkDriver[const MODE: DriverMode]:
 
             claimed.reset()
             negotiated = claimed.negotiate(
-                required=[VirtioFeature.flush],
-                optional=[VirtioFeature.ring_reset],
+                required=[VirtioFeature.Flush],
+                optional=[VirtioFeature.RingReset],
             )?
 
             # VirtQueue owns DmaShared control memory. Driver source never reads
@@ -129,7 +128,7 @@ pub struct BlkDriver[const MODE: DriverMode]:
                 )?
             self.capacity_sectors = negotiated.read_capacity_sectors()?
 
-            comptime if MODE == DriverMode.irq:
+            comptime if MODE == DriverMode.Irq:
                 irq = negotiated.take_irq()
                 irq.bind(self.on_queue_irq)
                 irq.unmask()
@@ -141,7 +140,7 @@ pub struct BlkDriver[const MODE: DriverMode]:
             self.device = negotiated.start()
         return Ok(unit)
 
-    comptime if MODE == DriverMode.irq:
+    comptime if MODE == DriverMode.Irq:
         isr fn on_queue_irq(self):
             status = self.irq_regs.interrupt_status.read()
             handled = status & (INT_VRING | INT_CONFIG)
@@ -155,12 +154,12 @@ pub struct BlkDriver[const MODE: DriverMode]:
     # waiting, so submission turns are not re-entered.
     @task(
         trigger=wake,
-        poll=(MODE == DriverMode.poll),
+        poll=(MODE == DriverMode.Poll),
         priority=driver,
         budget=us(200),
     )
     fn drain_used(mut self):
-        comptime if MODE == DriverMode.irq:
+        comptime if MODE == DriverMode.Irq:
             status = self.pending.swap_acquire(0)
         comptime else:
             status = self.queue.poll_sources()
@@ -182,24 +181,22 @@ pub struct BlkDriver[const MODE: DriverMode]:
     # It returns a receipt promptly, allowing the driver to accept the next
     # bounded submission before hardware completes.
     @receipt_handoff(input=buffer)
-    pub fn submit_read[region R](mut self,
-                                request: RequestContext[R],
-                                lba: u64,
-                                take buffer: iso[BlockPayloads] DmaBlock)
-        -> IoReceipt[iso[BlockPayloads] DmaBlock]:
+    pub fn submit_read(mut self,
+                       lba: u64,
+                       take buffer: iso[BlockPayloads] DmaBlock)
+        -> Receipt[iso[BlockPayloads] DmaBlock]:
         if lba >= self.capacity_sectors:
             # Even pre-publication rejection resolves a receipt that returns the
             # payload before exposing its error status.
             return self.queue.reject(
                 payload=take buffer,
-                error=IoError.out_of_range,
+                error=IoError.OutOfRange,
             )
 
         # Whole-image analysis proves this appliance can have no more than 42
         # direct requests in flight. reserve_proven obtains a full three-entry
         # chain or exposes a build error; there is no unchecked alloc_desc().
         permit = self.queue.reserve_proven(
-            request=request,
             descriptors=3,
         )
 
@@ -221,19 +218,17 @@ pub struct BlkDriver[const MODE: DriverMode]:
         return self.queue.publish(operation=take operation)
 
     @receipt_handoff(input=buffer)
-    pub fn submit_write[region R](mut self,
-                                 request: RequestContext[R],
-                                 lba: u64,
-                                 take buffer: iso[BlockPayloads] DmaBlock)
-        -> IoReceipt[iso[BlockPayloads] DmaBlock]:
+    pub fn submit_write(mut self,
+                        lba: u64,
+                        take buffer: iso[BlockPayloads] DmaBlock)
+        -> Receipt[iso[BlockPayloads] DmaBlock]:
         if lba >= self.capacity_sectors:
             return self.queue.reject(
                 payload=take buffer,
-                error=IoError.out_of_range,
+                error=IoError.OutOfRange,
             )
 
         permit = self.queue.reserve_proven(
-            request=request,
             descriptors=3,
         )
         operation = self.queue.prepare_block(
@@ -255,10 +250,10 @@ pub struct BlkDriver[const MODE: DriverMode]:
 # ---------------------------------------------------------------------------
 
 enum CacheState:
-    invalid
-    clean(lba: u64)
-    dirty(lba: u64)
-    replacing
+    Invalid
+    Clean(lba: u64)
+    Dirty(lba: u64)
+    Replacing
 
 
 struct CacheLine:
@@ -266,7 +261,7 @@ struct CacheLine:
     data: Option[iso[BlockPayloads] DmaBlock]
 
     fn invalid(take block: iso[BlockPayloads] DmaBlock) -> CacheLine:
-        return CacheLine(state=CacheState.invalid, data=Some(take block))
+        return CacheLine(state=CacheState.Invalid, data=Some(take block))
 
 
 # A cache-fill value describes a line temporarily removed from the cache while
@@ -282,7 +277,7 @@ struct CacheFill:
     data: iso[BlockPayloads] DmaBlock
 
     fn invalidate_fallback(mut self):
-        self.fallback = CacheState.invalid
+        self.fallback = CacheState.Invalid
 
 
 struct BlockCache:
@@ -295,9 +290,9 @@ struct BlockCache:
     fn lookup(read self, lba: u64) -> Option[usize]:
         index = (lba % CACHE_BLOCKS as u64) as usize
         match self.lines[index].state:
-            case .clean(found) if found == lba:
+            case .Clean(found) if found == lba:
                 return Some(index)
-            case .dirty(found) if found == lba:
+            case .Dirty(found) if found == lba:
                 return Some(index)
             case _:
                 return None
@@ -314,7 +309,7 @@ struct BlockCache:
                 data = take block
             case .None:
                 panic("cache line has no payload")
-        self.lines[index].state = CacheState.replacing
+        self.lines[index].state = CacheState.Replacing
         return CacheFill(
             index=index,
             fallback=take prior,
@@ -339,21 +334,20 @@ struct BlockCache:
 
     projection edit(mut self, index: usize) -> mut view DmaBlock:
         match self.lines[index].state:
-            case .clean(_) | .dirty(_):
+            case .Clean(_) | .Dirty(_):
                 match self.lines[index].data:
                     case .Some(data):
                         yield data
                     case .None:
                         panic("cache line has no payload")
-            case .invalid | .replacing:
+            case .Invalid | .Replacing:
                 panic("cache edit of unavailable line")
 
     fn mark_dirty(mut self, index: usize, lba: u64):
-        self.lines[index].state = CacheState.dirty(lba)
+        self.lines[index].state = CacheState.Dirty(lba)
 
-    async fn ensure[region R](self,
+    async fn ensure(self,
                     disk: Actor[BlkDriver[BLOCK_MODE]],
-                    request: RequestContext[R],
                     lba: u64) -> Result[usize, FsError]:
         if self.lookup(lba) is .Some(index):
             return Ok(index)
@@ -362,9 +356,8 @@ struct BlockCache:
         fill = self.begin_replace(index)
 
         match fill.fallback:
-            case .dirty(old_lba):
+            case .Dirty(old_lba):
                 match await disk.submit_write(
-                    request=request,
                     lba=old_lba,
                     buffer=take fill.data,
                 ):
@@ -381,9 +374,9 @@ struct BlockCache:
                     case .Err(error):
                         self.resolve_replace(take fill, next=None)
                         return Err(FsError.from(error))
-            case .clean(_) | .invalid:
+            case .Clean(_) | .Invalid:
                 pass
-            case .replacing:
+            case .Replacing:
                 panic("non-reentrant cache entered replacing state")
 
         # The device may partially overwrite a read payload. From this point
@@ -391,7 +384,6 @@ struct BlockCache:
         # metadata for the previous contents.
         fill.invalidate_fallback()
         match await disk.submit_read(
-            request=request,
             lba=lba,
             buffer=take fill.data,
         ):
@@ -409,7 +401,7 @@ struct BlockCache:
                 self.resolve_replace(take fill, next=None)
                 return Err(FsError.from(error))
 
-        self.resolve_replace(take fill, next=Some(CacheState.clean(lba)))
+        self.resolve_replace(take fill, next=Some(CacheState.Clean(lba)))
         return Ok(index)
 
 
@@ -438,15 +430,13 @@ struct ExtentFs:
         self.cache = BlockCache(blocks=take blocks)
         self.next_free_lba = 64
 
-    async fn read_file[region R](self,
-                       request: RequestContext[R],
+    async fn read_file(self,
                        ino: u32,
                        take out: iso[AppBuffers] Bytes)
         -> Result[iso[AppBuffers] Bytes, FsError]:
         inode_lba = INODE_LBA + (ino / 16) as u64
         inode_index = await self.cache.ensure(
             self.disk,
-            request,
             inode_lba,
         )?
 
@@ -457,22 +447,21 @@ struct ExtentFs:
             offset=((ino % 16) * 32) as usize,
         )?
         if node.magic != MAGIC_FS:
-            return Err(FsError.bad_inode)
+            return Err(FsError.BadInode)
 
         size = node.size_bytes.checked_as(usize)?
         if size > out.capacity():
-            return Err(FsError.output_too_small)
+            return Err(FsError.OutputTooSmall)
         if node.blocks.checked_as(usize)? != div_ceil(size, SECTOR):
-            return Err(FsError.bad_inode)
+            return Err(FsError.BadInode)
         _end_lba = node.start_lba.checked_add(
             node.blocks as u64,
-        ).ok_or(FsError.bad_inode)?
+        ).ok_or(FsError.BadInode)?
 
         written: usize = 0
         for block in 0 .. node.blocks:
             index = await self.cache.ensure(
                 self.disk,
-                request,
                 node.start_lba + block as u64,
             )?
             source: view DmaBlock = self.cache.peek(index)
@@ -490,8 +479,7 @@ struct ExtentFs:
         out.set_len(written)
         return Ok(take out)
 
-    async fn write_file[region R](self,
-                        request: RequestContext[R],
+    async fn write_file(self,
                         ino: u32,
                         take data: iso[AppBuffers] Bytes) -> Result[unit, FsError]:
         block_count = div_ceil(data.len(), SECTOR)
@@ -499,7 +487,7 @@ struct ExtentFs:
 
         for block in 0 .. block_count:
             lba = start + block as u64
-            index = await self.cache.ensure(self.disk, request, lba)?
+            index = await self.cache.ensure(self.disk, lba)?
 
             # Both projections are call-local and die before another await.
             destination: mut view DmaBlock = self.cache.edit(index)
@@ -514,7 +502,6 @@ struct ExtentFs:
         inode_lba = INODE_LBA + (ino / 16) as u64
         inode_index = await self.cache.ensure(
             self.disk,
-            request,
             inode_lba,
         )?
         inode_block: mut view DmaBlock = self.cache.edit(inode_index)
@@ -530,17 +517,15 @@ struct ExtentFs:
         )?
         self.cache.mark_dirty(inode_index, inode_lba)
         self.next_free_lba += block_count as u64
-        await self.flush(request)?
+        await self.flush()?
         return Ok(unit)
 
-    async fn flush[region R](self, request: RequestContext[R])
-        -> Result[unit, FsError]:
+    async fn flush(self) -> Result[unit, FsError]:
         for index in 0 .. CACHE_BLOCKS:
             match self.cache.lines[index].state:
-                case .dirty(lba):
+                case .Dirty(lba):
                     fill = self.cache.begin_replace(index)
                     match await self.disk.submit_write(
-                        request=request,
                         lba=lba,
                         buffer=take fill.data,
                     ):
@@ -559,11 +544,11 @@ struct ExtentFs:
                             return Err(FsError.from(error))
                     self.cache.resolve_replace(
                         take fill,
-                        next=Some(CacheState.clean(lba)),
+                        next=Some(CacheState.Clean(lba)),
                     )
-                case .clean(_) | .invalid:
+                case .Clean(_) | .Invalid:
                     pass
-                case .replacing:
+                case .Replacing:
                     panic("non-reentrant flush observed replacing line")
         return Ok(unit)
 
@@ -577,18 +562,16 @@ pub struct Storage:
                 take blocks: [iso[BlockPayloads] DmaBlock; CACHE_BLOCKS]):
         self.fs = ExtentFs(disk=disk, blocks=take blocks)
 
-    pub async fn read_file[region R](mut self,
-                           request: RequestContext[R],
+    pub async fn read_file(mut self,
                            ino: u32,
                            take out: iso[AppBuffers] Bytes)
         -> Result[iso[AppBuffers] Bytes, FsError]:
-        return await self.fs.read_file(request, ino, take out)
+        return await self.fs.read_file(ino, take out)
 
-    pub async fn write_file[region R](mut self,
-                            request: RequestContext[R],
+    pub async fn write_file(mut self,
                             ino: u32,
                             take data: iso[AppBuffers] Bytes) -> Result[unit, FsError]:
-        return await self.fs.write_file(request, ino, take data)
+        return await self.fs.write_file(ino, take data)
 
 
 # ---------------------------------------------------------------------------
@@ -612,7 +595,7 @@ pub struct Notes:
     @task(
         priority=normal,
         budget=ms(5),
-        failure=TaskFailure.escalate,
+        failure=TaskFailure.Escalate,
     )
     pub async fn run(mut self) -> Result[unit, AppError]:
         with request(deadline=now() + seconds(1)) as req:
@@ -620,14 +603,12 @@ pub struct Notes:
                 "wrela boots to an appliance, not a prompt.\n",
             )
             await self.storage.write_file(
-                request=req.context(),
                 ino=7,
                 data=take body,
             )?
 
             output = self.buffers.allocate_proven(capacity=4096)
             output = await self.storage.read_file(
-                request=req.context(),
                 ino=7,
                 out=take output,
             )?
@@ -655,8 +636,8 @@ pub fn build() -> Image:
             base=0x0a00_0000,
             irq=0x30,
         ),
-        required_features=[VirtioFeature.flush],
-        optional_features=[VirtioFeature.ring_reset],
+        required_features=[VirtioFeature.Flush],
+        optional_features=[VirtioFeature.RingReset],
     )
 
     disk = img.driver(
@@ -697,7 +678,7 @@ pub fn build() -> Image:
 
     img.supervise(
         children=[disk, storage, console, notes],
-        strategy=Restart.one_for_all,
+        strategy=Restart.OneForAll,
         intensity=RestartIntensity(max=3, within=seconds(10)),
     )
 

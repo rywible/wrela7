@@ -53,6 +53,7 @@ const APPLICATION_SOURCE: &str =
     include_str!("../../../std/examples/runtime-result/src/runtime_result/image.wr");
 const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.toml");
 const CORE_IMAGE_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
+const CORE_OPS_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/ops.wr");
 const CORE_RESULT_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/result.wr");
 const CORE_TIME_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/time.wr");
 const IMAGE_NAME: &str = "runtime-result";
@@ -174,6 +175,7 @@ fn package_identities(
             &canonical_core_manifest,
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
+                content_record("ops.wr", CORE_OPS_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
                 content_record("time.wr", CORE_TIME_SOURCE),
             ],

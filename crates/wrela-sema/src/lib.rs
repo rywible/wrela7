@@ -2042,7 +2042,9 @@ fn validate_exact_expression_local_values(
                     pending.push(*base);
                 }
             }
-            wrela_hir::ExpressionKind::Literal(_) | wrela_hir::ExpressionKind::Reference(_) => {}
+            wrela_hir::ExpressionKind::Literal(_)
+            | wrela_hir::ExpressionKind::Reference(_)
+            | wrela_hir::ExpressionKind::DotName { .. } => {}
             _ => {
                 return Err(invalid(
                     "local-value flow encountered an unsupported expression",
@@ -2684,7 +2686,10 @@ fn collect_source_body_closure(
                 | wrela_hir::Definition::Parameter(_)
                 | wrela_hir::Definition::Declaration(_)
                 | wrela_hir::Definition::Variant(_),
-            ) => {}
+            )
+            // A leading-dot variant is a resolved-candidate leaf: its
+            // `candidates` are HIR-lowering metadata, not sub-expressions.
+            | wrela_hir::ExpressionKind::DotName { .. } => {}
             wrela_hir::ExpressionKind::Call { callee, arguments } => {
                 let additional = arguments.len().checked_add(1).ok_or_else(invalid)?;
                 reserve_validation_scratch(
@@ -2926,6 +2931,19 @@ fn validate_exact_expression_fact(
                     )
                 }) => {}
         (
+            wrela_hir::ExpressionKind::DotName { candidates, .. },
+            ExpressionResolution::Constructor {
+                ty,
+                variant: Some(variant),
+            },
+            None,
+        ) if *ty == fact.ty
+            && candidates.iter().any(|candidate| {
+                exact_enum_constructor_reference_matches(
+                    analysis, program, candidate, *ty, *variant,
+                )
+            }) => {}
+        (
             wrela_hir::ExpressionKind::Call { callee, arguments },
             ExpressionResolution::Constructor { ty, variant: None },
             Some(_),
@@ -3060,6 +3078,74 @@ fn validate_exact_expression_fact(
                 *right,
                 fact,
             ) => {}
+        (
+            wrela_hir::ExpressionKind::Binary {
+                operator,
+                left,
+                right,
+            },
+            ExpressionResolution::OperatorCall {
+                function: callee,
+                arguments,
+                raw_result,
+                negate,
+            },
+            Some(result),
+        ) if exact_operator_call_matches(
+            analysis,
+            program,
+            function.id,
+            desugar_binary_operator(*operator),
+            *left,
+            *right,
+            fact,
+            *callee,
+            arguments,
+            *raw_result,
+            *negate,
+            result,
+        ) =>
+        {
+            // `<=`/`>=` define a distinct intermediate raw call result ahead
+            // of the logical NOT that defines the expression's own result.
+            if *negate {
+                increment_definition(definitions, *raw_result)?;
+            }
+        }
+        (
+            wrela_hir::ExpressionKind::Compare {
+                left,
+                operator,
+                right,
+            },
+            ExpressionResolution::OperatorCall {
+                function: callee,
+                arguments,
+                raw_result,
+                negate,
+            },
+            Some(result),
+        ) if exact_operator_call_matches(
+            analysis,
+            program,
+            function.id,
+            desugar_comparison_operator(*operator),
+            *left,
+            *right,
+            fact,
+            *callee,
+            arguments,
+            *raw_result,
+            *negate,
+            result,
+        ) =>
+        {
+            // `<=`/`>=` define a distinct intermediate raw call result ahead
+            // of the logical NOT that defines the expression's own result.
+            if *negate {
+                increment_definition(definitions, *raw_result)?;
+            }
+        }
         (
             wrela_hir::ExpressionKind::Cast { value: source, ty },
             ExpressionResolution::Value(value),
@@ -3350,10 +3436,30 @@ fn exact_enum_constructor_matches(
     if argument.name.is_some() {
         return Ok(false);
     }
-    let Some(source) = exact_resolved_enum_constructor(program, callee, is_cancelled)? else {
-        return Ok(false);
+    // A leading-dot variant callee (`.name(args)`) carries a candidate set
+    // rather than one structurally-fixed reference: it is legitimate here
+    // exactly when the recorded resolution's variant is among those HIR
+    // candidates, which is the same check expected-type intersection would
+    // have made. Every other callee shape keeps the purely structural
+    // re-derivation.
+    let source_matches = match program
+        .expression(callee)
+        .map(|expression| &expression.kind)
+    {
+        Some(wrela_hir::ExpressionKind::DotName { candidates, .. }) => {
+            candidates.iter().any(|candidate| {
+                exact_enum_constructor_reference_matches(analysis, program, candidate, ty, variant)
+            })
+        }
+        _ => {
+            let Some(source) = exact_resolved_enum_constructor(program, callee, is_cancelled)?
+            else {
+                return Ok(false);
+            };
+            exact_enum_constructor_reference_matches(analysis, program, &source, ty, variant)
+        }
     };
-    if !exact_enum_constructor_reference_matches(analysis, program, &source, ty, variant) {
+    if !source_matches {
         return Ok(false);
     }
     let callee_matches = exact_child_expression(analysis, function, callee).is_some_and(|fact| {
@@ -3688,6 +3794,158 @@ fn exact_scalar_unary_matches(
             .is_some_and(|ty| ty.linearity == Linearity::ExplicitCopy)
 }
 
+const fn desugar_binary_operator(
+    operator: wrela_hir::BinaryOperator,
+) -> Option<crate::interfaces::DesugarOperator> {
+    match operator {
+        wrela_hir::BinaryOperator::Add => Some(crate::interfaces::DesugarOperator::Add),
+        wrela_hir::BinaryOperator::Subtract => Some(crate::interfaces::DesugarOperator::Subtract),
+        _ => None,
+    }
+}
+
+const fn desugar_comparison_operator(
+    operator: wrela_hir::ComparisonOperator,
+) -> Option<crate::interfaces::DesugarOperator> {
+    match operator {
+        wrela_hir::ComparisonOperator::Less => Some(crate::interfaces::DesugarOperator::LessThan),
+        wrela_hir::ComparisonOperator::Greater => {
+            Some(crate::interfaces::DesugarOperator::GreaterThan)
+        }
+        wrela_hir::ComparisonOperator::LessEqual => {
+            Some(crate::interfaces::DesugarOperator::LessEqual)
+        }
+        wrela_hir::ComparisonOperator::GreaterEqual => {
+            Some(crate::interfaces::DesugarOperator::GreaterEqual)
+        }
+        _ => None,
+    }
+}
+
+/// Recompute the expected `core.ops` operator desugaring for one HIR binary or
+/// comparison expression and require the recorded [`ExpressionResolution::OperatorCall`]
+/// to match it exactly: the callee must be the operator's impl method declared
+/// for exactly the operand struct, the argument binding must follow the
+/// operator's swap mapping with operand values in source order, argument
+/// access modes must equal the callee's declared parameter modes, and the
+/// `raw_result`/`negate`/result relation must follow the resolution contract
+/// (`negate` only for `<=`/`>=`, where the expression result is a distinct
+/// logical NOT of the raw call result).
+#[allow(clippy::too_many_arguments)]
+fn exact_operator_call_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    function: FunctionInstanceId,
+    operator: Option<crate::interfaces::DesugarOperator>,
+    left: ExpressionId,
+    right: ExpressionId,
+    fact: &ExpressionFact,
+    callee: FunctionInstanceId,
+    arguments: &[ResolvedCallArgument],
+    raw_result: ValueId,
+    negate: bool,
+    result: ValueId,
+) -> bool {
+    let Some(operator) = operator else {
+        return false;
+    };
+    let (expected_swap, expected_negate) = operator.mapping();
+    if negate != expected_negate {
+        return false;
+    }
+    let (Some(left_fact), Some(right_fact)) = (
+        exact_child_expression(analysis, function, left),
+        exact_child_expression(analysis, function, right),
+    ) else {
+        return false;
+    };
+    // A reference operand carries its value in its `Value` resolution rather
+    // than a materialized expression result, matching the analyzer's
+    // `referenced.or(result)` argument rule.
+    let operand_value = |fact: &ExpressionFact| match fact.resolution {
+        ExpressionResolution::Value(value) => Some(value),
+        _ => fact.result,
+    };
+    let (Some(left_value), Some(right_value)) =
+        (operand_value(left_fact), operand_value(right_fact))
+    else {
+        return false;
+    };
+    if left_fact.ty != right_fact.ty {
+        return false;
+    }
+    let Some(SemanticTypeKind::Structure {
+        declaration: struct_declaration,
+        ..
+    }) = analysis
+        .types
+        .get(left_fact.ty.0 as usize)
+        .map(|record| &record.kind)
+    else {
+        return false;
+    };
+    let Some(instance) = analysis.functions.get(callee.0 as usize) else {
+        return false;
+    };
+    let FunctionOrigin::Source {
+        declaration: callee_declaration,
+        ..
+    } = instance.origin
+    else {
+        return false;
+    };
+    if crate::interfaces::receiver_concrete_struct(program, callee_declaration)
+        != Some(*struct_declaration)
+        || crate::interfaces::declaration_name(program, callee_declaration)
+            != Some(operator.method_name())
+        || instance.parameters.len() != 2
+        || arguments.len() != 2
+    {
+        return false;
+    }
+    let (self_source, self_value, other_source, other_value) = if expected_swap {
+        (1u32, right_value, 0u32, left_value)
+    } else {
+        (0u32, left_value, 1u32, right_value)
+    };
+    let expected = [
+        (self_source, 0u32, self_value),
+        (other_source, 1u32, other_value),
+    ];
+    for (argument, (source_index, parameter_index, value)) in arguments.iter().zip(expected) {
+        let Some(parameter) = instance.parameters.get(parameter_index as usize) else {
+            return false;
+        };
+        if argument.source_index != source_index
+            || argument.parameter_index != parameter_index
+            || argument.value != value
+            || argument.access != parameter.access
+        {
+            return false;
+        }
+    }
+    // Operand effects must be contained in the expression's recorded effects.
+    if fact.effects.0 & (left_fact.effects.0 | right_fact.effects.0)
+        != (left_fact.effects.0 | right_fact.effects.0)
+    {
+        return false;
+    }
+    let raw_value_valid = analysis
+        .values
+        .get(raw_result.0 as usize)
+        .is_some_and(|value| value.function == function && value.ty == instance.result);
+    if !raw_value_valid {
+        return false;
+    }
+    if negate {
+        // `<=`/`>=` write a distinct intermediate raw result and record the
+        // logical NOT as the expression's own result.
+        result != raw_result && fact.ty == instance.result
+    } else {
+        result == raw_result && fact.ty == instance.result
+    }
+}
+
 fn exact_scalar_binary_matches(
     analysis: &PartialAnalysis,
     function: FunctionInstanceId,
@@ -3872,18 +4130,32 @@ fn exact_runtime_source_type(
         };
         argument_types.push(exact_scalar_source_type(analysis, source)?);
     }
-    let mut matches = analysis.types.iter().filter(|candidate| {
-        matches!(&candidate.kind, SemanticTypeKind::Enumeration {
-            declaration: candidate_declaration,
-            arguments,
-            variants,
-        } if *candidate_declaration == declaration.declaration
-            && runtime_enum_arguments_supported(arguments, variants)
+    let arguments_match = |arguments: &[SemanticArgument]| {
+        arguments.len() == argument_types.len()
             && arguments.iter().zip(&argument_types).all(|(argument, expected)| {
                 matches!(argument, SemanticArgument::Type(actual) if actual == expected)
             })
-            && arguments.len() == argument_types.len())
-    });
+    };
+    let mut matches = analysis
+        .types
+        .iter()
+        .filter(|candidate| match &candidate.kind {
+            SemanticTypeKind::Enumeration {
+                declaration: candidate_declaration,
+                arguments,
+                variants,
+            } => {
+                *candidate_declaration == declaration.declaration
+                    && runtime_enum_arguments_supported(arguments, variants)
+                    && arguments_match(arguments)
+            }
+            SemanticTypeKind::Structure {
+                declaration: candidate_declaration,
+                arguments,
+                ..
+            } => *candidate_declaration == declaration.declaration && arguments_match(arguments),
+            _ => false,
+        });
     let result = matches.next()?.id;
     matches.next().is_none().then_some(result)
 }

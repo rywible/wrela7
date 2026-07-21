@@ -50,7 +50,10 @@ request, public effects are visible, and modules and build phases are defined.
 
 The prose in files 01 through 10 is normative. The worked example is
 illustrative; if it conflicts with normative prose, the prose wins. The decision
-ledger explains intent but does not override the specification.
+ledger explains intent but does not override the specification. Beyond this
+revision, normative prose for the daily-use kernel follows implementation
+evidence rather than leading it: a later edit advances a chapter only as far as
+the reference toolchain has actually built and measured.
 
 The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** carry their usual
 standards-language meanings. A paragraph headed “Rationale” is non-normative.
@@ -117,6 +120,9 @@ requires a language or target-package revision recorded in the image report.
 - Actors share no mutable state. Cross-actor calls create typed logical messages
   and move scalar/explicitly copied values, provenance-branded `iso[P]` ownership, or
   sealed linear receipts; views and `mut` loans cannot cross an actor boundary.
+  This is not Erlang/BEAM's actor model: the actor set, its mailboxes, and its
+  supervision tree are closed and sized at build time, with no dynamic process
+  spawning or hot code loading inside a sealed image.
 - Actor handles are image-wired capabilities, not mobile values. An abandoned
   peer resolves outstanding calls with typed `PeerFailed`; a failed installed
   task produces a bounded supervisor event rather than dropping its error.
@@ -129,7 +135,8 @@ requires a language or target-package revision recorded in the image report.
   `take` transfers ownership. Both effects are mirrored at non-receiver call
   arguments. Public receiver effects are explicit.
 - There is no general reference syntax. Only `projection` declarations may
-  yield `view T`/`mut view T`, and their signatures name provenance. Views are
+  yield `view T`/`mut view T`, with implicit conservative provenance over their
+  receivers and parameters. Views are
   lexical and second-class; they cannot be stored, sent, submitted to a device,
   or remain live across `await`.
 - Allocation is assigned to image, task-frame, call, request, or branded

@@ -13,6 +13,16 @@ handles, not object references. Apps are top-level workload leaves, services
 are reusable image dependencies, and drivers alone may own hardware authority;
 all three use the same turn and mailbox semantics.
 
+This is not Erlang. There is no actor registry, no dynamically assembled
+supervision topology, and no runtime process discovery. Every concrete
+`Actor[T]` handle is minted once by the image graph
+([Comptime and images](06-comptime-and-images.md)) and wired at build time;
+nothing spawns, registers, or looks up an actor while the target is running.
+This is deliberate: revision 0.1 trades Erlang-style dynamic topology for
+whole-image analyzability — the wait-for graph, mailbox capacities, and
+supervision tree described in this chapter all depend on the call graph being
+closed before boot.
+
 ```wrela
 @service
 pub struct Storage:
@@ -68,6 +78,30 @@ actor reply, runtime collection, or mutable runtime input. It cannot be created
 from or selected by a runtime actor ID. Consequently every possible
 cross-actor call edge is a concrete image-graph edge. Mobile actor handles
 require a future capability-flow analysis and are outside this revision.
+
+### 2.1 Brand aliases
+
+An actor-root struct may declare an associated `brand` alias for an
+image-bound pool it depends on:
+
+```wrela
+@service
+pub struct Storage:
+    brand Payloads
+    cache: BlockCache
+    disk: Actor[BlkDriver]
+
+    pub async fn read_file(mut self, ino: u32,
+                           take out: iso[Storage.Payloads] Bytes)
+        -> Result[iso[Storage.Payloads] Bytes, FsError]:
+        ...
+```
+
+Image construction binds `Storage.Payloads` to a concrete minted pool brand
+([Comptime and images](06-comptime-and-images.md)) exactly once, the same as
+any other brand. A public signature written against `Storage.Payloads`
+keeps compiling if the image later reshuffles which concrete pool backs it —
+only the construction site changes, not every method that names the alias.
 
 ## 3. Non-reentrant turns
 
@@ -138,18 +172,18 @@ One-way sends do not create reply-wait edges, but their admission and request
 registration edges remain in the unified graph. The compiler permits an
 infallible `send` only when mailbox capacity analysis proves a slot is
 available. `try send actor.method(...)` is the nonblocking alternative. It
-checks/reserves admission before evaluating any argument, so `rejected(reason)`
+checks/reserves admission before evaluating any argument, so `Rejected(reason)`
 leaves every source value initialized and suppresses every argument side effect.
 On success it evaluates arguments left-to-right and atomically commits the
-message; only that transition consumes `take` arguments. Its
-`admitted | rejected(AdmissionError)` result is a second-class control-flow
-carrier and cannot be stored or propagated with `?`.
+message; only that transition consumes `take` arguments. Its result is the
+ephemeral `AdmissionResult` (outcome taxonomy, §3.5) — a second-class
+control-flow carrier that cannot be stored or propagated with `?`.
 
 ```wrela
 match try send logger.record(event=take event):
-    case .admitted:
+    case .Admitted:
         pass                         # `event` was moved
-    case .rejected(reason):
+    case .Rejected(reason):
         retain_for_later(reason, event=take event)  # source still owned it
 ```
 
@@ -195,27 +229,17 @@ down for restart before resolving it, the completion resolves exactly once with
 `PeerFailed`, carrying the concrete actor identity, supervision epoch, and a
 bounded non-secret failure category.
 
-The effective result of every actor request is explicit:
-
-```text
-declared R             -> Result[R, ActorCallError[never]]
-declared Result[T, E]  -> Result[T, ActorCallError[E]]
-
-ActorCallError[E] =
-    exit(AsyncExit[E])
-  | peer_failed(PeerFailed)
-  | not_admitted(AdmissionError)
-```
-
-Variants impossible for a call may be eliminated after whole-image analysis but
-remain part of its source type. Postfix `?` converts them only through explicit
-`From` implementations. A caller cannot hang waiting for an actor epoch that
-no longer exists, and cancellation/deadline behavior is never a hidden control
-effect.
+The effective result of every actor request is `Result[R, ActorCallError[never]]`
+or `Result[T, ActorCallError[E]]` — the composed carrier defined once in the
+outcome taxonomy below (§3.5). Variants impossible for a call may be
+eliminated after whole-image analysis but remain part of its source type.
+Postfix `?` converts them only through explicit `From` implementations. A
+caller cannot hang waiting for an actor epoch that no longer exists, and
+cancellation/deadline behavior is never a hidden control effect.
 
 For a call with any `take` argument, its effective result is an
 ownership-conditioned second-class carrier until immediately consumed by `?`
-or `match`. In `not_admitted(reason)`, reservation failed before ordinary
+or `match`. In `NotAdmitted(reason)`, reservation failed before ordinary
 argument evaluation and every source remains initialized. Every other result
 means admission committed and those sources are uninitialized. Joining match
 arms must converge their linear initialization states. A call with no `take`
@@ -225,15 +249,64 @@ A successful mailbox admission consumes every `take` argument irrevocably. Peer
 failure, cancellation, forwarding, or abandonment does not reconstruct the
 caller's source place. A method that promises to return an input expresses it in
 all result variants, for example `Result[(Reply, P), (OperationError, P)]`.
-Protocols requiring recovery after publication use a sealed strict
-`TransferReceipt[P]` or `IoReceipt[P]` with a typed commit boundary. Before
-commit, every failure returns `P`; after commit, recovery follows the protocol's
-specified quiescence path or yields `OutcomeUnknown`. The compiler verifies the
-receipt implementation, not an implicit whole-program value-tracing promise.
+Protocols requiring recovery after publication use the sealed strict
+`Receipt[P]` state machine (§13) with a typed commit boundary: before it
+reaches its committed state every failure returns `P`; after, recovery follows
+the protocol's specified quiescence path or yields `OutcomeUnknown`. The
+compiler verifies the receipt implementation, not an implicit whole-program
+value-tracing promise.
 
 Peer failure, reply resolution, restart admission
 closure/reopening, and mailbox acceptance during restart are deterministic
 record/replay events.
+
+### 3.5 Outcome taxonomy
+
+wrela has one failure vocabulary for suspending activations, defined once
+here; no other section restates its variants.
+
+`AsyncExit[E]` is the core sealed outcome of any non-actor async activation:
+
+```text
+declared R             -> Result[R, AsyncExit[never]]
+declared Result[T, E]  -> Result[T, AsyncExit[E]]
+
+AsyncExit[E] =
+    Operation(E)
+  | Cancelled(Cancelled)
+  | DeadlineRejected(DeadlineRejected)
+  | DeadlineExceeded(DeadlineExceeded)
+```
+
+`ActorCallError[E]` composes it for every cross-actor request rather than
+redeclaring its variants:
+
+```text
+declared R             -> Result[R, ActorCallError[never]]
+declared Result[T, E]  -> Result[T, ActorCallError[E]]
+
+ActorCallError[E] =
+    Exit(AsyncExit[E])
+  | PeerFailed(PeerFailed)
+  | NotAdmitted(AdmissionError)
+```
+
+`AdmissionResult` is the ephemeral carrier returned by `try send` and other
+explicit admission APIs (§3.2):
+
+```text
+AdmissionResult = Admitted | Rejected(AdmissionError)
+```
+
+It shares the same `AdmissionError` that `NotAdmitted` carries: an admission
+failure has one representation whether it surfaces from a one-way `try send`
+or from a two-way actor call. `AdmissionResult` and the ownership-conditioned
+actor-call outcome (§3.4) are both ephemeral types
+([Values, views, and regions](03-values-views-regions.md)): produced only by
+an admission or call operation and consumed immediately by binding, `match`,
+or `is`. `AdmissionResult` permits only `match`/`is`, never `?`; the
+actor-call outcome additionally permits `?`, through explicit `From`
+conversions of its `ActorCallError`/`AsyncExit` causes.
 
 ## 4. Mailbox and turn bounds
 
@@ -276,18 +349,8 @@ There is no boxed future, runtime-polymorphic future, or runtime frame
 allocation. The compiler computes the frame layout after monomorphization and
 reserves the required number of slots.
 
-Every non-actor async activation completes with an explicit sealed outcome:
-
-```text
-declared R             -> Result[R, AsyncExit[never]]
-declared Result[T, E]  -> Result[T, AsyncExit[E]]
-
-AsyncExit[E] =
-    operation(E)
-  | cancelled(Cancelled)
-  | deadline_rejected(DeadlineRejected)
-  | deadline_exceeded(DeadlineExceeded)
-```
+Every non-actor async activation completes with the sealed `AsyncExit[E]`
+outcome defined once in the outcome taxonomy (§3.5).
 
 The effective outcome belongs to the awaitable/task boundary rather than being a
 catchable exception inside a canceled frame. Local/nursery callers handle or
@@ -441,8 +504,9 @@ with an ISR still uses the target's checked interrupt-ordering primitive.
 
 ## 9. Work budgets and checkpoints
 
-An `@task` or `@budget` contract bounds uninterrupted work between scheduling
-points, not device latency spent suspended.
+A single `@budget` attribute bounds uninterrupted work, at both function/task
+level and loop level, not device latency spent suspended. `@task(...,
+budget=...)` bounds a task's uninterrupted work between scheduling points:
 
 ```wrela
 @task(priority=normal, budget=us(200))
@@ -451,12 +515,13 @@ async fn drain(mut self):
 ```
 
 Every loop back edge lexically inside an async function/closure is a semantic
-checkpoint unless the loop is annotated `@uninterrupted(bound=...)`. At a
-checkpoint cancellation is observed and the scheduler may run other ready
-actors/tasks, while the current non-reentrant actor turn remains assigned to its
-frame. Implementations may elide a checkpoint only when the actor as-if rule
-proves that cancellation, scheduling, teardown, and record/replay observations
-are unchanged.
+checkpoint unless the loop itself is annotated `@budget(bound=...)`, which
+replaces that checkpoint with a build-proven maximum uninterrupted-cost bound
+instead of a scheduling point. At a checkpoint cancellation is observed and
+the scheduler may run other ready actors/tasks, while the current
+non-reentrant actor turn remains assigned to its frame. Implementations may
+elide a checkpoint only when the actor as-if rule proves that cancellation,
+scheduling, teardown, and record/replay observations are unchanged.
 
 A synchronous `fn`, synchronous `@task`, projection, scope abort/exit, and ISR
 never checkpoints or suspends implicitly. Every loop in such code—including a
@@ -469,18 +534,18 @@ The compiler proves the bound using the selected target's conservative cost
 model. A loop between suspension points is handled as follows:
 
 - an ordinary async loop is segmented at its semantic back-edge checkpoint;
-- an explicitly uninterrupted loop contributes its proven maximum iteration
-  cost;
+- a loop annotated `@budget(bound=...)` contributes its proven maximum
+  iteration cost;
 - every synchronous/ISR loop contributes its proven maximum cost; and
 - if the checkpoint is illegal because a non-suspend-safe access is live, source
-  must shorten that access or use a proven uninterrupted annotation.
+  must shorten that access or use a proven `@budget(bound=...)` annotation.
 
 A runtime async checkpoint is a suspension point. The compiler MUST NOT accept one while a
 view, mutable projection, turn-external access, or non-suspend-safe scope is
 live. It may shorten a provably dead access before the back edge, but it cannot
 change source-observable teardown or exclusivity. If the live access prevents
 the semantic checkpoint, the build fails with a diagnostic naming the access and
-suggesting an explicitly bounded uninterrupted loop only when one can be proved.
+suggesting a `@budget(bound=...)` annotation only when one can be proved.
 
 Budget reports distinguish proven instruction-time bounds from configuration
 estimates. A target without a defensible timing model may verify structural
@@ -498,7 +563,7 @@ returns a recoverable `DeadlineRejected` before starting. A runtime miss returns
 or triggers the request's timeout path; it is never silently ignored.
 
 `DeadlineRejected` occurs only inside
-`not_admitted(AdmissionError.deadline_rejected)`, before argument evaluation.
+`NotAdmitted(AdmissionError.DeadlineRejected)`, before argument evaluation.
 Once admitted, expiry closes the request lineage with cause
 `DeadlineExceeded`, runs its complete cleanup graph, and resolves the actor call
 with that typed cause. An explicitly committed external operation may additionally
@@ -520,11 +585,15 @@ with nursery(capacity=4) as children:
     results = await children.join_all()
 ```
 
+`children.start(...)` reads the ambient request lineage of its call site
+(§12); a child body neither receives nor forwards a context argument to
+inherit it.
+
 A nursery:
 
 - owns its child task-frame slots;
 - cannot outlive its parent scope;
-- propagates parent cancellation and deadlines;
+- propagates parent cancellation, deadlines, and ambient request lineage;
 - waits for or tears down every child before exit; and
 - has a statically included mailbox/frame footprint.
 
@@ -532,15 +601,57 @@ Starting beyond capacity returns `CapacityError` only when the API explicitly
 chooses runtime admission; image profiles may require proof that it cannot
 happen.
 
-## 12. Request scopes
+## 12. Request scopes and ambient lineage
 
-`with request(...)` creates one structured operation domain and mints a fresh
-proof-only region brand `R`:
+`with request(...)` opens one structured operation domain:
 
 ```wrela
-with request(deadline=now() + ms(50), budget=us(200)) as req[region R]:
-    result = await storage.read(req, path)?
+with request(deadline=now() + ms(50), budget=us(200)):
+    result = await storage.read(path)?
 ```
+
+Every `async fn` implicitly carries the **ambient request lineage** of its
+lexically enclosing `with request(...)` scope; a function with no enclosing
+scope carries its task root's lineage instead. Actor-call admission,
+`nursery.start`, and deadline/cancellation propagation all read this ambient
+lineage — an ordinary signature never declares, receives, or threads a
+request parameter. `storage.read(path)` above is admitted under the lineage
+opened one line earlier, with nothing in its argument list carrying that
+fact.
+
+Earlier drafts of this chapter wrote the same call as
+`await storage.read(req, path)?`, against a `req[region R]` binding and a
+`RequestContext[R]` parameter on `read`. Both disappear from ordinary
+signatures; the ambient lineage replaces them without changing any
+admission, deadline, or cancellation rule below — the request still mints a
+fresh proof-only region brand internally, it is simply no longer spelled out
+as a generic parameter.
+
+Two escapes exist:
+
+- an explicit `request=` argument overrides the ambient lineage for a call
+  that must run under a *different* one — genuinely rare, since it matters
+  only when a call is not lexically inside the lineage it must join; and
+- a declared `@detached` attribute marks work that is deliberately
+  independent of any enclosing request — it starts its own task-root lineage
+  rather than inheriting one.
+
+```wrela
+with request(deadline=now() + ms(50), budget=us(200)) as req:
+    send logger.record(event=take event, request=req)
+```
+
+`req` above has the sealed `RequestContext` type: a second-class admission
+descriptor carrying that lineage's request identity and epoch, inherited
+deadline/priority, cancellation ancestry, and proof-only region brand. It has
+no storable ordinary layout: it may be used repeatedly only as the immediate
+`request=` argument to a nursery or actor admission, and cannot be stored,
+returned, captured, formatted, or sent as unregistered data. Copyable
+diagnostic fields are obtained separately as `RequestMetadata`. Outside that
+override argument, `RequestContext` is otherwise a tooling-facing type only:
+**tooling MUST display, for every `async fn`, the lineage its body is
+inferred to run under** — a specific enclosing `with request(...)`, the task
+root, or `@detached` — since source no longer spells it out.
 
 The request owns:
 
@@ -551,27 +662,18 @@ The request owns:
 - any queue permits and completion tokens; and
 - any request-scoped `iso` or DMA buffers.
 
-`RequestContext[R]` is a sealed second-class admission descriptor for that exact
-lineage: request identity and epoch, inherited deadline/priority, cancellation
-ancestry, and brand `R`. It has no storable ordinary layout: it may be used
-repeatedly only as an immediate argument to a nursery or actor admission, and
-cannot be stored, returned, captured, formatted, or sent as unregistered data.
-Copyable diagnostic fields are obtained separately as `RequestMetadata`.
-The admission argument must be a bare context binding, not an arbitrary
-expression; the runtime may read it after the actor receiver and before all
-ordinary argument evaluation.
-
 Admission validates that the lineage is open and atomically creates a strict
-child-registration node before occupying the mailbox/task slot. The admitted
+child-registration node before occupying the mailbox/task slot, whether that
+lineage was read ambiently or supplied through `request=`. The admitted
 message owns that node even while queued; the receiving turn consumes it on
-completion. A stale, canceled, or expired descriptor fails admission without
+completion. A stale, canceled, or expired lineage fails admission without
 moving any other argument. This applies equally to request-associated one-way
 messages. A callee may register nested children, receipts, and cleanup nodes only
 through its owned registration, so the parent cannot resolve while queued or
 running descendants remain.
 
 Nested requests inherit cancellation and deadline. A child may narrow but not
-detach from its parent.
+detach from its parent, except by declaring `@detached`.
 
 ### 12.1 Cancellation delivery
 
@@ -616,8 +718,8 @@ admitting the synchronous driver handler. For a split virtio-blk request using
 three direct descriptors:
 
 ```wrela
-permit = await disk.admit(req, request_shape=VirtioBlkDirect3)?
-receipt = await disk.submit(req, permit=take permit, buffer=take buffer)?
+permit = await disk.admit(request_shape=VirtioBlkDirect3)?
+receipt = await disk.submit(permit=take permit, buffer=take buffer)?
 ```
 
 The permit owns the exact descriptor chain. With `QDEPTH = 128`, at most
@@ -648,8 +750,8 @@ the runtime cancels and fully tears down every loser before returning the winner
 
 ```wrela
 outcome = await race(
-    disk.read(req, lba),
-    timer.after(req, ms(20)),
+    disk.read(lba),
+    timer.after(ms(20)),
 )
 ```
 
@@ -662,26 +764,55 @@ A non-reentrant driver actor must not hold its mailbox turn for the entire
 duration of every hardware operation if it wants several requests in flight.
 The standard pattern is submission followed by a sealed receipt.
 
-A public synchronous driver method returning `IoReceipt[P]` for moved input
-`P` MUST declare `@receipt_handoff(input=parameter)`. This is an explicit
+`Receipt[P]` is the single sealed, strict-linear state machine used by every
+protocol that publishes work and later resolves or recovers it. It replaces
+the earlier separate `TransferReceipt[P]` and `IoReceipt[P]` types with one:
+
+```text
+Receipt[P] =
+    Submitted
+  | Committed
+  | Resolved(P)
+  | Recovery
+```
+
+A receipt begins in state `Submitted` at admission commit. While `Submitted`,
+any failure — cancellation, actor abandonment, driver reset — resolves it to
+`Recovery` and hands back `P` unconditionally: the underlying operation has
+not yet crossed its protocol's commit boundary, so nothing external can have
+happened. Crossing that boundary moves the receipt to `Committed`; a failure
+from there still attempts the protocol's specified quiescence path, which may
+itself resolve the receipt to `Recovery` with `P`, or may leave the outcome as
+the protocol's `OutcomeUnknown` when quiescence cannot be established.
+Successful completion resolves the receipt to `Resolved(payload)`, returning
+ownership of `P` together with the completion status the caller inspects
+afterward. Like every strict-linear awaitable, a `Receipt[P]` reaches its
+final resolution exactly once. The compiler verifies a conforming receipt
+implementation against this state machine; it is not an implicit
+whole-program value-tracing promise.
+
+A public synchronous driver method returning `Receipt[P]` for moved input `P`
+MUST declare `@receipt_handoff(input=parameter)`. This is an explicit
 compiler-verified proxy contract, not ordinary actor restoration. After
 reservation and argument evaluation, the admission commit atomically:
 
-1. moves `P` and a sealed receipt-producer endpoint into the message; and
+1. moves `P` and a sealed receipt-producer endpoint into the message,
+   entering state `Submitted`; and
 2. installs the paired strict recovery receipt in the caller frame.
 
 The generated proxy resolves its admission await with that caller-owned receipt
 at commit; it does not wait for handler execution. If the actor abandons before
 the handler publishes/rejects, supervisor cleanup consumes the queued producer
-endpoint and resolves recovery with `P`. The compiler verifies that every
-handler path consumes the producer exactly once by publishing, typed rejection,
-or supervised recovery. The annotation is legal only on `@driver`, names
-exactly one `take` input, and the returned receipt payload must be exactly that
-input type/brand. Other actor methods receive no such behavior.
+endpoint and resolves the receipt to `Recovery` with `P`. The compiler
+verifies that every handler path consumes the producer exactly once, by
+publishing (`Resolved`), typed rejection, or supervised recovery (`Recovery`).
+The annotation is legal only on `@driver`, names exactly one `take` input,
+and the returned receipt payload must be exactly that input type/brand.
+Other actor methods receive no such behavior.
 
 ```wrela
 # Quick actor turn: validate, reserve, publish, return receipt.
-receipt = await disk.submit(req, op=take operation)?
+receipt = await disk.submit(op=take operation)?
 
 # Receipt wait; its concrete bottom-half producer is in the wait-for graph.
 completion = await receipt
@@ -700,9 +831,30 @@ A client proxy MAY present these two steps as one `await disk.read(...)` call,
 but wait-for, ownership, and cancellation analysis must retain the two-stage
 semantics.
 
-Services whose state truly requires serial consistency may await a dependency
-while retaining their turn. Higher concurrency is expressed explicitly through
-sharding, child actors, or receipts—not by allowing reentrancy.
+A non-reentrant service has no equivalent mechanism of its own:
+`@receipt_handoff` is legal only on `@driver` methods, so a service cannot
+hand a client an owned recovery receipt the way a driver can. A service whose
+state truly requires serial consistency may await a dependency while
+retaining its turn; the concurrency it can offer several clients is
+expressed explicitly through sharding or child actors, not through
+reentrancy or a receipt of its own.
+
+### Open problem (revision 0.1): service-level interleaving
+
+A non-reentrant service that holds its turn across an I/O `await` serializes
+every other client behind that one turn — head-of-line blocking at the
+service, not merely FIFO ordering in its mailbox. This revision does not
+specify an answer. Candidate directions include a declared interleaving
+contract that lets specific methods run concurrently against disjoint state,
+canonized sharding patterns that turn one hot service into several
+independent actors, and head-of-line diagnostics that surface the blockage
+before it reaches production. All three are deliberately left unspecified
+until the reference appliance produces evidence about which pattern actually
+recurs. Until then, the actor-chatter diagnostic
+([Build contract](08-build-contract.md)) is required to also report this
+specific shape — "this turn awaits I/O while N senders queue" — naming the
+blocked turn and its queue depth, even though the design question it points
+at remains open.
 
 ## 14. Polling and idle behavior
 

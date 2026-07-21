@@ -1150,6 +1150,21 @@ fn validate_scalar_source_function(
     Ok(())
 }
 
+/// The callee of a direct or operator-desugared call resolution.
+const fn scalar_call_target(
+    resolution: &wrela_sema::ExpressionResolution,
+) -> Option<wrela_sema::FunctionInstanceId> {
+    match resolution {
+        wrela_sema::ExpressionResolution::DirectCall {
+            function: target, ..
+        }
+        | wrela_sema::ExpressionResolution::OperatorCall {
+            function: target, ..
+        } => Some(*target),
+        _ => None,
+    }
+}
+
 fn validate_scalar_runtime_facts(
     facts: &PartialAnalysis,
     source_function_count: usize,
@@ -1287,6 +1302,34 @@ fn supported_scalar_resolution(
                     && function.result == expression.ty
                     && is_runtime_value_type(facts, expression.ty)
             }),
+        // A desugared `core.ops` operator is a direct call plus the
+        // raw-result/negate relation: without `negate` the call writes the
+        // expression's own result; with `negate` (`<=`/`>=` only) the call
+        // writes a distinct intermediate and the expression result is its
+        // logical NOT.
+        wrela_sema::ExpressionResolution::OperatorCall {
+            function: target,
+            arguments,
+            raw_result,
+            negate,
+        } => facts
+            .functions
+            .get(target.0 as usize)
+            .is_some_and(|function| {
+                function.id == *target
+                    && function.role == FunctionRole::Ordinary
+                    && arguments.len() == function.parameters.len()
+                    && function.result == expression.ty
+                    && is_runtime_value_type(facts, expression.ty)
+                    && facts.values.get(raw_result.0 as usize).is_some_and(|raw| {
+                        raw.function == expression.function && raw.ty == function.result
+                    })
+                    && if *negate {
+                        expression.result != Some(*raw_result)
+                    } else {
+                        expression.result == Some(*raw_result)
+                    }
+            }),
         wrela_sema::ExpressionResolution::Constructor { ty, variant: None } => {
             *ty == expression.ty && is_flat_runtime_structure(facts, *ty)
         }
@@ -1330,10 +1373,7 @@ fn validate_scalar_call_graph(
     incoming.resize(source_function_count, 0u64);
     for expression in &facts.expressions {
         check_cancelled(is_cancelled)?;
-        let wrela_sema::ExpressionResolution::DirectCall {
-            function: target, ..
-        } = expression.resolution
-        else {
+        let Some(target) = scalar_call_target(&expression.resolution) else {
             continue;
         };
         let target = incoming.get_mut(target.0 as usize).ok_or(
@@ -1382,10 +1422,7 @@ fn validate_scalar_call_graph(
             .partition_point(|expression| (expression.function.0 as usize) <= function);
         for expression in &facts.expressions[start..end] {
             check_cancelled(is_cancelled)?;
-            let wrela_sema::ExpressionResolution::DirectCall {
-                function: target, ..
-            } = expression.resolution
-            else {
+            let Some(target) = scalar_call_target(&expression.resolution) else {
                 continue;
             };
             let count = incoming.get_mut(target.0 as usize).ok_or(

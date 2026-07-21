@@ -59,6 +59,7 @@ const PASSING_TEST_SOURCE: &str = include_str!(
 );
 const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.toml");
 const CORE_IMAGE_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
+const CORE_OPS_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/ops.wr");
 const CORE_RESULT_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/result.wr");
 const CORE_TIME_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/time.wr");
 const OVER_BOUND_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
@@ -108,11 +109,11 @@ fn scalar_week_conversion_rejects_one_over_bound():
 "#;
 const ADD_OVER_BOUND_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
-from core.time import add, as_nanoseconds, ns
+from core.time import as_nanoseconds, ns
 
 @test
 fn duration_addition_rejects_one_over_bound():
-    result = add(left=ns(18446744073709551615), right=ns(1))
+    result = ns(18446744073709551615) + ns(1)
     comptime assert as_nanoseconds(result) == 0, "unreachable after duration addition overflow"
 "#;
 const SCALE_OVER_BOUND_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
@@ -126,11 +127,11 @@ fn duration_scaling_rejects_one_over_bound():
 "#;
 const SUBTRACT_UNDERFLOW_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
-from core.time import as_nanoseconds, ns, subtract
+from core.time import as_nanoseconds, ns
 
 @test
 fn duration_subtraction_rejects_underflow():
-    result = subtract(left=ns(0), right=ns(1))
+    result = ns(0) - ns(1)
     comptime assert as_nanoseconds(result) == 0, "unreachable after duration subtraction underflow"
 "#;
 const CLAMP_INVERTED_BOUNDS_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
@@ -144,11 +145,11 @@ fn duration_clamp_rejects_inverted_bounds():
 "#;
 const UNSUPPORTED_ARITHMETIC_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
-from core.time import add, ns
+from core.time import ns
 
 @test
 fn duration_arithmetic_rejects_unsupported_loop():
-    result = add(left=ns(20), right=ns(22))
+    result = ns(20) + ns(22)
     loop:
         pass
 "#;
@@ -175,8 +176,8 @@ fn checked_in_time_scalar_workspace_is_canonical_and_exact_bounds_pass() {
     let workspace = load_checked_in_workspace();
     assert_eq!(workspace.canonical_lockfile(), WORKSPACE_LOCKFILE);
     assert_eq!(workspace.graph().packages().len(), 2);
-    assert_eq!(workspace.graph().modules().len(), 5);
-    assert_eq!(workspace.sources().len(), 5);
+    assert_eq!(workspace.graph().modules().len(), 6);
+    assert_eq!(workspace.sources().len(), 6);
     // The manifest declares no `[[module]]` block: modules are derived from
     // a source-root walk. Confirm the loader derived exactly the two root
     // package modules the checked-in sources provide.
@@ -334,8 +335,8 @@ fn installed_duration_arithmetic_rejects_exactly_one_over_bounds() {
     for (test_source, arithmetic, call) in [
         (
             ADD_OVER_BOUND_TEST_SOURCE,
-            b"left.nanoseconds + right.nanoseconds".as_slice(),
-            b"add(left=ns(18446744073709551615), right=ns(1))".as_slice(),
+            b"self.nanoseconds + right.nanoseconds".as_slice(),
+            b"ns(18446744073709551615) + ns(1)".as_slice(),
         ),
         (
             SCALE_OVER_BOUND_TEST_SOURCE,
@@ -399,8 +400,8 @@ fn installed_duration_subtraction_rejects_underflow_without_wrapping() {
     // this now fails with a code-prefixed `semantic-comptime-arithmetic`
     // overflow (the evaluator reports underflow the same way as overflow),
     // not an assertion-style message.
-    let arithmetic = b"left.nanoseconds - right.nanoseconds";
-    let call = b"subtract(left=ns(0), right=ns(1))";
+    let arithmetic = b"self.nanoseconds - right.nanoseconds";
+    let call = b"ns(0) - ns(1)";
     let expected_source = source_span(0, CORE_TIME_SOURCE, arithmetic);
     let expected_call = source_span(1, SUBTRACT_UNDERFLOW_TEST_SOURCE, call);
     assert_eq!(
@@ -436,7 +437,8 @@ fn installed_duration_clamp_rejects_inverted_bounds() {
     // upper.nanoseconds` (a real invariant, not an overflow guard), so this
     // still fails assertion-style (no diagnostic-code prefix), just against
     // the plain (not `_comptime`-suffixed) call spelling.
-    let assertion = b"assert lower.nanoseconds <= upper.nanoseconds, \"duration clamp lower bound exceeds its upper bound\"";
+    let assertion =
+        b"assert lower <= upper, \"duration clamp lower bound exceeds its upper bound\"";
     let call = b"clamp(value=ns(42), lower=ns(42), upper=ns(20))";
     let expected_source = source_span(0, CORE_TIME_SOURCE, assertion);
     let expected_call = source_span(1, CLAMP_INVERTED_BOUNDS_TEST_SOURCE, call);
@@ -568,13 +570,13 @@ fn installed_duration_arithmetic_has_exact_resources_and_cancellation() {
     // `std/wrela-core-0.1/src/time.wr`. The evaluator-bytes boundary is
     // unaffected (structure/argument byte accounting does not change).
     for (steps, expected) in [
-        (1167, TestOutcome::Passed),
+        (1109, TestOutcome::Passed),
         (
-            1166,
+            1108,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "comptime test exceeded comptime evaluator steps limit 1166 [source {}]",
+                    "comptime test exceeded comptime evaluator steps limit 1108 [source {}]",
                     source_span_nth(0, PASSING_TEST_SOURCE, b"42", 1),
                 ),
             },
@@ -587,19 +589,23 @@ fn installed_duration_arithmetic_has_exact_resources_and_cancellation() {
         assert_eq!(outcome, expected);
     }
     for (bytes, expected) in [
-        (896, TestOutcome::Passed),
+        (832, TestOutcome::Passed),
         (
-            895,
+            831,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "comptime test exceeded comptime evaluator bytes limit 895 [source {}; comptime calls <- {} <- {}]",
-                    source_span_nth(4, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 0,),
-                    source_span(4, CORE_TIME_SOURCE, b"ns(value=value.nanoseconds * factor)"),
+                    "comptime test exceeded comptime evaluator bytes limit 831 [source {}; comptime calls <- {} <- {}]",
+                    source_span_nth(5, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 0,),
+                    source_span(
+                        5,
+                        CORE_TIME_SOURCE,
+                        b"ns(value=self.nanoseconds + right.nanoseconds)"
+                    ),
                     source_span(
                         0,
                         PASSING_TEST_SOURCE,
-                        b"scale(value=ns(value=20), factor=2)",
+                        b"scale(value=ns(value=20), factor=2) + ns(value=2)",
                     ),
                 ),
             },
@@ -622,7 +628,7 @@ fn installed_duration_arithmetic_has_exact_resources_and_cancellation() {
         TestOutcome::Passed
     );
     let complete_polls = polls.get();
-    assert!(complete_polls > 1167);
+    assert!(complete_polls > 1109);
     let cancel_at = complete_polls / 2;
     let cancelled_polls = Cell::new(0u64);
     let cancelled = arithmetic_outcome(&fixture, AnalysisLimits::standard(), &|| {
@@ -726,20 +732,19 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
         root_identity.clone(),
         manifest.profiles[0].clone(),
     );
-
     // Empirically re-measured against the de-twinned time.wr: the manual
     // `comptime assert` bound checks in the deleted `_comptime` twins no
     // longer execute, so the exact evaluator-step boundary dropped from the
     // old dual-twin core (was 2793/2792). The evaluator-bytes boundary is
     // unaffected.
     for (steps, expected) in [
-        (2823, TestOutcome::Passed),
+        (2804, TestOutcome::Passed),
         (
-            2822,
+            2803,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "comptime test exceeded comptime evaluator steps limit 2822 [source {}]",
+                    "comptime test exceeded comptime evaluator steps limit 2803 [source {}]",
                     source_span_nth(0, PASSING_TEST_SOURCE, b"22", 0),
                 ),
             },
@@ -754,19 +759,20 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
         );
     }
     for (bytes, expected) in [
-        (1344, TestOutcome::Passed),
+        (1312, TestOutcome::Passed),
         (
-            1343,
+            1311,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "comptime test exceeded comptime evaluator bytes limit 1343 [source {}; comptime calls <- {} <- {}]",
-                    source_span_nth(4, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 0),
-                    source_span_nth(4, CORE_TIME_SOURCE, b"ns(value=selected)", 2),
-                    source_span(
+                    "comptime test exceeded comptime evaluator bytes limit 1311 [source {}; comptime calls <- {} <- {}]",
+                    source_span_nth(5, CORE_TIME_SOURCE, b"self", 5),
+                    source_span(5, CORE_TIME_SOURCE, b"selected < lower"),
+                    source_span_nth(
                         0,
                         PASSING_TEST_SOURCE,
-                        b"clamp(value=ns(value=84), lower=ns(value=20),\n        upper=ns(value=42))",
+                        b"clamp(value=ns(value=84), lower=ns(value=20), upper=ns(value=42))",
+                        1,
                     ),
                 ),
             },
@@ -798,15 +804,11 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
     let over_depth =
         loaded_source_fixture(load_checked_in_workspace(), root_identity, over_profile);
     let helper_call = source_span(
-        4,
+        5,
         CORE_TIME_SOURCE,
-        b"ns(value=left.nanoseconds - right.nanoseconds)",
+        b"ns(value=self.nanoseconds - right.nanoseconds)",
     );
-    let outer_call = source_span(
-        0,
-        PASSING_TEST_SOURCE,
-        b"subtract(left=ns(value=42), right=ns(value=42))",
-    );
+    let outer_call = source_span(0, PASSING_TEST_SOURCE, b"ns(value=42) - ns(value=42)");
     assert_eq!(
         subtraction_outcome(&over_depth, AnalysisLimits::standard(), &never_cancelled)
             .expect("over-depth installed duration subtraction"),
@@ -828,7 +830,7 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
         TestOutcome::Passed
     );
     let complete_polls = polls.get();
-    assert!(complete_polls > 2823);
+    assert!(complete_polls > 2804);
     let cancel_at = complete_polls / 2;
     for _ in 0..2 {
         let cancelled_polls = Cell::new(0u64);
@@ -850,22 +852,18 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
         root_identity.clone(),
         manifest.profiles[0].clone(),
     );
-
-    // Empirically re-measured after deleting `less_than`,
-    // `less_than_or_equal`, `greater_than`, and `greater_than_or_equal`: the
-    // test now spells every ordering check as an `as_nanoseconds(...)`
-    // comparison using the raw `<`/`<=`/`>`/`>=` operators instead of calling
-    // the deleted helpers, so the exact evaluator-step boundary dropped (was
-    // 3124/3123 when those comparison helpers were still part of the call
-    // graph).
+    // Empirically re-measured against the copy-fixed time.wr, whose
+    // comparisons now route through `impl Ord for Duration: fn less_than`
+    // (called via the raw `<`/`<=`/`>`/`>=` operators rather than the
+    // deleted free-function comparison helpers).
     for (steps, expected) in [
-        (2506, TestOutcome::Passed),
+        (2153, TestOutcome::Passed),
         (
-            2505,
+            2152,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "comptime test exceeded comptime evaluator steps limit 2505 [source {}]",
+                    "comptime test exceeded comptime evaluator steps limit 2152 [source {}]",
                     source_span_nth(0, PASSING_TEST_SOURCE, b"42", 6),
                 ),
             },
@@ -877,22 +875,21 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
             .expect("step-bounded installed duration ordering");
         assert_eq!(outcome, expected);
     }
-    // The evaluator-bytes boundary's cross-function-call chain used to
-    // bottom out in the deleted `less_than` helper (called from `max`);
-    // `max` now performs that comparison inline, so the chain instead runs
-    // through `max`'s own `ns` constructor call down to the same
-    // `Duration(nanoseconds=value)` leaf inside `ns`.
+    // The evaluator-bytes boundary's cross-function-call chain now bottoms
+    // out earlier, inside `max`'s own `if left < right:` comparison (which
+    // calls into `impl Ord for Duration: fn less_than`'s `self` reference),
+    // rather than in the subsequent `ns` constructor call.
     for (bytes, expected) in [
-        (1472, TestOutcome::Passed),
+        (1632, TestOutcome::Passed),
         (
-            1471,
+            1631,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "comptime test exceeded comptime evaluator bytes limit 1471 [source {}; comptime calls <- {} <- {}]",
-                    source_span_nth(4, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 0),
-                    source_span_nth(4, CORE_TIME_SOURCE, b"ns(value=selected)", 1),
-                    source_span(0, PASSING_TEST_SOURCE, b"max(left=zero, right=forty_two)",),
+                    "comptime test exceeded comptime evaluator bytes limit 1631 [source {}; comptime calls <- {} <- {}]",
+                    source_span_nth(5, CORE_TIME_SOURCE, b"self", 5),
+                    source_span(5, CORE_TIME_SOURCE, b"left < right"),
+                    source_span(0, PASSING_TEST_SOURCE, b"max(left=zero, right=forty_two)"),
                 ),
             },
         ),
@@ -924,7 +921,10 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
     // helper (called from `min`); `min` now performs that comparison inline,
     // so the depth-3 call it still makes runs straight through to its own
     // `ns` constructor call.
-    let helper_call = source_span_nth(4, CORE_TIME_SOURCE, b"ns(value=selected)", 0);
+    // `min`'s own `if left <= right:` comparison (routed through the `<=`
+    // operator) is now the depth-exceeding frame directly, rather than a
+    // deleted `less_than` helper or a subsequent `ns` constructor call.
+    let helper_call = source_span(5, CORE_TIME_SOURCE, b"left <= right");
     let outer_call = source_span(
         0,
         PASSING_TEST_SOURCE,
@@ -951,7 +951,7 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
         TestOutcome::Passed
     );
     let complete_polls = polls.get();
-    assert!(complete_polls > 2506);
+    assert!(complete_polls > 2153);
     let cancel_at = complete_polls / 2;
     let cancelled_polls = Cell::new(0u64);
     let cancelled = ordering_outcome(&fixture, AnalysisLimits::standard(), &|| {
@@ -1115,27 +1115,35 @@ fn installed_runtime_duration_functions_reach_canonical_machine_and_native_objec
             }
         }
     }
+    // Empirically re-measured against the operator-desugared model: `<`,
+    // `<=`, `>`, and `>=` now compile as calls into `impl Ord for Duration:
+    // fn less_than` (rather than an inlined comparison per call site), so
+    // exactly one `Less` binary op appears -- the single literal
+    // `self.nanoseconds < right.nanoseconds` inside `less_than`'s own body
+    // -- and no `LessEqual` op appears at all (`<=`/`>`/`>=` are expressed
+    // as calls plus argument order/negation, not a distinct binary op).
+    // `add`/`subtract` are likewise now separate `impl Add`/`impl Sub`
+    // functions with exactly one checked binary op each in their own
+    // bodies (was 2/2 when arithmetic was still partly inlined).
+    // `min`/`max`/`clamp` no longer end with a `ns(value=selected)` call,
+    // so `projects` drops to the sum of the leaf field-accessing bodies
+    // (`as_nanoseconds`:1, `add`:2, `subtract`:2, `less_than`:2, `scale`:1 =
+    // 8), while `copies` rises to the sum of `min`'s 2, `max`'s 2, and
+    // `clamp`'s 3 `copy`-annotated reassignments (was 1, from a different
+    // pre-copy-fix shape). `branches` (4: one `if` each in `min`/`max`,
+    // two in `clamp`) is unaffected.
     assert_eq!(semantic_aggregates, 1);
-    assert_eq!(semantic_projects, 22);
+    assert_eq!(semantic_projects, 8);
     assert_eq!(semantic_checked_multiplies, 8);
-    assert_eq!(semantic_checked_adds, 2);
-    assert_eq!(semantic_checked_subtracts, 2);
+    assert_eq!(semantic_checked_adds, 1);
+    assert_eq!(semantic_checked_subtracts, 1);
     semantic_comparisons.sort_by_key(|operator| match operator {
         SemanticBinaryOperator::Less => 0,
         SemanticBinaryOperator::LessEqual => 1,
         _ => 2,
     });
-    assert_eq!(
-        semantic_comparisons,
-        [
-            SemanticBinaryOperator::Less,
-            SemanticBinaryOperator::Less,
-            SemanticBinaryOperator::Less,
-            SemanticBinaryOperator::LessEqual,
-            SemanticBinaryOperator::LessEqual,
-        ]
-    );
-    assert_eq!(semantic_copies, 1);
+    assert_eq!(semantic_comparisons, [SemanticBinaryOperator::Less]);
+    assert_eq!(semantic_copies, 7);
     assert_eq!(semantic_branches, 4);
 
     let (semantic_wir, _) = semantic.into_parts();
@@ -1216,27 +1224,20 @@ fn installed_runtime_duration_functions_reach_canonical_machine_and_native_objec
             }
         }
     }
+    // Same operator-desugared shape as the SemanticWir counts above (FlowWir
+    // preserves the same operation counts 1:1 from SemanticWir here).
     assert_eq!(flow_aggregates, 1);
-    assert_eq!(flow_projects, 22);
+    assert_eq!(flow_projects, 8);
     assert_eq!(flow_checked_multiplies, 8);
-    assert_eq!(flow_checked_adds, 2);
-    assert_eq!(flow_checked_subtracts, 2);
+    assert_eq!(flow_checked_adds, 1);
+    assert_eq!(flow_checked_subtracts, 1);
     flow_comparisons.sort_by_key(|operator| match operator {
         FlowBinaryOp::Less => 0,
         FlowBinaryOp::LessEqual => 1,
         _ => 2,
     });
-    assert_eq!(
-        flow_comparisons,
-        [
-            FlowBinaryOp::Less,
-            FlowBinaryOp::Less,
-            FlowBinaryOp::Less,
-            FlowBinaryOp::LessEqual,
-            FlowBinaryOp::LessEqual,
-        ]
-    );
-    assert_eq!(flow_copies, 1);
+    assert_eq!(flow_comparisons, [FlowBinaryOp::Less]);
+    assert_eq!(flow_copies, 7);
     assert_eq!(flow_branches, 4);
     flow_call_edges.sort();
     assert_eq!(flow_call_edges, expected_runtime_call_edges());
@@ -1327,25 +1328,19 @@ fn installed_runtime_duration_functions_reach_canonical_machine_and_native_objec
             }
         }
     }
-    assert_eq!(machine_bitcasts, 24);
+    // Bitcasts track the fewer Duration<->u64 field accesses/aggregates in
+    // the operator-desugared shape above (was 24; the projects/aggregates
+    // count driving them dropped from 22/1 to 8/1).
+    assert_eq!(machine_bitcasts, 16);
     assert_eq!(machine_checked_multiplies, 8);
-    assert_eq!(machine_checked_adds, 2);
-    assert_eq!(machine_checked_subtracts, 2);
+    assert_eq!(machine_checked_adds, 1);
+    assert_eq!(machine_checked_subtracts, 1);
     machine_comparisons.sort_by_key(|predicate| match predicate {
         IntegerPredicate::UnsignedLess => 0,
         IntegerPredicate::UnsignedLessEqual => 1,
         _ => 2,
     });
-    assert_eq!(
-        machine_comparisons,
-        [
-            IntegerPredicate::UnsignedLess,
-            IntegerPredicate::UnsignedLess,
-            IntegerPredicate::UnsignedLess,
-            IntegerPredicate::UnsignedLessEqual,
-            IntegerPredicate::UnsignedLessEqual,
-        ]
-    );
+    assert_eq!(machine_comparisons, [IntegerPredicate::UnsignedLess]);
     assert_eq!(machine_branches, 4);
     machine_call_edges.sort();
     assert_eq!(machine_call_edges, expected_runtime_call_edges());
@@ -1390,6 +1385,7 @@ fn expected_runtime_call_edges() -> Vec<(String, String)> {
     const CLAMP: &str = "wrela-core@0.1.0::time::clamp";
     const DAYS: &str = "wrela-core@0.1.0::time::days";
     const HOURS: &str = "wrela-core@0.1.0::time::hours";
+    const LESS_THAN: &str = "wrela-core@0.1.0::time::less_than";
     const MAX: &str = "wrela-core@0.1.0::time::max";
     const MILLISECONDS: &str = "wrela-core@0.1.0::time::ms";
     const MIN: &str = "wrela-core@0.1.0::time::min";
@@ -1408,8 +1404,16 @@ fn expected_runtime_call_edges() -> Vec<(String, String)> {
         }
     };
     push("__wrela_test_entry", TEST, 1);
-    push(TEST, AS_NANOSECONDS, 22);
+    // The `<`/`<=`/`>`/`>=` comparisons on `before`, `before_or_equal`,
+    // `after`, and `after_or_equal` now desugar to four direct calls into
+    // `impl Ord for Duration: fn less_than` -- the native operator proof for
+    // this suite -- rather than an inlined comparison. `as_nanoseconds` is
+    // called from exactly the 14 call sites that wrap a `Duration` result
+    // (the four raw comparisons above return `bool` directly and no longer
+    // route through `as_nanoseconds`).
+    push(TEST, AS_NANOSECONDS, 14);
     push(TEST, NANOSECONDS, 21);
+    push(TEST, LESS_THAN, 4);
     for callee in [
         ADD,
         CLAMP,
@@ -1427,14 +1431,21 @@ fn expected_runtime_call_edges() -> Vec<(String, String)> {
     ] {
         push(TEST, callee, 1);
     }
+    // `min`/`max`/`clamp` no longer end with `return ns(value=selected)` --
+    // they return the branch-joined `selected: Duration` local directly, so
+    // they no longer call `ns` at all. Their `<`/`<=` comparisons instead
+    // call `less_than` directly: once each for `min`'s `left <= right` and
+    // `max`'s `left < right`, and three times for `clamp`'s
+    // `assert lower <= upper`, `if selected < lower`, and
+    // `if upper < selected`.
+    push(MIN, LESS_THAN, 1);
+    push(MAX, LESS_THAN, 1);
+    push(CLAMP, LESS_THAN, 3);
     for caller in [
         ADD,
-        CLAMP,
         DAYS,
         HOURS,
-        MAX,
         MILLISECONDS,
-        MIN,
         MINUTES,
         SCALE,
         SECONDS,
@@ -1494,6 +1505,7 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
             &canonical_core_manifest,
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
+                content_record("ops.wr", CORE_OPS_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
                 content_record("time.wr", CORE_TIME_SOURCE),
             ],
@@ -1555,6 +1567,7 @@ fn source_fixture(
     );
     let image = add_source(&mut sources, "conformance/image.wr", IMAGE_SOURCE, 0x83);
     let core_image = add_source(&mut sources, "core/image.wr", CORE_IMAGE_SOURCE, 0x84);
+    let core_ops = add_source(&mut sources, "core/ops.wr", CORE_OPS_SOURCE, 0x8b);
     let mut graph = PackageGraphBuilder::new(root_identity.clone());
     let core_package = graph
         .add_package(PackageIdentity {
@@ -1582,7 +1595,11 @@ fn source_fixture(
             )
             .expect("conformance module");
     }
-    for (module, file) in [(["image"], core_image), (["time"], core_time)] {
+    for (module, file) in [
+        (["image"], core_image),
+        (["ops"], core_ops),
+        (["time"], core_time),
+    ] {
         graph
             .add_module(
                 core_package,
@@ -1781,6 +1798,7 @@ fn load_checked_in_workspace() -> LoadedWorkspace {
                 manifest_bytes: CORE_MANIFEST.to_vec(),
                 sources: vec![
                     source_input("image.wr", CORE_IMAGE_SOURCE),
+                    source_input("ops.wr", CORE_OPS_SOURCE),
                     source_input("result.wr", CORE_RESULT_SOURCE),
                     source_input("time.wr", CORE_TIME_SOURCE),
                 ],

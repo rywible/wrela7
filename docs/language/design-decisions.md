@@ -38,7 +38,24 @@ when an early proposal and a later review disagreed.
 | Wrapping shift | `<<%` removed; wrapping +%/-%/*% remain. |
 | Outcome types | ActorCallError composes AsyncExit instead of duplicating its variants. |
 | Module list | Manifest [[module]] table removed; module set derived from source_root with verified module-declaration bijection. |
-| Integer widths | u128/i128 considered for removal, retained (implemented, low surface cost). |
+| Integer widths | u128/i128 first retained, then removed from 0.1 (decision reversed after two independent reviews: the bounded-appliance domain does not need 128-bit arithmetic, and every width multiplies checked-arithmetic/format/wire obligations; GUID-shaped data is `Bytes[16]`). |
+| Test tiers | `@test(runtime)` forces the runtime tier explicitly; routing-by-legality alone bred the tier-guard `while` incantation in examples. Intent is declared, not smuggled through an illegal construct. |
+| Argument labels | Declaration-owned (Swift lesson): parameters are label-required by default; `_` declares positional-only. Exactly one legal spelling per call site; replaces "positional until first named". |
+| Comptime contract | Public comptime-callability is a declared, compiler-verified `@comptime` marker on pub functions (cross-package); in-package stays inferred. Mirrors the receiver-effect rule: inferred privately, spelled publicly. |
+| POD duplication | `copy struct` opt-in: scalar-recursive pointer-free types duplicate implicitly; explicit `copy` remains for everything else. The C++ lesson is about non-POD implicit copies, not 8-byte values. `SlotMap.Key`/`RequestMetadata` re-specified through the marker instead of by fiat. |
+| Expression forms | `if` and `match` are expressions (inline `if c: a else: b`; block-form match-as-value with divergence-or-value arms). Statement-only forms taxed every binding with rebinding ceremony, measured in our own stdlib and worked example. |
+| Request lineage | Ambient by default: async fns implicitly carry the lexically enclosing request lineage; explicit `request=` override and `@detached` cover the exceptions; tooling displays the inference. Optional explicit threading is the C#/Go propagation-gap failure mode. `[region R]`/`RequestContext` leave ordinary signatures. |
+| Ephemeral types | The five second-class carriers (projection carrier, AdmissionResult, actor-call outcome, and peers) unify under one declared `ephemeral` concept with enumerated per-type deviations. |
+| Receipts | `TransferReceipt`/`IoReceipt` merged into one `Receipt[P]` state machine with named states; all strict-linear and recovery rules preserved. |
+| Evidence wrappers | `Untrusted[T]` and `Validated[F, T]` are two instantiations of one evidence-wrapper family (taint-in vs proof-out). |
+| Work bounds | `@budget` and `@uninterrupted` merged into one `@budget` attribute covering function-level and loop-level bounds. |
+| Prelude | A fixed, shadowable prelude: `Option`, `Some`, `None`, `Result`, `Ok`, `Err`, `panic`. Everything else is imported. |
+| Iteration | Revision 0.1 iterates a closed builtin set (ranges, arrays, container operations); a general user-defined iteration protocol is deliberately excluded until driver evidence demands one. |
+| Deriving | A sealed compiler-built-in `deriving(Eq, Format, From)` clause with a closed list; removes the error-conversion boilerplate farm without opening a macro system. |
+| Naming and capacity | Variants are CamelCase constructors (lint-enforced); `..N` spells bounded runtime occupancy, plain `N`/`[T; N]` spells exact extent. |
+| Doc comments | `##` documentation comments attach to the following declaration and feed tooling. |
+| Lockfiles | Dropped from revision 0.1: with exactly one acquirable package (the toolchain `core` component), a lock pins no choice. Returns with real third-party acquisition. |
+| Service reentrancy | Open problem, deliberately unspecified in 0.1: non-reentrant services holding turns across I/O awaits serialize clients (the Orleans lesson). Candidate mechanisms wait on reference-appliance evidence; head-of-line diagnostics are required meanwhile. |
 
 ## Why actors are in revision 0.1
 
@@ -100,3 +117,36 @@ structured cancellation and DMA ownership agree.
 The census counted roughly 225 user-facing concepts across the chapters. The
 standing cap is 100. A change introducing a new named concept must name the
 concept it retires or subsumes.
+
+The census counts concept FAMILIES, not spellings: one ephemeral-type concept,
+one evidence-wrapper family, one brand concept with three introduction sites,
+one access lattice at two scopes, and attribute families rather than individual
+attributes. After the recorded merges (ephemeral carriers −4, receipts −1,
+outcome taxonomy −2, work bounds −1, evidence wrappers −1, ambient lineage −2,
+brand consolidation −2, access lattice −1, u128/i128 −2) the honest estimate is
+roughly 190 against the cap; the remaining gap closes only through further
+retirements, never by re-counting.
+
+## Bets register
+
+A bet is a design decision whose correctness we cannot yet check. Each entry
+names its falsifier — the concrete evidence that would confirm or reverse it.
+Wrong-but-tracked is recoverable; wrong-but-implicit fossilizes.
+
+| Bet | Falsifier |
+|---|---|
+| Wait-for-graph acyclicity rejects few enough correct programs to keep | The reference virtio appliance: count restructurings of correct code required to satisfy the analyzer. The actor chapter does not freeze before this runs. |
+| Multicore will not change application APIs | A written 2-core semantic sketch showing non-reentrancy, per-vector IRQ ownership, mailbox ordering, and record/replay survive. Until then chapter 01 states a tracked bet, not a guarantee. |
+| `view`/projections earn their concept-budget rent | The first real driver: if the appliance needs projections beyond closure accessors and `with`-scoped access, they stay; otherwise they are cut before freeze. |
+| Verified `@comptime` markers prevent silent stdlib comptime breakage | The first stdlib upgrade that changes a marked function's closure: breakage must surface at the declaring package, not a consumer. |
+| Non-reentrant services are usable for I/O-bound work with only sharding/receipt patterns | The appliance's Storage actor under concurrent client load; head-of-line diagnostics measure queue-behind-latency incidents. |
+| Ambient request lineage covers real programs with rare explicit overrides | Frequency of `request=` overrides and `@detached` in the appliance; if overrides dominate, ambient was the wrong default. |
+| Dropping lockfiles from 0.1 loses nothing real | The arrival of third-party package acquisition; the lockfile returns designed against real requirements. |
+
+## Prose follows evidence
+
+Normative ergonomics prose in chapters 02–04 now follows implementation
+evidence: the daily-use kernel (expression `if`/`match`, POD copy, read-param
+loans, prelude, iteration, one end-to-end request-scoped I/O path) is
+implemented and exercised before further normative surface is added. The spec
+does not run ahead of what the worked example and the verticals have paid for.

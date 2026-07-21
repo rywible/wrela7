@@ -33,12 +33,24 @@ No call marker means read access, not an implicit copy. Core scalars duplicate
 implicitly. Every independent non-scalar duplicate is written `copy value`;
 otherwise assignment and value construction move their operand.
 
+These three levels form one lattice, `read < mut < take`, applied at two
+scopes: here, access is scoped to a single call; in views (§4), the same
+lattice projects across a lexical span that can outlive any one call. Both
+scopes are checked by the same exclusivity rule (§3); only the scope differs.
+
 ## 2. Copyable and linear values
 
-Scalars, structs, arrays, tuples, and enums composed entirely of copyable
-payloads are copyable. Copyability is structural and has no size heuristic.
-Duplicating a non-scalar copyable value requires the explicit `copy` expression
-and produces an independent value.
+Copyable values split into two classes, both structural with no size
+heuristic. **Implicit copyable** values duplicate like scalars, with no `copy`
+keyword: core scalars, and any `copy struct` declaration (grammar in
+[Source language](02-source-language.md)) whose every field is itself a scalar
+or, recursively, a copy struct, and which carries no linear, `iso`, view, or
+brand content. Writing `copy` on an implicit copyable value is legal but
+redundant and is a lint. **Explicit copyable** values are every other
+structurally copyable value — an ordinary struct, array, tuple, or enum
+composed entirely of copyable payloads, but not itself declared `copy
+struct`. Duplicating one requires the explicit `copy` expression and produces
+an independent value.
 
 Values of `linear struct` declarations, capabilities, queue permits, completion
 tokens, `iso` handles, region handles, and values that contain any of them are
@@ -96,7 +108,29 @@ Disjoint constant fields and array indexes MAY be proven separate. When
 disjointness cannot be proved, source can move values into separate locals or
 use a standard-library split operation whose contract proves separation.
 
-## 4. Views: second-class projections
+## 4. Ephemeral types and views
+
+### 4.1 Ephemeral types
+
+An ephemeral type is produced only by specific operations and must be
+consumed immediately: by a binding, `match`/`is`, or `?`. It can never be
+stored in a field, returned from an ordinary `fn`, captured by an escaping
+closure, sent in an actor message, or held live across a suspension point
+(`await`, `yield_now`, task suspension) or other checkpoint (ISR return,
+cancellation). This is the one restriction; every ephemeral shape below is
+this restriction applied to one carrier, not a separately repeated rule.
+
+`view T` and `mut view T` (§4.2) are ephemeral types. The projection carrier
+(§4.5) — the `Option[view T]` or `Result[view T, E]` a projection returns — is
+the first ephemeral type this chapter specifies fully, with one addition to
+the baseline consumer list: alongside binding, `match`/`is`, and `?`, it may
+also be consumed by a view-binding destructure such as
+`item: mut view Item = table.entry(key)?`.
+[Actors and async](04-actors-and-async.md) defines its own ephemeral types over
+admission and actor-call outcomes, each with its own enumerated deviations from
+this baseline.
+
+### 4.2 Views as projections
 
 `view T` is a read-only projection of storage owned elsewhere. `mut view T` is
 an exclusive read-write projection. Neither is a general reference and neither
@@ -110,7 +144,7 @@ hdr: view Header = header(packet)
 validate(hdr)
 ```
 
-### 4.1 Lexical lifetime
+### 4.3 Lexical lifetime
 
 A view's lifetime is derived lexically:
 
@@ -144,26 +178,31 @@ projection longer(a: Bytes, b: Bytes) -> view Bytes:
 The result conservatively depends on both inputs. Neither source may be mutated
 while the caller's result remains live.
 
-### 4.2 What a view cannot do
+When a call is blocked because provenance conservatively retains one of its
+arguments, the compiler MUST name both the frozen parameter and the blocking
+projection in the diagnostic:
 
-A view MUST NOT:
+```text
+error[access]: `key` is conservatively retained because it is a parameter of
+projection `entry`
+```
 
-- be stored in a struct field;
-- be inserted into a collection or `iso` value;
-- be captured by an escaping closure;
-- be included in an actor message;
-- be submitted to a device;
-- remain live across `await`, `yield_now`, task suspension, or an ISR return;
+### 4.4 What a view cannot do
+
+A view is an ephemeral type (§4.1) and inherits that restriction in full: it
+cannot be stored, returned, captured, sent, or held live across a suspension
+or checkpoint. In addition, a view MUST NOT:
+
 - outlive its source; or
 - cross a scope whose teardown may invalidate its source.
 
 ```wrela
 struct Holder:
-    held: view Bytes             # compile error: fields cannot contain views
+    held: view Bytes             # compile error: ephemeral, §4.1 — cannot be stored
 
 async fn bad(mut self):
     block = self.cache.peek(7)
-    await timer.sleep(ms(1))     # compile error: `block` is live across await
+    await timer.sleep(ms(1))     # compile error: ephemeral, §4.1 — live across await
     consume(block)
 ```
 
@@ -188,7 +227,7 @@ A private helper on an external argument is legal only when that argument's
 access ends before its first reachable `await`. In every case an async return
 type cannot contain a view.
 
-### 4.3 Read and mutable projections
+### 4.5 Read and mutable projections
 
 A `view T` freezes its source against mutation but may coexist with other read
 views. A `mut view T` exclusively loans the projected storage; the entire source
@@ -220,14 +259,14 @@ This is the zero-copy read/modify/write mechanism. It replaces holding a stored
 reference or copying an entire cache line merely to patch one field.
 
 A projection has exactly one view leaf, optionally wrapped in `Option[view T]`
-or `Result[view T, E]`. That wrapped form is legal only as a second-class
-projection carrier: it is consumed immediately by a view binding/destructure,
-`?`, or `match`; only the selected view or the owned error/`None` path
-survives. It has no ordinary storage layout, cannot be rebound as a value, and
-cannot itself cross `await`. An unsuccessful projection path executes no
-`yield` and releases every temporary access before returning.
+or `Result[view T, E]`. This wrapped form is the projection carrier defined in
+§4.1, the first ephemeral type this chapter specifies fully: only the selected
+view or the owned error/`None` path survives consumption. It has no ordinary
+storage layout, cannot be rebound as a value, and cannot itself cross `await`.
+An unsuccessful projection path executes no `yield` and releases every
+temporary access before returning.
 
-### 4.4 Iteration
+### 4.6 Iteration
 
 An iterator that yields `view T` holds a read projection of its collection for
 the iteration. Mutation of that collection during the loop is a compile error.
@@ -253,13 +292,18 @@ identifies every brand, pool, allocation authority, owner, and capacity. `iso`
 does not mean “garbage collected” and does not make an unbounded allocation
 legal.
 
-Brands are generative capabilities, not user-chosen zero-sized tags. Every image
-pool declaration mints a fresh nominal brand whose identity includes the image
-node, even when two declarations use the same display name or element type. A
-source brand name may only bind that minted identity; it cannot be reused by a
-second pool. Every dynamic request activation similarly introduces an unnameable
-fresh brand parameter `R`. Equality, conversion, or substitution between two
-fresh brands is impossible, and no cast erases a brand. The compiler rejects a
+`brand` is one generative-identity mechanism introduced at three sites: an
+explicit module-scope `brand Name` declaration, bound to exactly one
+pool/device/vector node at image construction
+([Source language](02-source-language.md)); an image pool declaration, which
+mints its brand the same way even when the pool names no separate `brand`
+declaration; and a dynamic request activation, which mints an unnameable fresh
+brand parameter `R` (§6.4). In every case the brand is generative, not a
+user-chosen zero-sized tag: its identity includes the minted node, so two
+declarations sharing a display name or element type still mint distinct
+brands; a source brand name may only bind the identity it mints and cannot be
+reused for a second node; equality, conversion, or substitution between two
+fresh brands is impossible; no cast erases a brand; and the compiler rejects a
 brand that escapes the declaration/scope that minted it.
 
 A request-backed brand `R` is scoped to that exact dynamic request lineage. It
@@ -314,7 +358,7 @@ Ordinary actor admission transfers `buffer` irrevocably when enqueue succeeds.
 A later peer failure does not reconstruct it. APIs that promise return of an
 input must encode that promise in their reply type and implementation, for
 example `Result[(Reply, P), (CallError, P)]`, or consume it into a sealed
-`TransferReceipt[P]` before publication. Such a receipt owns the payload until
+`Receipt[P]` before publication. Such a receipt owns the payload until
 a typed `commit` transition; before commit every failure returns `P`, while
 after commit failure may be `OutcomeUnknown` unless the external protocol proves
 quiescence. Device receipts use this explicit model. A suspend-safe outer scope
@@ -369,11 +413,12 @@ or a call graph whose stack bound cannot be established is a build error.
 ### 6.4 Request region
 
 A request region is a nested, suspend-safe region opened by
-`with request(...) as req[region R]`, where `R` is a fresh unnameable brand for
-that activation. It owns a deadline, cancellation state, cleanup dependency
-graph, child task slots, queue permits, and request-scoped buffers. It may live
-across `await` because its handle is part of the task frame. The source may omit
-`[R]` when it never names a request-backed type; tooling always displays it.
+`with request(...) as req:`. The compiler mints a fresh unnameable brand `R`
+for that activation internally; source never spells it, and tooling displays
+it in diagnostics and reports. The region owns a deadline, cancellation state,
+cleanup dependency graph, child task slots, queue permits, and request-scoped
+buffers. It may live across `await` because its handle is part of the task
+frame.
 
 Normal completion resets it. Cancellation or abandonment first initiates its
 generated teardown. Pure memory/resource actions run immediately; in-flight DMA
@@ -462,28 +507,28 @@ torn down. The compiler emits those actions before resetting the bump pointer.
 ## 10. Graph-shaped data
 
 Stored object references and intrusive pointers are not the revision 0.1 graph
-model. The standard pattern is `SlotMap[T, N]`:
+model. The standard pattern is `SlotMap[T, ..N]`:
 
 ```wrela
-map: SlotMap[Node, 1024]
+map: SlotMap[Node, ..1024]
 key = map.insert(value=take node)?
 match map.get(key):
     case .Some(node):
         inspect(node)
     case .None:
-        return Err(GraphError.stale_key)
+        return Err(GraphError.StaleKey)
 ```
 
-`SlotMap[T, N]` mints a fresh non-wrapping instance ID at construction, and its
-`Key` is the copyable `(map_id, index, generation)` value. Removing a slot
-increments its generation before reuse. A generation never wraps: a slot at its
-maximum generation is permanently retired, and insertion returns
+`SlotMap[T, ..N]` mints a fresh non-wrapping instance ID at construction, and
+its `Key` is a `copy struct` (§2) over `(map_id, index, generation)`. Removing
+a slot increments its generation before reuse. A generation never wraps: a
+slot at its maximum generation is permanently retired, and insertion returns
 `GenerationExhausted` if no unretired free slot exists. `get` and `get_mut`
 compare all three fields and return `None` for a foreign-map or stale key,
 preventing cross-map confusion and ABA reuse.
-Their `Option[view T]` results are second-class carriers consumed by the
-immediate `match`. Links between nodes store keys. Accessors return lexical
-views, never storable references.
+Their `Option[view T]` results are the projection carrier (§4.1), consumed by
+the immediate `match`. Links between nodes store keys. Accessors return
+lexical views, never storable references.
 
 A container and its elements share a region. A container of `iso[P] T` owns
 only the handles; the branded pointed-to regions remain independently
@@ -500,7 +545,7 @@ previously added element.
 with irqs_masked():
     update_route()
 
-with request(deadline=deadline) as req[region R]:
+with request(deadline=deadline) as req:
     ...
 
 with device.claimed() as claim:

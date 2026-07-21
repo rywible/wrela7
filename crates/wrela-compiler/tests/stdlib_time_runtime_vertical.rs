@@ -71,12 +71,18 @@ const APPLICATION_SOURCE: &str =
     include_str!("../../../std/examples/stdlib-time-runtime/src/runtime/time_test.wr");
 const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.toml");
 const CORE_IMAGE_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
+const CORE_OPS_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/ops.wr");
 const CORE_RESULT_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/result.wr");
 const CORE_TIME_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/time.wr");
 const PASS_SELECTOR: &str = "installed_core_time_executes_in_qemu";
 const FAILURE_SELECTOR: &str = "typed_checked_failure_reaches_qemu";
 const IMAGE_NAME: &str = "stdlib-time-runtime";
-const SOURCE_PATHS: [&str; 3] = ["core/image.wr", "core/time.wr", "runtime/time_test.wr"];
+const SOURCE_PATHS: [&str; 4] = [
+    "core/image.wr",
+    "core/ops.wr",
+    "core/time.wr",
+    "runtime/time_test.wr",
+];
 
 static HASHER: SoftwareSha256 = SoftwareSha256;
 static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -120,13 +126,10 @@ fn checked_in_runtime_workspace_is_canonical_and_names_two_exact_source_tests() 
             "selector must name exactly one source test"
         );
     }
-    assert!(APPLICATION_SOURCE.contains("from core.time import add, as_nanoseconds, ns"));
+    assert!(APPLICATION_SOURCE.contains("from core.time import as_nanoseconds, ns"));
     assert!(APPLICATION_SOURCE.contains("as_nanoseconds(value=ns(value=42))"));
-    assert!(APPLICATION_SOURCE.contains("add(left=ns(value=20), right=ns(value=22))"));
-    assert!(
-        APPLICATION_SOURCE
-            .contains("as_nanoseconds(value=ns(value=41)) < as_nanoseconds(value=ns(value=42))")
-    );
+    assert!(APPLICATION_SOURCE.contains("as_nanoseconds(value=ns(value=20) + ns(value=22))"));
+    assert!(APPLICATION_SOURCE.contains("ordered: bool = ns(value=41) < ns(value=42)"));
     assert!(APPLICATION_SOURCE.contains("value: u8 = left << count"));
 }
 
@@ -173,8 +176,7 @@ fn installed_core_time_source_reaches_real_test_harness_machine_and_native_objec
             "wrela-core@0.1.0::time::add",
             "wrela-core@0.1.0::time::as_nanoseconds",
             "wrela-core@0.1.0::time::as_nanoseconds",
-            "wrela-core@0.1.0::time::as_nanoseconds",
-            "wrela-core@0.1.0::time::as_nanoseconds",
+            "wrela-core@0.1.0::time::less_than",
             "wrela-core@0.1.0::time::ns",
             "wrela-core@0.1.0::time::ns",
             "wrela-core@0.1.0::time::ns",
@@ -1155,6 +1157,7 @@ fn source_fixture(application_source: &str) -> SourceFixture {
             CORE_MANIFEST,
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
+                content_record("ops.wr", CORE_OPS_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
                 content_record("time.wr", CORE_TIME_SOURCE),
             ],
@@ -1165,8 +1168,9 @@ fn source_fixture(application_source: &str) -> SourceFixture {
     };
     let mut sources = SourceDatabase::default();
     let core_image_file = add_source(&mut sources, SOURCE_PATHS[0], CORE_IMAGE_SOURCE);
-    let core_time_file = add_source(&mut sources, SOURCE_PATHS[1], CORE_TIME_SOURCE);
-    let application_file = add_source(&mut sources, SOURCE_PATHS[2], application_source);
+    let core_ops_file = add_source(&mut sources, SOURCE_PATHS[1], CORE_OPS_SOURCE);
+    let core_time_file = add_source(&mut sources, SOURCE_PATHS[2], CORE_TIME_SOURCE);
+    let application_file = add_source(&mut sources, SOURCE_PATHS[3], application_source);
     assert_eq!(
         sources
             .files()
@@ -1199,6 +1203,13 @@ fn source_fixture(application_source: &str) -> SourceFixture {
             core_image_file,
         )
         .expect("core image module");
+    graph
+        .add_module(
+            core,
+            ModulePath::new(["ops".to_owned()]).expect("core ops module path"),
+            core_ops_file,
+        )
+        .expect("core ops module");
     graph
         .add_module(
             core,
@@ -1335,6 +1346,7 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity, Ve
             &canonical_core_manifest,
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
+                content_record("ops.wr", CORE_OPS_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
                 content_record("time.wr", CORE_TIME_SOURCE),
             ],

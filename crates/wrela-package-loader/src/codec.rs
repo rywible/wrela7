@@ -1927,6 +1927,8 @@ mod tests {
         include_bytes!("../../../std/examples/minimal-image/wrela.lock");
     const CHECKED_IN_CORE_SOURCE: &[u8] =
         include_bytes!("../../../std/wrela-core-0.1/src/image.wr");
+    const CHECKED_IN_CORE_OPS_SOURCE: &[u8] =
+        include_bytes!("../../../std/wrela-core-0.1/src/ops.wr");
     const CHECKED_IN_CORE_RESULT_SOURCE: &[u8] =
         include_bytes!("../../../std/wrela-core-0.1/src/result.wr");
     const CHECKED_IN_CORE_TIME_SOURCE: &[u8] =
@@ -2098,6 +2100,11 @@ mod tests {
                 },
                 PackageContentRecord {
                     kind: PackageContentKind::Source,
+                    path: "ops.wr",
+                    digest: SoftwareSha256.sha256(CHECKED_IN_CORE_OPS_SOURCE),
+                },
+                PackageContentRecord {
+                    kind: PackageContentKind::Source,
                     path: "result.wr",
                     digest: SoftwareSha256.sha256(CHECKED_IN_CORE_RESULT_SOURCE),
                 },
@@ -2113,7 +2120,7 @@ mod tests {
         .expect("canonical core package content digest");
         assert_eq!(
             core_digest.to_hex(),
-            "d121c5e9cef32802172c53fa2bc8df0a020307e370b074d1d3d9b14931ec20c1"
+            "0011a42b0c7fa08e9388deebe81533ee1071c2d805ccc41f34d0958da9d8183f"
         );
         let application_digest = package_content_digest(
             &application_canonical,
@@ -2890,6 +2897,13 @@ mod tests {
                             digest: hasher.sha256(CHECKED_IN_CORE_SOURCE),
                         },
                         SourceInput {
+                            path: "ops.wr".to_owned(),
+                            text: std::str::from_utf8(CHECKED_IN_CORE_OPS_SOURCE)
+                                .expect("core ops source UTF-8")
+                                .to_owned(),
+                            digest: hasher.sha256(CHECKED_IN_CORE_OPS_SOURCE),
+                        },
+                        SourceInput {
                             path: "result.wr".to_owned(),
                             text: std::str::from_utf8(CHECKED_IN_CORE_RESULT_SOURCE)
                                 .expect("core result source UTF-8")
@@ -2928,8 +2942,8 @@ mod tests {
             CHECKED_IN_MINIMUM_IMAGE_LOCKFILE
         );
         assert_eq!(workspace.graph().packages().len(), 2);
-        assert_eq!(workspace.graph().modules().len(), 4);
-        assert_eq!(workspace.sources().len(), 4);
+        assert_eq!(workspace.graph().modules().len(), 5);
+        assert_eq!(workspace.sources().len(), 5);
         assert_eq!(workspace.root_manifest().name.as_str(), "bootstrap-image");
         assert_eq!(
             workspace

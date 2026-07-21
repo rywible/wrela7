@@ -50,20 +50,20 @@ pub fn scale(value: Duration, factor: u64) -> Duration:
 pub fn min(left: Duration, right: Duration) -> Duration:
     selected: Duration = copy right
     if left <= right:
-        selected = left
+        selected = copy left
     return selected
 
 pub fn max(left: Duration, right: Duration) -> Duration:
     selected: Duration = copy left
     if left < right:
-        selected = right
+        selected = copy right
     return selected
 
 pub fn clamp(value: Duration, lower: Duration, upper: Duration) -> Duration:
     assert lower <= upper, "duration clamp lower bound exceeds its upper bound"
     selected: Duration = copy value
     if selected < lower:
-        selected = lower
+        selected = copy lower
     if upper < selected:
-        selected = upper
+        selected = copy upper
     return selected

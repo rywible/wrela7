@@ -17,6 +17,11 @@ wrela separates failures by whether source is expected to recover.
 The target-fatal path is an outcome of failed recovery, not a fourth catchable
 language mechanism.
 
+The `AsyncExit[E]`, `ActorCallError[E]`, and `AdmissionResult` variants
+summarized above are defined exactly once, in the outcome taxonomy of
+[Actors and async](04-actors-and-async.md); this table cites their carrier
+types but does not restate their variants.
+
 ## 2. Recoverable faults
 
 Expected failures use `Result[T, E]`. Examples include:
@@ -104,9 +109,9 @@ it at boot and reports an appropriate boot fault or target-fatal rollback.
 The image graph is also a supervision tree. Every app, service, driver, and
 explicit task group has a parent policy. Standard strategies are:
 
-- `one_for_one` — restart only the failed child;
-- `one_for_all` — tear down and restart all siblings; and
-- `rest_for_one` — restart the failed child and children initialized after it.
+- `OneForOne` — restart only the failed child;
+- `OneForAll` — tear down and restart all siblings; and
+- `RestForOne` — restart the failed child and children initialized after it.
 
 Each supervisor declares a restart-intensity bound: at most `max` restarts
 within a fixed interval. Exceeding the bound causes the supervisor itself to
@@ -115,7 +120,7 @@ abandon and escalates to its parent.
 ```wrela
 img.supervise(
     children=[disk, storage, notes],
-    strategy=Restart.one_for_all,
+    strategy=Restart.OneForAll,
     intensity=RestartIntensity(max=3, within=seconds(10)),
 )
 ```
@@ -193,12 +198,12 @@ operation can report:
 
 ```wrela
 enum CompletionOutcome:
-    completed
-    not_completed
-    unknown
+    Completed
+    NotCompleted
+    Unknown
 ```
 
-`unknown` is especially important for writes: the device may have completed the
+`Unknown` is especially important for writes: the device may have completed the
 write before reset even when no completion was observed. Callers may retry only
 when the operation is idempotent or protected by a higher-level transaction or
 deduplication key.
@@ -265,6 +270,20 @@ input boundaries.
 
 True multi-core execution would invalidate this simple determinism theorem and
 requires a different record/replay specification.
+
+### 9.3 Recovery debuggability
+
+The record/replay profile and the image report MUST expose the
+cleanup-dependency-graph states named in
+[Actors and async](04-actors-and-async.md) — child registration, quarantine,
+pending/ready cleanup nodes, receipt/recovery transfer, and mailbox
+reopening — as first-class replay events, not only their net effect. A
+conforming implementation must let a deterministic replay viewer answer "why
+is my request not resolving" by walking the exact cleanup-dependency graph a
+stalled or canceled request left behind: which nodes are still pending, which
+recovery dependency they wait on, and which quarantined region or receipt
+blocks them. This is a requirement on the profile's event/state exposure, not
+new replay semantics; the determinism guarantee of section 9 is unchanged.
 
 ## 10. Sealed-image deployment
 

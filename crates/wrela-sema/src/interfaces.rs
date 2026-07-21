@@ -103,13 +103,18 @@ impl DesugarOperator {
     /// `negate` requests a logical NOT of the raw call result. Both operands
     /// are always evaluated left-to-right exactly as written regardless of
     /// `swap` — only the argument *binding* and result differ.
-    fn mapping(self) -> (bool, bool) {
+    pub(crate) fn mapping(self) -> (bool, bool) {
         match self {
             Self::Add | Self::Subtract | Self::LessThan => (false, false),
             Self::GreaterThan => (true, false),
             Self::LessEqual => (true, true),
             Self::GreaterEqual => (false, true),
         }
+    }
+
+    /// The impl method this operator desugars to.
+    pub(crate) fn method_name(self) -> &'static str {
+        self.interface().method_name()
     }
 }
 
@@ -209,7 +214,7 @@ fn poll(is_cancelled: &dyn Fn() -> bool) -> Result<(), AnalysisFailure> {
     }
 }
 
-fn declaration_name(program: &Program, id: DeclarationId) -> Option<&str> {
+pub(crate) fn declaration_name(program: &Program, id: DeclarationId) -> Option<&str> {
     program.declaration(id)?.name.as_ref().map(Name::as_str)
 }
 
