@@ -766,7 +766,7 @@ pub enum MachineActivationCancellation {
     DropCalleeThenPropagate,
 }
 
-/// Exact machine-consumer join for one FlowWir v10 immediate activation.
+/// Exact machine-consumer join for one FlowWir v11 immediate activation.
 ///
 /// The current closed subset lowers an ordinary async helper that is proven
 /// to return without another suspension into a private direct call followed

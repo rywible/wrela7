@@ -178,7 +178,7 @@ pub fn encode_and_verify(
     let expected = CanonicalFlowWirCodec.encode(EncodeRequest { wir, limits }, is_cancelled)?;
     if !encoded_candidate_equal(&expected, &candidate, is_cancelled)? {
         return Err(CodecError::NonCanonical(
-            "codec output differs from the canonical FlowWir v10 encoding",
+            "codec output differs from the canonical FlowWir v11 encoding",
         ));
     }
     drop(expected);

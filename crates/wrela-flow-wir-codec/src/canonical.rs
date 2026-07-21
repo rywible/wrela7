@@ -3076,7 +3076,7 @@ mod tests {
         harness_name.clone_from(&name);
         model
             .validate()
-            .expect("valid long-prefix FlowWir v10 fixture")
+            .expect("valid long-prefix FlowWir v11 fixture")
     }
 
     struct SubstitutingCodec<'a> {
@@ -4462,7 +4462,7 @@ mod tests {
                 &|| false,
             ),
             Err(CodecError::NonCanonical(
-                "codec output differs from the canonical FlowWir v10 encoding"
+                "codec output differs from the canonical FlowWir v11 encoding"
             ))
         ));
     }

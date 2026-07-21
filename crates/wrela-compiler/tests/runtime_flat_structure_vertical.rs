@@ -629,7 +629,7 @@ fn real_imported_duration_shape_reaches_flow_and_v10_roundtrips_exactly() {
         },
         &never_cancelled,
     )
-    .expect("FlowWir v10 canonical roundtrip");
+    .expect("FlowWir v11 canonical roundtrip");
     let decoded = CanonicalFlowWirCodec
         .decode(
             DecodeRequest {
@@ -639,7 +639,7 @@ fn real_imported_duration_shape_reaches_flow_and_v10_roundtrips_exactly() {
             },
             &never_cancelled,
         )
-        .expect("FlowWir v10 decode");
+        .expect("FlowWir v11 decode");
     assert_eq!(decoded, flow_wir);
 
     let prepared = prepare_canonical_frame_for_codegen(
@@ -756,7 +756,7 @@ fn local_flat_field_update_reaches_deterministic_native_coff() {
     assert_eq!(
         flow.wir().as_wir(),
         repeated_flow.wir().as_wir(),
-        "identical SemanticWir must produce identical FlowWir v10"
+        "identical SemanticWir must produce identical FlowWir v11"
     );
     let flow_insertions = flow
         .wir()
@@ -793,7 +793,7 @@ fn local_flat_field_update_reaches_deterministic_native_coff() {
             },
             &never_cancelled,
         )
-        .expect("field-update FlowWir v10 decode");
+        .expect("field-update FlowWir v11 decode");
     assert_eq!(decoded, flow_wir);
 
     let prepared = prepare_canonical_frame_for_codegen(
@@ -1151,7 +1151,7 @@ fn local_result_constructor_and_exhaustive_match_reach_machine_switch() {
         },
         &never_cancelled,
     )
-    .expect("FlowWir v10 enum roundtrip");
+    .expect("FlowWir v11 enum roundtrip");
     let prepared = prepare_canonical_frame_for_codegen(
         encoded.bytes(),
         &fixture.target,
