@@ -1,0 +1,5 @@
+{
+  "name": "wrela-linux",
+  "install": "bash .cursor/install.sh",
+  "agentCanUpdateSnapshot": true
+}
