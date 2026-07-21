@@ -457,6 +457,22 @@ const EXTERNAL_DEPENDENCIES: &[ExternalDependencyContract] = &[
     },
 ];
 
+// cpufeatures only links libc on aarch64 (Apple/Linux) and loongarch64 Linux —
+// matching its Cargo target cfg. x86_64 Linux must not expect that edge or the
+// host-filtered resolve closure drifts.
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "aarch64", target_vendor = "apple"),
+    all(target_arch = "loongarch64", target_os = "linux"),
+))]
+const CPUFEATURES_DEPENDENCIES: &[&str] = &["libc"];
+#[cfg(not(any(
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "aarch64", target_vendor = "apple"),
+    all(target_arch = "loongarch64", target_os = "linux"),
+)))]
+const CPUFEATURES_DEPENDENCIES: &[&str] = &[];
+
 // This is the reviewed fast-gate transitive registry closure. Optional native
 // dependencies are deliberately absent and are exercised only by `--full`.
 const REVIEWED_EXTERNAL_PACKAGES: &[ReviewedExternalPackage] = &[
@@ -473,7 +489,7 @@ const REVIEWED_EXTERNAL_PACKAGES: &[ReviewedExternalPackage] = &[
     ReviewedExternalPackage {
         name: "cpufeatures",
         version: "0.2.17",
-        dependencies: &["libc"],
+        dependencies: CPUFEATURES_DEPENDENCIES,
     },
     ReviewedExternalPackage {
         name: "crypto-common",
