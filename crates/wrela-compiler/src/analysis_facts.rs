@@ -3621,6 +3621,7 @@ pub fn boot() -> Image:
             values: Vec::new(),
             expressions: Vec::new(),
             statements: Vec::new(),
+            actor_state_accesses: Vec::new(),
             projection_protocols: Vec::new(),
             lexical_views: Vec::new(),
             scope_protocols: Vec::new(),

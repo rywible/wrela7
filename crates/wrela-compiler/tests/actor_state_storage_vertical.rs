@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use wrela_backend::{
     CodegenError, emit_prepared_object, flow_wir as flow, llvm_backend_available,
-    machine_wir::{MachineRegionStorageKind, ValidationError},
+    machine_wir::{MachineOperation, MachineRegionStorageKind, ValidationError},
     prepare_canonical_frame_for_codegen,
 };
 use wrela_build_model::{
@@ -49,6 +49,8 @@ pub struct Worker:
     value: u64 = 0
 
     pub async fn ping(mut self):
+        observed: u64 = self.value
+        self.value = 7
         await checkpoint()
 
     @task
@@ -249,6 +251,49 @@ fn canonical_zero_actor_state_reaches_native_machine_storage() {
         semantic_state.owner,
         semantic::ImageOwner::Actor(semantic::ActorId(0))
     );
+    let semantic_actor_turn = semantic_output
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .find(|function| function.role == semantic::FunctionRole::ActorTurn(semantic::ActorId(0)))
+        .expect("SemanticWir actor turn");
+    let semantic_state_operations = semantic_actor_turn
+        .body
+        .statements
+        .iter()
+        .filter_map(|statement| match statement {
+            semantic::SemanticStatement::Let(statement)
+                if matches!(
+                    statement.operation,
+                    semantic::SemanticOperation::ActorStateLoad { .. }
+                        | semantic::SemanticOperation::ActorStateStore { .. }
+                ) =>
+            {
+                Some(&statement.operation)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        semantic_state_operations.as_slice(),
+        [
+            semantic::SemanticOperation::ActorStateLoad {
+                actor: semantic::ActorId(0),
+                region,
+                proof,
+            },
+            semantic::SemanticOperation::ActorStateStore {
+                actor: semantic::ActorId(0),
+                region: store_region,
+                proof: store_proof,
+                ..
+            }
+        ] if *region == semantic_state.id
+            && store_region == region
+            && *proof == semantic_state.proof
+            && store_proof == proof
+    ));
 
     let (semantic_wir, _) = semantic_output.into_parts();
     let flow_output = CanonicalFlowLowerer::new()
@@ -271,6 +316,50 @@ fn canonical_zero_actor_state_reaches_native_machine_storage() {
     assert_eq!(flow_state.capacity_bytes, 8);
     assert_eq!(flow_state.alignment, 8);
     assert_eq!(flow_state.owner, flow::PlanOwner::Actor(flow::ActorId(0)));
+    let flow_actor_turn = flow_output
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .find(|function| function.role == flow::FunctionRole::ActorTurn(flow::ActorId(0)))
+        .expect("FlowWir actor turn");
+    let flow_state_addresses = flow_actor_turn
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                flow::FlowOperation::ActorStateAddress {
+                    actor: flow::ActorId(0),
+                    region,
+                    proof,
+                } if region == flow_state.id && proof == flow_state.capacity_proof
+            )
+        })
+        .count();
+    assert_eq!(flow_state_addresses, 2);
+    assert_eq!(
+        flow_actor_turn
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(instruction.operation, flow::FlowOperation::Load { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        flow_actor_turn
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(
+                instruction.operation,
+                flow::FlowOperation::Store { .. }
+            ))
+            .count(),
+        1
+    );
     let encoded = encode_and_verify(
         &CanonicalFlowWirCodec,
         EncodeRequest {
@@ -300,6 +389,42 @@ fn canonical_zero_actor_state_reaches_native_machine_storage() {
     assert_eq!(machine_state.bytes_per_unit, 8);
     assert_eq!(machine_state.capacity_bytes, 8);
     assert_eq!(machine_state.alignment, 8);
+    let machine_actor_turn = machine
+        .functions
+        .iter()
+        .find(|function| {
+            function.role == wrela_backend::machine_wir::MachineFunctionRole::ActorTurn(0)
+        })
+        .expect("MachineWir actor turn");
+    assert_eq!(
+        machine_actor_turn
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| {
+                instruction.operation == MachineOperation::GlobalAddress(machine_state.global)
+            })
+            .count(),
+        2
+    );
+    assert_eq!(
+        machine_actor_turn
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(instruction.operation, MachineOperation::Load { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        machine_actor_turn
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(instruction.operation, MachineOperation::Store { .. }))
+            .count(),
+        1
+    );
 
     let repeated =
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)

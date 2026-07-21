@@ -1416,7 +1416,12 @@ fn lower_activation_subset(
                 MachineActivationOwner::Actor { .. },
                 MachineActivationSchedule::DormantMailbox,
                 None,
-            ) => entry.instructions.len() == 1,
+            ) => exact_actor_state_prefix(
+                input,
+                caller,
+                actor.id,
+                &entry.instructions[..entry.instructions.len().saturating_sub(1)],
+            ),
             (
                 MachineActivationOwner::Task { .. },
                 MachineActivationSchedule::StartupOnce,
@@ -1644,6 +1649,141 @@ fn lower_activation_subset(
     }
     check_cancelled(is_cancelled)?;
     Ok(output)
+}
+
+fn exact_actor_state_prefix(
+    input: &flow::FlowWir,
+    function: &flow::FlowFunction,
+    actor: flow::ActorId,
+    instructions: &[flow::Instruction],
+) -> bool {
+    let Some(actor_plan) = input.actors.get(actor.0 as usize) else {
+        return false;
+    };
+    let mut index = 0;
+    while index < instructions.len() {
+        if let (
+            flow::FlowOperation::Immediate(flow::Immediate::Integer { bits: 64, bytes_le }),
+            [result],
+        ) = (
+            &instructions[index].operation,
+            instructions[index].results.as_slice(),
+        ) {
+            if bytes_le.len() != 8
+                || function
+                    .values
+                    .get(result.0 as usize)
+                    .and_then(|value| input.types.get(value.ty.0 as usize))
+                    .is_none_or(|ty| {
+                        ty.kind
+                            != flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                                signed: false,
+                                bits: 64,
+                            })
+                    })
+            {
+                return false;
+            }
+            index += 1;
+            continue;
+        }
+        let address_instruction = &instructions[index];
+        let (
+            flow::FlowOperation::ActorStateAddress {
+                actor: address_actor,
+                region,
+                proof,
+            },
+            [address],
+        ) = (
+            &address_instruction.operation,
+            address_instruction.results.as_slice(),
+        )
+        else {
+            return false;
+        };
+        if *address_actor != actor
+            || function
+                .values
+                .get(address.0 as usize)
+                .and_then(|value| input.types.get(value.ty.0 as usize))
+                .is_none_or(|ty| ty.kind != flow::FlowTypeKind::Scalar(flow::ScalarType::Address))
+        {
+            return false;
+        }
+        let Some(region_plan) = input.regions.get(region.0 as usize) else {
+            return false;
+        };
+        let region_matches = region_plan.owner == flow::PlanOwner::Actor(actor)
+            && region_plan.class == flow::RegionClass::Image
+            && region_plan.capacity_bytes == 8
+            && region_plan.alignment == 8
+            && region_plan.capacity_proof == *proof
+            && region_plan.name.strip_suffix(".state") == Some(actor_plan.name.as_str())
+            && input.proofs.get(proof.0 as usize).is_some_and(|record| {
+                record.kind == flow::ProofKind::CapacityBound
+                    && record.bound == Some(1)
+                    && record.sources.as_slice() == [region_plan.source]
+                    && record.depends_on.is_empty()
+            });
+        if !region_matches {
+            return false;
+        }
+        let Some(access) = instructions.get(index + 1) else {
+            return false;
+        };
+        let access_matches = match (&access.operation, access.results.as_slice()) {
+            (
+                flow::FlowOperation::Load {
+                    address: loaded,
+                    proof: load_proof,
+                },
+                [result],
+            ) => {
+                loaded == address
+                    && load_proof == proof
+                    && function
+                        .values
+                        .get(result.0 as usize)
+                        .and_then(|value| input.types.get(value.ty.0 as usize))
+                        .is_some_and(|ty| {
+                            ty.kind
+                                == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                                    signed: false,
+                                    bits: 64,
+                                })
+                        })
+            }
+            (
+                flow::FlowOperation::Store {
+                    address: stored,
+                    value,
+                    proof: store_proof,
+                },
+                [],
+            ) => {
+                stored == address
+                    && store_proof == proof
+                    && function
+                        .values
+                        .get(value.0 as usize)
+                        .and_then(|value| input.types.get(value.ty.0 as usize))
+                        .is_some_and(|ty| {
+                            ty.kind
+                                == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                                    signed: false,
+                                    bits: 64,
+                                })
+                        })
+            }
+            _ => false,
+        };
+        if !access_matches || access.source != address_instruction.source {
+            return false;
+        }
+        index += 2;
+    }
+    true
 }
 
 fn lower_region_storage(
@@ -3781,6 +3921,7 @@ fn for_each_flow_operation_value(
 ) {
     match operation {
         flow::FlowOperation::Immediate(_)
+        | flow::FlowOperation::ActorStateAddress { .. }
         | flow::FlowOperation::RegionReset { .. }
         | flow::FlowOperation::ActorCapability { .. }
         | flow::FlowOperation::ActorReserve { .. }
@@ -4187,6 +4328,7 @@ fn validate_supported_operation(
         )
         .map(|_| ()),
         flow::FlowOperation::ActorCapability { .. }
+        | flow::FlowOperation::ActorStateAddress { .. }
         | flow::FlowOperation::Immediate(
             flow::Immediate::Bool(_)
             | flow::Immediate::Integer { .. }
@@ -6289,6 +6431,34 @@ fn lower_operation(
         return Ok(None);
     }
     let operation = match &instruction.operation {
+        flow::FlowOperation::ActorStateAddress {
+            actor,
+            region,
+            proof,
+        } => {
+            let storage = plan
+                .region_storage
+                .get(region.0 as usize)
+                .filter(|storage| {
+                    matches!(
+                        storage.kind,
+                        MachineRegionStorageKind::ActorState { actor: owner }
+                            if owner == actor.0
+                    ) && storage.capacity_proof == ProofId(proof.0)
+                })
+                .ok_or(unsupported("an unauthenticated actor state address"))?;
+            let result = require_single_result(instruction)?;
+            if input
+                .types
+                .get(flow_value_type(function, result)?.0 as usize)
+                .is_none_or(|ty| ty.kind != flow::FlowTypeKind::Scalar(flow::ScalarType::Address))
+            {
+                return Err(unsupported(
+                    "an actor state address with a non-address result",
+                ));
+            }
+            MachineOperation::GlobalAddress(storage.global)
+        }
         flow::FlowOperation::Immediate(flow::Immediate::Bytes(_)) => {
             let result = require_single_result(instruction)?;
             let payload = plan

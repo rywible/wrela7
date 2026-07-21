@@ -1322,6 +1322,47 @@ fn validate_actor_source_function(
                             return Err(unsupported("noncanonical one-way mailbox receive"));
                         }
                     }
+                    semantic::SemanticOperation::ActorStateLoad {
+                        actor,
+                        region: state_region,
+                        proof,
+                    } => {
+                        let [result] = statement.results.as_slice() else {
+                            return Err(unsupported("actor state load result"));
+                        };
+                        if !supported_actor_state_access(
+                            input,
+                            function,
+                            *actor,
+                            *state_region,
+                            *proof,
+                        ) || scalar_value_type(function, *result).is_none_or(|ty| {
+                            !semantic_type_is(input, ty, semantic::PrimitiveType::U64)
+                        }) {
+                            return Err(unsupported("actor state load authentication"));
+                        }
+                    }
+                    semantic::SemanticOperation::ActorStateStore {
+                        actor,
+                        region: state_region,
+                        value,
+                        proof,
+                    } => {
+                        if !statement.results.is_empty()
+                            || !supported_actor_state_access(
+                                input,
+                                function,
+                                *actor,
+                                *state_region,
+                                *proof,
+                            )
+                            || scalar_value_type(function, *value).is_none_or(|ty| {
+                                !semantic_type_is(input, ty, semantic::PrimitiveType::U64)
+                            })
+                        {
+                            return Err(unsupported("actor state store authentication"));
+                        }
+                    }
                     semantic::SemanticOperation::Await { awaitable } => {
                         let [delivered] = statement.results.as_slice() else {
                             return Err(unsupported("async await result delivery"));
@@ -1449,6 +1490,39 @@ fn validate_actor_source_function(
         return Err(unsupported("one-way actor operation census"));
     }
     Ok(())
+}
+
+fn supported_actor_state_access(
+    input: &semantic::SemanticWir,
+    function: &semantic::SemanticFunction,
+    actor: semantic::ActorId,
+    region: semantic::RegionId,
+    proof: semantic::ProofId,
+) -> bool {
+    function.role == semantic::FunctionRole::ActorTurn(actor)
+        && input
+            .actors
+            .get(actor.0 as usize)
+            .is_some_and(|actor_plan| {
+                input
+                    .regions
+                    .get(region.0 as usize)
+                    .is_some_and(|region_plan| {
+                        region_plan.owner == semantic::ImageOwner::Actor(actor)
+                            && region_plan.class == semantic::RegionClass::Image
+                            && region_plan.capacity_bytes == 8
+                            && region_plan.alignment == 8
+                            && region_plan.proof == proof
+                            && region_plan.name.strip_suffix(".state")
+                                == Some(actor_plan.name.as_str())
+                            && input.proofs.get(proof.0 as usize).is_some_and(|proof| {
+                                proof.kind == semantic::ProofKind::CapacityBound
+                                    && proof.bound == Some(1)
+                                    && proof.sources.as_slice() == [region_plan.source]
+                                    && proof.depends_on.is_empty()
+                            })
+                    })
+            })
 }
 
 fn supported_generated_tests<'a>(
@@ -3198,6 +3272,8 @@ fn preflight_input(
                                 )?;
                             }
                             semantic::SemanticOperation::Constant(_)
+                            | semantic::SemanticOperation::ActorStateLoad { .. }
+                            | semantic::SemanticOperation::ActorStateStore { .. }
                             | semantic::SemanticOperation::Unary { .. }
                             | semantic::SemanticOperation::Binary { .. }
                             | semantic::SemanticOperation::Convert { .. }
@@ -4126,6 +4202,19 @@ fn measure_actor_flow_output_resources(
                                     resource: "FlowWir actor output model edges",
                                     limit: limits.model_edges,
                                 })?;
+                        if matches!(
+                            statement.operation,
+                            semantic::SemanticOperation::ActorStateLoad { .. }
+                                | semantic::SemanticOperation::ActorStateStore { .. }
+                        ) {
+                            instruction_count = instruction_count.checked_add(1).ok_or(
+                                LowerError::ResourceLimit {
+                                    resource: "FlowWir actor output model edges",
+                                    limit: limits.model_edges,
+                                },
+                            )?;
+                            meter.add_edges(1);
+                        }
                         meter.edges(&statement.results);
                         match &statement.operation {
                             semantic::SemanticOperation::Call { arguments, .. }
@@ -4146,7 +4235,9 @@ fn measure_actor_flow_output_resources(
                             | semantic::SemanticOperation::Convert { .. }
                             | semantic::SemanticOperation::ActorCapability { .. }
                             | semantic::SemanticOperation::ActorReserve { .. }
-                            | semantic::SemanticOperation::MailboxReceive { .. } => {}
+                            | semantic::SemanticOperation::MailboxReceive { .. }
+                            | semantic::SemanticOperation::ActorStateLoad { .. }
+                            | semantic::SemanticOperation::ActorStateStore { .. } => {}
                             _ => {
                                 return Err(unsupported(
                                     "actor operation changed after shape validation",
@@ -4254,6 +4345,34 @@ fn lower_actor_image(
     for ty in &input.types {
         types.push(lower_actor_type(ty, &input.actors, limits, is_cancelled)?);
     }
+    let actor_state_address_type = if input
+        .regions
+        .iter()
+        .any(|region| region.name.ends_with(".state"))
+    {
+        let id =
+            flow::TypeId(
+                u32::try_from(types.len()).map_err(|_| LowerError::ResourceLimit {
+                    resource: "FlowWir actor state address type",
+                    limit: limits.model_edges,
+                })?,
+            );
+        push_bounded(
+            &mut types,
+            flow::FlowType {
+                id,
+                kind: flow::FlowTypeKind::Scalar(flow::ScalarType::Address),
+                name: Some("__wrela_actor_state_address".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+            "FlowWir actor types",
+            limits.model_edges,
+        )?;
+        Some(id)
+    } else {
+        None
+    };
     let activation_types = append_activation_types(input, &mut types, limits, is_cancelled)?;
     let proofs = lower_proofs(input, limits, is_cancelled)?;
     let mut functions = try_vec(
@@ -4267,6 +4386,7 @@ fn lower_actor_image(
             input,
             function,
             &activation_types,
+            actor_state_address_type,
             limits,
             is_cancelled,
         )?);
@@ -4471,6 +4591,7 @@ fn lower_generated_tests(
             input,
             function,
             &activation_types,
+            None,
             limits,
             is_cancelled,
         )?);
@@ -4662,6 +4783,7 @@ fn lower_generated_function(
     input: &semantic::SemanticWir,
     function: &semantic::SemanticFunction,
     activation_types: &[Option<flow::TypeId>],
+    actor_state_address_type: Option<flow::TypeId>,
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<flow::FlowFunction, LowerError> {
@@ -4709,6 +4831,126 @@ fn lower_generated_function(
             check_cancelled(is_cancelled)?;
             match statement {
                 semantic::SemanticStatement::Let(statement) => {
+                    if let semantic::SemanticOperation::ActorStateLoad {
+                        actor,
+                        region,
+                        proof,
+                    } = &statement.operation
+                    {
+                        let [result] = statement.results.as_slice() else {
+                            return Err(unsupported("actor state load result"));
+                        };
+                        let address_ty = actor_state_address_type
+                            .ok_or_else(|| unsupported("actor state address type"))?;
+                        let address = flow::ValueId(u32::try_from(values.len()).map_err(|_| {
+                            LowerError::ResourceLimit {
+                                resource: "FlowWir values",
+                                limit: limits.model_edges,
+                            }
+                        })?);
+                        push_bounded(
+                            &mut values,
+                            flow::Value {
+                                id: address,
+                                ty: address_ty,
+                                source_name: None,
+                                source: statement.source,
+                            },
+                            "FlowWir values",
+                            limits.model_edges,
+                        )?;
+                        let block = pending_block_mut(&mut pending_blocks, item.block)?;
+                        push_bounded(
+                            &mut block.instructions,
+                            PendingInstruction {
+                                results: vec![address],
+                                operation: flow::FlowOperation::ActorStateAddress {
+                                    actor: flow::ActorId(actor.0),
+                                    region: flow::RegionId(region.0),
+                                    proof: flow::ProofId(proof.0),
+                                },
+                                source: statement.source,
+                            },
+                            "FlowWir instructions",
+                            limits.instructions,
+                        )?;
+                        push_bounded(
+                            &mut block.instructions,
+                            PendingInstruction {
+                                results: vec![flow::ValueId(result.0)],
+                                operation: flow::FlowOperation::Load {
+                                    address,
+                                    proof: flow::ProofId(proof.0),
+                                },
+                                source: statement.source,
+                            },
+                            "FlowWir instructions",
+                            limits.instructions,
+                        )?;
+                        item.next_statement += 1;
+                        continue;
+                    }
+                    if let semantic::SemanticOperation::ActorStateStore {
+                        actor,
+                        region,
+                        value,
+                        proof,
+                    } = &statement.operation
+                    {
+                        if !statement.results.is_empty() {
+                            return Err(unsupported("actor state store result"));
+                        }
+                        let address_ty = actor_state_address_type
+                            .ok_or_else(|| unsupported("actor state address type"))?;
+                        let address = flow::ValueId(u32::try_from(values.len()).map_err(|_| {
+                            LowerError::ResourceLimit {
+                                resource: "FlowWir values",
+                                limit: limits.model_edges,
+                            }
+                        })?);
+                        push_bounded(
+                            &mut values,
+                            flow::Value {
+                                id: address,
+                                ty: address_ty,
+                                source_name: None,
+                                source: statement.source,
+                            },
+                            "FlowWir values",
+                            limits.model_edges,
+                        )?;
+                        let block = pending_block_mut(&mut pending_blocks, item.block)?;
+                        push_bounded(
+                            &mut block.instructions,
+                            PendingInstruction {
+                                results: vec![address],
+                                operation: flow::FlowOperation::ActorStateAddress {
+                                    actor: flow::ActorId(actor.0),
+                                    region: flow::RegionId(region.0),
+                                    proof: flow::ProofId(proof.0),
+                                },
+                                source: statement.source,
+                            },
+                            "FlowWir instructions",
+                            limits.instructions,
+                        )?;
+                        push_bounded(
+                            &mut block.instructions,
+                            PendingInstruction {
+                                results: Vec::new(),
+                                operation: flow::FlowOperation::Store {
+                                    address,
+                                    value: flow::ValueId(value.0),
+                                    proof: flow::ProofId(proof.0),
+                                },
+                                source: statement.source,
+                            },
+                            "FlowWir instructions",
+                            limits.instructions,
+                        )?;
+                        item.next_statement += 1;
+                        continue;
+                    }
                     if let semantic::SemanticOperation::Await { awaitable } = &statement.operation {
                         if u64::from(next_async_state) >= u64::from(limits.states_per_function) {
                             return Err(LowerError::ResourceLimit {
@@ -5532,6 +5774,8 @@ fn lower_generated_operation(
             | semantic::Constant::Aggregate(_)
             | semantic::Constant::Zeroed(_),
         )
+        | semantic::SemanticOperation::ActorStateLoad { .. }
+        | semantic::SemanticOperation::ActorStateStore { .. }
         | semantic::SemanticOperation::Project { .. }
         | semantic::SemanticOperation::Index { .. }
         | semantic::SemanticOperation::BeginAccess { .. }
@@ -5959,6 +6203,7 @@ fn validate_model_resources(
                 meter.edges(&instruction.results);
                 match &instruction.operation {
                     FlowOperation::Immediate(value) => immediate(value, &mut meter),
+                    FlowOperation::ActorStateAddress { .. } => {}
                     FlowOperation::MakeAggregate { fields, .. }
                     | FlowOperation::Call {
                         arguments: fields, ..
@@ -6572,6 +6817,40 @@ fn actor_flow_operation_matches(
         (flow::FlowOperation::Immediate(expected), flow::FlowOperation::Immediate(output)) => {
             actor_flow_immediate_matches(expected, output, is_cancelled)?
         }
+        (
+            flow::FlowOperation::ActorStateAddress {
+                actor: ea,
+                region: er,
+                proof: ep,
+            },
+            flow::FlowOperation::ActorStateAddress {
+                actor: oa,
+                region: or,
+                proof: op,
+            },
+        ) => ea == oa && er == or && ep == op,
+        (
+            flow::FlowOperation::Load {
+                address: ea,
+                proof: ep,
+            },
+            flow::FlowOperation::Load {
+                address: oa,
+                proof: op,
+            },
+        ) => ea == oa && ep == op,
+        (
+            flow::FlowOperation::Store {
+                address: ea,
+                value: ev,
+                proof: ep,
+            },
+            flow::FlowOperation::Store {
+                address: oa,
+                value: ov,
+                proof: op,
+            },
+        ) => ea == oa && ev == ov && ep == op,
         (
             flow::FlowOperation::Unary {
                 op: expected_op,

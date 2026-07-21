@@ -13,9 +13,9 @@ use wrela_source::Span;
 
 pub use wrela_test_model::TestPlanLimits;
 
-pub const FLOW_WIR_VERSION: u32 = 10;
+pub const FLOW_WIR_VERSION: u32 = 11;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
-pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 9;
+pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 10;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -200,6 +200,14 @@ pub enum Immediate {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FlowOperation {
     Immediate(Immediate),
+    /// Materialize the address of one canonical actor-owned state region.
+    /// Machine lowering resolves this authenticated region identity to the
+    /// matching `ActorState` storage global; source receiver values stay erased.
+    ActorStateAddress {
+        actor: ActorId,
+        region: RegionId,
+        proof: ProofId,
+    },
     Unary {
         op: UnaryOp,
         value: ValueId,
@@ -1275,6 +1283,7 @@ fn meter_operation(
             }
         }
         FlowOperation::Unary { .. }
+        | FlowOperation::ActorStateAddress { .. }
         | FlowOperation::Binary { .. }
         | FlowOperation::Cast { .. }
         | FlowOperation::MakeEnum { .. }
@@ -4290,6 +4299,7 @@ fn flow_block_dominates(
 fn for_each_flow_operation_value(operation: &FlowOperation, mut visit: impl FnMut(ValueId)) {
     match operation {
         FlowOperation::Immediate(_)
+        | FlowOperation::ActorStateAddress { .. }
         | FlowOperation::RegionReset { .. }
         | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
@@ -4721,6 +4731,51 @@ fn validate_operation(
     }
     match &instruction.operation {
         FlowOperation::Immediate(immediate) => validate_immediate(module, immediate, errors),
+        FlowOperation::ActorStateAddress {
+            actor,
+            region,
+            proof: capacity,
+        } => {
+            require_id("actor state actor", actor.0, module.actors.len(), errors);
+            require_id("actor state region", region.0, module.regions.len(), errors);
+            proof!(*capacity);
+            let valid = function.role == FunctionRole::ActorTurn(*actor)
+                && module
+                    .actors
+                    .get(actor.0 as usize)
+                    .is_some_and(|actor_plan| {
+                        module
+                            .regions
+                            .get(region.0 as usize)
+                            .is_some_and(|region_plan| {
+                                region_plan.owner == PlanOwner::Actor(*actor)
+                                    && region_plan.class == RegionClass::Image
+                                    && region_plan.capacity_bytes == 8
+                                    && region_plan.alignment == 8
+                                    && region_plan.capacity_proof == *capacity
+                                    && region_plan.name.strip_suffix(".state")
+                                        == Some(actor_plan.name.as_str())
+                                    && module.proofs.get(capacity.0 as usize).is_some_and(|proof| {
+                                        proof.kind == ProofKind::CapacityBound
+                                            && proof.bound == Some(1)
+                                            && proof.sources.as_slice() == [region_plan.source]
+                                            && proof.depends_on.is_empty()
+                                    })
+                            })
+                    })
+                && matches!(instruction.results.as_slice(), [result]
+                if function.values.get(result.0 as usize).is_some_and(|value| {
+                    module.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                        ty.kind == FlowTypeKind::Scalar(ScalarType::Address)
+                    })
+                }));
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "actor state address",
+                    id: instruction.id.0,
+                });
+            }
+        }
         FlowOperation::Unary { value: operand, .. } => value!(*operand),
         FlowOperation::Binary { left, right, .. } => {
             value!(*left);

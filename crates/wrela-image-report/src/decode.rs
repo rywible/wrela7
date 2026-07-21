@@ -1635,9 +1635,9 @@ mod tests {
                 bytes: 16,
             }],
             representations: RepresentationFacts {
-                semantic_wir_version: 9,
-                flow_wir_version: 10,
-                flow_wir_wire_version: 10,
+                semantic_wir_version: 10,
+                flow_wir_version: 11,
+                flow_wir_wire_version: 11,
                 machine_wir_version: 12,
                 runtime_abi_version: 2,
                 optimization_pipeline_name: "development-v1".to_owned(),
@@ -1845,7 +1845,7 @@ mod tests {
         );
 
         let oversized_u32 = json.replacen(
-            "\"semantic_wir_version\":9",
+            "\"semantic_wir_version\":10",
             "\"semantic_wir_version\":4294967296",
             1,
         );

@@ -693,6 +693,7 @@ fn fold_operation(
             constant_to_immediate(constant(*value, constants)?, result_type, types)
         }
         FlowOperation::Immediate(_)
+        | FlowOperation::ActorStateAddress { .. }
         | FlowOperation::Cast { .. }
         | FlowOperation::MakeAggregate { .. }
         | FlowOperation::MakeEnum { .. }
@@ -2150,6 +2151,7 @@ fn map_operation_values(
 ) -> Result<(), OptimizeError> {
     match operation {
         FlowOperation::Immediate(_)
+        | FlowOperation::ActorStateAddress { .. }
         | FlowOperation::RegionReset { .. }
         | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
@@ -2657,6 +2659,7 @@ fn for_each_operation_value(
     };
     match operation {
         FlowOperation::Immediate(_)
+        | FlowOperation::ActorStateAddress { .. }
         | FlowOperation::RegionReset { .. }
         | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }

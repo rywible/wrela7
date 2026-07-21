@@ -1,7 +1,7 @@
 use wrela_machine_wir::{
     AtomicOrdering, BackendFacts, BackendProofKind, CallingConvention, ConversionOp, Endianness,
     Linkage, MACHINE_WIR_VERSION, MachineActivationOwner, MachineActivationSchedule,
-    MachineFunction, MachineFunctionRole, MachineImmediate, MachineOperation,
+    MachineFunction, MachineFunctionRole, MachineImmediate, MachineInstruction, MachineOperation,
     MachineRegionStorageKind, MachineTerminator, MachineTypeId, MachineTypeKind, MachineUnaryOp,
     MemorySemantics, REGION_STORAGE_SECTION_PREFIX, ScalarFailureKind, Section, SectionKind,
     SymbolDefinition, SymbolVisibility, ValueId,
@@ -985,7 +985,15 @@ fn validate_activation_table(
                 return false;
             };
             let prefix_matches = match activation.schedule {
-                MachineActivationSchedule::DormantMailbox => entry.instructions.len() == 1,
+                MachineActivationSchedule::DormantMailbox => exact_actor_state_machine_prefix(
+                    machine,
+                    caller,
+                    match activation.owner {
+                        MachineActivationOwner::Actor { actor, .. } => actor,
+                        MachineActivationOwner::Task { .. } => return false,
+                    },
+                    &entry.instructions[..entry.instructions.len().saturating_sub(1)],
+                ),
                 MachineActivationSchedule::MailboxOnce => {
                     matches!(entry.instructions.as_slice(), [receive, _]
                         if receive.results.is_empty()
@@ -1132,6 +1140,116 @@ fn validate_activation_table(
         }
     }
     Ok(())
+}
+
+fn exact_actor_state_machine_prefix(
+    machine: &wrela_machine_wir::MachineWir,
+    function: &MachineFunction,
+    actor: u32,
+    instructions: &[MachineInstruction],
+) -> bool {
+    let u64_type = |ty: MachineTypeId| {
+        machine.types.get(ty.0 as usize).is_some_and(|ty| {
+            ty.kind == MachineTypeKind::Integer { bits: 64 } && ty.size == 8 && ty.alignment == 8
+        })
+    };
+    let mut index = 0;
+    while index < instructions.len() {
+        if let (MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le }), [result]) = (
+            &instructions[index].operation,
+            instructions[index].results.as_slice(),
+        ) {
+            if bytes_le.len() != 8
+                || !u64_type(*ty)
+                || function
+                    .values
+                    .get(result.0 as usize)
+                    .is_none_or(|value| value.ty != *ty)
+            {
+                return false;
+            }
+            index += 1;
+            continue;
+        }
+        let address_instruction = &instructions[index];
+        let (MachineOperation::GlobalAddress(global), [address]) = (
+            &address_instruction.operation,
+            address_instruction.results.as_slice(),
+        ) else {
+            return false;
+        };
+        if function
+            .values
+            .get(address.0 as usize)
+            .and_then(|value| machine.types.get(value.ty.0 as usize))
+            .is_none_or(|ty| !matches!(ty.kind, MachineTypeKind::Pointer { .. }))
+        {
+            return false;
+        }
+        let Some(storage) = machine.region_storage.iter().find(|storage| {
+            storage.global == *global
+                && storage.kind == MachineRegionStorageKind::ActorState { actor }
+                && storage.capacity_units == 1
+                && storage.bytes_per_unit == 8
+                && storage.capacity_bytes == 8
+                && storage.alignment == 8
+        }) else {
+            return false;
+        };
+        let conservative_facts = |facts: &BackendFacts| {
+            facts.proof == storage.capacity_proof
+                && facts.alignment.is_none()
+                && !facts.non_null
+                && !facts.no_alias
+                && !facts.in_bounds
+                && !facts.no_unsigned_wrap
+                && !facts.no_signed_wrap
+        };
+        let Some(access) = instructions.get(index + 1) else {
+            return false;
+        };
+        let access_matches = match (&access.operation, access.results.as_slice()) {
+            (
+                MachineOperation::Load {
+                    address: loaded,
+                    ty,
+                    semantics: MemorySemantics::Ordinary,
+                    facts,
+                },
+                [result],
+            ) => {
+                loaded == address
+                    && u64_type(*ty)
+                    && conservative_facts(facts)
+                    && function
+                        .values
+                        .get(result.0 as usize)
+                        .is_some_and(|value| value.ty == *ty)
+            }
+            (
+                MachineOperation::Store {
+                    address: stored,
+                    value,
+                    semantics: MemorySemantics::Ordinary,
+                    facts,
+                },
+                [],
+            ) => {
+                stored == address
+                    && conservative_facts(facts)
+                    && function
+                        .values
+                        .get(value.0 as usize)
+                        .is_some_and(|value| u64_type(value.ty))
+            }
+            _ => false,
+        };
+        if !access_matches || access.source != address_instruction.source {
+            return false;
+        }
+        index += 2;
+    }
+    true
 }
 
 fn activation_codegen_schedule_matches(

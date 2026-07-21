@@ -16,7 +16,7 @@ pub use wrela_test_model::{
     TestDescriptor, TestId as ModelTestId, TestKind as ModelTestKind,
 };
 
-pub const SEMANTIC_WIR_VERSION: u32 = 9;
+pub const SEMANTIC_WIR_VERSION: u32 = 10;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 
 macro_rules! id_type {
@@ -341,6 +341,20 @@ pub enum SemanticOperation {
         base: ValueId,
         field: u32,
         access: AccessMode,
+    },
+    /// Load the one canonical actor-owned state cell. The region and capacity
+    /// proof authenticate storage independently of the erased receiver value.
+    ActorStateLoad {
+        actor: ActorId,
+        region: RegionId,
+        proof: ProofId,
+    },
+    /// Store the one canonical actor-owned state cell.
+    ActorStateStore {
+        actor: ActorId,
+        region: RegionId,
+        value: ValueId,
+        proof: ProofId,
     },
     Index {
         base: ValueId,
@@ -1224,6 +1238,8 @@ fn validate_model_resources(
                             | SemanticOperation::Convert { .. }
                             | SemanticOperation::InsertField { .. }
                             | SemanticOperation::Project { .. }
+                            | SemanticOperation::ActorStateLoad { .. }
+                            | SemanticOperation::ActorStateStore { .. }
                             | SemanticOperation::Index { .. }
                             | SemanticOperation::BeginAccess { .. }
                             | SemanticOperation::EndAccess { .. }
@@ -3380,6 +3396,48 @@ fn validate_operation(
             }
         }
         SemanticOperation::Project { base, .. } => value!(*base),
+        SemanticOperation::ActorStateLoad {
+            actor,
+            region,
+            proof,
+        } => {
+            require_id("actor state actor", actor.0, module.actors.len(), errors);
+            require_id("actor state region", region.0, module.regions.len(), errors);
+            require_id("actor state proof", proof.0, module.proofs.len(), errors);
+            if !valid_actor_state_operation(
+                module, function, results, *actor, *region, *proof, None,
+            ) {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "actor state load",
+                    id: region.0,
+                });
+            }
+        }
+        SemanticOperation::ActorStateStore {
+            actor,
+            region,
+            value: stored,
+            proof,
+        } => {
+            value!(*stored);
+            require_id("actor state actor", actor.0, module.actors.len(), errors);
+            require_id("actor state region", region.0, module.regions.len(), errors);
+            require_id("actor state proof", proof.0, module.proofs.len(), errors);
+            if !valid_actor_state_operation(
+                module,
+                function,
+                results,
+                *actor,
+                *region,
+                *proof,
+                Some(*stored),
+            ) {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "actor state store",
+                    id: region.0,
+                });
+            }
+        }
         SemanticOperation::Index { base, index, proof } => {
             value!(*base);
             value!(*index);
@@ -3641,6 +3699,49 @@ fn validate_operation(
             }
         }
     }
+}
+
+fn valid_actor_state_operation(
+    module: &SemanticWir,
+    function: &SemanticFunction,
+    results: &[ValueId],
+    actor: ActorId,
+    region: RegionId,
+    proof: ProofId,
+    stored: Option<ValueId>,
+) -> bool {
+    let Some(actor_record) = module.actors.get(actor.0 as usize) else {
+        return false;
+    };
+    let Some(region_record) = module.regions.get(region.0 as usize) else {
+        return false;
+    };
+    let Some(proof_record) = module.proofs.get(proof.0 as usize) else {
+        return false;
+    };
+    let u64_value = |value: ValueId| {
+        function.values.get(value.0 as usize).is_some_and(|value| {
+            module
+                .types
+                .get(value.ty.0 as usize)
+                .is_some_and(|ty| ty.kind == TypeKind::Primitive(PrimitiveType::U64))
+        })
+    };
+    function.role == FunctionRole::ActorTurn(actor)
+        && region_record.owner == ImageOwner::Actor(actor)
+        && region_record.class == RegionClass::Image
+        && region_record.capacity_bytes == 8
+        && region_record.alignment == 8
+        && region_record.proof == proof
+        && region_record.name.strip_suffix(".state") == Some(actor_record.name.as_str())
+        && proof_record.kind == ProofKind::CapacityBound
+        && proof_record.bound == Some(1)
+        && proof_record.sources.as_slice() == [region_record.source]
+        && proof_record.depends_on.is_empty()
+        && match stored {
+            None => matches!(results, [result] if u64_value(*result)),
+            Some(value) => results.is_empty() && u64_value(value),
+        }
 }
 
 fn use_value(function: &SemanticFunction, value: ValueId, errors: &mut ValidationErrorSink<'_>) {

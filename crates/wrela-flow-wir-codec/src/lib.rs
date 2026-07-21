@@ -15,7 +15,7 @@ mod canonical;
 
 pub use canonical::CanonicalFlowWirCodec;
 
-pub const FLOW_WIR_WIRE_VERSION: u32 = 10;
+pub const FLOW_WIR_WIRE_VERSION: u32 = 11;
 pub const FLOW_WIR_MAGIC: &[u8; 8] = b"WRELFLO\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,7 +492,7 @@ mod tests {
                 profile: digest,
             },
             source_summary: SourceSummary {
-                semantic_wir_version: 9,
+                semantic_wir_version: 10,
                 semantic_functions: 1,
                 hir_files: 1,
                 hir_declarations: 1,

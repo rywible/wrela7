@@ -4576,6 +4576,10 @@ enum SourceStatementPlan {
         operator: wrela_hir::BinaryOperator,
         value: wrela_hir::ExpressionId,
     },
+    ActorStateStore {
+        access: sema::ActorStateAccess,
+        value: wrela_hir::ExpressionId,
+    },
     Expression(wrela_hir::ExpressionId),
     Send(wrela_hir::ExpressionId),
     Return(Option<wrela_hir::ExpressionId>),
@@ -4638,6 +4642,7 @@ enum SourceExpressionPlan {
     Aggregate(AggregateInput),
     EnumAggregate(EnumAggregateInput),
     Project(ProjectInput),
+    ActorStateLoad(sema::ActorStateAccess),
     DirectCall(DirectCallInput),
     OperatorCall(OperatorCallInput),
     Unary(ScalarUnaryInput),
@@ -4794,41 +4799,62 @@ impl SourceFunctionLowerer<'_> {
                         operator,
                         value,
                     } => {
-                        let [target] = targets.as_slice() else {
-                            return Err(unsupported("multi-target scalar assignment"));
-                        };
-                        let wrela_hir::Definition::Local(local) = target.root else {
-                            return Err(unsupported("non-local scalar assignment"));
-                        };
-                        if let [wrela_hir::PlaceProjection::Field(field)] =
-                            target.projections.as_slice()
+                        if let Some(access) = self
+                            .input
+                            .facts()
+                            .actor_state_accesses
+                            .iter()
+                            .find(|access| {
+                                access.function == self.function.id
+                                    && matches!(
+                                        access.kind,
+                                        sema::ActorStateAccessKind::Write { statement, .. }
+                                            if statement == statement_id
+                                    )
+                            })
+                            .cloned()
                         {
-                            if compound_assignment_binary_operator(*operator).is_some() {
-                                return Err(unsupported(
-                                    "semantic-runtime-field-compound-assignment-pending",
-                                ));
-                            }
-                            SourceStatementPlan::AssignField {
-                                local,
-                                field: field.clone(),
+                            SourceStatementPlan::ActorStateStore {
+                                access,
                                 value: *value,
                             }
-                        } else if target.projections.is_empty() {
-                            match compound_assignment_binary_operator(*operator) {
-                                Some(operator) => SourceStatementPlan::CompoundAssign {
-                                    local,
-                                    operator,
-                                    value: *value,
-                                },
-                                None => SourceStatementPlan::Assign {
-                                    local,
-                                    value: *value,
-                                },
-                            }
                         } else {
-                            return Err(unsupported(
-                                "semantic-runtime-field-assignment-projection-pending",
-                            ));
+                            let [target] = targets.as_slice() else {
+                                return Err(unsupported("multi-target scalar assignment"));
+                            };
+                            let wrela_hir::Definition::Local(local) = target.root else {
+                                return Err(unsupported("non-local scalar assignment"));
+                            };
+                            if let [wrela_hir::PlaceProjection::Field(field)] =
+                                target.projections.as_slice()
+                            {
+                                if compound_assignment_binary_operator(*operator).is_some() {
+                                    return Err(unsupported(
+                                        "semantic-runtime-field-compound-assignment-pending",
+                                    ));
+                                }
+                                SourceStatementPlan::AssignField {
+                                    local,
+                                    field: field.clone(),
+                                    value: *value,
+                                }
+                            } else if target.projections.is_empty() {
+                                match compound_assignment_binary_operator(*operator) {
+                                    Some(operator) => SourceStatementPlan::CompoundAssign {
+                                        local,
+                                        operator,
+                                        value: *value,
+                                    },
+                                    None => SourceStatementPlan::Assign {
+                                        local,
+                                        value: *value,
+                                    },
+                                }
+                            } else {
+                                return Err(unsupported(
+                                    "semantic-runtime-field-assignment-projection-pending",
+                                ));
+                            }
                         }
                     }
                     wrela_hir::StatementKind::Expression(expression) => {
@@ -4908,6 +4934,11 @@ impl SourceFunctionLowerer<'_> {
                 | SourceStatementPlan::CompoundAssign { value, .. }
                 | SourceStatementPlan::Expression(value)
                 | SourceStatementPlan::Send(value) => self.expression_fact(*value)?.effects,
+                SourceStatementPlan::ActorStateStore { value, .. } => {
+                    let mut effects = self.expression_fact(*value)?.effects;
+                    effects.0 |= sema::EffectSet::ACTOR;
+                    effects
+                }
                 SourceStatementPlan::Return(Some(value)) => self.expression_fact(*value)?.effects,
                 SourceStatementPlan::Return(None) => sema::EffectSet::default(),
                 SourceStatementPlan::Assert { condition, .. } => {
@@ -5270,6 +5301,40 @@ impl SourceFunctionLowerer<'_> {
                         Some(statement_source),
                     )?;
                     local_state.set(local, definition.value)?;
+                }
+                SourceStatementPlan::ActorStateStore { access, value } => {
+                    if !statement_definitions.is_empty()
+                        || access.function != self.function.id
+                        || access.source != statement_source
+                        || !matches!(
+                            access.kind,
+                            sema::ActorStateAccessKind::Write {
+                                statement,
+                                value_expression,
+                                ..
+                            } if statement == statement_id && value_expression == value
+                        )
+                    {
+                        return Err(self.fact_mismatch("actor state store fact"));
+                    }
+                    let LoweredExpression::Value(value) =
+                        self.lower_expression(value, sema::AccessMode::Value, &mut statements)?
+                    else {
+                        return Err(self.fact_mismatch("actor state store value"));
+                    };
+                    self.push_statement(
+                        &mut statements,
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            results: Vec::new(),
+                            operation: wir::SemanticOperation::ActorStateStore {
+                                actor: wir::ActorId(access.actor.0),
+                                region: wir::RegionId(access.region.0),
+                                value,
+                                proof: wir::ProofId(access.capacity.0),
+                            },
+                            source: Some(statement_source),
+                        }),
+                    )?;
                 }
                 SourceStatementPlan::Expression(expression) => {
                     if !statement_definitions.is_empty() {
@@ -5870,16 +5935,44 @@ impl SourceFunctionLowerer<'_> {
                     fact: "source expression",
                 })?;
             let fact = self.expression_fact(expression_id)?;
+            let actor_state_access = self
+                .input
+                .facts()
+                .actor_state_accesses
+                .iter()
+                .find(|access| {
+                    access.function == self.function.id
+                        && matches!(
+                            access.kind,
+                            sema::ActorStateAccessKind::Read { expression, .. }
+                                if expression == expression_id
+                        )
+                })
+                .cloned();
             let expected_after = if requested_access == sema::AccessMode::Take {
                 sema::OwnershipState::Taken
             } else {
                 sema::OwnershipState::Owned
             };
+            let expected_proofs = actor_state_access.as_ref().map(|access| {
+                let mut proofs = self.function.proofs.clone();
+                if !proofs.contains(&access.capacity) {
+                    proofs.push(access.capacity);
+                    proofs.sort_unstable();
+                }
+                proofs
+            });
             if fact.category != sema::ValueCategory::Value
-                || fact.region.is_some()
+                || actor_state_access.as_ref().map_or_else(
+                    || fact.region.is_some() || fact.proofs != self.function.proofs,
+                    |access| {
+                        fact.region != Some(access.region)
+                            || expected_proofs.as_ref() != Some(&fact.proofs)
+                            || fact.effects.0 != sema::EffectSet::ACTOR
+                    },
+                )
                 || fact.ownership_before != sema::OwnershipState::Owned
                 || fact.ownership_after != expected_after
-                || fact.proofs != self.function.proofs
             {
                 return Err(self.fact_mismatch("scalar expression state"));
             }
@@ -5894,413 +5987,443 @@ impl SourceFunctionLowerer<'_> {
             ) {
                 return Err(self.fact_mismatch("exclusive scalar operand"));
             }
-            let plan = match (&expression.kind, &fact.resolution) {
-                (
-                    wrela_hir::ExpressionKind::Literal(literal),
-                    sema::ExpressionResolution::Constant(constant),
-                ) => {
-                    if fact.effects.0 != 0
-                        || !constant_matches_literal(self.input.facts(), fact.ty, literal, constant)
-                    {
-                        return Err(self.fact_mismatch("scalar literal"));
-                    }
-                    SourceExpressionPlan::Constant {
-                        value: lower_constant(constant)?,
-                        ty: fact.ty,
-                        result: fact
-                            .result
-                            .ok_or_else(|| self.fact_mismatch("literal result"))?,
-                    }
+            let plan = if let Some(access) = actor_state_access {
+                if !matches!(
+                    (&expression.kind, &fact.resolution, access.kind),
+                    (
+                        wrela_hir::ExpressionKind::Field { .. },
+                        sema::ExpressionResolution::Field { index },
+                        sema::ActorStateAccessKind::Read {
+                            expression,
+                            result,
+                        },
+                    ) if *index == access.field
+                        && expression == expression_id
+                        && fact.result == Some(result)
+                ) {
+                    return Err(self.fact_mismatch("actor state load fact"));
                 }
-                (
-                    wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(local)),
-                    sema::ExpressionResolution::Value(value),
-                ) => SourceExpressionPlan::Local(ValueReferenceInput {
-                    expression: expression_id,
-                    local: *local,
-                    value: *value,
-                    ty: fact.ty,
-                    effects: fact.effects,
-                    result: fact.result,
-                    source: expression.source,
-                }),
-                (
-                    wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Parameter(
-                        parameter,
-                    )),
-                    sema::ExpressionResolution::Value(value),
-                ) => SourceExpressionPlan::Parameter {
-                    parameter: *parameter,
-                    value: *value,
-                    ty: fact.ty,
-                    effects: fact.effects,
-                    result: fact.result,
-                },
-                (
-                    wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(
-                        source,
-                    )),
-                    sema::ExpressionResolution::Function(target),
-                ) => SourceExpressionPlan::Function {
-                    source: wrela_hir::ResolvedDeclaration {
-                        package: source.package,
-                        module: source.module,
-                        declaration: source.declaration,
+                SourceExpressionPlan::ActorStateLoad(access)
+            } else {
+                match (&expression.kind, &fact.resolution) {
+                    (
+                        wrela_hir::ExpressionKind::Literal(literal),
+                        sema::ExpressionResolution::Constant(constant),
+                    ) => {
+                        if fact.effects.0 != 0
+                            || !constant_matches_literal(
+                                self.input.facts(),
+                                fact.ty,
+                                literal,
+                                constant,
+                            )
+                        {
+                            return Err(self.fact_mismatch("scalar literal"));
+                        }
+                        SourceExpressionPlan::Constant {
+                            value: lower_constant(constant)?,
+                            ty: fact.ty,
+                            result: fact
+                                .result
+                                .ok_or_else(|| self.fact_mismatch("literal result"))?,
+                        }
+                    }
+                    (
+                        wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(local)),
+                        sema::ExpressionResolution::Value(value),
+                    ) => SourceExpressionPlan::Local(ValueReferenceInput {
+                        expression: expression_id,
+                        local: *local,
+                        value: *value,
+                        ty: fact.ty,
+                        effects: fact.effects,
+                        result: fact.result,
+                        source: expression.source,
+                    }),
+                    (
+                        wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Parameter(
+                            parameter,
+                        )),
+                        sema::ExpressionResolution::Value(value),
+                    ) => SourceExpressionPlan::Parameter {
+                        parameter: *parameter,
+                        value: *value,
+                        ty: fact.ty,
+                        effects: fact.effects,
+                        result: fact.result,
                     },
-                    target: *target,
-                    ty: fact.ty,
-                    effects: fact.effects,
-                    result: fact.result,
-                },
-                (
-                    wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(
-                        source,
-                    )),
-                    sema::ExpressionResolution::Constructor { ty, variant: None },
-                ) => SourceExpressionPlan::Constructor {
-                    source: wrela_hir::ResolvedDeclaration {
-                        package: source.package,
-                        module: source.module,
-                        declaration: source.declaration,
+                    (
+                        wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(
+                            source,
+                        )),
+                        sema::ExpressionResolution::Function(target),
+                    ) => SourceExpressionPlan::Function {
+                        source: wrela_hir::ResolvedDeclaration {
+                            package: source.package,
+                            module: source.module,
+                            declaration: source.declaration,
+                        },
+                        target: *target,
+                        ty: fact.ty,
+                        effects: fact.effects,
+                        result: fact.result,
                     },
-                    ty: *ty,
-                    effects: fact.effects,
-                    result: fact.result,
-                },
-                (
-                    wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Variant(source)),
-                    sema::ExpressionResolution::Constructor {
-                        ty,
-                        variant: Some(variant),
+                    (
+                        wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(
+                            source,
+                        )),
+                        sema::ExpressionResolution::Constructor { ty, variant: None },
+                    ) => SourceExpressionPlan::Constructor {
+                        source: wrela_hir::ResolvedDeclaration {
+                            package: source.package,
+                            module: source.module,
+                            declaration: source.declaration,
+                        },
+                        ty: *ty,
+                        effects: fact.effects,
+                        result: fact.result,
                     },
-                ) => SourceExpressionPlan::EnumConstructor {
-                    source: source.clone(),
-                    ty: *ty,
-                    variant: *variant,
-                    effects: fact.effects,
-                    result: fact.result,
-                },
-                (
-                    wrela_hir::ExpressionKind::Field { .. },
-                    sema::ExpressionResolution::Constructor {
-                        ty,
-                        variant: Some(variant),
+                    (
+                        wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Variant(
+                            source,
+                        )),
+                        sema::ExpressionResolution::Constructor {
+                            ty,
+                            variant: Some(variant),
+                        },
+                    ) => SourceExpressionPlan::EnumConstructor {
+                        source: source.clone(),
+                        ty: *ty,
+                        variant: *variant,
+                        effects: fact.effects,
+                        result: fact.result,
                     },
-                ) if resolved_enum_constructor_from_hir(
-                    self.input.hir().as_program(),
-                    expression_id,
-                )
-                .is_some_and(|source| source.variant == *variant) =>
-                {
-                    let source = resolved_enum_constructor_from_hir(
+                    (
+                        wrela_hir::ExpressionKind::Field { .. },
+                        sema::ExpressionResolution::Constructor {
+                            ty,
+                            variant: Some(variant),
+                        },
+                    ) if resolved_enum_constructor_from_hir(
                         self.input.hir().as_program(),
                         expression_id,
                     )
-                    .ok_or_else(|| self.fact_mismatch("enum constructor source identity"))?;
-                    SourceExpressionPlan::EnumConstructor {
-                        source,
-                        ty: *ty,
-                        variant: *variant,
-                        effects: fact.effects,
-                        result: fact.result,
+                    .is_some_and(|source| source.variant == *variant) =>
+                    {
+                        let source = resolved_enum_constructor_from_hir(
+                            self.input.hir().as_program(),
+                            expression_id,
+                        )
+                        .ok_or_else(|| self.fact_mismatch("enum constructor source identity"))?;
+                        SourceExpressionPlan::EnumConstructor {
+                            source,
+                            ty: *ty,
+                            variant: *variant,
+                            effects: fact.effects,
+                            result: fact.result,
+                        }
                     }
-                }
-                (
-                    wrela_hir::ExpressionKind::Call { callee, arguments },
-                    sema::ExpressionResolution::Constructor { ty, variant: None },
-                ) => SourceExpressionPlan::Aggregate(AggregateInput {
-                    expression: expression_id,
-                    source: expression.source,
-                    callee: *callee,
-                    source_argument_count: arguments.len(),
-                    ty: *ty,
-                    result: fact.result,
-                    effects: fact.effects,
-                }),
-                (
-                    wrela_hir::ExpressionKind::Call { callee, arguments },
-                    sema::ExpressionResolution::Constructor {
-                        ty,
-                        variant: Some(variant),
-                    },
-                ) if arguments.len() == 1 => {
-                    SourceExpressionPlan::EnumAggregate(EnumAggregateInput {
-                        expression: expression_id,
-                        source: expression.source,
-                        callee: *callee,
-                        ty: *ty,
-                        variant: *variant,
-                        result: fact.result,
-                        effects: fact.effects,
-                    })
-                }
-                (
-                    wrela_hir::ExpressionKind::Field { base, .. },
-                    sema::ExpressionResolution::Field { index },
-                ) => SourceExpressionPlan::Project(ProjectInput {
-                    expression: expression_id,
-                    source: expression.source,
-                    base: *base,
-                    field: *index,
-                    ty: fact.ty,
-                    result: fact.result,
-                    effects: fact.effects,
-                }),
-                (
-                    wrela_hir::ExpressionKind::Call { callee, arguments },
-                    sema::ExpressionResolution::DirectCall {
-                        function,
-                        arguments: bindings,
-                    },
-                ) => {
-                    let mut copied_bindings = try_vec(
-                        bindings.len(),
-                        "direct-call semantic bindings",
-                        self.limits.model_edges,
-                    )?;
-                    for binding in bindings {
-                        check_cancelled(self.is_cancelled)?;
-                        copied_bindings.push(*binding);
-                    }
-                    SourceExpressionPlan::DirectCall(DirectCallInput {
+                    (
+                        wrela_hir::ExpressionKind::Call { callee, arguments },
+                        sema::ExpressionResolution::Constructor { ty, variant: None },
+                    ) => SourceExpressionPlan::Aggregate(AggregateInput {
                         expression: expression_id,
                         source: expression.source,
                         callee: *callee,
                         source_argument_count: arguments.len(),
-                        target: *function,
-                        bindings: copied_bindings,
-                        result_type: fact.ty,
+                        ty: *ty,
                         result: fact.result,
                         effects: fact.effects,
-                    })
-                }
-                (
-                    wrela_hir::ExpressionKind::Unary {
-                        operator:
-                            operator @ (wrela_hir::UnaryOperator::Negate
-                            | wrela_hir::UnaryOperator::BitNot
-                            | wrela_hir::UnaryOperator::BoolNot
-                            | wrela_hir::UnaryOperator::Copy),
-                        operand,
-                    },
-                    sema::ExpressionResolution::Value(value),
-                ) if fact.result == Some(*value) => SourceExpressionPlan::Unary(ScalarUnaryInput {
-                    expression: expression_id,
-                    operator: *operator,
-                    operand: *operand,
-                    ty: fact.ty,
-                    result: *value,
-                    effects: fact.effects,
-                }),
-                (
-                    wrela_hir::ExpressionKind::Binary {
-                        operator,
-                        left,
-                        right,
-                    },
-                    sema::ExpressionResolution::Value(value),
-                ) if !matches!(
-                    operator,
-                    wrela_hir::BinaryOperator::LogicalOr | wrela_hir::BinaryOperator::LogicalAnd
-                ) && fact.result == Some(*value) =>
-                {
-                    SourceExpressionPlan::Binary(ScalarBinaryInput {
-                        expression: expression_id,
-                        operator: ScalarBinaryOperator::Arithmetic(*operator),
-                        left: *left,
-                        right: *right,
-                        ty: fact.ty,
-                        result: *value,
-                        effects: fact.effects,
-                    })
-                }
-                (
-                    wrela_hir::ExpressionKind::Compare {
-                        left,
-                        operator,
-                        right,
-                    },
-                    sema::ExpressionResolution::Value(value),
-                ) if !matches!(
-                    operator,
-                    wrela_hir::ComparisonOperator::In | wrela_hir::ComparisonOperator::NotIn
-                ) && fact.result == Some(*value) =>
-                {
-                    SourceExpressionPlan::Binary(ScalarBinaryInput {
-                        expression: expression_id,
-                        operator: ScalarBinaryOperator::Compare(*operator),
-                        left: *left,
-                        right: *right,
-                        ty: fact.ty,
-                        result: *value,
-                        effects: fact.effects,
-                    })
-                }
-                (
-                    wrela_hir::ExpressionKind::Binary {
-                        operator,
-                        left,
-                        right,
-                    },
-                    sema::ExpressionResolution::OperatorCall {
-                        function,
-                        arguments,
-                        raw_result,
-                        negate,
-                    },
-                ) if !matches!(
-                    operator,
-                    wrela_hir::BinaryOperator::LogicalOr | wrela_hir::BinaryOperator::LogicalAnd
-                ) =>
-                {
-                    let mut copied_bindings = try_vec(
-                        arguments.len(),
-                        "operator-call semantic bindings",
-                        self.limits.model_edges,
-                    )?;
-                    for binding in arguments {
-                        check_cancelled(self.is_cancelled)?;
-                        copied_bindings.push(*binding);
+                    }),
+                    (
+                        wrela_hir::ExpressionKind::Call { callee, arguments },
+                        sema::ExpressionResolution::Constructor {
+                            ty,
+                            variant: Some(variant),
+                        },
+                    ) if arguments.len() == 1 => {
+                        SourceExpressionPlan::EnumAggregate(EnumAggregateInput {
+                            expression: expression_id,
+                            source: expression.source,
+                            callee: *callee,
+                            ty: *ty,
+                            variant: *variant,
+                            result: fact.result,
+                            effects: fact.effects,
+                        })
                     }
-                    SourceExpressionPlan::OperatorCall(OperatorCallInput {
+                    (
+                        wrela_hir::ExpressionKind::Field { base, .. },
+                        sema::ExpressionResolution::Field { index },
+                    ) => SourceExpressionPlan::Project(ProjectInput {
                         expression: expression_id,
                         source: expression.source,
-                        left: *left,
-                        right: *right,
-                        target: *function,
-                        bindings: copied_bindings,
-                        raw_result: *raw_result,
-                        negate: *negate,
-                        result_type: fact.ty,
+                        base: *base,
+                        field: *index,
+                        ty: fact.ty,
                         result: fact.result,
                         effects: fact.effects,
-                    })
-                }
-                (
-                    wrela_hir::ExpressionKind::Compare {
-                        left,
-                        operator,
-                        right,
-                    },
-                    sema::ExpressionResolution::OperatorCall {
-                        function,
-                        arguments,
-                        raw_result,
-                        negate,
-                    },
-                ) if !matches!(
-                    operator,
-                    wrela_hir::ComparisonOperator::In | wrela_hir::ComparisonOperator::NotIn
-                ) =>
-                {
-                    let mut copied_bindings = try_vec(
-                        arguments.len(),
-                        "operator-call semantic bindings",
-                        self.limits.model_edges,
-                    )?;
-                    for binding in arguments {
-                        check_cancelled(self.is_cancelled)?;
-                        copied_bindings.push(*binding);
+                    }),
+                    (
+                        wrela_hir::ExpressionKind::Call { callee, arguments },
+                        sema::ExpressionResolution::DirectCall {
+                            function,
+                            arguments: bindings,
+                        },
+                    ) => {
+                        let mut copied_bindings = try_vec(
+                            bindings.len(),
+                            "direct-call semantic bindings",
+                            self.limits.model_edges,
+                        )?;
+                        for binding in bindings {
+                            check_cancelled(self.is_cancelled)?;
+                            copied_bindings.push(*binding);
+                        }
+                        SourceExpressionPlan::DirectCall(DirectCallInput {
+                            expression: expression_id,
+                            source: expression.source,
+                            callee: *callee,
+                            source_argument_count: arguments.len(),
+                            target: *function,
+                            bindings: copied_bindings,
+                            result_type: fact.ty,
+                            result: fact.result,
+                            effects: fact.effects,
+                        })
                     }
-                    SourceExpressionPlan::OperatorCall(OperatorCallInput {
+                    (
+                        wrela_hir::ExpressionKind::Unary {
+                            operator:
+                                operator @ (wrela_hir::UnaryOperator::Negate
+                                | wrela_hir::UnaryOperator::BitNot
+                                | wrela_hir::UnaryOperator::BoolNot
+                                | wrela_hir::UnaryOperator::Copy),
+                            operand,
+                        },
+                        sema::ExpressionResolution::Value(value),
+                    ) if fact.result == Some(*value) => {
+                        SourceExpressionPlan::Unary(ScalarUnaryInput {
+                            expression: expression_id,
+                            operator: *operator,
+                            operand: *operand,
+                            ty: fact.ty,
+                            result: *value,
+                            effects: fact.effects,
+                        })
+                    }
+                    (
+                        wrela_hir::ExpressionKind::Binary {
+                            operator,
+                            left,
+                            right,
+                        },
+                        sema::ExpressionResolution::Value(value),
+                    ) if !matches!(
+                        operator,
+                        wrela_hir::BinaryOperator::LogicalOr
+                            | wrela_hir::BinaryOperator::LogicalAnd
+                    ) && fact.result == Some(*value) =>
+                    {
+                        SourceExpressionPlan::Binary(ScalarBinaryInput {
+                            expression: expression_id,
+                            operator: ScalarBinaryOperator::Arithmetic(*operator),
+                            left: *left,
+                            right: *right,
+                            ty: fact.ty,
+                            result: *value,
+                            effects: fact.effects,
+                        })
+                    }
+                    (
+                        wrela_hir::ExpressionKind::Compare {
+                            left,
+                            operator,
+                            right,
+                        },
+                        sema::ExpressionResolution::Value(value),
+                    ) if !matches!(
+                        operator,
+                        wrela_hir::ComparisonOperator::In | wrela_hir::ComparisonOperator::NotIn
+                    ) && fact.result == Some(*value) =>
+                    {
+                        SourceExpressionPlan::Binary(ScalarBinaryInput {
+                            expression: expression_id,
+                            operator: ScalarBinaryOperator::Compare(*operator),
+                            left: *left,
+                            right: *right,
+                            ty: fact.ty,
+                            result: *value,
+                            effects: fact.effects,
+                        })
+                    }
+                    (
+                        wrela_hir::ExpressionKind::Binary {
+                            operator,
+                            left,
+                            right,
+                        },
+                        sema::ExpressionResolution::OperatorCall {
+                            function,
+                            arguments,
+                            raw_result,
+                            negate,
+                        },
+                    ) if !matches!(
+                        operator,
+                        wrela_hir::BinaryOperator::LogicalOr
+                            | wrela_hir::BinaryOperator::LogicalAnd
+                    ) =>
+                    {
+                        let mut copied_bindings = try_vec(
+                            arguments.len(),
+                            "operator-call semantic bindings",
+                            self.limits.model_edges,
+                        )?;
+                        for binding in arguments {
+                            check_cancelled(self.is_cancelled)?;
+                            copied_bindings.push(*binding);
+                        }
+                        SourceExpressionPlan::OperatorCall(OperatorCallInput {
+                            expression: expression_id,
+                            source: expression.source,
+                            left: *left,
+                            right: *right,
+                            target: *function,
+                            bindings: copied_bindings,
+                            raw_result: *raw_result,
+                            negate: *negate,
+                            result_type: fact.ty,
+                            result: fact.result,
+                            effects: fact.effects,
+                        })
+                    }
+                    (
+                        wrela_hir::ExpressionKind::Compare {
+                            left,
+                            operator,
+                            right,
+                        },
+                        sema::ExpressionResolution::OperatorCall {
+                            function,
+                            arguments,
+                            raw_result,
+                            negate,
+                        },
+                    ) if !matches!(
+                        operator,
+                        wrela_hir::ComparisonOperator::In | wrela_hir::ComparisonOperator::NotIn
+                    ) =>
+                    {
+                        let mut copied_bindings = try_vec(
+                            arguments.len(),
+                            "operator-call semantic bindings",
+                            self.limits.model_edges,
+                        )?;
+                        for binding in arguments {
+                            check_cancelled(self.is_cancelled)?;
+                            copied_bindings.push(*binding);
+                        }
+                        SourceExpressionPlan::OperatorCall(OperatorCallInput {
+                            expression: expression_id,
+                            source: expression.source,
+                            left: *left,
+                            right: *right,
+                            target: *function,
+                            bindings: copied_bindings,
+                            raw_result: *raw_result,
+                            negate: *negate,
+                            result_type: fact.ty,
+                            result: fact.result,
+                            effects: fact.effects,
+                        })
+                    }
+                    (
+                        wrela_hir::ExpressionKind::Cast { value: source, ty },
+                        sema::ExpressionResolution::Value(value),
+                    ) if fact.result == Some(*value)
+                        && source_type_matches_semantic(self.input.facts(), ty, fact.ty) =>
+                    {
+                        SourceExpressionPlan::Convert(ScalarConvertInput {
+                            expression: expression_id,
+                            value: *source,
+                            destination: fact.ty,
+                            result: *value,
+                            effects: fact.effects,
+                        })
+                    }
+                    (
+                        wrela_hir::ExpressionKind::Try(operand),
+                        sema::ExpressionResolution::ResultTry {
+                            result_type,
+                            ok_variant,
+                            err_variant,
+                            ok_payload,
+                            err_payload,
+                            propagated,
+                        },
+                    ) => SourceExpressionPlan::ResultTry(ResultTryInput {
                         expression: expression_id,
                         source: expression.source,
-                        left: *left,
-                        right: *right,
-                        target: *function,
-                        bindings: copied_bindings,
-                        raw_result: *raw_result,
-                        negate: *negate,
-                        result_type: fact.ty,
-                        result: fact.result,
+                        operand: *operand,
+                        payload_type: fact.ty,
+                        result_type: *result_type,
+                        ok_variant: *ok_variant,
+                        err_variant: *err_variant,
+                        ok_payload: *ok_payload,
+                        err_payload: *err_payload,
+                        propagated: *propagated,
+                        result: fact
+                            .result
+                            .ok_or_else(|| self.fact_mismatch("postfix question result"))?,
                         effects: fact.effects,
-                    })
-                }
-                (
-                    wrela_hir::ExpressionKind::Cast { value: source, ty },
-                    sema::ExpressionResolution::Value(value),
-                ) if fact.result == Some(*value)
-                    && source_type_matches_semantic(self.input.facts(), ty, fact.ty) =>
-                {
-                    SourceExpressionPlan::Convert(ScalarConvertInput {
+                    }),
+                    (
+                        wrela_hir::ExpressionKind::Unary {
+                            operator: wrela_hir::UnaryOperator::Await,
+                            operand,
+                        },
+                        sema::ExpressionResolution::Builtin(sema::IntrinsicOperation::Await),
+                    ) => SourceExpressionPlan::Await {
                         expression: expression_id,
-                        value: *source,
-                        destination: fact.ty,
-                        result: *value,
-                        effects: fact.effects,
-                    })
-                }
-                (
-                    wrela_hir::ExpressionKind::Try(operand),
-                    sema::ExpressionResolution::ResultTry {
-                        result_type,
-                        ok_variant,
-                        err_variant,
-                        ok_payload,
-                        err_payload,
-                        propagated,
-                    },
-                ) => SourceExpressionPlan::ResultTry(ResultTryInput {
-                    expression: expression_id,
-                    source: expression.source,
-                    operand: *operand,
-                    payload_type: fact.ty,
-                    result_type: *result_type,
-                    ok_variant: *ok_variant,
-                    err_variant: *err_variant,
-                    ok_payload: *ok_payload,
-                    err_payload: *err_payload,
-                    propagated: *propagated,
-                    result: fact
-                        .result
-                        .ok_or_else(|| self.fact_mismatch("postfix question result"))?,
-                    effects: fact.effects,
-                }),
-                (
-                    wrela_hir::ExpressionKind::Unary {
-                        operator: wrela_hir::UnaryOperator::Await,
-                        operand,
-                    },
-                    sema::ExpressionResolution::Builtin(sema::IntrinsicOperation::Await),
-                ) => SourceExpressionPlan::Await {
-                    expression: expression_id,
-                    operand: *operand,
-                    ty: fact.ty,
-                    result: fact
-                        .result
-                        .ok_or_else(|| self.fact_mismatch("await result"))?,
-                    effects: fact.effects,
-                },
-                (
-                    wrela_hir::ExpressionKind::If {
-                        condition,
-                        then_branch,
-                        elif_branches,
-                        else_branch,
-                    },
-                    sema::ExpressionResolution::Value(value),
-                ) if fact.result == Some(*value) => {
-                    let mut copied_elifs = try_vec(
-                        elif_branches.len(),
-                        "inline if elif branches",
-                        self.limits.model_edges,
-                    )?;
-                    copied_elifs.extend_from_slice(elif_branches);
-                    SourceExpressionPlan::InlineIf(InlineIfInput {
-                        expression: expression_id,
-                        condition: *condition,
-                        then_branch: *then_branch,
-                        elif_branches: copied_elifs,
-                        else_branch: *else_branch,
+                        operand: *operand,
                         ty: fact.ty,
-                        result: *value,
+                        result: fact
+                            .result
+                            .ok_or_else(|| self.fact_mismatch("await result"))?,
                         effects: fact.effects,
-                    })
-                }
-                _ => {
-                    return Err(unsupported(
-                        "ordinary source expressions outside scalar bodies",
-                    ));
+                    },
+                    (
+                        wrela_hir::ExpressionKind::If {
+                            condition,
+                            then_branch,
+                            elif_branches,
+                            else_branch,
+                        },
+                        sema::ExpressionResolution::Value(value),
+                    ) if fact.result == Some(*value) => {
+                        let mut copied_elifs = try_vec(
+                            elif_branches.len(),
+                            "inline if elif branches",
+                            self.limits.model_edges,
+                        )?;
+                        copied_elifs.extend_from_slice(elif_branches);
+                        SourceExpressionPlan::InlineIf(InlineIfInput {
+                            expression: expression_id,
+                            condition: *condition,
+                            then_branch: *then_branch,
+                            elif_branches: copied_elifs,
+                            else_branch: *else_branch,
+                            ty: fact.ty,
+                            result: *value,
+                            effects: fact.effects,
+                        })
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            "ordinary source expressions outside scalar bodies",
+                        ));
+                    }
                 }
             };
             (expression.source, plan)
@@ -6457,6 +6580,50 @@ impl SourceFunctionLowerer<'_> {
             }
             SourceExpressionPlan::Project(project) => {
                 self.lower_flat_projection(project, statements)
+            }
+            SourceExpressionPlan::ActorStateLoad(access) => {
+                let expression = self
+                    .input
+                    .hir()
+                    .as_program()
+                    .expression(expression_id)
+                    .ok_or_else(|| self.fact_mismatch("actor state load expression"))?;
+                let wrela_hir::ExpressionKind::Field { base, .. } = expression.kind else {
+                    return Err(self.fact_mismatch("actor state load expression kind"));
+                };
+                let base_fact = self.expression_fact(base)?;
+                if !matches!(
+                    self.input.hir().as_program().expression(base).map(|record| &record.kind),
+                    Some(wrela_hir::ExpressionKind::Reference(
+                        wrela_hir::Definition::Parameter(parameter)
+                    )) if *parameter == access.receiver
+                ) || base_fact.result.is_some()
+                    || base_fact.region.is_some()
+                    || base_fact.effects.0 != 0
+                    || base_fact.proofs != self.function.proofs
+                {
+                    return Err(self.fact_mismatch("actor state receiver witness"));
+                }
+                self.push_seen_expression(base)?;
+                let result = match access.kind {
+                    sema::ActorStateAccessKind::Read { result, .. } => result,
+                    sema::ActorStateAccessKind::Write { .. } => {
+                        return Err(self.fact_mismatch("actor state load kind"));
+                    }
+                };
+                let ty = self.expression_fact(expression_id)?.ty;
+                let result = self.lowered_expression_result(expression_id, result, ty, source)?;
+                self.push_let(
+                    statements,
+                    result,
+                    wir::SemanticOperation::ActorStateLoad {
+                        actor: wir::ActorId(access.actor.0),
+                        region: wir::RegionId(access.region.0),
+                        proof: wir::ProofId(access.capacity.0),
+                    },
+                    Some(source),
+                )?;
+                Ok(LoweredExpression::Value(result))
             }
             SourceExpressionPlan::DirectCall(call) => self.lower_direct_call(call, statements),
             SourceExpressionPlan::OperatorCall(call) => self.lower_operator_call(call, statements),
@@ -10115,6 +10282,8 @@ fn measure_model_resources(
                             | SemanticOperation::ConstructEnum { .. }
                             | SemanticOperation::InsertField { .. }
                             | SemanticOperation::Project { .. }
+                            | SemanticOperation::ActorStateLoad { .. }
+                            | SemanticOperation::ActorStateStore { .. }
                             | SemanticOperation::Index { .. }
                             | SemanticOperation::BeginAccess { .. }
                             | SemanticOperation::EndAccess { .. }
@@ -10945,6 +11114,32 @@ fn actor_operations_match(
                 method: rm,
             },
         ) => la == ra && lm == rm,
+        (
+            wir::SemanticOperation::ActorStateLoad {
+                actor: la,
+                region: lr,
+                proof: lp,
+            },
+            wir::SemanticOperation::ActorStateLoad {
+                actor: ra,
+                region: rr,
+                proof: rp,
+            },
+        ) => la == ra && lr == rr && lp == rp,
+        (
+            wir::SemanticOperation::ActorStateStore {
+                actor: la,
+                region: lr,
+                value: lv,
+                proof: lp,
+            },
+            wir::SemanticOperation::ActorStateStore {
+                actor: ra,
+                region: rr,
+                value: rv,
+                proof: rp,
+            },
+        ) => la == ra && lr == rr && lv == rv && lp == rp,
         _ => false,
     })
 }

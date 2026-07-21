@@ -1457,6 +1457,16 @@ fn encode_operation(writer: &mut Writer<'_>, value: &FlowOperation) -> Result<()
             writer.u32(actor.0)?;
             writer.u32(proof.0)
         }
+        FlowOperation::ActorStateAddress {
+            actor,
+            region,
+            proof,
+        } => {
+            writer.u8(53)?;
+            writer.u32(actor.0)?;
+            writer.u32(region.0)?;
+            writer.u32(proof.0)
+        }
     }
 }
 
@@ -2589,6 +2599,11 @@ impl Reader<'_> {
                 actor: ActorId(self.u32()?),
                 proof: ProofId(self.u32()?),
             },
+            53 => FlowOperation::ActorStateAddress {
+                actor: ActorId(self.u32()?),
+                region: RegionId(self.u32()?),
+                proof: ProofId(self.u32()?),
+            },
             tag => return Err(invalid_tag("FlowOperation", tag)),
         })
     }
@@ -2667,7 +2682,7 @@ mod tests {
             name: "canonical-image".to_owned(),
             build: build_identity(7),
             source_summary: SourceSummary {
-                semantic_wir_version: 9,
+                semantic_wir_version: 10,
                 semantic_functions: 2,
                 hir_files: 1,
                 hir_declarations: 2,
@@ -4925,13 +4940,34 @@ mod tests {
                 .expect("closed enum operation consumes exactly");
         }
 
-        let mut reader = Reader::new(&[53], 0, CodecLimits::standard(), &not_cancelled);
+        let mut reader = Reader::new(&[54], 0, CodecLimits::standard(), &not_cancelled);
         assert_eq!(
             reader.operation(),
             Err(CodecError::InvalidEnumTag {
                 kind: "FlowOperation",
-                tag: 53,
+                tag: 54,
             })
         );
+    }
+
+    #[test]
+    fn actor_state_address_uses_appended_tag_and_roundtrips_authority() {
+        let not_cancelled = || false;
+        let operation = FlowOperation::ActorStateAddress {
+            actor: ActorId(2),
+            region: RegionId(3),
+            proof: ProofId(5),
+        };
+        let mut writer = Writer::new(CodecLimits::standard(), &not_cancelled);
+        writer
+            .operation(&operation)
+            .expect("actor state address encodes");
+        let bytes = writer.finish();
+        assert_eq!(bytes[0], 53);
+        let mut reader = Reader::new(&bytes, 0, CodecLimits::standard(), &not_cancelled);
+        assert_eq!(reader.operation(), Ok(operation));
+        reader
+            .finish()
+            .expect("actor state address consumes exactly");
     }
 }

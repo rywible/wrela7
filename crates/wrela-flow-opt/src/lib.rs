@@ -1691,6 +1691,7 @@ fn scan_operation(
             arguments: fields, ..
         } => meter.collection(fields.len()),
         FlowOperation::Unary { .. }
+        | FlowOperation::ActorStateAddress { .. }
         | FlowOperation::Binary { .. }
         | FlowOperation::Cast { .. }
         | FlowOperation::MakeEnum { .. }

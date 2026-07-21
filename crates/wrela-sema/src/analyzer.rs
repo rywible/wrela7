@@ -1163,6 +1163,7 @@ fn empty_partial(
         values: Vec::new(),
         expressions: Vec::new(),
         statements: Vec::new(),
+        actor_state_accesses: Vec::new(),
         projection_protocols: Vec::new(),
         lexical_views: Vec::new(),
         scope_protocols: Vec::new(),
@@ -4795,27 +4796,44 @@ fn analyze_runtime_body(
                         "assign one initialized scalar local",
                     ));
                 };
-                let Definition::Local(local) = target.root else {
-                    if !target.projections.is_empty() {
+                if let Some(effects) = analyze_actor_state_assignment(
+                    request,
+                    partial,
+                    function,
+                    statement_id,
+                    statement.source,
+                    target,
+                    *operator,
+                    *value,
+                    locals,
+                    parameters,
+                    allow_assertions,
+                    &mut *aggregate_work,
+                    is_cancelled,
+                )? {
+                    statement_effects = effects;
+                } else {
+                    let Definition::Local(local) = target.root else {
+                        if !target.projections.is_empty() {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                target.source,
+                                "semantic-projected-assignment-root-pending",
+                                "projected assignment currently requires an owned local root",
+                                "parameter, declaration, and receiver roots require place authority to survive aggregate replacement",
+                                "copy the aggregate into a typed local before assigning one of its fields",
+                            ));
+                        }
                         return Err(runtime_type_diagnostic(
                             request,
                             target.source,
-                            "semantic-projected-assignment-root-pending",
-                            "projected assignment currently requires an owned local root",
-                            "parameter, declaration, and receiver roots require place authority to survive aggregate replacement",
-                            "copy the aggregate into a typed local before assigning one of its fields",
+                            "semantic-assignment-target",
+                            "scalar assignment target must be a local value",
+                            "parameters, declarations, and projected places are not local SSA bindings",
+                            "assign an initialized scalar local",
                         ));
-                    }
-                    return Err(runtime_type_diagnostic(
-                        request,
-                        target.source,
-                        "semantic-assignment-target",
-                        "scalar assignment target must be a local value",
-                        "parameters, declarations, and projected places are not local SSA bindings",
-                        "assign an initialized scalar local",
-                    ));
-                };
-                let current = locals
+                    };
+                    let current = locals
                     .get(local.0 as usize)
                     .copied()
                     .flatten()
@@ -4830,237 +4848,156 @@ fn analyze_runtime_body(
                             "initialize the local before the conditional",
                         )
                     })?;
-                reject_live_lexical_rebind(
-                    request,
-                    partial,
-                    function,
-                    current.value,
-                    local,
-                    target.source,
-                    is_cancelled,
-                )?;
-                if current.state != OwnershipState::Owned
-                    || current.authority != RuntimeAuthority::Own
-                {
-                    return Err(runtime_diagnostic(
+                    reject_live_lexical_rebind(
                         request,
+                        partial,
+                        function,
+                        current.value,
+                        local,
                         target.source,
-                        "semantic-assignment-ownership",
-                        "assignment target is not a live owned scalar value",
-                        Some(current),
-                        "a taken, moved, or borrowed value cannot be overwritten through this SSA path",
-                        "assign before transferring or borrowing the value",
-                    ));
-                }
-                let current_ty = partial
-                    .values
-                    .get(current.value.0 as usize)
-                    .filter(|record| record.function == function)
-                    .map(|record| record.ty)
-                    .ok_or(AnalysisFailure::RequestMismatch)?;
-                let local_record = request
-                    .hir
-                    .as_program()
-                    .locals
-                    .get(local.0 as usize)
-                    .filter(|record| record.id == local)
-                    .ok_or(AnalysisFailure::RequestMismatch)?;
-                if !target.projections.is_empty() {
-                    if *operator != AssignmentOperator::Assign {
-                        return Err(runtime_type_diagnostic(
+                        is_cancelled,
+                    )?;
+                    if current.state != OwnershipState::Owned
+                        || current.authority != RuntimeAuthority::Own
+                    {
+                        return Err(runtime_diagnostic(
                             request,
                             target.source,
-                            "semantic-projected-assignment-compound-pending",
-                            "compound projected assignment is not yet supported",
-                            "read-modify-write field operations require an explicit projected-place reservation",
-                            "compute the replacement scalar separately and use plain field assignment",
+                            "semantic-assignment-ownership",
+                            "assignment target is not a live owned scalar value",
+                            Some(current),
+                            "a taken, moved, or borrowed value cannot be overwritten through this SSA path",
+                            "assign before transferring or borrowing the value",
                         ));
                     }
-                    let [projection] = target.projections.as_slice() else {
-                        return Err(runtime_type_diagnostic(
-                            request,
-                            target.source,
-                            "semantic-projected-assignment-nested-pending",
-                            "nested projected assignment is not yet supported",
-                            "revision 0.1 currently replaces one field of one owned local aggregate",
-                            "assign through exactly one direct field projection",
-                        ));
-                    };
-                    let wrela_hir::PlaceProjection::Field(field_name) = projection else {
-                        return Err(runtime_type_diagnostic(
-                            request,
-                            target.source,
-                            "semantic-projected-assignment-shape-pending",
-                            "projected assignment currently supports named structure fields only",
-                            "tuple and indexed places require their own aggregate layout and bounds proofs",
-                            "assign one named field of a flat runtime structure",
-                        ));
-                    };
-                    let (declaration, field_ty, field_public) = {
-                        let record = partial
-                            .types
-                            .get(current_ty.0 as usize)
-                            .ok_or(AnalysisFailure::RequestMismatch)?;
-                        let SemanticTypeKind::Structure {
-                            declaration,
-                            arguments,
-                            fields,
-                        } = &record.kind
-                        else {
+                    let current_ty = partial
+                        .values
+                        .get(current.value.0 as usize)
+                        .filter(|record| record.function == function)
+                        .map(|record| record.ty)
+                        .ok_or(AnalysisFailure::RequestMismatch)?;
+                    let local_record = request
+                        .hir
+                        .as_program()
+                        .locals
+                        .get(local.0 as usize)
+                        .filter(|record| record.id == local)
+                        .ok_or(AnalysisFailure::RequestMismatch)?;
+                    if !target.projections.is_empty() {
+                        if *operator != AssignmentOperator::Assign {
                             return Err(runtime_type_diagnostic(
                                 request,
                                 target.source,
-                                "semantic-projected-assignment-base",
-                                "projected assignment requires a flat runtime structure local",
-                                "scalar and unsupported aggregate locals do not expose replaceable named fields",
-                                "use a nongeneric structure with scalar-backed fields",
-                            ));
-                        };
-                        if !arguments.is_empty()
-                            || !runtime_structure_arguments_supported(partial, arguments, fields)
-                        {
-                            return Err(runtime_type_diagnostic(
-                                request,
-                                target.source,
-                                "semantic-projected-assignment-base",
-                                "projected assignment requires a nongeneric flat runtime structure",
-                                "generic and non-flat aggregate replacement remains outside this lowering slice",
-                                "use a nongeneric structure with scalar-backed fields",
+                                "semantic-projected-assignment-compound-pending",
+                                "compound projected assignment is not yet supported",
+                                "read-modify-write field operations require an explicit projected-place reservation",
+                                "compute the replacement scalar separately and use plain field assignment",
                             ));
                         }
-                        let mut selected = None;
-                        for (index, field) in fields.iter().enumerate() {
-                            charge_runtime_aggregate_lookup(
+                        let [projection] = target.projections.as_slice() else {
+                            return Err(runtime_type_diagnostic(
                                 request,
-                                &mut *aggregate_work,
-                                is_cancelled,
-                            )?;
-                            if field.name == field_name.as_str()
-                                && selected.replace(index).is_some()
+                                target.source,
+                                "semantic-projected-assignment-nested-pending",
+                                "nested projected assignment is not yet supported",
+                                "revision 0.1 currently replaces one field of one owned local aggregate",
+                                "assign through exactly one direct field projection",
+                            ));
+                        };
+                        let wrela_hir::PlaceProjection::Field(field_name) = projection else {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                target.source,
+                                "semantic-projected-assignment-shape-pending",
+                                "projected assignment currently supports named structure fields only",
+                                "tuple and indexed places require their own aggregate layout and bounds proofs",
+                                "assign one named field of a flat runtime structure",
+                            ));
+                        };
+                        let (declaration, field_ty, field_public) = {
+                            let record = partial
+                                .types
+                                .get(current_ty.0 as usize)
+                                .ok_or(AnalysisFailure::RequestMismatch)?;
+                            let SemanticTypeKind::Structure {
+                                declaration,
+                                arguments,
+                                fields,
+                            } = &record.kind
+                            else {
+                                return Err(runtime_type_diagnostic(
+                                    request,
+                                    target.source,
+                                    "semantic-projected-assignment-base",
+                                    "projected assignment requires a flat runtime structure local",
+                                    "scalar and unsupported aggregate locals do not expose replaceable named fields",
+                                    "use a nongeneric structure with scalar-backed fields",
+                                ));
+                            };
+                            if !arguments.is_empty()
+                                || !runtime_structure_arguments_supported(
+                                    partial, arguments, fields,
+                                )
                             {
                                 return Err(runtime_type_diagnostic(
                                     request,
                                     target.source,
-                                    "semantic-projected-assignment-field",
-                                    "projected assignment field name is ambiguous",
-                                    "field replacement requires one exact structure declaration field",
-                                    "remove the duplicate field declaration",
+                                    "semantic-projected-assignment-base",
+                                    "projected assignment requires a nongeneric flat runtime structure",
+                                    "generic and non-flat aggregate replacement remains outside this lowering slice",
+                                    "use a nongeneric structure with scalar-backed fields",
                                 ));
                             }
-                        }
-                        let index = selected.ok_or_else(|| {
-                            runtime_type_diagnostic(
+                            let mut selected = None;
+                            for (index, field) in fields.iter().enumerate() {
+                                charge_runtime_aggregate_lookup(
+                                    request,
+                                    &mut *aggregate_work,
+                                    is_cancelled,
+                                )?;
+                                if field.name == field_name.as_str()
+                                    && selected.replace(index).is_some()
+                                {
+                                    return Err(runtime_type_diagnostic(
+                                        request,
+                                        target.source,
+                                        "semantic-projected-assignment-field",
+                                        "projected assignment field name is ambiguous",
+                                        "field replacement requires one exact structure declaration field",
+                                        "remove the duplicate field declaration",
+                                    ));
+                                }
+                            }
+                            let index = selected.ok_or_else(|| {
+                                runtime_type_diagnostic(
+                                    request,
+                                    target.source,
+                                    "semantic-projected-assignment-field",
+                                    "projected assignment does not name a declared structure field",
+                                    "field names are matched exactly and nominally",
+                                    "assign one of the structure's declared fields",
+                                )
+                            })?;
+                            (*declaration, fields[index].ty, fields[index].public)
+                        };
+                        if runtime_function_module(request, partial, function)?
+                            != request
+                                .hir
+                                .as_program()
+                                .declaration(declaration)
+                                .ok_or(AnalysisFailure::RequestMismatch)?
+                                .module
+                            && !field_public
+                        {
+                            return Err(runtime_type_diagnostic(
                                 request,
                                 target.source,
-                                "semantic-projected-assignment-field",
-                                "projected assignment does not name a declared structure field",
-                                "field names are matched exactly and nominally",
-                                "assign one of the structure's declared fields",
-                            )
-                        })?;
-                        (*declaration, fields[index].ty, fields[index].public)
-                    };
-                    if runtime_function_module(request, partial, function)?
-                        != request
-                            .hir
-                            .as_program()
-                            .declaration(declaration)
-                            .ok_or(AnalysisFailure::RequestMismatch)?
-                            .module
-                        && !field_public
-                    {
-                        return Err(runtime_type_diagnostic(
-                            request,
-                            target.source,
-                            "semantic-runtime-field-private",
-                            "runtime structure field is private to its declaring module",
-                            "projected assignment from another module preserves source visibility",
-                            "expose a public mutator from the declaring module",
-                        ));
-                    }
-                    *locals
-                        .get_mut(local.0 as usize)
-                        .ok_or(AnalysisFailure::RequestMismatch)? = Some(RuntimeBinding {
-                        state: OwnershipState::BorrowedMut,
-                        ..current
-                    });
-                    let outcome = analyze_runtime_expression(
-                        request,
-                        partial,
-                        function,
-                        *value,
-                        RuntimeExpressionRequest {
-                            expected: Some(field_ty),
-                            desired_result: None,
-                            access: AccessMode::Value,
-                        },
-                        &mut RuntimeState {
-                            locals: &mut *locals,
-                            parameters: &mut *parameters,
-                            aggregate_work: &mut *aggregate_work,
-                            allow_assertions,
-                            allow_scope_call: false,
-                        },
-                        is_cancelled,
-                    )?;
-                    statement_effects = outcome.effects;
-                    let reserved = locals
-                        .get(local.0 as usize)
-                        .copied()
-                        .flatten()
-                        .ok_or(AnalysisFailure::RequestMismatch)?;
-                    if reserved
-                        != (RuntimeBinding {
-                            state: OwnershipState::BorrowedMut,
-                            ..current
-                        })
-                    {
-                        return Err(AnalysisFailure::RequestMismatch.into());
-                    }
-                    let value_id = append_semantic_value(
-                        request,
-                        partial,
-                        function,
-                        current_ty,
-                        (
-                            SemanticValueOrigin::Local(local),
-                            Some(local_record.source),
-                            Some(local_record.name.as_str()),
-                        ),
-                        is_cancelled,
-                    )?;
-                    *locals
-                        .get_mut(local.0 as usize)
-                        .ok_or(AnalysisFailure::RequestMismatch)? = Some(RuntimeBinding {
-                        value: value_id,
-                        state: OwnershipState::Owned,
-                        ..current
-                    });
-                    definitions
-                        .try_reserve_exact(1)
-                        .map_err(|_| fact_resource(request, "statement local definitions"))?;
-                    definitions.push(LocalDefinition {
-                        local,
-                        value: value_id,
-                    });
-                } else {
-                    let compound = compound_assignment_binary_operator(*operator);
-                    if compound.is_some()
-                        && !matches!(
-                            runtime_scalar_type(partial, current_ty),
-                            Some(RuntimeScalarType::Integer { .. })
-                        )
-                    {
-                        return Err(runtime_type_diagnostic(
-                            request,
-                            statement.source,
-                            "semantic-compound-assignment-type",
-                            "compound assignment requires an integer local",
-                            "revision 0.1 defines compound arithmetic, bitwise, and shift assignment only for integers",
-                            "use an integer local or write an explicitly supported operation",
-                        ));
-                    }
-                    let value_id = if compound.is_some() {
+                                "semantic-runtime-field-private",
+                                "runtime structure field is private to its declaring module",
+                                "projected assignment from another module preserves source visibility",
+                                "expose a public mutator from the declaring module",
+                            ));
+                        }
                         *locals
                             .get_mut(local.0 as usize)
                             .ok_or(AnalysisFailure::RequestMismatch)? = Some(RuntimeBinding {
@@ -5073,7 +5010,7 @@ fn analyze_runtime_body(
                             function,
                             *value,
                             RuntimeExpressionRequest {
-                                expected: Some(current_ty),
+                                expected: Some(field_ty),
                                 desired_result: None,
                                 access: AccessMode::Value,
                             },
@@ -5100,19 +5037,6 @@ fn analyze_runtime_body(
                         {
                             return Err(AnalysisFailure::RequestMismatch.into());
                         }
-                        append_semantic_value(
-                            request,
-                            partial,
-                            function,
-                            current_ty,
-                            (
-                                SemanticValueOrigin::Local(local),
-                                Some(local_record.source),
-                                Some(local_record.name.as_str()),
-                            ),
-                            is_cancelled,
-                        )?
-                    } else {
                         let value_id = append_semantic_value(
                             request,
                             partial,
@@ -5125,42 +5049,139 @@ fn analyze_runtime_body(
                             ),
                             is_cancelled,
                         )?;
-                        let outcome = analyze_runtime_expression(
-                            request,
-                            partial,
-                            function,
-                            *value,
-                            RuntimeExpressionRequest {
-                                expected: Some(current_ty),
-                                desired_result: Some(value_id),
-                                access: AccessMode::Value,
-                            },
-                            &mut RuntimeState {
-                                locals: &mut *locals,
-                                parameters: &mut *parameters,
-                                aggregate_work: &mut *aggregate_work,
-                                allow_assertions,
-                                allow_scope_call: false,
-                            },
-                            is_cancelled,
-                        )?;
-                        statement_effects = outcome.effects;
-                        value_id
-                    };
-                    *locals
-                        .get_mut(local.0 as usize)
-                        .ok_or(AnalysisFailure::RequestMismatch)? = Some(RuntimeBinding {
-                        value: value_id,
-                        state: OwnershipState::Owned,
-                        ..current
-                    });
-                    definitions
-                        .try_reserve_exact(1)
-                        .map_err(|_| fact_resource(request, "statement local definitions"))?;
-                    definitions.push(LocalDefinition {
-                        local,
-                        value: value_id,
-                    });
+                        *locals
+                            .get_mut(local.0 as usize)
+                            .ok_or(AnalysisFailure::RequestMismatch)? = Some(RuntimeBinding {
+                            value: value_id,
+                            state: OwnershipState::Owned,
+                            ..current
+                        });
+                        definitions
+                            .try_reserve_exact(1)
+                            .map_err(|_| fact_resource(request, "statement local definitions"))?;
+                        definitions.push(LocalDefinition {
+                            local,
+                            value: value_id,
+                        });
+                    } else {
+                        let compound = compound_assignment_binary_operator(*operator);
+                        if compound.is_some()
+                            && !matches!(
+                                runtime_scalar_type(partial, current_ty),
+                                Some(RuntimeScalarType::Integer { .. })
+                            )
+                        {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                statement.source,
+                                "semantic-compound-assignment-type",
+                                "compound assignment requires an integer local",
+                                "revision 0.1 defines compound arithmetic, bitwise, and shift assignment only for integers",
+                                "use an integer local or write an explicitly supported operation",
+                            ));
+                        }
+                        let value_id = if compound.is_some() {
+                            *locals
+                                .get_mut(local.0 as usize)
+                                .ok_or(AnalysisFailure::RequestMismatch)? = Some(RuntimeBinding {
+                                state: OwnershipState::BorrowedMut,
+                                ..current
+                            });
+                            let outcome = analyze_runtime_expression(
+                                request,
+                                partial,
+                                function,
+                                *value,
+                                RuntimeExpressionRequest {
+                                    expected: Some(current_ty),
+                                    desired_result: None,
+                                    access: AccessMode::Value,
+                                },
+                                &mut RuntimeState {
+                                    locals: &mut *locals,
+                                    parameters: &mut *parameters,
+                                    aggregate_work: &mut *aggregate_work,
+                                    allow_assertions,
+                                    allow_scope_call: false,
+                                },
+                                is_cancelled,
+                            )?;
+                            statement_effects = outcome.effects;
+                            let reserved = locals
+                                .get(local.0 as usize)
+                                .copied()
+                                .flatten()
+                                .ok_or(AnalysisFailure::RequestMismatch)?;
+                            if reserved
+                                != (RuntimeBinding {
+                                    state: OwnershipState::BorrowedMut,
+                                    ..current
+                                })
+                            {
+                                return Err(AnalysisFailure::RequestMismatch.into());
+                            }
+                            append_semantic_value(
+                                request,
+                                partial,
+                                function,
+                                current_ty,
+                                (
+                                    SemanticValueOrigin::Local(local),
+                                    Some(local_record.source),
+                                    Some(local_record.name.as_str()),
+                                ),
+                                is_cancelled,
+                            )?
+                        } else {
+                            let value_id = append_semantic_value(
+                                request,
+                                partial,
+                                function,
+                                current_ty,
+                                (
+                                    SemanticValueOrigin::Local(local),
+                                    Some(local_record.source),
+                                    Some(local_record.name.as_str()),
+                                ),
+                                is_cancelled,
+                            )?;
+                            let outcome = analyze_runtime_expression(
+                                request,
+                                partial,
+                                function,
+                                *value,
+                                RuntimeExpressionRequest {
+                                    expected: Some(current_ty),
+                                    desired_result: Some(value_id),
+                                    access: AccessMode::Value,
+                                },
+                                &mut RuntimeState {
+                                    locals: &mut *locals,
+                                    parameters: &mut *parameters,
+                                    aggregate_work: &mut *aggregate_work,
+                                    allow_assertions,
+                                    allow_scope_call: false,
+                                },
+                                is_cancelled,
+                            )?;
+                            statement_effects = outcome.effects;
+                            value_id
+                        };
+                        *locals
+                            .get_mut(local.0 as usize)
+                            .ok_or(AnalysisFailure::RequestMismatch)? = Some(RuntimeBinding {
+                            value: value_id,
+                            state: OwnershipState::Owned,
+                            ..current
+                        });
+                        definitions
+                            .try_reserve_exact(1)
+                            .map_err(|_| fact_resource(request, "statement local definitions"))?;
+                        definitions.push(LocalDefinition {
+                            local,
+                            value: value_id,
+                        });
+                    }
                 }
             }
             StatementKind::Expression(expression) => {
@@ -11298,6 +11319,93 @@ fn analyze_flat_structure_field(
         state,
         is_cancelled,
     )?;
+    if let Some(state_access) =
+        canonical_actor_state_access(request, partial, function, base, name, source)?
+    {
+        let field_ty = ensure_primitive_type(
+            request,
+            partial,
+            PrimitiveSemanticType::Integer {
+                signed: false,
+                bits: 64,
+                pointer_sized: false,
+            },
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )?;
+        if expression_request
+            .expected
+            .is_some_and(|expected| expected != field_ty)
+        {
+            return Err(runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-actor-state-field-type",
+                "actor state field does not match its required type",
+                "the canonical actor state cell is exactly one u64",
+                "use the state value in a u64 context",
+            ));
+        }
+        let result = expression_result(
+            request,
+            partial,
+            function,
+            (expression, source),
+            field_ty,
+            expression_request.desired_result,
+            is_cancelled,
+        )?;
+        append_expression_fact_with_category(
+            request,
+            partial,
+            RuntimeExpressionFact {
+                function,
+                expression,
+                ty: field_ty,
+                result: Some(result),
+                resolution: ExpressionResolution::Field {
+                    index: state_access.field,
+                },
+                effects: EffectSet(EffectSet::ACTOR),
+                ownership_before: OwnershipState::Owned,
+                ownership_after: OwnershipState::Owned,
+            },
+            ValueCategory::Value,
+            Some(state_access.region),
+        )?;
+        let fact = partial
+            .expressions
+            .last_mut()
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if !fact.proofs.contains(&state_access.capacity) {
+            fact.proofs
+                .try_reserve(1)
+                .map_err(|_| fact_resource(request, "actor state access proofs"))?;
+            fact.proofs.push(state_access.capacity);
+            fact.proofs.sort_unstable();
+        }
+        partial
+            .actor_state_accesses
+            .try_reserve(1)
+            .map_err(|_| fact_resource(request, "actor state accesses"))?;
+        partial.actor_state_accesses.push(ActorStateAccess {
+            function,
+            actor: state_access.actor,
+            receiver: state_access.receiver,
+            class: state_access.class,
+            field: state_access.field,
+            region: state_access.region,
+            capacity: state_access.capacity,
+            source,
+            kind: ActorStateAccessKind::Read { expression, result },
+        });
+        return Ok(RuntimeExpression {
+            ty: field_ty,
+            result: Some(result),
+            referenced: None,
+            effects: EffectSet(EffectSet::ACTOR),
+        });
+    }
     let (declaration, field_index, field_ty) = {
         let record = partial
             .types
@@ -11412,6 +11520,256 @@ fn analyze_flat_structure_field(
         referenced: None,
         effects: base_value.effects,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CanonicalActorStateAccess {
+    actor: ActorId,
+    receiver: wrela_hir::ParameterId,
+    class: DeclarationId,
+    field: u32,
+    region: RegionId,
+    capacity: ProofId,
+}
+
+fn canonical_actor_state_access(
+    request: &AnalysisRequest<'_>,
+    partial: &PartialAnalysis,
+    function: FunctionInstanceId,
+    base: ExpressionId,
+    name: &wrela_hir::Name,
+    source: Span,
+) -> RuntimeResult<Option<CanonicalActorStateAccess>> {
+    if !matches!(
+        partial
+            .functions
+            .get(function.0 as usize)
+            .map(|record| record.role),
+        Some(FunctionRole::ActorTurn(_))
+    ) {
+        return Ok(None);
+    }
+    let Some(base_record) = request.hir.as_program().expression(base) else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    let ExpressionKind::Reference(Definition::Parameter(receiver)) = base_record.kind else {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-actor-state-root-pending",
+            "actor state access requires the turn's direct self receiver",
+            "aliases, temporaries, and other parameter roots cannot authenticate actor-owned storage",
+            "access the canonical field directly as `self.value`",
+        ));
+    };
+    canonical_actor_state_for_receiver(request, partial, function, receiver, name, source)
+}
+
+fn canonical_actor_state_for_receiver(
+    request: &AnalysisRequest<'_>,
+    partial: &PartialAnalysis,
+    function: FunctionInstanceId,
+    receiver: wrela_hir::ParameterId,
+    name: &wrela_hir::Name,
+    source: Span,
+) -> RuntimeResult<Option<CanonicalActorStateAccess>> {
+    let function_record = partial
+        .functions
+        .get(function.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let FunctionRole::ActorTurn(actor) = function_record.role else {
+        return Ok(None);
+    };
+    let Some(receiver_binding) = function_record.parameters.first() else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    if receiver_binding.parameter != receiver || receiver_binding.access != AccessMode::Mutate {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-actor-state-receiver",
+            "actor state access requires the actor-owned mutable turn receiver",
+            "state is isolated to one non-reentrant actor turn",
+            "declare and use `mut self` in a public actor turn method",
+        ));
+    }
+    let graph = partial
+        .graph
+        .as_ref()
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let actor_record = graph
+        .actors
+        .get(actor.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let class = actor_class_declaration(partial, actor_record.class)?;
+    let class_record = request
+        .hir
+        .as_program()
+        .declaration(class)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let DeclarationKind::Structure(class_source) = &class_record.kind else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    let [field] = class_source.fields.as_slice() else {
+        return Ok(None);
+    };
+    if name.as_str() != field.name.as_str() {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-actor-state-field-pending",
+            "actor state access names an unsupported field",
+            "this lowering slice authenticates exactly the canonical `value: u64 = 0` cell",
+            "access `self.value` or keep other state fail-closed",
+        ));
+    }
+    let region = graph
+        .regions
+        .iter()
+        .find(|region| {
+            region.owner == ImageOwner::Actor(actor)
+                && region.class == RegionClass::Image
+                && region.name.strip_suffix(".state") == Some(actor_record.name.as_str())
+        })
+        .ok_or_else(|| {
+            runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-actor-state-region-missing",
+                "actor state access has no canonical actor-owned image region",
+                "state access cannot manufacture storage from the erased receiver value",
+                "install the canonical stateful actor in the selected image",
+            )
+        })?;
+    Ok(Some(CanonicalActorStateAccess {
+        actor,
+        receiver,
+        class,
+        field: 0,
+        region: region.id,
+        capacity: region.proof,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_actor_state_assignment(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    statement: StatementId,
+    source: Span,
+    target: &wrela_hir::PlaceTarget,
+    operator: AssignmentOperator,
+    value_expression: ExpressionId,
+    locals: &mut [Option<RuntimeBinding>],
+    parameters: &mut [Option<RuntimeBinding>],
+    allow_assertions: bool,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<Option<EffectSet>> {
+    let Definition::Parameter(receiver) = target.root else {
+        return Ok(None);
+    };
+    let [wrela_hir::PlaceProjection::Field(name)] = target.projections.as_slice() else {
+        return Err(runtime_type_diagnostic(
+            request,
+            target.source,
+            "semantic-actor-state-place-shape-pending",
+            "actor state assignment requires one direct named field",
+            "nested, tuple, and indexed actor state places do not have authenticated layouts",
+            "assign directly to `self.value`",
+        ));
+    };
+    let Some(access) = canonical_actor_state_for_receiver(
+        request,
+        partial,
+        function,
+        receiver,
+        name,
+        target.source,
+    )?
+    else {
+        return Ok(None);
+    };
+    if operator != AssignmentOperator::Assign {
+        return Err(runtime_type_diagnostic(
+            request,
+            target.source,
+            "semantic-actor-state-compound-assignment-pending",
+            "compound actor state assignment is not yet supported",
+            "the canonical state path currently authenticates one plain store, not an atomic read-modify-write reservation",
+            "compute a replacement u64 separately and use `self.value = replacement`",
+        ));
+    }
+    let receiver_binding = parameters
+        .get(receiver.0 as usize)
+        .copied()
+        .flatten()
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if receiver_binding.state != OwnershipState::Owned
+        || receiver_binding.authority != RuntimeAuthority::Mutate
+    {
+        return Err(runtime_diagnostic(
+            request,
+            target.source,
+            "semantic-actor-state-authority",
+            "actor state assignment requires live exclusive turn authority",
+            Some(receiver_binding),
+            "state storage is isolated to its non-reentrant actor turn",
+            "store before transferring or borrowing the receiver",
+        ));
+    }
+    let u64_ty = ensure_primitive_type(
+        request,
+        partial,
+        PrimitiveSemanticType::Integer {
+            signed: false,
+            bits: 64,
+            pointer_sized: false,
+        },
+        &mut *aggregate_work,
+        is_cancelled,
+    )?;
+    let outcome = analyze_runtime_expression(
+        request,
+        partial,
+        function,
+        value_expression,
+        RuntimeExpressionRequest {
+            expected: Some(u64_ty),
+            desired_result: None,
+            access: AccessMode::Value,
+        },
+        &mut RuntimeState {
+            locals,
+            parameters,
+            aggregate_work,
+            allow_assertions,
+            allow_scope_call: false,
+        },
+        is_cancelled,
+    )?;
+    let value = outcome.result.ok_or(AnalysisFailure::RequestMismatch)?;
+    partial
+        .actor_state_accesses
+        .try_reserve(1)
+        .map_err(|_| fact_resource(request, "actor state accesses"))?;
+    partial.actor_state_accesses.push(ActorStateAccess {
+        function,
+        actor: access.actor,
+        receiver: access.receiver,
+        class: access.class,
+        field: access.field,
+        region: access.region,
+        capacity: access.capacity,
+        source,
+        kind: ActorStateAccessKind::Write {
+            statement,
+            value_expression,
+            value,
+        },
+    });
+    Ok(Some(EffectSet(outcome.effects.0 | EffectSet::ACTOR)))
 }
 
 fn runtime_function_module(
@@ -23506,6 +23864,33 @@ pub fn boot() -> Image:
     return img
 "#;
 
+    const STATE_ACCESS_ACTOR_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    value: u64 = 0
+
+    pub async fn ping(mut self):
+        observed: u64 = self.value
+        self.value = 7
+        await checkpoint()
+
+    @task
+    async fn pulse(mut self):
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#;
+
     #[test]
     fn zero_initialized_actor_state_has_exact_owned_storage() {
         let fixture = parsed_actor_fixture(ZERO_STATE_ACTOR_SOURCE);
@@ -23599,6 +23984,68 @@ pub fn boot() -> Image:
                 .validate_for_seal(image.hir(), &|| false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn direct_actor_state_read_and_plain_write_are_exact_and_sealed() {
+        let fixture = parsed_actor_fixture(STATE_ACCESS_ACTOR_SOURCE);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("actor state access analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "canonical state accesses must analyze: {:?}",
+            output.diagnostics()
+        );
+        let image = output.successful().expect("sealed actor state accesses");
+        let facts = image.facts();
+        assert!(matches!(
+            facts.actor_state_accesses.as_slice(),
+            [
+                ActorStateAccess {
+                    actor: ActorId(0),
+                    field: 0,
+                    kind: ActorStateAccessKind::Read { .. },
+                    ..
+                },
+                ActorStateAccess {
+                    actor: ActorId(0),
+                    field: 0,
+                    kind: ActorStateAccessKind::Write { .. },
+                    ..
+                }
+            ]
+        ));
+        let access = &facts.actor_state_accesses[0];
+        assert_eq!(facts.actor_state_accesses[1].region, access.region);
+        assert_eq!(facts.actor_state_accesses[1].capacity, access.capacity);
+
+        let mut forged = facts.clone();
+        forged.actor_state_accesses[0].region = RegionId(0);
+        assert!(forged.validate_for_seal(image.hir(), &|| false).is_err());
+    }
+
+    #[test]
+    fn actor_state_compound_assignment_fails_closed_by_name() {
+        let source = STATE_ACCESS_ACTOR_SOURCE.replace("self.value = 7", "self.value += 1");
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("unsupported compound state write is a source diagnostic");
+        assert_eq!(output.diagnostics().len(), 1);
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-actor-state-compound-assignment-pending")
+        );
+        assert!(output.partial().graph.is_none());
     }
 
     #[test]

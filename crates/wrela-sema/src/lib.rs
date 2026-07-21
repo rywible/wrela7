@@ -881,6 +881,35 @@ pub struct StatementFact {
     pub proofs: Vec<ProofId>,
 }
 
+/// One authenticated access to the canonical actor-owned state cell.  Actor
+/// instances remain erased language values: this record binds the source
+/// receiver and declared field to the independently planned image region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorStateAccess {
+    pub function: FunctionInstanceId,
+    pub actor: ActorId,
+    pub receiver: wrela_hir::ParameterId,
+    pub class: DeclarationId,
+    pub field: u32,
+    pub region: RegionId,
+    pub capacity: ProofId,
+    pub source: Span,
+    pub kind: ActorStateAccessKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorStateAccessKind {
+    Read {
+        expression: ExpressionId,
+        result: ValueId,
+    },
+    Write {
+        statement: StatementId,
+        value_expression: ExpressionId,
+        value: ValueId,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalDefinition {
     pub local: wrela_hir::LocalId,
@@ -1228,6 +1257,7 @@ pub struct PartialAnalysis {
     pub values: Vec<SemanticValue>,
     pub expressions: Vec<ExpressionFact>,
     pub statements: Vec<StatementFact>,
+    pub actor_state_accesses: Vec<ActorStateAccess>,
     pub projection_protocols: Vec<ProjectionProtocol>,
     pub lexical_views: Vec<LexicalView>,
     pub scope_protocols: Vec<ScopeProtocol>,
@@ -1826,6 +1856,11 @@ impl PartialAnalysis {
         if !valid_actor_state_contracts(self, hir.as_program(), graph) {
             return Err(invalid(
                 "actor state storage differs from its exact HIR declaration",
+            ));
+        }
+        if !valid_actor_state_accesses(self, hir.as_program(), graph) {
+            return Err(invalid(
+                "actor state accesses differ from their exact HIR receiver, field, region, or capacity proof",
             ));
         }
         if self.baked_artifacts.iter().any(|artifact| {
@@ -2480,104 +2515,140 @@ fn validate_exact_body_local_value_flow(
                 let [target] = targets.as_slice() else {
                     return Err(invalid("assignment local-value flow target is invalid"));
                 };
-                let wrela_hir::Definition::Local(local) = target.root else {
-                    return Err(invalid("assignment local-value flow target is not local"));
-                };
-                let projected_field = match target.projections.as_slice() {
-                    [] => None,
-                    [wrela_hir::PlaceProjection::Field(name)]
-                        if *operator == wrela_hir::AssignmentOperator::Assign =>
+                if let wrela_hir::Definition::Parameter(receiver) = target.root {
+                    validate_exact_expression_local_values(
+                        analysis,
+                        program,
+                        function.id,
+                        *value,
+                        locals,
+                        is_cancelled,
+                    )?;
+                    let expression = exact_child_expression(analysis, function.id, *value)
+                        .ok_or_else(|| {
+                            invalid("actor state assignment expression fact is missing")
+                        })?;
+                    if !fact.definitions.is_empty()
+                        || !exact_actor_state_write_matches(
+                            analysis,
+                            function.id,
+                            *statement_id,
+                            receiver,
+                            *value,
+                            expression.result,
+                        )
                     {
-                        Some(name)
-                    }
-                    _ => {
                         return Err(invalid(
-                            "assignment local-value flow projection is unsupported",
+                            "actor state assignment local-value flow is not exact",
                         ));
                     }
-                };
-                if projected_field.is_none()
-                    && *operator != wrela_hir::AssignmentOperator::Assign
-                    && expression_references_local(program, *value, local, is_cancelled)?
-                {
-                    return Err(invalid(
-                        "compound-assignment right-hand side overlaps its destination",
-                    ));
-                }
-                if projected_field.is_some()
-                    && expression_references_local(program, *value, local, is_cancelled)?
-                {
-                    return Err(invalid(
-                        "projected-assignment right-hand side overlaps its reserved aggregate",
-                    ));
-                }
-                validate_exact_expression_local_values(
-                    analysis,
-                    program,
-                    function.id,
-                    *value,
-                    locals,
-                    is_cancelled,
-                )?;
-                let [definition] = fact.definitions.as_slice() else {
-                    return Err(invalid("assignment local-value flow definition is missing"));
-                };
-                let slot = locals
-                    .get_mut(local.0 as usize)
-                    .ok_or_else(|| invalid("assignment local-value flow target is invalid"))?;
-                let previous = slot.ok_or_else(|| {
-                    invalid("assignment local-value flow target is uninitialized")
-                })?;
-                if definition.local != local || definition.value == previous {
-                    return Err(invalid("assignment local-value flow is not exact"));
-                }
-                if let Some(field_name) = projected_field {
-                    let previous_record = analysis
-                        .values
-                        .get(previous.0 as usize)
-                        .filter(|record| record.function == function.id)
-                        .ok_or_else(|| invalid("projected assignment previous value is invalid"))?;
-                    let replacement = analysis
-                        .values
-                        .get(definition.value.0 as usize)
-                        .filter(|record| record.function == function.id)
-                        .ok_or_else(|| invalid("projected assignment replacement is invalid"))?;
-                    let Some(SemanticTypeKind::Structure {
-                        arguments, fields, ..
-                    }) = analysis
-                        .types
-                        .get(previous_record.ty.0 as usize)
-                        .map(|record| &record.kind)
-                    else {
-                        return Err(invalid(
-                            "projected assignment previous value is not a structure",
-                        ));
+                    EffectSet(expression.effects.0 | EffectSet::ACTOR)
+                } else {
+                    let wrela_hir::Definition::Local(local) = target.root else {
+                        return Err(invalid("assignment local-value flow target is not local"));
                     };
-                    let rhs = exact_child_expression(analysis, function.id, *value)
-                        .ok_or_else(|| invalid("projected assignment RHS is missing"))?;
-                    let mut selected = None;
-                    for field in fields {
-                        check_analysis_cancelled(is_cancelled)?;
-                        if field.name == field_name.as_str() && selected.replace(field).is_some() {
-                            return Err(invalid("projected assignment field is ambiguous"));
+                    let projected_field = match target.projections.as_slice() {
+                        [] => None,
+                        [wrela_hir::PlaceProjection::Field(name)]
+                            if *operator == wrela_hir::AssignmentOperator::Assign =>
+                        {
+                            Some(name)
+                        }
+                        _ => {
+                            return Err(invalid(
+                                "assignment local-value flow projection is unsupported",
+                            ));
+                        }
+                    };
+                    if projected_field.is_none()
+                        && *operator != wrela_hir::AssignmentOperator::Assign
+                        && expression_references_local(program, *value, local, is_cancelled)?
+                    {
+                        return Err(invalid(
+                            "compound-assignment right-hand side overlaps its destination",
+                        ));
+                    }
+                    if projected_field.is_some()
+                        && expression_references_local(program, *value, local, is_cancelled)?
+                    {
+                        return Err(invalid(
+                            "projected-assignment right-hand side overlaps its reserved aggregate",
+                        ));
+                    }
+                    validate_exact_expression_local_values(
+                        analysis,
+                        program,
+                        function.id,
+                        *value,
+                        locals,
+                        is_cancelled,
+                    )?;
+                    let [definition] = fact.definitions.as_slice() else {
+                        return Err(invalid("assignment local-value flow definition is missing"));
+                    };
+                    let slot = locals
+                        .get_mut(local.0 as usize)
+                        .ok_or_else(|| invalid("assignment local-value flow target is invalid"))?;
+                    let previous = slot.ok_or_else(|| {
+                        invalid("assignment local-value flow target is uninitialized")
+                    })?;
+                    if definition.local != local || definition.value == previous {
+                        return Err(invalid("assignment local-value flow is not exact"));
+                    }
+                    if let Some(field_name) = projected_field {
+                        let previous_record = analysis
+                            .values
+                            .get(previous.0 as usize)
+                            .filter(|record| record.function == function.id)
+                            .ok_or_else(|| {
+                                invalid("projected assignment previous value is invalid")
+                            })?;
+                        let replacement = analysis
+                            .values
+                            .get(definition.value.0 as usize)
+                            .filter(|record| record.function == function.id)
+                            .ok_or_else(|| {
+                                invalid("projected assignment replacement is invalid")
+                            })?;
+                        let Some(SemanticTypeKind::Structure {
+                            arguments, fields, ..
+                        }) = analysis
+                            .types
+                            .get(previous_record.ty.0 as usize)
+                            .map(|record| &record.kind)
+                        else {
+                            return Err(invalid(
+                                "projected assignment previous value is not a structure",
+                            ));
+                        };
+                        let rhs = exact_child_expression(analysis, function.id, *value)
+                            .ok_or_else(|| invalid("projected assignment RHS is missing"))?;
+                        let mut selected = None;
+                        for field in fields {
+                            check_analysis_cancelled(is_cancelled)?;
+                            if field.name == field_name.as_str()
+                                && selected.replace(field).is_some()
+                            {
+                                return Err(invalid("projected assignment field is ambiguous"));
+                            }
+                        }
+                        let field = selected
+                            .ok_or_else(|| invalid("projected assignment field is not exact"))?;
+                        if !arguments.is_empty()
+                            || !runtime_structure_arguments_supported(analysis, arguments, fields)
+                            || replacement.ty != previous_record.ty
+                            || rhs.ty != field.ty
+                        {
+                            return Err(invalid(
+                                "projected assignment local-value flow type is not exact",
+                            ));
                         }
                     }
-                    let field = selected
-                        .ok_or_else(|| invalid("projected assignment field is not exact"))?;
-                    if !arguments.is_empty()
-                        || !runtime_structure_arguments_supported(analysis, arguments, fields)
-                        || replacement.ty != previous_record.ty
-                        || rhs.ty != field.ty
-                    {
-                        return Err(invalid(
-                            "projected assignment local-value flow type is not exact",
-                        ));
-                    }
+                    *slot = Some(definition.value);
+                    exact_child_expression(analysis, function.id, *value)
+                        .ok_or_else(|| invalid("assignment expression fact is missing"))?
+                        .effects
                 }
-                *slot = Some(definition.value);
-                exact_child_expression(analysis, function.id, *value)
-                    .ok_or_else(|| invalid("assignment expression fact is missing"))?
-                    .effects
             }
             wrela_hir::StatementKind::Expression(expression)
             | wrela_hir::StatementKind::Send(expression) => {
@@ -3622,7 +3693,13 @@ fn validate_exact_expression_fact(
             *index,
             fact.ty,
             is_cancelled,
-        )? => {}
+        )? || exact_actor_state_field_matches(
+            analysis,
+            function.id,
+            fact.expression,
+            fact.result,
+            fact.region,
+        ) => {}
         (
             wrela_hir::ExpressionKind::Field { base, name },
             ExpressionResolution::Function(target),
@@ -5544,125 +5621,146 @@ fn validate_exact_statement_fact(
             let [target] = targets.as_slice() else {
                 return Err(invalid("scalar assignment target arity differs from HIR"));
             };
-            let wrela_hir::Definition::Local(local) = &target.root else {
-                return Err(invalid("scalar assignment target is not a local"));
-            };
-            let [definition] = fact.definitions.as_slice() else {
-                return Err(invalid("assignment lacks one exact definition"));
-            };
-            let expression = analysis
-                .expressions
-                .binary_search_by_key(&(function.id, *value), |fact| {
-                    (fact.function, fact.expression)
-                })
-                .ok()
-                .and_then(|index| analysis.expressions.get(index))
-                .ok_or_else(|| invalid("assignment expression fact is missing"))?;
-            let local_record = program
-                .locals
-                .get(local.0 as usize)
-                .filter(|record| record.id == *local)
-                .ok_or_else(|| invalid("assignment local is invalid"))?;
-            let value_record = analysis
-                .values
-                .get(definition.value.0 as usize)
-                .ok_or_else(|| invalid("assignment value is invalid"))?;
-            if !target.projections.is_empty() {
-                let [wrela_hir::PlaceProjection::Field(field_name)] = target.projections.as_slice()
-                else {
-                    return Err(invalid(
-                        "projected assignment target is not one direct field",
-                    ));
-                };
-                if *operator != wrela_hir::AssignmentOperator::Assign {
-                    return Err(invalid("projected assignment operator is not plain assign"));
-                }
-                let Some(SemanticTypeKind::Structure {
-                    arguments, fields, ..
-                }) = analysis
-                    .types
-                    .get(value_record.ty.0 as usize)
-                    .map(|record| &record.kind)
-                else {
-                    return Err(invalid(
-                        "projected assignment value is not a flat structure",
-                    ));
-                };
-                if !arguments.is_empty()
-                    || !runtime_structure_arguments_supported(analysis, arguments, fields)
-                {
-                    return Err(invalid(
-                        "projected assignment structure is not the supported nongeneric shape",
-                    ));
-                }
-                let mut selected = None;
-                for (index, field) in fields.iter().enumerate() {
-                    check_analysis_cancelled(is_cancelled)?;
-                    if field.name == field_name.as_str() && selected.replace(index).is_some() {
-                        return Err(invalid("projected assignment field is ambiguous"));
-                    }
-                }
-                let field = selected
-                    .and_then(|index| fields.get(index))
-                    .ok_or_else(|| invalid("projected assignment field is missing"))?;
-                if definition.local != *local
-                    || expression.ty != field.ty
-                    || !exact_expression_produces_value(expression)
-                    || expression.result == Some(definition.value)
-                    || analysis.expressions.iter().any(|expression| {
-                        expression.function == function.id
-                            && expression.result == Some(definition.value)
-                    })
-                    || value_record.function != function.id
-                    || value_record.origin != SemanticValueOrigin::Local(*local)
-                    || value_record.source != Some(local_record.source)
-                    || value_record.source_name.as_deref() != Some(local_record.name.as_str())
-                    || exact_runtime_source_type(
+            if let wrela_hir::Definition::Parameter(receiver) = target.root {
+                let expression = exact_child_expression(analysis, function.id, *value)
+                    .ok_or_else(|| invalid("actor state assignment expression fact is missing"))?;
+                if !fact.definitions.is_empty()
+                    || !exact_actor_state_write_matches(
                         analysis,
-                        local_record
-                            .ty
-                            .as_ref()
-                            .ok_or_else(|| invalid("projected assignment local lacks a type"))?,
-                    ) != Some(value_record.ty)
+                        function.id,
+                        fact.statement,
+                        receiver,
+                        *value,
+                        expression.result,
+                    )
                 {
-                    return Err(invalid("projected assignment binding differs from HIR"));
+                    return Err(invalid(
+                        "actor state assignment differs from exact HIR storage access",
+                    ));
                 }
-                increment_definition(definitions, definition.value)?;
             } else {
-                let compound = *operator != wrela_hir::AssignmentOperator::Assign;
-                let expression_binding_matches = if compound {
-                    expression.result != Some(definition.value)
-                        && expression.ty == value_record.ty
-                        && analysis
-                            .types
-                            .get(value_record.ty.0 as usize)
-                            .is_some_and(|ty| matches!(ty.kind, SemanticTypeKind::Integer { .. }))
-                        && !analysis.expressions.iter().any(|expression| {
+                let wrela_hir::Definition::Local(local) = &target.root else {
+                    return Err(invalid("scalar assignment target is not a local"));
+                };
+                let [definition] = fact.definitions.as_slice() else {
+                    return Err(invalid("assignment lacks one exact definition"));
+                };
+                let expression = analysis
+                    .expressions
+                    .binary_search_by_key(&(function.id, *value), |fact| {
+                        (fact.function, fact.expression)
+                    })
+                    .ok()
+                    .and_then(|index| analysis.expressions.get(index))
+                    .ok_or_else(|| invalid("assignment expression fact is missing"))?;
+                let local_record = program
+                    .locals
+                    .get(local.0 as usize)
+                    .filter(|record| record.id == *local)
+                    .ok_or_else(|| invalid("assignment local is invalid"))?;
+                let value_record = analysis
+                    .values
+                    .get(definition.value.0 as usize)
+                    .ok_or_else(|| invalid("assignment value is invalid"))?;
+                if !target.projections.is_empty() {
+                    let [wrela_hir::PlaceProjection::Field(field_name)] =
+                        target.projections.as_slice()
+                    else {
+                        return Err(invalid(
+                            "projected assignment target is not one direct field",
+                        ));
+                    };
+                    if *operator != wrela_hir::AssignmentOperator::Assign {
+                        return Err(invalid("projected assignment operator is not plain assign"));
+                    }
+                    let Some(SemanticTypeKind::Structure {
+                        arguments, fields, ..
+                    }) = analysis
+                        .types
+                        .get(value_record.ty.0 as usize)
+                        .map(|record| &record.kind)
+                    else {
+                        return Err(invalid(
+                            "projected assignment value is not a flat structure",
+                        ));
+                    };
+                    if !arguments.is_empty()
+                        || !runtime_structure_arguments_supported(analysis, arguments, fields)
+                    {
+                        return Err(invalid(
+                            "projected assignment structure is not the supported nongeneric shape",
+                        ));
+                    }
+                    let mut selected = None;
+                    for (index, field) in fields.iter().enumerate() {
+                        check_analysis_cancelled(is_cancelled)?;
+                        if field.name == field_name.as_str() && selected.replace(index).is_some() {
+                            return Err(invalid("projected assignment field is ambiguous"));
+                        }
+                    }
+                    let field = selected
+                        .and_then(|index| fields.get(index))
+                        .ok_or_else(|| invalid("projected assignment field is missing"))?;
+                    if definition.local != *local
+                        || expression.ty != field.ty
+                        || !exact_expression_produces_value(expression)
+                        || expression.result == Some(definition.value)
+                        || analysis.expressions.iter().any(|expression| {
                             expression.function == function.id
                                 && expression.result == Some(definition.value)
                         })
-                        && !expression_references_local(program, *value, *local, is_cancelled)?
-                } else {
-                    expression.result == Some(definition.value)
-                };
-                if definition.local != *local
-                    || !expression_binding_matches
-                    || value_record.function != function.id
-                    || value_record.origin != SemanticValueOrigin::Local(*local)
-                    || value_record.source != Some(local_record.source)
-                    || value_record.source_name.as_deref() != Some(local_record.name.as_str())
-                    || exact_runtime_source_type(
-                        analysis,
-                        local_record
-                            .ty
-                            .as_ref()
-                            .ok_or_else(|| invalid("scalar assignment local lacks a type"))?,
-                    ) != Some(value_record.ty)
-                {
-                    return Err(invalid("scalar assignment binding differs from HIR"));
-                }
-                if compound {
+                        || value_record.function != function.id
+                        || value_record.origin != SemanticValueOrigin::Local(*local)
+                        || value_record.source != Some(local_record.source)
+                        || value_record.source_name.as_deref() != Some(local_record.name.as_str())
+                        || exact_runtime_source_type(
+                            analysis,
+                            local_record.ty.as_ref().ok_or_else(|| {
+                                invalid("projected assignment local lacks a type")
+                            })?,
+                        ) != Some(value_record.ty)
+                    {
+                        return Err(invalid("projected assignment binding differs from HIR"));
+                    }
                     increment_definition(definitions, definition.value)?;
+                } else {
+                    let compound = *operator != wrela_hir::AssignmentOperator::Assign;
+                    let expression_binding_matches = if compound {
+                        expression.result != Some(definition.value)
+                            && expression.ty == value_record.ty
+                            && analysis
+                                .types
+                                .get(value_record.ty.0 as usize)
+                                .is_some_and(|ty| {
+                                    matches!(ty.kind, SemanticTypeKind::Integer { .. })
+                                })
+                            && !analysis.expressions.iter().any(|expression| {
+                                expression.function == function.id
+                                    && expression.result == Some(definition.value)
+                            })
+                            && !expression_references_local(program, *value, *local, is_cancelled)?
+                    } else {
+                        expression.result == Some(definition.value)
+                    };
+                    if definition.local != *local
+                        || !expression_binding_matches
+                        || value_record.function != function.id
+                        || value_record.origin != SemanticValueOrigin::Local(*local)
+                        || value_record.source != Some(local_record.source)
+                        || value_record.source_name.as_deref() != Some(local_record.name.as_str())
+                        || exact_runtime_source_type(
+                            analysis,
+                            local_record
+                                .ty
+                                .as_ref()
+                                .ok_or_else(|| invalid("scalar assignment local lacks a type"))?,
+                        ) != Some(value_record.ty)
+                    {
+                        return Err(invalid("scalar assignment binding differs from HIR"));
+                    }
+                    if compound {
+                        increment_definition(definitions, definition.value)?;
+                    }
                 }
             }
         }
@@ -8372,7 +8470,16 @@ fn valid_expression_region(
             None => exact_regionless_lexical_view_witness(fact, analysis),
         },
         ValueCategory::Value | ValueCategory::TypeValue => match &fact.resolution {
-            ExpressionResolution::Field { .. } => fact.region.is_none(),
+            ExpressionResolution::Field { .. } => {
+                fact.region.is_none()
+                    || exact_actor_state_field_matches(
+                        analysis,
+                        fact.function,
+                        fact.expression,
+                        fact.result,
+                        fact.region,
+                    )
+            }
             ExpressionResolution::Index { .. } => fact.region.is_some_and(resolves),
             ExpressionResolution::Builtin(IntrinsicOperation::RegionAllocate {
                 region, ..
@@ -8399,6 +8506,50 @@ fn valid_expression_region(
         },
         ValueCategory::Error => false,
     }
+}
+
+fn exact_actor_state_field_matches(
+    analysis: &PartialAnalysis,
+    function: FunctionInstanceId,
+    expression: ExpressionId,
+    result: Option<ValueId>,
+    region: Option<RegionId>,
+) -> bool {
+    analysis.actor_state_accesses.iter().any(|access| {
+        access.function == function
+            && region == Some(access.region)
+            && matches!(
+                access.kind,
+                ActorStateAccessKind::Read {
+                    expression: candidate,
+                    result: candidate_result,
+                } if candidate == expression && result == Some(candidate_result)
+            )
+    })
+}
+
+fn exact_actor_state_write_matches(
+    analysis: &PartialAnalysis,
+    function: FunctionInstanceId,
+    statement: StatementId,
+    receiver: wrela_hir::ParameterId,
+    value_expression: ExpressionId,
+    value: Option<ValueId>,
+) -> bool {
+    analysis.actor_state_accesses.iter().any(|access| {
+        access.function == function
+            && access.receiver == receiver
+            && matches!(
+                access.kind,
+                ActorStateAccessKind::Write {
+                    statement: candidate,
+                    value_expression: candidate_expression,
+                    value: candidate_value,
+                } if candidate == statement
+                    && candidate_expression == value_expression
+                    && value == Some(candidate_value)
+            )
+    })
 }
 
 fn exact_regionless_lexical_view_witness(
@@ -8785,6 +8936,175 @@ fn valid_actor_state_contracts(
                 }
             }
             _ => return false,
+        }
+    }
+    true
+}
+
+fn valid_actor_state_accesses(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    graph: &ImageGraph,
+) -> bool {
+    for (index, access) in analysis.actor_state_accesses.iter().enumerate() {
+        if analysis.actor_state_accesses[index + 1..]
+            .iter()
+            .any(|candidate| candidate.function == access.function && candidate.kind == access.kind)
+        {
+            return false;
+        }
+        let Some(function) = analysis.functions.get(access.function.0 as usize) else {
+            return false;
+        };
+        let FunctionOrigin::Source { declaration, body } = function.origin else {
+            return false;
+        };
+        if function.role != FunctionRole::ActorTurn(access.actor)
+            || graph.actors.get(access.actor.0 as usize).is_none_or(|actor| {
+                analysis.types.get(actor.class.0 as usize).is_none_or(|ty| {
+                    !matches!(
+                        ty.kind,
+                        SemanticTypeKind::Class { declaration, ref arguments, ref fields }
+                            if declaration == access.class && arguments.is_empty() && fields.is_empty()
+                    )
+                })
+            })
+            || function.parameters.first().is_none_or(|parameter| {
+                parameter.parameter != access.receiver || parameter.access != AccessMode::Mutate
+            })
+        {
+            return false;
+        }
+        let Some(receiver) = program.parameter(access.receiver) else {
+            return false;
+        };
+        if !receiver.receiver
+            || receiver.owner != wrela_hir::CallableOwner::Declaration(declaration)
+            || receiver.access != wrela_hir::AccessMode::Mutate
+        {
+            return false;
+        }
+        let Some(class) = program.declaration(access.class) else {
+            return false;
+        };
+        let wrela_hir::DeclarationKind::Structure(class) = &class.kind else {
+            return false;
+        };
+        let Some(field) = class.fields.get(access.field as usize) else {
+            return false;
+        };
+        if access.field != 0
+            || field.name.as_str() != "value"
+            || !matches!(
+                field.ty.kind,
+                wrela_hir::TypeExpressionKind::Named {
+                    definition: wrela_hir::Definition::Builtin(wrela_hir::Builtin::U64),
+                    ref arguments,
+                } if arguments.is_empty()
+            )
+        {
+            return false;
+        }
+        let Some(region) = graph.regions.get(access.region.0 as usize) else {
+            return false;
+        };
+        if region.owner != ImageOwner::Actor(access.actor)
+            || region.class != RegionClass::Image
+            || region.capacity_bytes != 8
+            || region.alignment != 8
+            || region.proof != access.capacity
+            || graph
+                .actors
+                .get(access.actor.0 as usize)
+                .is_none_or(|actor| region.name.strip_suffix(".state") != Some(actor.name.as_str()))
+            || analysis
+                .proofs
+                .get(access.capacity.0 as usize)
+                .is_none_or(|proof| {
+                    proof.kind != ProofKind::CapacityBound
+                        || proof.bound != Some(1)
+                        || proof.sources.as_slice() != [region.source]
+                })
+        {
+            return false;
+        }
+        match access.kind {
+            ActorStateAccessKind::Read { expression, result } => {
+                let Some(record) = program.expression(expression) else {
+                    return false;
+                };
+                let wrela_hir::ExpressionKind::Field { base, ref name } = record.kind else {
+                    return false;
+                };
+                if record.source != access.source || name.as_str() != field.name.as_str() {
+                    return false;
+                }
+                let Some(base) = program.expression(base) else {
+                    return false;
+                };
+                if !matches!(base.kind, wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Parameter(parameter)) if parameter == access.receiver)
+                    || analysis
+                        .expressions
+                        .iter()
+                        .find(|fact| {
+                            fact.function == access.function && fact.expression == expression
+                        })
+                        .is_none_or(|fact| {
+                            fact.result != Some(result)
+                                || fact.region != Some(access.region)
+                                || fact.resolution
+                                    != ExpressionResolution::Field {
+                                        index: access.field,
+                                    }
+                                || !fact.proofs.contains(&access.capacity)
+                        })
+                {
+                    return false;
+                }
+            }
+            ActorStateAccessKind::Write {
+                statement,
+                value_expression,
+                value,
+            } => {
+                let Some(record) = program.statement(statement) else {
+                    return false;
+                };
+                let wrela_hir::StatementKind::Assign {
+                    ref targets,
+                    operator,
+                    value: source_value,
+                } = record.kind
+                else {
+                    return false;
+                };
+                let [target] = targets.as_slice() else {
+                    return false;
+                };
+                if record.source != access.source
+                    || operator != wrela_hir::AssignmentOperator::Assign
+                    || source_value != value_expression
+                    || target.root != wrela_hir::Definition::Parameter(access.receiver)
+                    || !matches!(target.projections.as_slice(), [wrela_hir::PlaceProjection::Field(name)] if name.as_str() == field.name.as_str())
+                    || analysis
+                        .expressions
+                        .iter()
+                        .find(|fact| {
+                            fact.function == access.function && fact.expression == value_expression
+                        })
+                        .is_none_or(|fact| fact.result != Some(value))
+                {
+                    return false;
+                }
+                if program.body(body).is_none()
+                    || !analysis
+                        .statements
+                        .iter()
+                        .any(|fact| fact.function == access.function && fact.statement == statement)
+                {
+                    return false;
+                }
+            }
         }
     }
     true
