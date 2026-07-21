@@ -591,6 +591,9 @@ fn validate_actor_source_type(
             }
             return Ok(());
         }
+        sema::SemanticTypeKind::Structure { .. } | sema::SemanticTypeKind::Enumeration { .. } => {
+            return validate_supported_source_type(ty, facts);
+        }
         _ => false,
     };
     if !scalar || ty.linearity != sema::Linearity::ScalarCopy {
@@ -1972,6 +1975,24 @@ fn validate_supported_source_type(
             arguments,
             variants,
         } => {
+            if !arguments.is_empty()
+                && variants
+                    .iter()
+                    .any(|variant| !matches!(variant.fields.as_slice(), [_]))
+            {
+                return Err(unsupported(
+                    "semantic-generic-enum-mixed-arity-lowering-pending (unit or non-unary generic enum variants)",
+                ));
+            }
+            if !arguments.is_empty()
+                && variants
+                    .windows(2)
+                    .any(|pair| pair[0].fields[0].ty != pair[1].fields[0].ty)
+            {
+                return Err(unsupported(
+                    "semantic-generic-enum-heterogeneous-lowering-pending (differing specialized generic enum payloads)",
+                ));
+            }
             // Every variant is exactly one supported copy scalar (no unit
             // variants); this is the payload-bearing runtime enum shape the
             // machine lowering below packs into one shared tagged-union slot.
@@ -2089,6 +2110,19 @@ fn supported_runtime_enum_arguments(
     if arguments.is_empty() {
         return true;
     }
+    arguments
+        .iter()
+        .all(|argument| matches!(argument, sema::SemanticArgument::Type(_)))
+        && matches!(variants.first().and_then(|variant| variant.fields.first()), Some(first)
+        if variants.iter().all(|variant| {
+            matches!(variant.fields.as_slice(), [field] if field.ty == first.ty)
+        }))
+}
+
+fn supported_core_result_arguments(
+    arguments: &[sema::SemanticArgument],
+    variants: &[sema::SemanticVariant],
+) -> bool {
     matches!(arguments, [sema::SemanticArgument::Type(ok), sema::SemanticArgument::Type(err)] if ok == err)
         && matches!(variants, [ok, err]
             if ok.name == "Ok"
@@ -2720,6 +2754,121 @@ fn lower_actor_types(
                 copy_text("__wrela_actor_reservation", limits.payload_bytes)?,
                 wir::TypeKind::Reservation,
             ),
+            sema::SemanticTypeKind::Enumeration {
+                declaration,
+                arguments,
+                variants,
+            } => {
+                let declaration = input
+                    .hir()
+                    .as_program()
+                    .declaration(*declaration)
+                    .filter(|record| {
+                        ty.source == Some(record.source)
+                            && matches!(record.kind, wrela_hir::DeclarationKind::Enumeration(_))
+                    })
+                    .ok_or(LowerError::MissingSemanticFact {
+                        subject: "closed actor runtime enum".to_owned(),
+                        fact: "source declaration",
+                    })?;
+                let wrela_hir::DeclarationKind::Enumeration(source_enum) = &declaration.kind else {
+                    return Err(unsupported(
+                        "non-enum source declaration for actor runtime enum",
+                    ));
+                };
+                let specialized_result = !arguments.is_empty()
+                    && core_result_source_matches_semantic(
+                        input.hir().as_program(),
+                        declaration,
+                        source_enum,
+                        arguments,
+                        variants,
+                    );
+                let specialized_generic_enum = !arguments.is_empty()
+                    && generic_enum_source_generics_match(
+                        input.hir().as_program(),
+                        declaration,
+                        source_enum,
+                        arguments,
+                    );
+                if source_enum.variants.len() != variants.len()
+                    || if arguments.is_empty() {
+                        !source_enum.generics.is_empty()
+                    } else {
+                        !specialized_result && !specialized_generic_enum
+                    }
+                {
+                    return Err(unsupported(
+                        "noncanonical actor runtime enum semantic facts",
+                    ));
+                }
+                let name = declaration
+                    .name
+                    .as_ref()
+                    .ok_or_else(|| unsupported("anonymous actor runtime enums"))?
+                    .as_str();
+                let mut lowered = try_vec(
+                    variants.len(),
+                    "SemanticWir actor enum variants",
+                    limits.model_edges,
+                )?;
+                for (variant_index, (variant, source_variant)) in
+                    variants.iter().zip(&source_enum.variants).enumerate()
+                {
+                    check_cancelled(is_cancelled)?;
+                    let [field] = variant.fields.as_slice() else {
+                        return Err(unsupported("noncanonical actor enum payload shape"));
+                    };
+                    let [source_field] = source_variant.fields.as_slice() else {
+                        return Err(unsupported("noncanonical actor enum source payload shape"));
+                    };
+                    let source_payload_matches = if specialized_result {
+                        source_enum.generics.get(variant_index).is_some_and(|generic| {
+                            matches!(&source_field.ty.kind, wrela_hir::TypeExpressionKind::Named {
+                                definition: wrela_hir::Definition::Generic(candidate),
+                                arguments,
+                            } if candidate == generic && arguments.is_empty())
+                                && matches!(arguments.as_slice(), [sema::SemanticArgument::Type(payload), _]
+                                    if *payload == field.ty)
+                        })
+                    } else if specialized_generic_enum {
+                        generic_enum_source_payload_matches(
+                            facts,
+                            source_enum,
+                            arguments,
+                            &source_field.ty,
+                            field.ty,
+                        )
+                    } else {
+                        source_type_matches_semantic(facts, &source_field.ty, field.ty)
+                    };
+                    if variant.name != source_variant.name.as_str()
+                        || source_field.name.is_some()
+                        || !field.name.is_empty()
+                        || !field.public
+                        || !source_payload_matches
+                    {
+                        return Err(unsupported(
+                            "actor runtime enum semantic facts differ from source",
+                        ));
+                    }
+                    let mut fields =
+                        try_vec(1, "SemanticWir actor enum payload field", limits.model_edges)?;
+                    fields.push(wir::FieldType {
+                        name: copy_text(&field.name, limits.payload_bytes)?,
+                        ty: wir::TypeId(field.ty.0),
+                        public: field.public,
+                    });
+                    lowered.push(wir::VariantType {
+                        name: copy_text(&variant.name, limits.payload_bytes)?,
+                        fields,
+                    });
+                }
+                (
+                    copy_text(name, limits.payload_bytes)?,
+                    wir::TypeKind::Enum { variants: lowered },
+                )
+            }
             sema::SemanticTypeKind::Class {
                 declaration,
                 arguments,
@@ -3709,19 +3858,27 @@ fn lower_source_types(
                 let wrela_hir::DeclarationKind::Enumeration(source_enum) = &declaration.kind else {
                     return Err(unsupported("non-enum source declaration for runtime enum"));
                 };
-                let specialized_result = !arguments.is_empty();
+                let specialized_result = !arguments.is_empty()
+                    && core_result_source_matches_semantic(
+                        input.hir().as_program(),
+                        declaration,
+                        source_enum,
+                        arguments,
+                        variants,
+                    );
+                let specialized_generic_enum = !arguments.is_empty()
+                    && generic_enum_source_generics_match(
+                        input.hir().as_program(),
+                        declaration,
+                        source_enum,
+                        arguments,
+                    );
                 if source_enum.variants.len() != variants.len()
                     || ty.source != Some(declaration.source)
-                    || if specialized_result {
-                        !core_result_source_matches_semantic(
-                            input.hir().as_program(),
-                            declaration,
-                            source_enum,
-                            arguments,
-                            variants,
-                        )
-                    } else {
+                    || if arguments.is_empty() {
                         !source_enum.generics.is_empty()
+                    } else {
+                        !specialized_result && !specialized_generic_enum
                     }
                 {
                     return Err(unsupported("noncanonical runtime enum semantic facts"));
@@ -3755,6 +3912,14 @@ fn lower_source_types(
                                 && matches!(arguments.as_slice(), [sema::SemanticArgument::Type(payload), _]
                                     if *payload == field.ty)
                         })
+                    } else if specialized_generic_enum {
+                        generic_enum_source_payload_matches(
+                            facts,
+                            source_enum,
+                            arguments,
+                            &source_field.ty,
+                            field.ty,
+                        )
                     } else {
                         source_type_matches_semantic(facts, &source_field.ty, field.ty)
                     };
@@ -3861,7 +4026,54 @@ fn core_result_source_matches_semantic(
         && matches!(source_enum.variants.as_slice(), [ok, err]
             if exact_core_result_source_variant(ok, "Ok", source_enum.generics[0])
                 && exact_core_result_source_variant(err, "Err", source_enum.generics[1]))
-        && supported_runtime_enum_arguments(arguments, variants)
+        && supported_core_result_arguments(arguments, variants)
+}
+
+fn generic_enum_source_generics_match(
+    program: &wrela_hir::Program,
+    declaration: &wrela_hir::Declaration,
+    source_enum: &wrela_hir::EnumDeclaration,
+    arguments: &[sema::SemanticArgument],
+) -> bool {
+    !arguments.is_empty()
+        && source_enum.generics.len() == arguments.len()
+        && source_enum
+            .generics
+            .iter()
+            .zip(arguments)
+            .all(|(generic, argument)| {
+                matches!(argument, sema::SemanticArgument::Type(_))
+                    && program.generic_parameter(*generic).is_some_and(|record| {
+                        record.owner == declaration.id
+                            && matches!(
+                                record.kind,
+                                wrela_hir::GenericParameterKind::Type { bound: None }
+                            )
+                    })
+            })
+}
+
+fn generic_enum_source_payload_matches(
+    facts: &sema::PartialAnalysis,
+    source_enum: &wrela_hir::EnumDeclaration,
+    arguments: &[sema::SemanticArgument],
+    source: &wrela_hir::TypeExpression,
+    ty: sema::SemanticTypeId,
+) -> bool {
+    match &source.kind {
+        wrela_hir::TypeExpressionKind::Named {
+            definition: wrela_hir::Definition::Generic(candidate),
+            arguments: nested,
+        } if nested.is_empty() => source_enum
+            .generics
+            .iter()
+            .position(|generic| generic == candidate)
+            .and_then(|index| arguments.get(index))
+            .is_some_and(|argument| {
+                matches!(argument, sema::SemanticArgument::Type(argument) if *argument == ty)
+            }),
+        _ => source_type_matches_semantic(facts, source, ty),
+    }
 }
 
 fn exact_core_result_source_variant(
@@ -7087,7 +7299,7 @@ impl SourceFunctionLowerer<'_> {
                     declaration,
                     arguments,
                     variants,
-                } if supported_runtime_enum_arguments(arguments, variants) => {
+                } if supported_core_result_arguments(arguments, variants) => {
                     Some((*declaration, variants))
                 }
                 _ => None,
@@ -10869,6 +11081,9 @@ fn actor_type_kind_matches(
         (wir::TypeKind::Struct { fields: left }, wir::TypeKind::Struct { fields: right }) => {
             left.is_empty() && right.is_empty()
         }
+        (wir::TypeKind::Enum { variants: left }, wir::TypeKind::Enum { variants: right }) => {
+            actor_enum_variants_match(left, right, is_cancelled)?
+        }
         (wir::TypeKind::Function(left), wir::TypeKind::Function(right)) => {
             left.color == right.color
                 && left.result == right.result
@@ -10881,6 +11096,34 @@ fn actor_type_kind_matches(
         (wir::TypeKind::Reservation, wir::TypeKind::Reservation) => true,
         _ => false,
     })
+}
+
+fn actor_enum_variants_match(
+    left: &[wir::VariantType],
+    right: &[wir::VariantType],
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, LowerError> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left.iter().zip(right) {
+        check_cancelled(is_cancelled)?;
+        if !text_matches(&left.name, &right.name, is_cancelled)?
+            || left.fields.len() != right.fields.len()
+        {
+            return Ok(false);
+        }
+        for (left, right) in left.fields.iter().zip(&right.fields) {
+            check_cancelled(is_cancelled)?;
+            if left.ty != right.ty
+                || left.public != right.public
+                || !text_matches(&left.name, &right.name, is_cancelled)?
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn actor_function_matches(
@@ -10986,6 +11229,47 @@ fn actor_regions_match(
                         limits.model_edges,
                     )?;
                 }
+                (
+                    wir::SemanticStatement::Match {
+                        scrutinee: left_scrutinee,
+                        arms: left_arms,
+                        results: left_results,
+                        source: left_source,
+                    },
+                    wir::SemanticStatement::Match {
+                        scrutinee: right_scrutinee,
+                        arms: right_arms,
+                        results: right_results,
+                        source: right_source,
+                    },
+                ) => {
+                    if left_scrutinee != right_scrutinee
+                        || left_source != right_source
+                        || left_arms.len() != right_arms.len()
+                        || !cancellable_slices_equal(left_results, right_results, is_cancelled)?
+                    {
+                        return Ok(false);
+                    }
+                    for (left_arm, right_arm) in left_arms.iter().zip(right_arms) {
+                        check_cancelled(is_cancelled)?;
+                        if left_arm.variant != right_arm.variant
+                            || left_arm.guard != right_arm.guard
+                            || !cancellable_slices_equal(
+                                &left_arm.bindings,
+                                &right_arm.bindings,
+                                is_cancelled,
+                            )?
+                        {
+                            return Ok(false);
+                        }
+                        push_bounded_id(
+                            &mut work,
+                            (&left_arm.body, &right_arm.body),
+                            "actor SemanticWir comparison",
+                            limits.model_edges,
+                        )?;
+                    }
+                }
                 (wir::SemanticStatement::Return(left), wir::SemanticStatement::Return(right))
                 | (wir::SemanticStatement::Yield(left), wir::SemanticStatement::Yield(right))
                 | (wir::SemanticStatement::Break(left), wir::SemanticStatement::Break(right))
@@ -11052,6 +11336,18 @@ fn actor_operations_match(
                 checked: rc,
             },
         ) => lv == rv && ld == rd && lc == rc,
+        (
+            wir::SemanticOperation::ConstructEnum {
+                ty: left_ty,
+                variant: left_variant,
+                payload: left_payload,
+            },
+            wir::SemanticOperation::ConstructEnum {
+                ty: right_ty,
+                variant: right_variant,
+                payload: right_payload,
+            },
+        ) => left_ty == right_ty && left_variant == right_variant && left_payload == right_payload,
         (
             wir::SemanticOperation::Copy { value: left },
             wir::SemanticOperation::Copy { value: right },
@@ -15937,6 +16233,162 @@ pub fn boot() -> Image:
             validate_generic_function_lowering_boundary(&facts),
             Err(LowerError::UnsupportedInput {
                 feature: "semantic-generic-function-lowering-pending (generic function specialization)"
+            })
+        ));
+    }
+
+    #[test]
+    fn uniform_copy_scalar_generic_enum_specialization_lowers() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub enum Choice[T]:
+    left(T)
+    right(T)
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        choice: Choice[u64] = Choice.left(7)
+        match choice:
+            case Choice.left(value):
+                pass
+            case Choice.right(value):
+                pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("uniform copy-scalar generic enum specialization should lower");
+        assert!(lowered.wir().as_wir().types.iter().any(|ty| {
+            matches!(&ty.kind, wir::TypeKind::Enum { variants }
+                if ty.source_name == "Choice"
+                    && matches!(variants.as_slice(), [left, right]
+                        if left.name == "left" && right.name == "right"
+                            && left.fields.len() == 1 && right.fields.len() == 1
+                            && left.fields[0].ty == right.fields[0].ty))
+        }));
+
+        let mut forged = lowered.wir().as_wir().clone();
+        let choice = forged
+            .types
+            .iter_mut()
+            .find(|ty| ty.source_name == "Choice")
+            .expect("lowered Choice specialization");
+        let wir::TypeKind::Enum { variants } = &mut choice.kind else {
+            panic!("Choice must remain an enum")
+        };
+        variants[0].name = "forged".to_owned();
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                forged,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn mixed_arity_generic_enum_lowering_fails_closed_by_name() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub enum Maybe[T]:
+    none
+    some(T)
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        value: Maybe[u64] = Maybe.some(7)
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-generic-enum-mixed-arity-lowering-pending (unit or non-unary generic enum variants)"
+            })
+        ));
+    }
+
+    #[test]
+    fn heterogeneous_generic_enum_lowering_fails_closed_by_name() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub enum Either[T, U]:
+    first(T)
+    second(U)
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        value: Either[u8, u64] = Either.first(7)
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-generic-enum-heterogeneous-lowering-pending (differing specialized generic enum payloads)"
             })
         ));
     }
