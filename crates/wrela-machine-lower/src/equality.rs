@@ -985,6 +985,28 @@ fn activation_equal(left: &MachineActivationPlan, right: &MachineActivationPlan)
     left == right
 }
 
+fn region_storage_equal(
+    left: &wrela_machine_wir::MachineRegionStorage,
+    right: &wrela_machine_wir::MachineRegionStorage,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, MachineLowerError> {
+    Ok(left.id == right.id
+        && left.flow_region == right.flow_region
+        && text_equal(&left.name, &right.name, is_cancelled)?
+        && left.kind == right.kind
+        && left.global == right.global
+        && left.symbol == right.symbol
+        && left.section == right.section
+        && left.ty == right.ty
+        && left.capacity_proof == right.capacity_proof
+        && left.capacity_units == right.capacity_units
+        && left.bytes_per_unit == right.bytes_per_unit
+        && left.capacity_bytes == right.capacity_bytes
+        && left.alignment == right.alignment
+        && left.source == right.source
+        && left.capacity_source == right.capacity_source)
+}
+
 pub(super) fn machine_wir_equal(
     left: &MachineWir,
     right: &MachineWir,
@@ -1029,6 +1051,12 @@ pub(super) fn machine_wir_equal(
             &right.activations,
             is_cancelled,
             |left, right| Ok(activation_equal(left, right)),
+        )?
+        && slice_equal_by(
+            &left.region_storage,
+            &right.region_storage,
+            is_cancelled,
+            |left, right| region_storage_equal(left, right, is_cancelled),
         )?
         && slice_equal_by(
             &left.interrupts,

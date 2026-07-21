@@ -513,7 +513,7 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
     .expect("real actor FlowWir has a canonical private-backend frame");
     let prepared =
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
-            .expect("real parsed actor source reaches sealed MachineWir v11");
+            .expect("real parsed actor source reaches sealed MachineWir v12");
     let optimized_wait = prepared
         .optimized()
         .wir()
@@ -524,7 +524,7 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
         .expect("optimized wait-graph proof");
     assert_eq!(optimized_wait.kind, flow::ProofKind::WaitGraphAcyclic);
     let machine = prepared.machine().wir().as_wir();
-    assert_eq!(machine.version, 11);
+    assert_eq!(machine.version, 12);
     assert_eq!(machine.activations.len(), 2);
     assert_eq!(machine.region_storage.len(), flow.regions.len());
     assert_eq!(machine.region_storage.len(), 5);

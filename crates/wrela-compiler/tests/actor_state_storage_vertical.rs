@@ -2,7 +2,11 @@
 
 use std::sync::Arc;
 
-use wrela_backend::{MachineLowerError, flow_wir as flow, prepare_canonical_frame_for_codegen};
+use wrela_backend::{
+    CodegenError, emit_prepared_object, flow_wir as flow, llvm_backend_available,
+    machine_wir::{MachineRegionStorageKind, ValidationError},
+    prepare_canonical_frame_for_codegen,
+};
 use wrela_build_model::{
     BuildConfiguration, BuildIdentity, BuildProfile, LanguageRevision, Sha256Digest,
     TargetIdentity, seal_build_configuration,
@@ -71,7 +75,7 @@ fn never_cancelled() -> bool {
 }
 
 #[test]
-fn canonical_zero_actor_state_reaches_flow_and_named_machine_boundary() {
+fn canonical_zero_actor_state_reaches_native_machine_storage() {
     let source_graph_digest = Sha256Digest::from_bytes([0xb1; 32]);
     let core_package_digest = Sha256Digest::from_bytes([0xb2; 32]);
     let target_digest = Sha256Digest::from_bytes([0xb3; 32]);
@@ -276,13 +280,129 @@ fn canonical_zero_actor_state_reaches_flow_and_named_machine_boundary() {
         &never_cancelled,
     )
     .expect("actor state FlowWir encodes canonically");
-    let error =
+    let prepared =
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
-            .expect_err("MachineWir v11 has no actor-state storage identity");
-    assert_eq!(
-        error.machine_lower_error(),
-        Some(&MachineLowerError::UnsupportedInput {
-            feature: "machine-actor-state-storage-lowering-pending",
+            .expect("canonical actor state reaches MachineWir");
+    let machine = prepared.machine().wir().as_wir();
+    assert_eq!(machine.version, 12);
+    let machine_state = machine
+        .region_storage
+        .iter()
+        .find(|storage| {
+            matches!(
+                storage.kind,
+                MachineRegionStorageKind::ActorState { actor: 0 }
+            )
         })
+        .expect("MachineWir actor state storage");
+    assert_eq!(machine_state.name, flow_state.name);
+    assert_eq!(machine_state.capacity_units, 1);
+    assert_eq!(machine_state.bytes_per_unit, 8);
+    assert_eq!(machine_state.capacity_bytes, 8);
+    assert_eq!(machine_state.alignment, 8);
+
+    let repeated =
+        prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
+            .expect("repeated canonical actor-state preparation");
+    assert_eq!(machine, repeated.machine().wir().as_wir());
+
+    let state_id = machine_state.id;
+    let state_section = machine.sections[machine_state.section.0 as usize].clone();
+    let state_symbol = machine.symbols[machine_state.symbol.0 as usize].clone();
+    match emit_prepared_object(&prepared, &target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(CodegenError::BackendNotBuilt) => {
+            panic!("LLVM reports available but rejected actor-state emission")
+        }
+        Err(error) => panic!("actor state must pass native codegen: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native actor-state object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &target, &never_cancelled)
+                .expect("repeated actor-state native object emission");
+            assert_eq!(first, second, "actor-state COFF must be byte-identical");
+            assert_eq!(first.bytes().get(..2), Some([0x64, 0xaa].as_slice()));
+            let emitted_section = first
+                .sections()
+                .iter()
+                .find(|section| section.name == state_section.name)
+                .expect("actor state has a native writable section");
+            assert_eq!(emitted_section.alignment, 8);
+            assert_eq!(emitted_section.file_bytes, 8);
+            assert_eq!(emitted_section.virtual_bytes, 8);
+            let emitted_symbol = first
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == state_symbol.name)
+                .expect("actor state has a native storage symbol");
+            assert_eq!(emitted_symbol.section, state_section.name);
+            assert_eq!(emitted_symbol.section_offset, 0);
+            assert_eq!(emitted_symbol.bytes, 8);
+        }
+    }
+
+    let mut wrong_owner = machine.clone();
+    wrong_owner.region_storage[state_id.0 as usize].kind =
+        MachineRegionStorageKind::ActorState { actor: 1 };
+    let errors = wrong_owner
+        .validate_for_target(&target)
+        .expect_err("actor state cannot be reassigned to another actor");
+    assert!(
+        errors
+            .0
+            .contains(&ValidationError::InvalidRegionStorage(state_id))
+    );
+
+    let mut wrong_proof = machine.clone();
+    wrong_proof.region_storage[state_id.0 as usize].capacity_proof =
+        wrong_proof.region_storage[0].capacity_proof;
+    let errors = wrong_proof
+        .validate_for_target(&target)
+        .expect_err("actor state cannot borrow the mailbox capacity proof");
+    assert!(
+        errors
+            .0
+            .contains(&ValidationError::InvalidRegionStorage(state_id))
+    );
+
+    let mut wrong_order = machine.clone();
+    wrong_order
+        .region_storage
+        .swap(state_id.0 as usize, state_id.0 as usize + 1);
+    let errors = wrong_order
+        .validate_for_target(&target)
+        .expect_err("actor state must remain between mailbox and turn-frame storage");
+    assert!(errors.0.iter().any(|error| matches!(
+        error,
+        ValidationError::NonDenseId {
+            kind: "region storage",
+            ..
+        }
+    )));
+
+    let mut wrong_layout = machine.clone();
+    wrong_layout.region_storage[state_id.0 as usize].bytes_per_unit = 16;
+    let errors = wrong_layout
+        .validate_for_target(&target)
+        .expect_err("actor state cannot widen beyond one u64 cell");
+    assert!(
+        errors
+            .0
+            .contains(&ValidationError::InvalidRegionStorage(state_id))
+    );
+
+    let mut wrong_name = machine.clone();
+    let renamed_state = wrong_name.region_storage[state_id.0 as usize].clone();
+    wrong_name.region_storage[state_id.0 as usize].name = "Renamed.state".to_owned();
+    wrong_name.sections[renamed_state.section.0 as usize].owner = "Renamed.state".to_owned();
+    wrong_name.types[renamed_state.ty.0 as usize].source_name = Some("Renamed.state".to_owned());
+    let errors = wrong_name
+        .validate_for_target(&target)
+        .expect_err("actor state must retain the matching mailbox actor-name stem");
+    assert!(
+        errors
+            .0
+            .contains(&ValidationError::InvalidRegionStorage(state_id))
     );
 }

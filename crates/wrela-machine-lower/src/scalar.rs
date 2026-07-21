@@ -686,19 +686,6 @@ fn preflight(
     if input.functions.is_empty() {
         return Err(unsupported("an empty FlowWir function table"));
     }
-    // Public lowering has already validated limits, build/target identity,
-    // target policy, cancellation, and the nonempty function floor. Stop
-    // before v11 activation planning interprets this exact v10 region as one
-    // of its closed mailbox/frame storage variants.
-    for region in &input.regions {
-        check_cancelled(is_cancelled)?;
-        if region.class == flow::RegionClass::Image
-            && matches!(region.owner, flow::PlanOwner::Actor(_))
-            && joined_name_has_suffix(&region.name, ".state", is_cancelled)?
-        {
-            return Err(unsupported("machine-actor-state-storage-lowering-pending"));
-        }
-    }
     let flow_actor_dispatch = discover_actor_dispatch(input, is_cancelled)?;
     let activations = lower_activation_subset(
         input,
@@ -1699,7 +1686,14 @@ fn lower_region_storage(
     let [task] = input.tasks.as_slice() else {
         return Err(unsupported("actor region storage without one task"));
     };
-    let static_region_count = if app.is_some() { 4 } else { 3 };
+    let has_actor_state = if let Some(region) = input.regions.get(1) {
+        region.owner == flow::PlanOwner::Actor(actor.id)
+            && region.class == flow::RegionClass::Image
+            && joined_name_matches(&region.name, &actor.name, ".state", is_cancelled)?
+    } else {
+        false
+    };
+    let static_region_count = (if app.is_some() { 4 } else { 3 }) + usize::from(has_actor_state);
     let expected_regions = activations.len().checked_add(static_region_count).ok_or(
         MachineLowerError::ResourceLimit {
             resource: "MachineWir region storage",
@@ -1792,7 +1786,23 @@ fn lower_region_storage(
                     ".mailbox",
                 )
             }
-            1 => {
+            1 if has_actor_state => {
+                if region.class != flow::RegionClass::Image
+                    || region.owner != flow::PlanOwner::Actor(actor.id)
+                    || region.capacity_bytes != 8
+                    || region.alignment != 8
+                    || !joined_name_matches(&region.name, &actor.name, ".state", is_cancelled)?
+                {
+                    return Err(unsupported("the canonical actor state region"));
+                }
+                (
+                    MachineRegionStorageKind::ActorState { actor: actor.id.0 },
+                    1,
+                    8,
+                    ".state",
+                )
+            }
+            index if index == 1 + usize::from(has_actor_state) => {
                 let [turn] = actor.turn_functions.as_slice() else {
                     return Err(unsupported("one actor turn-frame owner"));
                 };
@@ -1818,7 +1828,7 @@ fn lower_region_storage(
                     ".turn-frame",
                 )
             }
-            2 if app.is_some() => {
+            index if app.is_some() && index == 2 + usize::from(has_actor_state) => {
                 let app = app.expect("guarded image-wired app");
                 let expected_bytes = u64::from(app.mailbox_capacity)
                     .checked_mul(ACTOR_MAILBOX_SCALAR_SLOT_BYTES)
@@ -1920,6 +1930,11 @@ fn lower_region_storage(
         if proof.kind != flow::ProofKind::CapacityBound || proof.bound != Some(capacity_units) {
             return Err(unsupported("a substituted actor region capacity proof"));
         }
+        if matches!(kind, MachineRegionStorageKind::ActorState { .. })
+            && (!proof.depends_on.is_empty() || *capacity_source != region.source)
+        {
+            return Err(unsupported("the canonical actor state capacity proof"));
+        }
         let alignment = u32::try_from(region.alignment)
             .map_err(|_| unsupported("an actor region alignment outside the machine domain"))?;
         let global = GlobalId(first_global.checked_add(id).ok_or(
@@ -1995,6 +2010,31 @@ fn joined_name_has_suffix(
         return Ok(false);
     };
     for (index, (left, right)) in tail.bytes().zip(suffix.bytes()).enumerate() {
+        if index % CANCELLABLE_COPY_CHUNK_BYTES == 0 {
+            check_cancelled(is_cancelled)?;
+        }
+        if left != right {
+            return Ok(false);
+        }
+    }
+    check_cancelled(is_cancelled)?;
+    Ok(true)
+}
+
+fn joined_name_matches(
+    value: &str,
+    prefix: &str,
+    suffix: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, MachineLowerError> {
+    if prefix.len().checked_add(suffix.len()) != Some(value.len()) {
+        return Ok(false);
+    }
+    for (index, (left, right)) in value
+        .bytes()
+        .zip(prefix.bytes().chain(suffix.bytes()))
+        .enumerate()
+    {
         if index % CANCELLABLE_COPY_CHUNK_BYTES == 0 {
             check_cancelled(is_cancelled)?;
         }

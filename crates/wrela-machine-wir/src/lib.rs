@@ -19,7 +19,7 @@ use wrela_target::{InterruptDomain, TargetError, TargetPackage};
 use wrela_test_model::{GuestTestOutcome, TestEvent, TestEventKind, TestId};
 use wrela_test_protocol::{CanonicalTestEventCodec, ProtocolLimits, TestEventCodec};
 
-pub const MACHINE_WIR_VERSION: u32 = 11;
+pub const MACHINE_WIR_VERSION: u32 = 12;
 pub const REGION_STORAGE_SECTION_PREFIX: &str = ".data$wrela$region$";
 pub const REGION_STORAGE_SYMBOL_PREFIX: &str = "__wrela_region_storage_";
 
@@ -736,7 +736,7 @@ pub struct MachineFunction {
     pub source: Option<Span>,
 }
 
-/// The only scheduler ownership admitted by MachineWir v11. An actor turn is
+/// The only scheduler ownership admitted by MachineWir v12. An actor turn is
 /// compiled but remains dormant until a real mailbox admission operation
 /// exists; a single-slot static task is invoked exactly once during startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -803,6 +803,12 @@ pub enum MachineRegionStorageKind {
     ActorMailbox {
         actor: u32,
         mailbox_capacity: u32,
+    },
+    /// Canonical, actor-owned persistent state cell. MachineWir v12 admits
+    /// exactly one zero-initialized `u64` cell for a stateful actor; richer
+    /// state layouts remain outside this closed representation.
+    ActorState {
+        actor: u32,
     },
     ActorTurnFrame {
         actor: u32,
@@ -3448,10 +3454,17 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
             }
         ) && activation.schedule == MachineActivationSchedule::StartupOnce
     });
+    let actor_state_count = module
+        .region_storage
+        .iter()
+        .filter(|storage| matches!(storage.kind, MachineRegionStorageKind::ActorState { .. }))
+        .count();
+    let has_actor_state = actor_state_count == 1;
     let expected = module
         .activations
         .len()
-        .checked_add(if cross_actor { 4 } else { 3 });
+        .checked_add(if cross_actor { 4 } else { 3 })
+        .and_then(|count| count.checked_add(usize::from(has_actor_state)));
     if expected != Some(module.region_storage.len()) {
         errors.push(ValidationError::InvalidRecord {
             kind: "region storage set",
@@ -3475,6 +3488,8 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
         return;
     };
     let mut mailbox_count = 0u8;
+    let mut state_count = 0u8;
+    let mut actor_zero_mailbox_name = None;
     let mut actor_frame_count = 0u8;
     let mut task_frame_count = 0u8;
     let mut total_bytes = Some(0u64);
@@ -3618,7 +3633,15 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                 mailbox_capacity,
             } => {
                 mailbox_count = mailbox_count.saturating_add(1);
-                storage.id.0 == if actor == 0 { 0 } else { 2 }
+                if actor == 0 {
+                    actor_zero_mailbox_name = Some(storage.name.as_str());
+                }
+                storage.id.0
+                    == if actor == 0 {
+                        0
+                    } else {
+                        2 + u32::from(has_actor_state)
+                    }
                     && (!cross_actor || matches!(actor, 0 | 1))
                     && storage.capacity_units == u64::from(mailbox_capacity)
                     && storage.bytes_per_unit == 16
@@ -3635,9 +3658,31 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                             })
                     }) || (cross_actor && actor == 1 && mailbox_capacity == 1))
             }
+            MachineRegionStorageKind::ActorState { actor } => {
+                state_count = state_count.saturating_add(1);
+                let proof = module.proofs.get(storage.capacity_proof.0 as usize);
+                actor == 0
+                    && storage.id.0 == 1
+                    && storage.capacity_units == 1
+                    && storage.bytes_per_unit == 8
+                    && storage.capacity_bytes == 8
+                    && storage.alignment == 8
+                    && storage.source == storage.capacity_source
+                    && text_ends_with(&storage.name, ".state", errors)
+                    && actor_zero_mailbox_name.is_some_and(|mailbox_name| {
+                        sibling_storage_name_matches(
+                            mailbox_name,
+                            ".mailbox",
+                            &storage.name,
+                            ".state",
+                            errors,
+                        )
+                    })
+                    && proof.is_some_and(|proof| proof.depends_on.is_empty())
+            }
             MachineRegionStorageKind::ActorTurnFrame { actor, function } => {
                 actor_frame_count = actor_frame_count.saturating_add(1);
-                storage.id.0 == 1
+                storage.id.0 == 1 + u32::from(has_actor_state)
                     && storage.capacity_units == 1
                     && storage.bytes_per_unit == storage.capacity_bytes
                     && text_ends_with(&storage.name, ".turn-frame", errors)
@@ -3661,7 +3706,7 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                 slots,
             } => {
                 task_frame_count = task_frame_count.saturating_add(1);
-                storage.id.0 == if cross_actor { 3 } else { 2 }
+                storage.id.0 == (if cross_actor { 3 } else { 2 }) + u32::from(has_actor_state)
                     && slots == 1
                     && storage.capacity_units == u64::from(slots)
                     && storage.bytes_per_unit == storage.capacity_bytes
@@ -3712,6 +3757,8 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
     }
 
     if mailbox_count != if cross_actor { 2 } else { 1 }
+        || state_count != u8::from(has_actor_state)
+        || actor_state_count > 1
         || actor_frame_count != 1
         || task_frame_count != 1
     {
@@ -3762,6 +3809,34 @@ fn increment_identity_count(counts: &mut [u8], id: u32) {
     if let Some(count) = counts.get_mut(id as usize) {
         *count = count.saturating_add(1);
     }
+}
+
+fn sibling_storage_name_matches(
+    left: &str,
+    left_suffix: &str,
+    right: &str,
+    right_suffix: &str,
+    errors: &mut ValidationContext<'_>,
+) -> bool {
+    let Some(left_prefix_bytes) = left.len().checked_sub(left_suffix.len()) else {
+        return false;
+    };
+    let Some(right_prefix_bytes) = right.len().checked_sub(right_suffix.len()) else {
+        return false;
+    };
+    if left_prefix_bytes != right_prefix_bytes
+        || !left.ends_with(left_suffix)
+        || !right.ends_with(right_suffix)
+    {
+        return false;
+    }
+    let Some(left_prefix) = left.get(..left_prefix_bytes) else {
+        return false;
+    };
+    let Some(right_prefix) = right.get(..right_prefix_bytes) else {
+        return false;
+    };
+    text_equals(left_prefix, right_prefix, errors).unwrap_or(false)
 }
 
 fn validate_storage_identity_counts(
@@ -8037,8 +8112,8 @@ mod tests {
     }
 
     #[test]
-    fn native_struct_schema_revision_accepts_only_exact_machine_wir_v11() {
-        assert_eq!(MACHINE_WIR_VERSION, 11);
+    fn actor_state_schema_revision_accepts_only_exact_machine_wir_v12() {
+        assert_eq!(MACHINE_WIR_VERSION, 12);
         assert_eq!(
             CheckedIntegerOp::ShiftLeft.invalid_shift_count_fatal_code(),
             Some(RuntimeFatalCode::InvalidShiftCount)
@@ -8061,12 +8136,12 @@ mod tests {
         );
         assert_eq!(CheckedIntegerOp::Add.invalid_shift_count_fatal_code(), None);
         let (module, target) = fixture();
-        for rejected in [10, 12] {
+        for rejected in [11, 13] {
             let mut changed = module.clone();
             changed.version = rejected;
             let errors = changed
                 .validate_for_target(&target)
-                .expect_err("only exact-current MachineWir v11 is accepted");
+                .expect_err("only exact-current MachineWir v12 is accepted");
             assert!(
                 errors
                     .0

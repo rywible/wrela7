@@ -880,7 +880,7 @@ fn two_field_flat_local_reaches_unpacked_machine_wir_and_deterministic_coff() {
         &fixture.build,
         &never_cancelled,
     )
-    .expect("two-field local reaches MachineWir v11");
+    .expect("two-field local reaches MachineWir v12");
     let machine = prepared.machine().wir().as_wir();
     let pair = machine
         .types

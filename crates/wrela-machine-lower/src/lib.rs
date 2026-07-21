@@ -5523,7 +5523,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn actor_state_storage_stops_at_named_machine_boundary() {
+    fn actor_state_storage_no_longer_masks_later_plan_validation() {
         let (optimized, target, build) = actor_state_activation_fixture();
         assert!(
             optimized
@@ -5542,7 +5542,7 @@ mod contract_tests {
                 &|| false,
             ),
             Err(MachineLowerError::UnsupportedInput {
-                feature: "machine-actor-state-storage-lowering-pending",
+                feature: "actor activation images with exactly one static task",
             })
         );
         let mut invalid_limits = MachineLoweringLimits::standard();
@@ -5550,7 +5550,7 @@ mod contract_tests {
         assert_eq!(
             lower(&optimized, &target, &build, invalid_limits, &|| false,),
             Err(MachineLowerError::InvalidLimits),
-            "public machine policy validation must retain precedence over the pending state boundary"
+            "public machine policy validation must retain precedence over actor-state plan inspection"
         );
     }
 
@@ -6156,7 +6156,7 @@ mod contract_tests {
         .expect("float not-equal FlowWir reaches MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 11);
+        assert_eq!(machine.version, 12);
         assert!(matches!(machine.types[8].kind, MachineTypeKind::Float32));
         assert!(matches!(machine.types[9].kind, MachineTypeKind::Float64));
         let float_function = &machine.functions[3];
@@ -6264,7 +6264,7 @@ mod contract_tests {
         .expect("unary and lossless casts reach MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 11);
+        assert_eq!(machine.version, 12);
         assert!(matches!(
             machine.types[10].kind,
             MachineTypeKind::Integer { bits: 16 }

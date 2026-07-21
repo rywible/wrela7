@@ -4499,7 +4499,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn real_checked_scalar_surface_reaches_machine_v11_and_textual_llvm() {
+    fn real_checked_scalar_surface_reaches_machine_v12_and_textual_llvm() {
         let cases = [
             (
                 semantic::BinaryOperator::Add,
@@ -4558,7 +4558,7 @@ mod contract_tests {
                     right: semantic::ValueId(1),
                     arithmetic,
                 });
-            assert_eq!(machine.as_wir().version, 11);
+            assert_eq!(machine.as_wir().version, 12);
             assert!(
                 machine
                     .as_wir()

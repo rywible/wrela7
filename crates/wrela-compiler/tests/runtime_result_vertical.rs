@@ -662,7 +662,7 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
         )
         .expect("runtime-result MachineWir preparation");
         let machine = prepared.machine().wir().as_wir();
-        assert_eq!(machine.version, 11);
+        assert_eq!(machine.version, 12);
         assert!(
             machine
                 .types
@@ -965,7 +965,7 @@ fn checked_in_runtime_result_try_reaches_exact_early_return_switch() {
         )
         .expect("runtime-result Try MachineWir preparation");
         let machine = prepared.machine().wir().as_wir();
-        assert_eq!(machine.version, 11);
+        assert_eq!(machine.version, 12);
         let machine_propagation = machine
             .functions
             .iter()
