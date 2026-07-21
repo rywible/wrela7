@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use wrela_backend::{
     CodegenError, emit_prepared_object, flow_wir as flow, llvm_backend_available,
-    machine_wir::{MachineOperation, MachineRegionStorageKind, ValidationError},
+    machine_wir::{CheckedIntegerOp, MachineOperation, MachineRegionStorageKind, ValidationError},
     prepare_canonical_frame_for_codegen,
 };
 use wrela_build_model::{
@@ -49,8 +49,7 @@ pub struct Worker:
     value: u64 = 0
 
     pub async fn ping(mut self):
-        observed: u64 = self.value
-        self.value = 7
+        self.value += 7
         await checkpoint()
 
     @task
@@ -77,7 +76,7 @@ fn never_cancelled() -> bool {
 }
 
 #[test]
-fn canonical_zero_actor_state_reaches_native_machine_storage() {
+fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
     let source_graph_digest = Sha256Digest::from_bytes([0xb1; 32]);
     let core_package_digest = Sha256Digest::from_bytes([0xb2; 32]);
     let target_digest = Sha256Digest::from_bytes([0xb3; 32]);
@@ -267,10 +266,11 @@ fn canonical_zero_actor_state_reaches_native_machine_storage() {
                 if matches!(
                     statement.operation,
                     semantic::SemanticOperation::ActorStateLoad { .. }
+                        | semantic::SemanticOperation::Binary { .. }
                         | semantic::SemanticOperation::ActorStateStore { .. }
                 ) =>
             {
-                Some(&statement.operation)
+                Some(statement)
             }
             _ => None,
         })
@@ -278,21 +278,42 @@ fn canonical_zero_actor_state_reaches_native_machine_storage() {
     assert!(matches!(
         semantic_state_operations.as_slice(),
         [
-            semantic::SemanticOperation::ActorStateLoad {
-                actor: semantic::ActorId(0),
-                region,
-                proof,
-            },
-            semantic::SemanticOperation::ActorStateStore {
-                actor: semantic::ActorId(0),
-                region: store_region,
-                proof: store_proof,
+            semantic::LetStatement {
+                results: loaded,
+                operation: semantic::SemanticOperation::ActorStateLoad {
+                    actor: semantic::ActorId(0),
+                    region,
+                    proof,
+                },
                 ..
-            }
+            },
+            semantic::LetStatement {
+                results: summed,
+                operation: semantic::SemanticOperation::Binary {
+                    operator: semantic::BinaryOperator::Add,
+                    left,
+                    arithmetic: semantic::ArithmeticMode::Checked,
+                    ..
+                },
+                ..
+            },
+            semantic::LetStatement {
+                results: stored_results,
+                operation: semantic::SemanticOperation::ActorStateStore {
+                    actor: semantic::ActorId(0),
+                    region: store_region,
+                    value: stored,
+                    proof: store_proof,
+                },
+                ..
+            },
         ] if *region == semantic_state.id
             && store_region == region
             && *proof == semantic_state.proof
             && store_proof == proof
+            && matches!(loaded.as_slice(), [loaded] if loaded == left)
+            && matches!(summed.as_slice(), [sum] if sum == stored)
+            && stored_results.is_empty()
     ));
 
     let (semantic_wir, _) = semantic_output.into_parts();
@@ -345,6 +366,21 @@ fn canonical_zero_actor_state_reaches_native_machine_storage() {
             .iter()
             .flat_map(|block| &block.instructions)
             .filter(|instruction| matches!(instruction.operation, flow::FlowOperation::Load { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        flow_actor_turn
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(
+                instruction.operation,
+                flow::FlowOperation::Binary {
+                    op: flow::BinaryOp::AddChecked,
+                    ..
+                }
+            ))
             .count(),
         1
     );
@@ -413,6 +449,21 @@ fn canonical_zero_actor_state_reaches_native_machine_storage() {
             .iter()
             .flat_map(|block| &block.instructions)
             .filter(|instruction| matches!(instruction.operation, MachineOperation::Load { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        machine_actor_turn
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(
+                instruction.operation,
+                MachineOperation::CheckedInteger {
+                    op: CheckedIntegerOp::Add,
+                    ..
+                }
+            ))
             .count(),
         1
     );

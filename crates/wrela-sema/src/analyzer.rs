@@ -11970,14 +11970,17 @@ fn analyze_actor_state_assignment(
     else {
         return Ok(None);
     };
-    if operator != AssignmentOperator::Assign {
+    if !matches!(
+        operator,
+        AssignmentOperator::Assign | AssignmentOperator::Add
+    ) {
         return Err(runtime_type_diagnostic(
             request,
             target.source,
             "semantic-actor-state-compound-assignment-pending",
-            "compound actor state assignment is not yet supported",
-            "the canonical state path currently authenticates one plain store, not an atomic read-modify-write reservation",
-            "compute a replacement u64 separately and use `self.value = replacement`",
+            "this compound actor state assignment is not yet supported",
+            "the canonical state path authenticates plain assignment and checked u64 addition only",
+            "use `self.value = replacement` or `self.value += increment`",
         ));
     }
     let receiver_binding = parameters
@@ -12029,6 +12032,35 @@ fn analyze_actor_state_assignment(
         is_cancelled,
     )?;
     let value = outcome.result.ok_or(AnalysisFailure::RequestMismatch)?;
+    let compound_values = if operator == AssignmentOperator::Add {
+        let current = append_semantic_value(
+            request,
+            partial,
+            function,
+            u64_ty,
+            (
+                SemanticValueOrigin::ActorStateLoad(statement),
+                Some(source),
+                None,
+            ),
+            is_cancelled,
+        )?;
+        let result = append_semantic_value(
+            request,
+            partial,
+            function,
+            u64_ty,
+            (
+                SemanticValueOrigin::ActorStateCompoundResult(statement),
+                Some(source),
+                None,
+            ),
+            is_cancelled,
+        )?;
+        Some((current, result))
+    } else {
+        None
+    };
     partial
         .actor_state_accesses
         .try_reserve(1)
@@ -12042,10 +12074,19 @@ fn analyze_actor_state_assignment(
         region: access.region,
         capacity: access.capacity,
         source,
-        kind: ActorStateAccessKind::Write {
-            statement,
-            value_expression,
-            value,
+        kind: match compound_values {
+            Some((current, result)) => ActorStateAccessKind::CompoundAssign {
+                statement,
+                value_expression,
+                value,
+                current,
+                result,
+            },
+            None => ActorStateAccessKind::Write {
+                statement,
+                value_expression,
+                value,
+            },
         },
     });
     Ok(Some(EffectSet(outcome.effects.0 | EffectSet::ACTOR)))
@@ -13887,7 +13928,9 @@ fn expression_result(
         let origin_matches = match record.origin {
             SemanticValueOrigin::Local(_) => true,
             SemanticValueOrigin::Expression(candidate) => candidate == expression,
-            SemanticValueOrigin::Parameter(_) => false,
+            SemanticValueOrigin::Parameter(_)
+            | SemanticValueOrigin::ActorStateLoad(_)
+            | SemanticValueOrigin::ActorStateCompoundResult(_) => false,
         };
         if !origin_matches {
             return Err(AnalysisFailure::RequestMismatch);
@@ -25166,7 +25209,7 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn actor_state_compound_assignment_fails_closed_by_name() {
+    fn actor_state_checked_add_assignment_analyzes_and_seals() {
         let source = STATE_ACCESS_ACTOR_SOURCE.replace("self.value = 7", "self.value += 1");
         let fixture = parsed_actor_fixture(&source);
         let changes = no_changes();
@@ -25175,13 +25218,76 @@ pub fn boot() -> Image:
                 parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
                 &|| false,
             )
-            .expect("unsupported compound state write is a source diagnostic");
-        assert_eq!(output.diagnostics().len(), 1);
-        assert_eq!(
-            output.diagnostics()[0].code.as_deref(),
-            Some("semantic-actor-state-compound-assignment-pending")
+            .expect("checked-add actor state analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "checked-add actor state must analyze: {:?}",
+            output.diagnostics()
         );
-        assert!(output.partial().graph.is_none());
+        let image = output.successful().expect("sealed checked-add actor state");
+        let facts = image.facts();
+        let [
+            ActorStateAccess {
+                kind: ActorStateAccessKind::Read { .. },
+                ..
+            },
+            ActorStateAccess {
+                kind:
+                    ActorStateAccessKind::CompoundAssign {
+                        statement,
+                        value,
+                        current,
+                        result,
+                        ..
+                    },
+                ..
+            },
+        ] = facts.actor_state_accesses.as_slice()
+        else {
+            panic!("one explicit read followed by one compound state access");
+        };
+        assert_ne!(current, value);
+        assert_ne!(result, value);
+        assert_ne!(current, result);
+        assert_eq!(
+            facts.values[current.0 as usize].origin,
+            SemanticValueOrigin::ActorStateLoad(*statement)
+        );
+        assert_eq!(
+            facts.values[result.0 as usize].origin,
+            SemanticValueOrigin::ActorStateCompoundResult(*statement)
+        );
+
+        let mut forged = facts.clone();
+        forged.values[current.0 as usize].origin =
+            SemanticValueOrigin::ActorStateCompoundResult(*statement);
+        forged
+            .validate_partial_structure()
+            .expect("origin substitution remains prefix-valid");
+        assert!(forged.validate_for_seal(image.hir(), &|| false).is_err());
+    }
+
+    #[test]
+    fn actor_state_other_compound_assignments_fail_closed_by_name() {
+        for operator in ["-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="] {
+            let source = STATE_ACCESS_ACTOR_SOURCE
+                .replace("self.value = 7", &format!("self.value {operator} 1"));
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("unsupported compound state write is a source diagnostic");
+            assert_eq!(output.diagnostics().len(), 1, "{operator}");
+            assert_eq!(
+                output.diagnostics()[0].code.as_deref(),
+                Some("semantic-actor-state-compound-assignment-pending"),
+                "{operator}"
+            );
+            assert!(output.partial().graph.is_none(), "{operator}");
+        }
     }
 
     #[test]

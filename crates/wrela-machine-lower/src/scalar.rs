@@ -1781,6 +1781,91 @@ fn exact_actor_state_prefix(
         if !access_matches || access.source != address_instruction.source {
             return false;
         }
+        if let (
+            flow::FlowOperation::Load { .. },
+            [loaded],
+            Some(immediate),
+            Some(binary),
+            Some(store_address),
+            Some(store),
+        ) = (
+            &access.operation,
+            access.results.as_slice(),
+            instructions.get(index + 2),
+            instructions.get(index + 3),
+            instructions.get(index + 4),
+            instructions.get(index + 5),
+        ) {
+            let compound_matches = matches!(
+                (&immediate.operation, immediate.results.as_slice()),
+                (
+                    flow::FlowOperation::Immediate(flow::Immediate::Integer {
+                        bits: 64,
+                        bytes_le,
+                    }),
+                    [right],
+                ) if bytes_le.len() == 8
+                    && function.values.get(right.0 as usize)
+                        .and_then(|value| input.types.get(value.ty.0 as usize))
+                        .is_some_and(|ty| ty.kind == flow::FlowTypeKind::Scalar(
+                            flow::ScalarType::Integer { signed: false, bits: 64 }
+                        ))
+                    && matches!(
+                        (&binary.operation, binary.results.as_slice()),
+                        (
+                            flow::FlowOperation::Binary {
+                                op: flow::BinaryOp::AddChecked,
+                                left,
+                                right: binary_right,
+                            },
+                            [result],
+                        ) if left == loaded && binary_right == right
+                            && function.values.get(result.0 as usize)
+                                .and_then(|value| input.types.get(value.ty.0 as usize))
+                                .is_some_and(|ty| ty.kind == flow::FlowTypeKind::Scalar(
+                                    flow::ScalarType::Integer { signed: false, bits: 64 }
+                                ))
+                            && matches!(
+                                (&store_address.operation, store_address.results.as_slice()),
+                                (
+                                    flow::FlowOperation::ActorStateAddress {
+                                        actor: store_actor,
+                                        region: store_region,
+                                        proof: store_proof,
+                                    },
+                                    [stored_address],
+                                ) if store_actor == address_actor
+                                    && store_region == region
+                                    && store_proof == proof
+                                    && function.values.get(stored_address.0 as usize)
+                                        .and_then(|value| input.types.get(value.ty.0 as usize))
+                                        .is_some_and(|ty| ty.kind == flow::FlowTypeKind::Scalar(
+                                            flow::ScalarType::Address
+                                        ))
+                                    && matches!(
+                                        (&store.operation, store.results.as_slice()),
+                                        (
+                                            flow::FlowOperation::Store {
+                                                address,
+                                                value,
+                                                proof: final_proof,
+                                            },
+                                            [],
+                                        ) if address == stored_address
+                                            && value == result
+                                            && final_proof == proof
+                                    )
+                            )
+                    )
+                    && binary.source == address_instruction.source
+                    && store_address.source == address_instruction.source
+                    && store.source == address_instruction.source
+            );
+            if compound_matches {
+                index += 6;
+                continue;
+            }
+        }
         index += 2;
     }
     true

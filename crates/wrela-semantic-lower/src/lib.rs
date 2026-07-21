@@ -5538,6 +5538,10 @@ enum SourceStatementPlan {
         access: sema::ActorStateAccess,
         value: wrela_hir::ExpressionId,
     },
+    ActorStateCompoundAssign {
+        access: sema::ActorStateAccess,
+        value: wrela_hir::ExpressionId,
+    },
     Expression(wrela_hir::ExpressionId),
     Send(wrela_hir::ExpressionId),
     Return(Option<wrela_hir::ExpressionId>),
@@ -5781,17 +5785,29 @@ impl SourceFunctionLowerer<'_> {
                             .iter()
                             .find(|access| {
                                 access.function == self.function.id
-                                    && matches!(
-                                        access.kind,
+                                    && matches!(access.kind,
                                         sema::ActorStateAccessKind::Write { statement, .. }
-                                            if statement == statement_id
-                                    )
+                                        | sema::ActorStateAccessKind::CompoundAssign { statement, .. }
+                                            if statement == statement_id)
                             })
                             .cloned()
                         {
-                            SourceStatementPlan::ActorStateStore {
-                                access,
-                                value: *value,
+                            match access.kind {
+                                sema::ActorStateAccessKind::Write { .. } => {
+                                    SourceStatementPlan::ActorStateStore {
+                                        access,
+                                        value: *value,
+                                    }
+                                }
+                                sema::ActorStateAccessKind::CompoundAssign { .. } => {
+                                    SourceStatementPlan::ActorStateCompoundAssign {
+                                        access,
+                                        value: *value,
+                                    }
+                                }
+                                sema::ActorStateAccessKind::Read { .. } => {
+                                    return Err(self.fact_mismatch("actor state statement access"));
+                                }
                             }
                         } else {
                             let [target] = targets.as_slice() else {
@@ -5923,7 +5939,8 @@ impl SourceFunctionLowerer<'_> {
                 | SourceStatementPlan::CompoundAssign { value, .. }
                 | SourceStatementPlan::Expression(value)
                 | SourceStatementPlan::Send(value) => self.expression_fact(*value)?.effects,
-                SourceStatementPlan::ActorStateStore { value, .. } => {
+                SourceStatementPlan::ActorStateStore { value, .. }
+                | SourceStatementPlan::ActorStateCompoundAssign { value, .. } => {
                     let mut effects = self.expression_fact(*value)?.effects;
                     effects.0 |= sema::EffectSet::ACTOR;
                     effects
@@ -6293,6 +6310,111 @@ impl SourceFunctionLowerer<'_> {
                         Some(statement_source),
                     )?;
                     local_state.set(local, definition.value)?;
+                }
+                SourceStatementPlan::ActorStateCompoundAssign { access, value } => {
+                    let (value_fact, current, result) = match access.kind {
+                        sema::ActorStateAccessKind::CompoundAssign {
+                            statement,
+                            value_expression,
+                            value: semantic_value,
+                            current,
+                            result,
+                        } if statement == statement_id && value_expression == value => {
+                            let value_fact = self.expression_fact(value)?;
+                            if value_fact.result != Some(semantic_value) {
+                                return Err(self.fact_mismatch("actor state compound RHS"));
+                            }
+                            (value_fact, current, result)
+                        }
+                        _ => return Err(self.fact_mismatch("actor state compound fact")),
+                    };
+                    if !statement_definitions.is_empty()
+                        || access.function != self.function.id
+                        || access.source != statement_source
+                        || !matches!(
+                            self.input
+                                .facts()
+                                .types
+                                .get(value_fact.ty.0 as usize)
+                                .map(|ty| &ty.kind),
+                            Some(sema::SemanticTypeKind::Integer {
+                                signed: false,
+                                bits: 64,
+                                pointer_sized: false,
+                            })
+                        )
+                    {
+                        return Err(self.fact_mismatch("actor state compound statement"));
+                    }
+                    for (id, origin) in [
+                        (
+                            current,
+                            sema::SemanticValueOrigin::ActorStateLoad(statement_id),
+                        ),
+                        (
+                            result,
+                            sema::SemanticValueOrigin::ActorStateCompoundResult(statement_id),
+                        ),
+                    ] {
+                        if self
+                            .input
+                            .facts()
+                            .values
+                            .get(id.0 as usize)
+                            .is_none_or(|semantic| {
+                                semantic.function != self.function.id
+                                    || semantic.ty != value_fact.ty
+                                    || semantic.category != sema::ValueCategory::Value
+                                    || semantic.class != sema::SemanticValueClass::FirstClass
+                                    || semantic.origin != origin
+                                    || semantic.source != Some(statement_source)
+                                    || semantic.source_name.is_some()
+                            })
+                        {
+                            return Err(self.fact_mismatch("actor state compound value"));
+                        }
+                    }
+                    let current = self.value_map.get(current)?;
+                    self.push_let(
+                        &mut statements,
+                        current,
+                        wir::SemanticOperation::ActorStateLoad {
+                            actor: wir::ActorId(access.actor.0),
+                            region: wir::RegionId(access.region.0),
+                            proof: wir::ProofId(access.capacity.0),
+                        },
+                        Some(statement_source),
+                    )?;
+                    let LoweredExpression::Value(right) =
+                        self.lower_expression(value, sema::AccessMode::Value, &mut statements)?
+                    else {
+                        return Err(self.fact_mismatch("actor state compound RHS value"));
+                    };
+                    let result = self.value_map.get(result)?;
+                    self.push_let(
+                        &mut statements,
+                        result,
+                        wir::SemanticOperation::Binary {
+                            operator: wir::BinaryOperator::Add,
+                            left: current,
+                            right,
+                            arithmetic: wir::ArithmeticMode::Checked,
+                        },
+                        Some(statement_source),
+                    )?;
+                    self.push_statement(
+                        &mut statements,
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            results: Vec::new(),
+                            operation: wir::SemanticOperation::ActorStateStore {
+                                actor: wir::ActorId(access.actor.0),
+                                region: wir::RegionId(access.region.0),
+                                value: result,
+                                proof: wir::ProofId(access.capacity.0),
+                            },
+                            source: Some(statement_source),
+                        }),
+                    )?;
                 }
                 SourceStatementPlan::ActorStateStore { access, value } => {
                     if !statement_definitions.is_empty()
@@ -7871,7 +7993,8 @@ impl SourceFunctionLowerer<'_> {
                 self.push_seen_expression(base)?;
                 let result = match access.kind {
                     sema::ActorStateAccessKind::Read { result, .. } => result,
-                    sema::ActorStateAccessKind::Write { .. } => {
+                    sema::ActorStateAccessKind::Write { .. }
+                    | sema::ActorStateAccessKind::CompoundAssign { .. } => {
                         return Err(self.fact_mismatch("actor state load kind"));
                     }
                 };
@@ -8661,7 +8784,9 @@ impl SourceFunctionLowerer<'_> {
                         && record.source == Some(local_record.source)
                         && record.source_name.as_deref() == Some(local_record.name.as_str())
                 }),
-            sema::SemanticValueOrigin::Parameter(_) => false,
+            sema::SemanticValueOrigin::Parameter(_)
+            | sema::SemanticValueOrigin::ActorStateLoad(_)
+            | sema::SemanticValueOrigin::ActorStateCompoundResult(_) => false,
         };
         if !provenance_matches {
             return Err(self.fact_mismatch("expression result provenance"));

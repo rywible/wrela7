@@ -619,6 +619,11 @@ pub enum SemanticValueOrigin {
     Parameter(wrela_hir::ParameterId),
     Local(wrela_hir::LocalId),
     Expression(ExpressionId),
+    /// The old value loaded by one authenticated compound actor-state write.
+    ActorStateLoad(StatementId),
+    /// The checked arithmetic result stored by one authenticated compound
+    /// actor-state write.
+    ActorStateCompoundResult(StatementId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -907,6 +912,13 @@ pub enum ActorStateAccessKind {
         statement: StatementId,
         value_expression: ExpressionId,
         value: ValueId,
+    },
+    CompoundAssign {
+        statement: StatementId,
+        value_expression: ExpressionId,
+        value: ValueId,
+        current: ValueId,
+        result: ValueId,
     },
 }
 
@@ -2148,7 +2160,10 @@ fn validate_exact_source_facts(
                     ));
                 }
             }
-            SemanticValueOrigin::Parameter(_) | SemanticValueOrigin::Expression(_) => {}
+            SemanticValueOrigin::Parameter(_)
+            | SemanticValueOrigin::Expression(_)
+            | SemanticValueOrigin::ActorStateLoad(_)
+            | SemanticValueOrigin::ActorStateCompoundResult(_) => {}
         }
     }
     Ok(())
@@ -5687,6 +5702,12 @@ fn validate_exact_statement_fact(
                         "actor state assignment differs from exact HIR storage access",
                     ));
                 }
+                if let Some((current, result)) =
+                    exact_actor_state_compound_results(analysis, function.id, fact.statement)
+                {
+                    increment_definition(definitions, current)?;
+                    increment_definition(definitions, result)?;
+                }
             } else {
                 let wrela_hir::Definition::Local(local) = &target.root else {
                     return Err(invalid("scalar assignment target is not a local"));
@@ -8633,10 +8654,37 @@ fn exact_actor_state_write_matches(
                     statement: candidate,
                     value_expression: candidate_expression,
                     value: candidate_value,
+                }
+                | ActorStateAccessKind::CompoundAssign {
+                    statement: candidate,
+                    value_expression: candidate_expression,
+                    value: candidate_value,
+                    ..
                 } if candidate == statement
                     && candidate_expression == value_expression
                     && value == Some(candidate_value)
             )
+    })
+}
+
+fn exact_actor_state_compound_results(
+    analysis: &PartialAnalysis,
+    function: FunctionInstanceId,
+    statement: StatementId,
+) -> Option<(ValueId, ValueId)> {
+    analysis.actor_state_accesses.iter().find_map(|access| {
+        if access.function != function {
+            return None;
+        }
+        match access.kind {
+            ActorStateAccessKind::CompoundAssign {
+                statement: candidate,
+                current,
+                result,
+                ..
+            } if candidate == statement => Some((current, result)),
+            _ => None,
+        }
     })
 }
 
@@ -9193,6 +9241,94 @@ fn valid_actor_state_accesses(
                     return false;
                 }
             }
+            ActorStateAccessKind::CompoundAssign {
+                statement,
+                value_expression,
+                value,
+                current,
+                result,
+            } => {
+                let Some(record) = program.statement(statement) else {
+                    return false;
+                };
+                let wrela_hir::StatementKind::Assign {
+                    ref targets,
+                    operator,
+                    value: source_value,
+                } = record.kind
+                else {
+                    return false;
+                };
+                let [target] = targets.as_slice() else {
+                    return false;
+                };
+                let rhs_matches = analysis.expressions.iter().any(|fact| {
+                    fact.function == access.function
+                        && fact.expression == value_expression
+                        && fact.result == Some(value)
+                        && analysis.types.get(fact.ty.0 as usize).is_some_and(|ty| {
+                            matches!(
+                                ty.kind,
+                                SemanticTypeKind::Integer {
+                                    signed: false,
+                                    bits: 64,
+                                    pointer_sized: false,
+                                }
+                            )
+                        })
+                });
+                let synthetic_matches = [
+                    (current, SemanticValueOrigin::ActorStateLoad(statement)),
+                    (
+                        result,
+                        SemanticValueOrigin::ActorStateCompoundResult(statement),
+                    ),
+                ]
+                .into_iter()
+                .all(|(id, origin)| {
+                    id != value
+                        && analysis.values.get(id.0 as usize).is_some_and(|semantic| {
+                            semantic.function == access.function
+                                && semantic.origin == origin
+                                && semantic.category == ValueCategory::Value
+                                && semantic.class == SemanticValueClass::FirstClass
+                                && semantic.source == Some(record.source)
+                                && semantic.source_name.is_none()
+                                && analysis
+                                    .types
+                                    .get(semantic.ty.0 as usize)
+                                    .is_some_and(|ty| {
+                                        matches!(
+                                            ty.kind,
+                                            SemanticTypeKind::Integer {
+                                                signed: false,
+                                                bits: 64,
+                                                pointer_sized: false,
+                                            }
+                                        )
+                                    })
+                                && !analysis.expressions.iter().any(|fact| {
+                                    fact.function == access.function && fact.result == Some(id)
+                                })
+                        })
+                });
+                if record.source != access.source
+                    || operator != wrela_hir::AssignmentOperator::Add
+                    || source_value != value_expression
+                    || target.root != wrela_hir::Definition::Parameter(access.receiver)
+                    || !matches!(target.projections.as_slice(), [wrela_hir::PlaceProjection::Field(name)] if name.as_str() == field.name.as_str())
+                    || current == result
+                    || !rhs_matches
+                    || !synthetic_matches
+                    || program.body(body).is_none()
+                    || !analysis
+                        .statements
+                        .iter()
+                        .any(|fact| fact.function == access.function && fact.statement == statement)
+                {
+                    return false;
+                }
+            }
         }
     }
     true
@@ -9261,6 +9397,8 @@ fn valid_value_origin(origin: SemanticValueOrigin, hir: HirSummary) -> bool {
         SemanticValueOrigin::Parameter(parameter) => parameter.0 < hir.parameters,
         SemanticValueOrigin::Local(local) => local.0 < hir.locals,
         SemanticValueOrigin::Expression(expression) => expression.0 < hir.expressions,
+        SemanticValueOrigin::ActorStateLoad(statement)
+        | SemanticValueOrigin::ActorStateCompoundResult(statement) => statement.0 < hir.statements,
     }
 }
 

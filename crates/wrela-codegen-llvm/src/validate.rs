@@ -1,10 +1,11 @@
 use wrela_machine_wir::{
-    AtomicOrdering, BackendFacts, BackendProofKind, CallingConvention, ConversionOp, Endianness,
-    Linkage, MACHINE_WIR_VERSION, MachineActivationOwner, MachineActivationSchedule,
-    MachineFunction, MachineFunctionRole, MachineImmediate, MachineInstruction, MachineOperation,
-    MachineRegionStorageKind, MachineTerminator, MachineTypeId, MachineTypeKind, MachineUnaryOp,
-    MemorySemantics, REGION_STORAGE_SECTION_PREFIX, ScalarFailureKind, Section, SectionKind,
-    SymbolDefinition, SymbolVisibility, ValueId,
+    AtomicOrdering, BackendFacts, BackendProofKind, CallingConvention, CheckedIntegerOp,
+    ConversionOp, Endianness, IntegerSignedness, Linkage, MACHINE_WIR_VERSION,
+    MachineActivationOwner, MachineActivationSchedule, MachineFunction, MachineFunctionRole,
+    MachineImmediate, MachineInstruction, MachineOperation, MachineRegionStorageKind,
+    MachineTerminator, MachineTypeId, MachineTypeKind, MachineUnaryOp, MemorySemantics,
+    REGION_STORAGE_SECTION_PREFIX, ScalarFailureKind, Section, SectionKind, SymbolDefinition,
+    SymbolVisibility, ValueId,
 };
 use wrela_runtime_abi::{
     INTERRUPT_ROUTE_LAYOUT, INTERRUPT_ROUTE_SECTION, INTERRUPT_ROUTE_TABLE_SYMBOL,
@@ -1246,6 +1247,78 @@ fn exact_actor_state_machine_prefix(
         };
         if !access_matches || access.source != address_instruction.source {
             return false;
+        }
+        if let (
+            MachineOperation::Load { .. },
+            [loaded],
+            Some(immediate),
+            Some(binary),
+            Some(store_address),
+            Some(store),
+        ) = (
+            &access.operation,
+            access.results.as_slice(),
+            instructions.get(index + 2),
+            instructions.get(index + 3),
+            instructions.get(index + 4),
+            instructions.get(index + 5),
+        ) {
+            let compound_matches = matches!(
+                (&immediate.operation, immediate.results.as_slice()),
+                (
+                    MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le }),
+                    [right],
+                ) if bytes_le.len() == 8
+                    && u64_type(*ty)
+                    && function.values.get(right.0 as usize)
+                        .is_some_and(|value| value.ty == *ty)
+                    && matches!(
+                        (&binary.operation, binary.results.as_slice()),
+                        (
+                            MachineOperation::CheckedInteger {
+                                op: CheckedIntegerOp::Add,
+                                signedness: IntegerSignedness::Unsigned,
+                                left,
+                                right: binary_right,
+                                failure,
+                            },
+                            [result],
+                        ) if left == loaded
+                            && binary_right == right
+                            && failure.kind == ScalarFailureKind::Arithmetic
+                            && function.values.get(result.0 as usize)
+                                .is_some_and(|value| u64_type(value.ty))
+                            && matches!(
+                                (&store_address.operation, store_address.results.as_slice()),
+                                (MachineOperation::GlobalAddress(store_global), [stored_address])
+                                    if store_global == global
+                                        && function.values.get(stored_address.0 as usize)
+                                            .and_then(|value| machine.types.get(value.ty.0 as usize))
+                                            .is_some_and(|ty| matches!(ty.kind, MachineTypeKind::Pointer { .. }))
+                                        && matches!(
+                                            (&store.operation, store.results.as_slice()),
+                                            (
+                                                MachineOperation::Store {
+                                                    address,
+                                                    value,
+                                                    semantics: MemorySemantics::Ordinary,
+                                                    facts,
+                                                },
+                                                [],
+                                            ) if address == stored_address
+                                                && value == result
+                                                && conservative_facts(facts)
+                                        )
+                            )
+                    )
+                    && binary.source == address_instruction.source
+                    && store_address.source == address_instruction.source
+                    && store.source == address_instruction.source
+            );
+            if compound_matches {
+                index += 6;
+                continue;
+            }
         }
         index += 2;
     }
