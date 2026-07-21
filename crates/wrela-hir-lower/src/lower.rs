@@ -552,6 +552,10 @@ struct LoweringSession<'a, 'request> {
     headers: Vec<DeclarationHeader>,
     symbols: Vec<Symbol>,
     named_imports: Vec<NamedImport>,
+    /// Ambient prelude bindings installed for every module after ordinary
+    /// imports and module symbols, so an import or module-scope declaration
+    /// may shadow them.
+    prelude_bindings: Vec<NamedImport>,
     module_imports: Vec<ModuleImport>,
     import_edges: Vec<Vec<ModuleId>>,
     uses: Vec<ResolvedUse>,
@@ -605,6 +609,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
             headers: Vec::new(),
             symbols: Vec::new(),
             named_imports: Vec::new(),
+            prelude_bindings: Vec::new(),
             module_imports: Vec::new(),
             import_edges,
             uses: Vec::new(),
@@ -1283,6 +1288,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                         source: scope.exit_binding.meta.span,
                     }),
                     false,
+                    false,
                     scope.exit_binding.meta.span,
                 )?;
                 push(
@@ -1385,6 +1391,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                 lower_access(parameter.access),
                 None,
                 true,
+                false,
                 parameter.meta.span,
             )?;
             push(
@@ -1433,6 +1440,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
             lower_access(parameter.access),
             Some(ty),
             false,
+            parameter.positional_only,
             parameter.meta.span,
         )?;
         push(
@@ -1450,6 +1458,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
         access: hir::AccessMode,
         ty: Option<hir::TypeExpression>,
         receiver: bool,
+        positional_only: bool,
         source: Span,
     ) -> Result<hir::ParameterId, LowerFailure> {
         let id = hir::ParameterId(u32::try_from(self.program.parameters.len()).map_err(|_| {
@@ -1467,6 +1476,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                 access,
                 ty,
                 receiver,
+                positional_only,
                 source,
             },
             "parameters",
@@ -1528,6 +1538,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
             }
         }
         self.resolve_pending_named_imports(&pending_named)?;
+        self.inject_fixed_prelude()?;
         self.named_imports.sort_by(|left, right| {
             (
                 left.module,
@@ -1557,6 +1568,94 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                     .cmp(&(right.local_name.as_str(), right.source.range.start))
             });
         }
+        Ok(())
+    }
+
+    fn inject_fixed_prelude(&mut self) -> Result<(), LowerFailure> {
+        const PRELUDE_NAMES: &[&str] = &[
+            "Option", "Some", "None", "Result", "Ok", "Err", "panic",
+        ];
+        let mut core_packages = Vec::new();
+        for package in self.request.packages.packages() {
+            poll_cancellation(self.is_cancelled)?;
+            if package.identity.name.as_str() == "wrela-core" {
+                push64(
+                    &mut core_packages,
+                    package.id,
+                    "prelude core packages",
+                    self.request.limits.resolved_uses,
+                )?;
+            }
+        }
+        if core_packages.is_empty() {
+            return Ok(());
+        }
+
+        let mut targets = Vec::new();
+        for symbol in &self.symbols {
+            poll_cancellation(self.is_cancelled)?;
+            if !PRELUDE_NAMES.contains(&symbol.name.as_str()) {
+                continue;
+            }
+            let package = match &symbol.target {
+                SymbolTarget::Declaration(resolved) => resolved.package,
+                SymbolTarget::Variant(resolved) => resolved.enumeration.package,
+            };
+            if !core_packages.iter().any(|candidate| *candidate == package) {
+                continue;
+            }
+            push64(
+                &mut targets,
+                (symbol.name.clone(), symbol.target.clone()),
+                "prelude targets",
+                self.request.limits.resolved_uses,
+            )?;
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        let module_count = self.program.modules.len();
+        for module_index in 0..module_count {
+            poll_cancellation(self.is_cancelled)?;
+            let module = ModuleId(module_index as u32);
+            let source = self.program.modules[module_index].source;
+            for (name, target) in &targets {
+                poll_cancellation(self.is_cancelled)?;
+                let shadowed = self.named_imports.iter().any(|binding| {
+                    binding.module == module && binding.local_name.as_str() == name.as_str()
+                }) || self.symbols.iter().any(|symbol| {
+                    symbol.owner == SymbolOwner::Module(module)
+                        && symbol.name.as_str() == name.as_str()
+                });
+                if shadowed {
+                    continue;
+                }
+                push64(
+                    &mut self.prelude_bindings,
+                    NamedImport {
+                        module,
+                        local_name: name.clone(),
+                        target: target.clone(),
+                        source,
+                    },
+                    "prelude bindings",
+                    self.request.limits.resolved_uses,
+                )?;
+            }
+        }
+        self.prelude_bindings.sort_by(|left, right| {
+            (
+                left.module,
+                left.local_name.as_str(),
+                left.source.range.start,
+            )
+                .cmp(&(
+                    right.module,
+                    right.local_name.as_str(),
+                    right.source.range.start,
+                ))
+        });
         Ok(())
     }
 
@@ -2880,12 +2979,35 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                         hir::BuiltinAttribute::Test => function.color != syntax::FunctionColor::Isr,
                         _ => true,
                     };
-                if !valid_shape || !attribute.arguments.is_empty() {
+                let arguments_ok = match builtin {
+                    hir::BuiltinAttribute::Image => attribute.arguments.is_empty(),
+                    hir::BuiltinAttribute::Test => {
+                        test_attribute_arguments_are_supported(&attribute.arguments)
+                    }
+                    _ => true,
+                };
+                if !valid_shape {
                     self.emit(
                         "hir-invalid-entry-attribute",
                         attribute.meta.span,
                         "entry attributes require their exact zero-argument function signature",
                     )?;
+                    continue;
+                }
+                if !arguments_ok {
+                    if builtin == hir::BuiltinAttribute::Test {
+                        self.emit(
+                            "hir-invalid-test-attribute-argument",
+                            attribute.meta.span,
+                            "@test accepts no arguments or the single argument `runtime`",
+                        )?;
+                    } else {
+                        self.emit(
+                            "hir-invalid-entry-attribute",
+                            attribute.meta.span,
+                            "entry attributes require their exact zero-argument function signature",
+                        )?;
+                    }
                     continue;
                 }
                 if output.iter().any(|existing: &hir::Attribute| {
@@ -2942,7 +3064,16 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                     valid_arguments = false;
                     break;
                 }
-                let value = self.lower_expression(expression_context, &argument.value, 0)?;
+                // `@test(runtime)` is a tier keyword, not a resolvable value
+                // name; keep an Error expression so the argument remains
+                // covered without emitting `hir-unresolved-name`.
+                let value = if builtin == hir::BuiltinAttribute::Test
+                    && is_test_runtime_attribute_argument(argument)
+                {
+                    self.lower_test_runtime_marker(expression_context, &argument.value)?
+                } else {
+                    self.lower_expression(expression_context, &argument.value, 0)?
+                };
                 push64(
                     &mut arguments,
                     hir::AttributeArgument {
@@ -2971,6 +3102,34 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
             )?;
         }
         Ok(output)
+    }
+
+    fn lower_test_runtime_marker(
+        &mut self,
+        context: ExpressionContext,
+        value: &syntax::Expression,
+    ) -> Result<hir::ExpressionId, LowerFailure> {
+        poll_cancellation(self.is_cancelled)?;
+        let id =
+            hir::ExpressionId(u32::try_from(self.program.expressions.len()).map_err(|_| {
+                LowerFailure::ResourceLimit {
+                    resource: "expressions",
+                    limit: u64::from(self.request.limits.expressions),
+                }
+            })?);
+        push(
+            &mut self.program.expressions,
+            hir::Expression {
+                id,
+                owner: context.owner,
+                scope: context.scope,
+                kind: hir::ExpressionKind::Error,
+                source: value.meta.span,
+            },
+            "expressions",
+            self.request.limits.expressions,
+        )?;
+        Ok(id)
     }
 
     fn lower_aggregate(
@@ -3058,6 +3217,19 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
             fields,
             members: header.children,
             linear: value.linear,
+            copy: value.copy,
+            deriving: {
+                let mut names = Vec::new();
+                for name in &value.deriving {
+                    push64(
+                        &mut names,
+                        self.name(name)?,
+                        "deriving names",
+                        self.request.limits.model_edges,
+                    )?;
+                }
+                names
+            },
         })
     }
 
@@ -3141,6 +3313,18 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
             generics: header.generics,
             variants,
             members: header.children,
+            deriving: {
+                let mut names = Vec::new();
+                for name in &value.deriving {
+                    push64(
+                        &mut names,
+                        self.name(name)?,
+                        "deriving names",
+                        self.request.limits.model_edges,
+                    )?;
+                }
+                names
+            },
         })
     }
 
@@ -4086,6 +4270,12 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
             symbol.owner == SymbolOwner::Module(module)
                 && symbol.name.as_str() == identifier.spelling
         }) && let Some(resolution) = self.symbol_resolution(symbol.target.clone(), expected)
+        {
+            return Ok(Some(resolution));
+        }
+        if let Some(binding) = self.prelude_bindings.iter().find(|binding| {
+            binding.module == module && binding.local_name.as_str() == identifier.spelling
+        }) && let Some(resolution) = self.symbol_resolution(binding.target.clone(), expected)
         {
             return Ok(Some(resolution));
         }
@@ -5741,6 +5931,31 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                 syntax::ExpressionKind::TrySend(inner) => hir::ExpressionKind::TrySend(
                     self.lower_expression(context, inner, depth + 1)?,
                 ),
+                syntax::ExpressionKind::If {
+                    condition,
+                    then_branch,
+                    elif_branches,
+                    else_branch,
+                } => {
+                    let mut lowered_elif = Vec::new();
+                    for (elif_condition, elif_branch) in elif_branches {
+                        let condition =
+                            self.lower_expression(context, elif_condition, depth + 1)?;
+                        let branch = self.lower_expression(context, elif_branch, depth + 1)?;
+                        push64(
+                            &mut lowered_elif,
+                            (condition, branch),
+                            "if expression elif branches",
+                            self.request.limits.model_edges,
+                        )?;
+                    }
+                    hir::ExpressionKind::If {
+                        condition: self.lower_expression(context, condition, depth + 1)?,
+                        then_branch: self.lower_expression(context, then_branch, depth + 1)?,
+                        elif_branches: lowered_elif,
+                        else_branch: self.lower_expression(context, else_branch, depth + 1)?,
+                    }
+                }
                 syntax::ExpressionKind::Interpolated(parts) => {
                     let mut output = Vec::new();
                     for part in parts {
@@ -5814,20 +6029,16 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
         &self,
         arguments: &[syntax::Argument],
     ) -> Result<bool, LowerFailure> {
-        let mut saw_named = false;
         let mut names = Vec::new();
         for argument in arguments {
             poll_cancellation(self.is_cancelled)?;
             if let Some(name) = &argument.name {
-                saw_named = true;
                 push64(
                     &mut names,
                     name.spelling.as_str(),
                     "call argument names",
                     self.request.limits.model_edges,
                 )?;
-            } else if saw_named {
-                return Ok(false);
             }
         }
         names.sort_unstable();
@@ -5909,6 +6120,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                     access: lower_access(parameter.access),
                     ty,
                     receiver: false,
+                    positional_only: parameter.positional_only,
                     source: parameter.meta.span,
                 },
                 "parameters",
@@ -6411,6 +6623,10 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                 binding.module == module
                     && binding.local_name == *spelling
                     && binding.target == SymbolTarget::Variant(variant.clone())
+            }) || self.prelude_bindings.iter().any(|binding| {
+                binding.module == module
+                    && binding.local_name == *spelling
+                    && binding.target == SymbolTarget::Variant(variant.clone())
             });
             // A dot-form or bare pattern name also resolves against any
             // enum whose *type* (not necessarily each individual variant)
@@ -6418,6 +6634,9 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
             // Result` makes `.Ok`/`.Err` resolvable without separately
             // importing each variant by name.
             let enum_type_imported = self.named_imports.iter().any(|binding| {
+                binding.module == module
+                    && binding.target == SymbolTarget::Declaration(variant.enumeration.clone())
+            }) || self.prelude_bindings.iter().any(|binding| {
                 binding.module == module
                     && binding.target == SymbolTarget::Declaration(variant.enumeration.clone())
             });
@@ -6792,6 +7011,28 @@ fn builtin_attribute(value: &str) -> Option<hir::BuiltinAttribute> {
     })
 }
 
+fn test_attribute_arguments_are_supported(arguments: &[syntax::AttributeArgument]) -> bool {
+    match arguments {
+        [] => true,
+        [argument] => is_test_runtime_attribute_argument(argument),
+        _ => false,
+    }
+}
+
+fn is_test_runtime_attribute_argument(argument: &syntax::AttributeArgument) -> bool {
+    argument.name.is_none() && is_bare_name_expression(&argument.value, "runtime")
+}
+
+fn is_bare_name_expression(expression: &syntax::Expression, expected: &str) -> bool {
+    match &expression.kind {
+        syntax::ExpressionKind::Name(name) => {
+            name.segments.len() == 1 && name.segments[0].spelling == expected
+        }
+        syntax::ExpressionKind::Parenthesized(inner) => is_bare_name_expression(inner, expected),
+        _ => false,
+    }
+}
+
 fn builtin(value: &str) -> Option<hir::Builtin> {
     Some(match value {
         "never" => hir::Builtin::Never,
@@ -6816,8 +7057,6 @@ fn builtin(value: &str) -> Option<hir::Builtin> {
         "str" => hir::Builtin::Str,
         "Bytes" => hir::Builtin::Bytes,
         "String" => hir::Builtin::String,
-        "Option" => hir::Builtin::Option,
-        "Result" => hir::Builtin::Result,
         "Actor" => hir::Builtin::Actor,
         "Receipt" => hir::Builtin::Receipt,
         "Dma" => hir::Builtin::Dma,

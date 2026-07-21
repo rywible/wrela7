@@ -1,7 +1,6 @@
 module runtime_result.image
 
 from core.image import Image, Target
-from core.result import Result
 
 @image
 pub fn boot() -> Image:
@@ -39,8 +38,8 @@ fn propagate_try_err() -> Result[u8, u8]:
 fn result_ok_match_returns_payload():
     first: Result[u8, u8] = Result.Ok(42)
     repeated: Result[u8, u8] = Result.Err(7)
-    value: u8 = unwrap_or_zero(value=first)
-    fallback: u8 = unwrap_or_zero(value=repeated)
+    value: u8 = unwrap_or_zero(first)
+    fallback: u8 = unwrap_or_zero(repeated)
     assert value == 42, "Ok payload must survive exhaustive match"
     assert fallback == 0, "repeated Result[u8, u8] must reuse the same specialization"
     return
@@ -48,7 +47,7 @@ fn result_ok_match_returns_payload():
 @test
 fn result_bool_match_returns_payload():
     value: Result[bool, bool] = Result.Ok(true)
-    assert unwrap_bool_or_false(value=value), "bool Result payload must survive exhaustive match"
+    assert unwrap_bool_or_false(value), "bool Result payload must survive exhaustive match"
     return
 
 @test

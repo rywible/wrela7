@@ -1,5 +1,9 @@
 # Faults and reliability
 
+**Implementation status:** partial — restricted `Result` and assertions
+exist; supervision, restart provisioning, and record/replay are `gap` in the
+[conformance inventory](conformance-inventory.md).
+
 ## 1. Failure taxonomy
 
 wrela separates failures by whether source is expected to recover.

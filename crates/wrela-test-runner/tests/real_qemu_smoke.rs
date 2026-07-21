@@ -1407,15 +1407,12 @@ from core.image import Image, Target
 pub fn boot() -> Image:
     return Image(name="bootstrap", target=Target.aarch64_qemu_virt_uefi)
 
-@test
+@test(runtime)
 fn runtime_case():
     # A bounded `while` is outside the comptime evaluator's supported
     # subset, so this keeps the test in the runtime/image tier
     # deterministically (every function is otherwise phase-neutral and
     # would be comptime-legal on its own).
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
 "#;
 const APPLICATION_TEST_NAME: &str = "runner-smoke@0.1.0::bootstrap.image::runtime_case";
 const APPLICATION_TEST_TIMEOUT_NS: u64 = 30_000_000_000;
@@ -3725,7 +3722,7 @@ mod tests {
         .expect("measure runtime-timeout source package");
         assert_eq!(manifest.name.as_str(), RUNTIME_TIMEOUT_IMAGE);
         let source = std::str::from_utf8(RUNTIME_TIMEOUT_SOURCE).expect("UTF-8 timeout source");
-        assert!(source.contains("@test\nfn checked_arithmetic_fatal_times_out():"));
+        assert!(source.contains("@test(runtime)\nfn checked_arithmetic_fatal_times_out():"));
         assert!(source.contains("return left + right"));
 
         let toolchain_root = unique_root("runtime-timeout-selected-toolchain");

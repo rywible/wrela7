@@ -1,5 +1,11 @@
 # Actors and async
 
+**Implementation status:** partial — one-way unit actor send and selected
+flow models exist; general async lowering, replies, wait-for graph, request
+lineage, receipts, and the service slot idiom are `gap` in the
+[conformance inventory](conformance-inventory.md). Normative prose here leads
+the runtime; unsupported source must fail closed.
+
 ## 1. Why the actor is the unit of mutable concurrency
 
 Single-core execution prevents two ordinary instructions from running at the
@@ -831,30 +837,58 @@ A client proxy MAY present these two steps as one `await disk.read(...)` call,
 but wait-for, ownership, and cancellation analysis must retain the two-stage
 semantics.
 
-A non-reentrant service has no equivalent mechanism of its own:
-`@receipt_handoff` is legal only on `@driver` methods, so a service cannot
-hand a client an owned recovery receipt the way a driver can. A service whose
-state truly requires serial consistency may await a dependency while
-retaining its turn; the concurrency it can offer several clients is
-expressed explicitly through sharding or child actors, not through
-reentrancy or a receipt of its own.
+A non-reentrant service does not receive `@receipt_handoff` — that
+annotation is legal only on `@driver` methods — and must not invent
+reentrancy. The specified answer to service head-of-line blocking is the
+**service slot idiom**: end the turn early and park concurrent I/O in a
+bounded, actor-owned in-flight table.
 
-### Open problem (revision 0.1): service-level interleaving
+### Service slot idiom
 
-A non-reentrant service that holds its turn across an I/O `await` serializes
-every other client behind that one turn — head-of-line blocking at the
-service, not merely FIFO ordering in its mailbox. This revision does not
-specify an answer. Candidate directions include a declared interleaving
-contract that lets specific methods run concurrently against disjoint state,
-canonized sharding patterns that turn one hot service into several
-independent actors, and head-of-line diagnostics that surface the blockage
-before it reaches production. All three are deliberately left unspecified
-until the reference appliance produces evidence about which pattern actually
-recurs. Until then, the actor-chatter diagnostic
-([Build contract](08-build-contract.md)) is required to also report this
-specific shape — "this turn awaits I/O while N senders queue" — naming the
-blocked turn and its queue depth, even though the design question it points
-at remains open.
+A `@service` that performs I/O on behalf of multiple clients SHOULD NOT hold
+its turn across the I/O `await`. Instead it:
+
+1. **Admits** the request in a short turn: validate arguments, reserve one
+   slot in a bounded actor-owned in-flight table (`SlotMap[State, ..N]` or
+   equivalent), and acquire buffers from its pool.
+2. **Submits** to the downstream driver, receiving a sealed `Receipt[P]`.
+3. **Ends the turn** by resolving through the slot. The sealed stdlib
+   contract `slot.resolve(take receipt)` (see
+   [Standard library contracts](10-standard-library-contracts.md)) parks the
+   caller's reply on the slot, ends the service turn, and wires the
+   receipt's completion to a generated later turn that fills the slot and
+   resolves the reply. The turn *ends* rather than suspends — the same shape
+   `@receipt_handoff` already gives drivers.
+
+```wrela
+@service
+pub struct Storage:
+    inflight: SlotMap[ReadState, ..16]
+    pool: IsoPool[Payloads, ..16]
+    disk: Actor[BlkDriver]
+
+    pub async fn read(mut self, lba: u64) -> Result[Static[Bytes], IoError]:
+        slot = self.inflight.reserve()?
+        buffer = self.pool.get()?
+        receipt = self.disk.submit_read(lba=lba, buffer=take buffer)
+        return await slot.resolve(take receipt)
+```
+
+The client experience is one `await` and a pure-value result. Internally, up
+to `N` requests overlap. Each turn on `self` remains atomic; mutable
+structures (cache, in-flight table, pool) are touched only in short
+non-awaiting sections. Sharding into multiple actors remains available for
+state partitioning. Reentrancy is not reintroduced as an optimization or a
+service-tier exception.
+
+The slot is a wait-for-graph resource node whose producer edge is the
+driver's completion or recovery lane — the same participation receipts
+already have. No new node or edge kinds are introduced.
+
+The actor-chatter diagnostic ([Build contract](08-build-contract.md)) MUST
+report the specific shape "this turn awaits I/O while N senders queue",
+naming the blocked turn and its queue depth. The diagnostic's suggested
+repair is this idiom.
 
 ## 14. Polling and idle behavior
 
@@ -870,16 +904,25 @@ The event loop, policy, and queue abstractions are standard-library code. The
 atomic park transition and state-machine suspension are compiler/target
 primitives.
 
-## 15. Multi-core compatibility
+## 15. Multi-core placement
 
-Revision 0.1 implements one scheduler on one core. Its semantic actor model is
-already the `N = 1` case of a future per-core scheduler:
+Revision 0.1's advertised target profile remains one scheduler on one core.
+The semantic model is already the `N = 1` case of the normative multicore
+placement model in [Foundations](01-foundations.md) §8.1:
 
-- actor state is private;
-- mailbox payloads copy or move `iso` values;
-- device vectors have exclusive owners; and
-- public APIs contain no locks, `Send`/`Sync` bounds, or shared mutable aliases.
+- actor state is private and turns are non-reentrant on every core;
+- mailbox payloads copy or move `iso` values — the only cross-core transfer
+  forms;
+- device vectors have exclusive owners on the driver's core;
+- each actor is assigned to exactly one core by the image manifest (default
+  core 0); there is no migration and no work stealing;
+- same-core edges keep this chapter's semantics and as-if fast paths;
+  cross-core edges lower to compiler-generated bounded SPSC rings with
+  sealed publication/acquire ordering;
+- public APIs contain no locks, `Send`/`Sync` bounds, or shared mutable
+  aliases; and
+- record/replay logs per-mailbox admission order to recover the only
+  multicore nondeterminism.
 
-A future multi-core revision may change mailbox transport and actor placement.
-It may not retroactively weaken the revision 0.1 guarantee that actor messages
-share no mutable state.
+A full multicore runtime is not a revision 0.1 product claim. Application
+APIs MUST NOT change when a target package exposes cores > 1.

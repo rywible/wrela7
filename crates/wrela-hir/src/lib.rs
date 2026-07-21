@@ -319,6 +319,10 @@ pub struct Parameter {
     /// enclosing nominal/interface/implementation declaration.
     pub ty: Option<TypeExpression>,
     pub receiver: bool,
+    /// `_ name: Type` — call sites must omit the argument label. The unary
+    /// non-receiver rule also forces positional-only at call sites even when
+    /// this flag is false.
+    pub positional_only: bool,
     pub source: Span,
 }
 
@@ -336,6 +340,10 @@ pub struct AggregateDeclaration {
     pub members: Vec<DeclarationId>,
     /// `linear struct Name:` — non-copyable regardless of fields.
     pub linear: bool,
+    /// `copy struct Name:` — implicitly duplicable when fields are recursively copyable.
+    pub copy: bool,
+    /// Closed compiler-known `deriving(...)` names from the declaration header.
+    pub deriving: Vec<Name>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -353,6 +361,8 @@ pub struct EnumDeclaration {
     pub generics: Vec<GenericParameterId>,
     pub variants: Vec<EnumVariant>,
     pub members: Vec<DeclarationId>,
+    /// Closed compiler-known `deriving(...)` names from the declaration header.
+    pub deriving: Vec<Name>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -734,6 +744,13 @@ pub enum ExpressionKind {
     },
     TrySend(ExpressionId),
     Interpolate(Vec<InterpolationPart>),
+    /// Inline conditional expression with a mandatory else branch.
+    If {
+        condition: ExpressionId,
+        then_branch: ExpressionId,
+        elif_branches: Vec<(ExpressionId, ExpressionId)>,
+        else_branch: ExpressionId,
+    },
     Error,
 }
 
@@ -1637,6 +1654,7 @@ fn meter_expression(
         | ExpressionKind::Try(_)
         | ExpressionKind::Index { .. }
         | ExpressionKind::TrySend(_)
+        | ExpressionKind::If { .. }
         | ExpressionKind::Error => {}
     }
     Ok(())
@@ -3412,10 +3430,17 @@ fn validate_entry_candidate_coverage(program: &Program, errors: &mut ValidationE
             })
             .count();
         let malformed_entry_attribute = declaration.attributes.iter().any(|attribute| {
-            matches!(
-                attribute.identity,
-                AttributeIdentity::Builtin(BuiltinAttribute::Image | BuiltinAttribute::Test)
-            ) && !attribute.arguments.is_empty()
+            match attribute.identity {
+                AttributeIdentity::Builtin(BuiltinAttribute::Image) => {
+                    !attribute.arguments.is_empty()
+                }
+                // Lowering admits only bare `@test` or `@test(runtime)`; a
+                // single retained argument is therefore the runtime force.
+                AttributeIdentity::Builtin(BuiltinAttribute::Test) => {
+                    attribute.arguments.len() > 1
+                }
+                _ => false,
+            }
         });
         if image_count > 1 || test_count > 1 {
             errors.push(ValidationError::InvalidRecord {
@@ -3808,6 +3833,20 @@ fn collect_expression_children(kind: &ExpressionKind, coverage: &mut [u8]) {
                     increment_coverage(coverage, expression.0);
                 }
             }
+        }
+        ExpressionKind::If {
+            condition,
+            then_branch,
+            elif_branches,
+            else_branch,
+        } => {
+            increment_coverage(coverage, condition.0);
+            increment_coverage(coverage, then_branch.0);
+            for (elif_condition, elif_branch) in elif_branches {
+                increment_coverage(coverage, elif_condition.0);
+                increment_coverage(coverage, elif_branch.0);
+            }
+            increment_coverage(coverage, else_branch.0);
         }
         ExpressionKind::Literal(_)
         | ExpressionKind::Reference(_)
@@ -5029,20 +5068,21 @@ fn validate_expression(
         }
         ExpressionKind::Call { callee, arguments } => {
             child(*callee, "callee", errors);
-            let mut saw_named = false;
+            let mut names = Vec::new();
             for argument in arguments {
                 if errors.poll() {
                     return;
                 }
                 if let Some(name) = &argument.name {
                     validate_name(name, "call argument", errors);
-                    saw_named = true;
-                } else if saw_named {
-                    errors.push(ValidationError::InvalidRecord {
-                        arena: "call argument",
-                        id: expression.id.0,
-                        reason: "positional argument after named argument",
-                    });
+                    if names.iter().any(|existing| existing == name) {
+                        errors.push(ValidationError::InvalidRecord {
+                            arena: "call argument",
+                            id: expression.id.0,
+                            reason: "duplicate named argument",
+                        });
+                    }
+                    names.push(name.clone());
                 }
                 if !valid_span(argument.source)
                     || !span_contains(expression.source, argument.source)
@@ -5173,6 +5213,20 @@ fn validate_expression(
                     }
                 }
             }
+        }
+        ExpressionKind::If {
+            condition,
+            then_branch,
+            elif_branches,
+            else_branch,
+        } => {
+            child(*condition, "if condition", errors);
+            child(*then_branch, "if then branch", errors);
+            for (elif_condition, elif_branch) in elif_branches {
+                child(*elif_condition, "if elif condition", errors);
+                child(*elif_branch, "if elif branch", errors);
+            }
+            child(*else_branch, "if else branch", errors);
         }
         ExpressionKind::Error => {}
     }
@@ -5396,6 +5450,8 @@ mod tests {
                     fields: Vec::new(),
                     members: vec![DeclarationId(1)],
                     linear: false,
+                    copy: false,
+                    deriving: Vec::new(),
                 }),
                 source: span(1, 99),
             },
@@ -5421,6 +5477,7 @@ mod tests {
             access: AccessMode::Mutate,
             ty: None,
             receiver: true,
+            positional_only: false,
             source: span(15, 23),
         }];
         program.bodies = vec![Body {
@@ -5814,6 +5871,7 @@ mod tests {
                     access: AccessMode::Mutate,
                     ty: None,
                     receiver: true,
+            positional_only: false,
                     source: span(24, 28),
                 });
                 let DeclarationKind::Initializer(initializer) = &mut value.declarations[1].kind
@@ -5952,6 +6010,7 @@ mod tests {
                         source: span(20, 30),
                     }],
                     members: Vec::new(),
+                    deriving: Vec::new(),
                 }),
                 source: span(16, 90),
             }],
@@ -6003,6 +6062,8 @@ mod tests {
                         fields: Vec::new(),
                         members: vec![DeclarationId(1)],
                         linear: false,
+                    copy: false,
+                    deriving: Vec::new(),
                     }),
                     source,
                 },
@@ -6036,6 +6097,7 @@ mod tests {
                 access: AccessMode::Read,
                 ty: None,
                 receiver: true,
+            positional_only: false,
                 source: span(24, 28),
             }],
             bodies: Vec::new(),
@@ -6221,6 +6283,7 @@ mod tests {
                 access: AccessMode::Mutate,
                 ty: None,
                 receiver: false,
+            positional_only: false,
                 source: span(75, 86),
             }],
             bodies: vec![
@@ -6597,6 +6660,7 @@ mod tests {
                         source,
                     }],
                     members: Vec::new(),
+                    deriving: Vec::new(),
                 }),
                 source,
             }],

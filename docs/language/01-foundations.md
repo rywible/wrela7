@@ -214,7 +214,9 @@ number of objects per frame while retaining a build-time memory ceiling.
 
 Revision 0.1 deliberately excludes:
 
-- multi-core execution;
+- multi-core *runtime execution* on the advertised target profile (the
+  semantic multicore model is normative below; only
+  `aarch64-qemu-virt-uefi` single-core is advertised as a runnable profile);
 - shared-memory concurrency and app-visible atomics;
 - dynamic application installation or loading;
 - tracing garbage collection;
@@ -223,10 +225,38 @@ Revision 0.1 deliberately excludes:
 - arbitrary top-half or “privileged ISR” escape hatches; and
 - install-time verified bytecode.
 
-The actor/message semantics, `iso` transfer, and per-vector IRQ ownership are
-chosen to make it plausible that a future per-core actor scheduler would not
-change application APIs. This is an explicitly tracked bet, not a guarantee:
-its falsifier is the absence of a 2-core semantic sketch that validates
-non-reentrancy and deterministic replay under these same actor/message/`iso`
-rules. That future scheduler, and this bet about it, are not part of the
-current safety or determinism claim.
+### 8.1 Multicore semantics (normative; single-core advertised)
+
+The actor is simultaneously the unit of mutual exclusion, fault isolation,
+and physical placement. Cores are a property of the image graph — assigned
+at build time like pools, mailboxes, and IRQ vectors — not a runtime
+scheduling concern.
+
+- The image manifest assigns every actor to exactly one core. Unassigned
+  actors default to core 0. A target package that offers cores > 1 makes
+  the placement table meaningful; revision 0.1's advertised profile remains
+  single-core.
+- There is no actor migration and no work stealing. Load imbalance is a
+  build-time report and a manifest change.
+- Each core runs the cooperative scheduler of chapter 04. Same-core actor
+  edges keep chapter 04 semantics and as-if fast paths. Cross-core edges
+  are the same typed logical message channels, lowered to compiler-generated
+  bounded SPSC rings between the two cores. Ring publication/acquire
+  ordering is sealed inside those operations; freestanding fences and
+  app-visible atomics remain absent.
+- Cross-actor payload rules already forbid views, `mut` loans, and shared
+  mutable state; the same rules govern cross-core transfers. An `iso` move
+  across a cross-core ring is published under the sealed ring discipline.
+- A `@driver`'s interrupt vectors, DMA pools, queue permits, receipt recovery
+  lanes, and quarantine regions live on the driver's core. There is no
+  cross-core hardware state.
+- The only multicore nondeterminism is cross-core admission interleaving at
+  each mailbox. Record/replay logs per-mailbox admission order and enforces
+  it on replay; everything between admissions is deterministic per-core
+  execution.
+
+These rules are the written 2-core semantic model. Application APIs do not
+change between one core and N cores. A full multicore runtime (multi-core
+boot, GIC routing for N cores beyond a proof vertical) is not a revision
+0.1 runtime claim; see
+[the placement design](../superpowers/specs/2026-07-20-multicore-placement-and-service-slots-design.md).

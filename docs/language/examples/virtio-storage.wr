@@ -1,13 +1,17 @@
 # Corrected end-to-end design example for revision 0.1.
 #
-# This is aspirational source for the standard APIs named by the specification.
-# Executable coverage and the next required vertical slices are tracked in the
-# conformance inventory (../conformance-inventory.md); this file is not
-# currently a successful boot claim. It demonstrates the required ownership
-# and scheduling shape; transport helper
-# implementations are intentionally in the standard library rather than
-# reimplementing memory ordering with freestanding fences here.
-# The tiny write-back extent filesystem is didactic, not crash-consistent.
+# ASPIRATIONAL — not a successful boot claim. Imports modules the stdlib
+# does not yet ship. Executable coverage and required verticals are tracked
+# in ../conformance-inventory.md.
+#
+# Demonstrates ownership and scheduling shape for a didactic write-back
+# extent filesystem (not crash-consistent). Transport helpers belong in the
+# standard library; freestanding fences are not the public API.
+#
+# Multi-client Storage should use the service slot idiom (chapter 04 §13):
+# short admitting turns, bounded in-flight SlotMap, slot.resolve(take
+# receipt). This single-client sketch forwards to ExtentFs for clarity;
+# do not copy that pattern into a concurrent appliance.
 
 module examples.virtio_storage
 

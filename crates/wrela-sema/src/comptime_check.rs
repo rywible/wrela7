@@ -879,6 +879,7 @@ impl<'a> Checker<'a> {
             | ExpressionKind::DotName { .. }
             | ExpressionKind::TrySend(_)
             | ExpressionKind::Interpolate(_)
+            | ExpressionKind::If { .. }
             | ExpressionKind::Error => return Err(self.unsupported(expression.source)),
         };
         self.require_expected(actual, expected, expression.source)
@@ -1009,7 +1010,21 @@ impl<'a> Checker<'a> {
             supplied.push(false);
         }
 
-        for (source_index, argument) in arguments.iter().enumerate() {
+        let mut non_receiver_count = 0usize;
+        for parameter_id in &function.parameters {
+            self.work()?;
+            let parameter = self.parameter(*parameter_id, target_id, target.source)?;
+            if !parameter.receiver {
+                non_receiver_count = non_receiver_count.checked_add(1).ok_or_else(|| {
+                    self.resource_failure(
+                        "comptime source checker storage entries",
+                        self.limits.storage_entries,
+                    )
+                })?;
+            }
+        }
+
+        for argument in arguments.iter() {
             self.work()?;
             let parameter_index = if let Some(argument_name) = &argument.name {
                 let mut selected = None;
@@ -1028,15 +1043,46 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
-                selected.ok_or_else(|| {
+                let parameter_index = selected.ok_or_else(|| {
                     self.diagnostic(
                         argument.source,
-                        "semantic-comptime-call-argument",
-                        "comptime call argument does not name a declared parameter",
+                        "semantic-argument-unknown-label",
+                        "call argument label does not name a declared parameter",
+                    )
+                })?;
+                let parameter =
+                    self.parameter(function.parameters[parameter_index], target_id, target.source)?;
+                if (!parameter.receiver && non_receiver_count <= 1) || parameter.positional_only {
+                    return Err(self.diagnostic(
+                        argument.source,
+                        "semantic-argument-label-forbidden",
+                        "this parameter is positional-only and must not be labeled",
+                    ));
+                }
+                parameter_index
+            } else {
+                let mut found = None;
+                for (index, parameter_id) in function.parameters.iter().enumerate() {
+                    self.work()?;
+                    if *supplied.get(index).unwrap_or(&true) {
+                        continue;
+                    }
+                    let parameter = self.parameter(*parameter_id, target_id, target.source)?;
+                    let positional =
+                        parameter.receiver || non_receiver_count <= 1 || parameter.positional_only;
+                    if parameter.receiver || !positional {
+                        continue;
+                    }
+                    found = Some(index);
+                    break;
+                }
+                found.ok_or_else(|| {
+                    self.diagnostic(
+                        argument.source,
+                        "semantic-argument-label-required",
+                        "this call needs a labeled argument for a remaining parameter",
                     )
                 })?
-            } else {
-                source_index
             };
             let parameter_id = *function.parameters.get(parameter_index).ok_or_else(|| {
                 self.diagnostic(

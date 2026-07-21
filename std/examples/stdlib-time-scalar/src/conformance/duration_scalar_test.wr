@@ -4,47 +4,47 @@ from core.time import as_nanoseconds, clamp, days, hours, max, min, minutes, ms,
 
 @test
 fn scalar_nanosecond_conversion_edges():
-    nanoseconds = ns(value=18446744073709551615)
-    microseconds = us(value=18446744073709551)
-    milliseconds = ms(value=18446744073709)
-    second_value = seconds(value=18446744073)
-    minute_value = minutes(value=307445734)
-    hour_value = hours(value=5124095)
-    day_value = days(value=213503)
-    week_value = weeks(value=30500)
-    comptime assert as_nanoseconds(value=nanoseconds) == 18446744073709551615, "nanosecond representation changed"
-    comptime assert as_nanoseconds(value=microseconds) == 18446744073709551000, "microsecond conversion changed"
-    comptime assert as_nanoseconds(value=milliseconds) == 18446744073709000000, "millisecond conversion changed"
-    comptime assert as_nanoseconds(value=second_value) == 18446744073000000000, "second conversion changed"
-    comptime assert as_nanoseconds(value=minute_value) == 18446744040000000000, "minute conversion changed"
-    comptime assert as_nanoseconds(value=hour_value) == 18446742000000000000, "hour conversion changed"
-    comptime assert as_nanoseconds(value=day_value) == 18446659200000000000, "day conversion changed"
-    comptime assert as_nanoseconds(value=week_value) == 18446400000000000000, "week conversion changed"
+    nanoseconds = ns(18446744073709551615)
+    microseconds = us(18446744073709551)
+    milliseconds = ms(18446744073709)
+    second_value = seconds(18446744073)
+    minute_value = minutes(307445734)
+    hour_value = hours(5124095)
+    day_value = days(213503)
+    week_value = weeks(30500)
+    comptime assert as_nanoseconds(nanoseconds) == 18446744073709551615, "nanosecond representation changed"
+    comptime assert as_nanoseconds(microseconds) == 18446744073709551000, "microsecond conversion changed"
+    comptime assert as_nanoseconds(milliseconds) == 18446744073709000000, "millisecond conversion changed"
+    comptime assert as_nanoseconds(second_value) == 18446744073000000000, "second conversion changed"
+    comptime assert as_nanoseconds(minute_value) == 18446744040000000000, "minute conversion changed"
+    comptime assert as_nanoseconds(hour_value) == 18446742000000000000, "hour conversion changed"
+    comptime assert as_nanoseconds(day_value) == 18446659200000000000, "day conversion changed"
+    comptime assert as_nanoseconds(week_value) == 18446400000000000000, "week conversion changed"
 
 @test
 fn scalar_nanosecond_conversion_composes():
-    microseconds = us(value=1000000)
-    milliseconds = ms(value=1000)
-    second_value = seconds(value=1)
-    comptime assert as_nanoseconds(value=microseconds) == as_nanoseconds(value=milliseconds) and as_nanoseconds(value=milliseconds) == as_nanoseconds(value=second_value), "unit conversions disagree"
+    microseconds = us(1000000)
+    milliseconds = ms(1000)
+    second_value = seconds(1)
+    comptime assert as_nanoseconds(microseconds) == as_nanoseconds(milliseconds) and as_nanoseconds(milliseconds) == as_nanoseconds(second_value), "unit conversions disagree"
 
 @test
 fn duration_arithmetic_edges_and_nested_calls():
-    exact_sum = ns(value=18446744073709551614) + ns(value=1)
-    exact_scale = scale(value=ns(value=6148914691236517205), factor=3)
-    zero_scale = scale(value=ns(value=18446744073709551615), factor=0)
-    nested = scale(value=ns(value=20), factor=2) + ns(value=2)
-    comptime assert as_nanoseconds(value=exact_sum) == 18446744073709551615, "duration addition edge changed"
-    comptime assert as_nanoseconds(value=exact_scale) == 18446744073709551615, "duration scaling edge changed"
-    comptime assert as_nanoseconds(value=zero_scale) == 0, "zero duration scaling changed"
-    comptime assert as_nanoseconds(value=nested) == 42, "nested duration arithmetic changed"
+    exact_sum = ns(18446744073709551614) + ns(1)
+    exact_scale = scale(value=ns(6148914691236517205), factor=3)
+    zero_scale = scale(value=ns(18446744073709551615), factor=0)
+    nested = scale(value=ns(20), factor=2) + ns(2)
+    comptime assert as_nanoseconds(exact_sum) == 18446744073709551615, "duration addition edge changed"
+    comptime assert as_nanoseconds(exact_scale) == 18446744073709551615, "duration scaling edge changed"
+    comptime assert as_nanoseconds(zero_scale) == 0, "zero duration scaling changed"
+    comptime assert as_nanoseconds(nested) == 42, "nested duration arithmetic changed"
 
 @test
 fn duration_total_order_edges_and_nested_helpers():
-    zero = ns(value=0)
-    forty_one = ns(value=41)
-    forty_two = ns(value=42)
-    maximum = ns(value=18446744073709551615)
+    zero = ns(0)
+    forty_one = ns(41)
+    forty_two = ns(42)
+    maximum = ns(18446744073709551615)
     comptime assert zero < forty_two, "zero must order before a positive duration"
     comptime assert not forty_two < forty_two, "equal durations must not be less than one another"
     comptime assert forty_two <= forty_two, "duration ordering must include equality"
@@ -58,48 +58,45 @@ fn duration_total_order_edges_and_nested_helpers():
     equal_minimum = min(left=copy forty_two, right=copy forty_two)
     equal_maximum = max(left=copy forty_two, right=copy forty_two)
     nested = min(left=max(left=zero, right=forty_two), right=maximum)
-    comptime assert as_nanoseconds(value=lower) == 41, "duration minimum changed"
-    comptime assert as_nanoseconds(value=upper) == 42, "duration maximum changed"
-    comptime assert as_nanoseconds(value=equal_minimum) == 42, "equal duration minimum changed"
-    comptime assert as_nanoseconds(value=equal_maximum) == 42, "equal duration maximum changed"
-    comptime assert as_nanoseconds(value=nested) == 42, "nested duration ordering changed"
+    comptime assert as_nanoseconds(lower) == 41, "duration minimum changed"
+    comptime assert as_nanoseconds(upper) == 42, "duration maximum changed"
+    comptime assert as_nanoseconds(equal_minimum) == 42, "equal duration minimum changed"
+    comptime assert as_nanoseconds(equal_maximum) == 42, "equal duration maximum changed"
+    comptime assert as_nanoseconds(nested) == 42, "nested duration ordering changed"
 
 @test
 fn duration_subtraction_clamp_edges_and_nested_calls():
-    exact_zero = ns(value=42) - ns(value=42)
-    exact_difference = ns(value=18446744073709551615) - ns(value=1)
-    below = clamp(value=ns(value=1), lower=ns(value=20), upper=ns(value=42))
-    inside = clamp(value=ns(value=21), lower=ns(value=20), upper=ns(value=42))
-    above = clamp(value=ns(value=84), lower=ns(value=20), upper=ns(value=42))
-    nested = clamp(value=ns(value=84), lower=ns(value=20), upper=ns(value=42)) - ns(value=20)
-    comptime assert as_nanoseconds(value=exact_zero) == 0, "equal duration subtraction changed"
-    comptime assert as_nanoseconds(value=exact_difference) == 18446744073709551614, "duration subtraction edge changed"
-    comptime assert as_nanoseconds(value=below) == 20, "lower duration clamp changed"
-    comptime assert as_nanoseconds(value=inside) == 21, "interior duration clamp changed"
-    comptime assert as_nanoseconds(value=above) == 42, "upper duration clamp changed"
-    comptime assert as_nanoseconds(value=nested) == 22, "nested duration clamp and subtraction changed"
+    exact_zero = ns(42) - ns(42)
+    exact_difference = ns(18446744073709551615) - ns(1)
+    below = clamp(value=ns(1), lower=ns(20), upper=ns(42))
+    inside = clamp(value=ns(21), lower=ns(20), upper=ns(42))
+    above = clamp(value=ns(84), lower=ns(20), upper=ns(42))
+    nested = clamp(value=ns(84), lower=ns(20), upper=ns(42)) - ns(20)
+    comptime assert as_nanoseconds(exact_zero) == 0, "equal duration subtraction changed"
+    comptime assert as_nanoseconds(exact_difference) == 18446744073709551614, "duration subtraction edge changed"
+    comptime assert as_nanoseconds(below) == 20, "lower duration clamp changed"
+    comptime assert as_nanoseconds(inside) == 21, "interior duration clamp changed"
+    comptime assert as_nanoseconds(above) == 42, "upper duration clamp changed"
+    comptime assert as_nanoseconds(nested) == 22, "nested duration clamp and subtraction changed"
 
-@test
+@test(runtime)
 fn installed_runtime_duration_functions_reach_machine():
-    nanos: u64 = as_nanoseconds(value=ns(value=42))
-    micros: u64 = as_nanoseconds(value=us(value=42))
-    millis: u64 = as_nanoseconds(value=ms(value=42))
-    secs: u64 = as_nanoseconds(value=seconds(value=42))
-    mins: u64 = as_nanoseconds(value=minutes(value=42))
-    hrs: u64 = as_nanoseconds(value=hours(value=42))
-    day_count: u64 = as_nanoseconds(value=days(value=42))
-    week_count: u64 = as_nanoseconds(value=weeks(value=42))
-    sum: u64 = as_nanoseconds(value=ns(value=20) + ns(value=22))
-    difference: u64 = as_nanoseconds(value=ns(value=42) - ns(value=20))
-    scaled: u64 = as_nanoseconds(value=scale(value=ns(value=21), factor=2))
-    before: bool = ns(value=41) < ns(value=42)
-    before_or_equal: bool = ns(value=42) <= ns(value=42)
-    after: bool = ns(value=42) > ns(value=41)
-    after_or_equal: bool = ns(value=42) >= ns(value=42)
-    lower: u64 = as_nanoseconds(value=min(left=ns(value=42), right=ns(value=41)))
-    upper: u64 = as_nanoseconds(value=max(left=ns(value=41), right=ns(value=42)))
-    bounded: u64 = as_nanoseconds(value=clamp(value=ns(value=84), lower=ns(value=20), upper=ns(value=42)))
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
+    nanos: u64 = as_nanoseconds(ns(42))
+    micros: u64 = as_nanoseconds(us(42))
+    millis: u64 = as_nanoseconds(ms(42))
+    secs: u64 = as_nanoseconds(seconds(42))
+    mins: u64 = as_nanoseconds(minutes(42))
+    hrs: u64 = as_nanoseconds(hours(42))
+    day_count: u64 = as_nanoseconds(days(42))
+    week_count: u64 = as_nanoseconds(weeks(42))
+    sum: u64 = as_nanoseconds(ns(20) + ns(22))
+    difference: u64 = as_nanoseconds(ns(42) - ns(20))
+    scaled: u64 = as_nanoseconds(scale(value=ns(21), factor=2))
+    before: bool = ns(41) < ns(42)
+    before_or_equal: bool = ns(42) <= ns(42)
+    after: bool = ns(42) > ns(41)
+    after_or_equal: bool = ns(42) >= ns(42)
+    lower: u64 = as_nanoseconds(min(left=ns(42), right=ns(41)))
+    upper: u64 = as_nanoseconds(max(left=ns(41), right=ns(42)))
+    bounded: u64 = as_nanoseconds(clamp(value=ns(84), lower=ns(20), upper=ns(42)))
     return

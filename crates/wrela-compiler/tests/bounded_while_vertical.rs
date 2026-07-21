@@ -56,7 +56,7 @@ fn bounded_while_runtime():
         if index == 7:
             break
         total += index
-    consume(value=total)
+    consume(total)
     return
 
 fn consume(value: u32) -> u32:

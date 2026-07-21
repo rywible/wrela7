@@ -39,7 +39,7 @@ from core.image import Image, Target
 pub fn boot() -> Image:
     return Image(name="compound-image", target=Target.aarch64_qemu_virt_uefi)
 
-@test
+@test(runtime)
 fn compound_runtime():
     value: u32 = 40
     value += 5
@@ -57,14 +57,8 @@ fn compound_runtime():
         value += 1
     else:
         value -= 1
-    consume(value=value)
-    # A bounded `while` is outside the comptime evaluator's supported
-    # subset, so this keeps the test in the runtime/image tier
-    # deterministically (every function is otherwise phase-neutral and
-    # would be comptime-legal on its own).
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
+    consume(value)
+    # `@test(runtime)` keeps this in the runtime/image tier.
     return
 
 fn consume(value: u32) -> u32:
@@ -186,7 +180,7 @@ fn source_compound_assignments_reach_checked_semantic_and_flow_operations() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(assignments.len(), 13);
+    assert_eq!(assignments.len(), 12);
     assert_eq!(
         assignments
             .iter()
@@ -339,8 +333,8 @@ fn source_compound_assignments_reach_checked_semantic_and_flow_operations() {
         )
         .expect("compound assignments lower to SemanticWir");
     let semantic_debug = format!("{:?}", semantic_output.wir().as_wir());
-    assert_eq!(semantic_debug.matches("operation: Binary {").count(), 14);
-    assert_eq!(semantic_debug.matches("arithmetic: Checked").count(), 14);
+    assert_eq!(semantic_debug.matches("operation: Binary {").count(), 12);
+    assert_eq!(semantic_debug.matches("arithmetic: Checked").count(), 12);
 
     let (semantic_wir, _) = semantic_output.into_parts();
     let flow_output = CanonicalFlowLowerer::new()
@@ -385,20 +379,17 @@ from core.image import Image, Target
 pub fn boot() -> Image:
     return Image(name="implicit-return-image", target=Target.aarch64_qemu_virt_uefi)
 
-@test
+@test(runtime)
 fn falls_off_the_end_returns_unit():
     value: u32 = 40
     value += 2
-    consume(value=value)
+    consume(value)
     # A bounded `while` is outside the comptime evaluator's supported
     # subset, so this keeps the test in the runtime/image tier
     # deterministically (every function is otherwise phase-neutral and
     # would be comptime-legal on its own) -- this test exists specifically
     # to exercise the runtime pipeline's implicit-unit-return synthesis, so
     # falling off the end here (no trailing `return`) is the point.
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
 
 fn consume(value: u32) -> u32:
     return value

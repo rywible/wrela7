@@ -1,5 +1,11 @@
 # Values, views, and regions
 
+**Implementation status:** largely aspirational — views, regions, `iso`, and
+`with` cleanup are mostly `gap` in the
+[conformance inventory](conformance-inventory.md). Scalar/flat-aggregate
+ownership verticals exist; do not treat this chapter as a claim that the
+reference toolchain executes these rules end to end.
+
 ## 1. One model, three access verbs
 
 wrela has value semantics. Source code names values, not addresses, and a
@@ -113,22 +119,22 @@ use a standard-library split operation whose contract proves separation.
 ### 4.1 Ephemeral types
 
 An ephemeral type is produced only by specific operations and must be
-consumed immediately: by a binding, `match`/`is`, or `?`. It can never be
-stored in a field, returned from an ordinary `fn`, captured by an escaping
-closure, sent in an actor message, or held live across a suspension point
-(`await`, `yield_now`, task suspension) or other checkpoint (ISR return,
-cancellation). This is the one restriction; every ephemeral shape below is
-this restriction applied to one carrier, not a separately repeated rule.
+consumed immediately. It can never be stored in a field, returned from an
+ordinary `fn`, captured by an escaping closure, sent in an actor message, or
+held live across a suspension point (`await`, `yield_now`, task suspension)
+or other checkpoint (ISR return, cancellation).
 
-`view T` and `mut view T` (§4.2) are ephemeral types. The projection carrier
-(§4.5) — the `Option[view T]` or `Result[view T, E]` a projection returns — is
-the first ephemeral type this chapter specifies fully, with one addition to
-the baseline consumer list: alongside binding, `match`/`is`, and `?`, it may
-also be consumed by a view-binding destructure such as
-`item: mut view Item = table.entry(key)?`.
-[Actors and async](04-actors-and-async.md) defines its own ephemeral types over
-admission and actor-call outcomes, each with its own enumerated deviations from
-this baseline.
+**Baseline consumers:** binding, `match`/`is`, or `?`.
+
+Every ephemeral shape is this one restriction applied to one carrier — not a
+separately repeated rule. Per-carrier deviations:
+
+| Carrier | Defined in | Consumers beyond baseline | Notes |
+|---|---|---|---|
+| `view T` / `mut view T` | §4.2 | (baseline) | Lexical projection; ends at last use |
+| Projection carrier (`Option[view T]` / `Result[view T, E]`) | §4.5 | view-binding destructure, e.g. `item: mut view Item = table.entry(key)?` | Immediate only |
+| `AdmissionResult` | [Actors](04-actors-and-async.md) §3.5 | `match`/`is` only — never `?` | From `try send` |
+| Ownership-conditioned actor-call outcome | [Actors](04-actors-and-async.md) §3.4–3.5 | binding, `match`/`is`, `?` | Immediate consume |
 
 ### 4.2 Views as projections
 

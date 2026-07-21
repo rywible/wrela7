@@ -1341,6 +1341,7 @@ fn keyword_text(keyword: Keyword) -> &'static str {
         Keyword::Projection => "projection",
         Keyword::Scope => "scope",
         Keyword::Implements => "implements",
+        Keyword::Deriving => "deriving",
         Keyword::Region => "region",
         Keyword::View => "view",
         Keyword::Mut => "mut",

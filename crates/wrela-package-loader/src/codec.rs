@@ -1484,6 +1484,10 @@ mod tests {
         include_bytes!("../../../std/wrela-core-0.1/src/ops.wr");
     const CHECKED_IN_CORE_RESULT_SOURCE: &[u8] =
         include_bytes!("../../../std/wrela-core-0.1/src/result.wr");
+    const CHECKED_IN_CORE_OPTION_SOURCE: &[u8] =
+        include_bytes!("../../../std/wrela-core-0.1/src/option.wr");
+    const CHECKED_IN_CORE_PANIC_SOURCE: &[u8] =
+        include_bytes!("../../../std/wrela-core-0.1/src/panic.wr");
     const CHECKED_IN_CORE_TIME_SOURCE: &[u8] =
         include_bytes!("../../../std/wrela-core-0.1/src/time.wr");
     const CHECKED_IN_MINIMUM_IMAGE_SOURCE: &[u8] =
@@ -1626,6 +1630,16 @@ mod tests {
                 },
                 PackageContentRecord {
                     kind: PackageContentKind::Source,
+                    path: "option.wr",
+                    digest: SoftwareSha256.sha256(CHECKED_IN_CORE_OPTION_SOURCE),
+                },
+                PackageContentRecord {
+                    kind: PackageContentKind::Source,
+                    path: "panic.wr",
+                    digest: SoftwareSha256.sha256(CHECKED_IN_CORE_PANIC_SOURCE),
+                },
+                PackageContentRecord {
+                    kind: PackageContentKind::Source,
                     path: "result.wr",
                     digest: SoftwareSha256.sha256(CHECKED_IN_CORE_RESULT_SOURCE),
                 },
@@ -1641,7 +1655,7 @@ mod tests {
         .expect("canonical core package content digest");
         assert_eq!(
             core_digest.to_hex(),
-            "0011a42b0c7fa08e9388deebe81533ee1071c2d805ccc41f34d0958da9d8183f"
+            "16416e5e3711255f0440c5681ea407277e69d20325bddfdaa91db08cbe9597e8"
         );
         let application_digest = package_content_digest(
             &application_canonical,
@@ -2329,6 +2343,20 @@ mod tests {
                     digest: hasher.sha256(CHECKED_IN_CORE_RESULT_SOURCE),
                 },
                 SourceInput {
+                    path: "option.wr".to_owned(),
+                    text: std::str::from_utf8(CHECKED_IN_CORE_OPTION_SOURCE)
+                        .expect("core option source UTF-8")
+                        .to_owned(),
+                    digest: hasher.sha256(CHECKED_IN_CORE_OPTION_SOURCE),
+                },
+                SourceInput {
+                    path: "panic.wr".to_owned(),
+                    text: std::str::from_utf8(CHECKED_IN_CORE_PANIC_SOURCE)
+                        .expect("core panic source UTF-8")
+                        .to_owned(),
+                    digest: hasher.sha256(CHECKED_IN_CORE_PANIC_SOURCE),
+                },
+                SourceInput {
                     path: "time.wr".to_owned(),
                     text: std::str::from_utf8(CHECKED_IN_CORE_TIME_SOURCE)
                         .expect("core time source UTF-8")
@@ -2357,8 +2385,8 @@ mod tests {
             )
             .expect("checked-in bootstrap workspace loads and seals");
         assert_eq!(workspace.graph().packages().len(), 2);
-        assert_eq!(workspace.graph().modules().len(), 5);
-        assert_eq!(workspace.sources().len(), 5);
+        assert_eq!(workspace.graph().modules().len(), 7);
+        assert_eq!(workspace.sources().len(), 7);
         assert_eq!(workspace.root_manifest().name.as_str(), "bootstrap-image");
         assert_eq!(
             workspace

@@ -2042,6 +2042,30 @@ fn validate_exact_expression_local_values(
                     pending.push(*base);
                 }
             }
+            wrela_hir::ExpressionKind::If {
+                condition,
+                then_branch,
+                elif_branches,
+                else_branch,
+            } => {
+                let additional = elif_branches
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|elif| elif.checked_add(3))
+                    .ok_or_else(|| invalid("expression child count overflow"))?;
+                reserve_validation_scratch(
+                    &mut pending,
+                    additional,
+                    program.expressions.len() as u64,
+                )?;
+                pending.push(*else_branch);
+                for (elif_condition, elif_branch) in elif_branches.iter().rev() {
+                    pending.push(*elif_branch);
+                    pending.push(*elif_condition);
+                }
+                pending.push(*then_branch);
+                pending.push(*condition);
+            }
             wrela_hir::ExpressionKind::Literal(_)
             | wrela_hir::ExpressionKind::Reference(_)
             | wrela_hir::ExpressionKind::DotName { .. } => {}
@@ -2130,6 +2154,30 @@ fn expression_references_local(
             wrela_hir::ExpressionKind::Field { base, .. } => {
                 reserve_validation_scratch(&mut pending, 1, program.expressions.len() as u64)?;
                 pending.push(*base);
+            }
+            wrela_hir::ExpressionKind::If {
+                condition,
+                then_branch,
+                elif_branches,
+                else_branch,
+            } => {
+                let additional = elif_branches
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|elif| elif.checked_add(3))
+                    .ok_or_else(|| invalid("expression child count overflow"))?;
+                reserve_validation_scratch(
+                    &mut pending,
+                    additional,
+                    program.expressions.len() as u64,
+                )?;
+                pending.push(*else_branch);
+                for (elif_condition, elif_branch) in elif_branches.iter().rev() {
+                    pending.push(*elif_branch);
+                    pending.push(*elif_condition);
+                }
+                pending.push(*then_branch);
+                pending.push(*condition);
             }
             wrela_hir::ExpressionKind::Literal(_) | wrela_hir::ExpressionKind::Reference(_) => {}
             _ => {
@@ -2763,6 +2811,30 @@ fn collect_source_body_closure(
                     pending_expressions.push(*base);
                 }
             }
+            wrela_hir::ExpressionKind::If {
+                condition,
+                then_branch,
+                elif_branches,
+                else_branch,
+            } => {
+                let additional = elif_branches
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|elif| elif.checked_add(3))
+                    .ok_or_else(invalid)?;
+                reserve_validation_scratch(
+                    &mut pending_expressions,
+                    additional,
+                    program.expressions.len() as u64,
+                )?;
+                pending_expressions.push(*else_branch);
+                for (elif_condition, elif_branch) in elif_branches.iter().rev() {
+                    pending_expressions.push(*elif_branch);
+                    pending_expressions.push(*elif_condition);
+                }
+                pending_expressions.push(*then_branch);
+                pending_expressions.push(*condition);
+            }
             _ => return Err(invalid()),
         }
     }
@@ -3191,6 +3263,25 @@ fn validate_exact_expression_fact(
             increment_definition(definitions, *err_payload)?;
             increment_definition(definitions, *propagated)?;
         }
+        (
+            wrela_hir::ExpressionKind::If {
+                condition,
+                then_branch,
+                elif_branches,
+                else_branch,
+            },
+            ExpressionResolution::Value(value),
+            Some(result),
+        ) if *value == result
+            && exact_inline_if_matches(
+                analysis,
+                function.id,
+                *condition,
+                *then_branch,
+                elif_branches,
+                *else_branch,
+                fact,
+            ) => {}
         _ => {
             return Err(invalid(&format!(
                 "expression semantic fact differs from exact HIR meaning: function {:?}, expression {:?}, HIR {:?}, resolution {:?}, result {:?}",
@@ -3199,6 +3290,47 @@ fn validate_exact_expression_fact(
         }
     }
     Ok(())
+}
+
+fn exact_inline_if_matches(
+    analysis: &PartialAnalysis,
+    function: FunctionInstanceId,
+    condition: ExpressionId,
+    then_branch: ExpressionId,
+    elif_branches: &[(ExpressionId, ExpressionId)],
+    else_branch: ExpressionId,
+    fact: &ExpressionFact,
+) -> bool {
+    let Some(condition_fact) = exact_child_expression(analysis, function, condition) else {
+        return false;
+    };
+    let Some(then_fact) = exact_child_expression(analysis, function, then_branch) else {
+        return false;
+    };
+    let Some(else_fact) = exact_child_expression(analysis, function, else_branch) else {
+        return false;
+    };
+    if then_fact.ty != fact.ty || else_fact.ty != fact.ty {
+        return false;
+    }
+    let mut effects = condition_fact.effects;
+    effects.0 |= then_fact.effects.0;
+    for (elif_condition, elif_branch) in elif_branches {
+        let Some(elif_condition_fact) = exact_child_expression(analysis, function, *elif_condition)
+        else {
+            return false;
+        };
+        let Some(elif_fact) = exact_child_expression(analysis, function, *elif_branch) else {
+            return false;
+        };
+        if elif_fact.ty != fact.ty {
+            return false;
+        }
+        effects.0 |= elif_condition_fact.effects.0;
+        effects.0 |= elif_fact.effects.0;
+    }
+    effects.0 |= else_fact.effects.0;
+    effects.0 == fact.effects.0
 }
 
 #[allow(clippy::too_many_arguments)]

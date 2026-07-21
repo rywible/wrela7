@@ -187,19 +187,18 @@ const SHALLOW_CANCELLATION_SOURCE_UNIT_TEST: &[u8] = b"module app.math_test\n\nf
 const DEEP_CANCELLATION_SOURCE_UNIT_TEST: &[u8] = b"module app.math_test\n\nfrom app.math import countdown\n\n@test\nfn imported_countdown_is_cancellable():\n    result: u32 = countdown(24)\n    comptime assert result == 0, \"countdown returned the wrong value\"\n";
 // `runtime_case`'s body is a bounded `while` (not a bare `pass`): a trivial
 // `pass` body is structurally within the static comptime-legality checker's
-// supported subset (`StatementKind::Pass` is legal there), so it would be
-// silently misrouted into the comptime tier instead of reaching the
-// `--integration` selection this test exercises. A bounded `while` is
-// unsupported by the static checker (forcing the runtime tier) but fully
-// supported by the runtime-shape checker, so it deterministically stays
-// selectable under `--integration`.
-const INTEGRATION_TEST_SOURCE: &[u8] = b"module bootstrap.image\n\nfrom core.image import Image, Target\n\n@image\npub fn boot() -> Image:\n    return Image(name=\"bootstrap\", target=Target.aarch64_qemu_virt_uefi)\n\n@test\nfn runtime_case():\n    guard: u32 = 0\n    while guard < 1:\n        guard += 1\n";
+// The previous revision smuggled runtime-tier selection through a bounded
+// `while` that the comptime checker rejected. `@test(runtime)` is now the
+// explicit, legal way to force the runtime/image tier under `--integration`.
+const INTEGRATION_TEST_SOURCE: &[u8] = b"module bootstrap.image\n\nfrom core.image import Image, Target\n\n@image\npub fn boot() -> Image:\n    return Image(name=\"bootstrap\", target=Target.aarch64_qemu_virt_uefi)\n\n@test(runtime)\nfn runtime_case():\n    return\n";
 const MALFORMED_APPLICATION_SOURCE: &[u8] = b"module bootstrap.image\n\nfrom core.image import Image, Target\n\n@image\npub fn boot() -> Image:\n    return Image(name=, target=Target.aarch64_qemu_virt_uefi)\n";
 const UNFORMATTED_APPLICATION_SOURCE: &[u8] = b"module   bootstrap.image\n";
 const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.toml");
 const CORE_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/image.wr");
 const CORE_OPS_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/ops.wr");
 const CORE_RESULT_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/result.wr");
+const CORE_OPTION_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/option.wr");
+const CORE_PANIC_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/panic.wr");
 const CORE_TIME_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/time.wr");
 const TARGET_MANIFEST: &[u8] =
     include_bytes!("../../../toolchain/targets/aarch64-qemu-virt-uefi/target.toml");
@@ -1613,6 +1612,10 @@ fn install_toolchain_with_frontend(directory: &TestDirectory, frontend_bytes: &[
     directory.write(
         "toolchain/share/wrela/std/wrela-core-0.1/src/result.wr",
         CORE_RESULT_SOURCE,
+        "toolchain/share/wrela/std/wrela-core-0.1/src/option.wr",
+        CORE_OPTION_SOURCE,
+        "toolchain/share/wrela/std/wrela-core-0.1/src/panic.wr",
+        CORE_PANIC_SOURCE,
     );
     directory.write(
         "toolchain/share/wrela/std/wrela-core-0.1/src/time.wr",
@@ -1634,6 +1637,8 @@ fn install_toolchain_with_frontend(directory: &TestDirectory, frontend_bytes: &[
     let standard_library = tree_measurement(&[
         tree_record("wrela-core-0.1/src/image.wr", CORE_SOURCE),
         tree_record("wrela-core-0.1/src/ops.wr", CORE_OPS_SOURCE),
+        tree_record("wrela-core-0.1/src/option.wr", CORE_OPTION_SOURCE),
+        tree_record("wrela-core-0.1/src/panic.wr", CORE_PANIC_SOURCE),
         tree_record("wrela-core-0.1/src/result.wr", CORE_RESULT_SOURCE),
         tree_record("wrela-core-0.1/src/time.wr", CORE_TIME_SOURCE),
         tree_record("wrela-core-0.1/wrela.toml", CORE_MANIFEST),
@@ -1662,6 +1667,8 @@ fn install_toolchain_with_frontend(directory: &TestDirectory, frontend_bytes: &[
                     ("image.wr", CORE_SOURCE),
                     ("ops.wr", CORE_OPS_SOURCE),
                     ("result.wr", CORE_RESULT_SOURCE),
+            ("option.wr", CORE_OPTION_SOURCE),
+            ("panic.wr", CORE_PANIC_SOURCE),
                     ("time.wr", CORE_TIME_SOURCE),
                 ],
             ),

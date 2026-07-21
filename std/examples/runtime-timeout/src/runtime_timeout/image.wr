@@ -6,15 +6,12 @@ from core.image import Image, Target
 pub fn boot() -> Image:
     return Image(name="runtime-timeout", target=Target.aarch64_qemu_virt_uefi)
 
-@test
+@test(runtime)
 fn checked_arithmetic_fatal_times_out():
     maximum: u8 = 255
     one: u8 = 1
     value: u8 = checked_add(left=maximum, right=one)
-    consume_u8(value=value)
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
+    consume_u8(value)
     return
 
 fn checked_add(left: u8, right: u8) -> u8:

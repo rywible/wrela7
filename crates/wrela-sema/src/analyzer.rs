@@ -916,6 +916,7 @@ impl SemanticAnalyzer for CanonicalSemanticAnalyzer {
         let census =
             census_builtin_attributes(request.hir.as_program(), request.limits, is_cancelled)?;
         let mut diagnostics = census.diagnostics;
+        diagnose_deriving_clauses(&request, &mut diagnostics, is_cancelled)?;
         diagnose_unsupported_initializers(&request, &mut diagnostics, is_cancelled)?;
         let (_, interface_diagnostics) = crate::interfaces::collect_interface_model(
             request.hir.as_program(),
@@ -1227,6 +1228,70 @@ fn push_diagnostic(
     Ok(())
 }
 
+fn diagnose_deriving_clauses(
+    request: &AnalysisRequest<'_>,
+    diagnostics: &mut Vec<Diagnostic>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), AnalysisFailure> {
+    for declaration in &request.hir.as_program().declarations {
+        check_cancelled(is_cancelled)?;
+        let deriving = match &declaration.kind {
+            DeclarationKind::Structure(aggregate) => aggregate.deriving.as_slice(),
+            DeclarationKind::Enumeration(enumeration) => enumeration.deriving.as_slice(),
+            _ => continue,
+        };
+        if deriving.is_empty() {
+            continue;
+        }
+        let payload_carriers = match &declaration.kind {
+            DeclarationKind::Structure(aggregate) => aggregate.fields.len(),
+            DeclarationKind::Enumeration(enumeration) => enumeration
+                .variants
+                .iter()
+                .filter(|variant| !variant.fields.is_empty())
+                .count(),
+            _ => 0,
+        };
+        for name in deriving {
+            match name.as_str() {
+                "Eq" | "Format" => {}
+                "From" => {
+                    if payload_carriers != 1 {
+                        let mut diagnostic = Diagnostic::error(
+                            Category::TYPE,
+                            declaration.source,
+                            "`deriving(From)` requires exactly one payload-carrying field or variant",
+                        );
+                        diagnostic.code = Some("semantic-deriving-from-shape".to_owned());
+                        diagnostic.help.push(
+                            "use `deriving(From)` only on a single-field struct or a single-payload enum"
+                                .to_owned(),
+                        );
+                        push_diagnostic(diagnostics, diagnostic, request.limits)?;
+                    }
+                }
+                _ => {
+                    let mut diagnostic = Diagnostic::error(
+                        Category::TYPE,
+                        declaration.source,
+                        format!(
+                            "`deriving({})` is not in the closed compiler-known list `Eq`, `Format`, `From`",
+                            name.as_str()
+                        ),
+                    );
+                    diagnostic.code = Some("semantic-deriving-unknown".to_owned());
+                    diagnostic.help.push(
+                        "spell one of `Eq`, `Format`, or `From`, or remove the deriving clause"
+                            .to_owned(),
+                    );
+                    push_diagnostic(diagnostics, diagnostic, request.limits)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn diagnose_unsupported_initializers(
     request: &AnalysisRequest<'_>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -1238,7 +1303,7 @@ fn diagnose_unsupported_initializers(
             let mut diagnostic = Diagnostic::error(
                 Category::TYPE,
                 declaration.source,
-                "class initializers are not yet executable by semantic analysis",
+                "struct initializers (`init`) are not yet executable by semantic analysis",
             );
             diagnostic.code = Some("semantic-initializer-not-supported".to_owned());
             diagnostic.notes.push(
@@ -1246,7 +1311,7 @@ fn diagnose_unsupported_initializers(
                     .to_owned(),
             );
             diagnostic.help.push(
-                "remove the initializer until class construction semantics are implemented"
+                "remove the `init` declaration until struct construction semantics are implemented"
                     .to_owned(),
             );
             push_diagnostic(diagnostics, diagnostic, request.limits)?;
@@ -1502,9 +1567,10 @@ fn discover_tests(
                 }
             };
         // A plain `fn` test's tier is decided by whether its transitive call
-        // closure is comptime-legal, not by its declared color, so the
-        // requested `--comptime`/`--integration` selection can only be
-        // enforced once that has actually been checked.
+        // closure is comptime-legal (or by an explicit `@test(runtime)` force),
+        // not by its declared color, so the requested `--comptime`/
+        // `--integration` selection can only be enforced once that has
+        // actually been checked.
         let is_comptime_tier = supported.checked_comptime.is_some();
         let tier_selected = match source_selection {
             TestDiscoverySelection::Comptime => is_comptime_tier,
@@ -1790,6 +1856,16 @@ fn discover_tests(
     Ok(())
 }
 
+fn declaration_forces_runtime_tier(declaration: &wrela_hir::Declaration) -> bool {
+    // Lowering admits only bare `@test` or `@test(runtime)`, so a retained
+    // argument on the test attribute is exactly the runtime-tier force.
+    declaration.attributes.iter().any(|attribute| {
+        attribute.identity
+            == wrela_hir::AttributeIdentity::Builtin(wrela_hir::BuiltinAttribute::Test)
+            && !attribute.arguments.is_empty()
+    })
+}
+
 fn source_test_selected(
     request: &AnalysisRequest<'_>,
     declaration: DeclarationId,
@@ -2039,22 +2115,39 @@ fn inspect_source_test(
     // comptime-tier when its transitive call closure happens to be
     // comptime-legal, and a runtime/image test otherwise (an `async fn`
     // test can never be comptime-legal, since comptime forbids async
-    // operations). Try the comptime tier first; a closure-legality failure
-    // here is not itself a hard error on its own -- this test may still be a
-    // perfectly good runtime/image test, so fall through to the runtime
-    // shape check below. An explicit `--comptime` selection, though, is a
-    // request to run *this* test at the comptime tier specifically: if the
-    // runtime shape check *also* rejects the closure, the comptime
-    // checker's own diagnostic is the more specific and correct one to
-    // report (it names the real reason, e.g. a moved-value read or an
-    // unsupported aggregate shape, rather than the runtime checker's
-    // generic "not supported"), so prefer it over the runtime shape
-    // failure below. For every other selection, the runtime shape
-    // checker's own diagnostic remains authoritative -- it is, after all,
-    // testing the runtime tier specifically.
+    // operations). `@test(runtime)` forces the runtime tier even when the
+    // closure would otherwise be comptime-legal. Try the comptime tier
+    // first; a closure-legality failure here is not itself a hard error on
+    // its own -- this test may still be a perfectly good runtime/image
+    // test, so fall through to the runtime shape check below. An explicit
+    // `--comptime` selection, though, is a request to run *this* test at
+    // the comptime tier specifically: if the runtime shape check *also*
+    // rejects the closure, the comptime checker's own diagnostic is the
+    // more specific and correct one to report (it names the real reason,
+    // e.g. a moved-value read or an unsupported aggregate shape, rather
+    // than the runtime checker's generic "not supported"), so prefer it
+    // over the runtime shape failure below. For every other selection, the
+    // runtime shape checker's own diagnostic remains authoritative -- it
+    // is, after all, testing the runtime tier specifically.
     let prefer_comptime_diagnostic = matches!(source_selection, TestDiscoverySelection::Comptime);
+    let force_runtime = declaration_forces_runtime_tier(declaration);
     let mut comptime_failure = None;
-    let checked_comptime = if function.color == FunctionColor::Sync {
+    let checked_comptime = if force_runtime {
+        comptime_failure = Some(test_source_diagnostic(
+            declaration
+                .attributes
+                .iter()
+                .find(|attribute| {
+                    attribute.identity
+                        == wrela_hir::AttributeIdentity::Builtin(wrela_hir::BuiltinAttribute::Test)
+                        && !attribute.arguments.is_empty()
+                })
+                .map_or(declaration.source, |attribute| attribute.source),
+            "semantic-test-runtime-forced",
+            "@test(runtime) forces the runtime/image tier",
+        ));
+        None
+    } else if function.color == FunctionColor::Sync {
         match check_source_comptime_unit_test(
             request.hir.as_ref(),
             request.standard_library_package,
@@ -2816,6 +2909,36 @@ fn inspect_runtime_expression_shape(
             ExpressionKind::Field { base, .. } => {
                 reserve_runtime_shape(&mut pending, 1, limit, "runtime expression scratch")?;
                 pending.push(*base);
+            }
+            ExpressionKind::If {
+                condition,
+                then_branch,
+                elif_branches,
+                else_branch,
+            } => {
+                let additional = elif_branches
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|elif| elif.checked_add(3))
+                    .ok_or({
+                        RuntimeShapeFailure::Failure(AnalysisFailure::ResourceLimit {
+                            resource: "runtime expression scratch",
+                            limit,
+                        })
+                    })?;
+                reserve_runtime_shape(
+                    &mut pending,
+                    additional,
+                    limit,
+                    "runtime expression scratch",
+                )?;
+                pending.push(*else_branch);
+                for (elif_condition, elif_branch) in elif_branches.iter().rev() {
+                    pending.push(*elif_branch);
+                    pending.push(*elif_condition);
+                }
+                pending.push(*then_branch);
+                pending.push(*condition);
             }
             _ => return Err(RuntimeShapeFailure::Unsupported(expression.source)),
         }
@@ -5068,6 +5191,25 @@ fn analyze_runtime_expression(
                 is_cancelled,
             )
         }
+        ExpressionKind::If {
+            condition,
+            then_branch,
+            elif_branches,
+            else_branch,
+        } => analyze_inline_if_expression(
+            request,
+            partial,
+            function,
+            expression_id,
+            expression.source,
+            *condition,
+            *then_branch,
+            elif_branches,
+            *else_branch,
+            expression_request,
+            state,
+            is_cancelled,
+        ),
         _ => Err(AnalysisFailure::RequestMismatch.into()),
     }
 }
@@ -5592,7 +5734,12 @@ fn analyze_scalar_unary(
         wrela_hir::UnaryOperator::Copy => partial
             .types
             .get(operand.ty.0 as usize)
-            .is_some_and(|ty| ty.linearity == Linearity::ExplicitCopy),
+            .is_some_and(|ty| {
+                matches!(
+                    ty.linearity,
+                    Linearity::ExplicitCopy | Linearity::ScalarCopy
+                )
+            }),
         wrela_hir::UnaryOperator::Await
         | wrela_hir::UnaryOperator::Take
         | wrela_hir::UnaryOperator::Comptime => false,
@@ -6432,6 +6579,277 @@ fn aggregate_has_initializer(program: &wrela_hir::Program, declaration: Declarat
     })
 }
 
+fn parameter_is_effectively_positional(
+    parameter: &wrela_hir::Parameter,
+    non_receiver_count: usize,
+) -> bool {
+    if parameter.receiver {
+        return true;
+    }
+    non_receiver_count <= 1 || parameter.positional_only
+}
+
+fn resolve_declaration_owned_argument(
+    request: &AnalysisRequest<'_>,
+    target_parameters: &[FunctionParameter],
+    argument: &wrela_hir::CallArgument,
+    resolved_arguments: &[Option<ResolvedCallArgument>],
+    non_receiver_count: usize,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<usize> {
+    match &argument.name {
+        Some(name) => {
+            let mut found = None;
+            for (index, parameter) in target_parameters.iter().enumerate() {
+                check_cancelled(is_cancelled)?;
+                let hir_parameter = request
+                    .hir
+                    .as_program()
+                    .parameters
+                    .get(parameter.parameter.0 as usize)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                let matches = hir_parameter
+                    .name
+                    .as_ref()
+                    .is_some_and(|parameter_name| parameter_name == name);
+                if matches && found.replace(index).is_some() {
+                    return Err(runtime_diagnostic(
+                        request,
+                        argument.source,
+                        "semantic-argument-duplicate",
+                        "call argument label matches more than one parameter",
+                        None,
+                        "declaration-owned labels require one exact parameter match",
+                        "rename one of the parameters so each label is unique",
+                    ));
+                }
+            }
+            let Some(parameter_index) = found else {
+                return Err(runtime_diagnostic(
+                    request,
+                    argument.source,
+                    "semantic-argument-unknown-label",
+                    "call argument label does not name a declared parameter",
+                    None,
+                    "argument labels are matched exactly against the selected declaration",
+                    "use the parameter's declared name, or omit the label for a positional-only parameter",
+                ));
+            };
+            let hir_parameter = request
+                .hir
+                .as_program()
+                .parameters
+                .get(target_parameters[parameter_index].parameter.0 as usize)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            if parameter_is_effectively_positional(hir_parameter, non_receiver_count) {
+                return Err(runtime_diagnostic(
+                    request,
+                    argument.source,
+                    "semantic-argument-label-forbidden",
+                    "this parameter is positional-only and must not be labeled",
+                    None,
+                    "unary non-receiver parameters and `_` parameters omit their labels at call sites",
+                    "remove the argument label",
+                ));
+            }
+            Ok(parameter_index)
+        }
+        None => {
+            let mut found = None;
+            for (index, parameter) in target_parameters.iter().enumerate() {
+                check_cancelled(is_cancelled)?;
+                if resolved_arguments
+                    .get(index)
+                    .is_some_and(Option::is_some)
+                {
+                    continue;
+                }
+                let hir_parameter = request
+                    .hir
+                    .as_program()
+                    .parameters
+                    .get(parameter.parameter.0 as usize)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                if !parameter_is_effectively_positional(hir_parameter, non_receiver_count) {
+                    continue;
+                }
+                found = Some(index);
+                break;
+            }
+            found.ok_or_else(|| {
+                runtime_diagnostic(
+                    request,
+                    argument.source,
+                    "semantic-argument-label-required",
+                    "this call needs a labeled argument for a remaining parameter",
+                    None,
+                    "multi-parameter declarations require labels unless a parameter is declared with `_`",
+                    "write the parameter label, or declare the parameter positional-only with `_`",
+                )
+            })
+        }
+    }
+}
+
+fn analyze_inline_if_expression(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    expression_id: ExpressionId,
+    source: Span,
+    condition: ExpressionId,
+    then_branch: ExpressionId,
+    elif_branches: &[(ExpressionId, ExpressionId)],
+    else_branch: ExpressionId,
+    expression_request: RuntimeExpressionRequest,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<RuntimeExpression> {
+    let bool_ty = ensure_primitive_type(
+        request,
+        partial,
+        PrimitiveSemanticType::Bool,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    let condition_outcome = analyze_runtime_expression(
+        request,
+        partial,
+        function,
+        condition,
+        RuntimeExpressionRequest {
+            expected: Some(bool_ty),
+            desired_result: None,
+            access: AccessMode::Value,
+        },
+        state,
+        is_cancelled,
+    )?;
+    let then_outcome = analyze_runtime_expression(
+        request,
+        partial,
+        function,
+        then_branch,
+        RuntimeExpressionRequest {
+            expected: expression_request.expected,
+            desired_result: None,
+            access: AccessMode::Value,
+        },
+        state,
+        is_cancelled,
+    )?;
+    let mut effects = condition_outcome.effects;
+    effects.0 |= then_outcome.effects.0;
+    let arm_ty = then_outcome.ty;
+    for (elif_condition, elif_branch) in elif_branches {
+        check_cancelled(is_cancelled)?;
+        let elif_condition_outcome = analyze_runtime_expression(
+            request,
+            partial,
+            function,
+            *elif_condition,
+            RuntimeExpressionRequest {
+                expected: Some(bool_ty),
+                desired_result: None,
+                access: AccessMode::Value,
+            },
+            state,
+            is_cancelled,
+        )?;
+        effects.0 |= elif_condition_outcome.effects.0;
+        let elif_outcome = analyze_runtime_expression(
+            request,
+            partial,
+            function,
+            *elif_branch,
+            RuntimeExpressionRequest {
+                expected: Some(arm_ty),
+                desired_result: None,
+                access: AccessMode::Value,
+            },
+            state,
+            is_cancelled,
+        )?;
+        effects.0 |= elif_outcome.effects.0;
+        if elif_outcome.ty != arm_ty {
+            return Err(runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-if-expression-type",
+                "inline `if` expression arms must agree on one result type",
+                "each branch produces a value of the same type",
+                "change an arm so every branch yields the same type",
+            ));
+        }
+    }
+    let else_outcome = analyze_runtime_expression(
+        request,
+        partial,
+        function,
+        else_branch,
+        RuntimeExpressionRequest {
+            expected: Some(arm_ty),
+            desired_result: None,
+            access: AccessMode::Value,
+        },
+        state,
+        is_cancelled,
+    )?;
+    effects.0 |= else_outcome.effects.0;
+    if else_outcome.ty != arm_ty {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-if-expression-type",
+            "inline `if` expression arms must agree on one result type",
+            "each branch produces a value of the same type",
+            "change an arm so every branch yields the same type",
+        ));
+    }
+    if expression_request
+        .expected
+        .is_some_and(|expected| expected != arm_ty)
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-scalar-type-mismatch",
+            "scalar expression type does not match its required context",
+            "revision 0.1 performs no implicit numeric conversion",
+            "use an explicit checked `as` conversion",
+        ));
+    }
+    let result = expression_result(
+        request,
+        partial,
+        function,
+        (expression_id, source),
+        arm_ty,
+        expression_request.desired_result,
+        is_cancelled,
+    )?;
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: expression_id,
+            ty: arm_ty,
+            result: Some(result),
+            resolution: ExpressionResolution::Value(result),
+            effects,
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    Ok(RuntimeExpression {
+        ty: arm_ty,
+        result: Some(result),
+        referenced: None,
+        effects,
+    })
+}
+
 fn analyze_direct_call(
     request: &AnalysisRequest<'_>,
     partial: &mut PartialAnalysis,
@@ -6505,7 +6923,7 @@ fn analyze_direct_call(
         return Err(runtime_type_diagnostic(
             request,
             call.source,
-            "semantic-class-construction-not-supported",
+            "semantic-struct-construction-not-supported",
             "initializer-based construction is not yet supported by semantic analysis",
             "structs with an `init` member require the dedicated initializer protocol; they cannot use structure field construction",
             "remove the initializer-based construction call until initializer execution is implemented",
@@ -6621,28 +7039,34 @@ fn analyze_direct_call(
     accesses
         .try_reserve_exact(call.arguments.len())
         .map_err(|_| fact_resource(request, "direct-call ownership accesses"))?;
+    let non_receiver_count = {
+        let mut count = 0usize;
+        for parameter in &target_parameters {
+            check_cancelled(is_cancelled)?;
+            let hir_parameter = request
+                .hir
+                .as_program()
+                .parameters
+                .get(parameter.parameter.0 as usize)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            if !hir_parameter.receiver {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| fact_resource(request, "direct-call target parameters"))?;
+            }
+        }
+        count
+    };
     for (source_index, argument) in call.arguments.iter().enumerate() {
         check_cancelled(is_cancelled)?;
-        let parameter_index = match &argument.name {
-            Some(name) => {
-                let mut found = None;
-                for (index, parameter) in target_parameters.iter().enumerate() {
-                    check_cancelled(is_cancelled)?;
-                    let matches = request
-                        .hir
-                        .as_program()
-                        .parameters
-                        .get(parameter.parameter.0 as usize)
-                        .and_then(|parameter| parameter.name.as_ref())
-                        .is_some_and(|parameter_name| parameter_name == name);
-                    if matches && found.replace(index).is_some() {
-                        return Err(AnalysisFailure::RequestMismatch.into());
-                    }
-                }
-                found.ok_or(AnalysisFailure::RequestMismatch)?
-            }
-            None => source_index,
-        };
+        let parameter_index = resolve_declaration_owned_argument(
+            request,
+            &target_parameters,
+            argument,
+            &resolved_arguments,
+            non_receiver_count,
+            is_cancelled,
+        )?;
         let target_parameter = target_parameters
             .get(parameter_index)
             .copied()
@@ -8742,7 +9166,11 @@ fn ensure_flat_structure_type(
             arguments: Vec::new(),
             fields,
         },
-        linearity: Linearity::ExplicitCopy,
+        linearity: if aggregate.copy {
+            Linearity::ScalarCopy
+        } else {
+            Linearity::ExplicitCopy
+        },
         size_upper_bound: Some(size),
         alignment_lower_bound: alignment,
         source: Some(record.source),
@@ -10329,7 +10757,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 } else if self.direct_initializer_struct_callee(*callee)?.is_some() {
                     Err(self.diagnostic(
                         expression.source,
-                        "semantic-class-construction-not-supported",
+                        "semantic-struct-construction-not-supported",
                         "initializer-based construction is not yet supported by semantic analysis",
                     ))
                 } else {
@@ -10530,6 +10958,36 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                     )
                 } else {
                     self.evaluate_comparison(*operator, left, right, expression.source)
+                }
+            }
+            ExpressionKind::If {
+                condition,
+                then_branch,
+                elif_branches,
+                else_branch,
+            } => {
+                let condition =
+                    self.evaluate_expression(*condition, Some(ComptimeType::Bool), depth + 1)?;
+                let ComptimeValue::Boolean(condition) = condition else {
+                    return Err(self.type_mismatch(expression.source));
+                };
+                if condition {
+                    self.evaluate_expression(*then_branch, expected, depth + 1)
+                } else {
+                    for (elif_condition, elif_branch) in elif_branches {
+                        let elif_condition = self.evaluate_expression(
+                            *elif_condition,
+                            Some(ComptimeType::Bool),
+                            depth + 1,
+                        )?;
+                        let ComptimeValue::Boolean(elif_condition) = elif_condition else {
+                            return Err(self.type_mismatch(expression.source));
+                        };
+                        if elif_condition {
+                            return self.evaluate_expression(*elif_branch, expected, depth + 1);
+                        }
+                    }
+                    self.evaluate_expression(*else_branch, expected, depth + 1)
                 }
             }
             ExpressionKind::Literal(_)
@@ -10916,7 +11374,22 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             self.work()?;
             resolved.push(None);
         }
-        for (source_index, argument) in arguments.iter().enumerate() {
+        let mut non_receiver_count = 0usize;
+        for parameter_id in &function.parameters {
+            self.work()?;
+            let parameter = self
+                .program
+                .parameters
+                .get(parameter_id.0 as usize)
+                .filter(|parameter| parameter.id == *parameter_id)
+                .ok_or_else(|| self.unsupported(source))?;
+            if !parameter.receiver {
+                non_receiver_count = non_receiver_count
+                    .checked_add(1)
+                    .ok_or_else(|| self.evaluator_byte_failure())?;
+            }
+        }
+        for argument in arguments.iter() {
             self.work()?;
             let parameter_index = if let Some(argument_name) = &argument.name {
                 let mut selected = None;
@@ -10937,9 +11410,55 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                         }
                     }
                 }
-                selected.ok_or_else(|| self.unsupported(argument.source))?
+                let parameter_index = selected.ok_or_else(|| {
+                    self.diagnostic(
+                        argument.source,
+                        "semantic-argument-unknown-label",
+                        "call argument label does not name a declared parameter",
+                    )
+                })?;
+                let parameter_id = function.parameters[parameter_index];
+                let parameter = self
+                    .program
+                    .parameters
+                    .get(parameter_id.0 as usize)
+                    .ok_or_else(|| self.unsupported(argument.source))?;
+                if parameter_is_effectively_positional(parameter, non_receiver_count) {
+                    return Err(self.diagnostic(
+                        argument.source,
+                        "semantic-argument-label-forbidden",
+                        "this parameter is positional-only and must not be labeled",
+                    ));
+                }
+                parameter_index
             } else {
-                source_index
+                let mut found = None;
+                for (index, parameter_id) in function.parameters.iter().enumerate() {
+                    self.work()?;
+                    if resolved.get(index).is_some_and(Option::is_some) {
+                        continue;
+                    }
+                    let parameter = self
+                        .program
+                        .parameters
+                        .get(parameter_id.0 as usize)
+                        .filter(|parameter| parameter.id == *parameter_id)
+                        .ok_or_else(|| self.unsupported(argument.source))?;
+                    if parameter.receiver
+                        || !parameter_is_effectively_positional(parameter, non_receiver_count)
+                    {
+                        continue;
+                    }
+                    found = Some(index);
+                    break;
+                }
+                found.ok_or_else(|| {
+                    self.diagnostic(
+                        argument.source,
+                        "semantic-argument-label-required",
+                        "this call needs a labeled argument for a remaining parameter",
+                    )
+                })?
             };
             let parameter_id = *function
                 .parameters
@@ -12220,7 +12739,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 Category::ACTOR,
                 source,
                 "semantic-actor-install-shape",
-                "actor installation requires one actor class, at most one image-wired service handle, and one `mailbox` capacity",
+                "actor installation requires one actor struct, at most one image-wired service handle, and one `mailbox` capacity",
             ));
         }
         let class_argument = &arguments[0];
@@ -12240,7 +12759,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 Category::ACTOR,
                 class_argument.source,
                 "semantic-actor-install-class",
-                "the first actor installation argument must name an actor class",
+                "the first actor installation argument must name an actor struct",
             ));
         };
         if class_kind != install_kind {
@@ -12248,7 +12767,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 Category::ACTOR,
                 class_argument.source,
                 "semantic-actor-install-role",
-                "the image installation method does not match the actor class role",
+                "the image installation method does not match the actor struct role",
             ));
         }
         if install_kind == EvaluatedActorKind::Driver {
@@ -12312,7 +12831,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 Category::ACTOR,
                 class_argument.source,
                 "semantic-actor-install-class",
-                "the installed actor class is missing from HIR",
+                "the installed actor struct is missing from HIR",
             )
         })?;
         let dependency = if arguments.len() == 3 {
@@ -12449,7 +12968,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 Category::ACTOR,
                 source,
                 "semantic-actor-instance-ambiguous",
-                "revision 0.1 requires one concrete image instance per actor class in this subset",
+                "revision 0.1 requires one concrete image instance per actor struct in this subset",
             ) {
                 EvaluationFailure::Diagnostic(diagnostic) => diagnostic,
                 EvaluationFailure::Analysis(_) => unreachable!(),
@@ -13493,9 +14012,9 @@ fn inspect_actor_plans(
             return Err(actor_runtime_diagnostic(
                 Category::ACTOR,
                 declaration.source,
-                "semantic-actor-class-shape",
-                "actor class must be public, concrete, and non-generic in this revision 0.1 slice",
-                "remove generic and interface specialization from the installed actor class",
+                "semantic-actor-struct-shape",
+                "actor struct must be public, concrete, and non-generic in this revision 0.1 slice",
+                "remove generic and interface specialization from the installed actor struct",
             ));
         }
         if !class.fields.is_empty() && actor.dependency.is_none() {
@@ -13533,7 +14052,7 @@ fn inspect_actor_plans(
                 Category::ACTOR,
                 declaration.source,
                 "semantic-actor-role",
-                "installed actor class has an ambiguous or mismatched actor role",
+                "installed actor struct has an ambiguous or mismatched actor role",
                 "declare exactly one matching @app or @service attribute without arguments",
             ));
         }
@@ -13551,8 +14070,8 @@ fn inspect_actor_plans(
                     Category::ACTOR,
                     member.source,
                     "semantic-actor-member-kind",
-                    "actor classes in this slice may contain only runtime functions",
-                    "move nested types and protocols outside the actor class",
+                    "actor structs in this slice may contain only runtime functions",
+                    "move nested types and protocols outside the actor struct",
                 ));
             };
             if function.color == FunctionColor::Isr {
@@ -16441,6 +16960,8 @@ pub struct Packet:
                         fields: Vec::new(),
                         members: Vec::new(),
                         linear: false,
+                    copy: false,
+                    deriving: Vec::new(),
                     }),
                     source: span(1, 10, 60),
                 },
@@ -16459,6 +16980,7 @@ pub struct Packet:
                             source: span(1, 80, 110),
                         }],
                         members: Vec::new(),
+                        deriving: Vec::new(),
                     }),
                     source: span(1, 70, 120),
                 },
@@ -16724,6 +17246,7 @@ pub struct Packet:
                 access: AccessMode::Value,
                 ty: Some(u32_ty(span(0, 411, 414))),
                 receiver: false,
+            positional_only: false,
                 source: span(0, 408, 414),
             });
             let DeclarationKind::Function(runtime) = &mut program.declarations[4].kind else {
@@ -17487,6 +18010,7 @@ pub struct Packet:
             access: AccessMode::Mutate,
             ty: Some(u32_type(span(0, 458, 461))),
             receiver: false,
+            positional_only: false,
             source: span(0, 454, 461),
         });
         program.bodies.push(Body {
@@ -17582,6 +18106,7 @@ pub struct Packet:
                 source: span(0, 414, 417),
             }),
             receiver: false,
+            positional_only: false,
             source: span(0, 414, 417),
         });
         let ExpressionKind::Call { arguments, .. } = &mut program.expressions[8].kind else {
@@ -18934,10 +19459,10 @@ fn negative_count_out_of_range():
     fn long_named_comptime_argument_comparison_polls_each_source_byte() {
         let parameter = "parameter".repeat(28);
         let math = format!(
-            "module app.math\n\npub fn identity({parameter}: u32) -> u32:\n    return {parameter}\n"
+            "module app.math\n\npub fn identity({parameter}: u32, unused: u32) -> u32:\n    return {parameter}\n"
         );
         let test_source = format!(
-            "module app.math_test\n\nfrom app.math import identity\n\n@test\nfn named_argument_is_polled():\n    result = identity({parameter}=42)\n    comptime assert result == 42, \"named result\"\n"
+            "module app.math_test\n\nfrom app.math import identity\n\n@test\nfn named_argument_is_polled():\n    result = identity({parameter}=42, unused=0)\n    comptime assert result == 42, \"named result\"\n"
         );
         let fixture = parsed_comptime_fixture(&math, &test_source);
         let changes = no_changes();
@@ -22912,7 +23437,7 @@ fn projection_fixture():
     #[test]
     fn dot_variant_named_argument_resolves_payload_variant() {
         let source = dot_variant_actor_source(
-            "fn accept(value: Lookup):\n    pass\n\nasync fn checkpoint():\n    accept(value=.found(11))\n    pass\n\n",
+            "fn accept(value: Lookup):\n    pass\n\nasync fn checkpoint():\n    accept(.found(11))\n    pass\n\n",
         );
         let fixture = parsed_actor_fixture(&source);
         let changes = no_changes();
@@ -22924,7 +23449,7 @@ fn projection_fixture():
             .expect("dot-variant named argument should analyze");
         assert!(
             output.diagnostics().is_empty(),
-            "named argument `value=.found(11)` must resolve against the parameter type: {:?}",
+            "named argument on multi-parameter identity must resolve: {:?}",
             output.diagnostics()
         );
         assert!(output.successful().is_some());

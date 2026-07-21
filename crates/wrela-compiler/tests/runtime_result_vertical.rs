@@ -52,6 +52,8 @@ const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.t
 const CORE_IMAGE_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
 const CORE_OPS_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/ops.wr");
 const CORE_RESULT_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/result.wr");
+const CORE_OPTION_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/option.wr");
+const CORE_PANIC_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/panic.wr");
 const CORE_TIME_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/time.wr");
 const IMAGE_NAME: &str = "runtime-result";
 const SELECTORS: [(&str, usize); 2] = [
@@ -163,6 +165,8 @@ fn package_identities(
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
                 content_record("ops.wr", CORE_OPS_SOURCE),
+                content_record("option.wr", CORE_OPTION_SOURCE),
+                content_record("panic.wr", CORE_PANIC_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
                 content_record("time.wr", CORE_TIME_SOURCE),
             ],
@@ -718,7 +722,7 @@ fn unwrap_u64_or_zero(value: Result[u64, u64]) -> u64:
 @test
 fn result_u64_match_returns_payload():
     value: Result[u64, u64] = Result.Ok(42)
-    assert unwrap_u64_or_zero(value=value) == 42, "u64 Result payload must survive exhaustive match"
+    assert unwrap_u64_or_zero(value) == 42, "u64 Result payload must survive exhaustive match"
     return
 "#,
     );
@@ -999,7 +1003,6 @@ fn bounded_core_result_rejects_unsupported_specializations_stably() {
     let prefix = r#"module runtime_result.image
 
 from core.image import Image, Target
-from core.result import Result
 
 @image
 pub fn boot() -> Image:
@@ -1055,7 +1058,6 @@ fn bounded_result_try_rejects_unsupported_ownership_stably() {
     let prefix = r#"module runtime_result.image
 
 from core.image import Image, Target
-from core.result import Result
 
 @image
 pub fn boot() -> Image:

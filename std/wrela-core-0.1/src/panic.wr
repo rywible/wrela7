@@ -1,0 +1,4 @@
+module panic
+
+pub fn panic(_ message: str):
+    assert false, "panic"

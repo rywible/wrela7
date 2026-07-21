@@ -1501,7 +1501,12 @@ fn is_flat_runtime_structure(facts: &PartialAnalysis, id: wrela_sema::SemanticTy
     let SemanticTypeKind::Structure { arguments, .. } = &ty.kind else {
         return false;
     };
-    arguments.is_empty() && ty.linearity == Linearity::ExplicitCopy && ty.source.is_some()
+    arguments.is_empty()
+        && matches!(
+            ty.linearity,
+            Linearity::ExplicitCopy | Linearity::ScalarCopy
+        )
+        && ty.source.is_some()
 }
 
 fn validate_flat_runtime_structure(
@@ -3019,6 +3024,8 @@ pub fn boot() -> Image:
                         fields: Vec::new(),
                         members: Vec::new(),
                         linear: false,
+                    copy: false,
+                    deriving: Vec::new(),
                     }),
                     source: span(1, 10, 60),
                 },
@@ -3037,6 +3044,7 @@ pub fn boot() -> Image:
                             source: span(1, 80, 110),
                         }],
                         members: Vec::new(),
+                        deriving: Vec::new(),
                     }),
                     source: span(1, 70, 120),
                 },

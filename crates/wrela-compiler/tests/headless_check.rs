@@ -37,6 +37,8 @@ const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.t
 const CORE_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/image.wr");
 const CORE_OPS_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/ops.wr");
 const CORE_RESULT_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/result.wr");
+const CORE_OPTION_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/option.wr");
+const CORE_PANIC_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/panic.wr");
 const CORE_TIME_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/time.wr");
 const APPLICATION_MANIFEST: &[u8] =
     include_bytes!("../../../std/examples/minimal-image/wrela.toml");
@@ -713,6 +715,8 @@ fn current_core_identity() -> PackageIdentity {
         &[
             ("image.wr", CORE_SOURCE),
             ("ops.wr", CORE_OPS_SOURCE),
+            ("option.wr", CORE_OPTION_SOURCE),
+            ("panic.wr", CORE_PANIC_SOURCE),
             ("result.wr", CORE_RESULT_SOURCE),
             ("time.wr", CORE_TIME_SOURCE),
         ],
@@ -769,6 +773,10 @@ fn install_toolchain(directory: &TestDirectory, frontend_bytes: &[u8]) {
     directory.write(
         "toolchain/share/wrela/std/wrela-core-0.1/src/result.wr",
         CORE_RESULT_SOURCE,
+        "toolchain/share/wrela/std/wrela-core-0.1/src/option.wr",
+        CORE_OPTION_SOURCE,
+        "toolchain/share/wrela/std/wrela-core-0.1/src/panic.wr",
+        CORE_PANIC_SOURCE,
     );
     directory.write(
         "toolchain/share/wrela/std/wrela-core-0.1/src/time.wr",
@@ -791,6 +799,8 @@ fn install_toolchain(directory: &TestDirectory, frontend_bytes: &[u8]) {
     let standard_library = tree_measurement(&[
         tree_record("wrela-core-0.1/src/image.wr", CORE_SOURCE),
         tree_record("wrela-core-0.1/src/ops.wr", CORE_OPS_SOURCE),
+        tree_record("wrela-core-0.1/src/option.wr", CORE_OPTION_SOURCE),
+        tree_record("wrela-core-0.1/src/panic.wr", CORE_PANIC_SOURCE),
         tree_record("wrela-core-0.1/src/result.wr", CORE_RESULT_SOURCE),
         tree_record("wrela-core-0.1/src/time.wr", CORE_TIME_SOURCE),
         tree_record("wrela-core-0.1/wrela.toml", CORE_MANIFEST),

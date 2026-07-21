@@ -6,47 +6,35 @@ from core.image import Image, Target
 pub fn boot() -> Image:
     return Image(name="checked-shift-runtime", target=Target.aarch64_qemu_virt_uefi)
 
-@test
+@test(runtime)
 fn checked_shift_passes():
     left: u8 = 1
     count: u8 = 3
     value: u8 = checked_u8(left=left, count=count)
     assert value == 8, "checked shift must produce the exact target-width result"
-    assert_shift_value(value=value)
-    consume_u8(value=value)
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
+    assert_shift_value(value)
+    consume_u8(value)
     return
 
-@test
+@test(runtime)
 fn runtime_assertion_fails():
     assert false, "intentional runtime assertion failure"
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
     return
 
-@test
+@test(runtime)
 fn checked_shift_result_loss():
     left: u8 = 128
     count: u8 = 1
     value: u8 = checked_u8(left=left, count=count)
-    consume_u8(value=value)
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
+    consume_u8(value)
     return
 
-@test
+@test(runtime)
 fn invalid_shift_count():
     left: u8 = 1
     count: u8 = 8
     value: u8 = checked_u8(left=left, count=count)
-    consume_u8(value=value)
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
+    consume_u8(value)
     return
 
 fn checked_u8(left: u8, count: u8) -> u8:

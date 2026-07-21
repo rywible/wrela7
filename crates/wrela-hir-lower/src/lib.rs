@@ -898,6 +898,7 @@ fn validate_model_resources(
             | ExpressionKind::Index { .. }
             | ExpressionKind::TrySend(_)
             | ExpressionKind::DotName { .. }
+            | ExpressionKind::If { .. }
             | ExpressionKind::Error => {}
         }
     }

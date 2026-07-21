@@ -206,6 +206,35 @@ of overriding it. Tooling displays the inferred ambient lineage at every call
 site. `RequestMetadata` is the separate explicitly copyable bounded diagnostic
 value; it carries no admission authority or region brand.
 
+### 5.1 Service slot resolution
+
+A service in-flight slot obtained from `SlotMap[State, ..N].reserve()` (or an
+equivalent bounded in-flight table) exposes the sealed contract:
+
+```text
+Slot[State].resolve(take receipt: Receipt[P])
+    -> Result[Outcome, E]
+```
+
+where `Outcome` and `E` are determined by the receipt's completion status and
+any service-local conversion. The contract MUST:
+
+1. park the enclosing actor-call reply on the slot before returning from the
+   admitting turn;
+2. end that service turn (it does not suspend across the receipt await);
+3. wire the receipt's exactly-once resolution — `Resolved`, `Recovery`, or a
+   typed failure — to a generated later service turn that fills the slot and
+   resolves the parked reply with ownership-conditioned outcomes identical to
+   chapter 04's actor-call taxonomy; and
+4. reclaim the slot on every normal and abnormal path, including peer failure
+   and abandonment of the completing producer.
+
+The caller's reply therefore outlives the originating service turn without
+violating non-reentrancy: the turn ends, and completion is a separate turn.
+This is the stdlib face of the service slot idiom in
+[Actors and async](04-actors-and-async.md) §13. Implementations that invent a
+second synchronization vocabulary for the same purpose are non-conforming.
+
 ## 6. Time
 
 `Duration` is a nonnegative checked span represented by a target-independent
@@ -318,7 +347,9 @@ and return second-class
 permanently retires a slot rather than wrapping; insertion may return
 `GenerationExhausted`. Image-resident instances receive compile-time IDs;
 runtime construction draws from a bounded ID pool and may return
-`MapIdExhausted` rather than wrapping.
+`MapIdExhausted` rather than wrapping. A service-owned `SlotMap` used as an
+in-flight table exposes `reserve` plus the sealed `Slot.resolve` contract of
+§5.1 so concurrent I/O does not hold the service turn.
 
 ### 9.1 Iteration
 

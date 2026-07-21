@@ -1,5 +1,10 @@
 # Hardware safety
 
+**Implementation status:** largely aspirational — MMIO/DMA/virtio/ISR
+ownership protocols are mostly `gap` in the
+[conformance inventory](conformance-inventory.md). Target ABI models and
+selected interrupt contracts exist; this chapter is not a boot claim.
+
 The reference virtio contracts in this revision target the modern split-ring
 model of OASIS VIRTIO 1.2. Each target package MUST pin the protocol revision it
 implements. Later features are available only when named in that versioned

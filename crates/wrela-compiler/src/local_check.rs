@@ -990,6 +990,8 @@ mod tests {
     const CORE_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/image.wr");
     const CORE_OPS_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/ops.wr");
     const CORE_RESULT_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/result.wr");
+    const CORE_OPTION_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/option.wr");
+    const CORE_PANIC_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/panic.wr");
     const CORE_TIME_SOURCE: &[u8] = include_bytes!("../../../std/wrela-core-0.1/src/time.wr");
     const APPLICATION_MANIFEST: &[u8] =
         include_bytes!("../../../std/examples/minimal-image/wrela.toml");
@@ -1378,6 +1380,8 @@ mod tests {
             &[
                 ("image.wr", CORE_SOURCE),
                 ("ops.wr", CORE_OPS_SOURCE),
+                ("option.wr", CORE_OPTION_SOURCE),
+                ("panic.wr", CORE_PANIC_SOURCE),
                 ("result.wr", CORE_RESULT_SOURCE),
                 ("time.wr", CORE_TIME_SOURCE),
             ],

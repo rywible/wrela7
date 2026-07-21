@@ -68,6 +68,8 @@ const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.t
 const CORE_IMAGE_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
 const CORE_OPS_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/ops.wr");
 const CORE_RESULT_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/result.wr");
+const CORE_OPTION_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/option.wr");
+const CORE_PANIC_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/panic.wr");
 const CORE_TIME_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/time.wr");
 const PASS_SELECTOR: &str = "installed_core_time_executes_in_qemu";
 const FAILURE_SELECTOR: &str = "typed_checked_failure_reaches_qemu";
@@ -112,9 +114,9 @@ fn checked_in_runtime_workspace_is_canonical_and_names_two_exact_source_tests() 
         );
     }
     assert!(APPLICATION_SOURCE.contains("from core.time import as_nanoseconds, ns"));
-    assert!(APPLICATION_SOURCE.contains("as_nanoseconds(value=ns(value=42))"));
-    assert!(APPLICATION_SOURCE.contains("as_nanoseconds(value=ns(value=20) + ns(value=22))"));
-    assert!(APPLICATION_SOURCE.contains("ordered: bool = ns(value=41) < ns(value=42)"));
+    assert!(APPLICATION_SOURCE.contains("as_nanoseconds(ns(42))"));
+    assert!(APPLICATION_SOURCE.contains("as_nanoseconds(ns(20) + ns(22))"));
+    assert!(APPLICATION_SOURCE.contains("ordered: bool = ns(41) < ns(42)"));
     assert!(APPLICATION_SOURCE.contains("value: u8 = left << count"));
 }
 
@@ -222,7 +224,7 @@ fn installed_core_time_source_reaches_real_test_harness_machine_and_native_objec
     let report = flow.report().clone();
     let mut exact_limits = FlowLoweringLimits::standard();
     // `installed_core_time_executes_in_qemu`'s body ends in a bounded `guard:
-    // u32 = 0; while guard < 1: guard += 1` marker (the mechanism that keeps
+    // @test(runtime)` attribute (the mechanism that keeps
     // it out of the comptime tier); its FlowWir lowering reserves one more
     // block than the report's final trimmed count, so the tight bound below
     // needs a `+ 1` fudge a marker-free body would not.
@@ -929,7 +931,7 @@ fn typed_runtime_failure_and_source_diagnostic_remain_exact() {
         .flat_map(|block| &block.instructions)
         .filter_map(|instruction| match &instruction.operation {
             // `typed_checked_failure_reaches_qemu`'s body ends in a bounded
-            // `while guard < 1: guard += 1` marker (the mechanism that keeps
+            // `@test(runtime)` attribute (the mechanism that keeps
             // it out of the comptime tier); its `+= 1` also lowers to a
             // `CheckedInteger::Add` in this same function, which this
             // exercise is not about, so only the shift variant is collected.
@@ -952,7 +954,7 @@ fn typed_runtime_failure_and_source_diagnostic_remain_exact() {
         6
     );
 
-    let invalid_source = APPLICATION_SOURCE.replacen("ns(value=42)", "ns(value=true)", 1);
+    let invalid_source = APPLICATION_SOURCE.replacen("ns(42)", "ns(true)", 1);
     assert_ne!(invalid_source, APPLICATION_SOURCE);
     let invalid = source_fixture(&invalid_source);
     let output = discover(&invalid, PASS_SELECTOR)
@@ -1142,6 +1144,8 @@ fn source_fixture(application_source: &str) -> SourceFixture {
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
                 content_record("ops.wr", CORE_OPS_SOURCE),
+                content_record("option.wr", CORE_OPTION_SOURCE),
+                content_record("panic.wr", CORE_PANIC_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
                 content_record("time.wr", CORE_TIME_SOURCE),
             ],
@@ -1336,6 +1340,8 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity) {
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
                 content_record("ops.wr", CORE_OPS_SOURCE),
+                content_record("option.wr", CORE_OPTION_SOURCE),
+                content_record("panic.wr", CORE_PANIC_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
                 content_record("time.wr", CORE_TIME_SOURCE),
             ],

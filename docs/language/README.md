@@ -42,9 +42,28 @@ request, public effects are visible, and modules and build phases are defined.
 11. [Conformance inventory](conformance-inventory.md) — non-normative,
     chapter-by-chapter implementation, evidence, gap, and exclusion tracking.
 12. [Worked virtio appliance](examples/virtio-storage.wr) — an illustrative,
-    corrected block-driver/filesystem/app slice.
+    corrected block-driver/filesystem/app slice (**aspirational**).
 13. [Design decisions](design-decisions.md) — non-normative reconciliation of
     the source discussions and explicit exclusions.
+
+### Audience paths (one language, two vocabularies)
+
+The language is one. The onboarding path is not.
+
+- **App / service authors** (high-level core): chapters 01, 02, 03 §§1–3
+  (access verbs and copy/linear classes; skip projections/`iso` detail until
+  needed), 04 §§1–4 and the service slot idiom in §13, 07, then the prelude and
+  actor/time contracts in 10. Prefer stdlib virtio and `BlockDevice`-style
+  service APIs; MMIO, ISR, and descriptor rings should not appear in ordinary
+  app code.
+- **Driver authors** (robust edge): the app path plus chapter 05, 04
+  §§13–14 (receipts, `@receipt_handoff`, poll/IRQ), and 06 (image binding,
+  capabilities). Write custom drivers when the stdlib does not cover the
+  device; still consume sealed ring/DMA contracts rather than freestanding
+  fences.
+
+Check the [conformance inventory](conformance-inventory.md) before assuming a
+chapter is executable in the reference toolchain.
 
 ## Authority and notation
 

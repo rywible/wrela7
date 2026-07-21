@@ -64,13 +64,13 @@ pub fn nanoseconds(value: u64) -> RuntimeDurationRepresentation:
     return RuntimeDurationRepresentation(nanoseconds=value)
 
 pub fn microseconds(value: u64) -> RuntimeDurationRepresentation:
-    return nanoseconds(value=value * 1000)
+    return nanoseconds(value * 1000)
 
 pub fn milliseconds(value: u64) -> RuntimeDurationRepresentation:
-    return nanoseconds(value=value * 1000000)
+    return nanoseconds(value * 1000000)
 
 pub fn seconds(value: u64) -> RuntimeDurationRepresentation:
-    return nanoseconds(value=value * 1000000000)
+    return nanoseconds(value * 1000000000)
 
 pub fn copied(value: RuntimeDurationRepresentation) -> RuntimeDurationRepresentation:
     return copy value
@@ -83,20 +83,14 @@ const TEST_SOURCE: &str = r#"module app.duration_test
 
 from app.duration import as_nanoseconds, copied, microseconds, milliseconds, nanoseconds, seconds
 
-@test
+@test(runtime)
 fn imported_duration_constructors_reach_flow():
-    nanos: u64 = as_nanoseconds(value=nanoseconds(value=42))
-    copied_nanos: u64 = as_nanoseconds(value=copied(value=nanoseconds(value=42)))
-    micros: u64 = as_nanoseconds(value=microseconds(value=42))
-    millis: u64 = as_nanoseconds(value=milliseconds(value=42))
-    secs: u64 = as_nanoseconds(value=seconds(value=42))
-    # A bounded `while` is outside the comptime evaluator's supported
-    # subset, so this keeps the test in the runtime/image tier
-    # deterministically (every function is otherwise phase-neutral and
-    # would be comptime-legal on its own).
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
+    nanos: u64 = as_nanoseconds(nanoseconds(42))
+    copied_nanos: u64 = as_nanoseconds(copied(nanoseconds(42)))
+    micros: u64 = as_nanoseconds(microseconds(42))
+    millis: u64 = as_nanoseconds(milliseconds(42))
+    secs: u64 = as_nanoseconds(seconds(42))
+    # `@test(runtime)` keeps this in the runtime/image tier.
     return
 "#;
 
@@ -124,14 +118,14 @@ const LOCAL_RESULT_TEST_SOURCE: &str = r#"module app.duration_test
 
 from app.duration import err, ok, unwrap_or_zero
 
-@test
+@test(runtime)
 fn result_ok_match_returns_payload():
-    value: u8 = unwrap_or_zero(value=ok(value=42))
+    value: u8 = unwrap_or_zero(ok(42))
     return
 
-@test
+@test(runtime)
 fn result_err_match_returns_payload():
-    value: u8 = unwrap_or_zero(value=err(value=7))
+    value: u8 = unwrap_or_zero(err(7))
     return
 "#;
 
@@ -158,16 +152,10 @@ const WIDE_STRUCTURE_TEST_SOURCE: &str = r#"module app.duration_test
 
 from app.duration import last, make
 
-@test
+@test(runtime)
 fn imported_late_field_is_bounded():
-    value: u64 = last(value=make(a=1, b=2, c=3, d=4, e=5, f=6, g=7, h=8))
-    # A bounded `while` is outside the comptime evaluator's supported
-    # subset, so this keeps the test in the runtime/image tier
-    # deterministically (every function is otherwise phase-neutral and
-    # would be comptime-legal on its own).
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
+    value: u64 = last(make(a=1, b=2, c=3, d=4, e=5, f=6, g=7, h=8))
+    # `@test(runtime)` keeps this in the runtime/image tier.
     return
 "#;
 
@@ -832,16 +820,16 @@ fn local_result_constructor_and_exhaustive_match_reach_machine_switch() {
 fn structure_lowering_honors_exact_operation_bounds_and_late_cancellation() {
     let fixture = fixture(DURATION_SOURCE, TEST_SOURCE);
     let mut exact_lookup_limits = AnalysisLimits::standard();
-    exact_lookup_limits.runtime_aggregate_lookup_work = 147;
+    exact_lookup_limits.runtime_aggregate_lookup_work = 126;
     let exact_lookup = compile(&fixture, exact_lookup_limits, &never_cancelled)
         .expect("exact runtime aggregate lookup-work bound");
     assert!(exact_lookup.diagnostics().is_empty());
-    exact_lookup_limits.runtime_aggregate_lookup_work = 146;
+    exact_lookup_limits.runtime_aggregate_lookup_work = 125;
     assert!(matches!(
         compile(&fixture, exact_lookup_limits, &never_cancelled),
         Err(AnalysisFailure::ResourceLimit {
             resource: "runtime type and aggregate lookup work",
-            limit: 146,
+            limit: 125,
         })
     ));
 
@@ -977,7 +965,7 @@ fn late_named_field_lookup_has_an_exact_global_work_bound() {
     let fixture = fixture(WIDE_STRUCTURE_SOURCE, WIDE_STRUCTURE_TEST_SOURCE);
     let mut limits = AnalysisLimits::standard();
     // The field-name component is 8 * 8 + 8 = 72 comparisons. Including all
-    // type interning and nominal lookup scans, plus the bounded-while tier
+    // type interning and nominal lookup scans
     // guard's own scalar local, makes the exact global work bound below.
     limits.runtime_aggregate_lookup_work = 173;
     let exact = compile(&fixture, limits, &never_cancelled)
@@ -1025,12 +1013,9 @@ pub fn malformed(value: u64) -> Pair:
 "#,
             r#"module app.duration_test
 from app.duration import malformed
-@test
+@test(runtime)
 fn malformed_constructor():
-    malformed(value=1)
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
+    malformed(1)
     return
 "#,
             "semantic-runtime-constructor-argument",
@@ -1046,12 +1031,9 @@ pub fn unsupported(value: u64) -> Outer:
 "#,
             r#"module app.duration_test
 from app.duration import unsupported
-@test
+@test(runtime)
 fn nested_structure():
-    unsupported(value=1)
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
+    unsupported(1)
     return
 "#,
             "semantic-runtime-aggregate-not-supported",
@@ -1065,13 +1047,10 @@ pub fn make(value: u64) -> Secret:
 "#,
             r#"module app.duration_test
 from app.duration import Secret, make
-@test
+@test(runtime)
 fn private_projection():
-    secret: Secret = make(value=1)
-    consume(value=secret.value)
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
+    secret: Secret = make(1)
+    consume(secret.value)
     return
 fn consume(value: u64):
     return
@@ -1087,13 +1066,10 @@ pub fn make(value: u64) -> Flat:
 "#,
             r#"module app.duration_test
 from app.duration import Flat, make
-@test
+@test(runtime)
 fn implicit_copy():
-    first: Flat = make(value=1)
+    first: Flat = make(1)
     second: Flat = first
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
     return
 "#,
             "semantic-explicit-copy-required",
@@ -1109,12 +1085,9 @@ pub fn wrong_nominal(value: u64) -> First:
 "#,
             r#"module app.duration_test
 from app.duration import wrong_nominal
-@test
+@test(runtime)
 fn nominal_substitution():
-    wrong_nominal(value=1)
-    guard: u32 = 0
-    while guard < 1:
-        guard += 1
+    wrong_nominal(1)
     return
 "#,
             "semantic-constructor-result-type",
@@ -1141,4 +1114,116 @@ fn nominal_substitution():
             output.diagnostics()
         );
     }
+}
+
+#[test]
+fn copy_struct_permits_implicit_duplication() {
+    let fixture = fixture(
+        r#"module app.duration
+pub copy struct Point:
+    pub value: u64
+pub fn make(value: u64) -> Point:
+    return Point(value=value)
+"#,
+        r#"module app.duration_test
+from app.duration import Point, make
+@test(runtime)
+fn copy_struct_implicit_copy():
+    first: Point = make(1)
+    second: Point = first
+    return
+"#,
+    );
+    let output = compile(&fixture, AnalysisLimits::standard(), &never_cancelled)
+        .expect("copy struct implicit duplication analyzes");
+    assert!(
+        output.diagnostics().is_empty(),
+        "{:?}",
+        output.diagnostics()
+    );
+    assert!(output.successful().is_some());
+}
+
+#[test]
+fn inline_if_expression_analyzes() {
+    let fixture = fixture(
+        r#"module app.duration
+pub fn pick(flag: bool) -> u64:
+    return if flag: 1 else: 0
+"#,
+        r#"module app.duration_test
+from app.duration import pick
+@test(runtime)
+fn inline_if_value():
+    chosen: u64 = pick(true)
+    return
+"#,
+    );
+    assert!(
+        fixture.discovery_diagnostics.is_empty(),
+        "{:?}",
+        fixture.discovery_diagnostics
+    );
+    let output = compile(&fixture, AnalysisLimits::standard(), &never_cancelled)
+        .expect("inline if expression analyzes");
+    assert!(
+        output.diagnostics().is_empty(),
+        "{:?}",
+        output.diagnostics()
+    );
+    assert!(output.successful().is_some());
+}
+
+#[test]
+fn deriving_unknown_name_is_rejected() {
+    let fixture = fixture(
+        r#"module app.duration
+pub struct Point deriving(Clone):
+    pub value: u64
+pub fn make(value: u64) -> Point:
+    return Point(value=value)
+"#,
+        r#"module app.duration_test
+from app.duration import Point, make
+@test(runtime)
+fn unused():
+    point: Point = make(1)
+    return
+"#,
+    );
+    assert!(
+        fixture
+            .discovery_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some("semantic-deriving-unknown")),
+        "{:?}",
+        fixture.discovery_diagnostics
+    );
+}
+
+#[test]
+fn deriving_eq_is_accepted() {
+    let fixture = fixture(
+        r#"module app.duration
+pub struct Point deriving(Eq):
+    pub value: u64
+pub fn make(value: u64) -> Point:
+    return Point(value=value)
+"#,
+        r#"module app.duration_test
+from app.duration import Point, make
+@test(runtime)
+fn deriving_eq_parses():
+    first: Point = make(1)
+    return
+"#,
+    );
+    let output = compile(&fixture, AnalysisLimits::standard(), &never_cancelled)
+        .expect("deriving Eq analyzes");
+    assert!(
+        output.diagnostics().is_empty(),
+        "{:?}",
+        output.diagnostics()
+    );
+    assert!(output.successful().is_some());
 }

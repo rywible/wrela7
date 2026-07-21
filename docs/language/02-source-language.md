@@ -646,13 +646,19 @@ hand-written `impl`.
 Every parameter has one access mode:
 
 ```wrela
-fn inspect(_ packet: Packet):             # read is the default; `_` makes it positional-only
+fn inspect(packet: Packet):             # sole non-receiver param: positional by default
     ...
 
-fn fill(mut buffer: Bytes):             # exclusive in-place mutation; label-required
+fn fill(mut buffer: Bytes):             # exclusive in-place mutation; sole param → positional
     ...
 
-fn enqueue(take packet: iso[NetPackets] Packet):  # ownership transfer; label-required
+fn enqueue(take packet: iso[NetPackets] Packet):  # sole param → positional; take still mirrored
+    ...
+
+fn submit(queue: u32, take payload: Packet):  # 2+ non-receiver params: label-required
+    ...
+
+fn hash_pair(_ a: u64, _ b: u64) -> u64:  # `_` forces positional on a multi-param API
     ...
 ```
 
@@ -663,28 +669,28 @@ A receiver, when present, is the first parameter and appears exactly once. It is
 legal only in a declaration nested in a nominal type or its `impl`; module
 functions and receiver-free associated functions have no implicit receiver.
 
-A parameter is label-required at its call sites by default. Writing `_`
-before the parameter name in its declaration — as with `packet` above —
+A parameter is label-required at its call sites by default when the declaration
+has two or more non-receiver parameters. Writing `_` before the parameter name
 declares it positional-only instead, and the call must then omit the label.
-Writing a label on a positional-only parameter, or omitting the label on a
-label-required parameter, is a compile error, so exactly one spelling is
-legal per call site. Receiver `self` is never labeled and `_` does not apply
-to it. A parameter may be supplied exactly once; labels/positions are
-resolved against the selected declaration before evaluation, and revision 0.1
-has no variadic or runtime keyword-argument collection. Struct constructor
-fields already followed this named-required rule (subject to the one-field
-positional exception) and are unaffected. Named arguments affect binding
-only, never source evaluation order.
+**Unary rule:** when a declaration has exactly one non-receiver parameter, that
+parameter is positional-only by default (as if `_` were written); writing `_`
+explicitly is legal and redundant. Writing a label on a positional-only
+parameter, or omitting the label on a label-required parameter, is a compile
+error, so exactly one spelling is legal per call site. Receiver `self` is never
+labeled and `_` does not apply to it. A parameter may be supplied exactly once;
+labels/positions are resolved against the selected declaration before
+evaluation, and revision 0.1 has no variadic or runtime keyword-argument
+collection. Struct constructor fields already followed this named-required rule
+(subject to the one-field positional exception) and are unaffected. Named
+arguments affect binding only, never source evaluation order.
 
 Non-receiver `mut` and `take` effects MUST be mirrored at the call site:
 
 ```wrela
 inspect(packet)
-fill(buffer=mut buffer)
-enqueue(packet=take packet)
-
-# Named arguments place the effect after `=`.
-driver.submit(queue=0, payload=take packet)
+fill(mut buffer)
+enqueue(take packet)
+submit(queue=0, payload=take packet)
 fs.read_file(ino=7, out=mut output)
 ```
 
@@ -1442,7 +1448,10 @@ arguments        = argument, { ",", argument }, [ "," ] ;
 argument         = [ IDENT, "=" ],
                    ( ( "mut" | "take" ), place_expression | expression ) ;
                    (* IDENT "=" is required or forbidden per the matching
-                      parameter's own "_" marking; see §4 *)
+                      parameter's label rule: label-required when the
+                      declaration has two or more non-receiver parameters
+                      (unless `_`), unary non-receiver positional by default;
+                      see §4 *)
 qualified_name   = IDENT, { ".", IDENT } ;
 
 expression       = if_expression | closure_expression | or_expression ;

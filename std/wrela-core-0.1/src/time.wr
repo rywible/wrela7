@@ -9,43 +9,43 @@ pub fn ns(value: u64) -> Duration:
     return Duration(nanoseconds=value)
 
 pub fn us(value: u64) -> Duration:
-    return ns(value=value * 1000)
+    return ns(value * 1000)
 
 pub fn ms(value: u64) -> Duration:
-    return ns(value=value * 1000000)
+    return ns(value * 1000000)
 
 pub fn seconds(value: u64) -> Duration:
-    return ns(value=value * 1000000000)
+    return ns(value * 1000000000)
 
 pub fn minutes(value: u64) -> Duration:
-    return ns(value=value * 60000000000)
+    return ns(value * 60000000000)
 
 pub fn hours(value: u64) -> Duration:
-    return ns(value=value * 3600000000000)
+    return ns(value * 3600000000000)
 
 pub fn days(value: u64) -> Duration:
-    return ns(value=value * 86400000000000)
+    return ns(value * 86400000000000)
 
 pub fn weeks(value: u64) -> Duration:
-    return ns(value=value * 604800000000000)
+    return ns(value * 604800000000000)
 
 pub fn as_nanoseconds(value: Duration) -> u64:
     return value.nanoseconds
 
 impl Add for Duration:
     fn add(read self, right: Duration) -> Duration:
-        return ns(value=self.nanoseconds + right.nanoseconds)
+        return ns(self.nanoseconds + right.nanoseconds)
 
 impl Sub for Duration:
     fn subtract(read self, right: Duration) -> Duration:
-        return ns(value=self.nanoseconds - right.nanoseconds)
+        return ns(self.nanoseconds - right.nanoseconds)
 
 impl Ord for Duration:
     fn less_than(read self, right: Duration) -> bool:
         return self.nanoseconds < right.nanoseconds
 
 pub fn scale(value: Duration, factor: u64) -> Duration:
-    return ns(value=value.nanoseconds * factor)
+    return ns(value.nanoseconds * factor)
 
 pub fn min(left: Duration, right: Duration) -> Duration:
     selected: Duration = copy right

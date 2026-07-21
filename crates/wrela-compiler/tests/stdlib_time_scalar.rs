@@ -59,6 +59,8 @@ const CORE_MANIFEST: &[u8] = include_bytes!("../../../std/wrela-core-0.1/wrela.t
 const CORE_IMAGE_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
 const CORE_OPS_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/ops.wr");
 const CORE_RESULT_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/result.wr");
+const CORE_OPTION_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/option.wr");
+const CORE_PANIC_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/panic.wr");
 const CORE_TIME_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/time.wr");
 const OVER_BOUND_TEST_SOURCE: &str = r#"module conformance.duration_scalar_test
 
@@ -167,8 +169,8 @@ fn checked_in_time_scalar_workspace_is_canonical_and_exact_bounds_pass() {
 
     let workspace = load_checked_in_workspace();
     assert_eq!(workspace.graph().packages().len(), 2);
-    assert_eq!(workspace.graph().modules().len(), 6);
-    assert_eq!(workspace.sources().len(), 6);
+    assert_eq!(workspace.graph().modules().len(), 8);
+    assert_eq!(workspace.sources().len(), 8);
     // The manifest declares no `[[module]]` block: modules are derived from
     // a source-root walk. Confirm the loader derived exactly the two root
     // package modules the checked-in sources provide.
@@ -560,13 +562,13 @@ fn installed_duration_arithmetic_has_exact_resources_and_cancellation() {
     // `std/wrela-core-0.1/src/time.wr`. The evaluator-bytes boundary is
     // unaffected (structure/argument byte accounting does not change).
     for (steps, expected) in [
-        (1109, TestOutcome::Passed),
+        (1040, TestOutcome::Passed),
         (
-            1108,
+            1039,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "comptime test exceeded comptime evaluator steps limit 1108 [source {}]",
+                    "comptime test exceeded comptime evaluator steps limit 1039 [source {}]",
                     source_span_nth(0, PASSING_TEST_SOURCE, b"42", 1),
                 ),
             },
@@ -586,16 +588,16 @@ fn installed_duration_arithmetic_has_exact_resources_and_cancellation() {
                 phase: FailurePhase::Comptime,
                 message: format!(
                     "comptime test exceeded comptime evaluator bytes limit 831 [source {}; comptime calls <- {} <- {}]",
-                    source_span_nth(5, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 0,),
+                    source_span_nth(7, CORE_TIME_SOURCE, b"Duration(nanoseconds=value)", 0,),
                     source_span(
-                        5,
+                        7,
                         CORE_TIME_SOURCE,
-                        b"ns(value=self.nanoseconds + right.nanoseconds)"
+                        b"ns(self.nanoseconds + right.nanoseconds)"
                     ),
                     source_span(
                         0,
                         PASSING_TEST_SOURCE,
-                        b"scale(value=ns(value=20), factor=2) + ns(value=2)",
+                        b"scale(value=ns(20), factor=2) + ns(2)",
                     ),
                 ),
             },
@@ -728,13 +730,13 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
     // old dual-twin core (was 2793/2792). The evaluator-bytes boundary is
     // unaffected.
     for (steps, expected) in [
-        (2804, TestOutcome::Passed),
+        (2686, TestOutcome::Passed),
         (
-            2803,
+            2685,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "comptime test exceeded comptime evaluator steps limit 2803 [source {}]",
+                    "comptime test exceeded comptime evaluator steps limit 2685 [source {}]",
                     source_span_nth(0, PASSING_TEST_SOURCE, b"22", 0),
                 ),
             },
@@ -756,12 +758,12 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
                 phase: FailurePhase::Comptime,
                 message: format!(
                     "comptime test exceeded comptime evaluator bytes limit 1311 [source {}; comptime calls <- {} <- {}]",
-                    source_span_nth(5, CORE_TIME_SOURCE, b"self", 5),
-                    source_span(5, CORE_TIME_SOURCE, b"selected < lower"),
+                    source_span_nth(7, CORE_TIME_SOURCE, b"self", 5),
+                    source_span(7, CORE_TIME_SOURCE, b"selected < lower"),
                     source_span_nth(
                         0,
                         PASSING_TEST_SOURCE,
-                        b"clamp(value=ns(value=84), lower=ns(value=20), upper=ns(value=42))",
+                        b"clamp(value=ns(84), lower=ns(20), upper=ns(42))",
                         1,
                     ),
                 ),
@@ -794,11 +796,11 @@ fn installed_duration_subtraction_and_clamp_have_exact_resources_and_cancellatio
     let over_depth =
         loaded_source_fixture(load_checked_in_workspace(), root_identity, over_profile);
     let helper_call = source_span(
-        5,
+        7,
         CORE_TIME_SOURCE,
-        b"ns(value=self.nanoseconds - right.nanoseconds)",
+        b"ns(self.nanoseconds - right.nanoseconds)",
     );
-    let outer_call = source_span(0, PASSING_TEST_SOURCE, b"ns(value=42) - ns(value=42)");
+    let outer_call = source_span(0, PASSING_TEST_SOURCE, b"ns(42) - ns(42)");
     assert_eq!(
         subtraction_outcome(&over_depth, AnalysisLimits::standard(), &never_cancelled)
             .expect("over-depth installed duration subtraction"),
@@ -847,13 +849,13 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
     // (called via the raw `<`/`<=`/`>`/`>=` operators rather than the
     // deleted free-function comparison helpers).
     for (steps, expected) in [
-        (2153, TestOutcome::Passed),
+        (2120, TestOutcome::Passed),
         (
-            2152,
+            2119,
             TestOutcome::Failed {
                 phase: FailurePhase::Comptime,
                 message: format!(
-                    "comptime test exceeded comptime evaluator steps limit 2152 [source {}]",
+                    "comptime test exceeded comptime evaluator steps limit 2119 [source {}]",
                     source_span_nth(0, PASSING_TEST_SOURCE, b"42", 6),
                 ),
             },
@@ -877,8 +879,8 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
                 phase: FailurePhase::Comptime,
                 message: format!(
                     "comptime test exceeded comptime evaluator bytes limit 1631 [source {}; comptime calls <- {} <- {}]",
-                    source_span_nth(5, CORE_TIME_SOURCE, b"self", 5),
-                    source_span(5, CORE_TIME_SOURCE, b"left < right"),
+                    source_span_nth(7, CORE_TIME_SOURCE, b"self", 5),
+                    source_span(7, CORE_TIME_SOURCE, b"left < right"),
                     source_span(0, PASSING_TEST_SOURCE, b"max(left=zero, right=forty_two)"),
                 ),
             },
@@ -914,7 +916,7 @@ fn installed_duration_ordering_has_exact_resources_depth_and_cancellation() {
     // `min`'s own `if left <= right:` comparison (routed through the `<=`
     // operator) is now the depth-exceeding frame directly, rather than a
     // deleted `less_than` helper or a subsequent `ns` constructor call.
-    let helper_call = source_span(5, CORE_TIME_SOURCE, b"left <= right");
+    let helper_call = source_span(7, CORE_TIME_SOURCE, b"left <= right");
     let outer_call = source_span(
         0,
         PASSING_TEST_SOURCE,
@@ -1115,7 +1117,7 @@ fn installed_runtime_duration_functions_reach_canonical_machine_and_native_objec
     // `add`/`subtract` are likewise now separate `impl Add`/`impl Sub`
     // functions with exactly one checked binary op each in their own
     // bodies (was 2/2 when arithmetic was still partly inlined).
-    // `min`/`max`/`clamp` no longer end with a `ns(value=selected)` call,
+    // `min`/`max`/`clamp` no longer end with a `ns(selected)` call,
     // so `projects` drops to the sum of the leaf field-accessing bodies
     // (`as_nanoseconds`:1, `add`:2, `subtract`:2, `less_than`:2, `scale`:1 =
     // 8), while `copies` rises to the sum of `min`'s 2, `max`'s 2, and
@@ -1421,7 +1423,7 @@ fn expected_runtime_call_edges() -> Vec<(String, String)> {
     ] {
         push(TEST, callee, 1);
     }
-    // `min`/`max`/`clamp` no longer end with `return ns(value=selected)` --
+    // `min`/`max`/`clamp` no longer end with `return ns(selected)` --
     // they return the branch-joined `selected: Duration` local directly, so
     // they no longer call `ns` at all. Their `<`/`<=` comparisons instead
     // call `less_than` directly: once each for `min`'s `left <= right` and
@@ -1501,6 +1503,8 @@ fn canonical_workspace() -> (wrela_package::PackageManifest, PackageIdentity) {
             &[
                 content_record("image.wr", CORE_IMAGE_SOURCE),
                 content_record("ops.wr", CORE_OPS_SOURCE),
+                content_record("option.wr", CORE_OPTION_SOURCE),
+                content_record("panic.wr", CORE_PANIC_SOURCE),
                 content_record("result.wr", CORE_RESULT_SOURCE),
                 content_record("time.wr", CORE_TIME_SOURCE),
             ],
@@ -1791,6 +1795,8 @@ fn load_checked_in_workspace() -> LoadedWorkspace {
         vec![
             source_input("image.wr", CORE_IMAGE_SOURCE),
             source_input("ops.wr", CORE_OPS_SOURCE),
+            source_input("option.wr", CORE_OPTION_SOURCE),
+            source_input("panic.wr", CORE_PANIC_SOURCE),
             source_input("result.wr", CORE_RESULT_SOURCE),
             source_input("time.wr", CORE_TIME_SOURCE),
         ],

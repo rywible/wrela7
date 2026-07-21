@@ -1770,8 +1770,10 @@ fn validate_supported_source_type(
             arguments,
             fields,
         } => {
-            ty.linearity == sema::Linearity::ExplicitCopy
-                && ty.source.is_some()
+            matches!(
+                ty.linearity,
+                sema::Linearity::ExplicitCopy | sema::Linearity::ScalarCopy
+            ) && ty.source.is_some()
                 && declaration.0 < facts.hir.declarations
                 && arguments.is_empty()
                 && fields.iter().all(|field| {
@@ -4404,6 +4406,7 @@ enum SourceExpressionPlan {
     Binary(ScalarBinaryInput),
     Convert(ScalarConvertInput),
     ResultTry(ResultTryInput),
+    InlineIf(InlineIfInput),
     Await {
         expression: wrela_hir::ExpressionId,
         operand: wrela_hir::ExpressionId,
@@ -4411,6 +4414,17 @@ enum SourceExpressionPlan {
         result: sema::ValueId,
         effects: sema::EffectSet,
     },
+}
+
+struct InlineIfInput {
+    expression: wrela_hir::ExpressionId,
+    condition: wrela_hir::ExpressionId,
+    then_branch: wrela_hir::ExpressionId,
+    elif_branches: Vec<(wrela_hir::ExpressionId, wrela_hir::ExpressionId)>,
+    else_branch: wrela_hir::ExpressionId,
+    ty: sema::SemanticTypeId,
+    result: sema::ValueId,
+    effects: sema::EffectSet,
 }
 
 struct SourceFunctionLowerer<'a> {
@@ -5890,6 +5904,32 @@ impl SourceFunctionLowerer<'_> {
                         .ok_or_else(|| self.fact_mismatch("await result"))?,
                     effects: fact.effects,
                 },
+                (
+                    wrela_hir::ExpressionKind::If {
+                        condition,
+                        then_branch,
+                        elif_branches,
+                        else_branch,
+                    },
+                    sema::ExpressionResolution::Value(value),
+                ) if fact.result == Some(*value) => {
+                    let mut copied_elifs = try_vec(
+                        elif_branches.len(),
+                        "inline if elif branches",
+                        self.limits.model_edges,
+                    )?;
+                    copied_elifs.extend_from_slice(elif_branches);
+                    SourceExpressionPlan::InlineIf(InlineIfInput {
+                        expression: expression_id,
+                        condition: *condition,
+                        then_branch: *then_branch,
+                        elif_branches: copied_elifs,
+                        else_branch: *else_branch,
+                        ty: fact.ty,
+                        result: *value,
+                        effects: fact.effects,
+                    })
+                }
                 _ => {
                     return Err(unsupported(
                         "ordinary source expressions outside scalar bodies",
@@ -6064,6 +6104,9 @@ impl SourceFunctionLowerer<'_> {
             }
             SourceExpressionPlan::ResultTry(result_try) => {
                 self.lower_result_try(result_try, statements)
+            }
+            SourceExpressionPlan::InlineIf(inline_if) => {
+                self.lower_inline_if(inline_if, source, statements)
             }
             SourceExpressionPlan::Await {
                 expression,
@@ -6310,7 +6353,12 @@ impl SourceFunctionLowerer<'_> {
                 .facts()
                 .types
                 .get(unary.ty.0 as usize)
-                .is_some_and(|ty| ty.linearity == sema::Linearity::ExplicitCopy)
+                .is_some_and(|ty| {
+                    matches!(
+                        ty.linearity,
+                        sema::Linearity::ExplicitCopy | sema::Linearity::ScalarCopy
+                    )
+                })
             {
                 return Err(self.fact_mismatch("explicit-copy unary type"));
             }
@@ -6628,6 +6676,87 @@ impl SourceFunctionLowerer<'_> {
                 arms,
                 results: one_value_vec(result, self.limits.model_edges)?,
                 source: Some(result_try.source),
+            },
+        )?;
+        Ok(LoweredExpression::Value(result))
+    }
+
+    fn lower_inline_if(
+        &mut self,
+        inline_if: InlineIfInput,
+        source: Span,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<LoweredExpression, LowerError> {
+        if !inline_if.elif_branches.is_empty() {
+            return Err(unsupported(
+                "inline `if` elif chains in ordinary source lowering",
+            ));
+        }
+        let result = self.lowered_expression_result(
+            inline_if.expression,
+            inline_if.result,
+            inline_if.ty,
+            source,
+        )?;
+        let condition_fact = self.expression_fact(inline_if.condition)?;
+        let then_fact = self.expression_fact(inline_if.then_branch)?;
+        let else_fact = self.expression_fact(inline_if.else_branch)?;
+        let mut expected_effects = condition_fact.effects;
+        expected_effects.0 |= then_fact.effects.0;
+        expected_effects.0 |= else_fact.effects.0;
+        if then_fact.ty != inline_if.ty
+            || else_fact.ty != inline_if.ty
+            || expected_effects.0 != inline_if.effects.0
+        {
+            return Err(self.fact_mismatch("inline if arm types or effects"));
+        }
+        let LoweredExpression::Value(condition) =
+            self.lower_expression(inline_if.condition, sema::AccessMode::Value, statements)?
+        else {
+            return Err(self.fact_mismatch("inline if condition value"));
+        };
+        let mut then_statements =
+            try_vec(2, "inline if then region", self.limits.model_edges)?;
+        let LoweredExpression::Value(then_value) = self.lower_expression(
+            inline_if.then_branch,
+            sema::AccessMode::Value,
+            &mut then_statements,
+        )?
+        else {
+            return Err(self.fact_mismatch("inline if then value"));
+        };
+        self.push_statement(
+            &mut then_statements,
+            wir::SemanticStatement::Yield(one_value_vec(then_value, self.limits.model_edges)?),
+        )?;
+        let mut else_statements =
+            try_vec(2, "inline if else region", self.limits.model_edges)?;
+        let LoweredExpression::Value(else_value) = self.lower_expression(
+            inline_if.else_branch,
+            sema::AccessMode::Value,
+            &mut else_statements,
+        )?
+        else {
+            return Err(self.fact_mismatch("inline if else value"));
+        };
+        self.push_statement(
+            &mut else_statements,
+            wir::SemanticStatement::Yield(one_value_vec(else_value, self.limits.model_edges)?),
+        )?;
+        self.push_statement(
+            statements,
+            wir::SemanticStatement::If {
+                condition,
+                then_region: wir::SemanticRegion {
+                    parameters: Vec::new(),
+                    statements: then_statements,
+                },
+                else_region: wir::SemanticRegion {
+                    parameters: Vec::new(),
+                    statements: else_statements,
+                },
+                results: one_value_vec(result, self.limits.model_edges)?,
+                source: Some(source),
             },
         )?;
         Ok(LoweredExpression::Value(result))
@@ -11268,6 +11397,8 @@ pub fn boot() -> Image:
                         fields: Vec::new(),
                         members: Vec::new(),
                         linear: false,
+                    copy: false,
+                    deriving: Vec::new(),
                     }),
                     source: span(1, 10, 60),
                 },
@@ -11286,6 +11417,7 @@ pub fn boot() -> Image:
                             source: span(1, 80, 110),
                         }],
                         members: Vec::new(),
+                        deriving: Vec::new(),
                     }),
                     source: span(1, 70, 120),
                 },
@@ -11648,6 +11780,7 @@ pub fn boot() -> Image:
                     access: AccessMode::Value,
                     ty: Some(u32_ty(span(0, 176, 179))),
                     receiver: false,
+            positional_only: false,
                     source: span(0, 174, 179),
                 },
                 Parameter {
@@ -11657,6 +11790,7 @@ pub fn boot() -> Image:
                     access: AccessMode::Value,
                     ty: Some(u32_ty(span(0, 182, 185))),
                     receiver: false,
+            positional_only: false,
                     source: span(0, 180, 185),
                 },
             ]);

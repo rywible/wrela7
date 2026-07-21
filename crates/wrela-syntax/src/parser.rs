@@ -1916,6 +1916,7 @@ fn keyword(spelling: &str) -> Option<Keyword> {
         "projection" => Keyword::Projection,
         "scope" => Keyword::Scope,
         "implements" => Keyword::Implements,
+        "deriving" => Keyword::Deriving,
         "region" => Keyword::Region,
         "view" => Keyword::View,
         "mut" => Keyword::Mut,
@@ -2261,7 +2262,10 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             self.parse_function(depth + 1, true)?
                 .map(DeclarationKind::Function)
         } else if self.at_linear_struct() {
-            self.parse_type_declaration(depth + 1, true)?
+            self.parse_type_declaration(depth + 1, true, false)?
+                .map(DeclarationKind::Structure)
+        } else if self.at_copy_struct() {
+            self.parse_type_declaration(depth + 1, false, true)?
                 .map(DeclarationKind::Structure)
         } else {
             match self.kind() {
@@ -2272,7 +2276,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
                     .parse_brand_declaration(depth + 1)?
                     .map(DeclarationKind::Brand),
                 TokenKind::Keyword(Keyword::Struct) => self
-                    .parse_type_declaration(depth + 1, false)?
+                    .parse_type_declaration(depth + 1, false, false)?
                     .map(DeclarationKind::Structure),
                 TokenKind::Keyword(Keyword::Enum) => self
                     .parse_enum_declaration(depth + 1)?
@@ -2338,6 +2342,12 @@ impl<'a, 'diag> Parser<'a, 'diag> {
     fn at_linear_struct(&self) -> bool {
         self.kind() == TokenKind::Identifier
             && self.token_text(self.position) == "linear"
+            && self.nth_kind(1) == Some(TokenKind::Keyword(Keyword::Struct))
+    }
+
+    /// `copy struct` uses the reserved `copy` keyword as a declaration modifier.
+    fn at_copy_struct(&self) -> bool {
+        self.at_keyword(Keyword::Copy)
             && self.nth_kind(1) == Some(TokenKind::Keyword(Keyword::Struct))
     }
 
@@ -2558,10 +2568,11 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         &mut self,
         depth: u32,
         linear: bool,
+        copy: bool,
     ) -> Result<Option<TypeDeclaration>, ParseFailure> {
         let start = self.position;
-        if linear {
-            self.bump()?; // consume the contextual `linear` identifier
+        if linear || copy {
+            self.bump()?; // consume `linear` identifier or `copy` keyword
         }
         self.bump()?; // consume `struct`
         let Some(name) = self.parse_identifier(depth + 1)? else {
@@ -2577,6 +2588,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         } else {
             Vec::new()
         };
+        let deriving = self.parse_deriving_list(depth + 1)?;
         if !self.eat_punctuation(Punctuation::Colon)? {
             self.error_here(
                 "syntax-expected-suite-colon",
@@ -2637,7 +2649,47 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             members,
             explicit_pass,
             linear,
+            copy,
+            deriving,
         }))
+    }
+
+    fn parse_deriving_list(&mut self, depth: u32) -> Result<Vec<Identifier>, ParseFailure> {
+        self.check_depth(depth)?;
+        if !self.eat_keyword(Keyword::Deriving)? {
+            return Ok(Vec::new());
+        }
+        if !self.eat_punctuation(Punctuation::LeftParen)? {
+            self.error_here(
+                "syntax-expected-deriving-list",
+                "expected `(` after `deriving`",
+            )?;
+            return Ok(Vec::new());
+        }
+        let mut names = Vec::new();
+        while !self.at_punctuation(Punctuation::RightParen)
+            && !self.at(TokenKind::EndOfFile)
+            && !self.at(TokenKind::Newline)
+        {
+            let Some(name) = self.parse_identifier(depth + 1)? else {
+                self.error_here(
+                    "syntax-expected-deriving-name",
+                    "expected a deriving trait name",
+                )?;
+                break;
+            };
+            push_ast_value(&mut names, name, self.limits.ast_nodes)?;
+            if !self.eat_punctuation(Punctuation::Comma)? {
+                break;
+            }
+        }
+        if !self.eat_punctuation(Punctuation::RightParen)? {
+            self.error_here(
+                "syntax-unclosed-deriving-list",
+                "expected `)` to close the deriving list",
+            )?;
+        }
+        Ok(names)
     }
 
     fn parse_type_list(
@@ -2965,6 +3017,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             return Ok(None);
         };
         let generics = self.parse_generic_parameters(depth + 1)?;
+        let deriving = self.parse_deriving_list(depth + 1)?;
         if !self.eat_punctuation(Punctuation::Colon)? {
             self.error_here(
                 "syntax-expected-suite-colon",
@@ -3001,6 +3054,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             name,
             generics,
             variants,
+            deriving,
         }))
     }
 
@@ -3794,6 +3848,16 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         let start = self.position;
         let access = self.parse_access_mode()?;
         let receiver = self.at_keyword(Keyword::SelfValue);
+        let positional_only = if !receiver
+            && self.at(TokenKind::Identifier)
+            && self.token_text(self.position) == "_"
+            && self.nth_kind(1) == Some(TokenKind::Identifier)
+        {
+            self.bump()?;
+            true
+        } else {
+            false
+        };
         let name = if receiver {
             self.identifier_from_current(depth + 1)?.ok_or_else(|| {
                 ParseFailure::InternalInvariant(
@@ -3826,6 +3890,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             name,
             ty,
             receiver,
+            positional_only,
         }))
     }
 
@@ -5175,8 +5240,106 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         self.check_depth(depth)?;
         if self.starts_closure_expression() {
             self.parse_closure_expression(depth + 1)
+        } else if self.at_keyword(Keyword::If) {
+            self.parse_if_expression(depth + 1)
         } else {
             self.parse_or(depth + 1)
+        }
+    }
+
+    fn parse_if_expression(&mut self, depth: u32) -> Result<Expression, ParseFailure> {
+        self.check_depth(depth)?;
+        let start = self.position;
+        self.bump()?; // if
+        let condition = Box::new(self.parse_expression(depth + 1)?);
+        if !self.eat_punctuation(Punctuation::Colon)? {
+            self.error_here(
+                "syntax-expected-if-expression-colon",
+                "expected `:` after the inline `if` condition",
+            )?;
+        }
+        let then_branch = Box::new(self.parse_if_expression_arm(depth + 1)?);
+        let mut elif_branches = Vec::new();
+        while self.eat_expression_elif()? {
+            let elif_condition = self.parse_expression(depth + 1)?;
+            if !self.eat_punctuation(Punctuation::Colon)? {
+                self.error_here(
+                    "syntax-expected-if-expression-colon",
+                    "expected `:` after the inline `elif` condition",
+                )?;
+            }
+            let elif_branch = self.parse_if_expression_arm(depth + 1)?;
+            push_ast_value(
+                &mut elif_branches,
+                (elif_condition, elif_branch),
+                self.limits.ast_nodes,
+            )?;
+        }
+        if !self.eat_expression_else()? {
+            self.error_here(
+                "syntax-expected-if-expression-else",
+                "an inline `if` expression requires a mandatory `else` branch",
+            )?;
+        }
+        if !self.eat_punctuation(Punctuation::Colon)? {
+            self.error_here(
+                "syntax-expected-if-expression-colon",
+                "expected `:` after `else` in an inline `if` expression",
+            )?;
+        }
+        let else_branch = Box::new(self.parse_if_expression_arm(depth + 1)?);
+        Ok(Expression {
+            meta: self.meta(start, self.position)?,
+            kind: ExpressionKind::If {
+                condition,
+                then_branch,
+                elif_branches,
+                else_branch,
+            },
+        })
+    }
+
+    /// Tail-position / inline arm: either a single expression or a one-statement
+    /// suite whose sole statement is a bare expression (chapter 2 §7.1).
+    fn parse_if_expression_arm(&mut self, depth: u32) -> Result<Expression, ParseFailure> {
+        self.check_depth(depth)?;
+        if self.at(TokenKind::Newline) {
+            let suite = self.parse_suite(depth + 1)?;
+            return self.expression_from_tail_suite(suite, depth + 1);
+        }
+        self.parse_expression(depth + 1)
+    }
+
+    fn expression_from_tail_suite(
+        &mut self,
+        suite: Suite,
+        depth: u32,
+    ) -> Result<Expression, ParseFailure> {
+        self.check_depth(depth)?;
+        let [statement] = suite.statements.as_slice() else {
+            let span = suite.meta.span;
+            self.diagnostics.error(
+                "syntax-tail-if-suite",
+                span.range.start as usize,
+                span.range.end as usize,
+                "a tail-position `if` arm suite must contain exactly one expression statement"
+                    .to_owned(),
+            )?;
+            return self.error_expression(self.position, self.position, depth + 1);
+        };
+        match &statement.kind {
+            StatementKind::Expression(expression) => Ok(expression.clone()),
+            _ => {
+                let span = statement.meta.span;
+                self.diagnostics.error(
+                    "syntax-tail-if-suite",
+                    span.range.start as usize,
+                    span.range.end as usize,
+                    "a tail-position `if` arm suite must end in a bare expression value"
+                        .to_owned(),
+                )?;
+                self.error_expression(self.position, self.position, depth + 1)
+            }
         }
     }
 
@@ -5232,6 +5395,7 @@ impl<'a, 'diag> Parser<'a, 'diag> {
                 name,
                 ty: Some(ty),
                 receiver: false,
+                positional_only: false,
             };
             push_ast_value(&mut parameters, parameter, self.limits.ast_nodes)?;
             if !self.eat_punctuation(Punctuation::Comma)? {
@@ -5626,7 +5790,6 @@ impl<'a, 'diag> Parser<'a, 'diag> {
 
     fn parse_arguments(&mut self, depth: u32) -> Result<Vec<Argument>, ParseFailure> {
         let mut arguments = Vec::new();
-        let mut saw_named = false;
         while !self.at_punctuation(Punctuation::RightParen)
             && !self.at(TokenKind::EndOfFile)
             && !self.at(TokenKind::Newline)
@@ -5637,15 +5800,8 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             let name = if named {
                 let name = self.parse_identifier(depth + 1)?;
                 self.bump()?;
-                saw_named = true;
                 name
             } else {
-                if saw_named {
-                    self.error_here(
-                        "syntax-positional-after-named-argument",
-                        "positional arguments cannot follow a named argument",
-                    )?;
-                }
                 None
             };
             let exclusive = match self.kind() {
@@ -6363,6 +6519,24 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         self.eat(TokenKind::Keyword(keyword))
     }
 
+    fn eat_expression_elif(&mut self) -> Result<bool, ParseFailure> {
+        if self.newline_precedes_keyword(Keyword::Elif) {
+            self.bump()?;
+            self.bump()?;
+            return Ok(true);
+        }
+        self.eat_keyword(Keyword::Elif)
+    }
+
+    fn eat_expression_else(&mut self) -> Result<bool, ParseFailure> {
+        if self.newline_precedes_keyword(Keyword::Else) {
+            self.bump()?;
+            self.bump()?;
+            return Ok(true);
+        }
+        self.eat_keyword(Keyword::Else)
+    }
+
     fn eat_punctuation(&mut self, punctuation: Punctuation) -> Result<bool, ParseFailure> {
         self.eat(TokenKind::Punctuation(punctuation))
     }
@@ -6666,6 +6840,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_positional_only_parameter_marker() {
+        let output = parse_clean(
+            "module contracts.labels\n\nfn hash(_ data: u64) -> u64:\n    return data\n\nfn pair(_ a: u64, b: u64) -> u64:\n    return a\n",
+        );
+        let declarations = &output.parsed().ast().declarations;
+        assert_eq!(declarations.len(), 2);
+        let DeclarationKind::Function(hash) = &declarations[0].kind else {
+            panic!("expected hash function");
+        };
+        assert!(hash.parameters[0].positional_only);
+        assert_eq!(hash.parameters[0].name.spelling, "data");
+        let DeclarationKind::Function(pair) = &declarations[1].kind else {
+            panic!("expected pair function");
+        };
+        assert!(pair.parameters[0].positional_only);
+        assert!(!pair.parameters[1].positional_only);
+    }
+
+    #[test]
     fn statement_pattern_expression_recovery_is_structured() {
         let output = parse_with_limits(STATEMENTS_EXPRESSIONS_MALFORMED, ParseLimits::standard())
             .expect("malformed phase-three fixture remains recoverable");
@@ -6684,7 +6877,6 @@ mod tests {
             "syntax-legacy-variant-pattern",
             "syntax-expected-dot-variant-name",
             "syntax-try-send-call",
-            "syntax-positional-after-named-argument",
             "syntax-closure-parameter-type",
             "syntax-empty-interpolation-format",
             "syntax-interpolation-format-ascii",
@@ -7022,6 +7214,56 @@ mod tests {
                         }
                     }
                     "interpolated"
+                }
+                ExpressionKind::If {
+                    condition,
+                    then_branch,
+                    elif_branches,
+                    else_branch,
+                } => {
+                    collect_expression(
+                        condition,
+                        expressions,
+                        patterns,
+                        flags,
+                        statements,
+                        operators,
+                    );
+                    collect_expression(
+                        then_branch,
+                        expressions,
+                        patterns,
+                        flags,
+                        statements,
+                        operators,
+                    );
+                    for (elif_condition, elif_branch) in elif_branches {
+                        collect_expression(
+                            elif_condition,
+                            expressions,
+                            patterns,
+                            flags,
+                            statements,
+                            operators,
+                        );
+                        collect_expression(
+                            elif_branch,
+                            expressions,
+                            patterns,
+                            flags,
+                            statements,
+                            operators,
+                        );
+                    }
+                    collect_expression(
+                        else_branch,
+                        expressions,
+                        patterns,
+                        flags,
+                        statements,
+                        operators,
+                    );
+                    "if"
                 }
                 ExpressionKind::Error(_) => "error",
             };

@@ -72,6 +72,7 @@ pub enum Keyword {
     Projection,
     Scope,
     Implements,
+    Deriving,
     Region,
     View,
     Mut,
@@ -399,6 +400,8 @@ pub struct Parameter {
     pub name: Identifier,
     pub ty: Option<TypeExpression>,
     pub receiver: bool,
+    /// `_ name: Type` — call sites must omit the argument label.
+    pub positional_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -411,6 +414,10 @@ pub struct TypeDeclaration {
     pub explicit_pass: bool,
     /// `linear struct Name:` — non-copyable regardless of fields.
     pub linear: bool,
+    /// `copy struct Name:` — implicitly duplicable; fields must be scalar or `copy struct`.
+    pub copy: bool,
+    /// Closed `deriving(Eq, Format, From)` list from the declaration header.
+    pub deriving: Vec<Identifier>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -447,6 +454,8 @@ pub struct EnumDeclaration {
     pub name: Identifier,
     pub generics: Vec<GenericParameter>,
     pub variants: Vec<EnumVariant>,
+    /// Closed `deriving(Eq, Format, From)` list from the declaration header.
+    pub deriving: Vec<Identifier>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -748,6 +757,13 @@ pub enum ExpressionKind {
     Array(Vec<Expression>),
     TrySend(Box<Expression>),
     Interpolated(Vec<InterpolationPart>),
+    /// Inline conditional: `if c: a elif d: b else: e` (expression form).
+    If {
+        condition: Box<Expression>,
+        then_branch: Box<Expression>,
+        elif_branches: Vec<(Expression, Expression)>,
+        else_branch: Box<Expression>,
+    },
     Error(ErrorNode),
 }
 
@@ -2181,6 +2197,9 @@ impl AstValidator<'_> {
         for implementation in &value.implements {
             self.ty(implementation, depth + 1, parent)?;
         }
+        for name in &value.deriving {
+            self.identifier(name, depth + 1, parent)?;
+        }
         for member in &value.members {
             self.member(member, depth + 1, parent)?;
         }
@@ -2242,6 +2261,9 @@ impl AstValidator<'_> {
         self.identifier(&value.name, depth + 1, parent)?;
         for generic in &value.generics {
             self.generic(generic, depth + 1, parent)?;
+        }
+        for name in &value.deriving {
+            self.identifier(name, depth + 1, parent)?;
         }
         for variant in &value.variants {
             let variant_parent = self.meta(variant.meta, depth + 1, Some(parent))?;
@@ -2619,6 +2641,20 @@ impl AstValidator<'_> {
                     self.expression(value, depth + 1, parent)?;
                 }
                 Ok(())
+            }
+            ExpressionKind::If {
+                condition,
+                then_branch,
+                elif_branches,
+                else_branch,
+            } => {
+                self.expression(condition, depth + 1, parent)?;
+                self.expression(then_branch, depth + 1, parent)?;
+                for (elif_condition, elif_branch) in elif_branches {
+                    self.expression(elif_condition, depth + 1, parent)?;
+                    self.expression(elif_branch, depth + 1, parent)?;
+                }
+                self.expression(else_branch, depth + 1, parent)
             }
             ExpressionKind::Interpolated(parts) => {
                 for part in parts {
