@@ -187,8 +187,8 @@ D2 need this scope substantially complete; B10 needs F5.
 |---|---|---|---|
 | 1 | B2a promotion/region report schema | — | **landed** 3eb2cb69 |
 | 1 | B5b wait-for graph + diagnostics | — | **landed** 3e216d38 |
-| 1 | B1a view/provenance semantics | — | not started (never dispatched) |
-| 1 | B4a cleanup DAG sema analysis | — | **complete at sema tier** — free-call scope protocols/calls, lexical activations, reverse-source cleanup DAG + `CleanupAcyclic`, synthetic cycle detector, and named await/receiver/outside-`with` rejections; pass-only cleanup bodies and no lowering (`semantic-with-cleanup-lowering-pending`) |
+| 1 | B1a view/provenance semantics | lexical provenance model | **sealed-boundary audit required** — `SemanticTypeKind::View`/`Loan` currently require real `RegionId`s, but B1a is analysis-only and L2.3 owns runtime region production; use a separate bounded lexical provenance fact or explicitly merge the region-producing work, never a placeholder/dangling region |
+| 1 | B4a cleanup DAG sema analysis | — | **landed** 43d3e279 — free-call scope protocols/calls, lexical activations, reverse-source cleanup DAG + `CleanupAcyclic`, synthetic cycle detector, and named await/receiver/outside-`with` rejections; pass-only cleanup bodies and no lowering (`semantic-with-cleanup-lowering-pending`) |
 | 0 | **T0.1 general nongeneric ADTs — COMPLETE** | — | **landed** — enum type resolution: unit + mixed-arity + heterogeneous-scalar + flat-struct + nongeneric-enum payloads, tagged-union max-slot layout, structural cycle rejection |
 | 0 | · T0.1a unit variants | — | landed ce8385e6 |
 | 0 | · T0.1b heterogeneous scalar payloads | T0.1a | landed 4b5f125a |
@@ -196,11 +196,13 @@ D2 need this scope substantially complete; B10 needs F5.
 | 0 | · T0.1d enum payloads + cycle rejection | T0.1c | landed 0b953537 |
 | 0 | T0.1 deferred tails (fail-closed) | T0.1 | nominal/enum **construction** + **lowering**, generic/view/tuple/array payloads, unit-variant DotName construction — all named-diagnostic fail-closed |
 | 0 | T0.2 ephemeral type kind | T0.1 + a **producer** | **producer-gated** — needs views (B1) or `try send` (B5c) to exercise the `?`-vs-`match`/`is` rule end to end |
-| 0 | T0.3 generics/monomorphization (A6) | T0.1 | queued (multi-session) |
-| — | General `match`/`is` over ADTs (consumer; uses T0.1, needed for AdmissionResult consumption) | T0.1 | **complete in A-1** — mixed-arity/per-variant-type exhaustive statement match; unit/payload-wildcard `is`; success-dominated `is` binding remains named fail-closed |
-| 2 | L2.1 place-level aggregate mutation | T0 | queued |
-| 2 | L2.2 values-through-WIR + codegen | L2.1,T0 | queued |
-| 2 | L2.3 region/escape producer | L2.2 | queued |
+| 0 | T0.3 generics/monomorphization (A6) | T0.1 | **scope correction required** — start with type-only generic flat-struct specialization; preserve existing parsed/HIR `region` generics unchanged but exclude region substitution until the source spec (which says no surface region parameter) and normative syntax fixture are reconciled |
+| — | General `match`/`is` over ADTs (consumer; uses T0.1, needed for AdmissionResult consumption) | T0.1 | **landed** 69188c6b — mixed-arity/per-variant-type exhaustive statement match; unit/payload-wildcard `is`; success-dominated `is` binding remains named fail-closed |
+| 2 | L2.1a local aggregate mutation | T0 | queued — local `agg.field` can use root-SSA replacement, then `InsertField`; persistent `self.field` is not part of this increment |
+| 2 | actor-state initialization/storage floor | L2.1a | **new prerequisite** — actors currently retain no initialized state value/global, so `self.field` mutation cannot be represented without discarding persistence |
+| 2 | L2.1b persistent actor-state mutation | actor-state storage | queued — must remain `semantic-self-field-mutation-state-pending` until the state store exists |
+| 2 | L2.2 values-through-WIR + codegen | L2.1a,T0 | queued — first increment is multi-field flat scalar structs through MachineWir/LLVM; reply slots remain exclusively L2.4 |
+| 2 | L2.3 region/escape producer + B2b | L2.1b,L2.2 | **reordered** — a stateful `self.field` escape cannot be produced before persistent actor state; `Promote` also has no FlowWir representation today |
 | 2 | L2.4 reply-slot + scheduler (B5c) | L2.2,T0.1 | queued |
 | 2 | L2.5 scope-op lowering (B4b/c) | L2.2,B4a | queued |
 | 3 | feature verticals (B1b,B2b/c,B3,B5c,B6–B10,A1/3/4/5/7/8) | tiers 0–2 | queued |
@@ -211,8 +213,13 @@ exercised without a value of an ephemeral type, and the only producers (views,
 `try send`) are themselves unbuilt. So the autonomous path pivots to consumers
 and producers that are testable now: general `match`/`is` over the new ADTs is
 complete at the analysis tier; B1a view analysis (the first ephemeral producer)
-is next and unblocks T0.2. Generics (T0.3) and Tier-2 lowering proceed in
-parallel as independent tracks.
+is the next intended producer, but its lexical-provenance representation must be
+resolved without forging runtime region IDs before it can unblock T0.2. The
+sealed-boundary audit also moves B2b behind local aggregate mutation plus a real
+actor-state initialization/storage floor. T0.3 begins with type-only generic
+flat structures while the contradictory surface-region contract remains
+untouched. L2.2 begins with multi-field flat scalar structures and does not
+duplicate L2.4's reply-slot/ABI ownership.
 
 Update this table and the cited inventory rows as each slice lands. One commit
 per slice; the branch is the integration unit for the whole A+B scope.

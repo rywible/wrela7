@@ -369,3 +369,34 @@ Keep the table in
 slices land, and update the cited inventory rows in the same commit. One commit
 per task; the working branch is the integration unit; fast-forward to `main`
 when a coherent group is green.
+
+### 8.1 Execution audit (2026-07-21)
+
+The first execution pass landed A-1 (`69188c6b`) and A-3/B4a (`43d3e279`) and
+found four sequencing/model assumptions that cross sealed boundaries. Per §0.6,
+none was worked around:
+
+- **A-2/B2b is not an independent sema slice.** Stateful actor installation,
+  projected `self.field` assignment, actor-state storage, and FlowWir promotion
+  are all absent or explicitly fail closed. B2b now follows local aggregate
+  mutation, a real actor-state initialization/storage floor, persistent state
+  mutation, and the L2.3 promotion path.
+- **B1a needs a lexical provenance model distinct from runtime allocation
+  regions.** Existing view/loan records require real `RegionId`s, whose producer
+  belongs to L2.3. Placeholder or dangling regions are forbidden. Either add a
+  separately sealed lexical provenance fact or explicitly merge the real region
+  producer into the slice before implementing it.
+- **T0.3 preserves the region-generic surface unchanged.** The source-language
+  chapter says surface `region` generic parameters are not in revision 0.1,
+  while the parser, HIR, and normative syntax fixture accept them. The first
+  increment is type-only generic flat-struct specialization; region substitution
+  remains excluded until that normative contradiction is adjudicated.
+- **L2.1 is two different storage problems.** Local `agg.field` updates can use
+  root-SSA replacement and existing FlowWir `InsertField`. Persistent
+  `self.field` updates require an initialized actor-state value/global and cannot
+  be represented as local SSA. L2.2 starts with multi-field flat scalar structs;
+  reply slots and their ABI remain solely L2.4.
+
+These corrections are reflected in the unified plan's §8 table. They supersede
+the “A-2 independent sema slice” and undivided L2.1/L2.2 ordering assumptions in
+§4–§6 of this handoff.
