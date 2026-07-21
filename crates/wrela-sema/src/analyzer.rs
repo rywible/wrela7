@@ -6799,6 +6799,34 @@ fn analyze_result_try_expression(
             "bind the propagated payload before requesting exclusive access",
         ));
     }
+    let named_operand = request
+        .hir
+        .as_program()
+        .expression(operand)
+        .and_then(|operand| match operand.kind {
+            ExpressionKind::Reference(Definition::Local(local)) => state
+                .locals
+                .get(local.0 as usize)
+                .and_then(Option::as_ref)
+                .copied(),
+            ExpressionKind::Reference(Definition::Parameter(parameter)) => state
+                .parameters
+                .get(parameter.0 as usize)
+                .and_then(Option::as_ref)
+                .copied(),
+            _ => None,
+        });
+    if let Some(kind) = named_operand
+        .and_then(|binding| partial.values.get(binding.value.0 as usize))
+        .and_then(|value| match value.class {
+            SemanticValueClass::Ephemeral(kind) if !kind.permits(EphemeralUse::Question) => {
+                Some(kind)
+            }
+            _ => None,
+        })
+    {
+        return Err(ephemeral_question_diagnostic(request, source, kind));
+    }
     if request
         .hir
         .as_program()
@@ -6987,6 +7015,33 @@ fn analyze_result_try_expression(
         referenced: None,
         effects: operand_outcome.effects,
     })
+}
+
+fn ephemeral_question_diagnostic(
+    request: &AnalysisRequest<'_>,
+    source: Span,
+    kind: EphemeralKind,
+) -> RuntimeFailure {
+    let message = match kind {
+        EphemeralKind::View => "postfix question is not a permitted consumer for an ephemeral view",
+        EphemeralKind::ProjectionCarrier => {
+            "postfix question is not a permitted consumer for this projection carrier"
+        }
+        EphemeralKind::AdmissionResult => {
+            "postfix question is not a permitted consumer for ephemeral AdmissionResult"
+        }
+        EphemeralKind::OwnershipConditionedActorCallOutcome => {
+            "postfix question is not a permitted consumer for this ownership-conditioned outcome"
+        }
+    };
+    runtime_type_diagnostic(
+        request,
+        source,
+        "semantic-ephemeral-question-forbidden",
+        message,
+        "ephemeral carriers have an explicit, closed consumption policy",
+        "consume this carrier with one of its permitted immediate forms",
+    )
 }
 
 fn analyze_actor_send_expression(
@@ -11480,6 +11535,13 @@ fn record_lexical_view_initialization(
     let mut unary_consumers = 0_u32;
     for candidate in &request.hir.as_program().expressions {
         charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+        if candidate.kind == ExpressionKind::Try(terminal.id) {
+            return Err(ephemeral_question_diagnostic(
+                request,
+                candidate.source,
+                EphemeralKind::View,
+            ));
+        }
         if let ExpressionKind::Call { arguments, .. } = &candidate.kind
             && matches!(
                 arguments.as_slice(),
@@ -11682,6 +11744,14 @@ fn append_semantic_value_with_category(
         function,
         ty,
         category,
+        class: if matches!(
+            category,
+            ValueCategory::SharedView | ValueCategory::MutableView
+        ) {
+            SemanticValueClass::Ephemeral(EphemeralKind::View)
+        } else {
+            SemanticValueClass::FirstClass
+        },
         origin,
         source,
         source_name,
@@ -28256,6 +28326,43 @@ fn projection_call_is_lexical():
             facts.values[view.value.0 as usize].category,
             ValueCategory::SharedView
         );
+        assert_eq!(
+            facts.values[view.value.0 as usize].class,
+            SemanticValueClass::Ephemeral(EphemeralKind::View)
+        );
+        let mut forged_first_class_view = facts.clone();
+        forged_first_class_view.values[view.value.0 as usize].class =
+            SemanticValueClass::FirstClass;
+        assert!(
+            forged_first_class_view
+                .validate_partial_structure()
+                .is_err(),
+            "the prefix sealer must reject a lexical view forged as first-class"
+        );
+        assert!(
+            forged_first_class_view
+                .validate_for_seal(analyzed.hir(), &|| false)
+                .is_err(),
+            "the sealer must reject a lexical view forged as first-class"
+        );
+        let ordinary = facts
+            .values
+            .iter()
+            .find(|value| value.category == ValueCategory::Value)
+            .expect("ordinary value");
+        let mut forged_ephemeral_value = facts.clone();
+        forged_ephemeral_value.values[ordinary.id.0 as usize].class =
+            SemanticValueClass::Ephemeral(EphemeralKind::AdmissionResult);
+        assert!(
+            forged_ephemeral_value.validate_partial_structure().is_err(),
+            "the prefix sealer must reject an ephemeral value without an exact producer"
+        );
+        assert!(
+            forged_ephemeral_value
+                .validate_for_seal(analyzed.hir(), &|| false)
+                .is_err(),
+            "the sealer must reject an ordinary value forged as an ephemeral view"
+        );
         let call = facts
             .expressions
             .iter()
@@ -28857,6 +28964,71 @@ fn binary_view_consumption_is_deferred():
             "broader ephemeral consumption must fail closed before operator analysis: {:?}",
             output.diagnostics()
         );
+    }
+
+    #[test]
+    fn postfix_question_rejects_real_lexical_view_producer() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn view_question_is_forbidden():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    value: u64 = hdr?
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert_eq!(
+            output
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.as_deref()),
+            Some("semantic-ephemeral-question-forbidden"),
+            "postfix question must reject the real ephemeral view producer: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn ephemeral_consumption_policy_is_closed_per_carrier() {
+        let cases = [
+            (EphemeralKind::View, [true, true, true, false, true]),
+            (
+                EphemeralKind::ProjectionCarrier,
+                [true, true, true, true, false],
+            ),
+            (
+                EphemeralKind::AdmissionResult,
+                [true, true, true, false, false],
+            ),
+            (
+                EphemeralKind::OwnershipConditionedActorCallOutcome,
+                [true, true, true, true, false],
+            ),
+        ];
+        let uses = [
+            EphemeralUse::DirectBinding,
+            EphemeralUse::PatternMatch,
+            EphemeralUse::TypeTest,
+            EphemeralUse::Question,
+            EphemeralUse::ImmediateRead,
+        ];
+        for (kind, expected) in cases {
+            for (usage, expected) in uses.into_iter().zip(expected) {
+                assert_eq!(kind.permits(usage), expected, "{kind:?} / {usage:?}");
+            }
+        }
     }
 
     #[test]

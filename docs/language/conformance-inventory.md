@@ -107,6 +107,15 @@ The direct-root disjointness proof additionally forges two individually exact
 views onto one root and verifies that full sealing rejects their overlapping
 exclusive intervals.
 
+T0.2 now classifies typed semantic values as first-class or as one of four
+closed ephemeral carrier kinds. Exact prefix/full sealing authenticates only
+the currently real `Ephemeral(View)` producer and rejects both a view forged as
+first-class and an ordinary value forged as producerless ephemeral data.
+`postfix_question_rejects_real_lexical_view_producer` exercises the shared
+`semantic-ephemeral-question-forbidden` path; the AdmissionResult and actor-call
+kinds remain modeled but unproducible, with their matrix pinned by
+`ephemeral_consumption_policy_is_closed_per_carrier`.
+
 ## Chapter 04 — Actors and async
 
 | Spec | Contract inventory | Layers/evidence | Status / delivery owner |

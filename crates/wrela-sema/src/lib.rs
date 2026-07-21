@@ -603,6 +603,11 @@ pub struct SemanticValue {
     pub function: FunctionInstanceId,
     pub ty: SemanticTypeId,
     pub category: ValueCategory,
+    /// Storage/consumption class of this typed value. Producer-dependent
+    /// carriers live here rather than on the nominal type record: a lexical
+    /// view intentionally shares its target `SemanticTypeId` while remaining
+    /// second-class.
+    pub class: SemanticValueClass,
     /// Exact source construct which introduces this runtime value.
     pub origin: SemanticValueOrigin,
     pub source: Option<Span>,
@@ -624,6 +629,45 @@ pub enum ValueCategory {
     MutableView,
     TypeValue,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticValueClass {
+    FirstClass,
+    Ephemeral(EphemeralKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EphemeralKind {
+    View,
+    ProjectionCarrier,
+    AdmissionResult,
+    OwnershipConditionedActorCallOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EphemeralUse {
+    DirectBinding,
+    PatternMatch,
+    TypeTest,
+    Question,
+    ImmediateRead,
+}
+
+impl EphemeralKind {
+    #[must_use]
+    pub const fn permits(self, usage: EphemeralUse) -> bool {
+        match usage {
+            EphemeralUse::DirectBinding | EphemeralUse::PatternMatch | EphemeralUse::TypeTest => {
+                true
+            }
+            EphemeralUse::Question => matches!(
+                self,
+                Self::ProjectionCarrier | Self::OwnershipConditionedActorCallOutcome
+            ),
+            EphemeralUse::ImmediateRead => matches!(self, Self::View),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1247,6 +1291,7 @@ impl PartialAnalysis {
             if value.function.0 as usize >= self.functions.len()
                 || value.ty.0 as usize >= self.types.len()
                 || !valid_value_origin(value.origin, self.hir)
+                || !valid_semantic_value_class(value)
                 || value
                     .source_name
                     .as_ref()
@@ -1544,6 +1589,7 @@ impl PartialAnalysis {
             if value.function.0 as usize >= self.functions.len()
                 || value.ty.0 as usize >= self.types.len()
                 || !valid_value_origin(value.origin, self.hir)
+                || !valid_semantic_value_class(value)
                 || value
                     .source_name
                     .as_ref()
@@ -6610,6 +6656,7 @@ fn valid_lexical_view_prefix(view: &LexicalView, analysis: &PartialAnalysis) -> 
             value.function == view.function
                 && value.ty == protocol.target
                 && value.category == expected_category
+                && value.class == SemanticValueClass::Ephemeral(EphemeralKind::View)
                 && value.origin == SemanticValueOrigin::Local(view.binding)
         });
     let initialization_matches = analysis
@@ -7678,6 +7725,22 @@ fn valid_value_origin(origin: SemanticValueOrigin, hir: HirSummary) -> bool {
         SemanticValueOrigin::Local(local) => local.0 < hir.locals,
         SemanticValueOrigin::Expression(expression) => expression.0 < hir.expressions,
     }
+}
+
+fn valid_semantic_value_class(value: &SemanticValue) -> bool {
+    matches!(
+        (value.category, value.class),
+        (
+            ValueCategory::SharedView | ValueCategory::MutableView,
+            SemanticValueClass::Ephemeral(EphemeralKind::View)
+        ) | (
+            ValueCategory::Value
+                | ValueCategory::Place
+                | ValueCategory::TypeValue
+                | ValueCategory::Error,
+            SemanticValueClass::FirstClass
+        )
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]

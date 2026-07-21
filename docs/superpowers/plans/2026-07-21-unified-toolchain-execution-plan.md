@@ -196,7 +196,7 @@ D2 need this scope substantially complete; B10 needs F5.
 | 0 | · T0.1c flat-struct payloads | T0.1b | landed c509694d |
 | 0 | · T0.1d enum payloads + cycle rejection | T0.1c | landed 0b953537 |
 | 0 | T0.1 deferred tails (fail-closed) | T0.1 | nominal enum-payload **construction** + **lowering**, generic/view/tuple/array payloads — all named-diagnostic fail-closed |
-| 0 | T0.2 ephemeral type kind | T0.1 + a **producer** | **producer-gated** — needs views (B1) or `try send` (B5c) to exercise the `?`-vs-`match`/`is` rule end to end |
+| 0 | T0.2 ephemeral typed-value kind | T0.1 + a **producer** | **landed in this slice for the authenticated view producer** — `SemanticValueClass::Ephemeral` carries a closed carrier kind/policy; exact sealers admit only real lexical views today, and `hdr?` rejects as `semantic-ephemeral-question-forbidden` (`postfix_question_rejects_real_lexical_view_producer`, `ephemeral_consumption_policy_is_closed_per_carrier`). Admission/call carriers remain producer-gated. |
 
 | 0 | T0.3 generics/monomorphization (A6) | T0.1 | **scope correction required** — start with type-only generic flat-struct specialization; preserve existing parsed/HIR `region` generics unchanged but exclude region substitution until the source spec (which says no surface region parameter) and normative syntax fixture are reconciled |
 | — | General `match`/`is` over ADTs (consumer; uses T0.1, needed for AdmissionResult consumption) | T0.1 | **landed** 69188c6b — mixed-arity/per-variant-type exhaustive statement match; unit/payload-wildcard `is`; success-dominated `is` binding remains named fail-closed |
@@ -222,13 +222,10 @@ and exact call facts are forged into individually valid same-root views; the
 full sealer rejects their overlapping exclusive intervals.
 
 **Sequencing note (2026-07-21):** T0.1 (ADT type resolution) is complete. T0.2
-(ephemeral kind) turned out **producer-gated** — the `?`-rejection rule can't be
-exercised without a value of an ephemeral type, and the only producers (views,
-`try send`) are themselves unbuilt. So the autonomous path pivots to consumers
-and producers that are testable now: general `match`/`is` over the new ADTs is
-complete at the analysis tier; B1a view analysis (the first ephemeral producer)
-is the next intended producer, but its lexical-provenance representation must be
-resolved without forging runtime region IDs before it can unblock T0.2. The
+was producer-gated until B1a supplied the first real ephemeral value. The
+regionless view producer and shared typed-value classification now land
+together without forging allocation-region IDs; future `AdmissionResult` and
+actor-call carrier kinds remain sealed until their exact producers exist. The
 sealed-boundary audit also moves B2b behind local aggregate mutation plus a real
 actor-state initialization/storage floor. T0.3 begins with type-only generic
 flat structures while the contradictory surface-region contract remains
