@@ -17,7 +17,7 @@ use crate::{
     seal_analysis_facts,
 };
 
-/// Decode and authenticate one canonical schema-v12 image report.
+/// Decode and authenticate one canonical schema-v13 image report.
 ///
 /// The caller supplies the build identity expected at this trust boundary and
 /// all resource ceilings. The decoded facts are resealed through the same
@@ -1460,6 +1460,26 @@ mod tests {
                     depends_on: Vec::new(),
                     why_chain: vec!["one owner".to_owned()],
                 },
+                ProofFact {
+                    id: 2,
+                    category: "region-bound".to_owned(),
+                    subject: "alloc:0:actor-state".to_owned(),
+                    result: "proved".to_owned(),
+                    bound: Some(1),
+                    sources: Vec::new(),
+                    depends_on: Vec::new(),
+                    why_chain: vec!["bounded promotion".to_owned()],
+                },
+                ProofFact {
+                    id: 3,
+                    category: "region-bound".to_owned(),
+                    subject: "alloc:4:pool-slot".to_owned(),
+                    result: "proved".to_owned(),
+                    bound: Some(1),
+                    sources: Vec::new(),
+                    depends_on: Vec::new(),
+                    why_chain: vec!["bounded promotion".to_owned()],
+                },
             ],
             actor_lowerings: vec![ActorLoweringFact {
                 source: "actor:0:alpha".to_owned(),
@@ -1531,18 +1551,18 @@ mod tests {
             ],
             promotions: vec![
                 PromotionFact {
-                    allocation: "alloc:6:buffer".to_owned(),
+                    allocation: "alloc:0:actor-state".to_owned(),
                     source_region: RegionClass::TaskFrame,
                     destination_region: RegionClass::Image,
                     reason: "escapes through `self.pending`".to_owned(),
-                    proof: 0,
+                    proof: 2,
                 },
                 PromotionFact {
-                    allocation: "alloc:7:log\\雪".to_owned(),
+                    allocation: "alloc:4:pool-slot".to_owned(),
                     source_region: RegionClass::Call,
                     destination_region: RegionClass::Pool,
                     reason: "moved into durable pool 雪".to_owned(),
-                    proof: 1,
+                    proof: 3,
                 },
             ],
             image_edges: vec![ImageEdgeFact {
@@ -1813,15 +1833,15 @@ mod tests {
     #[test]
     fn schema_scalar_enum_and_json_structure_mutations_fail_closed() {
         let json = full_report(ActorLoweringKind::Queued, OptimizationAction::Retained).to_json();
-        let schema = json.replacen("\"schema\":12", "\"schema\":13", 1);
+        let schema = json.replacen("\"schema\":13", "\"schema\":14", 1);
         assert_eq!(
             decode(schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(13))
+            Err(ReportError::UnsupportedSchema(14))
         );
-        let stale_schema = json.replacen("\"schema\":12", "\"schema\":11", 1);
+        let stale_schema = json.replacen("\"schema\":13", "\"schema\":12", 1);
         assert_eq!(
             decode(stale_schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(11))
+            Err(ReportError::UnsupportedSchema(12))
         );
 
         let oversized_u32 = json.replacen(

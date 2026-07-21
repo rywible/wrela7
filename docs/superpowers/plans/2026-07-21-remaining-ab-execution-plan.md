@@ -141,7 +141,8 @@ algebraic data types. Key symbols (re-grep for exact lines; they move):
   awaited-`ActorRequest` branch in `analyze_wait_graph` currently hard-errors
   `RequestMismatch` (unreachable today) — that is the **B5c integration point**.
 - **B2a**: `RegionAssignmentFact` / `PromotionFact` in
-  `crates/wrela-image-report` (schema v12), **producer empty** (that's B2b).
+  `crates/wrela-image-report` (schema v13 after exact identity/proof sealing),
+  **producer empty** (that's B2b).
 
 ### Known walls (verified this session; cite when scoping)
 - Views: `TypeExpressionKind::View` exists; `semantic-view-escape`

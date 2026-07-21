@@ -119,7 +119,7 @@ These are dispatched or landable immediately; none needs Tier 0.
 |---|---|---|
 | B1a | View/projection static semantics (provenance, lexical lifetime, disjointness; named negatives) | **B1a.1 landed in this slice** — separate bounded lexical provenance uses exact HIR `ParameterId`s rather than fabricated `RegionId`s; bare-view declarations prove exact-one-yield path shape and mutable-source legality. Projection calls, view values/binding/consumption, lifetime/disjointness diagnostics, carrier rebound, and lowering remain open. |
 | B5b | Unified wait-for graph + `wait-cycle`/self-wait diagnostics | **running** |
-| B2a | Promotion/region report schema (`PromotionFact`/`RegionAssignmentFact`) | **running** |
+| B2a | Promotion/region report schema (`PromotionFact`/`RegionAssignmentFact`) | **landed + hardened** |
 | B4a | `with`/scope sema analysis: cleanup DAG + `CleanupAcyclic` + cycle diagnostic | **dispatching** |
 
 Lane A front-ends that are likely Tier 1 (need a surface-verification pass before
@@ -185,7 +185,7 @@ D2 need this scope substantially complete; B10 needs F5.
 
 | Tier | Slice | Deps | Status |
 |---|---|---|---|
-| 1 | B2a promotion/region report schema | — | **landed** 3eb2cb69 |
+| 1 | B2a promotion/region report schema | — | **landed** 3eb2cb69; follow-up sealing requires canonical allocation identities, authenticated dense promotion proofs, and empty producer vectors until B2b is reachable |
 | 1 | B5b wait-for graph + diagnostics | — | **landed** 3e216d38 |
 | 1 | B1a view/provenance semantics | lexical provenance model | **B1a.3 direct-root disjointness landed in this slice** — B1a.2's regionless straight-line `LexicalView` now enforces symmetric access exclusion: shared/shared views may coexist, while any live mutable view excludes later access to the same direct named root; distinct roots and post-terminal reborrows remain legal (`live_mut_projection_excludes_later_read_projection`, `shared_projection_views_may_coexist_on_one_source`, `projection_views_on_distinct_roots_may_overlap`, `projection_root_may_be_reborrowed_after_mut_view_terminal_use`). Full sealing independently rejects forged overlapping exclusive intervals. Receiver/wrapped/generic projections, mutation through views, structured control-flow liveness, projected-path disjointness, general ephemeral legality, and lowering remain fail-closed. |
 | 1 | B4a cleanup DAG sema analysis | — | **landed** 43d3e279 — free-call scope protocols/calls, lexical activations, reverse-source cleanup DAG + `CleanupAcyclic`, synthetic cycle detector, and named await/receiver/outside-`with` rejections; pass-only cleanup bodies and no lowering (`semantic-with-cleanup-lowering-pending`) |

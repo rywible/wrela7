@@ -977,14 +977,15 @@ it. It injects phase implementations and bounded host capabilities, while
   `RegionAssignmentFact` records one allocation's assigned `RegionClass` (image,
   task-frame, call, request, pool, or static), and a `PromotionFact` records one
   promoted allocation's identity, source and destination region, reason, and the
-  dense proof reference. Both are canonicalized, deduplicated, item/payload
-  bounded, cancellation-aware, and round-trip through canonical JSON and the
-  decoder; a promotion between identical regions or with an empty identity or
-  reason is rejected. These two arrays are appended to the analysis section
-  ahead of their producer: the compiler frontend does not yet populate them
-  (that is Lane B task B2b), so ordinary builds leave both empty. Adding them
-  bumped the report schema from 11 to 12; the decoder gates on the exact
-  version, and existing v11 fields are unchanged.
+  dense proof reference. Assignment identities form a unique dense
+  `alloc:<u32>:<name>` set. Every promotion joins to the same allocation's final
+  assignment and to an exact `region-bound`/`proved` proof whose subject is that
+  allocation and whose finite bound is nonzero. Both vectors are canonicalized,
+  item/payload bounded, cancellation-aware, and round-trip through canonical
+  JSON and the decoder. The compiler frontend does not yet populate them (Lane
+  B task B2b), so ordinary builds leave both empty. Adding the arrays produced
+  schema v12; exact identity/assignment/proof sealing bumps 12 to 13. The decoder
+  accepts only the exact current version.
 - Consumer needs met: the report exposes logical image topology and physical
   lowering, bounds, proof why-chains, actor paths, stack/frame/work/checkpoints,
   hardware/recovery, startup/shutdown, all IR/ABI versions, runtime intrinsics,

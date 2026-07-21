@@ -12,12 +12,12 @@ pub use decode::decode_image_report_json;
 
 /// Current machine-readable report schema.
 ///
-/// Bumped 11 → 12 when whole-image region inference facts (`RegionAssignmentFact`
-/// and `PromotionFact`) were added to the sealed analysis section. The decoder
-/// gates on this exact value, so a v11 report is rejected as
-/// [`ReportError::UnsupportedSchema`]; existing v11 fields are unchanged and the
-/// two new arrays are appended, never reflowed into, the analysis section.
-pub const REPORT_SCHEMA_VERSION: u32 = 12;
+/// Version 12 added whole-image region inference facts (`RegionAssignmentFact`
+/// and `PromotionFact`) to the sealed analysis section. Version 13 makes their
+/// allocation identities, final-region join, and bounded proof join exact. The
+/// decoder gates on this exact value, so every older representation is rejected
+/// as [`ReportError::UnsupportedSchema`].
+pub const REPORT_SCHEMA_VERSION: u32 = 13;
 
 const CURRENT_SEMANTIC_WIR_VERSION: u32 = 8;
 const CURRENT_FLOW_WIR_VERSION: u32 = 10;
@@ -165,9 +165,12 @@ impl RegionClass {
 /// One allocation's inferred region assignment (ch03 §7 region inference).
 ///
 /// Records the allocation identity and the exact region class inference placed
-/// it in. The producer that fills this from whole-image analysis is wired
-/// separately (Lane B task B2b); this schema records the fact ahead of that
-/// producer, so ordinary builds leave the vector empty.
+/// it in. Allocation identities use the canonical producer form
+/// `alloc:<dense-u32-id>:<nonempty-name>`. IDs are dense and unique across the
+/// assignment vector. The producer that fills this from
+/// whole-image analysis is wired separately (Lane B task B2b); this schema
+/// records the fact ahead of that producer, so ordinary builds leave the vector
+/// empty.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RegionAssignmentFact {
     pub allocation: String,
@@ -181,9 +184,10 @@ pub struct RegionAssignmentFact {
 /// into a wider region, and only when doing so stays statically bounded. This
 /// retains what §8 requires a promotion to record: the promoted allocation, the
 /// region it was promoted from, the region it was promoted into, the
-/// human-readable reason (the why-chain summary), and the dense `FlowWir` proof
-/// establishing the promotion is bounded. Like [`RegionAssignmentFact`] the
-/// producer is B2b; ordinary builds leave the vector empty.
+/// human-readable reason (the why-chain summary), and an authenticated dense
+/// `FlowWir` proof ID establishing the promotion is bounded. Like
+/// [`RegionAssignmentFact`] the producer is B2b; ordinary builds leave the
+/// vector empty.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PromotionFact {
     pub allocation: String,
@@ -1991,18 +1995,66 @@ fn validate_analysis(
             return Err(ReportError::InvalidFact);
         }
     }
+    let assignment_count = u32::try_from(analysis.region_assignments.len())
+        .map_err(|_| ReportError::MeasurementOverflow)?;
+    let mut allocation_ids = Vec::new();
+    allocation_ids
+        .try_reserve_exact(analysis.region_assignments.len())
+        .map_err(|_| ReportError::ResourceLimit {
+            resource: "region assignment validation index",
+            limit: u64::from(assignment_count),
+        })?;
+    allocation_ids.resize(analysis.region_assignments.len(), false);
+    let mut prior_allocation: Option<&str> = None;
     for fact in &analysis.region_assignments {
-        if !nonempty(&fact.allocation, is_cancelled)? {
+        if is_cancelled() {
+            return Err(ReportError::Cancelled);
+        }
+        let Some(allocation_id) =
+            canonical_named_identity_id(&fact.allocation, "alloc", is_cancelled)?
+        else {
+            return Err(ReportError::InvalidFact);
+        };
+        let allocation_index =
+            usize::try_from(allocation_id).map_err(|_| ReportError::MeasurementOverflow)?;
+        if allocation_id >= assignment_count
+            || allocation_ids
+                .get(allocation_index)
+                .copied()
+                .unwrap_or(true)
+            || prior_allocation == Some(fact.allocation.as_str())
+        {
             return Err(ReportError::InvalidFact);
         }
+        allocation_ids[allocation_index] = true;
+        prior_allocation = Some(&fact.allocation);
     }
     for fact in &analysis.promotions {
         // A promotion moves an allocation between two distinct regions with a
         // stated reason. A same-region "promotion" or an empty identity/reason
         // is not a promotion the report can carry.
-        if !nonempty(&fact.allocation, is_cancelled)?
+        let proof = usize::try_from(fact.proof)
+            .ok()
+            .and_then(|proof| analysis.proofs.get(proof));
+        let assignment = analysis
+            .region_assignments
+            .binary_search_by(|assignment| assignment.allocation.cmp(&fact.allocation))
+            .ok()
+            .and_then(|index| analysis.region_assignments.get(index));
+        if !canonical_named_identity(&fact.allocation, "alloc", is_cancelled)?
             || !nonempty(&fact.reason, is_cancelled)?
             || fact.source_region == fact.destination_region
+            || assignment.is_none_or(|assignment| {
+                assignment.allocation != fact.allocation
+                    || assignment.region_class != fact.destination_region
+            })
+            || proof.is_none_or(|proof| {
+                proof.id != fact.proof
+                    || proof.category != "region-bound"
+                    || proof.subject != fact.allocation
+                    || proof.result != "proved"
+                    || proof.bound.is_none_or(|bound| bound == 0)
+            })
         {
             return Err(ReportError::InvalidFact);
         }
@@ -3861,7 +3913,7 @@ mod tests {
         };
         let sealed = seal_analysis_facts(request, facts.clone(), &|| false)
             .expect("exact actor/task/region graph limit");
-        assert_eq!(super::REPORT_SCHEMA_VERSION, 12);
+        assert_eq!(super::REPORT_SCHEMA_VERSION, 13);
         assert_eq!(sealed.as_facts().image_nodes.len(), 8);
         assert_eq!(sealed.as_facts().region_capacity_evidence.len(), 5);
         assert_eq!(sealed.as_facts().activation_frame_evidence.len(), 2);
@@ -3883,7 +3935,7 @@ mod tests {
             BackendFactLimits::standard(),
             &|| false,
         )
-        .expect("schema-v12 activation report");
+        .expect("schema-v13 activation report");
         let json = report.to_json();
         assert!(json.contains("\"activation_frame_evidence\":[{"));
         assert!(json.contains("\"kind\":\"actor-activation-frame-region\""));
@@ -3897,7 +3949,7 @@ mod tests {
                 u64::try_from(json.len()).expect("bounded activation report bytes"),
                 &|| false,
             )
-            .expect("decode exact schema-v12 activation evidence"),
+            .expect("decode exact schema-v13 activation evidence"),
             report
         );
         let corrupt_cancellation = json.replacen(
@@ -4501,7 +4553,7 @@ mod tests {
         let digest = Sha256Digest::from_bytes([0x67; 32]);
         let minimum = assemble(digest, AnalysisFacts::default(), backend(digest))
             .expect("minimum one-block DIR64 relocation evidence");
-        assert_eq!(minimum.schema(), 12);
+        assert_eq!(minimum.schema(), 13);
         assert_eq!(minimum.backend().relocation_directory_bytes, 12);
         assert_eq!(minimum.backend().base_relocation_blocks, 1);
         assert_eq!(minimum.backend().base_relocation_dir64_count, 1);
@@ -4872,9 +4924,23 @@ mod tests {
 
     fn region_fact_base() -> AnalysisFacts {
         AnalysisFacts {
+            proofs: vec![region_proof(0, "alloc:0:buffer")],
             startup_order: vec!["only".to_owned()],
             shutdown_order: vec!["only".to_owned()],
             ..AnalysisFacts::default()
+        }
+    }
+
+    fn region_proof(id: u32, allocation: &str) -> ProofFact {
+        ProofFact {
+            id,
+            category: "region-bound".to_owned(),
+            subject: allocation.to_owned(),
+            result: "proved".to_owned(),
+            bound: Some(1),
+            sources: Vec::new(),
+            depends_on: Vec::new(),
+            why_chain: vec!["bounded whole-image region inference".to_owned()],
         }
     }
 
@@ -4882,6 +4948,23 @@ mod tests {
     fn region_assignment_and_promotion_facts_round_trip_canonically_and_encode_identically() {
         let digest = Sha256Digest::from_bytes([0x71; 32]);
         let mut facts = region_fact_base();
+        facts.proofs = [
+            "alloc:0:actor-state",
+            "alloc:1:frame-live",
+            "alloc:2:scratch",
+            "alloc:3:req-buffer",
+            "alloc:4:pool-slot",
+            "alloc:5:baked-table",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(id, allocation)| {
+            region_proof(
+                u32::try_from(id).expect("bounded proof fixture"),
+                allocation,
+            )
+        })
+        .collect();
         // Deliberately out of canonical order so sealing must sort both vectors.
         facts.region_assignments = vec![
             RegionAssignmentFact {
@@ -4911,23 +4994,23 @@ mod tests {
         ];
         facts.promotions = vec![
             PromotionFact {
-                allocation: "buffer\\雪".to_owned(),
+                allocation: "alloc:2:scratch".to_owned(),
                 source_region: RegionClass::TaskFrame,
-                destination_region: RegionClass::Image,
+                destination_region: RegionClass::Call,
                 reason: "escapes through `self.pending`".to_owned(),
-                proof: 3,
+                proof: 2,
             },
             PromotionFact {
-                allocation: "alloc:0:cursor".to_owned(),
+                allocation: "alloc:4:pool-slot".to_owned(),
                 source_region: RegionClass::Call,
                 destination_region: RegionClass::Pool,
                 reason: "moved into durable pool".to_owned(),
-                proof: 1,
+                proof: 4,
             },
         ];
         let digest_build = build(digest);
         let report = assemble(digest, facts, backend(digest)).expect("assemble region report");
-        assert_eq!(report.schema(), 12);
+        assert_eq!(report.schema(), 13);
         // Canonicalization sorted both vectors by their derived total order.
         assert_eq!(
             report
@@ -4952,7 +5035,7 @@ mod tests {
                 .iter()
                 .map(|fact| fact.allocation.as_str())
                 .collect::<Vec<_>>(),
-            ["alloc:0:cursor", "buffer\\雪"]
+            ["alloc:2:scratch", "alloc:4:pool-slot"]
         );
         let json = report.to_json();
         // Both arrays are present with all six region-class spellings and the promotion shape.
@@ -4973,7 +5056,7 @@ mod tests {
             );
         }
         assert!(json.contains(
-            "\"promotions\":[{\"allocation\":\"alloc:0:cursor\",\"source_region\":\"call\",\"destination_region\":\"pool\",\"reason\":\"moved into durable pool\",\"proof\":1}"
+            "\"promotions\":[{\"allocation\":\"alloc:2:scratch\",\"source_region\":\"task-frame\",\"destination_region\":\"call\",\"reason\":\"escapes through `self.pending`\",\"proof\":2}"
         ));
         // Repeat encode of the same validated report is byte-identical.
         assert_eq!(report.to_json(), json);
@@ -5014,18 +5097,52 @@ mod tests {
         }];
         reject(empty_assignment_allocation);
 
+        let mut noncanonical_assignment_allocation = region_fact_base();
+        noncanonical_assignment_allocation.region_assignments = vec![RegionAssignmentFact {
+            allocation: "allocation:0:buffer".to_owned(),
+            region_class: RegionClass::Image,
+        }];
+        reject(noncanonical_assignment_allocation);
+
+        let mut unnamed_assignment_allocation = region_fact_base();
+        unnamed_assignment_allocation.region_assignments = vec![RegionAssignmentFact {
+            allocation: "alloc:0".to_owned(),
+            region_class: RegionClass::Image,
+        }];
+        reject(unnamed_assignment_allocation);
+
         let mut duplicate_assignment = region_fact_base();
         duplicate_assignment.region_assignments = vec![
             RegionAssignmentFact {
-                allocation: "alloc:0".to_owned(),
+                allocation: "alloc:0:buffer".to_owned(),
                 region_class: RegionClass::Image,
             },
             RegionAssignmentFact {
-                allocation: "alloc:0".to_owned(),
+                allocation: "alloc:0:buffer".to_owned(),
                 region_class: RegionClass::Image,
             },
         ];
         reject(duplicate_assignment);
+
+        let mut gapped_assignment = region_fact_base();
+        gapped_assignment.region_assignments = vec![RegionAssignmentFact {
+            allocation: "alloc:1:buffer".to_owned(),
+            region_class: RegionClass::Image,
+        }];
+        reject(gapped_assignment);
+
+        let mut reused_assignment_id = region_fact_base();
+        reused_assignment_id.region_assignments = vec![
+            RegionAssignmentFact {
+                allocation: "alloc:0:first".to_owned(),
+                region_class: RegionClass::Image,
+            },
+            RegionAssignmentFact {
+                allocation: "alloc:0:second".to_owned(),
+                region_class: RegionClass::Call,
+            },
+        ];
+        reject(reused_assignment_id);
 
         let mut empty_promotion_allocation = region_fact_base();
         empty_promotion_allocation.promotions = vec![PromotionFact {
@@ -5039,7 +5156,7 @@ mod tests {
 
         let mut empty_promotion_reason = region_fact_base();
         empty_promotion_reason.promotions = vec![PromotionFact {
-            allocation: "alloc:0".to_owned(),
+            allocation: "alloc:0:buffer".to_owned(),
             source_region: RegionClass::Call,
             destination_region: RegionClass::Image,
             reason: String::new(),
@@ -5049,13 +5166,65 @@ mod tests {
 
         let mut same_region_promotion = region_fact_base();
         same_region_promotion.promotions = vec![PromotionFact {
-            allocation: "alloc:0".to_owned(),
+            allocation: "alloc:0:buffer".to_owned(),
             source_region: RegionClass::Image,
             destination_region: RegionClass::Image,
             reason: "no-op".to_owned(),
             proof: 0,
         }];
         reject(same_region_promotion);
+
+        let mut noncanonical_promotion_allocation = region_fact_base();
+        noncanonical_promotion_allocation.promotions = vec![PromotionFact {
+            allocation: "alloc:00:buffer".to_owned(),
+            source_region: RegionClass::Call,
+            destination_region: RegionClass::Image,
+            reason: "escapes".to_owned(),
+            proof: 0,
+        }];
+        reject(noncanonical_promotion_allocation);
+
+        let mut foreign_promotion_proof = region_fact_base();
+        foreign_promotion_proof.promotions = vec![PromotionFact {
+            allocation: "alloc:0:buffer".to_owned(),
+            source_region: RegionClass::Call,
+            destination_region: RegionClass::Image,
+            reason: "escapes".to_owned(),
+            proof: 1,
+        }];
+        reject(foreign_promotion_proof);
+
+        let valid_promotion_facts = || {
+            let mut facts = region_fact_base();
+            facts.region_assignments = vec![RegionAssignmentFact {
+                allocation: "alloc:0:buffer".to_owned(),
+                region_class: RegionClass::Image,
+            }];
+            facts.promotions = vec![PromotionFact {
+                allocation: "alloc:0:buffer".to_owned(),
+                source_region: RegionClass::Call,
+                destination_region: RegionClass::Image,
+                reason: "escapes".to_owned(),
+                proof: 0,
+            }];
+            facts
+        };
+
+        let mut wrong_promotion_destination = valid_promotion_facts();
+        wrong_promotion_destination.promotions[0].destination_region = RegionClass::Pool;
+        reject(wrong_promotion_destination);
+
+        let mut wrong_promotion_category = valid_promotion_facts();
+        wrong_promotion_category.proofs[0].category = "unrelated".to_owned();
+        reject(wrong_promotion_category);
+
+        let mut wrong_promotion_subject = valid_promotion_facts();
+        wrong_promotion_subject.proofs[0].subject = "alloc:0:other".to_owned();
+        reject(wrong_promotion_subject);
+
+        let mut unbounded_promotion = valid_promotion_facts();
+        unbounded_promotion.proofs[0].bound = None;
+        reject(unbounded_promotion);
     }
 
     #[test]
@@ -5063,11 +5232,11 @@ mod tests {
         let digest = Sha256Digest::from_bytes([0x73; 32]);
         let mut facts = region_fact_base();
         facts.region_assignments = vec![RegionAssignmentFact {
-            allocation: "alloc:0:actor-state".to_owned(),
+            allocation: "alloc:0:buffer".to_owned(),
             region_class: RegionClass::Image,
         }];
         facts.promotions = vec![PromotionFact {
-            allocation: "alloc:1:buffer".to_owned(),
+            allocation: "alloc:0:buffer".to_owned(),
             source_region: RegionClass::TaskFrame,
             destination_region: RegionClass::Image,
             reason: "escapes through `self.pending`".to_owned(),

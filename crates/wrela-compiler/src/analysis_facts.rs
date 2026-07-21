@@ -2266,6 +2266,12 @@ fn projection_matches(
             && proofs_match
             && facts.actor_lowerings.is_empty()
             && actor_facts_match
+            // Region inference and promotion remain producer-empty in this
+            // projection. The public report sealer validates their shape, but
+            // cannot authenticate them against semantic facts until B2b wires
+            // the producer, so any caller-supplied row must fail closed here.
+            && facts.region_assignments.is_empty()
+            && facts.promotions.is_empty()
             && work_matches
             && facts.hardware.is_empty()
             && facts.recovery.is_empty()
@@ -4356,6 +4362,8 @@ pub fn boot() -> Image:
         assert!(facts.actor_lowerings.is_empty());
         assert!(facts.image_nodes.is_empty());
         assert!(facts.image_edges.is_empty());
+        assert!(facts.region_assignments.is_empty());
+        assert!(facts.promotions.is_empty());
         assert!(facts.hardware.is_empty());
         assert!(facts.recovery.is_empty());
         assert!(facts.compiled_test_group.is_none());
@@ -4431,6 +4439,64 @@ pub fn boot() -> Image:
                     limits,
                 },
                 wrong_reachability,
+                &|| false,
+            ),
+            Err(AnalysisFactAssemblyError::InvalidSemanticFacts(_))
+        ));
+
+        let mut forged_region_assignment = baseline.clone();
+        forged_region_assignment.region_assignments =
+            vec![wrela_image_report::RegionAssignmentFact {
+                allocation: "alloc:0:forged".to_owned(),
+                region_class: wrela_image_report::RegionClass::Image,
+            }];
+        assert!(matches!(
+            seal_projection(
+                &projection,
+                ReportRequest {
+                    build: &semantic.build,
+                    image_name: &graph.name,
+                    limits,
+                },
+                forged_region_assignment,
+                &|| false,
+            ),
+            Err(AnalysisFactAssemblyError::InvalidSemanticFacts(_))
+        ));
+
+        let mut forged_promotion = baseline.clone();
+        forged_promotion.region_assignments = vec![wrela_image_report::RegionAssignmentFact {
+            allocation: "alloc:0:forged".to_owned(),
+            region_class: wrela_image_report::RegionClass::Image,
+        }];
+        forged_promotion.proofs.push(wrela_image_report::ProofFact {
+            id: u32::try_from(forged_promotion.proofs.len())
+                .expect("bounded projection proof fixture"),
+            category: "region-bound".to_owned(),
+            subject: "alloc:0:forged".to_owned(),
+            result: "proved".to_owned(),
+            bound: Some(1),
+            sources: Vec::new(),
+            depends_on: Vec::new(),
+            why_chain: vec!["forged bounded promotion".to_owned()],
+        });
+        forged_promotion.promotions = vec![wrela_image_report::PromotionFact {
+            allocation: "alloc:0:forged".to_owned(),
+            source_region: wrela_image_report::RegionClass::Call,
+            destination_region: wrela_image_report::RegionClass::Image,
+            reason: "forged escape".to_owned(),
+            proof: u32::try_from(forged_promotion.proofs.len() - 1)
+                .expect("bounded projection proof fixture"),
+        }];
+        assert!(matches!(
+            seal_projection(
+                &projection,
+                ReportRequest {
+                    build: &semantic.build,
+                    image_name: &graph.name,
+                    limits,
+                },
+                forged_promotion,
                 &|| false,
             ),
             Err(AnalysisFactAssemblyError::InvalidSemanticFacts(_))
