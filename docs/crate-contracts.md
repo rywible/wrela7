@@ -466,6 +466,13 @@ it. It injects phase implementations and bounded host capabilities, while
   Validation joins the prior aggregate's struct type, selected field, inserted
   value type, and single result of the unchanged aggregate type; FlowWir v10
   preserves the same operation and independently repeats that join.
+- MachineWir v11 retains same-block nongeneric flat values with two or more
+  primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
+  `InsertField`, and `ExtractField` carry exact SSA joins through independent
+  validation, equality, and resource metering; LLVM renders them with
+  first-class `insertvalue`/`extractvalue`. One-field `u64` structs retain the
+  established erased bitcast representation. Aggregate function/block
+  boundaries, packed/empty/non-flat structs, and nested aggregates fail closed.
 - The current schema retains the exact compiled `FullImageTestGroup`, including its
   plan identity, generated-harness function keys or declared-image/scenario
   binding, descriptors, seed, and execution policy. Validation joins generated
@@ -778,7 +785,8 @@ it. It injects phase implementations and bounded host capabilities, while
   added blocks/case/return edges before construction, recanonicalizes dense
   instruction IDs after expansion, and polls cancellation during every new
   scan. The separate closed actor slice accepts exactly the version-7
-  one-actor/one-task immediate-unit-helper contract above. Richer aggregates,
+  one-actor/one-task immediate-unit-helper contract above. Aggregate values are
+  additionally limited to same-block flat primitive-scalar locals; richer aggregates,
   ownership operations, mailbox/actor-method dispatch, multi-slot or recurring
   task scheduling, device operations, interrupt functions, and dynamic test
   payloads fail explicitly with `UnsupportedInput` until their exact lowering

@@ -159,11 +159,20 @@ fn validate_resources(
     for (index, ty) in machine.types.iter().enumerate() {
         check_periodically(index, is_cancelled)?;
         add_text(&mut measurement_bytes, ty.source_name.as_deref())?;
-        if let MachineTypeKind::Function { parameters, .. } = &ty.kind {
-            for (parameter_index, _) in parameters.iter().enumerate() {
-                check_periodically(parameter_index, is_cancelled)?;
+        match &ty.kind {
+            MachineTypeKind::Function { parameters, .. } => {
+                for (parameter_index, _) in parameters.iter().enumerate() {
+                    check_periodically(parameter_index, is_cancelled)?;
+                }
+                edges = checked_add(edges, parameters.len(), "model edges")?;
             }
-            edges = checked_add(edges, parameters.len(), "model edges")?;
+            MachineTypeKind::Struct { fields, .. } => {
+                for (field_index, _) in fields.iter().enumerate() {
+                    check_periodically(field_index, is_cancelled)?;
+                }
+                edges = checked_add(edges, fields.len(), "model edges")?;
+            }
+            _ => {}
         }
     }
     for (index, section) in machine.sections.iter().enumerate() {
@@ -265,6 +274,7 @@ fn validate_scalar_surface(
         check_cancelled(is_cancelled)?;
         if !supported_scalar_type(&ty.kind, ty.size, ty.alignment)
             && !supported_enum_type(machine, ty.id)
+            && !supported_struct_type(machine, ty.id)
             && !supported_static_byte_array(machine, ty.id)
             && !supported_passive_function_type(machine, ty.id, is_cancelled)?
         {
@@ -1286,6 +1296,10 @@ fn validate_operation(
         | MachineOperation::IntegerCompare { .. }
         | MachineOperation::FloatCompare { .. }
         | MachineOperation::Select { .. }
+        | MachineOperation::Copy { .. }
+        | MachineOperation::MakeStruct { .. }
+        | MachineOperation::InsertField { .. }
+        | MachineOperation::ExtractField { .. }
         | MachineOperation::MakeEnum { .. }
         | MachineOperation::EnumTag { .. }
         | MachineOperation::EnumPayload { .. }
@@ -1836,6 +1850,56 @@ fn supported_enum_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeI
         && size == Some(ty.size)
 }
 
+fn supported_struct_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeId) -> bool {
+    supported_struct_layout(&machine.types, id)
+}
+
+fn supported_struct_layout(types: &[wrela_machine_wir::MachineType], id: MachineTypeId) -> bool {
+    let Some(ty) = types.get(id.0 as usize) else {
+        return false;
+    };
+    let MachineTypeKind::Struct {
+        fields,
+        packed: false,
+    } = &ty.kind
+    else {
+        return false;
+    };
+    if fields.len() < 2 {
+        return false;
+    }
+    let mut end = 0_u64;
+    let mut alignment = 1_u32;
+    for field in fields {
+        let Some(field_ty) = types.get(field.ty.0 as usize) else {
+            return false;
+        };
+        let field_alignment = u64::from(field_ty.alignment);
+        let Some(expected_offset) = end
+            .checked_add(field_alignment - 1)
+            .map(|offset| offset & !(field_alignment - 1))
+        else {
+            return false;
+        };
+        if !supported_scalar_type(&field_ty.kind, field_ty.size, field_ty.alignment)
+            || matches!(field_ty.kind, MachineTypeKind::Void)
+            || field.offset != expected_offset
+        {
+            return false;
+        }
+        let Some(next) = field.offset.checked_add(field_ty.size) else {
+            return false;
+        };
+        end = next;
+        alignment = alignment.max(field_ty.alignment);
+    }
+    let aggregate_alignment = u64::from(alignment);
+    let expected_size = end
+        .checked_add(aggregate_alignment - 1)
+        .map(|size| size & !(aggregate_alignment - 1));
+    ty.alignment == alignment && expected_size == Some(ty.size)
+}
+
 fn supported_passive_function_type(
     machine: &wrela_machine_wir::MachineWir,
     ty: MachineTypeId,
@@ -2032,10 +2096,14 @@ fn operation_edges(operation: &MachineOperation) -> usize {
         MachineOperation::Unary { .. }
         | MachineOperation::Convert { .. }
         | MachineOperation::CheckedConvert { .. }
+        | MachineOperation::Copy { .. }
         | MachineOperation::MakeEnum { .. }
         | MachineOperation::EnumTag { .. }
         | MachineOperation::EnumPayload { .. }
+        | MachineOperation::ExtractField { .. }
         | MachineOperation::TestAssert { .. } => 1,
+        MachineOperation::MakeStruct { fields, .. } => fields.len(),
+        MachineOperation::InsertField { .. } => 2,
         MachineOperation::ActorCommit { .. } => 1,
         MachineOperation::Arithmetic { .. }
         | MachineOperation::CheckedInteger { .. }
@@ -2217,13 +2285,58 @@ mod adversarial_tests {
 
     use super::{
         CodegenError, IncomingEdge, contains_non_whitespace, fallible_filled, poll_values,
-        sort_edges, terminator_edges, text_slices_equal, valid_name, validate_scalar_value_types,
-        value_slices_equal,
+        sort_edges, supported_struct_layout, terminator_edges, text_slices_equal, valid_name,
+        validate_scalar_value_types, value_slices_equal,
     };
     use wrela_machine_wir::{
-        BlockId, MachineTerminator, MachineType, MachineTypeId, MachineTypeKind, MachineValue,
-        ValueId,
+        BlockId, MachineField, MachineTerminator, MachineType, MachineTypeId, MachineTypeKind,
+        MachineValue, ValueId,
     };
+
+    #[test]
+    fn unpacked_struct_layout_rejects_a_crafted_aligned_gap() {
+        let scalar = MachineType {
+            id: MachineTypeId(0),
+            kind: MachineTypeKind::Integer { bits: 8 },
+            size: 1,
+            alignment: 1,
+            source_name: None,
+        };
+        let natural = MachineType {
+            id: MachineTypeId(1),
+            kind: MachineTypeKind::Struct {
+                fields: vec![
+                    MachineField {
+                        ty: MachineTypeId(0),
+                        offset: 0,
+                    },
+                    MachineField {
+                        ty: MachineTypeId(0),
+                        offset: 1,
+                    },
+                ],
+                packed: false,
+            },
+            size: 2,
+            alignment: 1,
+            source_name: None,
+        };
+        assert!(supported_struct_layout(
+            &[scalar.clone(), natural.clone()],
+            MachineTypeId(1)
+        ));
+
+        let mut gapped = natural;
+        let MachineTypeKind::Struct { fields, .. } = &mut gapped.kind else {
+            panic!("fixture struct type")
+        };
+        fields[1].offset = 7;
+        gapped.size = 8;
+        assert!(!supported_struct_layout(
+            &[scalar, gapped],
+            MachineTypeId(1)
+        ));
+    }
 
     #[test]
     fn scratch_tables_reject_limits_before_allocation() {

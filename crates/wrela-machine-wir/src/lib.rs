@@ -19,7 +19,7 @@ use wrela_target::{InterruptDomain, TargetError, TargetPackage};
 use wrela_test_model::{GuestTestOutcome, TestEvent, TestEventKind, TestId};
 use wrela_test_protocol::{CanonicalTestEventCodec, ProtocolLimits, TestEventCodec};
 
-pub const MACHINE_WIR_VERSION: u32 = 10;
+pub const MACHINE_WIR_VERSION: u32 = 11;
 pub const REGION_STORAGE_SECTION_PREFIX: &str = ".data$wrela$region$";
 pub const REGION_STORAGE_SYMBOL_PREFIX: &str = "__wrela_region_storage_";
 
@@ -480,6 +480,26 @@ pub enum MachineOperation {
         then_value: ValueId,
         else_value: ValueId,
     },
+    /// Construct one unpacked, target-laid-out struct value from its fields.
+    MakeStruct {
+        ty: MachineTypeId,
+        fields: Vec<ValueId>,
+    },
+    /// Replace one field while preserving every other field of an unpacked struct.
+    InsertField {
+        aggregate: ValueId,
+        field: u32,
+        value: ValueId,
+    },
+    /// Project one field from an unpacked struct value.
+    ExtractField {
+        aggregate: ValueId,
+        field: u32,
+    },
+    /// Preserve one first-class machine value without changing its representation.
+    Copy {
+        value: ValueId,
+    },
     /// Construct the canonical `{u8 tag, payload}` machine enum value.
     MakeEnum {
         ty: MachineTypeId,
@@ -716,7 +736,7 @@ pub struct MachineFunction {
     pub source: Option<Span>,
 }
 
-/// The only scheduler ownership admitted by MachineWir v10. An actor turn is
+/// The only scheduler ownership admitted by MachineWir v11. An actor turn is
 /// compiled but remains dormant until a real mailbox admission operation
 /// exists; a single-slot static task is invoked exactly once during startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1455,7 +1475,10 @@ fn meter_operation(
             Ok(0)
         }
         MachineOperation::Call { arguments, .. }
-        | MachineOperation::RuntimeCall { arguments, .. } => {
+        | MachineOperation::RuntimeCall { arguments, .. }
+        | MachineOperation::MakeStruct {
+            fields: arguments, ..
+        } => {
             meter.edge_slice(arguments)?;
             u64::try_from(arguments.len()).map_err(|_| ValidationFailure::ResourceLimit {
                 resource: "validation work",
@@ -1465,12 +1488,15 @@ fn meter_operation(
         MachineOperation::Unary { .. }
         | MachineOperation::Convert { .. }
         | MachineOperation::CheckedConvert { .. }
+        | MachineOperation::Copy { .. }
         | MachineOperation::Load { .. }
         | MachineOperation::GlobalAddress(_)
         | MachineOperation::StackAddress(_) => Ok(1),
         MachineOperation::MakeEnum { .. }
         | MachineOperation::EnumTag { .. }
-        | MachineOperation::EnumPayload { .. } => Ok(1),
+        | MachineOperation::EnumPayload { .. }
+        | MachineOperation::ExtractField { .. } => Ok(1),
+        MachineOperation::InsertField { .. } => Ok(2),
         MachineOperation::TestAssert { failure, .. } => {
             meter.payload(failure.expression.len())?;
             if let Some(message) = &failure.message {
@@ -2433,23 +2459,41 @@ fn validate_type(module: &MachineWir, ty: &MachineType, errors: &mut ValidationC
         MachineTypeKind::Array { element, .. } => {
             require_id("array element", element.0, module.types.len(), errors)
         }
-        MachineTypeKind::Struct { fields, .. } => {
-            let mut previous_end = 0;
+        MachineTypeKind::Struct { fields, packed } => {
+            let mut previous_end = 0_u64;
+            let mut aggregate_alignment = 1_u32;
             for field in fields {
                 if !errors.poll() {
                     return;
                 }
                 require_id("struct field type", field.ty.0, module.types.len(), errors);
                 if let Some(field_ty) = module.types.get(field.ty.0 as usize) {
+                    let field_alignment = if *packed { 1 } else { field_ty.alignment };
+                    let alignment = u64::from(field_alignment);
+                    let expected_offset = previous_end
+                        .checked_add(alignment - 1)
+                        .map(|offset| offset & !(alignment - 1));
                     let end = field.offset.checked_add(field_ty.size);
-                    if field.offset < previous_end || end.is_none_or(|end| end > ty.size) {
+                    if expected_offset != Some(field.offset) || end.is_none_or(|end| end > ty.size)
+                    {
                         errors.push(ValidationError::InvalidRecord {
                             kind: "struct field",
                             id: ty.id.0,
                         });
                     }
                     previous_end = end.unwrap_or(u64::MAX);
+                    aggregate_alignment = aggregate_alignment.max(field_alignment);
                 }
+            }
+            let alignment = u64::from(aggregate_alignment);
+            let expected_size = previous_end
+                .checked_add(alignment - 1)
+                .map(|size| size & !(alignment - 1));
+            if ty.alignment != aggregate_alignment || expected_size != Some(ty.size) {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "struct layout",
+                    id: ty.id.0,
+                });
             }
         }
         MachineTypeKind::TaggedEnum {
@@ -4913,12 +4957,18 @@ fn for_each_operation_value(
         MachineOperation::Unary { value, .. }
         | MachineOperation::Convert { value, .. }
         | MachineOperation::CheckedConvert { value, .. }
+        | MachineOperation::Copy { value }
         | MachineOperation::TestAssert {
             condition: value, ..
         } => visit(*value),
         MachineOperation::MakeEnum { payload: value, .. }
         | MachineOperation::EnumTag { value }
         | MachineOperation::EnumPayload { value } => visit(*value),
+        MachineOperation::MakeStruct { fields, .. } => fields.iter().copied().all(&mut visit),
+        MachineOperation::InsertField {
+            aggregate, value, ..
+        } => visit(*aggregate) && visit(*value),
+        MachineOperation::ExtractField { aggregate, .. } => visit(*aggregate),
         MachineOperation::Select {
             condition,
             then_value,
@@ -5110,6 +5160,7 @@ fn validate_operation(
             );
             checked_failure!(*failure, ScalarFailureKind::Conversion);
         }
+        MachineOperation::Copy { value } => value!(*value),
         MachineOperation::Select {
             condition,
             then_value,
@@ -5119,6 +5170,19 @@ fn validate_operation(
             value!(*then_value);
             value!(*else_value);
         }
+        MachineOperation::MakeStruct { ty, fields } => {
+            require_id("constructed struct type", ty.0, module.types.len(), errors);
+            for field in fields {
+                value!(*field);
+            }
+        }
+        MachineOperation::InsertField {
+            aggregate, value, ..
+        } => {
+            value!(*aggregate);
+            value!(*value);
+        }
+        MachineOperation::ExtractField { aggregate, .. } => value!(*aggregate),
         MachineOperation::MakeEnum { ty, payload, .. } => {
             require_id("constructed enum type", ty.0, module.types.len(), errors);
             value!(*payload);
@@ -5507,6 +5571,7 @@ fn validate_operation_types(
                     .is_some_and(|ty| checked_numeric_kind_matches(module, *source, ty))
                 && checked_numeric_kind_matches(module, *destination_kind, *destination)
         }
+        MachineOperation::Copy { value } => result_count == 1 && value_ty(*value) == result_ty(0),
         MachineOperation::Select {
             condition,
             then_value,
@@ -5516,6 +5581,51 @@ fn validate_operation_types(
                 && value_ty(*condition).is_some_and(|ty| is_bool(module, ty))
                 && same(*then_value, *else_value)
                 && value_ty(*then_value) == result_ty(0)
+        }
+        MachineOperation::MakeStruct { ty, fields } => {
+            result_count == 1
+                && result_ty(0) == Some(*ty)
+                && module.types.get(ty.0 as usize).is_some_and(|record| {
+                    matches!(&record.kind, MachineTypeKind::Struct {
+                        fields: expected,
+                        packed: false,
+                    } if expected.len() >= 2
+                        && expected.len() == fields.len()
+                        && expected.iter().zip(fields).all(|(field, value)| {
+                            value_ty(*value) == Some(field.ty)
+                        }))
+                })
+        }
+        MachineOperation::InsertField {
+            aggregate,
+            field,
+            value,
+        } => {
+            result_count == 1
+                && value_ty(*aggregate) == result_ty(0)
+                && value_ty(*aggregate)
+                    .and_then(|ty| module.types.get(ty.0 as usize))
+                    .and_then(|record| match &record.kind {
+                        MachineTypeKind::Struct {
+                            fields,
+                            packed: false,
+                        } => fields.get(*field as usize).map(|field| field.ty),
+                        _ => None,
+                    })
+                    .is_some_and(|expected| value_ty(*value) == Some(expected))
+        }
+        MachineOperation::ExtractField { aggregate, field } => {
+            result_count == 1
+                && value_ty(*aggregate)
+                    .and_then(|ty| module.types.get(ty.0 as usize))
+                    .and_then(|record| match &record.kind {
+                        MachineTypeKind::Struct {
+                            fields,
+                            packed: false,
+                        } => fields.get(*field as usize).map(|field| field.ty),
+                        _ => None,
+                    })
+                    .is_some_and(|expected| result_ty(0) == Some(expected))
         }
         MachineOperation::MakeEnum {
             ty,
@@ -7190,6 +7300,194 @@ mod tests {
         (module, target)
     }
 
+    fn native_struct_fixture() -> (MachineWir, TargetPackage) {
+        let (mut module, target) = fixture();
+        module.types.extend([
+            MachineType {
+                id: MachineTypeId(3),
+                kind: MachineTypeKind::Integer { bits: 32 },
+                size: 4,
+                alignment: 4,
+                source_name: Some("u32".to_owned()),
+            },
+            MachineType {
+                id: MachineTypeId(4),
+                kind: MachineTypeKind::Struct {
+                    fields: vec![
+                        MachineField {
+                            ty: MachineTypeId(3),
+                            offset: 0,
+                        },
+                        MachineField {
+                            ty: MachineTypeId(2),
+                            offset: 8,
+                        },
+                    ],
+                    packed: false,
+                },
+                size: 16,
+                alignment: 8,
+                source_name: Some("Pair".to_owned()),
+            },
+        ]);
+        let function = &mut module.functions[0];
+        function.values.extend([
+            MachineValue {
+                id: ValueId(4),
+                ty: MachineTypeId(3),
+                source_name: None,
+            },
+            MachineValue {
+                id: ValueId(5),
+                ty: MachineTypeId(2),
+                source_name: None,
+            },
+            MachineValue {
+                id: ValueId(6),
+                ty: MachineTypeId(4),
+                source_name: None,
+            },
+            MachineValue {
+                id: ValueId(7),
+                ty: MachineTypeId(4),
+                source_name: None,
+            },
+            MachineValue {
+                id: ValueId(8),
+                ty: MachineTypeId(2),
+                source_name: None,
+            },
+        ]);
+        function.blocks[0].instructions.extend([
+            MachineInstruction {
+                id: InstructionId(1),
+                results: vec![ValueId(4)],
+                operation: MachineOperation::Immediate(MachineImmediate::Integer {
+                    ty: MachineTypeId(3),
+                    bytes_le: vec![1, 0, 0, 0],
+                }),
+                source: None,
+            },
+            MachineInstruction {
+                id: InstructionId(2),
+                results: vec![ValueId(5)],
+                operation: MachineOperation::Immediate(MachineImmediate::Integer {
+                    ty: MachineTypeId(2),
+                    bytes_le: vec![2, 0, 0, 0, 0, 0, 0, 0],
+                }),
+                source: None,
+            },
+            MachineInstruction {
+                id: InstructionId(3),
+                results: vec![ValueId(6)],
+                operation: MachineOperation::MakeStruct {
+                    ty: MachineTypeId(4),
+                    fields: vec![ValueId(4), ValueId(5)],
+                },
+                source: None,
+            },
+            MachineInstruction {
+                id: InstructionId(4),
+                results: vec![ValueId(7)],
+                operation: MachineOperation::InsertField {
+                    aggregate: ValueId(6),
+                    field: 1,
+                    value: ValueId(5),
+                },
+                source: None,
+            },
+            MachineInstruction {
+                id: InstructionId(5),
+                results: vec![ValueId(8)],
+                operation: MachineOperation::ExtractField {
+                    aggregate: ValueId(7),
+                    field: 1,
+                },
+                source: None,
+            },
+        ]);
+        function.blocks[1].instructions[0].id = InstructionId(6);
+        (module, target)
+    }
+
+    #[test]
+    fn unpacked_struct_operations_validate_exact_field_types_and_layout() {
+        let (module, target) = native_struct_fixture();
+        module
+            .clone()
+            .validate_for_target(&target)
+            .expect("canonical unpacked struct operations");
+
+        let mut wrong_field = module.clone();
+        let MachineOperation::InsertField { field, .. } =
+            &mut wrong_field.functions[0].blocks[0].instructions[4].operation
+        else {
+            panic!("fixture field insertion")
+        };
+        *field = 0;
+        let errors = wrong_field
+            .validate_for_target(&target)
+            .expect_err("field value type substitution must fail");
+        assert!(errors.0.contains(&ValidationError::OperationTypeMismatch {
+            function: FunctionId(0),
+            instruction: InstructionId(4),
+        }));
+
+        let mut packed_module = module;
+        let MachineTypeKind::Struct { packed, .. } = &mut packed_module.types[4].kind else {
+            panic!("fixture struct type")
+        };
+        *packed = true;
+        assert!(
+            packed_module
+                .validate_for_target(&target)
+                .expect_err("packed struct operations stay unsupported")
+                .0
+                .contains(&ValidationError::OperationTypeMismatch {
+                    function: FunctionId(0),
+                    instruction: InstructionId(3),
+                })
+        );
+
+        let mut empty = native_struct_fixture().0;
+        empty.types[4].kind = MachineTypeKind::Struct {
+            fields: Vec::new(),
+            packed: false,
+        };
+        empty.types[4].size = 0;
+        empty.types[4].alignment = 1;
+        let make = &mut empty.functions[0].blocks[0].instructions[3];
+        make.operation = MachineOperation::MakeStruct {
+            ty: MachineTypeId(4),
+            fields: Vec::new(),
+        };
+        assert!(
+            empty
+                .validate_for_target(&target)
+                .expect_err("empty first-class struct construction must fail")
+                .0
+                .contains(&ValidationError::OperationTypeMismatch {
+                    function: FunctionId(0),
+                    instruction: InstructionId(3),
+                })
+        );
+
+        let mut gapped = native_struct_fixture().0;
+        let MachineTypeKind::Struct { fields, .. } = &mut gapped.types[4].kind else {
+            panic!("fixture struct type")
+        };
+        fields[1].ty = MachineTypeId(3);
+        fields[1].offset = 8;
+        gapped.types[4].alignment = 4;
+        let errors = gapped
+            .validate_for_target(&target)
+            .expect_err("unpacked struct gaps must not diverge from LLVM layout");
+        assert!(errors.0.contains(&ValidationError::InvalidRecord {
+            kind: "struct field",
+            id: 4,
+        }));
+    }
+
     fn generated_test_fixture() -> (MachineWir, TargetPackage) {
         let (mut module, target) = fixture();
         module.runtime = RuntimeRequirements::new(vec![
@@ -7739,8 +8037,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_assertion_and_enum_schema_revision_accepts_only_exact_machine_wir_v10() {
-        assert_eq!(MACHINE_WIR_VERSION, 10);
+    fn native_struct_schema_revision_accepts_only_exact_machine_wir_v11() {
+        assert_eq!(MACHINE_WIR_VERSION, 11);
         assert_eq!(
             CheckedIntegerOp::ShiftLeft.invalid_shift_count_fatal_code(),
             Some(RuntimeFatalCode::InvalidShiftCount)
@@ -7763,12 +8061,12 @@ mod tests {
         );
         assert_eq!(CheckedIntegerOp::Add.invalid_shift_count_fatal_code(), None);
         let (module, target) = fixture();
-        for rejected in [9, 11] {
+        for rejected in [10, 12] {
             let mut changed = module.clone();
             changed.version = rejected;
             let errors = changed
                 .validate_for_target(&target)
-                .expect_err("only exact-current MachineWir v10 is accepted");
+                .expect_err("only exact-current MachineWir v11 is accepted");
             assert!(
                 errors
                     .0

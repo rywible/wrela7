@@ -1638,7 +1638,7 @@ mod tests {
                 semantic_wir_version: 9,
                 flow_wir_version: 10,
                 flow_wir_wire_version: 10,
-                machine_wir_version: 10,
+                machine_wir_version: 11,
                 runtime_abi_version: 2,
                 optimization_pipeline_name: "development-v1".to_owned(),
                 optimization_pipeline_revision: 8,

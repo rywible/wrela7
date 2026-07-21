@@ -365,6 +365,45 @@ fn operation_equal(
             MachineOperation::EnumPayload { value: right },
         ) => left == right,
         (
+            MachineOperation::MakeStruct {
+                ty: left_ty,
+                fields: left_fields,
+            },
+            MachineOperation::MakeStruct {
+                ty: right_ty,
+                fields: right_fields,
+            },
+        ) => left_ty == right_ty && fixed_slice_equal(left_fields, right_fields, is_cancelled)?,
+        (
+            MachineOperation::InsertField {
+                aggregate: left_aggregate,
+                field: left_field,
+                value: left_value,
+            },
+            MachineOperation::InsertField {
+                aggregate: right_aggregate,
+                field: right_field,
+                value: right_value,
+            },
+        ) => {
+            left_aggregate == right_aggregate
+                && left_field == right_field
+                && left_value == right_value
+        }
+        (
+            MachineOperation::ExtractField {
+                aggregate: left_aggregate,
+                field: left_field,
+            },
+            MachineOperation::ExtractField {
+                aggregate: right_aggregate,
+                field: right_field,
+            },
+        ) => left_aggregate == right_aggregate && left_field == right_field,
+        (MachineOperation::Copy { value: left }, MachineOperation::Copy { value: right }) => {
+            left == right
+        }
+        (
             MachineOperation::Unary {
                 op: left_op,
                 value: left_value,

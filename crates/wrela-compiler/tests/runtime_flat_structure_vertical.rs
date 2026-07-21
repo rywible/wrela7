@@ -181,6 +181,28 @@ fn imported_late_field_is_bounded():
     return
 "#;
 
+const NATIVE_PAIR_SOURCE: &str = r#"module app.duration
+
+pub struct Pair:
+    pub count: u32
+    pub total: u64
+
+pub fn update_and_read() -> u64:
+    value: Pair = Pair(count=1, total=2)
+    value.total = 9
+    return value.total
+"#;
+
+const NATIVE_PAIR_TEST_SOURCE: &str = r#"module app.duration_test
+
+from app.duration import update_and_read
+
+@test(runtime)
+fn native_pair_field_update_runs():
+    value: u64 = update_and_read()
+    return
+"#;
+
 struct Fixture {
     hir: Arc<wrela_hir::ValidatedProgram>,
     target: TargetPackage,
@@ -792,6 +814,97 @@ fn local_flat_field_update_reaches_deterministic_native_coff() {
                 first.bytes(),
                 second.bytes(),
                 "identical field-update MachineWir must emit byte-identical ARM64 COFF"
+            );
+        }
+    }
+}
+
+#[test]
+fn two_field_flat_local_reaches_unpacked_machine_wir_and_deterministic_coff() {
+    let fixture = fixture(NATIVE_PAIR_SOURCE, NATIVE_PAIR_TEST_SOURCE);
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed(&fixture),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("two-field local lowers to SemanticWir");
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.into_parts().0,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("two-field local lowers to FlowWir");
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow.into_parts().0,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("two-field FlowWir canonical frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("two-field local reaches MachineWir v11");
+    let machine = prepared.machine().wir().as_wir();
+    let pair = machine
+        .types
+        .iter()
+        .find(|ty| ty.source_name.as_deref() == Some("Pair"))
+        .expect("nominal Pair machine type");
+    let MachineTypeKind::Struct {
+        fields,
+        packed: false,
+    } = &pair.kind
+    else {
+        panic!("Pair must retain an unpacked machine representation")
+    };
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].offset, 0);
+    assert_eq!(fields[1].offset, 8);
+    assert_eq!((pair.size, pair.alignment), (16, 8));
+
+    let mut constructs = 0;
+    let mut inserts = 0;
+    let mut extracts = 0;
+    for instruction in machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+    {
+        match instruction.operation {
+            MachineOperation::MakeStruct { .. } => constructs += 1,
+            MachineOperation::InsertField { field: 1, .. } => inserts += 1,
+            MachineOperation::ExtractField { field: 1, .. } => extracts += 1,
+            _ => {}
+        }
+    }
+    assert_eq!((constructs, inserts, extracts), (1, 1, 1));
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("two-field native object emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat two-field native object emission");
+            assert_eq!(
+                first.bytes(),
+                second.bytes(),
+                "identical two-field MachineWir emits byte-identical ARM64 COFF"
             );
         }
     }

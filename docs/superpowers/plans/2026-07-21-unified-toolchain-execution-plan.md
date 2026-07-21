@@ -138,7 +138,7 @@ Dependency-ordered; each depends on the Tier-0 value shapes it carries.
   field & projected places (`self.field`, `agg.field`). Unblocks view-RMW (B1b),
   actor state, region escape. Overlaps the old "Lane A aggregate ownership".
 - **L2.2 — Non-scalar values through WIR + codegen.** Aggregates/views/replies
-  represented (or erased) through SemanticWir v9 / FlowWir v10 / MachineWir v10 +
+  represented (or erased) through SemanticWir v9 / FlowWir v10 / MachineWir v11 +
   codecs + LLVM codegen, to native COFF. Depends L2.1, T0.
 - **L2.3 — Region/escape producer.** Whole-image escape analysis emitting
   `Allocate`/`ResetRegion`/`Promote`; feeds B2a's schema with real facts (B2b).
@@ -203,7 +203,7 @@ D2 need this scope substantially complete; B10 needs F5.
 | 2 | L2.1a local aggregate mutation | T0 | **landed in this slice** — plain one-level `owned_local.field = rhs` uses exact root-SSA aggregate replacement through SemanticWir v9/FlowWir v10 `InsertField`; the guarded one-field-`u64` representation reaches MachineWir and repeat byte-identical ARM64 COFF (`projected_local_assignment_defines_a_fresh_aggregate_value`, `local_flat_field_update_reaches_deterministic_native_coff`). Compound/nested/nonlocal/actor-state mutation stays named fail-closed; persistent `self.field` remains the next prerequisite. |
 | 2 | actor-state initialization/storage floor | L2.1a | **new prerequisite** — actors currently retain no initialized state value/global, so `self.field` mutation cannot be represented without discarding persistence |
 | 2 | L2.1b persistent actor-state mutation | actor-state storage | queued — must remain `semantic-self-field-mutation-state-pending` until the state store exists |
-| 2 | L2.2 values-through-WIR + codegen | L2.1a,T0 | queued — first increment is multi-field flat scalar structs through MachineWir/LLVM; reply slots remain exclusively L2.4 |
+| 2 | L2.2 values-through-WIR + codegen | L2.1a,T0 | **L2.2a landed in this slice** — same-block nongeneric flat locals with two or more scalar fields retain an aligned unpacked MachineWir v11 struct, explicit construct/copy/insert/extract operations, exact validation/equality/metering, LLVM `insertvalue`/`extractvalue` rendering, and byte-identical repeated ARM64 COFF (`unpacked_struct_operations_validate_exact_field_types_and_layout`, `two_field_flat_local_reaches_unpacked_machine_wir_and_deterministic_coff`). One-field-`u64` erasure remains byte-compatible. Aggregate function/block boundaries and non-flat shapes remain named fail-closed; views/replies remain pending. |
 | 2 | L2.3 region/escape producer + B2b | L2.1b,L2.2 | **reordered** — a stateful `self.field` escape cannot be produced before persistent actor state; `Promote` also has no FlowWir representation today |
 | 2 | L2.4 reply-slot + scheduler (B5c) | L2.2,T0.1 | queued |
 | 2 | L2.5 scope-op lowering (B4b/c) | L2.2,B4a | queued |

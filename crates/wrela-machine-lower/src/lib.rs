@@ -2116,7 +2116,10 @@ fn model_resources(
                 match &instruction.operation {
                     MachineOperation::Immediate(value) => immediate(value, &mut meter)?,
                     MachineOperation::Call { arguments, .. }
-                    | MachineOperation::RuntimeCall { arguments, .. } => meter.edges(arguments)?,
+                    | MachineOperation::RuntimeCall { arguments, .. }
+                    | MachineOperation::MakeStruct {
+                        fields: arguments, ..
+                    } => meter.edges(arguments)?,
                     MachineOperation::TestAssert { failure, .. } => {
                         meter.text(&failure.expression)?;
                         if let Some(message) = &failure.message {
@@ -2130,7 +2133,10 @@ fn model_resources(
                     | MachineOperation::FloatCompare { .. }
                     | MachineOperation::Convert { .. }
                     | MachineOperation::CheckedConvert { .. }
+                    | MachineOperation::Copy { .. }
                     | MachineOperation::Select { .. }
+                    | MachineOperation::InsertField { .. }
+                    | MachineOperation::ExtractField { .. }
                     | MachineOperation::MakeEnum { .. }
                     | MachineOperation::EnumTag { .. }
                     | MachineOperation::EnumPayload { .. }
@@ -6038,7 +6044,7 @@ mod contract_tests {
         .expect("float not-equal FlowWir reaches MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 10);
+        assert_eq!(machine.version, 11);
         assert!(matches!(machine.types[8].kind, MachineTypeKind::Float32));
         assert!(matches!(machine.types[9].kind, MachineTypeKind::Float64));
         let float_function = &machine.functions[3];
@@ -6146,7 +6152,7 @@ mod contract_tests {
         .expect("unary and lossless casts reach MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 10);
+        assert_eq!(machine.version, 11);
         assert!(matches!(
             machine.types[10].kind,
             MachineTypeKind::Integer { bits: 16 }

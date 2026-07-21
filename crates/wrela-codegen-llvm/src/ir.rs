@@ -610,6 +610,18 @@ fn render_instruction(
             *failure,
             is_cancelled,
         )?,
+        MachineOperation::Copy { value } => {
+            render_result(ir, result)?;
+            ir.push("select i1 true, ")?;
+            render_value_type(ir, machine, function, *value)?;
+            ir.push(" %v")?;
+            ir.number(u128::from(value.0))?;
+            ir.push(", ")?;
+            render_value_type(ir, machine, function, *value)?;
+            ir.push(" %v")?;
+            ir.number(u128::from(value.0))?;
+            ir.push("\n")?;
+        }
         MachineOperation::Select {
             condition,
             then_value,
@@ -627,6 +639,68 @@ fn render_instruction(
             render_value_type(ir, machine, function, *else_value)?;
             ir.push(" %v")?;
             ir.number(u128::from(else_value.0))?;
+            ir.push("\n")?;
+        }
+        MachineOperation::MakeStruct { ty, fields } => {
+            let result = required_result(result)?;
+            let mut current = None;
+            for (index, field) in fields.iter().enumerate() {
+                if index + 1 == fields.len() {
+                    ir.push("  %v")?;
+                    ir.number(u128::from(result.0))?;
+                } else {
+                    ir.push("  %t")?;
+                    ir.number(u128::from(instruction.id.0))?;
+                    ir.push("_struct_")?;
+                    ir.number(index as u128)?;
+                }
+                ir.push(" = insertvalue ")?;
+                render_type(ir, machine, *ty)?;
+                match current {
+                    Some(previous) => {
+                        ir.push(" %t")?;
+                        ir.number(u128::from(instruction.id.0))?;
+                        ir.push("_struct_")?;
+                        ir.number(previous as u128)?;
+                    }
+                    None => ir.push(" poison")?,
+                }
+                ir.push(", ")?;
+                render_value_type(ir, machine, function, *field)?;
+                ir.push(" %v")?;
+                ir.number(u128::from(field.0))?;
+                ir.push(", ")?;
+                ir.number(index as u128)?;
+                ir.push("\n")?;
+                current = Some(index);
+            }
+        }
+        MachineOperation::InsertField {
+            aggregate,
+            field,
+            value,
+        } => {
+            render_result(ir, result)?;
+            ir.push("insertvalue ")?;
+            render_value_type(ir, machine, function, *aggregate)?;
+            ir.push(" %v")?;
+            ir.number(u128::from(aggregate.0))?;
+            ir.push(", ")?;
+            render_value_type(ir, machine, function, *value)?;
+            ir.push(" %v")?;
+            ir.number(u128::from(value.0))?;
+            ir.push(", ")?;
+            ir.number(u128::from(*field))?;
+            ir.push("\n")?;
+        }
+        MachineOperation::ExtractField { aggregate, field } => {
+            render_result(ir, result)?;
+            ir.push("extractvalue ")?;
+            render_value_type(ir, machine, function, *aggregate)?;
+            ir.push(" %v")?;
+            ir.number(u128::from(aggregate.0))?;
+            ir.push(", ")?;
+            ir.number(u128::from(*field))?;
             ir.push("\n")?;
         }
         MachineOperation::MakeEnum {
@@ -3252,6 +3326,19 @@ fn render_type(
             render_type(ir, machine, *tag)?;
             ir.push(", ")?;
             render_type(ir, machine, *payload)?;
+            ir.push(" }")
+        }
+        MachineTypeKind::Struct {
+            fields,
+            packed: false,
+        } => {
+            ir.push("{ ")?;
+            for (index, field) in fields.iter().enumerate() {
+                if index != 0 {
+                    ir.push(", ")?;
+                }
+                render_type(ir, machine, field.ty)?;
+            }
             ir.push(" }")
         }
         _ => Err(CodegenError::UnsupportedMachineContract(

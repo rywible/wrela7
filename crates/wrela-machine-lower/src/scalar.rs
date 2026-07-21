@@ -2557,6 +2557,9 @@ fn require_supported_type(
         flow::FlowTypeKind::Struct { .. } if flat_u64_struct_field(types, ty.id).is_some() => {
             Ok(())
         }
+        flow::FlowTypeKind::Struct { .. } if flat_native_struct_fields(types, ty.id).is_some() => {
+            Ok(())
+        }
         flow::FlowTypeKind::Enum { .. } if closed_scalar_enum_payload(types, ty.id).is_some() => {
             Ok(())
         }
@@ -2598,6 +2601,41 @@ fn flat_u64_struct_field(types: &[flow::FlowType], ty: flow::TypeId) -> Option<f
         )
         .then_some(*field)
     })
+}
+
+fn flat_native_struct_fields(
+    types: &[flow::FlowType],
+    ty: flow::TypeId,
+) -> Option<&[flow::TypeId]> {
+    let flow::FlowTypeKind::Struct { fields } = &types.get(ty.0 as usize)?.kind else {
+        return None;
+    };
+    if fields.len() < 2
+        || fields.iter().any(|field| {
+            types
+                .get(field.0 as usize)
+                .is_none_or(|record| !native_struct_scalar(&record.kind))
+        })
+    {
+        return None;
+    }
+    Some(fields)
+}
+
+fn native_struct_scalar(kind: &flow::FlowTypeKind) -> bool {
+    matches!(
+        kind,
+        flow::FlowTypeKind::Scalar(
+            flow::ScalarType::Bool
+                | flow::ScalarType::Float32
+                | flow::ScalarType::Float64
+                | flow::ScalarType::Address
+                | flow::ScalarType::Integer {
+                    bits: 8 | 16 | 32 | 64 | 128,
+                    ..
+                }
+        )
+    )
 }
 
 fn closed_scalar_enum_payload(types: &[flow::FlowType], ty: flow::TypeId) -> Option<flow::TypeId> {
@@ -3561,6 +3599,7 @@ fn validate_function_surface(
     if function.result_types.len() > 1 {
         return Err(unsupported("functions with multiple return values"));
     }
+    validate_native_struct_locality(&input.types, function, is_cancelled)?;
     if (function.stack_bound != 0 || function.frame_bound != 0) && !activation_function {
         return Err(unsupported("nonzero scalar function stack or frame bounds"));
     }
@@ -3604,6 +3643,233 @@ fn validate_function_surface(
         }
     }
     Ok(())
+}
+
+fn validate_native_struct_locality(
+    types: &[flow::FlowType],
+    function: &flow::FlowFunction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), MachineLowerError> {
+    let native = |value: flow::ValueId| {
+        flow_value_type(function, value)
+            .ok()
+            .is_some_and(|ty| flat_native_struct_fields(types, ty).is_some())
+    };
+    if function.parameters.iter().copied().any(native)
+        || function
+            .result_types
+            .iter()
+            .copied()
+            .any(|ty| flat_native_struct_fields(types, ty).is_some())
+    {
+        return Err(unsupported(
+            "machine-flat-structure-function-boundary-lowering-pending",
+        ));
+    }
+    for block in &function.blocks {
+        check_cancelled(is_cancelled)?;
+        if block.parameters.iter().copied().any(native) {
+            return Err(unsupported(
+                "machine-flat-structure-cross-block-lowering-pending",
+            ));
+        }
+        for instruction in &block.instructions {
+            check_cancelled(is_cancelled)?;
+            for result in instruction
+                .results
+                .iter()
+                .copied()
+                .filter(|value| native(*value))
+            {
+                if !matches!(
+                    instruction.operation,
+                    flow::FlowOperation::MakeAggregate { .. }
+                        | flow::FlowOperation::InsertField { .. }
+                        | flow::FlowOperation::Move { .. }
+                        | flow::FlowOperation::Copy { .. }
+                ) {
+                    return Err(unsupported(
+                        "machine-flat-structure-operation-lowering-pending",
+                    ));
+                }
+                for use_block in &function.blocks {
+                    check_cancelled(is_cancelled)?;
+                    for candidate in &use_block.instructions {
+                        check_cancelled(is_cancelled)?;
+                        if flow_operation_uses_value(&candidate.operation, result)
+                            && use_block.id != block.id
+                        {
+                            return Err(unsupported(
+                                "machine-flat-structure-cross-block-lowering-pending",
+                            ));
+                        }
+                    }
+                    if flow_terminator_uses_value(&use_block.terminator, result) {
+                        return Err(unsupported(
+                            "machine-flat-structure-function-boundary-lowering-pending",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    check_cancelled(is_cancelled)
+}
+
+fn flow_operation_uses_value(operation: &flow::FlowOperation, sought: flow::ValueId) -> bool {
+    let mut found = false;
+    for_each_flow_operation_value(operation, |value| found |= value == sought);
+    found
+}
+
+fn for_each_flow_operation_value(
+    operation: &flow::FlowOperation,
+    mut visit: impl FnMut(flow::ValueId),
+) {
+    match operation {
+        flow::FlowOperation::Immediate(_)
+        | flow::FlowOperation::RegionReset { .. }
+        | flow::FlowOperation::ActorCapability { .. }
+        | flow::FlowOperation::ActorReserve { .. }
+        | flow::FlowOperation::MailboxReceive { .. }
+        | flow::FlowOperation::TaskAcquireSlot { .. }
+        | flow::FlowOperation::Checkpoint { .. }
+        | flow::FlowOperation::DeadlineRead
+        | flow::FlowOperation::InterruptMask
+        | flow::FlowOperation::MmioRead { .. }
+        | flow::FlowOperation::Fence { .. } => {}
+        flow::FlowOperation::Unary { value, .. }
+        | flow::FlowOperation::Cast { value, .. }
+        | flow::FlowOperation::EnumTag { value }
+        | flow::FlowOperation::EnumPayload { value }
+        | flow::FlowOperation::ExtractField {
+            aggregate: value, ..
+        }
+        | flow::FlowOperation::EndAccess { access: value }
+        | flow::FlowOperation::Load { address: value, .. }
+        | flow::FlowOperation::Move { value }
+        | flow::FlowOperation::Copy { value }
+        | flow::FlowOperation::Drop { value }
+        | flow::FlowOperation::ActorReject { reservation: value }
+        | flow::FlowOperation::TaskCancel { task: value }
+        | flow::FlowOperation::Park { wait_set: value }
+        | flow::FlowOperation::Wake { target: value }
+        | flow::FlowOperation::InterruptRestore { token: value }
+        | flow::FlowOperation::ValidateDeviceValue { value, .. }
+        | flow::FlowOperation::Check {
+            condition: value, ..
+        }
+        | flow::FlowOperation::Assert {
+            condition: value, ..
+        }
+        | flow::FlowOperation::RecordEvent { payload: value, .. }
+        | flow::FlowOperation::ReplayEvent {
+            destination: value, ..
+        }
+        | flow::FlowOperation::TestEmit { payload: value }
+        | flow::FlowOperation::TestFinish { outcome: value } => visit(*value),
+        flow::FlowOperation::Binary { left, right, .. } => {
+            visit(*left);
+            visit(*right);
+        }
+        flow::FlowOperation::MakeAggregate { fields, .. } => {
+            fields.iter().copied().for_each(&mut visit)
+        }
+        flow::FlowOperation::MakeEnum { payload, .. } => visit(*payload),
+        flow::FlowOperation::InsertField {
+            aggregate, value, ..
+        }
+        | flow::FlowOperation::Store {
+            address: aggregate,
+            value,
+            ..
+        }
+        | flow::FlowOperation::ReplyResolve {
+            endpoint: aggregate,
+            outcome: value,
+        }
+        | flow::FlowOperation::ReceiptCommit {
+            receipt: aggregate,
+            payload: value,
+        }
+        | flow::FlowOperation::ReceiptResolve {
+            receipt: aggregate,
+            outcome: value,
+        }
+        | flow::FlowOperation::InterruptPublish {
+            cell: aggregate,
+            value,
+        }
+        | flow::FlowOperation::QueuePublish {
+            reservation: aggregate,
+            payload: value,
+        } => {
+            visit(*aggregate);
+            visit(*value);
+        }
+        flow::FlowOperation::ActorCommit {
+            reservation,
+            arguments,
+        } => {
+            visit(*reservation);
+            arguments.iter().copied().for_each(&mut visit);
+        }
+        flow::FlowOperation::Select {
+            condition,
+            then_value,
+            else_value,
+        } => {
+            visit(*condition);
+            visit(*then_value);
+            visit(*else_value);
+        }
+        flow::FlowOperation::BeginAccess { place, .. } => visit(*place),
+        flow::FlowOperation::Call { arguments, .. }
+        | flow::FlowOperation::AsyncCall { arguments, .. } => {
+            arguments.iter().copied().for_each(&mut visit)
+        }
+        flow::FlowOperation::Allocate { count, .. } => visit(*count),
+        flow::FlowOperation::TaskStart {
+            slot, arguments, ..
+        } => {
+            visit(*slot);
+            arguments.iter().copied().for_each(&mut visit);
+        }
+        flow::FlowOperation::MmioWrite { value, .. } => visit(*value),
+        flow::FlowOperation::DmaTransition { token, .. } => visit(*token),
+        flow::FlowOperation::QueueReserve { descriptors, .. } => visit(*descriptors),
+    }
+}
+
+fn flow_terminator_uses_value(terminator: &flow::Terminator, sought: flow::ValueId) -> bool {
+    match terminator {
+        flow::Terminator::Jump { arguments, .. }
+        | flow::Terminator::Return(arguments)
+        | flow::Terminator::TailCall { arguments, .. } => arguments.contains(&sought),
+        flow::Terminator::Branch {
+            condition,
+            then_arguments,
+            else_arguments,
+            ..
+        } => {
+            *condition == sought
+                || then_arguments.contains(&sought)
+                || else_arguments.contains(&sought)
+        }
+        flow::Terminator::Switch {
+            value,
+            cases,
+            default_arguments,
+            ..
+        } => {
+            *value == sought
+                || default_arguments.contains(&sought)
+                || cases.iter().any(|case| case.arguments.contains(&sought))
+        }
+        flow::Terminator::Suspend { activation, .. } => *activation == sought,
+        flow::Terminator::Trap { detail, .. } => *detail == Some(sought),
+        flow::Terminator::Unreachable => false,
+    }
 }
 
 fn flow_scalar_type(
@@ -3905,22 +4171,38 @@ fn validate_supported_operation(
         }
         flow::FlowOperation::MakeAggregate { ty, fields } => {
             let result = require_single_result(instruction)?;
-            let Some(field_type) = flat_u64_struct_field(&input.types, *ty) else {
-                return Err(unsupported(
-                    "an aggregate constructor outside the one-field u64 representation",
-                ));
-            };
-            let [field] = fields.as_slice() else {
-                return Err(unsupported(
-                    "an aggregate constructor without exactly one field value",
-                ));
-            };
-            if flow_value_type(function, result)? != *ty
-                || flow_value_type(function, *field)? != field_type
-            {
+            if flow_value_type(function, result)? != *ty {
                 return Err(unsupported(
                     "an aggregate constructor with mismatched field or result types",
                 ));
+            }
+            if let Some(field_type) = flat_u64_struct_field(&input.types, *ty) {
+                let [field] = fields.as_slice() else {
+                    return Err(unsupported(
+                        "an aggregate constructor with mismatched field or result types",
+                    ));
+                };
+                if flow_value_type(function, *field)? != field_type {
+                    return Err(unsupported(
+                        "an aggregate constructor with mismatched field or result types",
+                    ));
+                }
+            } else {
+                let field_types = flat_native_struct_fields(&input.types, *ty).ok_or(
+                    unsupported("machine-flat-structure-construction-lowering-pending"),
+                )?;
+                if fields.len() != field_types.len() {
+                    return Err(unsupported(
+                        "an aggregate constructor with mismatched field or result types",
+                    ));
+                }
+                for (value, expected) in fields.iter().zip(field_types) {
+                    if flow_value_type(function, *value)? != *expected {
+                        return Err(unsupported(
+                            "an aggregate constructor with mismatched field or result types",
+                        ));
+                    }
+                }
             }
             Ok(())
         }
@@ -3991,12 +4273,16 @@ fn validate_supported_operation(
         flow::FlowOperation::ExtractField { aggregate, field } => {
             let result = require_single_result(instruction)?;
             let aggregate_type = flow_value_type(function, *aggregate)?;
-            let Some(field_type) = flat_u64_struct_field(&input.types, aggregate_type) else {
-                return Err(unsupported(
-                    "a field extraction outside the one-field u64 representation",
-                ));
-            };
-            if *field != 0 || flow_value_type(function, result)? != field_type {
+            let field_type = flat_u64_struct_field(&input.types, aggregate_type)
+                .filter(|_| *field == 0)
+                .or_else(|| {
+                    flat_native_struct_fields(&input.types, aggregate_type)
+                        .and_then(|fields| fields.get(*field as usize).copied())
+                })
+                .ok_or(unsupported(
+                    "machine-flat-structure-extraction-lowering-pending",
+                ))?;
+            if flow_value_type(function, result)? != field_type {
                 return Err(unsupported(
                     "a field extraction with an invalid field or result type",
                 ));
@@ -4246,13 +4532,15 @@ fn lower_types(
                 lower_type_kind(&ty.kind, limits, is_cancelled)?
             }
             flow::FlowTypeKind::Struct { .. } => {
-                let field = flat_u64_struct_field(&input.types, ty.id)
-                    .ok_or(unsupported("a non-scalar-backed aggregate type"))?;
-                let field = input
-                    .types
-                    .get(field.0 as usize)
-                    .ok_or(unsupported("a flat aggregate with an unknown field type"))?;
-                lower_type_kind(&field.kind, limits, is_cancelled)?
+                if let Some(field) = flat_u64_struct_field(&input.types, ty.id) {
+                    let field = input
+                        .types
+                        .get(field.0 as usize)
+                        .ok_or(unsupported("a flat aggregate with an unknown field type"))?;
+                    lower_type_kind(&field.kind, limits, is_cancelled)?
+                } else {
+                    lower_native_struct_type(input, ty.id, limits, is_cancelled)?
+                }
             }
             flow::FlowTypeKind::Enum { .. } => {
                 let payload = closed_scalar_enum_payload(&input.types, ty.id)
@@ -4422,6 +4710,64 @@ fn lower_passive_function_type(
         },
         0,
         1,
+    ))
+}
+
+fn lower_native_struct_type(
+    input: &flow::FlowWir,
+    ty: flow::TypeId,
+    limits: MachineLoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(MachineTypeKind, u64, u32), MachineLowerError> {
+    let fields = flat_native_struct_fields(&input.types, ty)
+        .ok_or(unsupported("machine-flat-structure-type-lowering-pending"))?;
+    let mut machine_fields = try_vec(
+        fields.len(),
+        "MachineWir model edges",
+        limits.model_edges,
+        is_cancelled,
+    )?;
+    let mut size = 0_u64;
+    let mut aggregate_alignment = 1_u32;
+    for field in fields {
+        check_cancelled(is_cancelled)?;
+        let record = input
+            .types
+            .get(field.0 as usize)
+            .ok_or(unsupported("a flat aggregate with an unknown field type"))?;
+        let (_, field_size, field_alignment) = lower_type_kind(&record.kind, limits, is_cancelled)?;
+        let alignment = u64::from(field_alignment);
+        let offset = size
+            .checked_add(alignment - 1)
+            .map(|value| value & !(alignment - 1))
+            .ok_or(MachineLowerError::LayoutOverflow {
+                subject: "flat structure field".to_owned(),
+            })?;
+        size = offset
+            .checked_add(field_size)
+            .ok_or(MachineLowerError::LayoutOverflow {
+                subject: "flat structure field".to_owned(),
+            })?;
+        aggregate_alignment = aggregate_alignment.max(field_alignment);
+        machine_fields.push(wrela_machine_wir::MachineField {
+            ty: MachineTypeId(field.0),
+            offset,
+        });
+    }
+    let alignment = u64::from(aggregate_alignment);
+    size = size
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+        .ok_or(MachineLowerError::LayoutOverflow {
+            subject: "flat structure".to_owned(),
+        })?;
+    Ok((
+        MachineTypeKind::Struct {
+            fields: machine_fields,
+            packed: false,
+        },
+        size,
+        aggregate_alignment,
     ))
 }
 
@@ -5933,23 +6279,54 @@ fn lower_operation(
         }
         flow::FlowOperation::MakeAggregate { ty, fields } => {
             let result = require_single_result(instruction)?;
-            let [field] = fields.as_slice() else {
+            if value_type(function, result)? != MachineTypeId(ty.0) {
                 return Err(unsupported(
-                    "an aggregate constructor without exactly one field value",
-                ));
-            };
-            if value_type(function, result)? != MachineTypeId(ty.0)
-                || flat_u64_struct_field(&input.types, *ty)
-                    != Some(flow_value_type(function, *field)?)
-            {
-                return Err(unsupported(
-                    "an aggregate constructor outside flat u64 lowering",
+                    "an aggregate constructor with a mismatched result type",
                 ));
             }
-            MachineOperation::Convert {
-                op: ConversionOp::Bitcast,
-                value: map_value(*field, mapping)?,
-                destination: MachineTypeId(ty.0),
+            if let Some(field_type) = flat_u64_struct_field(&input.types, *ty) {
+                let [field] = fields.as_slice() else {
+                    return Err(unsupported(
+                        "an aggregate constructor without exactly one field value",
+                    ));
+                };
+                if flow_value_type(function, *field)? != field_type {
+                    return Err(unsupported(
+                        "an aggregate constructor outside flat u64 lowering",
+                    ));
+                }
+                MachineOperation::Convert {
+                    op: ConversionOp::Bitcast,
+                    value: map_value(*field, mapping)?,
+                    destination: MachineTypeId(ty.0),
+                }
+            } else {
+                let expected = flat_native_struct_fields(&input.types, *ty).ok_or(unsupported(
+                    "machine-flat-structure-construction-lowering-pending",
+                ))?;
+                if fields.len() != expected.len() {
+                    return Err(unsupported(
+                        "an aggregate constructor with mismatched fields",
+                    ));
+                }
+                let mut lowered = try_vec(
+                    fields.len(),
+                    "MachineWir model edges",
+                    limits.model_edges,
+                    is_cancelled,
+                )?;
+                for (field, expected) in fields.iter().zip(expected) {
+                    if flow_value_type(function, *field)? != *expected {
+                        return Err(unsupported(
+                            "an aggregate constructor with mismatched fields",
+                        ));
+                    }
+                    lowered.push(map_value(*field, mapping)?);
+                }
+                MachineOperation::MakeStruct {
+                    ty: MachineTypeId(ty.0),
+                    fields: lowered,
+                }
             }
         }
         flow::FlowOperation::InsertField {
@@ -5966,10 +6343,18 @@ fn lower_operation(
                 *field,
                 *value,
             )?;
-            MachineOperation::Convert {
-                op: ConversionOp::Bitcast,
-                value: map_value(*value, mapping)?,
-                destination: MachineTypeId(aggregate_type.0),
+            if flat_u64_struct_field(&input.types, aggregate_type).is_some() {
+                MachineOperation::Convert {
+                    op: ConversionOp::Bitcast,
+                    value: map_value(*value, mapping)?,
+                    destination: MachineTypeId(aggregate_type.0),
+                }
+            } else {
+                MachineOperation::InsertField {
+                    aggregate: map_value(*aggregate, mapping)?,
+                    field: *field,
+                    value: map_value(*value, mapping)?,
+                }
             }
         }
         flow::FlowOperation::MakeEnum {
@@ -5990,16 +6375,30 @@ fn lower_operation(
         flow::FlowOperation::ExtractField { aggregate, field } => {
             let result = require_single_result(instruction)?;
             let aggregate_type = flow_value_type(function, *aggregate)?;
-            if *field != 0
-                || flat_u64_struct_field(&input.types, aggregate_type)
-                    != Some(flow_value_type(function, result)?)
+            if flat_u64_struct_field(&input.types, aggregate_type)
+                == Some(flow_value_type(function, result)?)
+                && *field == 0
             {
-                return Err(unsupported("a field extraction outside flat u64 lowering"));
-            }
-            MachineOperation::Convert {
-                op: ConversionOp::Bitcast,
-                value: map_value(*aggregate, mapping)?,
-                destination: value_type(function, result)?,
+                MachineOperation::Convert {
+                    op: ConversionOp::Bitcast,
+                    value: map_value(*aggregate, mapping)?,
+                    destination: value_type(function, result)?,
+                }
+            } else {
+                let expected = flat_native_struct_fields(&input.types, aggregate_type)
+                    .and_then(|fields| fields.get(*field as usize).copied())
+                    .ok_or(unsupported(
+                        "machine-flat-structure-extraction-lowering-pending",
+                    ))?;
+                if expected != flow_value_type(function, result)? {
+                    return Err(unsupported(
+                        "a field extraction with mismatched result type",
+                    ));
+                }
+                MachineOperation::ExtractField {
+                    aggregate: map_value(*aggregate, mapping)?,
+                    field: *field,
+                }
             }
         }
         flow::FlowOperation::Select {
@@ -6038,10 +6437,20 @@ fn lower_operation(
         }
         flow::FlowOperation::Move { value } | flow::FlowOperation::Copy { value } => {
             let result = require_single_result(instruction)?;
-            MachineOperation::Convert {
-                op: ConversionOp::Bitcast,
-                value: map_value(*value, mapping)?,
-                destination: value_type(function, result)?,
+            let ty = flow_value_type(function, *value)?;
+            if flow_value_type(function, result)? != ty {
+                return Err(unsupported("a copy with mismatched value types"));
+            }
+            if flat_native_struct_fields(&input.types, ty).is_some() {
+                MachineOperation::Copy {
+                    value: map_value(*value, mapping)?,
+                }
+            } else {
+                MachineOperation::Convert {
+                    op: ConversionOp::Bitcast,
+                    value: map_value(*value, mapping)?,
+                    destination: value_type(function, result)?,
+                }
             }
         }
         flow::FlowOperation::Drop { .. } => {
@@ -6254,8 +6663,13 @@ fn validate_flat_structure_field_update(
     value: flow::ValueId,
 ) -> Result<flow::TypeId, MachineLowerError> {
     let aggregate_type = flow_value_type(function, aggregate)?;
-    if field != 0
-        || flat_u64_struct_field(types, aggregate_type) != Some(flow_value_type(function, value)?)
+    let expected = flat_u64_struct_field(types, aggregate_type)
+        .filter(|_| field == 0)
+        .or_else(|| {
+            flat_native_struct_fields(types, aggregate_type)
+                .and_then(|fields| fields.get(field as usize).copied())
+        });
+    if expected != Some(flow_value_type(function, value)?)
         || flow_value_type(function, result)? != aggregate_type
     {
         return Err(unsupported(
@@ -7235,7 +7649,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_field_update_rejects_unlowered_shapes_with_named_tail() {
+    fn aggregate_field_update_admits_multi_field_scalar_and_rejects_adjacent_shapes() {
         let u64_type = flow::FlowType {
             id: flow::TypeId(0),
             kind: flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
@@ -7269,6 +7683,17 @@ mod tests {
                 flow::ValueId(2),
                 flow::ValueId(0),
                 0,
+                flow::ValueId(1),
+            ),
+            Ok(flow::TypeId(1))
+        );
+        assert_eq!(
+            validate_flat_structure_field_update(
+                &two_field_types,
+                &field_update_function(flow::TypeId(1), flow::TypeId(0)),
+                flow::ValueId(2),
+                flow::ValueId(0),
+                2,
                 flow::ValueId(1),
             ),
             error
@@ -7305,6 +7730,82 @@ mod tests {
                 flow::ValueId(1),
             ),
             error
+        );
+    }
+
+    #[test]
+    fn native_flat_struct_locality_guards_boundaries_and_cross_block_uses_by_name() {
+        let types = vec![
+            flow::FlowType {
+                id: flow::TypeId(0),
+                kind: flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                    signed: false,
+                    bits: 64,
+                }),
+                name: Some("u64".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+            flow::FlowType {
+                id: flow::TypeId(1),
+                kind: flow::FlowTypeKind::Struct {
+                    fields: vec![flow::TypeId(0), flow::TypeId(0)],
+                },
+                name: Some("Pair".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+        ];
+        let mut function = field_update_function(flow::TypeId(1), flow::TypeId(0));
+        function.blocks = vec![
+            flow::Block {
+                id: flow::BlockId(0),
+                parameters: Vec::new(),
+                instructions: vec![flow::Instruction {
+                    id: flow::InstructionId(0),
+                    results: vec![flow::ValueId(0)],
+                    operation: flow::FlowOperation::MakeAggregate {
+                        ty: flow::TypeId(1),
+                        fields: vec![flow::ValueId(1), flow::ValueId(1)],
+                    },
+                    source: None,
+                }],
+                terminator: flow::Terminator::Jump {
+                    target: flow::BlockId(1),
+                    arguments: Vec::new(),
+                },
+                source: None,
+            },
+            flow::Block {
+                id: flow::BlockId(1),
+                parameters: Vec::new(),
+                instructions: vec![flow::Instruction {
+                    id: flow::InstructionId(1),
+                    results: vec![flow::ValueId(1)],
+                    operation: flow::FlowOperation::ExtractField {
+                        aggregate: flow::ValueId(0),
+                        field: 0,
+                    },
+                    source: None,
+                }],
+                terminator: flow::Terminator::Return(Vec::new()),
+                source: None,
+            },
+        ];
+        assert_eq!(
+            validate_native_struct_locality(&types, &function, &|| false),
+            Err(MachineLowerError::UnsupportedInput {
+                feature: "machine-flat-structure-cross-block-lowering-pending",
+            })
+        );
+
+        function.blocks[1].instructions.clear();
+        function.result_types = vec![flow::TypeId(1)];
+        assert_eq!(
+            validate_native_struct_locality(&types, &function, &|| false),
+            Err(MachineLowerError::UnsupportedInput {
+                feature: "machine-flat-structure-function-boundary-lowering-pending",
+            })
         );
     }
 
