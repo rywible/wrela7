@@ -197,7 +197,7 @@ D2 need this scope substantially complete; B10 needs F5.
 | 0 | T0.1 deferred tails (fail-closed) | T0.1 | nominal/enum **construction** + **lowering**, generic/view/tuple/array payloads, unit-variant DotName construction — all named-diagnostic fail-closed |
 | 0 | T0.2 ephemeral type kind | T0.1 + a **producer** | **producer-gated** — needs views (B1) or `try send` (B5c) to exercise the `?`-vs-`match`/`is` rule end to end |
 | 0 | T0.3 generics/monomorphization (A6) | T0.1 | queued (multi-session) |
-| — | General `match`/`is` over ADTs (consumer; uses T0.1, needed for AdmissionResult consumption) | T0.1 | **next — cleanly testable now** |
+| — | General `match`/`is` over ADTs (consumer; uses T0.1, needed for AdmissionResult consumption) | T0.1 | **complete in A-1** — mixed-arity/per-variant-type exhaustive statement match; unit/payload-wildcard `is`; success-dominated `is` binding remains named fail-closed |
 | 2 | L2.1 place-level aggregate mutation | T0 | queued |
 | 2 | L2.2 values-through-WIR + codegen | L2.1,T0 | queued |
 | 2 | L2.3 region/escape producer | L2.2 | queued |
@@ -209,10 +209,10 @@ D2 need this scope substantially complete; B10 needs F5.
 (ephemeral kind) turned out **producer-gated** — the `?`-rejection rule can't be
 exercised without a value of an ephemeral type, and the only producers (views,
 `try send`) are themselves unbuilt. So the autonomous path pivots to consumers
-and producers that are testable now: general `match`/`is` over the new ADTs
-(next), then B1a view analysis (the first ephemeral producer) which unblocks
-T0.2. Generics (T0.3) and Tier-2 lowering proceed in parallel as independent
-tracks.
+and producers that are testable now: general `match`/`is` over the new ADTs is
+complete at the analysis tier; B1a view analysis (the first ephemeral producer)
+is next and unblocks T0.2. Generics (T0.3) and Tier-2 lowering proceed in
+parallel as independent tracks.
 
 Update this table and the cited inventory rows as each slice lands. One commit
 per slice; the branch is the integration unit for the whole A+B scope.

@@ -3012,6 +3012,10 @@ fn inspect_runtime_expression_shape(
                 reserve_runtime_shape(&mut pending, 1, limit, "runtime expression scratch")?;
                 pending.push(*operand);
             }
+            ExpressionKind::IsPattern { value, .. } => {
+                reserve_runtime_shape(&mut pending, 1, limit, "runtime expression scratch")?;
+                pending.push(*value);
+            }
             ExpressionKind::Unary {
                 operator:
                     wrela_hir::UnaryOperator::Negate
@@ -4756,7 +4760,7 @@ fn analyze_closed_enum_match(
         },
         is_cancelled,
     )?;
-    let (enumeration, variants, payload_ty) = partial
+    let (enumeration, variants) = partial
         .types
         .get(scrutinee.ty.0 as usize)
         .and_then(|record| match &record.kind {
@@ -4764,10 +4768,7 @@ fn analyze_closed_enum_match(
                 declaration,
                 variants,
                 ..
-            } => variants
-                .first()
-                .and_then(|variant| variant.fields.first())
-                .map(|field| (*declaration, variants.len(), field.ty)),
+            } if !variants.is_empty() => Some((*declaration, variants.len())),
             _ => None,
         })
         .ok_or_else(|| {
@@ -4868,95 +4869,123 @@ fn analyze_closed_enum_match(
             ));
         }
         covered[candidate.variant as usize] = true;
-        let [argument] = arguments.as_slice() else {
-            return Err(runtime_type_diagnostic(
-                request,
-                alternative.source,
-                "semantic-runtime-match-payload-shape",
-                "runtime enum pattern requires one payload binding",
-                "the matched representation contains exactly one shared scalar payload",
-                "bind the variant payload once",
-            ));
-        };
-        if argument.take {
-            return Err(runtime_type_diagnostic(
-                request,
-                argument.source,
-                "semantic-runtime-match-take-not-supported",
-                "runtime enum pattern payload cannot use `take`",
-                "R1 payloads are implicit copy scalars",
-                "remove `take` from the payload binding",
-            ));
-        }
-        let payload_pattern = request
-            .hir
-            .as_program()
-            .patterns
-            .get(argument.pattern.0 as usize)
+        let payload_ty = partial
+            .types
+            .get(scrutinee.ty.0 as usize)
+            .and_then(|record| match &record.kind {
+                SemanticTypeKind::Enumeration { variants, .. } => variants
+                    .get(candidate.variant as usize)
+                    .map(|variant| variant.fields.first().map(|field| field.ty)),
+                _ => None,
+            })
             .ok_or(AnalysisFailure::RequestMismatch)?;
-        let [payload_alternative] = payload_pattern.alternatives.as_slice() else {
-            return Err(runtime_type_diagnostic(
-                request,
-                payload_pattern.source,
-                "semantic-runtime-match-alternatives-not-supported",
-                "runtime enum payload requires one binding pattern",
-                "payload alternatives are outside the exact R1 slice",
-                "bind the scalar payload directly",
-            ));
-        };
-        let wrela_hir::PrimaryPattern::Bind(local) = &payload_alternative.kind else {
-            return Err(runtime_type_diagnostic(
-                request,
-                payload_alternative.source,
-                "semantic-runtime-match-payload-shape",
-                "runtime enum payload pattern must bind one scalar name",
-                "wildcard and nested destructuring are outside the exact R1 slice",
-                "bind the payload to a local name",
-            ));
-        };
-        let local_record = request
-            .hir
-            .as_program()
-            .locals
-            .get(local.0 as usize)
-            .filter(|record| record.id == *local && record.body == arm.body)
-            .ok_or(AnalysisFailure::RequestMismatch)?;
-        let value = append_semantic_value(
-            request,
-            partial,
-            function,
-            payload_ty,
-            (
-                SemanticValueOrigin::Local(*local),
-                Some(local_record.source),
-                Some(local_record.name.as_str()),
-            ),
-            is_cancelled,
-        )?;
-        definitions
-            .try_reserve(1)
-            .map_err(|_| fact_resource(request, "runtime match bindings"))?;
-        definitions.push(LocalDefinition {
-            local: *local,
-            value,
-        });
         let mut arm_locals = copy_binding_map(locals, request.limits.values)?;
         let mut arm_parameters = copy_binding_map(parameters, request.limits.values)?;
-        let slot = arm_locals
-            .get_mut(local.0 as usize)
-            .ok_or(AnalysisFailure::RequestMismatch)?;
-        if slot
-            .replace(RuntimeBinding {
-                value,
-                state: OwnershipState::Owned,
-                authority: RuntimeAuthority::Own,
-                origin: RuntimeBindingOrigin::Local(*local),
-                source: local_record.source,
-            })
-            .is_some()
-        {
-            return Err(AnalysisFailure::RequestMismatch.into());
-        }
+        let binding_local = match payload_ty {
+            None => {
+                if !arguments.is_empty() {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        alternative.source,
+                        "semantic-runtime-match-payload-shape",
+                        "unit enum pattern cannot bind a payload",
+                        "this variant declares no payload fields",
+                        "remove the payload pattern from this unit variant arm",
+                    ));
+                }
+                None
+            }
+            Some(payload_ty) => {
+                let [argument] = arguments.as_slice() else {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        alternative.source,
+                        "semantic-runtime-match-payload-shape",
+                        "payload enum pattern requires one binding",
+                        "this variant declares exactly one payload field",
+                        "bind the variant payload once",
+                    ));
+                };
+                if argument.take {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        argument.source,
+                        "semantic-runtime-match-take-not-supported",
+                        "runtime enum pattern payload cannot use `take`",
+                        "the admitted ADT payload subset is copied into an arm-local binding",
+                        "remove `take` from the payload binding",
+                    ));
+                }
+                let payload_pattern = request
+                    .hir
+                    .as_program()
+                    .patterns
+                    .get(argument.pattern.0 as usize)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                let [payload_alternative] = payload_pattern.alternatives.as_slice() else {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        payload_pattern.source,
+                        "semantic-runtime-match-alternatives-not-supported",
+                        "runtime enum payload requires one binding pattern",
+                        "payload alternatives are outside the admitted ADT match subset",
+                        "bind the payload directly",
+                    ));
+                };
+                let wrela_hir::PrimaryPattern::Bind(local) = &payload_alternative.kind else {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        payload_alternative.source,
+                        "semantic-runtime-match-payload-shape",
+                        "runtime enum payload pattern must bind one name",
+                        "wildcard and nested destructuring remain outside the admitted ADT match subset",
+                        "bind the payload to a local name",
+                    ));
+                };
+                let local_record = request
+                    .hir
+                    .as_program()
+                    .locals
+                    .get(local.0 as usize)
+                    .filter(|record| record.id == *local && record.body == arm.body)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                let value = append_semantic_value(
+                    request,
+                    partial,
+                    function,
+                    payload_ty,
+                    (
+                        SemanticValueOrigin::Local(*local),
+                        Some(local_record.source),
+                        Some(local_record.name.as_str()),
+                    ),
+                    is_cancelled,
+                )?;
+                definitions
+                    .try_reserve(1)
+                    .map_err(|_| fact_resource(request, "runtime match bindings"))?;
+                definitions.push(LocalDefinition {
+                    local: *local,
+                    value,
+                });
+                let slot = arm_locals
+                    .get_mut(local.0 as usize)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                if slot
+                    .replace(RuntimeBinding {
+                        value,
+                        state: OwnershipState::Owned,
+                        authority: RuntimeAuthority::Own,
+                        origin: RuntimeBindingOrigin::Local(*local),
+                        source: local_record.source,
+                    })
+                    .is_some()
+                {
+                    return Err(AnalysisFailure::RequestMismatch.into());
+                }
+                Some(*local)
+            }
+        };
         let fact_start = partial.statements.len();
         analyze_runtime_body(
             request,
@@ -4977,7 +5006,7 @@ fn analyze_closed_enum_match(
         }
         for (index, (left, right)) in arm_locals.iter().zip(locals.iter()).enumerate() {
             check_cancelled(is_cancelled)?;
-            if index != local.0 as usize {
+            if binding_local.is_none_or(|local| index != local.0 as usize) {
                 state_changed |= left != right;
             }
         }
@@ -5326,6 +5355,22 @@ fn analyze_runtime_expression(
             state,
             is_cancelled,
         ),
+        ExpressionKind::IsPattern {
+            value,
+            negated: _,
+            pattern,
+        } => analyze_closed_enum_is_pattern(
+            request,
+            partial,
+            function,
+            expression_id,
+            expression.source,
+            *value,
+            *pattern,
+            expression_request,
+            state,
+            is_cancelled,
+        ),
         ExpressionKind::DotName { candidates, .. } => {
             let resolved = resolve_dot_variant_candidate(
                 request,
@@ -5371,6 +5416,223 @@ fn analyze_runtime_expression(
         ),
         _ => Err(AnalysisFailure::RequestMismatch.into()),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_closed_enum_is_pattern(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    expression: ExpressionId,
+    source: Span,
+    value: ExpressionId,
+    pattern: wrela_hir::PatternId,
+    expression_request: RuntimeExpressionRequest,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<RuntimeExpression> {
+    require_scalar_temporary_access(request, source, expression_request.access)?;
+    let scrutinee = analyze_runtime_expression(
+        request,
+        partial,
+        function,
+        value,
+        RuntimeExpressionRequest {
+            expected: None,
+            desired_result: None,
+            access: AccessMode::Read,
+        },
+        state,
+        is_cancelled,
+    )?;
+    let enumeration = partial
+        .types
+        .get(scrutinee.ty.0 as usize)
+        .and_then(|record| match &record.kind {
+            SemanticTypeKind::Enumeration {
+                declaration,
+                variants,
+                ..
+            } if !variants.is_empty() => Some(*declaration),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-runtime-is-scrutinee",
+                "runtime `is` requires a supported closed enum",
+                "the admitted pattern test dispatches on one canonical enum tag",
+                "test a nongeneric closed enum value",
+            )
+        })?;
+    let pattern = request
+        .hir
+        .as_program()
+        .patterns
+        .get(pattern.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let [alternative] = pattern.alternatives.as_slice() else {
+        return Err(runtime_type_diagnostic(
+            request,
+            pattern.source,
+            "semantic-runtime-is-pattern-shape",
+            "runtime `is` requires one constructor pattern",
+            "pattern alternatives are not one exact enum-tag test",
+            "test one explicit enum variant",
+        ));
+    };
+    let wrela_hir::PrimaryPattern::Constructor {
+        candidates,
+        arguments,
+        ..
+    } = &alternative.kind
+    else {
+        return Err(runtime_type_diagnostic(
+            request,
+            alternative.source,
+            "semantic-runtime-is-pattern-shape",
+            "runtime `is` requires an explicit enum constructor pattern",
+            "wildcard, literal, binding-only, tuple, and array tests are outside this ADT slice",
+            "name one declared enum variant",
+        ));
+    };
+    let [candidate] = candidates.as_slice() else {
+        return Err(runtime_type_diagnostic(
+            request,
+            alternative.source,
+            "semantic-runtime-is-pattern-shape",
+            "runtime `is` constructor is ambiguous or unresolved",
+            "tag testing requires one exact declaration and variant identity",
+            "qualify one visible enum variant",
+        ));
+    };
+    if candidate.enumeration.declaration != enumeration {
+        return Err(runtime_type_diagnostic(
+            request,
+            alternative.source,
+            "semantic-runtime-is-pattern-type",
+            "runtime `is` pattern belongs to a different enum",
+            "closed enum identities are never substituted by layout",
+            "test a variant declared by the scrutinee enum",
+        ));
+    }
+    let payload_ty = partial
+        .types
+        .get(scrutinee.ty.0 as usize)
+        .and_then(|record| match &record.kind {
+            SemanticTypeKind::Enumeration { variants, .. } => variants
+                .get(candidate.variant as usize)
+                .map(|variant| variant.fields.first().map(|field| field.ty)),
+            _ => None,
+        })
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    match payload_ty {
+        None if arguments.is_empty() => {}
+        None => {
+            return Err(runtime_type_diagnostic(
+                request,
+                alternative.source,
+                "semantic-runtime-is-pattern-shape",
+                "unit enum variant has no payload to test",
+                "this variant declares no payload fields",
+                "remove the payload pattern",
+            ));
+        }
+        Some(_) => {
+            let [argument] = arguments.as_slice() else {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    alternative.source,
+                    "semantic-runtime-is-pattern-shape",
+                    "payload enum variant requires one payload pattern",
+                    "this variant declares exactly one payload field",
+                    "use `_` when only the variant tag matters",
+                ));
+            };
+            if argument.take {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    argument.source,
+                    "semantic-runtime-is-pattern-shape",
+                    "runtime `is` cannot take a payload",
+                    "a boolean pattern test does not transfer payload ownership",
+                    "remove `take` from the payload pattern",
+                ));
+            }
+            let payload = request
+                .hir
+                .as_program()
+                .patterns
+                .get(argument.pattern.0 as usize)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            let [payload_alternative] = payload.alternatives.as_slice() else {
+                return Err(AnalysisFailure::RequestMismatch.into());
+            };
+            if !matches!(
+                payload_alternative.kind,
+                wrela_hir::PrimaryPattern::Wildcard
+            ) {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    payload_alternative.source,
+                    "semantic-runtime-is-binding-pending",
+                    "runtime `is` payload bindings are not yet supported",
+                    "this slice admits tag tests; success-dominated payload bindings require branch-local flow facts",
+                    "use `_` to test only the variant tag, or use exhaustive `match` to bind the payload",
+                ));
+            }
+        }
+    }
+    let bool_ty = ensure_primitive_type(
+        request,
+        partial,
+        PrimitiveSemanticType::Bool,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    if expression_request
+        .expected
+        .is_some_and(|expected| expected != bool_ty)
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-runtime-is-result",
+            "runtime `is` produces bool",
+            "pattern tests have one fixed boolean result type",
+            "use the test in a boolean context",
+        ));
+    }
+    let result = expression_result(
+        request,
+        partial,
+        function,
+        (expression, source),
+        bool_ty,
+        expression_request.desired_result,
+        is_cancelled,
+    )?;
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression,
+            ty: bool_ty,
+            result: Some(result),
+            resolution: ExpressionResolution::Value(result),
+            effects: scrutinee.effects,
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    Ok(RuntimeExpression {
+        ty: bool_ty,
+        result: Some(result),
+        referenced: None,
+        effects: scrutinee.effects,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -23794,6 +24056,156 @@ fn projection_fixture():
         format!(
             "module app\n\nfrom core.image import Image, Target\n\n{DOT_VARIANT_LOOKUP_ENUM}\n{app_body}\n@service\npub struct Worker:\n    pub async fn ping(mut self):\n        await checkpoint()\n\n@image\npub fn boot() -> Image:\n    img = Image(name=\"actor-image\", target=Target.aarch64_qemu_virt_uefi)\n    installed = img.service(Worker, mailbox=2)\n    return img\n"
         )
+    }
+
+    #[test]
+    fn runtime_adt_match_admits_unit_scalar_and_struct_payload_arms() {
+        let source = dot_variant_actor_source(
+            "pub struct Detail:\n    code: u32\n\npub enum Report:\n    empty\n    byte(u8)\n    filled(Detail)\n\nasync fn checkpoint():\n    state: Report = .filled(Detail(code=1))\n    match state:\n        case Report.empty:\n            pass\n        case Report.byte(value):\n            pass\n        case Report.filled(detail):\n            pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("mixed-arity ADT match is a recoverable analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "unit, scalar, and struct-payload arms must analyze cleanly: {:?}",
+            output.diagnostics()
+        );
+        let detail_ty = output
+            .partial()
+            .types
+            .iter()
+            .find(|ty| matches!(&ty.kind, SemanticTypeKind::Structure { fields, .. } if fields.iter().any(|field| field.name == "code")))
+            .map(|ty| ty.id)
+            .expect("Detail semantic type");
+        let detail_binding = output
+            .partial()
+            .values
+            .iter()
+            .find(|value| value.source_name.as_deref() == Some("detail"))
+            .expect("struct payload binding");
+        assert_eq!(detail_binding.ty, detail_ty);
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn runtime_adt_match_binds_each_variant_own_payload_type() {
+        let source = dot_variant_actor_source(
+            "pub enum Inner:\n    flag(u32)\n\npub enum Outer:\n    marker(u8)\n    nested(Inner)\n\nasync fn checkpoint():\n    state: Outer = .marker(1)\n    match state:\n        case Outer.marker(byte):\n            pass\n        case Outer.nested(inner):\n            pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("enum-payload ADT match is a recoverable analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "matching an enum-payload arm must analyze cleanly: {:?}",
+            output.diagnostics()
+        );
+        let inner_ty = output
+            .partial()
+            .types
+            .iter()
+            .find(|ty| matches!(&ty.kind, SemanticTypeKind::Enumeration { variants, .. } if variants.iter().any(|variant| variant.name == "flag")))
+            .map(|ty| ty.id)
+            .expect("Inner semantic type");
+        let inner_binding = output
+            .partial()
+            .values
+            .iter()
+            .find(|value| value.source_name.as_deref() == Some("inner"))
+            .expect("enum payload binding");
+        assert_eq!(inner_binding.ty, inner_ty);
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn runtime_adt_is_tests_unit_variant_without_binding() {
+        let source = dot_variant_actor_source(
+            "pub enum Status:\n    idle\n    active(u8)\n\nasync fn checkpoint():\n    state: Status = .active(1)\n    idle: bool = state is Status.idle\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("unit-variant is test is a recoverable analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "`is` over a unit ADT variant must analyze cleanly: {:?}",
+            output.diagnostics()
+        );
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn runtime_adt_is_tests_payload_variant_with_wildcard() {
+        let source = dot_variant_actor_source(
+            "pub enum Status:\n    idle\n    active(u8)\n\nasync fn checkpoint():\n    state: Status = .active(1)\n    active: bool = state is Status.active(_)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("payload-variant is test is a recoverable analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "`is` may ignore an admitted payload with `_`: {:?}",
+            output.diagnostics()
+        );
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn runtime_adt_is_payload_binding_fails_closed() {
+        let source = dot_variant_actor_source(
+            "pub enum Status:\n    idle\n    active(u8)\n\nasync fn checkpoint():\n    state: Status = .active(1)\n    if state is Status.active(value):\n        pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("is payload binding is a source diagnostic");
+        assert!(output.diagnostics().iter().any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("semantic-runtime-is-binding-pending")
+        }));
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn runtime_adt_match_nonexhaustive_names_stable_diagnostic() {
+        let source = dot_variant_actor_source(
+            "pub enum Status:\n    idle\n    active(u8)\n\nasync fn checkpoint():\n    state: Status = .active(1)\n    match state:\n        case Status.active(value):\n            pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("nonexhaustive ADT match is a source diagnostic");
+        assert!(output.diagnostics().iter().any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("semantic-runtime-match-nonexhaustive")
+        }));
+        assert!(output.has_errors());
     }
 
     #[test]
