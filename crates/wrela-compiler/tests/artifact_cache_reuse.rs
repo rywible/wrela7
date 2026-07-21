@@ -275,7 +275,7 @@ fn flow_fixture(build: BuildIdentity) -> ValidatedFlowWir {
         name: "cache-image".to_owned(),
         build,
         source_summary: SourceSummary {
-            semantic_wir_version: 8,
+            semantic_wir_version: 9,
             semantic_functions: 1,
             hir_files: 1,
             hir_declarations: 1,

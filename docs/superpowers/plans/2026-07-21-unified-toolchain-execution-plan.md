@@ -138,7 +138,7 @@ Dependency-ordered; each depends on the Tier-0 value shapes it carries.
   field & projected places (`self.field`, `agg.field`). Unblocks view-RMW (B1b),
   actor state, region escape. Overlaps the old "Lane A aggregate ownership".
 - **L2.2 — Non-scalar values through WIR + codegen.** Aggregates/views/replies
-  represented (or erased) through SemanticWir v8 / FlowWir v10 / MachineWir v10 +
+  represented (or erased) through SemanticWir v9 / FlowWir v10 / MachineWir v10 +
   codecs + LLVM codegen, to native COFF. Depends L2.1, T0.
 - **L2.3 — Region/escape producer.** Whole-image escape analysis emitting
   `Allocate`/`ResetRegion`/`Promote`; feeds B2a's schema with real facts (B2b).
@@ -200,7 +200,7 @@ D2 need this scope substantially complete; B10 needs F5.
 
 | 0 | T0.3 generics/monomorphization (A6) | T0.1 | **T0.3a + T0.3b analysis tiers landed** — flat structures and module-level synchronous functions specialize over ordered primitive stored-copy-scalar type arguments. Function inference combines expected results and already-typed arguments, repeat instances deduplicate, signatures substitute exactly, recursive specialization is bounded by an active stack, and full sealing independently derives the specialization key/signature (`generic_copy_scalar_function_specializes_expected_types`, `generic_function_infers_from_a_typed_argument_without_result_context`). Const/bounded/region and nested-nominal arguments, unconstrained/conflicting inference, and recursion remain named fail-closed. Generic interfaces/method syntax are subsequent increments; lowering rejects `semantic-generic-structure-lowering-pending` and `semantic-generic-function-lowering-pending`. Existing parsed/HIR `region` generics remain unchanged pending the source-spec/normative-fixture reconciliation. |
 | — | General `match`/`is` over ADTs (consumer; uses T0.1, needed for AdmissionResult consumption) | T0.1 | **landed** 69188c6b — mixed-arity/per-variant-type exhaustive statement match; unit/payload-wildcard `is`; success-dominated `is` binding remains named fail-closed |
-| 2 | L2.1a local aggregate mutation | T0 | queued — local `agg.field` can use root-SSA replacement, then `InsertField`; persistent `self.field` is not part of this increment |
+| 2 | L2.1a local aggregate mutation | T0 | **landed in this slice** — plain one-level `owned_local.field = rhs` uses exact root-SSA aggregate replacement through SemanticWir v9/FlowWir v10 `InsertField`; the guarded one-field-`u64` representation reaches MachineWir and repeat byte-identical ARM64 COFF (`projected_local_assignment_defines_a_fresh_aggregate_value`, `local_flat_field_update_reaches_deterministic_native_coff`). Compound/nested/nonlocal/actor-state mutation stays named fail-closed; persistent `self.field` remains the next prerequisite. |
 | 2 | actor-state initialization/storage floor | L2.1a | **new prerequisite** — actors currently retain no initialized state value/global, so `self.field` mutation cannot be represented without discarding persistence |
 | 2 | L2.1b persistent actor-state mutation | actor-state storage | queued — must remain `semantic-self-field-mutation-state-pending` until the state store exists |
 | 2 | L2.2 values-through-WIR + codegen | L2.1a,T0 | queued — first increment is multi-field flat scalar structs through MachineWir/LLVM; reply slots remain exclusively L2.4 |

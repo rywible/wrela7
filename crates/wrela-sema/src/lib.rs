@@ -2460,16 +2460,32 @@ fn validate_exact_body_local_value_flow(
                 let wrela_hir::Definition::Local(local) = target.root else {
                     return Err(invalid("assignment local-value flow target is not local"));
                 };
-                if !target.projections.is_empty() {
-                    return Err(invalid(
-                        "assignment local-value flow target contains a projection",
-                    ));
-                }
-                if *operator != wrela_hir::AssignmentOperator::Assign
+                let projected_field = match target.projections.as_slice() {
+                    [] => None,
+                    [wrela_hir::PlaceProjection::Field(name)]
+                        if *operator == wrela_hir::AssignmentOperator::Assign =>
+                    {
+                        Some(name)
+                    }
+                    _ => {
+                        return Err(invalid(
+                            "assignment local-value flow projection is unsupported",
+                        ));
+                    }
+                };
+                if projected_field.is_none()
+                    && *operator != wrela_hir::AssignmentOperator::Assign
                     && expression_references_local(program, *value, local, is_cancelled)?
                 {
                     return Err(invalid(
                         "compound-assignment right-hand side overlaps its destination",
+                    ));
+                }
+                if projected_field.is_some()
+                    && expression_references_local(program, *value, local, is_cancelled)?
+                {
+                    return Err(invalid(
+                        "projected-assignment right-hand side overlaps its reserved aggregate",
                     ));
                 }
                 validate_exact_expression_local_values(
@@ -2491,6 +2507,49 @@ fn validate_exact_body_local_value_flow(
                 })?;
                 if definition.local != local || definition.value == previous {
                     return Err(invalid("assignment local-value flow is not exact"));
+                }
+                if let Some(field_name) = projected_field {
+                    let previous_record = analysis
+                        .values
+                        .get(previous.0 as usize)
+                        .filter(|record| record.function == function.id)
+                        .ok_or_else(|| invalid("projected assignment previous value is invalid"))?;
+                    let replacement = analysis
+                        .values
+                        .get(definition.value.0 as usize)
+                        .filter(|record| record.function == function.id)
+                        .ok_or_else(|| invalid("projected assignment replacement is invalid"))?;
+                    let Some(SemanticTypeKind::Structure {
+                        arguments, fields, ..
+                    }) = analysis
+                        .types
+                        .get(previous_record.ty.0 as usize)
+                        .map(|record| &record.kind)
+                    else {
+                        return Err(invalid(
+                            "projected assignment previous value is not a structure",
+                        ));
+                    };
+                    let rhs = exact_child_expression(analysis, function.id, *value)
+                        .ok_or_else(|| invalid("projected assignment RHS is missing"))?;
+                    let mut selected = None;
+                    for field in fields {
+                        check_analysis_cancelled(is_cancelled)?;
+                        if field.name == field_name.as_str() && selected.replace(field).is_some() {
+                            return Err(invalid("projected assignment field is ambiguous"));
+                        }
+                    }
+                    let field = selected
+                        .ok_or_else(|| invalid("projected assignment field is not exact"))?;
+                    if !arguments.is_empty()
+                        || !runtime_structure_arguments_supported(analysis, arguments, fields)
+                        || replacement.ty != previous_record.ty
+                        || rhs.ty != field.ty
+                    {
+                        return Err(invalid(
+                            "projected assignment local-value flow type is not exact",
+                        ));
+                    }
                 }
                 *slot = Some(definition.value);
                 exact_child_expression(analysis, function.id, *value)
@@ -5282,11 +5341,8 @@ fn validate_exact_statement_fact(
             let wrela_hir::Definition::Local(local) = &target.root else {
                 return Err(invalid("scalar assignment target is not a local"));
             };
-            if !target.projections.is_empty() {
-                return Err(invalid("scalar assignment target contains a projection"));
-            }
             let [definition] = fact.definitions.as_slice() else {
-                return Err(invalid("scalar assignment lacks one exact definition"));
+                return Err(invalid("assignment lacks one exact definition"));
             };
             let expression = analysis
                 .expressions
@@ -5295,50 +5351,113 @@ fn validate_exact_statement_fact(
                 })
                 .ok()
                 .and_then(|index| analysis.expressions.get(index))
-                .ok_or_else(|| invalid("scalar assignment expression fact is missing"))?;
+                .ok_or_else(|| invalid("assignment expression fact is missing"))?;
             let local_record = program
                 .locals
                 .get(local.0 as usize)
                 .filter(|record| record.id == *local)
-                .ok_or_else(|| invalid("scalar assignment local is invalid"))?;
+                .ok_or_else(|| invalid("assignment local is invalid"))?;
             let value_record = analysis
                 .values
                 .get(definition.value.0 as usize)
-                .ok_or_else(|| invalid("scalar assignment value is invalid"))?;
-            let compound = *operator != wrela_hir::AssignmentOperator::Assign;
-            let expression_binding_matches = if compound {
-                expression.result != Some(definition.value)
-                    && expression.ty == value_record.ty
-                    && analysis
-                        .types
-                        .get(value_record.ty.0 as usize)
-                        .is_some_and(|ty| matches!(ty.kind, SemanticTypeKind::Integer { .. }))
-                    && !analysis.expressions.iter().any(|expression| {
+                .ok_or_else(|| invalid("assignment value is invalid"))?;
+            if !target.projections.is_empty() {
+                let [wrela_hir::PlaceProjection::Field(field_name)] = target.projections.as_slice()
+                else {
+                    return Err(invalid(
+                        "projected assignment target is not one direct field",
+                    ));
+                };
+                if *operator != wrela_hir::AssignmentOperator::Assign {
+                    return Err(invalid("projected assignment operator is not plain assign"));
+                }
+                let Some(SemanticTypeKind::Structure {
+                    arguments, fields, ..
+                }) = analysis
+                    .types
+                    .get(value_record.ty.0 as usize)
+                    .map(|record| &record.kind)
+                else {
+                    return Err(invalid(
+                        "projected assignment value is not a flat structure",
+                    ));
+                };
+                if !arguments.is_empty()
+                    || !runtime_structure_arguments_supported(analysis, arguments, fields)
+                {
+                    return Err(invalid(
+                        "projected assignment structure is not the supported nongeneric shape",
+                    ));
+                }
+                let mut selected = None;
+                for (index, field) in fields.iter().enumerate() {
+                    check_analysis_cancelled(is_cancelled)?;
+                    if field.name == field_name.as_str() && selected.replace(index).is_some() {
+                        return Err(invalid("projected assignment field is ambiguous"));
+                    }
+                }
+                let field = selected
+                    .and_then(|index| fields.get(index))
+                    .ok_or_else(|| invalid("projected assignment field is missing"))?;
+                if definition.local != *local
+                    || expression.ty != field.ty
+                    || !exact_expression_produces_value(expression)
+                    || expression.result == Some(definition.value)
+                    || analysis.expressions.iter().any(|expression| {
                         expression.function == function.id
                             && expression.result == Some(definition.value)
                     })
-                    && !expression_references_local(program, *value, *local, is_cancelled)?
-            } else {
-                expression.result == Some(definition.value)
-            };
-            if definition.local != *local
-                || !expression_binding_matches
-                || value_record.function != function.id
-                || value_record.origin != SemanticValueOrigin::Local(*local)
-                || value_record.source != Some(local_record.source)
-                || value_record.source_name.as_deref() != Some(local_record.name.as_str())
-                || exact_runtime_source_type(
-                    analysis,
-                    local_record
-                        .ty
-                        .as_ref()
-                        .ok_or_else(|| invalid("scalar assignment local lacks a type"))?,
-                ) != Some(value_record.ty)
-            {
-                return Err(invalid("scalar assignment binding differs from HIR"));
-            }
-            if compound {
+                    || value_record.function != function.id
+                    || value_record.origin != SemanticValueOrigin::Local(*local)
+                    || value_record.source != Some(local_record.source)
+                    || value_record.source_name.as_deref() != Some(local_record.name.as_str())
+                    || exact_runtime_source_type(
+                        analysis,
+                        local_record
+                            .ty
+                            .as_ref()
+                            .ok_or_else(|| invalid("projected assignment local lacks a type"))?,
+                    ) != Some(value_record.ty)
+                {
+                    return Err(invalid("projected assignment binding differs from HIR"));
+                }
                 increment_definition(definitions, definition.value)?;
+            } else {
+                let compound = *operator != wrela_hir::AssignmentOperator::Assign;
+                let expression_binding_matches = if compound {
+                    expression.result != Some(definition.value)
+                        && expression.ty == value_record.ty
+                        && analysis
+                            .types
+                            .get(value_record.ty.0 as usize)
+                            .is_some_and(|ty| matches!(ty.kind, SemanticTypeKind::Integer { .. }))
+                        && !analysis.expressions.iter().any(|expression| {
+                            expression.function == function.id
+                                && expression.result == Some(definition.value)
+                        })
+                        && !expression_references_local(program, *value, *local, is_cancelled)?
+                } else {
+                    expression.result == Some(definition.value)
+                };
+                if definition.local != *local
+                    || !expression_binding_matches
+                    || value_record.function != function.id
+                    || value_record.origin != SemanticValueOrigin::Local(*local)
+                    || value_record.source != Some(local_record.source)
+                    || value_record.source_name.as_deref() != Some(local_record.name.as_str())
+                    || exact_runtime_source_type(
+                        analysis,
+                        local_record
+                            .ty
+                            .as_ref()
+                            .ok_or_else(|| invalid("scalar assignment local lacks a type"))?,
+                    ) != Some(value_record.ty)
+                {
+                    return Err(invalid("scalar assignment binding differs from HIR"));
+                }
+                if compound {
+                    increment_definition(definitions, definition.value)?;
+                }
             }
         }
         wrela_hir::StatementKind::Match { scrutinee, arms } => {
@@ -7356,7 +7475,6 @@ fn valid_lexical_view_record(
         if let wrela_hir::StatementKind::Assign { targets, .. } = &candidate.kind {
             let rebinds_retained = targets.iter().any(|target| {
                 target.source.range.start < terminal.source.range.start
-                    && target.projections.is_empty()
                     && match target.root {
                         wrela_hir::Definition::Local(local) if local == view.binding => true,
                         wrela_hir::Definition::Local(local) => view.sources.iter().any(|source| {

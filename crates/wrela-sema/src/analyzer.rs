@@ -4796,6 +4796,16 @@ fn analyze_runtime_body(
                     ));
                 };
                 let Definition::Local(local) = target.root else {
+                    if !target.projections.is_empty() {
+                        return Err(runtime_type_diagnostic(
+                            request,
+                            target.source,
+                            "semantic-projected-assignment-root-pending",
+                            "projected assignment currently requires an owned local root",
+                            "parameter, declaration, and receiver roots require place authority to survive aggregate replacement",
+                            "copy the aggregate into a typed local before assigning one of its fields",
+                        ));
+                    }
                     return Err(runtime_type_diagnostic(
                         request,
                         target.source,
@@ -4805,16 +4815,6 @@ fn analyze_runtime_body(
                         "assign an initialized scalar local",
                     ));
                 };
-                if !target.projections.is_empty() {
-                    return Err(runtime_type_diagnostic(
-                        request,
-                        target.source,
-                        "semantic-assignment-form",
-                        "scalar assignment requires a direct local target",
-                        "projected assignment requires aggregate place-level mutation semantics",
-                        "assign the explicitly typed scalar local directly",
-                    ));
-                }
                 let current = locals
                     .get(local.0 as usize)
                     .copied()
@@ -4865,23 +4865,119 @@ fn analyze_runtime_body(
                     .get(local.0 as usize)
                     .filter(|record| record.id == local)
                     .ok_or(AnalysisFailure::RequestMismatch)?;
-                let compound = compound_assignment_binary_operator(*operator);
-                if compound.is_some()
-                    && !matches!(
-                        runtime_scalar_type(partial, current_ty),
-                        Some(RuntimeScalarType::Integer { .. })
-                    )
-                {
-                    return Err(runtime_type_diagnostic(
-                        request,
-                        statement.source,
-                        "semantic-compound-assignment-type",
-                        "compound assignment requires an integer local",
-                        "revision 0.1 defines compound arithmetic, bitwise, and shift assignment only for integers",
-                        "use an integer local or write an explicitly supported operation",
-                    ));
-                }
-                let value_id = if compound.is_some() {
+                if !target.projections.is_empty() {
+                    if *operator != AssignmentOperator::Assign {
+                        return Err(runtime_type_diagnostic(
+                            request,
+                            target.source,
+                            "semantic-projected-assignment-compound-pending",
+                            "compound projected assignment is not yet supported",
+                            "read-modify-write field operations require an explicit projected-place reservation",
+                            "compute the replacement scalar separately and use plain field assignment",
+                        ));
+                    }
+                    let [projection] = target.projections.as_slice() else {
+                        return Err(runtime_type_diagnostic(
+                            request,
+                            target.source,
+                            "semantic-projected-assignment-nested-pending",
+                            "nested projected assignment is not yet supported",
+                            "revision 0.1 currently replaces one field of one owned local aggregate",
+                            "assign through exactly one direct field projection",
+                        ));
+                    };
+                    let wrela_hir::PlaceProjection::Field(field_name) = projection else {
+                        return Err(runtime_type_diagnostic(
+                            request,
+                            target.source,
+                            "semantic-projected-assignment-shape-pending",
+                            "projected assignment currently supports named structure fields only",
+                            "tuple and indexed places require their own aggregate layout and bounds proofs",
+                            "assign one named field of a flat runtime structure",
+                        ));
+                    };
+                    let (declaration, field_ty, field_public) = {
+                        let record = partial
+                            .types
+                            .get(current_ty.0 as usize)
+                            .ok_or(AnalysisFailure::RequestMismatch)?;
+                        let SemanticTypeKind::Structure {
+                            declaration,
+                            arguments,
+                            fields,
+                        } = &record.kind
+                        else {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                target.source,
+                                "semantic-projected-assignment-base",
+                                "projected assignment requires a flat runtime structure local",
+                                "scalar and unsupported aggregate locals do not expose replaceable named fields",
+                                "use a nongeneric structure with scalar-backed fields",
+                            ));
+                        };
+                        if !arguments.is_empty()
+                            || !runtime_structure_arguments_supported(partial, arguments, fields)
+                        {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                target.source,
+                                "semantic-projected-assignment-base",
+                                "projected assignment requires a nongeneric flat runtime structure",
+                                "generic and non-flat aggregate replacement remains outside this lowering slice",
+                                "use a nongeneric structure with scalar-backed fields",
+                            ));
+                        }
+                        let mut selected = None;
+                        for (index, field) in fields.iter().enumerate() {
+                            charge_runtime_aggregate_lookup(
+                                request,
+                                &mut *aggregate_work,
+                                is_cancelled,
+                            )?;
+                            if field.name == field_name.as_str()
+                                && selected.replace(index).is_some()
+                            {
+                                return Err(runtime_type_diagnostic(
+                                    request,
+                                    target.source,
+                                    "semantic-projected-assignment-field",
+                                    "projected assignment field name is ambiguous",
+                                    "field replacement requires one exact structure declaration field",
+                                    "remove the duplicate field declaration",
+                                ));
+                            }
+                        }
+                        let index = selected.ok_or_else(|| {
+                            runtime_type_diagnostic(
+                                request,
+                                target.source,
+                                "semantic-projected-assignment-field",
+                                "projected assignment does not name a declared structure field",
+                                "field names are matched exactly and nominally",
+                                "assign one of the structure's declared fields",
+                            )
+                        })?;
+                        (*declaration, fields[index].ty, fields[index].public)
+                    };
+                    if runtime_function_module(request, partial, function)?
+                        != request
+                            .hir
+                            .as_program()
+                            .declaration(declaration)
+                            .ok_or(AnalysisFailure::RequestMismatch)?
+                            .module
+                        && !field_public
+                    {
+                        return Err(runtime_type_diagnostic(
+                            request,
+                            target.source,
+                            "semantic-runtime-field-private",
+                            "runtime structure field is private to its declaring module",
+                            "projected assignment from another module preserves source visibility",
+                            "expose a public mutator from the declaring module",
+                        ));
+                    }
                     *locals
                         .get_mut(local.0 as usize)
                         .ok_or(AnalysisFailure::RequestMismatch)? = Some(RuntimeBinding {
@@ -4894,7 +4990,7 @@ fn analyze_runtime_body(
                         function,
                         *value,
                         RuntimeExpressionRequest {
-                            expected: Some(current_ty),
+                            expected: Some(field_ty),
                             desired_result: None,
                             access: AccessMode::Value,
                         },
@@ -4921,19 +5017,6 @@ fn analyze_runtime_body(
                     {
                         return Err(AnalysisFailure::RequestMismatch.into());
                     }
-                    append_semantic_value(
-                        request,
-                        partial,
-                        function,
-                        current_ty,
-                        (
-                            SemanticValueOrigin::Local(local),
-                            Some(local_record.source),
-                            Some(local_record.name.as_str()),
-                        ),
-                        is_cancelled,
-                    )?
-                } else {
                     let value_id = append_semantic_value(
                         request,
                         partial,
@@ -4946,42 +5029,139 @@ fn analyze_runtime_body(
                         ),
                         is_cancelled,
                     )?;
-                    let outcome = analyze_runtime_expression(
-                        request,
-                        partial,
-                        function,
-                        *value,
-                        RuntimeExpressionRequest {
-                            expected: Some(current_ty),
-                            desired_result: Some(value_id),
-                            access: AccessMode::Value,
-                        },
-                        &mut RuntimeState {
-                            locals: &mut *locals,
-                            parameters: &mut *parameters,
-                            aggregate_work: &mut *aggregate_work,
-                            allow_assertions,
-                            allow_scope_call: false,
-                        },
-                        is_cancelled,
-                    )?;
-                    statement_effects = outcome.effects;
-                    value_id
-                };
-                *locals
-                    .get_mut(local.0 as usize)
-                    .ok_or(AnalysisFailure::RequestMismatch)? = Some(RuntimeBinding {
-                    value: value_id,
-                    state: OwnershipState::Owned,
-                    ..current
-                });
-                definitions
-                    .try_reserve_exact(1)
-                    .map_err(|_| fact_resource(request, "statement local definitions"))?;
-                definitions.push(LocalDefinition {
-                    local,
-                    value: value_id,
-                });
+                    *locals
+                        .get_mut(local.0 as usize)
+                        .ok_or(AnalysisFailure::RequestMismatch)? = Some(RuntimeBinding {
+                        value: value_id,
+                        state: OwnershipState::Owned,
+                        ..current
+                    });
+                    definitions
+                        .try_reserve_exact(1)
+                        .map_err(|_| fact_resource(request, "statement local definitions"))?;
+                    definitions.push(LocalDefinition {
+                        local,
+                        value: value_id,
+                    });
+                } else {
+                    let compound = compound_assignment_binary_operator(*operator);
+                    if compound.is_some()
+                        && !matches!(
+                            runtime_scalar_type(partial, current_ty),
+                            Some(RuntimeScalarType::Integer { .. })
+                        )
+                    {
+                        return Err(runtime_type_diagnostic(
+                            request,
+                            statement.source,
+                            "semantic-compound-assignment-type",
+                            "compound assignment requires an integer local",
+                            "revision 0.1 defines compound arithmetic, bitwise, and shift assignment only for integers",
+                            "use an integer local or write an explicitly supported operation",
+                        ));
+                    }
+                    let value_id = if compound.is_some() {
+                        *locals
+                            .get_mut(local.0 as usize)
+                            .ok_or(AnalysisFailure::RequestMismatch)? = Some(RuntimeBinding {
+                            state: OwnershipState::BorrowedMut,
+                            ..current
+                        });
+                        let outcome = analyze_runtime_expression(
+                            request,
+                            partial,
+                            function,
+                            *value,
+                            RuntimeExpressionRequest {
+                                expected: Some(current_ty),
+                                desired_result: None,
+                                access: AccessMode::Value,
+                            },
+                            &mut RuntimeState {
+                                locals: &mut *locals,
+                                parameters: &mut *parameters,
+                                aggregate_work: &mut *aggregate_work,
+                                allow_assertions,
+                                allow_scope_call: false,
+                            },
+                            is_cancelled,
+                        )?;
+                        statement_effects = outcome.effects;
+                        let reserved = locals
+                            .get(local.0 as usize)
+                            .copied()
+                            .flatten()
+                            .ok_or(AnalysisFailure::RequestMismatch)?;
+                        if reserved
+                            != (RuntimeBinding {
+                                state: OwnershipState::BorrowedMut,
+                                ..current
+                            })
+                        {
+                            return Err(AnalysisFailure::RequestMismatch.into());
+                        }
+                        append_semantic_value(
+                            request,
+                            partial,
+                            function,
+                            current_ty,
+                            (
+                                SemanticValueOrigin::Local(local),
+                                Some(local_record.source),
+                                Some(local_record.name.as_str()),
+                            ),
+                            is_cancelled,
+                        )?
+                    } else {
+                        let value_id = append_semantic_value(
+                            request,
+                            partial,
+                            function,
+                            current_ty,
+                            (
+                                SemanticValueOrigin::Local(local),
+                                Some(local_record.source),
+                                Some(local_record.name.as_str()),
+                            ),
+                            is_cancelled,
+                        )?;
+                        let outcome = analyze_runtime_expression(
+                            request,
+                            partial,
+                            function,
+                            *value,
+                            RuntimeExpressionRequest {
+                                expected: Some(current_ty),
+                                desired_result: Some(value_id),
+                                access: AccessMode::Value,
+                            },
+                            &mut RuntimeState {
+                                locals: &mut *locals,
+                                parameters: &mut *parameters,
+                                aggregate_work: &mut *aggregate_work,
+                                allow_assertions,
+                                allow_scope_call: false,
+                            },
+                            is_cancelled,
+                        )?;
+                        statement_effects = outcome.effects;
+                        value_id
+                    };
+                    *locals
+                        .get_mut(local.0 as usize)
+                        .ok_or(AnalysisFailure::RequestMismatch)? = Some(RuntimeBinding {
+                        value: value_id,
+                        state: OwnershipState::Owned,
+                        ..current
+                    });
+                    definitions
+                        .try_reserve_exact(1)
+                        .map_err(|_| fact_resource(request, "statement local definitions"))?;
+                    definitions.push(LocalDefinition {
+                        local,
+                        value: value_id,
+                    });
+                }
             }
             StatementKind::Expression(expression) => {
                 let outcome = analyze_runtime_expression(
@@ -26349,7 +26529,7 @@ fn projection_fixture():
         });
         assert_eq!(
             diagnostic(&projected).code.as_deref(),
-            Some("semantic-assignment-form")
+            Some("semantic-projected-assignment-compound-pending")
         );
 
         let multi = mutate_scalar_fixture(|program| {
@@ -28968,6 +29148,201 @@ fn scope_binding_is_lexical():
     }
 
     #[test]
+    fn projected_local_assignment_defines_a_fresh_aggregate_value() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Pair:
+    pub left: u64
+    pub right: u64
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn projected_store_is_ssa():
+    pair: Pair = Pair(left=1, right=2)
+    pair.right = 9
+    observed: u64 = pair.right
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "owned local projected assignment must analyze: {:?}",
+            output.diagnostics()
+        );
+        let analyzed = output.successful().expect("sealed projected assignment");
+        let facts = analyzed.facts();
+        let pair = analyzed
+            .hir()
+            .as_program()
+            .locals
+            .iter()
+            .find(|local| local.name.as_str() == "pair")
+            .expect("pair local")
+            .id;
+        let definitions: Vec<_> = facts
+            .statements
+            .iter()
+            .flat_map(|fact| &fact.definitions)
+            .filter(|definition| definition.local == pair)
+            .copied()
+            .collect();
+        assert_eq!(definitions.len(), 2);
+        assert_ne!(definitions[0].value, definitions[1].value);
+        assert!(matches!(
+            facts.types[facts.values[definitions[1].value.0 as usize].ty.0 as usize].kind,
+            SemanticTypeKind::Structure { .. }
+        ));
+        assert!(
+            !facts
+                .expressions
+                .iter()
+                .any(|expression| expression.result == Some(definitions[1].value)),
+            "the field RHS is distinct from the replacement aggregate value"
+        );
+
+        let program = analyzed.hir().as_program();
+        let projected = program
+            .statements
+            .iter()
+            .find_map(|statement| match &statement.kind {
+                StatementKind::Assign { targets, value, .. }
+                    if targets
+                        .first()
+                        .is_some_and(|target| !target.projections.is_empty()) =>
+                {
+                    Some((statement.id, *value))
+                }
+                _ => None,
+            })
+            .expect("projected assignment HIR");
+        let rhs = facts
+            .expressions
+            .iter()
+            .find(|fact| fact.expression == projected.1)
+            .and_then(|fact| fact.result)
+            .expect("projected assignment RHS value");
+        let mut forged = facts.clone();
+        forged
+            .statements
+            .iter_mut()
+            .find(|fact| fact.statement == projected.0)
+            .and_then(|fact| fact.definitions.first_mut())
+            .expect("mutable projected assignment definition")
+            .value = rhs;
+        assert!(
+            forged.validate_for_seal(analyzed.hir(), &|| false).is_err(),
+            "the exact sealer must reject a scalar RHS forged as the replacement aggregate"
+        );
+
+        let mut overlapping_program = analyzed.hir().clone().into_program();
+        overlapping_program.expressions[projected.1.0 as usize].kind =
+            ExpressionKind::Reference(Definition::Local(pair));
+        let overlapping_hir = overlapping_program
+            .validate()
+            .expect("structurally valid overlapping projected assignment HIR");
+        let mut overlapping_facts = facts.clone();
+        overlapping_facts.hir =
+            HirSummary::from_validated(&overlapping_hir).expect("overlapping HIR summary");
+        assert!(
+            overlapping_facts
+                .validate_for_seal(&overlapping_hir, &|| false)
+                .is_err(),
+            "the exact sealer must reject a projected-assignment RHS forged to reference its reserved aggregate"
+        );
+    }
+
+    #[test]
+    fn projected_assignment_adjacent_shapes_fail_closed_and_live_views_stay_frozen() {
+        const PREFIX: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Pair:
+    pub left: u64
+    pub right: u64
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+"#;
+        let diagnostic = |source: &str| {
+            let output = compile_scope_fixture(source);
+            assert!(output.has_errors(), "fixture must fail closed");
+            output
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.clone())
+        };
+
+        let compound = format!(
+            "{PREFIX}\n@test(runtime)\nfn rejected():\n    pair: Pair = Pair(left=1, right=2)\n    pair.right += 1\n"
+        );
+        assert_eq!(
+            diagnostic(&compound).as_deref(),
+            Some("semantic-projected-assignment-compound-pending")
+        );
+
+        let nested = format!(
+            "{PREFIX}\n@test(runtime)\nfn rejected():\n    pair: Pair = Pair(left=1, right=2)\n    pair.right.value = 1\n"
+        );
+        assert_eq!(
+            diagnostic(&nested).as_deref(),
+            Some("semantic-projected-assignment-nested-pending")
+        );
+
+        let nonlocal = format!(
+            "{PREFIX}\nfn replace(mut pair: Pair):\n    pair.right = 3\n\n@test(runtime)\nfn rejected():\n    pair: Pair = Pair(left=1, right=2)\n    replace(mut pair)\n"
+        );
+        assert_eq!(
+            diagnostic(&nonlocal).as_deref(),
+            Some("semantic-projected-assignment-root-pending")
+        );
+
+        let overlap = format!(
+            "{PREFIX}\nfn consume(take pair: Pair) -> u64:\n    return 7\n\n@test(runtime)\nfn rejected():\n    pair: Pair = Pair(left=1, right=2)\n    pair.right = consume(take pair)\n"
+        );
+        assert_eq!(
+            diagnostic(&overlap).as_deref(),
+            Some("semantic-compound-overlap")
+        );
+
+        const VIEW_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Pair:
+    pub left: u64
+    pub right: u64
+
+projection choose(read left: Pair, read right: Pair) -> view u64:
+    yield left.left
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn rejected():
+    left: Pair = Pair(left=1, right=2)
+    right: Pair = Pair(left=3, right=4)
+    selected: view u64 = choose(left=left, right=right)
+    right.left = 5
+    consume(selected)
+"#;
+        assert_eq!(
+            diagnostic(VIEW_SOURCE).as_deref(),
+            Some("semantic-projection-carrier-rebound")
+        );
+    }
+
+    #[test]
     fn free_scope_call_builds_protocol_activation_and_lexical_binding() {
         let output = compile_scope_fixture(SCOPE_SEMANTICS_SOURCE);
         assert!(
@@ -29618,6 +29993,20 @@ fn projection_call_is_lexical():
             .get_mut(terminal_statement.0 as usize)
             .expect("terminal statement")
             .kind = StatementKind::Pass;
+        let mut forged_projected_program = forged_program.clone();
+        let StatementKind::Assign { targets, .. } = &mut forged_projected_program
+            .statements
+            .get_mut(intervening.0 as usize)
+            .expect("intervening projected assignment")
+            .kind
+        else {
+            panic!("intervening assignment shape");
+        };
+        targets[0]
+            .projections
+            .push(wrela_hir::PlaceProjection::Field(
+                Name::new("header".to_owned()).expect("field name"),
+            ));
         let forged_hir = forged_program
             .validate()
             .expect("structurally valid forged HIR");
@@ -29638,6 +30027,29 @@ fn projection_call_is_lexical():
                 .validate_for_seal(&forged_hir, &|| false)
                 .is_err(),
             "the exact sealer must independently reject retained-source rebinding"
+        );
+
+        let forged_projected_hir = forged_projected_program
+            .validate()
+            .expect("structurally valid projected retained-source mutation");
+        assert!(
+            !valid_lexical_view_record(
+                &facts.lexical_views[0],
+                facts,
+                forged_projected_hir.as_program(),
+                &|| false,
+            )
+            .expect("exact lexical-view projected-mutation validation"),
+            "the lexical-view validator must treat projected assignment as replacement of its retained aggregate"
+        );
+        let mut forged_projected_facts = facts.clone();
+        forged_projected_facts.hir =
+            HirSummary::from_validated(&forged_projected_hir).expect("projected HIR summary");
+        assert!(
+            forged_projected_facts
+                .validate_for_seal(&forged_projected_hir, &|| false)
+                .is_err(),
+            "the exact sealer must reject projected mutation of a retained source"
         );
     }
 

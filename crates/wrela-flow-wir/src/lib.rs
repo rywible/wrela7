@@ -15,7 +15,7 @@ pub use wrela_test_model::TestPlanLimits;
 
 pub const FLOW_WIR_VERSION: u32 = 10;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
-pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 8;
+pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 9;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -4765,11 +4765,42 @@ fn validate_operation(
         FlowOperation::ExtractField { aggregate, .. } => value!(*aggregate),
         FlowOperation::InsertField {
             aggregate,
+            field,
             value: inserted,
-            ..
         } => {
             value!(*aggregate);
             value!(*inserted);
+            let valid = function
+                .values
+                .get(aggregate.0 as usize)
+                .and_then(|aggregate| {
+                    let aggregate_ty = aggregate.ty;
+                    module
+                        .types
+                        .get(aggregate_ty.0 as usize)
+                        .and_then(|record| match &record.kind {
+                            FlowTypeKind::Struct { fields } => fields
+                                .get(*field as usize)
+                                .copied()
+                                .map(|field_ty| (aggregate_ty, field_ty)),
+                            _ => None,
+                        })
+                })
+                .is_some_and(|(aggregate_ty, field_ty)| {
+                    function
+                        .values
+                        .get(inserted.0 as usize)
+                        .is_some_and(|inserted| inserted.ty == field_ty)
+                        && matches!(instruction.results.as_slice(), [result]
+                            if function.values.get(result.0 as usize)
+                                .is_some_and(|result| result.ty == aggregate_ty))
+                });
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "field insertion",
+                    id: instruction.id.0,
+                });
+            }
         }
         FlowOperation::Select {
             condition,
@@ -5350,7 +5381,7 @@ mod tests {
                 profile: digest,
             },
             source_summary: SourceSummary {
-                semantic_wir_version: 8,
+                semantic_wir_version: SUPPORTED_SEMANTIC_WIR_VERSION,
                 semantic_functions: 1,
                 hir_files: 1,
                 hir_declarations: 1,
@@ -5512,6 +5543,138 @@ mod tests {
         module.source_summary.reachable_declarations = 2;
         module.source_summary.monomorphized_instantiations = 2;
         module
+    }
+
+    fn insert_field_fixture() -> FlowWir {
+        let mut module = fixture();
+        module.types.push(FlowType {
+            id: TypeId(1),
+            kind: FlowTypeKind::Scalar(ScalarType::Integer {
+                signed: false,
+                bits: 64,
+            }),
+            name: Some("u64".to_owned()),
+            copyable: true,
+            strict_linear: false,
+        });
+        module.types.push(FlowType {
+            id: TypeId(2),
+            kind: FlowTypeKind::Struct {
+                fields: vec![TypeId(1)],
+            },
+            name: Some("Cell".to_owned()),
+            copyable: true,
+            strict_linear: false,
+        });
+        let source = Span {
+            file: FileId(0),
+            range: TextRange { start: 0, end: 0 },
+        };
+        module.functions.push(FlowFunction {
+            id: FunctionId(1),
+            name: "replace-cell-value".to_owned(),
+            origin: FunctionOrigin::SourceSemantic {
+                semantic_function: 1,
+            },
+            role: FunctionRole::Ordinary,
+            color: FunctionColor::Sync,
+            parameters: vec![ValueId(0), ValueId(1)],
+            result_types: vec![TypeId(2)],
+            values: vec![
+                Value {
+                    id: ValueId(0),
+                    ty: TypeId(2),
+                    source_name: Some("cell".to_owned()),
+                    source: Some(source),
+                },
+                Value {
+                    id: ValueId(1),
+                    ty: TypeId(1),
+                    source_name: Some("value".to_owned()),
+                    source: Some(source),
+                },
+                Value {
+                    id: ValueId(2),
+                    ty: TypeId(2),
+                    source_name: Some("updated".to_owned()),
+                    source: Some(source),
+                },
+            ],
+            blocks: vec![Block {
+                id: BlockId(0),
+                parameters: Vec::new(),
+                instructions: vec![Instruction {
+                    id: InstructionId(0),
+                    results: vec![ValueId(2)],
+                    operation: FlowOperation::InsertField {
+                        aggregate: ValueId(0),
+                        field: 0,
+                        value: ValueId(1),
+                    },
+                    source: Some(source),
+                }],
+                terminator: Terminator::Return(vec![ValueId(2)]),
+                source: Some(source),
+            }],
+            entry: BlockId(0),
+            stack_bound: 0,
+            frame_bound: 0,
+            proofs: Vec::new(),
+            source: Some(source),
+        });
+        module.source_summary.semantic_functions = 2;
+        module.source_summary.monomorphized_instantiations = 2;
+        module
+    }
+
+    #[test]
+    fn insert_field_authenticates_aggregate_field_value_and_result_types() {
+        let module = insert_field_fixture();
+        module.clone().validate().expect("exact field insertion");
+
+        let cases: &[(ValueId, u32, ValueId, TypeId)] = &[
+            (ValueId(1), 0, ValueId(1), TypeId(2)),
+            (ValueId(0), 1, ValueId(1), TypeId(2)),
+            (ValueId(0), 0, ValueId(0), TypeId(2)),
+            (ValueId(0), 0, ValueId(1), TypeId(1)),
+        ];
+        for &(aggregate, field, value, result_ty) in cases {
+            let mut forged = module.clone();
+            let instruction = &mut forged.functions[1].blocks[0].instructions[0];
+            instruction.operation = FlowOperation::InsertField {
+                aggregate,
+                field,
+                value,
+            };
+            forged.functions[1].values[2].ty = result_ty;
+            let errors = forged
+                .validate()
+                .expect_err("forged field insertion must fail")
+                .0;
+            assert!(errors.iter().any(|error| matches!(
+                error,
+                ValidationError::InvalidRecord {
+                    kind: "field insertion",
+                    id: 0
+                }
+            )));
+        }
+
+        for results in [Vec::new(), vec![ValueId(2), ValueId(2)]] {
+            let mut forged = module.clone();
+            forged.functions[1].blocks[0].instructions[0].results = results;
+            let errors = forged
+                .validate()
+                .expect_err("non-singleton insertion result must fail")
+                .0;
+            assert!(errors.iter().any(|error| matches!(
+                error,
+                ValidationError::InvalidRecord {
+                    kind: "field insertion",
+                    id: 0
+                }
+            )));
+        }
     }
 
     #[test]

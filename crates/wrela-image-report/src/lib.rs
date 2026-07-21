@@ -19,7 +19,7 @@ pub use decode::decode_image_report_json;
 /// as [`ReportError::UnsupportedSchema`].
 pub const REPORT_SCHEMA_VERSION: u32 = 13;
 
-const CURRENT_SEMANTIC_WIR_VERSION: u32 = 8;
+const CURRENT_SEMANTIC_WIR_VERSION: u32 = 9;
 const CURRENT_FLOW_WIR_VERSION: u32 = 10;
 const CURRENT_FLOW_WIR_WIRE_VERSION: u32 = 10;
 const CURRENT_MACHINE_WIR_VERSION: u32 = 10;
@@ -3515,7 +3515,7 @@ mod tests {
             sections: Vec::new(),
             symbols: Vec::new(),
             representations: super::RepresentationFacts {
-                semantic_wir_version: 8,
+                semantic_wir_version: 9,
                 flow_wir_version: 10,
                 flow_wir_wire_version: 10,
                 machine_wir_version: 10,

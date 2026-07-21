@@ -4,6 +4,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use wrela_backend::{
+    CodegenError, emit_prepared_object, llvm_backend_available,
     machine_wir::{
         CheckedIntegerOp, ConversionOp, MachineOperation, MachineTerminator, MachineTypeKind,
     },
@@ -91,6 +92,27 @@ fn imported_duration_constructors_reach_flow():
     millis: u64 = as_nanoseconds(milliseconds(42))
     secs: u64 = as_nanoseconds(seconds(42))
     # `@test(runtime)` keeps this in the runtime/image tier.
+    return
+"#;
+
+const MUTATION_SOURCE: &str = r#"module app.duration
+
+pub struct RuntimeDurationRepresentation:
+    pub nanoseconds: u64
+
+pub fn replace_nanoseconds(value: u64) -> u64:
+    duration: RuntimeDurationRepresentation = RuntimeDurationRepresentation(nanoseconds=1)
+    duration.nanoseconds = value
+    return duration.nanoseconds
+"#;
+
+const MUTATION_TEST_SOURCE: &str = r#"module app.duration_test
+
+from app.duration import replace_nanoseconds
+
+@test(runtime)
+fn local_field_update_reaches_native():
+    updated: u64 = replace_nanoseconds(42)
     return
 "#;
 
@@ -619,6 +641,160 @@ fn real_imported_duration_shape_reaches_flow_and_v10_roundtrips_exactly() {
     assert_eq!(machine_bitcasts, 3);
     assert_eq!(machine_checked_multiplies, 3);
     assert!(machine_calls >= 8);
+}
+
+#[test]
+fn local_flat_field_update_reaches_deterministic_native_coff() {
+    let fixture = fixture(MUTATION_SOURCE, MUTATION_TEST_SOURCE);
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed(&fixture),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("owned local field update lowers to SemanticWir");
+    let repeated_semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed(&fixture),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("repeat owned local field update lowering");
+    assert_eq!(
+        semantic.wir().as_wir(),
+        repeated_semantic.wir().as_wir(),
+        "identical source must produce identical SemanticWir v9"
+    );
+    let semantic_insertions = semantic
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .flat_map(|function| &function.body.statements)
+        .filter(|statement| {
+            matches!(
+                statement,
+                LoweredSemanticStatement::Let(statement)
+                    if matches!(statement.operation, SemanticOperation::InsertField { field: 0, .. })
+                        && statement.results.len() == 1
+            )
+        })
+        .count();
+    assert_eq!(semantic_insertions, 1);
+
+    let (semantic_wir, _) = semantic.into_parts();
+    let (repeated_semantic_wir, _) = repeated_semantic.into_parts();
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("owned local field update lowers to FlowWir");
+    let repeated_flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: repeated_semantic_wir,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("repeat owned local field update FlowWir lowering");
+    assert_eq!(
+        flow.wir().as_wir(),
+        repeated_flow.wir().as_wir(),
+        "identical SemanticWir must produce identical FlowWir v10"
+    );
+    let flow_insertions = flow
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                FlowOperation::InsertField { field: 0, .. }
+            ) && instruction.results.len() == 1
+        })
+        .count();
+    assert_eq!(flow_insertions, 1);
+
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("field-update FlowWir canonical frame");
+    let decoded = CanonicalFlowWirCodec
+        .decode(
+            DecodeRequest {
+                bytes: encoded.bytes(),
+                limits: CodecLimits::standard(),
+                expected_build: Some(fixture.build.identity()),
+            },
+            &never_cancelled,
+        )
+        .expect("field-update FlowWir v10 decode");
+    assert_eq!(decoded, flow_wir);
+
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("one-field u64 update reaches MachineWir");
+    let update_bitcasts = prepared
+        .machine()
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                MachineOperation::Convert {
+                    op: ConversionOp::Bitcast,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        update_bitcasts, 3,
+        "construct, full-field replacement, and projection each lower to one exact bitcast"
+    );
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("field-update native object emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat field-update native object emission");
+            assert_eq!(
+                first.bytes(),
+                second.bytes(),
+                "identical field-update MachineWir must emit byte-identical ARM64 COFF"
+            );
+        }
+    }
 }
 
 #[test]

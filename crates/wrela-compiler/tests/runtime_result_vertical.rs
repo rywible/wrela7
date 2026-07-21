@@ -40,6 +40,7 @@ use wrela_sema::{
 use wrela_semantic_lower::{
     CanonicalSemanticLowerer, LowerRequest as SemanticLowerRequest,
     LoweringLimits as SemanticLoweringLimits, SemanticLowerer, SemanticOperation, SemanticTypeKind,
+    semantic_wir::SEMANTIC_WIR_VERSION,
 };
 use wrela_source::{FileId, SourceDatabase, SourceInput};
 use wrela_syntax::{ParseLimits, ParseRequest, SyntaxParser, WrelaSyntaxParser};
@@ -545,7 +546,7 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
     let fixture = source_fixture();
     for (selector, expected_constructs) in SELECTORS {
         let semantic = compile_selected(&fixture, selector);
-        assert_eq!(semantic.as_wir().version, 8);
+        assert_eq!(semantic.as_wir().version, SEMANTIC_WIR_VERSION);
         let erased_enums = semantic
             .as_wir()
             .types
@@ -842,7 +843,7 @@ fn checked_in_runtime_result_try_reaches_exact_early_return_switch() {
     let fixture = source_fixture();
     for selector in TRY_SELECTORS {
         let semantic = compile_selected(&fixture, selector);
-        assert_eq!(semantic.as_wir().version, 8);
+        assert_eq!(semantic.as_wir().version, SEMANTIC_WIR_VERSION);
         let propagation_name = if selector == "result_try_ok_yields_payload" {
             "propagate_try_ok"
         } else {

@@ -3339,6 +3339,12 @@ fn record_operation_payload_uses(
             record(*address)?;
             record(*value)?;
         }
+        flow::FlowOperation::InsertField {
+            aggregate, value, ..
+        } => {
+            record(*aggregate)?;
+            record(*value)?;
+        }
         flow::FlowOperation::Call { arguments, .. }
         | flow::FlowOperation::AsyncCall { arguments, .. } => {
             for argument in arguments {
@@ -3918,6 +3924,22 @@ fn validate_supported_operation(
             }
             Ok(())
         }
+        flow::FlowOperation::InsertField {
+            aggregate,
+            field,
+            value,
+        } => {
+            let result = require_single_result(instruction)?;
+            validate_flat_structure_field_update(
+                &input.types,
+                function,
+                result,
+                *aggregate,
+                *field,
+                *value,
+            )?;
+            Ok(())
+        }
         flow::FlowOperation::MakeEnum {
             ty,
             variant,
@@ -4118,8 +4140,7 @@ fn validate_supported_operation(
         flow::FlowOperation::Immediate(flow::Immediate::GlobalAddress(_)) => {
             Err(unsupported("global-address immediates"))
         }
-        flow::FlowOperation::InsertField { .. }
-        | flow::FlowOperation::BeginAccess { .. }
+        flow::FlowOperation::BeginAccess { .. }
         | flow::FlowOperation::EndAccess { .. }
         | flow::FlowOperation::Allocate { .. }
         | flow::FlowOperation::RegionReset { .. }
@@ -5931,6 +5952,26 @@ fn lower_operation(
                 destination: MachineTypeId(ty.0),
             }
         }
+        flow::FlowOperation::InsertField {
+            aggregate,
+            field,
+            value,
+        } => {
+            let result = require_single_result(instruction)?;
+            let aggregate_type = validate_flat_structure_field_update(
+                &input.types,
+                function,
+                result,
+                *aggregate,
+                *field,
+                *value,
+            )?;
+            MachineOperation::Convert {
+                op: ConversionOp::Bitcast,
+                value: map_value(*value, mapping)?,
+                destination: MachineTypeId(aggregate_type.0),
+            }
+        }
         flow::FlowOperation::MakeEnum {
             ty,
             variant,
@@ -6202,6 +6243,26 @@ fn lower_operation(
         _ => return Err(unsupported("an operation outside scalar lowering")),
     };
     Ok(Some(operation))
+}
+
+fn validate_flat_structure_field_update(
+    types: &[flow::FlowType],
+    function: &flow::FlowFunction,
+    result: flow::ValueId,
+    aggregate: flow::ValueId,
+    field: u32,
+    value: flow::ValueId,
+) -> Result<flow::TypeId, MachineLowerError> {
+    let aggregate_type = flow_value_type(function, aggregate)?;
+    if field != 0
+        || flat_u64_struct_field(types, aggregate_type) != Some(flow_value_type(function, value)?)
+        || flow_value_type(function, result)? != aggregate_type
+    {
+        return Err(unsupported(
+            "machine-flat-structure-field-update-lowering-pending",
+        ));
+    }
+    Ok(aggregate_type)
 }
 
 fn lower_immediate(
@@ -7132,6 +7193,120 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    fn field_update_function(aggregate: flow::TypeId, field: flow::TypeId) -> flow::FlowFunction {
+        flow::FlowFunction {
+            id: flow::FunctionId(0),
+            name: "field_update".to_owned(),
+            origin: flow::FunctionOrigin::SourceSemantic {
+                semantic_function: 0,
+            },
+            role: flow::FunctionRole::Ordinary,
+            color: flow::FunctionColor::Sync,
+            parameters: Vec::new(),
+            result_types: Vec::new(),
+            values: vec![
+                flow::Value {
+                    id: flow::ValueId(0),
+                    ty: aggregate,
+                    source_name: None,
+                    source: None,
+                },
+                flow::Value {
+                    id: flow::ValueId(1),
+                    ty: field,
+                    source_name: None,
+                    source: None,
+                },
+                flow::Value {
+                    id: flow::ValueId(2),
+                    ty: aggregate,
+                    source_name: None,
+                    source: None,
+                },
+            ],
+            blocks: Vec::new(),
+            entry: flow::BlockId(0),
+            stack_bound: 0,
+            frame_bound: 0,
+            proofs: Vec::new(),
+            source: None,
+        }
+    }
+
+    #[test]
+    fn aggregate_field_update_rejects_unlowered_shapes_with_named_tail() {
+        let u64_type = flow::FlowType {
+            id: flow::TypeId(0),
+            kind: flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                signed: false,
+                bits: 64,
+            }),
+            name: Some("u64".to_owned()),
+            copyable: true,
+            strict_linear: false,
+        };
+        let error = Err(MachineLowerError::UnsupportedInput {
+            feature: "machine-flat-structure-field-update-lowering-pending",
+        });
+
+        let two_field_types = vec![
+            u64_type.clone(),
+            flow::FlowType {
+                id: flow::TypeId(1),
+                kind: flow::FlowTypeKind::Struct {
+                    fields: vec![flow::TypeId(0), flow::TypeId(0)],
+                },
+                name: Some("Pair".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+        ];
+        assert_eq!(
+            validate_flat_structure_field_update(
+                &two_field_types,
+                &field_update_function(flow::TypeId(1), flow::TypeId(0)),
+                flow::ValueId(2),
+                flow::ValueId(0),
+                0,
+                flow::ValueId(1),
+            ),
+            error
+        );
+
+        let non_u64_types = vec![
+            flow::FlowType {
+                id: flow::TypeId(0),
+                kind: flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                    signed: false,
+                    bits: 32,
+                }),
+                name: Some("u32".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+            flow::FlowType {
+                id: flow::TypeId(1),
+                kind: flow::FlowTypeKind::Struct {
+                    fields: vec![flow::TypeId(0)],
+                },
+                name: Some("Word".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+        ];
+        assert_eq!(
+            validate_flat_structure_field_update(
+                &non_u64_types,
+                &field_update_function(flow::TypeId(1), flow::TypeId(0)),
+                flow::ValueId(2),
+                flow::ValueId(0),
+                0,
+                flow::ValueId(1),
+            ),
+            error
+        );
+    }
 
     fn exact_erasure_types() -> Vec<flow::FlowType> {
         vec![

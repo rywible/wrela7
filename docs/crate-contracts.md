@@ -462,6 +462,10 @@ it. It injects phase implementations and bounded host capabilities, while
   preserves the analyzer's exact proof-kind vocabulary and every proof source,
   as well as function instance keys, attached proof IDs, recursive-depth
   bounds, and the HIR declaration/file bounds used to validate provenance.
+- SemanticWir v9 adds exact SSA aggregate field replacement as `InsertField`.
+  Validation joins the prior aggregate's struct type, selected field, inserted
+  value type, and single result of the unchanged aggregate type; FlowWir v10
+  preserves the same operation and independently repeats that join.
 - The current schema retains the exact compiled `FullImageTestGroup`, including its
   plan identity, generated-harness function keys or declared-image/scenario
   binding, descriptors, seed, and execution policy. Validation joins generated
@@ -504,6 +508,11 @@ it. It injects phase implementations and bounded host capabilities, while
   executable bodies, actor methods/cross-actor requests, devices/pools, baked
   artifacts, and every runtime graph outside that closed subset remain explicit
   unsupported-feature errors; no facts or proofs are fabricated.
+- The bounded source subset also lowers plain one-level field assignment on an
+  initialized owned nongeneric flat-structure local as SSA aggregate
+  replacement. It never invents an address or memory proof. Compound/nested,
+  nonlocal, view write-through, and actor-state stores remain explicit pending
+  boundaries.
 
 ### `wrela-flow-wir`
 

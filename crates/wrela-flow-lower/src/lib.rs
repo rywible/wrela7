@@ -1742,6 +1742,9 @@ fn supported_source_value_type(input: &semantic::SemanticWir, ty: semantic::Type
             record.linearity == semantic::Linearity::ExplicitCopy
                 && record.source.is_some()
                 && !fields.is_empty()
+                && fields
+                    .iter()
+                    .all(|field| scalar_primitive(input, field.ty).is_some())
         }
         semantic::TypeKind::Enum { variants } => {
             let payload = variants
@@ -2178,6 +2181,35 @@ fn validate_scalar_source_function(
                             {
                                 return Err(unsupported("flat aggregate field type"));
                             }
+                        }
+                    }
+                    semantic::SemanticOperation::InsertField {
+                        aggregate,
+                        field,
+                        value,
+                    } => {
+                        let [result] = statement.results.as_slice() else {
+                            return Err(unsupported("field insertion result arity"));
+                        };
+                        let aggregate_ty = scalar_value_type(function, *aggregate)
+                            .ok_or(unsupported("field insertion aggregate"))?;
+                        let expected = input
+                            .types
+                            .get(aggregate_ty.0 as usize)
+                            .and_then(|record| match &record.kind {
+                                semantic::TypeKind::Struct { fields }
+                                    if supported_source_value_type(input, aggregate_ty) =>
+                                {
+                                    fields.get(*field as usize).map(|field| field.ty)
+                                }
+                                _ => None,
+                            })
+                            .ok_or(unsupported("field insertion field"))?;
+                        if scalar_value_type(function, *result) != Some(aggregate_ty)
+                            || scalar_value_type(function, *value) != Some(expected)
+                            || scalar_primitive(input, expected).is_none()
+                        {
+                            return Err(unsupported("field insertion type"));
                         }
                     }
                     semantic::SemanticOperation::ConstructEnum {
@@ -3113,6 +3145,7 @@ fn preflight_input(
                             | semantic::SemanticOperation::Binary { .. }
                             | semantic::SemanticOperation::Convert { .. }
                             | semantic::SemanticOperation::ConstructEnum { .. }
+                            | semantic::SemanticOperation::InsertField { .. }
                             | semantic::SemanticOperation::Project { .. }
                             | semantic::SemanticOperation::Index { .. }
                             | semantic::SemanticOperation::BeginAccess { .. }
@@ -5307,6 +5340,15 @@ fn lower_generated_operation(
                 fields: lowered,
             })
         }
+        semantic::SemanticOperation::InsertField {
+            aggregate,
+            field,
+            value,
+        } => Ok(flow::FlowOperation::InsertField {
+            aggregate: flow::ValueId(aggregate.0),
+            field: *field,
+            value: flow::ValueId(value.0),
+        }),
         semantic::SemanticOperation::ConstructEnum {
             ty,
             variant,
@@ -7084,7 +7126,7 @@ mod contract_tests {
     use super::{
         CanonicalFlowLowerer, FlowLowerer, LowerError, LowerRequest, LoweringLimits,
         LoweringReport, actor_flow_program_matches, lower_proof_kind,
-        measure_actor_flow_output_resources, preflight_input, seal,
+        measure_actor_flow_output_resources, preflight_input, seal, supported_source_value_type,
     };
     use wrela_build_model::{BuildIdentity, LanguageRevision, Sha256Digest, TargetIdentity};
     use wrela_flow_wir as flow;
@@ -7249,6 +7291,52 @@ mod contract_tests {
         }
         .validate()
         .expect("valid minimum SemanticWir")
+    }
+
+    #[test]
+    fn supported_flat_structure_types_require_scalar_fields() {
+        let mut module = fixture().into_wir();
+        module.types.extend([
+            semantic::TypeRecord {
+                id: semantic::TypeId(1),
+                source_name: "u64".to_owned(),
+                kind: semantic::TypeKind::Primitive(semantic::PrimitiveType::U64),
+                linearity: semantic::Linearity::CopyScalar,
+                source: Some(span(0, 1, 2)),
+            },
+            semantic::TypeRecord {
+                id: semantic::TypeId(2),
+                source_name: "ScalarField".to_owned(),
+                kind: semantic::TypeKind::Struct {
+                    fields: vec![semantic::FieldType {
+                        name: "value".to_owned(),
+                        ty: semantic::TypeId(1),
+                        public: true,
+                    }],
+                },
+                linearity: semantic::Linearity::ExplicitCopy,
+                source: Some(span(0, 3, 4)),
+            },
+            semantic::TypeRecord {
+                id: semantic::TypeId(3),
+                source_name: "NestedField".to_owned(),
+                kind: semantic::TypeKind::Struct {
+                    fields: vec![semantic::FieldType {
+                        name: "nested".to_owned(),
+                        ty: semantic::TypeId(2),
+                        public: true,
+                    }],
+                },
+                linearity: semantic::Linearity::ExplicitCopy,
+                source: Some(span(0, 5, 6)),
+            },
+        ]);
+
+        assert!(supported_source_value_type(&module, semantic::TypeId(2)));
+        assert!(
+            !supported_source_value_type(&module, semantic::TypeId(3)),
+            "crafted nested aggregate fields must not enter the flat scalar lowering subset"
+        );
     }
 
     fn actor_fixture() -> semantic::ValidatedSemanticWir {

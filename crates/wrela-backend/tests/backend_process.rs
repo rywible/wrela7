@@ -190,7 +190,7 @@ fn canonical_wir(build: BuildIdentity) -> Vec<u8> {
         name: "canonical-process-image".to_owned(),
         build: build.clone(),
         source_summary: SourceSummary {
-            semantic_wir_version: 8,
+            semantic_wir_version: 9,
             semantic_functions: 1,
             hir_files: 1,
             hir_declarations: 1,

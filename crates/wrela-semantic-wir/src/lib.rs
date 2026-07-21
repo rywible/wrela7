@@ -16,7 +16,7 @@ pub use wrela_test_model::{
     TestDescriptor, TestId as ModelTestId, TestKind as ModelTestKind,
 };
 
-pub const SEMANTIC_WIR_VERSION: u32 = 8;
+pub const SEMANTIC_WIR_VERSION: u32 = 9;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 
 macro_rules! id_type {
@@ -324,6 +324,12 @@ pub enum SemanticOperation {
     Aggregate {
         ty: TypeId,
         fields: Vec<ValueId>,
+    },
+    /// Produce a fresh aggregate value by replacing one exact struct field.
+    InsertField {
+        aggregate: ValueId,
+        field: u32,
+        value: ValueId,
     },
     /// Construct one closed enum variant from its exact positional payload.
     ConstructEnum {
@@ -1216,6 +1222,7 @@ fn validate_model_resources(
                             SemanticOperation::Unary { .. }
                             | SemanticOperation::Binary { .. }
                             | SemanticOperation::Convert { .. }
+                            | SemanticOperation::InsertField { .. }
                             | SemanticOperation::Project { .. }
                             | SemanticOperation::Index { .. }
                             | SemanticOperation::BeginAccess { .. }
@@ -3260,6 +3267,44 @@ fn validate_operation(
                 value!(*field);
             }
         }
+        SemanticOperation::InsertField {
+            aggregate,
+            field,
+            value: inserted,
+        } => {
+            value!(*aggregate);
+            value!(*inserted);
+            let valid = function
+                .values
+                .get(aggregate.0 as usize)
+                .and_then(|aggregate| {
+                    let aggregate_ty = aggregate.ty;
+                    module
+                        .types
+                        .get(aggregate_ty.0 as usize)
+                        .and_then(|record| match &record.kind {
+                            TypeKind::Struct { fields } => fields
+                                .get(*field as usize)
+                                .map(|selected| (aggregate_ty, selected.ty)),
+                            _ => None,
+                        })
+                })
+                .is_some_and(|(aggregate_ty, field_ty)| {
+                    function
+                        .values
+                        .get(inserted.0 as usize)
+                        .is_some_and(|inserted| inserted.ty == field_ty)
+                        && matches!(results, [result]
+                            if function.values.get(result.0 as usize)
+                                .is_some_and(|result| result.ty == aggregate_ty))
+                });
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "field insertion",
+                    id: results.first().map_or(u32::MAX, |result| result.0),
+                });
+            }
+        }
         SemanticOperation::ConstructEnum {
             ty,
             variant,
@@ -3933,6 +3978,142 @@ mod tests {
             frame_bound: 0,
             uninterrupted_bound: None,
             recursive_depth_bound: Some(1),
+        }
+    }
+
+    fn insert_field_fixture() -> SemanticWir {
+        let mut module = fixture();
+        module.types.push(TypeRecord {
+            id: TypeId(1),
+            source_name: "u64".to_owned(),
+            kind: TypeKind::Primitive(PrimitiveType::U64),
+            linearity: Linearity::CopyScalar,
+            source: None,
+        });
+        module.types.push(TypeRecord {
+            id: TypeId(2),
+            source_name: "Cell".to_owned(),
+            kind: TypeKind::Struct {
+                fields: vec![FieldType {
+                    name: "value".to_owned(),
+                    ty: TypeId(1),
+                    public: false,
+                }],
+            },
+            linearity: Linearity::ExplicitCopy,
+            source: None,
+        });
+        let source = span(0);
+        module.functions.push(SemanticFunction {
+            id: FunctionId(1),
+            instance_key: Sha256Digest::from_bytes([3; 32]),
+            name: "replace-cell-value".to_owned(),
+            origin: FunctionOrigin::Source,
+            role: FunctionRole::Ordinary,
+            color: FunctionColor::Sync,
+            parameters: vec![ValueId(0), ValueId(1)],
+            result: TypeId(2),
+            values: vec![
+                SemanticValue {
+                    id: ValueId(0),
+                    ty: TypeId(2),
+                    origin: Some(source),
+                    name: Some("cell".to_owned()),
+                },
+                SemanticValue {
+                    id: ValueId(1),
+                    ty: TypeId(1),
+                    origin: Some(source),
+                    name: Some("value".to_owned()),
+                },
+                SemanticValue {
+                    id: ValueId(2),
+                    ty: TypeId(2),
+                    origin: Some(source),
+                    name: Some("updated".to_owned()),
+                },
+            ],
+            body: SemanticRegion {
+                parameters: vec![ValueId(0), ValueId(1)],
+                statements: vec![
+                    SemanticStatement::Let(LetStatement {
+                        results: vec![ValueId(2)],
+                        operation: SemanticOperation::InsertField {
+                            aggregate: ValueId(0),
+                            field: 0,
+                            value: ValueId(1),
+                        },
+                        source: Some(source),
+                    }),
+                    SemanticStatement::Return(vec![ValueId(2)]),
+                ],
+            },
+            effects: EffectSet(0),
+            proofs: Vec::new(),
+            source: Some(source),
+            stack_bound: 0,
+            frame_bound: 0,
+            uninterrupted_bound: None,
+            recursive_depth_bound: Some(1),
+        });
+        module.source_summary.monomorphized_instantiations = 2;
+        module
+    }
+
+    #[test]
+    fn insert_field_authenticates_aggregate_field_value_and_result_types() {
+        let module = insert_field_fixture();
+        module.clone().validate().expect("exact field insertion");
+
+        let cases: &[(ValueId, u32, ValueId, TypeId)] = &[
+            (ValueId(1), 0, ValueId(1), TypeId(2)),
+            (ValueId(0), 1, ValueId(1), TypeId(2)),
+            (ValueId(0), 0, ValueId(0), TypeId(2)),
+            (ValueId(0), 0, ValueId(1), TypeId(1)),
+        ];
+        for &(aggregate, field, value, result_ty) in cases {
+            let mut forged = module.clone();
+            let SemanticStatement::Let(statement) = &mut forged.functions[1].body.statements[0]
+            else {
+                panic!("fixture insertion statement")
+            };
+            statement.operation = SemanticOperation::InsertField {
+                aggregate,
+                field,
+                value,
+            };
+            forged.functions[1].values[2].ty = result_ty;
+            let errors = forged
+                .validate()
+                .expect_err("forged field insertion must fail")
+                .0;
+            assert!(errors.iter().any(|error| matches!(
+                error,
+                ValidationError::InvalidRecord {
+                    kind: "field insertion",
+                    id: 2
+                }
+            )));
+        }
+
+        for results in [Vec::new(), vec![ValueId(2), ValueId(2)]] {
+            let mut forged = module.clone();
+            let SemanticStatement::Let(statement) = &mut forged.functions[1].body.statements[0]
+            else {
+                panic!("fixture insertion statement")
+            };
+            statement.results = results;
+            let errors = forged
+                .validate()
+                .expect_err("non-singleton insertion result must fail")
+                .0;
+            assert!(errors.iter().any(|error| matches!(
+                error,
+                ValidationError::InvalidRecord {
+                    kind: "field insertion",
+                    ..
+                }
+            )));
         }
     }
 

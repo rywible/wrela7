@@ -4429,6 +4429,11 @@ enum SourceStatementPlan {
         local: wrela_hir::LocalId,
         value: wrela_hir::ExpressionId,
     },
+    AssignField {
+        local: wrela_hir::LocalId,
+        field: wrela_hir::Name,
+        value: wrela_hir::ExpressionId,
+    },
     CompoundAssign {
         local: wrela_hir::LocalId,
         operator: wrela_hir::BinaryOperator,
@@ -4658,19 +4663,35 @@ impl SourceFunctionLowerer<'_> {
                         let wrela_hir::Definition::Local(local) = target.root else {
                             return Err(unsupported("non-local scalar assignment"));
                         };
-                        if !target.projections.is_empty() {
-                            return Err(unsupported("projected scalar assignment"));
-                        }
-                        match compound_assignment_binary_operator(*operator) {
-                            Some(operator) => SourceStatementPlan::CompoundAssign {
+                        if let [wrela_hir::PlaceProjection::Field(field)] =
+                            target.projections.as_slice()
+                        {
+                            if compound_assignment_binary_operator(*operator).is_some() {
+                                return Err(unsupported(
+                                    "semantic-runtime-field-compound-assignment-pending",
+                                ));
+                            }
+                            SourceStatementPlan::AssignField {
                                 local,
-                                operator,
+                                field: field.clone(),
                                 value: *value,
-                            },
-                            None => SourceStatementPlan::Assign {
-                                local,
-                                value: *value,
-                            },
+                            }
+                        } else if target.projections.is_empty() {
+                            match compound_assignment_binary_operator(*operator) {
+                                Some(operator) => SourceStatementPlan::CompoundAssign {
+                                    local,
+                                    operator,
+                                    value: *value,
+                                },
+                                None => SourceStatementPlan::Assign {
+                                    local,
+                                    value: *value,
+                                },
+                            }
+                        } else {
+                            return Err(unsupported(
+                                "semantic-runtime-field-assignment-projection-pending",
+                            ));
                         }
                     }
                     wrela_hir::StatementKind::Expression(expression) => {
@@ -4746,6 +4767,7 @@ impl SourceFunctionLowerer<'_> {
                 SourceStatementPlan::Pass => sema::EffectSet::default(),
                 SourceStatementPlan::Initialize { value, .. }
                 | SourceStatementPlan::Assign { value, .. }
+                | SourceStatementPlan::AssignField { value, .. }
                 | SourceStatementPlan::CompoundAssign { value, .. }
                 | SourceStatementPlan::Expression(value)
                 | SourceStatementPlan::Send(value) => self.expression_fact(*value)?.effects,
@@ -4912,6 +4934,118 @@ impl SourceFunctionLowerer<'_> {
                     ) {
                         return Err(self.fact_mismatch("lowered scalar assignment identity"));
                     }
+                    local_state.set(local, definition.value)?;
+                }
+                SourceStatementPlan::AssignField {
+                    local,
+                    field,
+                    value,
+                } => {
+                    let previous = local_state
+                        .get(local)
+                        .ok_or_else(|| self.fact_mismatch("uninitialized field assignment"))?;
+                    let [definition] = statement_definitions.as_slice() else {
+                        return Err(self.fact_mismatch("field assignment definition"));
+                    };
+                    if definition.local != local || definition.value == previous {
+                        return Err(self.fact_mismatch("field assignment target"));
+                    }
+                    let previous_record = self
+                        .input
+                        .facts()
+                        .values
+                        .get(previous.0 as usize)
+                        .filter(|record| record.function == self.function.id)
+                        .ok_or_else(|| self.fact_mismatch("field assignment previous value"))?;
+                    let semantic_value = self
+                        .input
+                        .facts()
+                        .values
+                        .get(definition.value.0 as usize)
+                        .filter(|record| {
+                            record.function == self.function.id
+                                && record.ty == previous_record.ty
+                                && record.origin == sema::SemanticValueOrigin::Local(local)
+                        })
+                        .ok_or_else(|| self.fact_mismatch("field assignment aggregate value"))?;
+                    let local_record = self
+                        .input
+                        .hir()
+                        .as_program()
+                        .locals
+                        .get(local.0 as usize)
+                        .filter(|record| {
+                            record.id == local
+                                && body_is_ancestor(
+                                    self.input.hir().as_program(),
+                                    record.body,
+                                    body_id,
+                                )
+                        })
+                        .ok_or_else(|| self.fact_mismatch("field assignment provenance"))?;
+                    if semantic_value.source != Some(local_record.source)
+                        || semantic_value.source_name.as_deref() != Some(local_record.name.as_str())
+                    {
+                        return Err(self.fact_mismatch("field assignment provenance"));
+                    }
+                    let fields = match self
+                        .input
+                        .facts()
+                        .types
+                        .get(previous_record.ty.0 as usize)
+                        .map(|record| &record.kind)
+                    {
+                        Some(sema::SemanticTypeKind::Structure {
+                            arguments, fields, ..
+                        }) if arguments.is_empty() => fields,
+                        _ => return Err(self.fact_mismatch("field assignment aggregate type")),
+                    };
+                    let mut selected = None;
+                    for (index, candidate) in fields.iter().enumerate() {
+                        check_cancelled(self.is_cancelled)?;
+                        self.aggregate_name_work = self.aggregate_name_work.checked_add(1).ok_or(
+                            LowerError::ResourceLimit {
+                                resource: "SemanticWir aggregate name lookup work",
+                                limit: self.limits.model_edges,
+                            },
+                        )?;
+                        if self.aggregate_name_work > self.limits.model_edges {
+                            return Err(LowerError::ResourceLimit {
+                                resource: "SemanticWir aggregate name lookup work",
+                                limit: self.limits.model_edges,
+                            });
+                        }
+                        if candidate.name == field.as_str() {
+                            selected = Some((index, candidate));
+                            break;
+                        }
+                    }
+                    let (field_index, selected_field) = selected
+                        .ok_or_else(|| self.fact_mismatch("field assignment semantic field"))?;
+                    let rhs_fact = self.expression_fact(value)?;
+                    if rhs_fact.ty != selected_field.ty {
+                        return Err(self.fact_mismatch("field assignment RHS type"));
+                    }
+                    let LoweredExpression::Value(lowered_rhs) =
+                        self.lower_expression(value, sema::AccessMode::Value, &mut statements)?
+                    else {
+                        return Err(self.fact_mismatch("field assignment RHS value"));
+                    };
+                    let result = self.value_map.get(definition.value)?;
+                    if lowered_rhs == result {
+                        return Err(self.fact_mismatch("field assignment replacement identity"));
+                    }
+                    self.push_let(
+                        &mut statements,
+                        result,
+                        wir::SemanticOperation::InsertField {
+                            aggregate: self.value_map.get(previous)?,
+                            field: u32::try_from(field_index)
+                                .map_err(|_| self.fact_mismatch("field assignment index"))?,
+                            value: lowered_rhs,
+                        },
+                        Some(statement_source),
+                    )?;
                     local_state.set(local, definition.value)?;
                 }
                 SourceStatementPlan::CompoundAssign {
@@ -9842,6 +9976,7 @@ fn measure_model_resources(
                             | SemanticOperation::Binary { .. }
                             | SemanticOperation::Convert { .. }
                             | SemanticOperation::ConstructEnum { .. }
+                            | SemanticOperation::InsertField { .. }
                             | SemanticOperation::Project { .. }
                             | SemanticOperation::Index { .. }
                             | SemanticOperation::BeginAccess { .. }
