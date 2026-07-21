@@ -2870,8 +2870,11 @@ fn lower_actor_types(
                             "actor runtime enum semantic facts differ from source",
                         ));
                     }
-                    let mut fields =
-                        try_vec(1, "SemanticWir actor enum payload field", limits.model_edges)?;
+                    let mut fields = try_vec(
+                        1,
+                        "SemanticWir actor enum payload field",
+                        limits.model_edges,
+                    )?;
                     fields.push(wir::FieldType {
                         name: copy_text(&field.name, limits.payload_bytes)?,
                         ty: wir::TypeId(field.ty.0),
