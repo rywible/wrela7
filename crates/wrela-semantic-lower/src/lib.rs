@@ -280,18 +280,19 @@ fn validate_admission_result_lowering_boundary(
 }
 
 fn validate_method_call_lowering_boundary(facts: &sema::PartialAnalysis) -> Result<(), LowerError> {
-    if facts.expressions.iter().any(|fact| {
-        matches!(
-            fact.resolution,
-            sema::ExpressionResolution::MethodCall { .. }
-        )
-    }) {
-        Err(unsupported(
-            "semantic-method-call-lowering-pending (concrete receiver method calls)",
-        ))
-    } else {
-        Ok(())
+    for fact in &facts.expressions {
+        if let sema::ExpressionResolution::MethodCall {
+            receiver_access, ..
+        } = fact.resolution
+        {
+            if receiver_access != sema::AccessMode::Read {
+                return Err(unsupported(
+                    "semantic-method-call-receiver-lowering-pending (mutate or take receiver)",
+                ));
+            }
+        }
     }
+    Ok(())
 }
 
 fn validate_generic_function_lowering_boundary(input: &AnalyzedImage) -> Result<(), LowerError> {
@@ -322,10 +323,23 @@ fn validate_generic_function_lowering_boundary_parts(
                 "semantic-generic-function-kind-lowering-pending (methods, interfaces, async, or generated specialization)",
             ));
         };
-        if !matches!(
+        let method_owner = match declaration_record.owner {
+            wrela_hir::DeclarationOwner::Declaration(owner) => {
+                program.declaration(owner).is_some_and(|owner| {
+                    matches!(
+                        owner.kind,
+                        wrela_hir::DeclarationKind::Structure(_)
+                            | wrela_hir::DeclarationKind::Implementation(_)
+                    )
+                })
+            }
+            wrela_hir::DeclarationOwner::Module(_) => false,
+        };
+        if (!matches!(
             declaration_record.owner,
             wrela_hir::DeclarationOwner::Module(_)
-        ) || source.color != wrela_hir::FunctionColor::Sync
+        ) && !method_owner)
+            || source.color != wrela_hir::FunctionColor::Sync
             || function.color != wrela_hir::FunctionColor::Sync
             || function.role != sema::FunctionRole::Ordinary
             || source.body != Some(body)
@@ -394,17 +408,28 @@ fn validate_generic_function_lowering_boundary_parts(
                     "semantic-generic-function-signature-lowering-pending (unsupported or unauthenticated substitution)",
                 ));
             };
-            if parameter.owner != wrela_hir::CallableOwner::Declaration(declaration)
-                || parameter.receiver
-                || semantic_parameter.parameter != *source_parameter
-                || parameter.ty.as_ref().and_then(|ty| {
+            let receiver_matches = method_owner
+                && parameter.receiver
+                && parameter.access == wrela_hir::AccessMode::Read
+                && parameter.ty.is_none()
+                && semantic_parameter.access == sema::AccessMode::Read
+                && facts.types.get(semantic_parameter.ty.0 as usize).is_some_and(|ty| {
+                    matches!(&ty.kind, sema::SemanticTypeKind::Structure { arguments, fields, .. }
+                        if arguments.is_empty()
+                            && fields.iter().all(|field| is_stored_copy_scalar(facts, field.ty)))
+                });
+            let ordinary_matches = !parameter.receiver
+                && parameter.ty.as_ref().and_then(|ty| {
                     generic_function_source_type_matches(
                         facts,
                         source,
                         &function.generic_arguments,
                         ty,
                     )
-                }) != Some(semantic_parameter.ty)
+                }) == Some(semantic_parameter.ty);
+            if parameter.owner != wrela_hir::CallableOwner::Declaration(declaration)
+                || semantic_parameter.parameter != *source_parameter
+                || !(receiver_matches || ordinary_matches)
             {
                 return Err(unsupported(
                     "semantic-generic-function-signature-lowering-pending (unsupported or unauthenticated substitution)",
@@ -1356,6 +1381,9 @@ fn validate_actor_source_functions(
                 function: target, ..
             }
             | sema::ExpressionResolution::OperatorCall {
+                function: target, ..
+            }
+            | sema::ExpressionResolution::MethodCall {
                 function: target, ..
             } => target,
             _ => continue,
@@ -5406,6 +5434,21 @@ struct DirectCallInput {
     effects: sema::EffectSet,
 }
 
+struct MethodCallInput {
+    expression: wrela_hir::ExpressionId,
+    source: Span,
+    callee: wrela_hir::ExpressionId,
+    receiver_expression: wrela_hir::ExpressionId,
+    receiver: sema::ValueId,
+    receiver_access: sema::AccessMode,
+    source_argument_count: usize,
+    target: sema::FunctionInstanceId,
+    bindings: Vec<sema::ResolvedCallArgument>,
+    result_type: sema::SemanticTypeId,
+    result: Option<sema::ValueId>,
+    effects: sema::EffectSet,
+}
+
 /// A binary/comparison operator desugared to a direct call on a `core.ops`
 /// interface impl method (chapter 10 §12). Unlike `DirectCallInput`, there is
 /// no source `Call` expression: `left`/`right` are the original operator's
@@ -5610,6 +5653,7 @@ enum SourceExpressionPlan {
     Project(ProjectInput),
     ActorStateLoad(sema::ActorStateAccess),
     DirectCall(DirectCallInput),
+    MethodCall(MethodCallInput),
     OperatorCall(OperatorCallInput),
     Unary(ScalarUnaryInput),
     Binary(ScalarBinaryInput),
@@ -7587,6 +7631,49 @@ impl SourceFunctionLowerer<'_> {
                         })
                     }
                     (
+                        wrela_hir::ExpressionKind::Call { callee, arguments },
+                        sema::ExpressionResolution::MethodCall {
+                            function,
+                            receiver,
+                            receiver_access,
+                            arguments: bindings,
+                        },
+                    ) => {
+                        let receiver_expression = self
+                            .input
+                            .hir()
+                            .as_program()
+                            .expression(*callee)
+                            .and_then(|callee| match callee.kind {
+                                wrela_hir::ExpressionKind::Field { base, .. } => Some(base),
+                                _ => None,
+                            })
+                            .ok_or_else(|| self.fact_mismatch("method-call callee shape"))?;
+                        let mut copied_bindings = try_vec(
+                            bindings.len(),
+                            "method-call semantic bindings",
+                            self.limits.model_edges,
+                        )?;
+                        for binding in bindings {
+                            check_cancelled(self.is_cancelled)?;
+                            copied_bindings.push(*binding);
+                        }
+                        SourceExpressionPlan::MethodCall(MethodCallInput {
+                            expression: expression_id,
+                            source: expression.source,
+                            callee: *callee,
+                            receiver_expression,
+                            receiver: *receiver,
+                            receiver_access: *receiver_access,
+                            source_argument_count: arguments.len(),
+                            target: *function,
+                            bindings: copied_bindings,
+                            result_type: fact.ty,
+                            result: fact.result,
+                            effects: fact.effects,
+                        })
+                    }
+                    (
                         wrela_hir::ExpressionKind::Unary {
                             operator:
                                 operator @ (wrela_hir::UnaryOperator::Negate
@@ -8020,6 +8107,7 @@ impl SourceFunctionLowerer<'_> {
                 Ok(LoweredExpression::Value(result))
             }
             SourceExpressionPlan::DirectCall(call) => self.lower_direct_call(call, statements),
+            SourceExpressionPlan::MethodCall(call) => self.lower_method_call(call, statements),
             SourceExpressionPlan::OperatorCall(call) => self.lower_operator_call(call, statements),
             SourceExpressionPlan::Unary(unary) => {
                 self.lower_scalar_unary(unary, source, statements)
@@ -9305,6 +9393,214 @@ impl SourceFunctionLowerer<'_> {
             wir::SemanticOperation::Call {
                 function: wir::FunctionId(call.target.0),
                 arguments: lowered_arguments,
+                activation: None,
+            },
+            Some(call.source),
+        )?;
+        Ok(LoweredExpression::Value(result))
+    }
+
+    fn lower_method_call(
+        &mut self,
+        call: MethodCallInput,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<LoweredExpression, LowerError> {
+        if call.receiver_access != sema::AccessMode::Read {
+            return Err(unsupported(
+                "semantic-method-call-receiver-lowering-pending (mutate or take receiver)",
+            ));
+        }
+        let callee_fact = self.expression_fact(call.callee)?;
+        if callee_fact.function != self.function.id
+            || callee_fact.result.is_some()
+            || callee_fact.effects.0 != 0
+        {
+            return Err(self.fact_mismatch("method-call callee fact"));
+        }
+        self.push_seen_expression(call.callee)?;
+        let LoweredExpression::Value(receiver) =
+            self.lower_expression(call.receiver_expression, sema::AccessMode::Read, statements)?
+        else {
+            return Err(self.fact_mismatch("method-call receiver value"));
+        };
+        if receiver != self.value_map.get(call.receiver)? {
+            return Err(self.fact_mismatch("method-call receiver identity"));
+        }
+        let target = self
+            .input
+            .facts()
+            .functions
+            .get(call.target.0 as usize)
+            .filter(|target| {
+                target.id == call.target
+                    && target.role == sema::FunctionRole::Ordinary
+                    && target.color == wrela_hir::FunctionColor::Sync
+            })
+            .ok_or_else(|| self.fact_mismatch("method-call target"))?;
+        let declaration = match target.origin {
+            sema::FunctionOrigin::Source { declaration, .. } => declaration,
+            _ => return Err(self.fact_mismatch("method-call source target")),
+        };
+        let receiver_parameter = target
+            .parameters
+            .first()
+            .ok_or_else(|| self.fact_mismatch("method-call receiver parameter"))?;
+        let _hir_receiver = self
+            .input
+            .hir()
+            .as_program()
+            .parameter(receiver_parameter.parameter)
+            .filter(|parameter| {
+                parameter.owner == wrela_hir::CallableOwner::Declaration(declaration)
+                    && parameter.receiver
+                    && parameter.access == wrela_hir::AccessMode::Read
+                    && parameter.ty.is_none()
+            })
+            .ok_or_else(|| self.fact_mismatch("method-call HIR receiver"))?;
+        let receiver_value = self
+            .input
+            .facts()
+            .values
+            .get(call.receiver.0 as usize)
+            .filter(|value| value.function == self.function.id)
+            .ok_or_else(|| self.fact_mismatch("method-call semantic receiver"))?;
+        if receiver_parameter.access != sema::AccessMode::Read
+            || receiver_parameter.ty != receiver_value.ty
+            || target.result != call.result_type
+            || target.effects != call.effects
+            || target.parameters.len() != call.bindings.len().saturating_add(1)
+            || call.source_argument_count != call.bindings.len()
+        {
+            return Err(self.fact_mismatch("method-call signature"));
+        }
+
+        let mut operands = try_vec(
+            call.source_argument_count,
+            "method-call source operands",
+            self.limits.model_edges,
+        )?;
+        for source_index in 0..call.source_argument_count {
+            check_cancelled(self.is_cancelled)?;
+            let source_argument = self.call_argument(call.expression, source_index)?;
+            let binding = call
+                .bindings
+                .iter()
+                .find(|binding| binding.source_index as usize == source_index)
+                .ok_or_else(|| self.fact_mismatch("method-call source binding"))?;
+            let wrela_hir::CallArgumentValue::Value(argument) = &source_argument.value else {
+                return Err(unsupported(
+                    "semantic-method-call-argument-lowering-pending (mutate or take argument)",
+                ));
+            };
+            if !matches!(
+                binding.access,
+                sema::AccessMode::Value | sema::AccessMode::Read
+            ) {
+                return Err(unsupported(
+                    "semantic-method-call-argument-lowering-pending (mutate or take argument)",
+                ));
+            }
+            let LoweredExpression::Value(value) =
+                self.lower_expression(*argument, binding.access, statements)?
+            else {
+                return Err(self.fact_mismatch("method-call argument value"));
+            };
+            operands.push(value);
+        }
+
+        let mut arguments = try_vec(
+            target.parameters.len(),
+            "SemanticWir method-call arguments",
+            self.limits.model_edges,
+        )?;
+        arguments.push(wir::Argument {
+            access: wir::AccessMode::Read,
+            value: receiver,
+        });
+        let mut source_used = try_vec(
+            call.source_argument_count,
+            "method-call source permutation",
+            self.limits.model_edges,
+        )?;
+        source_used.resize(call.source_argument_count, false);
+        for (explicit_index, parameter) in target.parameters.iter().skip(1).enumerate() {
+            check_cancelled(self.is_cancelled)?;
+            let parameter_index = explicit_index.saturating_add(1);
+            let binding = call
+                .bindings
+                .iter()
+                .find(|binding| binding.parameter_index as usize == parameter_index)
+                .ok_or_else(|| self.fact_mismatch("method-call parameter binding"))?;
+            let source_index = usize::try_from(binding.source_index)
+                .map_err(|_| self.fact_mismatch("method-call source index"))?;
+            let used = source_used
+                .get_mut(source_index)
+                .ok_or_else(|| self.fact_mismatch("method-call source permutation"))?;
+            if *used {
+                return Err(self.fact_mismatch("method-call source permutation"));
+            }
+            *used = true;
+            let source_argument = self.call_argument(call.expression, source_index)?;
+            let hir_parameter = self
+                .input
+                .hir()
+                .as_program()
+                .parameter(parameter.parameter)
+                .filter(|record| {
+                    record.owner == wrela_hir::CallableOwner::Declaration(declaration)
+                        && !record.receiver
+                })
+                .ok_or_else(|| self.fact_mismatch("method-call HIR parameter"))?;
+            let name_matches = match &source_argument.name {
+                Some(name) => hir_parameter.name.as_ref() == Some(name),
+                None => source_index == explicit_index,
+            };
+            let value_record = self
+                .input
+                .facts()
+                .values
+                .get(binding.value.0 as usize)
+                .filter(|value| value.function == self.function.id)
+                .ok_or_else(|| self.fact_mismatch("method-call argument semantic value"))?;
+            let expression = match &source_argument.value {
+                wrela_hir::CallArgumentValue::Value(expression) => *expression,
+                wrela_hir::CallArgumentValue::Exclusive { .. } => {
+                    return Err(unsupported(
+                        "semantic-method-call-argument-lowering-pending (mutate or take argument)",
+                    ));
+                }
+            };
+            let expression_fact = self.expression_fact(expression)?;
+            if !name_matches
+                || binding.access != parameter.access
+                || value_record.ty != parameter.ty
+                || (expression_fact.result != Some(binding.value)
+                    && expression_fact.resolution
+                        != sema::ExpressionResolution::Value(binding.value))
+            {
+                return Err(self.fact_mismatch("method-call argument permutation"));
+            }
+            arguments.push(wir::Argument {
+                access: lower_access(binding.access),
+                value: *operands
+                    .get(source_index)
+                    .ok_or_else(|| self.fact_mismatch("method-call lowered operand"))?,
+            });
+        }
+        if source_used.iter().any(|used| !used) {
+            return Err(self.fact_mismatch("method-call source permutation"));
+        }
+        let result = call
+            .result
+            .ok_or_else(|| self.fact_mismatch("method-call result"))?;
+        let result =
+            self.lowered_expression_result(call.expression, result, call.result_type, call.source)?;
+        self.push_let(
+            statements,
+            result,
+            wir::SemanticOperation::Call {
+                function: wir::FunctionId(call.target.0),
+                arguments,
                 activation: None,
             },
             Some(call.source),
@@ -18155,27 +18451,129 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn concrete_method_call_stops_at_named_lowering_boundary() {
-        let mut facts = analyze_parsed_actor().into_facts();
-        let template = facts
-            .expressions
-            .first()
-            .expect("actor fixture expression")
-            .clone();
-        let mut method = template;
-        method.resolution = sema::ExpressionResolution::MethodCall {
-            function: sema::FunctionInstanceId(0),
-            receiver: sema::ValueId(0),
-            receiver_access: sema::AccessMode::Read,
-            arguments: Vec::new(),
-        };
-        facts.expressions.push(method);
+    fn concrete_read_receiver_method_call_lowers_to_exact_semantic_call() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
 
-        assert!(matches!(
-            validate_method_call_lowering_boundary(&facts),
-            Err(LowerError::UnsupportedInput {
-                feature: "semantic-method-call-lowering-pending (concrete receiver method calls)"
+from core.image import Image, Target
+
+pub struct Cell:
+    pub value: u32
+
+    pub fn choose[T](read self, candidate: T) -> T:
+        return candidate
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        cell: Cell = Cell(7)
+        spare: Cell = Cell(8)
+        selected: u64 = cell.choose(9)
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let method = image
+            .facts()
+            .functions
+            .iter()
+            .find(|function| function.name.ends_with("choose"))
+            .expect("specialized method")
+            .id;
+        let mut non_read = image.facts().clone();
+        let receiver_access = non_read
+            .expressions
+            .iter_mut()
+            .find_map(|fact| match &mut fact.resolution {
+                sema::ExpressionResolution::MethodCall {
+                    receiver_access, ..
+                } => Some(receiver_access),
+                _ => None,
             })
+            .expect("method-call receiver access");
+        *receiver_access = sema::AccessMode::Mutate;
+        assert!(matches!(
+            validate_method_call_lowering_boundary(&non_read),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-method-call-receiver-lowering-pending (mutate or take receiver)"
+            })
+        ));
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("read-receiver method call should lower");
+        let wir = lowered.wir().as_wir();
+        let calls: Vec<_> = wir
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation:
+                        wir::SemanticOperation::Call {
+                            function,
+                            arguments,
+                            activation: None,
+                        },
+                    ..
+                }) if *function == wir::FunctionId(method.0) => Some(arguments),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), 2, "receiver precedes the explicit argument");
+        assert_eq!(calls[0][0].access, wir::AccessMode::Read);
+
+        let mut forged = wir.clone();
+        let spare = forged
+            .functions
+            .iter()
+            .flat_map(|function| &function.values)
+            .find(|value| value.name.as_deref() == Some("spare"))
+            .expect("same-typed alternate receiver")
+            .id;
+        let call = forged
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation:
+                        wir::SemanticOperation::Call {
+                            function,
+                            arguments,
+                            activation: None,
+                        },
+                    ..
+                }) if *function == wir::FunctionId(method.0) => Some(arguments),
+                _ => None,
+            })
+            .expect("method call");
+        call[0].value = spare;
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                forged,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
         ));
     }
 
