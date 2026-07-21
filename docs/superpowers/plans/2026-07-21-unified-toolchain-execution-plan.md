@@ -188,7 +188,7 @@ D2 need this scope substantially complete; B10 needs F5.
 | 1 | B2a promotion/region report schema | — | **landed** 3eb2cb69 |
 | 1 | B5b wait-for graph + diagnostics | — | **landed** 3e216d38 |
 | 1 | B1a view/provenance semantics | — | not started (never dispatched) |
-| 1 | B4a cleanup DAG sema analysis | — | not started (first attempt discarded in isolation recovery; redo fresh) |
+| 1 | B4a cleanup DAG sema analysis | — | **complete at sema tier** — free-call scope protocols/calls, lexical activations, reverse-source cleanup DAG + `CleanupAcyclic`, synthetic cycle detector, and named await/receiver/outside-`with` rejections; pass-only cleanup bodies and no lowering (`semantic-with-cleanup-lowering-pending`) |
 | 0 | **T0.1 general nongeneric ADTs — COMPLETE** | — | **landed** — enum type resolution: unit + mixed-arity + heterogeneous-scalar + flat-struct + nongeneric-enum payloads, tagged-union max-slot layout, structural cycle rejection |
 | 0 | · T0.1a unit variants | — | landed ce8385e6 |
 | 0 | · T0.1b heterogeneous scalar payloads | T0.1a | landed 4b5f125a |

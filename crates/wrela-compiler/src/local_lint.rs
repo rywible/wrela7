@@ -323,9 +323,11 @@ impl CanonicalSemanticLinter {
                 ExpressionResolution::Error
                 | ExpressionResolution::Constant(_)
                 | ExpressionResolution::Function(_)
+                | ExpressionResolution::Scope(_)
                 | ExpressionResolution::Constructor { .. }
                 | ExpressionResolution::ResultTry { .. }
                 | ExpressionResolution::DirectCall { .. }
+                | ExpressionResolution::ScopeCall { .. }
                 | ExpressionResolution::OperatorCall { .. }
                 | ExpressionResolution::ActorRequest { .. }
                 | ExpressionResolution::Field { .. }

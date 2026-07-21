@@ -635,6 +635,10 @@ pub enum ExpressionResolution {
     Constant(ConstantValue),
     Value(ValueId),
     Function(FunctionInstanceId),
+    /// A source `scope` declaration is callable only as the acquisition of a
+    /// `with` statement. It is deliberately not represented by a synthetic
+    /// [`FunctionInstance`]: scope phases have their own protocol contract.
+    Scope(ScopeProtocolId),
     Constructor {
         ty: SemanticTypeId,
         variant: Option<u32>,
@@ -651,6 +655,12 @@ pub enum ExpressionResolution {
         function: FunctionInstanceId,
         /// Exact source-to-parameter permutation. Records are canonical by
         /// `parameter_index`; `source_index` indexes the HIR call arguments.
+        arguments: Vec<ResolvedCallArgument>,
+    },
+    ScopeCall {
+        protocol: ScopeProtocolId,
+        /// Exact source-to-scope-parameter permutation, canonical by
+        /// `parameter_index` just like an ordinary direct call.
         arguments: Vec<ResolvedCallArgument>,
     },
     /// A binary/comparison operator desugared to a direct call on a
@@ -1589,6 +1599,11 @@ impl PartialAnalysis {
                 return Err(invalid("scope activation contains a dangling reference"));
             }
         }
+        if !valid_scope_contracts(self, hir.as_program()) {
+            return Err(invalid(
+                "scope protocols or activations differ from exact HIR cleanup semantics",
+            ));
+        }
         for proof in &self.proofs {
             if proof.subject.trim().is_empty()
                 || proof.explanation.is_empty()
@@ -1835,7 +1850,9 @@ fn validate_exact_source_facts(
                     .get_mut(value.0 as usize)
                     .ok_or_else(|| invalid("taken expression value is invalid"))? = true;
             }
-            if let ExpressionResolution::DirectCall { arguments, .. } = &fact.resolution {
+            if let ExpressionResolution::DirectCall { arguments, .. }
+            | ExpressionResolution::ScopeCall { arguments, .. } = &fact.resolution
+            {
                 for argument in arguments {
                     check_analysis_cancelled(is_cancelled)?;
                     if argument.access == AccessMode::Take {
@@ -1997,7 +2014,8 @@ fn validate_exact_expression_local_values(
                                 }
                             };
                             let resolved = match &fact.resolution {
-                                ExpressionResolution::DirectCall { arguments, .. } => arguments
+                                ExpressionResolution::DirectCall { arguments, .. }
+                                | ExpressionResolution::ScopeCall { arguments, .. } => arguments
                                     .iter()
                                     .find(|binding| binding.source_index as usize == source_index)
                                     .map(|binding| binding.value),
@@ -2515,6 +2533,55 @@ fn validate_exact_body_local_value_flow(
                 }
                 effects
             }
+            wrela_hir::StatementKind::With {
+                value,
+                binding,
+                body,
+                ..
+            } => {
+                validate_exact_expression_local_values(
+                    analysis,
+                    program,
+                    function.id,
+                    *value,
+                    locals,
+                    is_cancelled,
+                )?;
+                let value_effects = exact_child_expression(analysis, function.id, *value)
+                    .ok_or_else(|| invalid("with acquisition expression fact is missing"))?
+                    .effects;
+                let mut body_locals = copy_exact_local_values(locals)?;
+                if let Some(local) = binding {
+                    let [definition] = fact.definitions.as_slice() else {
+                        return Err(invalid("with binding flow definition is missing"));
+                    };
+                    let slot = body_locals
+                        .get_mut(local.0 as usize)
+                        .ok_or_else(|| invalid("with binding flow local is invalid"))?;
+                    if slot.replace(definition.value).is_some() || definition.local != *local {
+                        return Err(invalid("with binding flow shadows a live local"));
+                    }
+                } else if !fact.definitions.is_empty() {
+                    return Err(invalid("unbound with flow defines a local"));
+                }
+                let body_effects = validate_exact_body_local_value_flow(
+                    analysis,
+                    program,
+                    function,
+                    *body,
+                    &mut body_locals,
+                    depth + 1,
+                    is_cancelled,
+                )?;
+                for index in 0..locals.len() {
+                    check_analysis_cancelled(is_cancelled)?;
+                    if binding.is_some_and(|local| index == local.0 as usize) {
+                        continue;
+                    }
+                    locals[index] = body_locals[index];
+                }
+                EffectSet(value_effects.0 | body_effects.0)
+            }
             _ => {
                 return Err(invalid(
                     "local-value flow encountered an unsupported statement",
@@ -2725,6 +2792,20 @@ fn collect_source_body_closure(
                     for arm in arms {
                         pending_bodies.push(arm.body);
                     }
+                }
+                wrela_hir::StatementKind::With { value, body, .. } => {
+                    reserve_validation_scratch(
+                        &mut pending_expressions,
+                        1,
+                        program.expressions.len() as u64,
+                    )?;
+                    pending_expressions.push(*value);
+                    reserve_validation_scratch(
+                        &mut pending_bodies,
+                        1,
+                        program.bodies.len() as u64,
+                    )?;
+                    pending_bodies.push(*body);
                 }
                 _ => return Err(invalid()),
             }
@@ -2985,6 +3066,26 @@ fn validate_exact_expression_fact(
             }) => {}
         (
             wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(source)),
+            ExpressionResolution::Scope(protocol),
+            None,
+        ) if analysis
+            .scope_protocols
+            .get(protocol.0 as usize)
+            .is_some_and(|protocol| {
+                protocol.declaration == source.declaration
+                    && analysis.types.get(fact.ty.0 as usize).is_some_and(|ty| {
+                        matches!(
+                            &ty.kind,
+                            SemanticTypeKind::Function {
+                                color: wrela_hir::FunctionColor::Sync,
+                                parameters,
+                                result,
+                            } if parameters == &protocol.parameters && *result == protocol.result
+                        )
+                    })
+            }) => {}
+        (
+            wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(source)),
             ExpressionResolution::Constructor { ty, variant: None },
             None,
         ) if *ty == fact.ty
@@ -3110,6 +3211,22 @@ fn validate_exact_expression_fact(
             *callee,
             arguments,
             *target,
+            bindings,
+        ) => {}
+        (
+            wrela_hir::ExpressionKind::Call { callee, arguments },
+            ExpressionResolution::ScopeCall {
+                protocol,
+                arguments: bindings,
+            },
+            Some(_),
+        ) if exact_scope_call_bindings_match(
+            analysis,
+            program,
+            function.id,
+            *callee,
+            arguments,
+            *protocol,
             bindings,
         ) => {}
         (
@@ -4825,6 +4942,42 @@ fn validate_exact_statement_fact(
                 increment_definition(definitions, definition.value)?;
             }
         }
+        wrela_hir::StatementKind::With {
+            value,
+            binding,
+            body,
+            ..
+        } => match binding {
+            Some(local) => {
+                let [definition] = fact.definitions.as_slice() else {
+                    return Err(invalid("with binding lacks one exact definition"));
+                };
+                let local_record = program
+                    .locals
+                    .get(local.0 as usize)
+                    .filter(|record| record.id == *local && record.body == *body)
+                    .ok_or_else(|| invalid("with binding local differs from its child body"))?;
+                let value_fact = exact_child_expression(analysis, function.id, *value)
+                    .ok_or_else(|| invalid("with acquisition expression fact is missing"))?;
+                let value_record = analysis
+                    .values
+                    .get(definition.value.0 as usize)
+                    .filter(|record| {
+                        definition.local == *local
+                            && record.function == function.id
+                            && record.origin == SemanticValueOrigin::Local(*local)
+                            && record.source == Some(local_record.source)
+                            && record.source_name.as_deref() == Some(local_record.name.as_str())
+                            && value_fact.result == Some(record.id)
+                    })
+                    .ok_or_else(|| invalid("with binding value provenance is invalid"))?;
+                if value_fact.ty != value_record.ty {
+                    return Err(invalid("with binding type differs from acquisition result"));
+                }
+            }
+            None if fact.definitions.is_empty() => {}
+            None => return Err(invalid("unbound with statement defines a source local")),
+        },
         _ if fact.definitions.is_empty() => {}
         _ => {
             return Err(invalid(
@@ -4971,6 +5124,98 @@ fn exact_call_bindings_match(
                                 })
                     }
                 }
+        })
+}
+
+fn exact_scope_call_bindings_match(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    caller: FunctionInstanceId,
+    callee_expression: ExpressionId,
+    source_arguments: &[wrela_hir::CallArgument],
+    protocol: ScopeProtocolId,
+    bindings: &[ResolvedCallArgument],
+) -> bool {
+    let Some(protocol_record) = analysis.scope_protocols.get(protocol.0 as usize) else {
+        return false;
+    };
+    let Some(wrela_hir::DeclarationKind::Scope(source_scope)) = program
+        .declaration(protocol_record.declaration)
+        .map(|declaration| &declaration.kind)
+    else {
+        return false;
+    };
+    let callee_matches = analysis
+        .expressions
+        .binary_search_by_key(&(caller, callee_expression), |fact| {
+            (fact.function, fact.expression)
+        })
+        .ok()
+        .and_then(|index| analysis.expressions.get(index))
+        .is_some_and(|fact| {
+            fact.result.is_none() && fact.resolution == ExpressionResolution::Scope(protocol)
+        });
+    if !callee_matches
+        || bindings.len() != source_arguments.len()
+        || bindings.len()
+            != source_scope
+                .parameters
+                .iter()
+                .filter(|parameter| **parameter != source_scope.exit_parameter)
+                .count()
+        || bindings.len() != protocol_record.parameters.len()
+    {
+        return false;
+    }
+    bindings
+        .iter()
+        .zip(&protocol_record.parameters)
+        .enumerate()
+        .all(|(parameter_index, (binding, parameter))| {
+            let Some(source) = source_arguments.get(binding.source_index as usize) else {
+                return false;
+            };
+            let Some(parameter_id) = source_scope
+                .parameters
+                .iter()
+                .filter(|parameter| **parameter != source_scope.exit_parameter)
+                .nth(parameter_index)
+            else {
+                return false;
+            };
+            let Some(hir_parameter) = program.parameters.get(parameter_id.0 as usize) else {
+                return false;
+            };
+            let name_matches = match &source.name {
+                Some(name) => hir_parameter.name.as_ref() == Some(name),
+                None => binding.source_index as usize == parameter_index,
+            };
+            binding.parameter_index as usize == parameter_index
+                && binding.access == parameter.access
+                && name_matches
+                && matches!(
+                    (&source.value, binding.access),
+                    (
+                        wrela_hir::CallArgumentValue::Value(_),
+                        AccessMode::Value | AccessMode::Read
+                    ) | (
+                        wrela_hir::CallArgumentValue::Exclusive {
+                            access: wrela_hir::ExclusiveAccess::Mutate,
+                            ..
+                        },
+                        AccessMode::Mutate,
+                    ) | (
+                        wrela_hir::CallArgumentValue::Exclusive {
+                            access: wrela_hir::ExclusiveAccess::Take,
+                            ..
+                        },
+                        AccessMode::Take,
+                    )
+                )
+                && analysis
+                    .values
+                    .get(binding.value.0 as usize)
+                    .is_some_and(|value| value.function == caller && value.ty == parameter.ty)
         })
 }
 
@@ -5809,6 +6054,9 @@ fn valid_expression_resolution(
         ExpressionResolution::Constant(value) => valid_constant(value, analysis, graph),
         ExpressionResolution::Value(value) => value_id(*value),
         ExpressionResolution::Function(target) => function_id(*target),
+        ExpressionResolution::Scope(protocol) => {
+            (protocol.0 as usize) < analysis.scope_protocols.len()
+        }
         ExpressionResolution::Constructor { ty, variant } => analysis
             .types
             .get(ty.0 as usize)
@@ -5859,6 +6107,22 @@ fn valid_expression_resolution(
                         },
                     )
             }),
+        ExpressionResolution::ScopeCall {
+            protocol,
+            arguments,
+        } => analysis
+            .scope_protocols
+            .get(protocol.0 as usize)
+            .is_some_and(|protocol| {
+                arguments.len() == protocol.parameters.len()
+                    && arguments.iter().zip(&protocol.parameters).enumerate().all(
+                        |(parameter_index, (actual, expected))| {
+                            usize::try_from(actual.parameter_index) == Ok(parameter_index)
+                                && actual.access == expected.access
+                                && value_id(actual.value)
+                        },
+                    )
+            }),
         ExpressionResolution::OperatorCall {
             function: target,
             arguments,
@@ -5897,6 +6161,174 @@ fn valid_expression_resolution(
         ExpressionResolution::Index { bounds } => proof_id(*bounds),
         ExpressionResolution::Builtin(operation) => valid_intrinsic(operation, analysis, graph),
     }
+}
+
+fn valid_scope_protocol_record(
+    protocol: &ScopeProtocol,
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+) -> bool {
+    let Some(declaration) = program.declaration(protocol.declaration) else {
+        return false;
+    };
+    let wrela_hir::DeclarationKind::Scope(source) = &declaration.kind else {
+        return false;
+    };
+    let exact_name = declaration.name.as_ref().map(wrela_hir::Name::as_str);
+    let acquisition_parameters = source
+        .parameters
+        .iter()
+        .filter(|parameter| **parameter != source.exit_parameter)
+        .collect::<Vec<_>>();
+    exact_name == Some(protocol.name.as_str())
+        && protocol.setup == source.setup
+        && protocol.enter == source.enter
+        && protocol.abort == source.abort
+        && protocol.exit == source.exit
+        && exact_runtime_source_type(analysis, &source.result) == Some(protocol.result)
+        && protocol.parameters.len() == acquisition_parameters.len()
+        && protocol
+            .parameters
+            .iter()
+            .zip(acquisition_parameters)
+            .all(|(semantic, parameter)| {
+                program
+                    .parameters
+                    .get(parameter.0 as usize)
+                    .is_some_and(|parameter| {
+                        !parameter.receiver
+                            && parameter.ty.as_ref().is_some_and(|ty| {
+                                exact_runtime_source_type(analysis, ty) == Some(semantic.ty)
+                            })
+                            && matches!(
+                                (parameter.access, semantic.access),
+                                (wrela_hir::AccessMode::Value, AccessMode::Value)
+                                    | (wrela_hir::AccessMode::Read, AccessMode::Read)
+                                    | (wrela_hir::AccessMode::Mutate, AccessMode::Mutate)
+                                    | (wrela_hir::AccessMode::Take, AccessMode::Take)
+                            )
+                    })
+            })
+        && !protocol.suspend_safe
+        && protocol.abort_effects == EffectSet(0)
+        && protocol.exit_effects == EffectSet(0)
+        && analysis
+            .proofs
+            .get(protocol.proof.0 as usize)
+            .is_some_and(|proof| proof.kind == ProofKind::CleanupAcyclic)
+}
+
+fn valid_scope_contracts(analysis: &PartialAnalysis, program: &wrela_hir::Program) -> bool {
+    if analysis
+        .scope_protocols
+        .iter()
+        .any(|protocol| !valid_scope_protocol_record(protocol, analysis, program))
+    {
+        return false;
+    }
+    for activation in &analysis.scope_activations {
+        let Some(statement) = program.statement(activation.statement) else {
+            return false;
+        };
+        let wrela_hir::StatementKind::With { value, .. } = statement.kind else {
+            return false;
+        };
+        let Some(value_fact) = exact_child_expression(analysis, activation.function, value) else {
+            return false;
+        };
+        if !matches!(
+            value_fact.resolution,
+            ExpressionResolution::ScopeCall { protocol, .. } if protocol == activation.protocol
+        ) || analysis
+            .scope_protocols
+            .get(activation.protocol.0 as usize)
+            .is_none_or(|protocol| protocol.result != activation.state_type)
+            || analysis
+                .proofs
+                .get(activation.proof.0 as usize)
+                .is_none_or(|proof| proof.kind != ProofKind::CleanupAcyclic)
+            || activation.cleanup_dependencies.iter().any(|dependency| {
+                *dependency == activation.statement
+                    || !analysis.scope_activations.iter().any(|candidate| {
+                        candidate.function == activation.function
+                            && candidate.statement == *dependency
+                    })
+            })
+        {
+            return false;
+        }
+    }
+    let mut functions = analysis
+        .scope_activations
+        .iter()
+        .map(|activation| activation.function)
+        .collect::<Vec<_>>();
+    functions.sort_unstable();
+    functions.dedup();
+    for function in functions {
+        let mut activations = analysis
+            .scope_activations
+            .iter()
+            .filter(|activation| activation.function == function)
+            .collect::<Vec<_>>();
+        activations.sort_by_key(|activation| activation.statement);
+        let count = activations.len();
+        if activations.iter().enumerate().any(|(index, activation)| {
+            usize::try_from(activation.reverse_source_order) != Ok(count.saturating_sub(index + 1))
+        }) {
+            return false;
+        }
+        let mut colors = vec![0u8; count];
+        let mut stack = Vec::<(usize, usize)>::new();
+        for root in 0..count {
+            if colors[root] != 0 {
+                continue;
+            }
+            colors[root] = 1;
+            stack.push((root, 0));
+            while let Some((node, next)) = stack.last_mut() {
+                if *next >= activations[*node].cleanup_dependencies.len() {
+                    colors[*node] = 2;
+                    stack.pop();
+                    continue;
+                }
+                let dependency = activations[*node].cleanup_dependencies[*next];
+                *next += 1;
+                let Some(target) = activations
+                    .iter()
+                    .position(|activation| activation.statement == dependency)
+                else {
+                    return false;
+                };
+                match colors[target] {
+                    0 => {
+                        colors[target] = 1;
+                        stack.push((target, 0));
+                    }
+                    1 => return false,
+                    2 => {}
+                    _ => return false,
+                }
+            }
+        }
+        let edge_count = activations.iter().try_fold(0u64, |total, activation| {
+            total.checked_add(u64::try_from(activation.cleanup_dependencies.len()).ok()?)
+        });
+        let Some(proof) = activations
+            .first()
+            .and_then(|activation| analysis.proofs.get(activation.proof.0 as usize))
+        else {
+            return false;
+        };
+        if activations
+            .iter()
+            .any(|activation| activation.proof != proof.id)
+            || proof.bound != edge_count
+        {
+            return false;
+        }
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5970,9 +6402,11 @@ fn valid_expression_region(fact: &ExpressionFact, graph: &ImageGraph) -> bool {
             ExpressionResolution::Constant(_)
             | ExpressionResolution::Value(_)
             | ExpressionResolution::Function(_)
+            | ExpressionResolution::Scope(_)
             | ExpressionResolution::Constructor { .. }
             | ExpressionResolution::ResultTry { .. }
             | ExpressionResolution::DirectCall { .. }
+            | ExpressionResolution::ScopeCall { .. }
             | ExpressionResolution::OperatorCall { .. }
             | ExpressionResolution::ActorRequest { .. }
             | ExpressionResolution::Closure { .. }
@@ -7374,11 +7808,13 @@ fn validate_fact_resources(
                 push_fact_constant(&mut constants, (value, 1), limits)?;
             }
             ExpressionResolution::DirectCall { arguments, .. }
+            | ExpressionResolution::ScopeCall { arguments, .. }
             | ExpressionResolution::OperatorCall { arguments, .. } => meter.edges(arguments),
             ExpressionResolution::Closure { captures, .. } => meter.edges(captures),
             ExpressionResolution::Error
             | ExpressionResolution::Value(_)
             | ExpressionResolution::Function(_)
+            | ExpressionResolution::Scope(_)
             | ExpressionResolution::Constructor { .. }
             | ExpressionResolution::ResultTry { .. }
             | ExpressionResolution::ActorRequest { .. }

@@ -2696,6 +2696,9 @@ fn runtime_body_work_bound(program: &wrela_hir::Program, body: BodyId) -> Option
                     .checked_mul(runtime_body_work_bound(program, *body)?.checked_add(1)?)?
                     .checked_add(1)?
             }
+            StatementKind::With { body, .. } => {
+                runtime_body_work_bound(program, *body)?.checked_add(1)?
+            }
             _ => 1,
         };
         total.checked_add(work)
@@ -2882,10 +2885,33 @@ fn inspect_runtime_body_shape(
                 StatementKind::Yield(_)
                 | StatementKind::For { .. }
                 | StatementKind::Loop { .. }
-                | StatementKind::With { .. }
                 | StatementKind::ComptimeIf { .. }
                 | StatementKind::Error => {
                     return Err(RuntimeShapeFailure::Unsupported(statement.source));
+                }
+                StatementKind::With {
+                    value,
+                    body,
+                    region,
+                    ..
+                } => {
+                    if region.is_some() {
+                        return Err(RuntimeShapeFailure::Unsupported(statement.source));
+                    }
+                    inspect_runtime_expression_shape(
+                        request,
+                        *value,
+                        color,
+                        callees,
+                        is_cancelled,
+                    )?;
+                    reserve_runtime_shape(
+                        &mut bodies,
+                        1,
+                        request.limits.fact_edges,
+                        "runtime with body scratch",
+                    )?;
+                    bodies.push(*body);
                 }
             }
             statements.push(*statement_id);
@@ -2966,13 +2992,17 @@ fn inspect_runtime_expression_shape(
                         .expression(*callee)
                         .map(|expression| &expression.kind)
                 {
-                    reserve_runtime_shape(
-                        callees,
-                        1,
-                        request.limits.fact_edges,
-                        "runtime callee scratch",
-                    )?;
-                    callees.push(declaration.declaration);
+                    if program.declaration(declaration.declaration).is_some_and(|record| {
+                        matches!(record.kind, DeclarationKind::Function(_))
+                    }) {
+                        reserve_runtime_shape(
+                            callees,
+                            1,
+                            request.limits.fact_edges,
+                            "runtime callee scratch",
+                        )?;
+                        callees.push(declaration.declaration);
+                    }
                 }
                 let additional = arguments.len().checked_add(1).ok_or({
                     RuntimeShapeFailure::Failure(AnalysisFailure::ResourceLimit {
@@ -3434,6 +3464,7 @@ struct RuntimeState<'a> {
     parameters: &'a mut [Option<RuntimeBinding>],
     aggregate_work: &'a mut RuntimeAggregateWork,
     allow_assertions: bool,
+    allow_scope_call: bool,
 }
 
 #[derive(Debug, Default)]
@@ -3478,6 +3509,18 @@ struct RuntimeDirectCall<'a> {
     source: Span,
     callee: ExpressionId,
     arguments: &'a [wrela_hir::CallArgument],
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeScopeCall<'a> {
+    direct: RuntimeDirectCall<'a>,
+    declaration: DeclarationId,
+}
+
+#[derive(Clone, Copy)]
+struct ScopeEnterContext<'a> {
+    scope: &'a wrela_hir::ScopeDeclaration,
+    parameter_types: &'a [SemanticParameter],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3544,6 +3587,8 @@ struct RuntimeCheckpoint {
     expressions: usize,
     statements: usize,
     proofs: usize,
+    scope_protocols: usize,
+    scope_activations: usize,
 }
 
 impl RuntimeCheckpoint {
@@ -3555,6 +3600,8 @@ impl RuntimeCheckpoint {
             expressions: partial.expressions.len(),
             statements: partial.statements.len(),
             proofs: partial.proofs.len(),
+            scope_protocols: partial.scope_protocols.len(),
+            scope_activations: partial.scope_activations.len(),
         }
     }
 
@@ -3565,6 +3612,8 @@ impl RuntimeCheckpoint {
         partial.expressions.truncate(self.expressions);
         partial.statements.truncate(self.statements);
         partial.proofs.truncate(self.proofs);
+        partial.scope_protocols.truncate(self.scope_protocols);
+        partial.scope_activations.truncate(self.scope_activations);
     }
 }
 
@@ -3995,6 +4044,7 @@ fn populate_runtime_body(
         aggregate_work,
         is_cancelled,
     )?;
+    finalize_scope_activations(request, partial, function, is_cancelled)?;
     let body_effects = partial
         .statements
         .iter()
@@ -4094,6 +4144,7 @@ fn analyze_runtime_body(
                         parameters: &mut *parameters,
                         aggregate_work: &mut *aggregate_work,
                         allow_assertions,
+                        allow_scope_call: false,
                     },
                     is_cancelled,
                 )?;
@@ -4240,6 +4291,7 @@ fn analyze_runtime_body(
                             parameters: &mut *parameters,
                             aggregate_work: &mut *aggregate_work,
                             allow_assertions,
+                            allow_scope_call: false,
                         },
                         is_cancelled,
                     )?;
@@ -4297,6 +4349,7 @@ fn analyze_runtime_body(
                             parameters: &mut *parameters,
                             aggregate_work: &mut *aggregate_work,
                             allow_assertions,
+                            allow_scope_call: false,
                         },
                         is_cancelled,
                     )?;
@@ -4334,6 +4387,7 @@ fn analyze_runtime_body(
                         parameters: &mut *parameters,
                         aggregate_work: &mut *aggregate_work,
                         allow_assertions,
+                        allow_scope_call: false,
                     },
                     is_cancelled,
                 )?;
@@ -4350,6 +4404,7 @@ fn analyze_runtime_body(
                         parameters: &mut *parameters,
                         aggregate_work: &mut *aggregate_work,
                         allow_assertions,
+                        allow_scope_call: false,
                     },
                     is_cancelled,
                 )?;
@@ -4416,6 +4471,7 @@ fn analyze_runtime_body(
                         parameters: &mut *parameters,
                         aggregate_work: &mut *aggregate_work,
                         allow_assertions,
+                        allow_scope_call: false,
                     },
                     is_cancelled,
                 )?;
@@ -4447,6 +4503,7 @@ fn analyze_runtime_body(
                                 parameters: &mut *parameters,
                                 aggregate_work: &mut *aggregate_work,
                                 allow_assertions,
+                                allow_scope_call: false,
                             },
                             is_cancelled,
                         )?;
@@ -4485,6 +4542,7 @@ fn analyze_runtime_body(
                         parameters: &mut *parameters,
                         aggregate_work: &mut *aggregate_work,
                         allow_assertions,
+                        allow_scope_call: false,
                     },
                     is_cancelled,
                 )?;
@@ -4646,6 +4704,7 @@ fn analyze_runtime_body(
                         parameters: &mut *parameters,
                         aggregate_work: &mut *aggregate_work,
                         allow_assertions,
+                        allow_scope_call: false,
                     },
                     is_cancelled,
                 )?;
@@ -4703,6 +4762,29 @@ fn analyze_runtime_body(
                     is_cancelled,
                 )?;
             }
+            StatementKind::With {
+                value,
+                binding,
+                region,
+                body,
+            } => {
+                statement_effects = analyze_runtime_with(
+                    request,
+                    partial,
+                    function,
+                    statement_id,
+                    *value,
+                    *binding,
+                    *region,
+                    *body,
+                    locals,
+                    parameters,
+                    allow_assertions,
+                    &mut *aggregate_work,
+                    &mut definitions,
+                    is_cancelled,
+                )?;
+            }
             _ => return Err(AnalysisFailure::RequestMismatch.into()),
         }
         append_statement_fact(
@@ -4719,6 +4801,454 @@ fn analyze_runtime_body(
             is_cancelled,
         )?;
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_runtime_with(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    statement: StatementId,
+    value: ExpressionId,
+    binding: Option<LocalId>,
+    region: Option<wrela_hir::RegionId>,
+    body: BodyId,
+    locals: &mut [Option<RuntimeBinding>],
+    parameters: &mut [Option<RuntimeBinding>],
+    allow_assertions: bool,
+    aggregate_work: &mut RuntimeAggregateWork,
+    definitions: &mut Vec<LocalDefinition>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<EffectSet> {
+    let program = request.hir.as_program();
+    let statement_record = program
+        .statement(statement)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if region.is_some() {
+        return Err(runtime_type_diagnostic(
+            request,
+            statement_record.source,
+            "semantic-with-region-pending",
+            "region-branded with activation is not yet supported",
+            "this slice proves scope cleanup semantics without region allocation",
+            "omit the with region until region lowering lands",
+        ));
+    }
+    let value_record = program
+        .expression(value)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let ExpressionKind::Call { callee, .. } = value_record.kind else {
+        return Err(runtime_type_diagnostic(
+            request,
+            value_record.source,
+            "semantic-with-scope-call-required",
+            "with acquisition requires one direct scope call",
+            "an arbitrary value does not carry a statically resolved cleanup protocol",
+            "write `with scope_name(...) as binding:`",
+        ));
+    };
+    let callee_record = program
+        .expression(callee)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if matches!(callee_record.kind, ExpressionKind::Field { .. }) {
+        return Err(runtime_type_diagnostic(
+            request,
+            callee_record.source,
+            "semantic-with-receiver-scope-pending",
+            "receiver-form scope acquisition is not yet supported",
+            "scope method resolution depends on the receiver-call subsystem",
+            "call a module-level free scope declaration",
+        ));
+    }
+    let ExpressionKind::Reference(Definition::Declaration(resolved)) = &callee_record.kind else {
+        return Err(runtime_type_diagnostic(
+            request,
+            callee_record.source,
+            "semantic-with-scope-call-required",
+            "with acquisition callee is not a resolved free scope declaration",
+            "closures and computed callees cannot establish a closed cleanup protocol",
+            "call a module-level scope declaration directly",
+        ));
+    };
+    if !program
+        .declaration(resolved.declaration)
+        .is_some_and(|declaration| matches!(declaration.kind, DeclarationKind::Scope(_)))
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            callee_record.source,
+            "semantic-with-scope-callee",
+            "with acquisition callee is not a scope declaration",
+            "ordinary functions do not carry abort and exit cleanup contracts",
+            "declare and call a scope",
+        ));
+    }
+    let protocol = ensure_scope_protocol(
+        request,
+        partial,
+        resolved.declaration,
+        aggregate_work,
+        is_cancelled,
+    )?;
+    let state_type = partial
+        .scope_protocols
+        .get(protocol.0 as usize)
+        .map(|protocol| protocol.result)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let binding_value = if let Some(local) = binding {
+        let local_record = program
+            .locals
+            .get(local.0 as usize)
+            .filter(|record| record.id == local && record.body == body)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if let Some(annotation) = &local_record.ty {
+            let annotation = semantic_type_from_source(
+                request,
+                partial,
+                annotation,
+                aggregate_work,
+                is_cancelled,
+            )?;
+            if annotation != state_type {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    local_record.source,
+                    "semantic-with-binding-type",
+                    "with binding annotation does not match the scope state type",
+                    "the binding receives the exact value produced by scope enter",
+                    "remove the annotation or use the scope's declared result type",
+                ));
+            }
+        }
+        Some(append_semantic_value(
+            request,
+            partial,
+            function,
+            state_type,
+            (
+                SemanticValueOrigin::Local(local),
+                Some(local_record.source),
+                Some(local_record.name.as_str()),
+            ),
+            is_cancelled,
+        )?)
+    } else {
+        None
+    };
+    let acquisition = analyze_runtime_expression(
+        request,
+        partial,
+        function,
+        value,
+        RuntimeExpressionRequest {
+            expected: Some(state_type),
+            desired_result: binding_value,
+            access: AccessMode::Value,
+        },
+        &mut RuntimeState {
+            locals: &mut *locals,
+            parameters: &mut *parameters,
+            aggregate_work: &mut *aggregate_work,
+            allow_assertions,
+            allow_scope_call: true,
+        },
+        is_cancelled,
+    )?;
+    if acquisition.ty != state_type {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    if let (Some(local), Some(value)) = (binding, binding_value) {
+        let local_record = program
+            .locals
+            .get(local.0 as usize)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let slot = locals
+            .get_mut(local.0 as usize)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if slot
+            .replace(RuntimeBinding {
+                value,
+                state: OwnershipState::Owned,
+                authority: RuntimeAuthority::Own,
+                origin: RuntimeBindingOrigin::Local(local),
+                source: local_record.source,
+            })
+            .is_some()
+        {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        }
+        definitions.push(LocalDefinition { local, value });
+    }
+    let activation_start = partial.scope_activations.len();
+    let nested_fact_start = partial.statements.len();
+    analyze_runtime_body(
+        request,
+        partial,
+        function,
+        body,
+        locals,
+        parameters,
+        allow_assertions,
+        aggregate_work,
+        is_cancelled,
+    )?;
+    let mut effects = acquisition.effects;
+    for nested in partial
+        .statements
+        .get(nested_fact_start..)
+        .ok_or(AnalysisFailure::RequestMismatch)?
+    {
+        effects.0 |= nested.effects.0;
+    }
+    if let Some(local) = binding {
+        *locals
+            .get_mut(local.0 as usize)
+            .ok_or(AnalysisFailure::RequestMismatch)? = None;
+    }
+    if partial.scope_activations.len() >= request.limits.scope_activations as usize {
+        return Err(fact_resource(request, "scope activations").into());
+    }
+    let mut cleanup_dependencies = partial
+        .scope_activations
+        .get(activation_start..)
+        .ok_or(AnalysisFailure::RequestMismatch)?
+        .iter()
+        .filter(|activation| activation.function == function)
+        .map(|activation| activation.statement)
+        .collect::<Vec<_>>();
+    cancellable_stable_sort_by(
+        &mut cleanup_dependencies,
+        request.limits.fact_edges,
+        "scope cleanup dependency sort scratch",
+        is_cancelled,
+        &|left, right| Ok(left.cmp(right)),
+    )?;
+    cancellable_dedup(&mut cleanup_dependencies, is_cancelled)?;
+    let protocol_proof = partial
+        .scope_protocols
+        .get(protocol.0 as usize)
+        .map(|protocol| protocol.proof)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    partial.scope_activations.push(ScopeActivation {
+        statement,
+        function,
+        protocol,
+        state_type,
+        cleanup_dependencies,
+        reverse_source_order: 0,
+        proof: protocol_proof,
+    });
+    Ok(effects)
+}
+
+fn cleanup_cycle_participants(
+    activations: &[ScopeActivation],
+    function: FunctionInstanceId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<Vec<StatementId>>, AnalysisFailure> {
+    let nodes = activations
+        .iter()
+        .enumerate()
+        .filter(|(_, activation)| activation.function == function)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut colors = vec![0u8; nodes.len()];
+    let mut path = Vec::<usize>::new();
+    let mut stack = Vec::<(usize, usize)>::new();
+    for root in 0..nodes.len() {
+        check_cancelled(is_cancelled)?;
+        if colors[root] != 0 {
+            continue;
+        }
+        colors[root] = 1;
+        path.push(root);
+        stack.push((root, 0));
+        while let Some((node, next_dependency)) = stack.last_mut() {
+            check_cancelled(is_cancelled)?;
+            let activation = &activations[nodes[*node]];
+            if *next_dependency >= activation.cleanup_dependencies.len() {
+                colors[*node] = 2;
+                stack.pop();
+                path.pop();
+                continue;
+            }
+            let dependency = activation.cleanup_dependencies[*next_dependency];
+            *next_dependency = next_dependency
+                .checked_add(1)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            let target = nodes
+                .iter()
+                .position(|index| activations[*index].statement == dependency)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            match colors[target] {
+                0 => {
+                    colors[target] = 1;
+                    path.push(target);
+                    stack.push((target, 0));
+                }
+                1 => {
+                    let start = path
+                        .iter()
+                        .position(|candidate| *candidate == target)
+                        .ok_or(AnalysisFailure::RequestMismatch)?;
+                    let mut participants = path[start..]
+                        .iter()
+                        .map(|node| activations[nodes[*node]].statement)
+                        .collect::<Vec<_>>();
+                    participants.sort_unstable();
+                    participants.dedup();
+                    return Ok(Some(participants));
+                }
+                2 => {}
+                _ => return Err(AnalysisFailure::RequestMismatch),
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn finalize_scope_activations(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<()> {
+    let indices = partial
+        .scope_activations
+        .iter()
+        .enumerate()
+        .filter(|(_, activation)| activation.function == function)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if indices.is_empty() {
+        return Ok(());
+    }
+    if let Some(participants) =
+        cleanup_cycle_participants(&partial.scope_activations, function, is_cancelled)?
+    {
+        let primary = participants
+            .first()
+            .and_then(|statement| request.hir.as_program().statement(*statement))
+            .map_or_else(
+                || fallback_span(request.hir.as_program()),
+                |statement| statement.source,
+            );
+        let mut diagnostic = Diagnostic::error(
+            Category::OWNERSHIP,
+            primary,
+            "scope cleanup dependencies contain a cycle",
+        );
+        diagnostic.code = Some(copy_static_analysis_text(
+            "semantic-cleanup-cycle",
+            request.limits.fact_bytes,
+        )?);
+        diagnostic
+            .labels
+            .try_reserve_exact(participants.len())
+            .map_err(|_| fact_resource(request, "scope cleanup cycle labels"))?;
+        for participant in participants {
+            let statement = request
+                .hir
+                .as_program()
+                .statement(participant)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            diagnostic.labels.push(wrela_diagnostics::Label {
+                span: statement.source,
+                message: copy_analysis_text(
+                    &format!("cleanup participant statement {}", participant.0),
+                    request.limits.fact_bytes,
+                    is_cancelled,
+                )?,
+            });
+        }
+        diagnostic.notes.push(copy_static_analysis_text(
+            "every scope teardown must have a finite reverse-topological order",
+            request.limits.fact_bytes,
+        )?);
+        diagnostic.help.push(copy_static_analysis_text(
+            "remove the cleanup dependency back edge",
+            request.limits.fact_bytes,
+        )?);
+        return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
+    }
+    if partial.proofs.len() >= request.limits.proofs as usize {
+        return Err(fact_resource(request, "scope activation proofs").into());
+    }
+    let mut ordered = indices.clone();
+    ordered.sort_by_key(|index| partial.scope_activations[*index].statement);
+    let count = u32::try_from(ordered.len())
+        .map_err(|_| fact_resource(request, "scope activation order"))?;
+    let mut sources = Vec::new();
+    let mut dependencies = Vec::new();
+    let mut edge_count = 0u64;
+    for (source_order, index) in ordered.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        let activation = &partial.scope_activations[*index];
+        sources.push(
+            request
+                .hir
+                .as_program()
+                .statement(activation.statement)
+                .ok_or(AnalysisFailure::RequestMismatch)?
+                .source,
+        );
+        dependencies.push(
+            partial
+                .scope_protocols
+                .get(activation.protocol.0 as usize)
+                .ok_or(AnalysisFailure::RequestMismatch)?
+                .proof,
+        );
+        edge_count = edge_count
+            .checked_add(
+                u64::try_from(activation.cleanup_dependencies.len())
+                    .map_err(|_| fact_resource(request, "scope cleanup edges"))?,
+            )
+            .ok_or_else(|| fact_resource(request, "scope cleanup edges"))?;
+        partial.scope_activations[*index].reverse_source_order = count
+            .checked_sub(1)
+            .and_then(|maximum| maximum.checked_sub(source_order as u32))
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+    }
+    dependencies.sort_unstable();
+    dependencies.dedup();
+    let proof = ProofId(
+        u32::try_from(partial.proofs.len())
+            .map_err(|_| fact_resource(request, "scope activation proofs"))?,
+    );
+    let function_name = partial
+        .functions
+        .get(function.0 as usize)
+        .map(|function| function.name.as_str())
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    partial.proofs.push(Proof {
+        id: proof,
+        kind: ProofKind::CleanupAcyclic,
+        subject: bounded_test_fact(
+            request,
+            "scope cleanup DAG: ",
+            function_name,
+            is_cancelled,
+        )?,
+        sources,
+        depends_on: dependencies,
+        bound: Some(edge_count),
+        explanation: vec![
+            "lexically nested scope activations form an acyclic cleanup DAG; ready cleanup runs in reverse source order"
+                .to_owned(),
+        ],
+    });
+    for index in indices {
+        partial.scope_activations[index].proof = proof;
+    }
+    partial.scope_activations.sort_by_key(|activation| {
+        (
+            activation.function,
+            activation.reverse_source_order,
+            activation.statement,
+        )
+    });
     Ok(())
 }
 
@@ -4757,6 +5287,7 @@ fn analyze_closed_enum_match(
             parameters: &mut *parameters,
             aggregate_work: &mut *aggregate_work,
             allow_assertions,
+            allow_scope_call: false,
         },
         is_cancelled,
     )?;
@@ -7268,6 +7799,248 @@ fn analyze_inline_if_expression(
     })
 }
 
+fn analyze_scope_direct_call(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    call: RuntimeScopeCall<'_>,
+    expression_request: RuntimeExpressionRequest,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<RuntimeExpression> {
+    let RuntimeScopeCall {
+        direct: call,
+        declaration,
+    } = call;
+    if !state.allow_scope_call {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-scope-call-outside-with",
+            "scope acquisition may only appear as the value of a with statement",
+            "a scope call creates cleanup obligations that require lexical activation tracking",
+            "write `with scope_name(...) as binding:`",
+        ));
+    }
+    let protocol_id = ensure_scope_protocol(
+        request,
+        partial,
+        declaration,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    let protocol = partial
+        .scope_protocols
+        .get(protocol_id.0 as usize)
+        .cloned()
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if expression_request
+        .expected
+        .is_some_and(|expected| expected != protocol.result)
+        || call.arguments.len() != protocol.parameters.len()
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-scope-call-signature",
+            "scope acquisition arguments or result context do not match the protocol",
+            "scope calls use the declaration's exact parameter access and state type",
+            "match the scope declaration's arguments and with binding type",
+        ));
+    }
+    let DeclarationKind::Scope(source_scope) = &request
+        .hir
+        .as_program()
+        .declaration(declaration)
+        .ok_or(AnalysisFailure::RequestMismatch)?
+        .kind
+    else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    let mut target_parameters = Vec::new();
+    target_parameters
+        .try_reserve_exact(protocol.parameters.len())
+        .map_err(|_| fact_resource(request, "scope call parameters"))?;
+    for (parameter, semantic) in source_scope
+        .parameters
+        .iter()
+        .filter(|parameter| **parameter != source_scope.exit_parameter)
+        .zip(&protocol.parameters)
+    {
+        target_parameters.push(FunctionParameter {
+            parameter: *parameter,
+            value: ValueId(0),
+            access: semantic.access,
+            ty: semantic.ty,
+        });
+    }
+    let callable_ty = ensure_callable_type(
+        request,
+        partial,
+        FunctionColor::Sync,
+        protocol.parameters.clone(),
+        protocol.result,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: call.callee,
+            ty: callable_ty,
+            result: None,
+            resolution: ExpressionResolution::Scope(protocol_id),
+            effects: EffectSet(0),
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    let mut resolved = optional_call_map(call.arguments.len(), request.limits.fact_edges)?;
+    let mut effects = EffectSet(0);
+    let mut accesses: Vec<(ValueId, AccessMode, Span)> = Vec::new();
+    accesses
+        .try_reserve_exact(call.arguments.len())
+        .map_err(|_| fact_resource(request, "scope call ownership accesses"))?;
+    for (source_index, argument) in call.arguments.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        let parameter_index = resolve_declaration_owned_argument(
+            request,
+            &target_parameters,
+            argument,
+            &resolved,
+            target_parameters.len(),
+            is_cancelled,
+        )?;
+        let target = target_parameters
+            .get(parameter_index)
+            .copied()
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let access = match (&argument.value, target.access) {
+            (wrela_hir::CallArgumentValue::Value(_), AccessMode::Value | AccessMode::Read) => {
+                target.access
+            }
+            (wrela_hir::CallArgumentValue::Exclusive { .. }, expected)
+                if lower_access(argument.access()) == expected =>
+            {
+                expected
+            }
+            _ => {
+                return Err(runtime_diagnostic(
+                    request,
+                    argument.source,
+                    "semantic-access-marker-mismatch",
+                    "scope argument access does not match the parameter contract",
+                    None,
+                    "the source access marker must exactly name the scope parameter access",
+                    "change the argument marker to match the declared parameter",
+                ));
+            }
+        };
+        let outcome = match &argument.value {
+            wrela_hir::CallArgumentValue::Value(value) => analyze_runtime_expression(
+                request,
+                partial,
+                function,
+                *value,
+                RuntimeExpressionRequest {
+                    expected: Some(target.ty),
+                    desired_result: None,
+                    access,
+                },
+                state,
+                is_cancelled,
+            )?,
+            wrela_hir::CallArgumentValue::Exclusive { place, .. } => {
+                analyze_runtime_place(request, partial, function, place, target.ty, access, state)?
+            }
+        };
+        effects.0 |= outcome.effects.0;
+        let value = outcome
+            .referenced
+            .or(outcome.result)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if let Some((_, _, first_source)) = accesses.iter().find(|(prior, prior_access, _)| {
+            *prior == value && accesses_conflict(*prior_access, access)
+        }) {
+            let mut diagnostic = runtime_ownership_diagnostic(
+                request,
+                argument.source,
+                "semantic-overlapping-access",
+                "one scope acquisition requests overlapping exclusive access to the same value",
+                runtime_binding_by_value(state.locals, state.parameters, value, is_cancelled)?,
+                "mutable and take access are exclusive for the complete acquisition",
+                "move one argument into a distinct local or use read access only",
+            )?;
+            diagnostic.labels.insert(
+                0,
+                wrela_diagnostics::Label {
+                    span: *first_source,
+                    message: "the first overlapping access begins here".to_owned(),
+                },
+            );
+            return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
+        }
+        accesses.push((value, access, argument.source));
+        let slot = resolved
+            .get_mut(parameter_index)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if slot
+            .replace(ResolvedCallArgument {
+                source_index: u32::try_from(source_index)
+                    .map_err(|_| fact_resource(request, "scope call arguments"))?,
+                parameter_index: u32::try_from(parameter_index)
+                    .map_err(|_| fact_resource(request, "scope call arguments"))?,
+                access,
+                value,
+            })
+            .is_some()
+        {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        }
+    }
+    let mut arguments = Vec::new();
+    arguments
+        .try_reserve_exact(resolved.len())
+        .map_err(|_| fact_resource(request, "scope call arguments"))?;
+    for argument in resolved {
+        arguments.push(argument.ok_or(AnalysisFailure::RequestMismatch)?);
+    }
+    let result = expression_result(
+        request,
+        partial,
+        function,
+        (call.expression, call.source),
+        protocol.result,
+        expression_request.desired_result,
+        is_cancelled,
+    )?;
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: call.expression,
+            ty: protocol.result,
+            result: Some(result),
+            resolution: ExpressionResolution::ScopeCall {
+                protocol: protocol_id,
+                arguments,
+            },
+            effects,
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    Ok(RuntimeExpression {
+        ty: protocol.result,
+        result: Some(result),
+        referenced: None,
+        effects,
+    })
+}
+
 fn analyze_direct_call(
     request: &AnalysisRequest<'_>,
     partial: &mut PartialAnalysis,
@@ -7319,6 +8092,25 @@ fn analyze_direct_call(
     else {
         return Err(AnalysisFailure::RequestMismatch.into());
     };
+    if request
+        .hir
+        .as_program()
+        .declaration(resolved.declaration)
+        .is_some_and(|record| matches!(record.kind, DeclarationKind::Scope(_)))
+    {
+        return analyze_scope_direct_call(
+            request,
+            partial,
+            function,
+            RuntimeScopeCall {
+                direct: call,
+                declaration: resolved.declaration,
+            },
+            expression_request,
+            state,
+            is_cancelled,
+        );
+    }
     let is_struct = request
         .hir
         .as_program()
@@ -8345,6 +9137,528 @@ fn runtime_function_module(
         .declaration(declaration)
         .map(|declaration| declaration.module)
         .ok_or(AnalysisFailure::RequestMismatch.into())
+}
+
+fn scope_phase_contains_await(
+    program: &wrela_hir::Program,
+    root: BodyId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, AnalysisFailure> {
+    let mut bodies = vec![root];
+    let mut expressions = Vec::new();
+    let mut visited = 0usize;
+    while let Some(body) = bodies.pop() {
+        check_cancelled(is_cancelled)?;
+        visited = visited
+            .checked_add(1)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if visited > program.bodies.len() {
+            return Err(AnalysisFailure::RequestMismatch);
+        }
+        let body = program.body(body).ok_or(AnalysisFailure::RequestMismatch)?;
+        for statement in &body.statements {
+            check_cancelled(is_cancelled)?;
+            let statement = program
+                .statement(*statement)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            match &statement.kind {
+                StatementKind::Initialize { value, .. }
+                | StatementKind::Assign { value, .. }
+                | StatementKind::Expression(value)
+                | StatementKind::Send(value)
+                | StatementKind::Yield(value) => expressions.push(*value),
+                StatementKind::Return(Some(value)) => expressions.push(*value),
+                StatementKind::Assert { condition, .. } => expressions.push(*condition),
+                StatementKind::If {
+                    branches,
+                    else_body,
+                } => {
+                    for (condition, body) in branches {
+                        expressions.push(*condition);
+                        bodies.push(*body);
+                    }
+                    if let Some(body) = else_body {
+                        bodies.push(*body);
+                    }
+                }
+                StatementKind::Match { scrutinee, arms } => {
+                    expressions.push(*scrutinee);
+                    for arm in arms {
+                        if let Some(guard) = arm.guard {
+                            expressions.push(guard);
+                        }
+                        bodies.push(arm.body);
+                    }
+                }
+                StatementKind::For { iterable, body, .. } => {
+                    expressions.push(*iterable);
+                    bodies.push(*body);
+                }
+                StatementKind::While { condition, body } => {
+                    expressions.push(*condition);
+                    bodies.push(*body);
+                }
+                StatementKind::Loop { body } => bodies.push(*body),
+                StatementKind::With { value, body, .. } => {
+                    expressions.push(*value);
+                    bodies.push(*body);
+                }
+                StatementKind::ComptimeIf {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    expressions.push(*condition);
+                    bodies.push(*then_body);
+                    if let Some(body) = else_body {
+                        bodies.push(*body);
+                    }
+                }
+                StatementKind::Pass
+                | StatementKind::Return(None)
+                | StatementKind::Break
+                | StatementKind::Continue
+                | StatementKind::Error => {}
+            }
+        }
+    }
+    let mut expression_visits = 0usize;
+    while let Some(expression) = expressions.pop() {
+        check_cancelled(is_cancelled)?;
+        expression_visits = expression_visits
+            .checked_add(1)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if expression_visits > program.expressions.len() {
+            return Err(AnalysisFailure::RequestMismatch);
+        }
+        let expression = program
+            .expression(expression)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        match &expression.kind {
+            ExpressionKind::Unary {
+                operator: wrela_hir::UnaryOperator::Await,
+                ..
+            } => return Ok(true),
+            ExpressionKind::Unary { operand, .. }
+            | ExpressionKind::Try(operand)
+            | ExpressionKind::TrySend(operand) => expressions.push(*operand),
+            ExpressionKind::Binary { left, right, .. }
+            | ExpressionKind::Compare { left, right, .. }
+            | ExpressionKind::Range {
+                start: left,
+                end: right,
+                ..
+            } => {
+                expressions.push(*right);
+                expressions.push(*left);
+            }
+            ExpressionKind::IsPattern { value, .. }
+            | ExpressionKind::Cast { value, .. }
+            | ExpressionKind::Field { base: value, .. } => expressions.push(*value),
+            ExpressionKind::Call { callee, arguments } => {
+                expressions.push(*callee);
+                for argument in arguments {
+                    if let wrela_hir::CallArgumentValue::Value(value) = argument.value {
+                        expressions.push(value);
+                    }
+                }
+            }
+            ExpressionKind::Index { base, index } => {
+                expressions.push(*index);
+                expressions.push(*base);
+            }
+            ExpressionKind::Tuple(values) | ExpressionKind::Array(values) => {
+                expressions.extend(values.iter().copied());
+            }
+            ExpressionKind::Interpolate(parts) => {
+                for part in parts {
+                    if let wrela_hir::InterpolationPart::Value { expression, .. } = part {
+                        expressions.push(*expression);
+                    }
+                }
+            }
+            ExpressionKind::If {
+                condition,
+                then_branch,
+                elif_branches,
+                else_branch,
+            } => {
+                expressions.extend([*condition, *then_branch, *else_branch]);
+                for (condition, branch) in elif_branches {
+                    expressions.extend([*condition, *branch]);
+                }
+            }
+            ExpressionKind::Closure { .. }
+            | ExpressionKind::Literal(_)
+            | ExpressionKind::Reference(_)
+            | ExpressionKind::DotName { .. }
+            | ExpressionKind::Error => {}
+        }
+    }
+    Ok(false)
+}
+
+fn scope_phase_is_pass_only(program: &wrela_hir::Program, body: BodyId) -> bool {
+    program.body(body).is_some_and(|body| {
+        body.statements.iter().all(|statement| {
+            program
+                .statement(*statement)
+                .is_some_and(|statement| matches!(statement.kind, StatementKind::Pass))
+        })
+    })
+}
+
+fn scope_enter_expression_type(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    context: ScopeEnterContext<'_>,
+    expression: ExpressionId,
+    expected: SemanticTypeId,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
+    check_cancelled(is_cancelled)?;
+    let program = request.hir.as_program();
+    let record = program
+        .expression(expression)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let actual = match &record.kind {
+        ExpressionKind::Reference(Definition::Parameter(parameter)) => context
+            .scope
+            .parameters
+            .iter()
+            .filter(|candidate| **candidate != context.scope.exit_parameter)
+            .position(|candidate| candidate == parameter)
+            .and_then(|index| context.parameter_types.get(index))
+            .map(|parameter| parameter.ty)
+            .ok_or(AnalysisFailure::RequestMismatch)?,
+        ExpressionKind::Literal(literal) => {
+            lower_scalar_literal(request, partial, expected, literal, is_cancelled)
+                .map_err(RuntimeFailure::from)?;
+            expected
+        }
+        ExpressionKind::Call { callee, arguments } => {
+            let callee = program
+                .expression(*callee)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            let ExpressionKind::Reference(Definition::Declaration(resolved)) = &callee.kind else {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    record.source,
+                    "semantic-scope-enter-form-pending",
+                    "scope enter expression uses an unsupported callable form",
+                    "the analysis-tier scope slice admits direct flat-structure construction, literals, and scope parameters",
+                    "return a flat state value directly from enter",
+                ));
+            };
+            let declaration = program
+                .declaration(resolved.declaration)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            let DeclarationKind::Structure(aggregate) = &declaration.kind else {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    record.source,
+                    "semantic-scope-enter-form-pending",
+                    "scope enter expression calls an unsupported declaration",
+                    "ordinary function execution inside scope acquisition is deferred",
+                    "construct the declared scope state directly",
+                ));
+            };
+            if aggregate_has_initializer(program, resolved.declaration) {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    record.source,
+                    "semantic-scope-enter-form-pending",
+                    "initializer-based scope state construction is pending",
+                    "the analysis-tier scope slice admits flat structure construction only",
+                    "use a flat state structure without an init member",
+                ));
+            }
+            let ty = ensure_flat_structure_type(
+                request,
+                partial,
+                resolved.declaration,
+                aggregate_work,
+                is_cancelled,
+            )?;
+            if arguments.len() != aggregate.fields.len() {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    record.source,
+                    "semantic-scope-enter-constructor-argument",
+                    "scope state construction must initialize every field exactly once",
+                    "partial scope state cannot satisfy deterministic cleanup",
+                    "supply one initializer for each state field",
+                ));
+            }
+            let field_types = partial
+                .types
+                .get(ty.0 as usize)
+                .and_then(|record| match &record.kind {
+                    SemanticTypeKind::Structure { fields, .. } => {
+                        Some(fields.iter().map(|field| field.ty).collect::<Vec<_>>())
+                    }
+                    _ => None,
+                })
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            let mut resolved_fields = vec![false; aggregate.fields.len()];
+            for (source_index, argument) in arguments.iter().enumerate() {
+                let wrela_hir::CallArgumentValue::Value(value) = argument.value else {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        argument.source,
+                        "semantic-scope-enter-constructor-access",
+                        "scope state fields use value access",
+                        "exclusive access markers do not describe scope state construction",
+                        "remove the access marker",
+                    ));
+                };
+                if aggregate.fields.len() != 1 && argument.name.is_none() {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        argument.source,
+                        "semantic-scope-enter-constructor-argument",
+                        "multi-field scope state construction requires labels",
+                        "labels make the cleanup state layout unambiguous",
+                        "label every constructor argument",
+                    ));
+                }
+                let field_index = if let Some(name) = &argument.name {
+                    aggregate
+                        .fields
+                        .iter()
+                        .position(|field| field.name == *name)
+                        .ok_or_else(|| {
+                            runtime_type_diagnostic(
+                                request,
+                                argument.source,
+                                "semantic-scope-enter-constructor-argument",
+                                "scope state constructor label names no field",
+                                "field labels are nominal and exact",
+                                "use a declared state field name",
+                            )
+                        })?
+                } else {
+                    source_index
+                };
+                if resolved_fields
+                    .get_mut(field_index)
+                    .is_none_or(|slot| std::mem::replace(slot, true))
+                {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        argument.source,
+                        "semantic-scope-enter-constructor-argument",
+                        "scope state constructor initializes one field more than once",
+                        "each cleanup state field needs exactly one producer",
+                        "remove the duplicate initializer",
+                    ));
+                }
+                scope_enter_expression_type(
+                    request,
+                    partial,
+                    context,
+                    value,
+                    field_types[field_index],
+                    aggregate_work,
+                    is_cancelled,
+                )?;
+            }
+            ty
+        }
+        _ => {
+            return Err(runtime_type_diagnostic(
+                request,
+                record.source,
+                "semantic-scope-enter-form-pending",
+                "scope enter expression is outside the analysis-tier state subset",
+                "scope acquisition currently admits literals, parameters, and flat state construction",
+                "return a directly constructed bounded state value",
+            ));
+        }
+    };
+    if actual != expected {
+        return Err(runtime_type_diagnostic(
+            request,
+            record.source,
+            "semantic-scope-enter-type",
+            "scope enter expression does not produce the declared state type",
+            "cleanup receives exactly the value returned by enter",
+            "make the declared result and enter expression types match",
+        ));
+    }
+    Ok(actual)
+}
+
+fn ensure_scope_protocol(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    declaration: DeclarationId,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<ScopeProtocolId> {
+    for protocol in &partial.scope_protocols {
+        check_cancelled(is_cancelled)?;
+        if protocol.declaration == declaration {
+            return Ok(protocol.id);
+        }
+    }
+    let program = request.hir.as_program();
+    let declaration_record = program
+        .declaration(declaration)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let DeclarationKind::Scope(scope) = &declaration_record.kind else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    let mut parameters = Vec::new();
+    parameters
+        .try_reserve_exact(scope.parameters.len())
+        .map_err(|_| fact_resource(request, "scope protocol parameters"))?;
+    for parameter_id in &scope.parameters {
+        check_cancelled(is_cancelled)?;
+        if *parameter_id == scope.exit_parameter {
+            continue;
+        }
+        let parameter = program
+            .parameters
+            .get(parameter_id.0 as usize)
+            .filter(|parameter| parameter.id == *parameter_id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if parameter.receiver {
+            return Err(runtime_type_diagnostic(
+                request,
+                parameter.source,
+                "semantic-with-receiver-scope-pending",
+                "receiver-form scope acquisition is not yet supported",
+                "this slice resolves only module-level free-call scope protocols",
+                "declare and call a free scope until receiver resolution lands",
+            ));
+        }
+        let ty = semantic_type_from_source(
+            request,
+            partial,
+            parameter
+                .ty
+                .as_ref()
+                .ok_or(AnalysisFailure::RequestMismatch)?,
+            aggregate_work,
+            is_cancelled,
+        )?;
+        parameters.push(SemanticParameter {
+            access: lower_access(parameter.access),
+            ty,
+        });
+    }
+    let result = semantic_type_from_source(
+        request,
+        partial,
+        &scope.result,
+        aggregate_work,
+        is_cancelled,
+    )?;
+    if !scope_phase_is_pass_only(program, scope.setup) {
+        return Err(runtime_type_diagnostic(
+            request,
+            program
+                .body(scope.setup)
+                .map_or(declaration_record.source, |body| body.source),
+            "semantic-scope-setup-form-pending",
+            "scope setup statements are outside the current analysis subset",
+            "setup execution needs the scope-phase operation model",
+            "keep setup empty or use pass before enter",
+        ));
+    }
+    for (phase, body, code) in [
+        ("abort", scope.abort, "semantic-scope-abort-await"),
+        ("exit", Some(scope.exit), "semantic-scope-exit-await"),
+    ] {
+        let Some(body) = body else { continue };
+        if scope_phase_contains_await(program, body, is_cancelled)? {
+            return Err(runtime_type_diagnostic(
+                request,
+                program
+                    .body(body)
+                    .map_or(declaration_record.source, |body| body.source),
+                code,
+                if phase == "abort" {
+                    "scope abort cleanup may not suspend"
+                } else {
+                    "scope exit cleanup may not suspend"
+                },
+                "cleanup must complete in bounded non-suspending order on every exit path",
+                "remove await from the cleanup phase",
+            ));
+        }
+        if !scope_phase_is_pass_only(program, body) {
+            return Err(runtime_type_diagnostic(
+                request,
+                program
+                    .body(body)
+                    .map_or(declaration_record.source, |body| body.source),
+                "semantic-scope-cleanup-form-pending",
+                "scope cleanup body is outside the current analysis subset",
+                "this sema slice proves pass-only non-suspending abort and exit bodies",
+                "keep cleanup pass-only until cleanup operation lowering lands",
+            ));
+        }
+    }
+    scope_enter_expression_type(
+        request,
+        partial,
+        ScopeEnterContext {
+            scope,
+            parameter_types: &parameters,
+        },
+        scope.enter,
+        result,
+        aggregate_work,
+        is_cancelled,
+    )?;
+    if partial.scope_protocols.len() >= request.limits.scope_protocols as usize
+        || partial.proofs.len() >= request.limits.proofs as usize
+    {
+        return Err(fact_resource(request, "scope protocols").into());
+    }
+    let id = ScopeProtocolId(
+        u32::try_from(partial.scope_protocols.len())
+            .map_err(|_| fact_resource(request, "scope protocols"))?,
+    );
+    let proof = ProofId(
+        u32::try_from(partial.proofs.len()).map_err(|_| fact_resource(request, "scope proofs"))?,
+    );
+    let name = declaration_record
+        .name
+        .as_ref()
+        .map(wrela_hir::Name::as_str)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    partial.proofs.push(Proof {
+        id: proof,
+        kind: ProofKind::CleanupAcyclic,
+        subject: bounded_test_fact(request, "scope protocol: ", name, is_cancelled)?,
+        sources: vec![declaration_record.source],
+        depends_on: Vec::new(),
+        bound: Some(0),
+        explanation: vec![
+            "the scope protocol has bounded non-suspending cleanup phases; activation dependencies are proved per source function"
+                .to_owned(),
+        ],
+    });
+    partial.scope_protocols.push(ScopeProtocol {
+        id,
+        declaration,
+        name: copy_analysis_text(name, request.limits.fact_bytes, is_cancelled)?,
+        parameters,
+        result,
+        setup: scope.setup,
+        enter: scope.enter,
+        abort: scope.abort,
+        exit: scope.exit,
+        suspend_safe: false,
+        abort_effects: EffectSet(0),
+        exit_effects: EffectSet(0),
+        proof,
+    });
+    Ok(id)
 }
 
 fn ensure_ordinary_source_function(
@@ -9899,6 +11213,26 @@ fn ensure_function_type(
             ty: parameter.ty,
         });
     }
+    ensure_callable_type(
+        request,
+        partial,
+        color,
+        parameters,
+        result,
+        aggregate_work,
+        is_cancelled,
+    )
+}
+
+fn ensure_callable_type(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    color: FunctionColor,
+    parameters: Vec<SemanticParameter>,
+    result: SemanticTypeId,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<SemanticTypeId, AnalysisFailure> {
     let kind = SemanticTypeKind::Function {
         color,
         parameters,
@@ -24864,5 +26198,262 @@ fn projection_fixture():
             output.diagnostics()
         );
         assert!(output.has_errors());
+    }
+
+    const SCOPE_SEMANTICS_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Masked:
+    token: u32
+
+scope irqs_masked() -> Masked:
+    enter Masked(token=1)
+    exit state:
+        pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn scope_binding_is_lexical():
+    with irqs_masked() as mask:
+        pass
+    return
+"#;
+
+    fn compile_scope_fixture(source: &str) -> AnalysisOutput {
+        let fixture = parsed_actor_fixture(source);
+        let changes = no_changes();
+        let analyzer = CanonicalSemanticAnalyzer::new();
+        let discovery_request = AnalysisRequest {
+            hir: Arc::clone(&fixture.fixture.hir),
+            standard_library_package: PackageId(1),
+            target: fixture.fixture.target.semantic(),
+            build: &fixture.fixture.build,
+            mode: AnalysisMode::DiscoverTests {
+                image_name: "scope-image",
+                image_entry: fixture.entry,
+                declared_image_tests: &[],
+                source_selection: TestDiscoverySelection::All,
+            },
+            changes: &changes,
+            limits: AnalysisLimits::standard(),
+        };
+        let discovery = analyzer
+            .analyze(discovery_request, &|| false)
+            .expect("scope fixture discovery");
+        if discovery.has_errors() {
+            return discovery;
+        }
+        let plan = discovery
+            .successful()
+            .and_then(|image| image.facts().test_plan.as_ref())
+            .expect("scope fixture runtime test plan")
+            .clone();
+        analyzer
+            .analyze(
+                AnalysisRequest {
+                    hir: Arc::clone(&fixture.fixture.hir),
+                    standard_library_package: PackageId(1),
+                    target: fixture.fixture.target.semantic(),
+                    build: &fixture.fixture.build,
+                    mode: AnalysisMode::CompileTestGroup {
+                        plan: &plan,
+                        group: plan.image_groups()[0].id,
+                        declared_entry: None,
+                    },
+                    changes: &changes,
+                    limits: AnalysisLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("scope fixture compilation")
+    }
+
+    #[test]
+    fn free_scope_call_builds_protocol_activation_and_lexical_binding() {
+        let output = compile_scope_fixture(SCOPE_SEMANTICS_SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "free-call scope must analyze cleanly: {:?}",
+            output.diagnostics()
+        );
+        let analyzed = output.successful().expect("sealed scope analysis");
+        let facts = analyzed.facts();
+        let program = analyzed.shared_hir().as_program();
+        assert_eq!(facts.scope_protocols.len(), 1);
+        assert_eq!(facts.scope_activations.len(), 1);
+        let protocol = &facts.scope_protocols[0];
+        assert_eq!(protocol.name, "irqs_masked");
+        let activation = &facts.scope_activations[0];
+        assert_eq!(activation.protocol, protocol.id);
+        assert!(activation.cleanup_dependencies.is_empty());
+        assert_eq!(activation.reverse_source_order, 0);
+        assert_eq!(
+            facts.proofs[activation.proof.0 as usize].kind,
+            ProofKind::CleanupAcyclic
+        );
+
+        let with_statement = activation.statement;
+        let mask = program
+            .statement(with_statement)
+            .and_then(|statement| match statement.kind {
+                StatementKind::With { binding, .. } => binding,
+                _ => None,
+            })
+            .expect("with binding");
+        let body_statement = program
+            .statement(with_statement)
+            .and_then(|statement| match statement.kind {
+                StatementKind::With { body, .. } => program.body(body),
+                _ => None,
+            })
+            .and_then(|body| body.statements.first())
+            .copied()
+            .expect("with body statement");
+        let body_fact = facts
+            .statements
+            .iter()
+            .find(|fact| fact.statement == body_statement)
+            .expect("with body fact");
+        assert!(body_fact.initialized_after.iter().any(|value| {
+            facts.values[value.0 as usize].origin == SemanticValueOrigin::Local(mask)
+        }));
+        let with_fact = facts
+            .statements
+            .iter()
+            .find(|fact| fact.statement == with_statement)
+            .expect("with statement fact");
+        assert!(with_fact.initialized_after.iter().all(|value| {
+            facts.values[value.0 as usize].origin != SemanticValueOrigin::Local(mask)
+        }));
+    }
+
+    #[test]
+    fn scope_exit_await_is_a_named_rejection() {
+        let source = SCOPE_SEMANTICS_SOURCE.replace(
+            "scope irqs_masked() -> Masked:\n    enter Masked(token=1)\n    exit state:\n        pass",
+            "async fn checkpoint():\n    pass\n\nscope irqs_masked() -> Masked:\n    enter Masked(token=1)\n    exit state:\n        await checkpoint()",
+        );
+        let output = compile_scope_fixture(&source);
+        assert!(output.has_errors());
+        assert!(
+            output.diagnostics().iter().any(|diagnostic| {
+                diagnostic.code.as_deref() == Some("semantic-scope-exit-await")
+            }),
+            "expected semantic-scope-exit-await: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn nested_scope_activations_form_reverse_source_cleanup_dag() {
+        let source = SCOPE_SEMANTICS_SOURCE.replace(
+            "    with irqs_masked() as mask:\n        pass",
+            "    with irqs_masked() as outer:\n        with irqs_masked() as inner:\n            pass",
+        );
+        let output = compile_scope_fixture(&source);
+        assert!(
+            output.diagnostics().is_empty(),
+            "nested free-call scopes must analyze: {:?}",
+            output.diagnostics()
+        );
+        let analyzed = output.successful().expect("sealed nested scope analysis");
+        let activations = &analyzed.facts().scope_activations;
+        assert_eq!(activations.len(), 2);
+        assert_eq!(activations[0].reverse_source_order, 0);
+        assert!(activations[0].cleanup_dependencies.is_empty());
+        assert_eq!(activations[1].reverse_source_order, 1);
+        assert_eq!(
+            activations[1].cleanup_dependencies,
+            vec![activations[0].statement],
+            "outer cleanup waits for the inner cleanup"
+        );
+        assert_eq!(activations[0].proof, activations[1].proof);
+        assert_eq!(
+            analyzed.facts().proofs[activations[0].proof.0 as usize].bound,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn scope_abort_await_is_a_named_rejection() {
+        let source = SCOPE_SEMANTICS_SOURCE.replace(
+            "scope irqs_masked() -> Masked:\n    enter Masked(token=1)\n    exit state:\n        pass",
+            "async fn checkpoint():\n    pass\n\nscope irqs_masked() -> Masked:\n    enter Masked(token=1)\n    abort:\n        await checkpoint()\n    exit state:\n        pass",
+        );
+        let output = compile_scope_fixture(&source);
+        assert!(output.has_errors());
+        assert!(
+            output.diagnostics().iter().any(|diagnostic| {
+                diagnostic.code.as_deref() == Some("semantic-scope-abort-await")
+            }),
+            "expected semantic-scope-abort-await: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn receiver_scope_call_remains_named_and_fail_closed() {
+        let source = SCOPE_SEMANTICS_SOURCE.replace(
+            "    with irqs_masked() as mask:\n        pass",
+            "    controller: u32 = 0\n    with controller.irqs_masked() as mask:\n        pass",
+        );
+        let output = compile_scope_fixture(&source);
+        assert!(output.has_errors());
+        assert!(
+            output.diagnostics().iter().any(|diagnostic| {
+                diagnostic.code.as_deref() == Some("semantic-with-receiver-scope-pending")
+            }),
+            "expected semantic-with-receiver-scope-pending: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn free_scope_call_outside_with_remains_named_and_fail_closed() {
+        let source = SCOPE_SEMANTICS_SOURCE.replace(
+            "    with irqs_masked() as mask:\n        pass",
+            "    state: Masked = irqs_masked()",
+        );
+        let output = compile_scope_fixture(&source);
+        assert!(output.has_errors());
+        assert!(
+            output.diagnostics().iter().any(|diagnostic| {
+                diagnostic.code.as_deref() == Some("semantic-scope-call-outside-with")
+            }),
+            "expected semantic-scope-call-outside-with: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn cleanup_cycle_detector_reports_synthetic_back_edge_participants() {
+        let activations = vec![
+            ScopeActivation {
+                statement: StatementId(4),
+                function: FunctionInstanceId(2),
+                protocol: ScopeProtocolId(0),
+                state_type: SemanticTypeId(0),
+                cleanup_dependencies: vec![StatementId(7)],
+                reverse_source_order: 0,
+                proof: ProofId(0),
+            },
+            ScopeActivation {
+                statement: StatementId(7),
+                function: FunctionInstanceId(2),
+                protocol: ScopeProtocolId(0),
+                state_type: SemanticTypeId(0),
+                cleanup_dependencies: vec![StatementId(4)],
+                reverse_source_order: 1,
+                proof: ProofId(0),
+            },
+        ];
+        let cycle = cleanup_cycle_participants(&activations, FunctionInstanceId(2), &|| false)
+            .expect("cycle scan")
+            .expect("synthetic cleanup back edge must be rejected");
+        assert_eq!(cycle, vec![StatementId(4), StatementId(7)]);
     }
 }

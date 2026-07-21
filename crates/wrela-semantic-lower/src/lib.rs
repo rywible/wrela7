@@ -282,7 +282,9 @@ fn supported_minimum(facts: &sema::PartialAnalysis) -> Result<MinimumFacts<'_>, 
         }
     }
     if !facts.scope_protocols.is_empty() || !facts.scope_activations.is_empty() {
-        return Err(unsupported("scope protocols and activations"));
+        return Err(unsupported(
+            "semantic-with-cleanup-lowering-pending (scope protocols and activations)",
+        ));
     }
     if !facts.baked_artifacts.is_empty() {
         return Err(unsupported("baked artifacts"));
@@ -396,7 +398,7 @@ fn supported_actor_image<'a>(
     }
     if !facts.scope_protocols.is_empty() || !facts.scope_activations.is_empty() {
         return Err(unsupported(
-            "scope protocols and activations in actor images",
+            "semantic-with-cleanup-lowering-pending (scope protocols and activations in actor images)",
         ));
     }
     if !facts.baked_artifacts.is_empty() {
@@ -1606,7 +1608,7 @@ fn supported_generated_tests<'a>(
     }
     if !facts.scope_protocols.is_empty() || !facts.scope_activations.is_empty() {
         return Err(unsupported(
-            "scope protocols and activations in generated tests",
+            "semantic-with-cleanup-lowering-pending (scope protocols and activations in generated tests)",
         ));
     }
     if !facts.baked_artifacts.is_empty() {
@@ -15282,6 +15284,33 @@ pub fn boot() -> Image:
             supported_minimum(&facts),
             Err(LowerError::UnsupportedInput {
                 feature: "source function bodies"
+            })
+        ));
+    }
+
+    #[test]
+    fn scope_semantics_stop_at_named_cleanup_lowering_boundary() {
+        let (image, _target) = analyze_minimum();
+        let mut facts = image.into_facts();
+        facts.scope_protocols.push(sema::ScopeProtocol {
+            id: sema::ScopeProtocolId(0),
+            declaration: DeclarationId(0),
+            name: "synthetic_scope_boundary".to_owned(),
+            parameters: Vec::new(),
+            result: sema::SemanticTypeId(0),
+            setup: BodyId(0),
+            enter: ExpressionId(0),
+            abort: None,
+            exit: BodyId(0),
+            suspend_safe: false,
+            abort_effects: sema::EffectSet(0),
+            exit_effects: sema::EffectSet(0),
+            proof: sema::ProofId(0),
+        });
+        assert!(matches!(
+            supported_minimum(&facts),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-with-cleanup-lowering-pending (scope protocols and activations)"
             })
         ));
     }
