@@ -1925,16 +1925,12 @@ fn remove_nightly_worktree(root: &Path, worktree: &Path) {
 }
 
 fn run_nightly_full_gates(root: &Path) -> Result<(), String> {
+    // The fast `gate all` step already ran; this only adds the native LLVM/LLD
+    // feature matrix for the workspace-wide distribution route.
     let metadata = resolved_cargo_metadata(root)?;
-    for slice in DEVELOPMENT_SLICES {
-        if slice.full_route == FullRoute::None {
-            continue;
-        }
-        let target = gate_target(slice.name)?;
-        let closure = validate_gate_closure(&target, &metadata)?;
-        run_full_route(root, &target, &closure)?;
-    }
-    Ok(())
+    let target = gate_target("all")?;
+    let closure = validate_gate_closure(&target, &metadata)?;
+    run_full_route(root, &target, &closure)
 }
 
 fn write_nightly_report(path: &Path, body: &str) -> Result<(), String> {
@@ -1968,10 +1964,15 @@ fn full_route_steps(target: &GateTarget, closure: &GateClosure) -> Vec<CargoStep
         "--offline".to_owned(),
     ];
     append_package_selection(&mut arguments, target, closure, "--workspace", "--package");
-    arguments.extend([
-        "--features".to_owned(),
-        "wrela-backend/bundled-backend".to_owned(),
-    ]);
+    // Artifact-only closures do not include `wrela-backend`, so enable the LLVM
+    // feature on the codegen package directly. Backend and distribution closures
+    // include `wrela-backend` and use its bundled-backend feature.
+    let feature = match target.full_route {
+        FullRoute::ArtifactNative => "wrela-codegen-llvm/llvm",
+        FullRoute::BackendNative | FullRoute::Distribution => "wrela-backend/bundled-backend",
+        FullRoute::None => return Vec::new(),
+    };
+    arguments.extend(["--features".to_owned(), feature.to_owned()]);
     vec![CargoStep {
         label: "native system LLVM/LLD (+ QEMU) gate",
         arguments,
@@ -3147,7 +3148,7 @@ mod tests {
         assert!(
             artifact_steps[0]
                 .arguments
-                .contains(&"wrela-backend/bundled-backend".to_owned())
+                .contains(&"wrela-codegen-llvm/llvm".to_owned())
         );
         assert!(
             artifact_steps[0]

@@ -506,7 +506,8 @@ fn assert_hir_diagnostic(application_source: &str, expected: &str) {
 
 fn inspect_native_object(bytes: &[u8], expected_digest: Sha256Digest) {
     let sequence = OBJECT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
+    let temporary = fs::canonicalize(std::env::temp_dir()).expect("canonical temporary root");
+    let directory = temporary.join(format!(
         "wrela-runtime-result-{}-{sequence}",
         std::process::id()
     ));
