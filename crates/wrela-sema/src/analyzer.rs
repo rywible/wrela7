@@ -3435,6 +3435,14 @@ struct RuntimeState<'a> {
 #[derive(Debug, Default)]
 struct RuntimeAggregateWork {
     comparisons: u64,
+    // The stack of enum `DeclarationId`s whose resolution is currently in
+    // progress on the active recursion path. A payload enum whose id is already
+    // on this stack is (directly or transitively) its own payload and therefore
+    // has no finite machine layout; `ensure_closed_scalar_enum_type` fails closed
+    // BEFORE recursing again rather than looping, blowing the stack, or leaning on
+    // the `comparisons` budget to eventually stop. Threaded through the existing
+    // aggregate-work context so call sites are unchanged.
+    resolving_enums: Vec<DeclarationId>,
 }
 
 fn charge_runtime_aggregate_lookup(
@@ -7547,6 +7555,28 @@ fn analyze_closed_enum_constructor(
             ));
         }
         Some(payload_ty) => {
+            // T0.1d: a nongeneric closed enum is admitted as a variant PAYLOAD
+            // TYPE (folding into the tagged-union slot, resolved above), but
+            // CONSTRUCTING such a variant (`.some(Inner.a)`) requires building the
+            // inner enum value first — an initialization path this slice does not
+            // yet plumb (it would otherwise surface a non-diagnostic RequestMismatch
+            // from the inner enum-value analysis). Fail closed with a NEW named
+            // diagnostic here, after the outer enum TYPE has already resolved into
+            // `partial.types`, rather than propagating an internal invariant/panic.
+            if partial
+                .types
+                .get(payload_ty.0 as usize)
+                .is_some_and(|record| matches!(record.kind, SemanticTypeKind::Enumeration { .. }))
+            {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    call.source,
+                    "semantic-runtime-enum-enum-payload-construction-pending",
+                    "constructing a variant with a nongeneric-enum payload is not yet supported at the runtime tier",
+                    "this slice admits enum payloads into type resolution and layout; building the inner enum value is a later slice",
+                    "resolve the enum-payload type only (e.g. via an annotation or match), or use a scalar or flat-struct payload",
+                ));
+            }
             // The callee sub-expression fact precedes the payload it applies to.
             append_expression_fact(
                 request,
@@ -9017,6 +9047,53 @@ fn ensure_closed_scalar_enum_type(
     aggregate_work: &mut RuntimeAggregateWork,
     is_cancelled: &dyn Fn() -> bool,
 ) -> RuntimeResult<SemanticTypeId> {
+    // Cycle guard (T0.1d): a payload enum whose id is already on the active
+    // resolution stack recurses into itself (directly, or transitively through
+    // another enum), so it has no finite machine layout. Fail closed here BEFORE
+    // recursing again — never loop, overflow the native stack, or rely on the
+    // aggregate-lookup budget to "eventually" stop. The offending enum is named
+    // by its own declaration source span.
+    if aggregate_work.resolving_enums.contains(&declaration) {
+        let record = request
+            .hir
+            .as_program()
+            .declaration(declaration)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        return Err(runtime_type_diagnostic(
+            request,
+            record.source,
+            "semantic-runtime-enum-recursive-payload",
+            "runtime enum variant payload recurses into the enum being resolved",
+            "a variant whose payload is its own enum (directly or transitively) has no finite machine layout",
+            "break the payload cycle, or box the recursive payload in a later ownership slice",
+        ));
+    }
+    // Push this enum onto the in-progress stack, resolve, then pop on EVERY
+    // return path (the inner helper's `?` early-returns included) so the stack
+    // stays balanced across sibling and later resolutions.
+    aggregate_work
+        .resolving_enums
+        .try_reserve(1)
+        .map_err(|_| fact_resource(request, "runtime enum resolution stack"))?;
+    aggregate_work.resolving_enums.push(declaration);
+    let resolved = ensure_closed_scalar_enum_type_resolved(
+        request,
+        partial,
+        declaration,
+        &mut *aggregate_work,
+        is_cancelled,
+    );
+    aggregate_work.resolving_enums.pop();
+    resolved
+}
+
+fn ensure_closed_scalar_enum_type_resolved(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    declaration: DeclarationId,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
     for existing in &partial.types {
         charge_runtime_aggregate_lookup(request, &mut *aggregate_work, is_cancelled)?;
         if matches!(&existing.kind, SemanticTypeKind::Enumeration {
@@ -9140,14 +9217,19 @@ fn ensure_closed_scalar_enum_type(
                 }
                 payload
             }
-            // A flat-struct (nongeneric, all-scalar-field) nominal payload is
-            // admitted as a variant's single field. `ensure_flat_structure_type`
-            // enforces the flat-scalar subset and fails closed
-            // (`semantic-runtime-aggregate-not-supported`) on any structure it
-            // does not accept. A flat struct stores only scalars, so it can
-            // never transitively contain this enum: no payload recursion is
-            // possible. Enum, view, generic, tuple, and array payloads stay
-            // rejected in the fallthrough arm.
+            // A nominal payload is admitted as a variant's single field when it
+            // is a flat struct (T0.1c) OR a nongeneric closed enum (T0.1d), each
+            // resolved recursively by its own `ensure_*` routine, which folds its
+            // size/alignment into the shared tagged-union slot below with no
+            // layout-code change. `ensure_flat_structure_type` enforces the
+            // flat-scalar subset; `ensure_closed_scalar_enum_type` enforces the
+            // closed-enum subset AND detects payload recursion (a variant whose
+            // payload is its own enum, directly or transitively) via the
+            // resolution-in-progress stack, failing closed with
+            // `semantic-runtime-enum-recursive-payload` instead of looping. A
+            // flat struct stores only scalars, so it can never transitively
+            // contain an enum. Generic (argument-bearing OR generic-declaration)
+            // enums, view, tuple, and array payloads stay rejected here.
             TypeExpressionKind::Named {
                 definition: Definition::Declaration(resolved),
                 arguments,
@@ -9156,23 +9238,48 @@ fn ensure_closed_scalar_enum_type(
                     .hir
                     .resolved_declaration(resolved)
                     .ok_or(AnalysisFailure::RequestMismatch)?;
-                if !matches!(payload_declaration.kind, DeclarationKind::Structure(_)) {
-                    return Err(runtime_type_diagnostic(
+                match &payload_declaration.kind {
+                    DeclarationKind::Structure(_) => ensure_flat_structure_type(
                         request,
-                        field.source,
-                        "semantic-runtime-enum-payload-type",
-                        "runtime enum payload is not a supported copy scalar or flat struct",
-                        "nested enum, generic, view, and non-structure nominal payloads require later ownership lowering",
-                        "use one primitive scalar or one flat scalar-backed structure payload type",
-                    ));
+                        partial,
+                        payload_declaration.id,
+                        &mut *aggregate_work,
+                        is_cancelled,
+                    )?,
+                    DeclarationKind::Enumeration(payload_enum) => {
+                        // Keep the existing generic rejection: a generic enum
+                        // payload is not part of this bounded slice and stays
+                        // rejected under the uniform payload-type diagnostic
+                        // rather than reaching the nongeneric recursion path.
+                        if !payload_enum.generics.is_empty() {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                field.source,
+                                "semantic-runtime-enum-payload-type",
+                                "runtime enum payload is not a supported copy scalar, flat struct, or nongeneric enum",
+                                "generic enum payloads require later ownership and monomorphization lowering",
+                                "use one primitive scalar, one flat scalar-backed structure, or one nongeneric closed enum payload type",
+                            ));
+                        }
+                        ensure_closed_scalar_enum_type(
+                            request,
+                            partial,
+                            payload_declaration.id,
+                            &mut *aggregate_work,
+                            is_cancelled,
+                        )?
+                    }
+                    _ => {
+                        return Err(runtime_type_diagnostic(
+                            request,
+                            field.source,
+                            "semantic-runtime-enum-payload-type",
+                            "runtime enum payload is not a supported copy scalar, flat struct, or nongeneric enum",
+                            "view and other non-structure, non-enum nominal payloads require later ownership lowering",
+                            "use one primitive scalar, one flat scalar-backed structure, or one nongeneric closed enum payload type",
+                        ));
+                    }
                 }
-                ensure_flat_structure_type(
-                    request,
-                    partial,
-                    payload_declaration.id,
-                    &mut *aggregate_work,
-                    is_cancelled,
-                )?
             }
             _ => {
                 return Err(runtime_type_diagnostic(
@@ -24095,13 +24202,25 @@ fn projection_fixture():
         );
     }
 
+    // --- T0.1d: nongeneric closed-enum payloads in enum variants ---
+
     #[test]
-    fn runtime_enum_rejects_enum_payload_variant() {
-        // Nested-enum payloads remain a later slice (they require ownership
-        // lowering) and must still fail closed at type resolution: only flat
-        // structs and scalars are admitted this slice.
+    fn runtime_enum_admits_enum_payload_and_layout_folds_inner() {
+        // A nongeneric closed enum is now admitted as a variant's single field
+        // and resolved recursively via `ensure_closed_scalar_enum_type`. `Inner`
+        // (all-unit `a` / `b`) has size 1, alignment 1; the enum `Outer`
+        // (`none` | `mark(u8)` | `some(Inner)`) becomes a tagged union: one-byte
+        // tag + one-byte payload aligned to 1 => size 2, alignment 1. The `Inner`
+        // size/alignment come from the recursive resolution and fold into the
+        // shared slot with no layout-code change. The old nominal-payload
+        // rejection must NOT fire. `Outer` also carries a `mark(u8)` scalar
+        // variant purely so a SUCCEEDING construction (`.mark(3)`) commits the
+        // resolved `Outer` type into `partial.types` (a failing construction rolls
+        // its resolved types back); the `some(Inner)` variant is the enum payload
+        // under test, resolved as a TYPE during that construction. Enum-payload
+        // CONSTRUCTION is exercised (and fails closed) in a sibling test.
         let source = dot_variant_actor_source(
-            "pub enum Inner:\n    a\n    b\n\npub enum Outer:\n    wrap(Inner)\n\nasync fn checkpoint():\n    state: Outer = .wrap(.a)\n    pass\n\n",
+            "pub enum Inner:\n    a\n    b\n\npub enum Outer:\n    none\n    mark(u8)\n    some(Inner)\n\nasync fn checkpoint():\n    state: Outer = .mark(3)\n    pass\n\n",
         );
         let fixture = parsed_actor_fixture(&source);
         let changes = no_changes();
@@ -24110,17 +24229,201 @@ fn projection_fixture():
                 parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
                 &|| false,
             )
-            .expect("an enum-payload variant is a structured source diagnostic");
+            .expect(
+                "an enum-payload variant should analyze to an image or a structured diagnostic",
+            );
+        assert!(
+            output.diagnostics().is_empty(),
+            "resolving an enum-payload variant as a TYPE and constructing the sibling scalar variant must analyze cleanly: {:?}",
+            output.diagnostics()
+        );
+        let outer = output
+            .partial()
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(&ty.kind, SemanticTypeKind::Enumeration { variants, .. }
+                if variants.iter().any(|variant| variant.name == "none")
+                    && variants.iter().any(|variant| variant.name == "some"))
+            })
+            .expect("the enum-payload `Outer` enum must resolve as a semantic type");
+        assert_eq!(
+            outer.size_upper_bound,
+            Some(2),
+            "unit/`u8`/`Inner` union: one-byte tag + one-byte payload aligned to 1 => 2 bytes",
+        );
+        assert_eq!(
+            outer.alignment_lower_bound, 1,
+            "an all-unit inner enum payload has alignment 1, so the union alignment stays 1",
+        );
+    }
+
+    #[test]
+    fn runtime_enum_admits_scalar_bearing_enum_payload_and_folds_widest() {
+        // A payload enum that itself carries a scalar payload folds its own
+        // resolved layout into the outer slot. `Inner` (`flag(u32)`) resolves to
+        // size 8, alignment 4 (one-byte tag + u32 payload aligned to 4 => 8);
+        // `Outer` (`none` | `mark(u8)` | `some(Inner)`) then reserves one-byte tag
+        // + an 8-byte, 4-aligned `Inner` payload => size 12, alignment 4. The u8
+        // `mark` variant (size 1, align 1) cannot produce align 4 or size 12, so
+        // this UNAMBIGUOUSLY proves the recursive `Inner` resolution's size and
+        // alignment flow through the shared slot as the widest payload. `.mark(3)`
+        // is a SUCCEEDING construction that commits the resolved `Outer` type.
+        let source = dot_variant_actor_source(
+            "pub enum Inner:\n    flag(u32)\n\npub enum Outer:\n    none\n    mark(u8)\n    some(Inner)\n\nasync fn checkpoint():\n    state: Outer = .mark(3)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("a scalar-bearing enum-payload variant should analyze");
+        let outer = output
+            .partial()
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(&ty.kind, SemanticTypeKind::Enumeration { variants, .. }
+                if variants.iter().any(|variant| variant.name == "none")
+                    && variants.iter().any(|variant| variant.name == "some"))
+            })
+            .expect("the enum-payload `Outer` enum must resolve as a semantic type");
+        assert_eq!(
+            outer.size_upper_bound,
+            Some(12),
+            "unit/`Inner` union: one-byte tag + 8-byte `Inner` payload aligned to 4 => 12 bytes",
+        );
+        assert_eq!(
+            outer.alignment_lower_bound, 4,
+            "the union adopts the inner enum's u32-payload alignment (4)",
+        );
+    }
+
+    #[test]
+    fn runtime_enum_rejects_direct_recursive_payload() {
+        // The core T0.1d hazard: an enum whose variant payload is the enum itself
+        // is infinite-size. Resolution MUST fail closed with the named
+        // `semantic-runtime-enum-recursive-payload` diagnostic and must NOT loop,
+        // overflow the native stack, or surface a resource-limit/budget error.
+        let source = dot_variant_actor_source(
+            "pub enum Loop:\n    stop\n    more(Loop)\n\nasync fn checkpoint():\n    state: Loop = .stop\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect(
+                "a directly recursive enum payload is a structured source diagnostic, not a panic",
+            );
         assert!(
             output
                 .diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic.code.as_deref()
-                    == Some("semantic-runtime-enum-payload-type")),
-            "an enum-payload variant must still fail closed: {:?}",
+                    == Some("semantic-runtime-enum-recursive-payload")),
+            "a self-recursive enum payload must fail closed with the recursive-payload diagnostic: {:?}",
+            output.diagnostics()
+        );
+        assert!(
+            !output.diagnostics().iter().any(|diagnostic| diagnostic
+                .code
+                .as_deref()
+                .is_some_and(|code| code.contains("resource") || code.contains("limit"))),
+            "recursion must be detected structurally, never via a resource/budget limit: {:?}",
             output.diagnostics()
         );
         assert!(output.has_errors());
+    }
+
+    #[test]
+    fn runtime_enum_rejects_mutually_recursive_payload() {
+        // Transitive recursion (`A.x(B)` / `B.y(A)`) must also fail closed with
+        // `semantic-runtime-enum-recursive-payload`: the in-progress stack holds
+        // both `A` and `B` when resolution re-enters `A`. No infinite loop, stack
+        // overflow, or resource-limit error.
+        let source = dot_variant_actor_source(
+            "pub enum A:\n    x(B)\n\npub enum B:\n    y(A)\n\nasync fn checkpoint():\n    state: A = .x(0)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect(
+                "a mutually recursive enum payload is a structured source diagnostic, not a panic",
+            );
+        assert!(
+            output
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_deref()
+                    == Some("semantic-runtime-enum-recursive-payload")),
+            "a mutually recursive enum payload must fail closed with the recursive-payload diagnostic: {:?}",
+            output.diagnostics()
+        );
+        assert!(
+            !output.diagnostics().iter().any(|diagnostic| diagnostic
+                .code
+                .as_deref()
+                .is_some_and(|code| code.contains("resource") || code.contains("limit"))),
+            "mutual recursion must be detected structurally, never via a resource/budget limit: {:?}",
+            output.diagnostics()
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn runtime_enum_enum_payload_construction_fails_closed() {
+        // Constructing an enum-payload variant `.some(Inner.a)` requires first
+        // building the inner enum value `Inner.a` — a unit-variant construction
+        // that is not yet plumbed at the runtime tier. The construction therefore
+        // fails closed with a named source diagnostic (NOT an internal invariant
+        // or panic). The enum-payload TYPE still resolves (asserted in the sibling
+        // layout test); here we only require a clean, named fail-closed. `Inner.a`
+        // routes through the unit-variant construction path, whose named pending
+        // diagnostic is `semantic-runtime-enum-unit-construction-pending`.
+        let source = dot_variant_actor_source(
+            "pub enum Inner:\n    a\n    b\n\npub enum Outer:\n    none\n    some(Inner)\n\nasync fn checkpoint():\n    state: Outer = .some(Inner.a)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("enum-payload construction is a structured source diagnostic, not a panic");
+        assert!(
+            output.has_errors(),
+            "constructing `.some(Inner.a)` must fail closed, not silently succeed: {:?}",
+            output.diagnostics()
+        );
+        assert!(
+            output.diagnostics().iter().all(|diagnostic| diagnostic
+                .code
+                .as_deref()
+                .is_some_and(|code| !code.is_empty())),
+            "every emitted diagnostic must carry a stable named code (no anonymous internal invariant): {:?}",
+            output.diagnostics()
+        );
+        assert!(
+            output
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_deref()
+                    == Some("semantic-runtime-enum-unit-construction-pending")
+                    || diagnostic.code.as_deref()
+                        == Some("semantic-runtime-enum-enum-payload-construction-pending")),
+            "enum-payload construction must fail closed with a named pending diagnostic: {:?}",
+            output.diagnostics()
+        );
     }
 
     #[test]

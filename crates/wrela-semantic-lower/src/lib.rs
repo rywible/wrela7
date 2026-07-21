@@ -1829,15 +1829,17 @@ fn validate_supported_source_type(
                     "semantic-enum-heterogeneous-lowering-pending (per-variant differing scalar enum payloads)",
                 ));
             }
-            // A flat-struct (nominal) payload resolves at the sema tier (T0.1c),
-            // but the machine lowering that packs a struct into the shared
-            // tagged-union slot is a later slice. Any variant carrying a single
-            // non-scalar payload field (only a flat struct can reach here, since
-            // sema rejects every other nominal/view/generic payload) trips this
-            // guard. Fail closed with a named diagnostic rather than falling
-            // through to the generic scalar/flat-structure rejection below or
-            // miscompiling against the scalar-slot layout assumed there.
-            // (`arguments.is_empty()` excludes the generic core Result path.)
+            // A nominal payload — a flat struct (T0.1c) OR a nongeneric closed
+            // enum (T0.1d) — resolves at the sema tier, but the machine lowering
+            // that packs it into the shared tagged-union slot is a later slice.
+            // Any variant carrying a single NON-scalar payload field trips this
+            // guard: sema admits only flat-struct and nongeneric-enum nominal
+            // payloads (rejecting every view/generic/recursive payload), so a
+            // non-scalar field here is exactly one of those two nominal shapes.
+            // Fail closed with a named diagnostic rather than falling through to
+            // the generic scalar/flat-structure rejection below or miscompiling
+            // against the scalar-slot layout assumed there. (`arguments.is_empty()`
+            // excludes the generic core Result path.)
             if arguments.is_empty()
                 && variants.iter().any(|variant| {
                     matches!(variant.fields.as_slice(), [field]
@@ -1850,7 +1852,7 @@ fn validate_supported_source_type(
                 })
             {
                 return Err(unsupported(
-                    "semantic-enum-nominal-payload-lowering-pending (flat-struct nominal enum payloads)",
+                    "semantic-enum-nominal-payload-lowering-pending (flat-struct or nongeneric-enum nominal enum payloads)",
                 ));
             }
             let layout = variants
