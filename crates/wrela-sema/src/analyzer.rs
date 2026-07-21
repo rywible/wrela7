@@ -11474,9 +11474,15 @@ fn analyze_flat_structure_field(
         state,
         is_cancelled,
     )?;
-    if let Some(state_access) =
-        canonical_actor_state_access(request, partial, function, base, name, source)?
-    {
+    if let Some(state_access) = canonical_actor_state_access(
+        request,
+        partial,
+        function,
+        base,
+        base_value.ty,
+        name,
+        source,
+    )? {
         let field_ty = ensure_primitive_type(
             request,
             partial,
@@ -11692,16 +11698,24 @@ fn canonical_actor_state_access(
     partial: &PartialAnalysis,
     function: FunctionInstanceId,
     base: ExpressionId,
+    base_ty: SemanticTypeId,
     name: &wrela_hir::Name,
     source: Span,
 ) -> RuntimeResult<Option<CanonicalActorStateAccess>> {
-    if !matches!(
-        partial
-            .functions
-            .get(function.0 as usize)
-            .map(|record| record.role),
-        Some(FunctionRole::ActorTurn(_))
-    ) {
+    let Some(FunctionRole::ActorTurn(actor)) = partial
+        .functions
+        .get(function.0 as usize)
+        .map(|record| record.role)
+    else {
+        return Ok(None);
+    };
+    let actor_class = partial
+        .graph
+        .as_ref()
+        .and_then(|graph| graph.actors.get(actor.0 as usize))
+        .map(|actor| actor.class)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if base_ty != actor_class {
         return Ok(None);
     }
     let Some(base_record) = request.hir.as_program().expression(base) else {

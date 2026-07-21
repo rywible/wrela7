@@ -1961,9 +1961,12 @@ fn validate_supported_source_type(
             arguments,
             fields,
         } => {
-            if !arguments.is_empty() {
+            if !arguments.iter().all(|argument| {
+                matches!(argument, sema::SemanticArgument::Type(ty)
+                    if is_stored_copy_scalar(facts, *ty))
+            }) {
                 return Err(unsupported(
-                    "semantic-generic-structure-lowering-pending (generic structure specialization)",
+                    "semantic-generic-structure-argument-lowering-pending (non-type or non-scalar specialization)",
                 ));
             }
             matches!(
@@ -1971,22 +1974,14 @@ fn validate_supported_source_type(
                 sema::Linearity::ExplicitCopy | sema::Linearity::ScalarCopy
             ) && ty.source.is_some()
                 && declaration.0 < facts.hir.declarations
-                && arguments.is_empty()
-                && fields.iter().all(|field| {
-                    !field.name.is_empty()
-                        && facts
-                            .types
-                            .get(field.ty.0 as usize)
-                            .is_some_and(|field_ty| {
-                                field_ty.linearity == sema::Linearity::ScalarCopy
-                                    && matches!(
-                                        field_ty.kind,
-                                        sema::SemanticTypeKind::Bool
-                                            | sema::SemanticTypeKind::Integer { .. }
-                                            | sema::SemanticTypeKind::Float { bits: 32 | 64 }
-                                    )
-                            })
-                })
+                && fields
+                    .iter()
+                    .all(|field| !field.name.is_empty() && is_stored_copy_scalar(facts, field.ty))
+                && canonical_flat_structure_layout(facts, fields).is_some_and(
+                    |(size, alignment)| {
+                        ty.size_upper_bound == Some(size) && ty.alignment_lower_bound == alignment
+                    },
+                )
         }
         sema::SemanticTypeKind::Enumeration {
             declaration,
@@ -2724,6 +2719,94 @@ fn lower_actor_types(
             } => {
                 let (name, kind) = lower_integer_type(*signed, *bits, *pointer_sized)?;
                 (copy_text(name, limits.payload_bytes)?, kind)
+            }
+            sema::SemanticTypeKind::Float { bits: 32 } => (
+                copy_text("f32", limits.payload_bytes)?,
+                wir::TypeKind::Primitive(wir::PrimitiveType::F32),
+            ),
+            sema::SemanticTypeKind::Float { bits: 64 } => (
+                copy_text("f64", limits.payload_bytes)?,
+                wir::TypeKind::Primitive(wir::PrimitiveType::F64),
+            ),
+            sema::SemanticTypeKind::Structure {
+                declaration,
+                arguments,
+                fields,
+            } => {
+                let declaration = input
+                    .hir()
+                    .as_program()
+                    .declaration(*declaration)
+                    .filter(|record| {
+                        ty.source == Some(record.source)
+                            && matches!(record.kind, wrela_hir::DeclarationKind::Structure(_))
+                    })
+                    .ok_or(LowerError::MissingSemanticFact {
+                        subject: "flat actor runtime structure".to_owned(),
+                        fact: "source declaration",
+                    })?;
+                let wrela_hir::DeclarationKind::Structure(source_structure) = &declaration.kind
+                else {
+                    return Err(unsupported(
+                        "non-structure source declaration for actor runtime structure",
+                    ));
+                };
+                if !generic_structure_source_generics_match(
+                    input.hir().as_program(),
+                    declaration,
+                    source_structure,
+                    arguments,
+                ) {
+                    return Err(unsupported(
+                        "semantic-generic-structure-parameter-lowering-pending (const, bounded, or unauthenticated specialization)",
+                    ));
+                }
+                if !source_structure.implements.is_empty()
+                    || source_structure.fields.len() != fields.len()
+                {
+                    return Err(unsupported(
+                        "noncanonical actor runtime structure semantic facts",
+                    ));
+                }
+                let name = declaration
+                    .name
+                    .as_ref()
+                    .ok_or_else(|| unsupported("anonymous flat actor runtime structures"))?
+                    .as_str();
+                let mut lowered = try_vec(
+                    fields.len(),
+                    "SemanticWir actor structure fields",
+                    limits.model_edges,
+                )?;
+                for (field, source_field) in fields.iter().zip(&source_structure.fields) {
+                    check_cancelled(is_cancelled)?;
+                    if field.name != source_field.name.as_str()
+                        || field.public
+                            != (source_field.visibility != wrela_hir::Visibility::Private)
+                        || source_field.default.is_some()
+                        || !source_field.attributes.is_empty()
+                        || !generic_structure_source_field_matches(
+                            facts,
+                            source_structure,
+                            arguments,
+                            &source_field.ty,
+                            field.ty,
+                        )
+                    {
+                        return Err(unsupported(
+                            "actor runtime structure semantic facts differ from source",
+                        ));
+                    }
+                    lowered.push(wir::FieldType {
+                        name: copy_text(&field.name, limits.payload_bytes)?,
+                        ty: wir::TypeId(field.ty.0),
+                        public: field.public,
+                    });
+                }
+                (
+                    copy_text(name, limits.payload_bytes)?,
+                    wir::TypeKind::Struct { fields: lowered },
+                )
             }
             sema::SemanticTypeKind::Function {
                 color,
@@ -3826,7 +3909,7 @@ fn lower_source_types(
                 declaration,
                 arguments,
                 fields,
-            } if arguments.is_empty() => {
+            } => {
                 let declaration = input
                     .hir()
                     .as_program()
@@ -3839,6 +3922,27 @@ fn lower_source_types(
                         subject: "flat runtime structure".to_owned(),
                         fact: "source declaration",
                     })?;
+                let wrela_hir::DeclarationKind::Structure(source_structure) = &declaration.kind
+                else {
+                    return Err(unsupported(
+                        "non-structure source declaration for runtime structure",
+                    ));
+                };
+                if !generic_structure_source_generics_match(
+                    input.hir().as_program(),
+                    declaration,
+                    source_structure,
+                    arguments,
+                ) {
+                    return Err(unsupported(
+                        "semantic-generic-structure-parameter-lowering-pending (const, bounded, or unauthenticated specialization)",
+                    ));
+                }
+                if !source_structure.implements.is_empty()
+                    || source_structure.fields.len() != fields.len()
+                {
+                    return Err(unsupported("noncanonical runtime structure semantic facts"));
+                }
                 let name = declaration
                     .name
                     .as_ref()
@@ -3849,8 +3953,25 @@ fn lower_source_types(
                     "SemanticWir structure fields",
                     limits.model_edges,
                 )?;
-                for field in fields {
+                for (field, source_field) in fields.iter().zip(&source_structure.fields) {
                     check_cancelled(is_cancelled)?;
+                    if field.name != source_field.name.as_str()
+                        || field.public
+                            != (source_field.visibility != wrela_hir::Visibility::Private)
+                        || source_field.default.is_some()
+                        || !source_field.attributes.is_empty()
+                        || !generic_structure_source_field_matches(
+                            facts,
+                            source_structure,
+                            arguments,
+                            &source_field.ty,
+                            field.ty,
+                        )
+                    {
+                        return Err(unsupported(
+                            "runtime structure semantic facts differ from source",
+                        ));
+                    }
                     lowered.push(wir::FieldType {
                         name: copy_text(&field.name, limits.payload_bytes)?,
                         ty: wir::TypeId(field.ty.0),
@@ -4072,6 +4193,89 @@ fn generic_enum_source_generics_match(
                             )
                     })
             })
+}
+
+fn generic_structure_source_generics_match(
+    program: &wrela_hir::Program,
+    declaration: &wrela_hir::Declaration,
+    source: &wrela_hir::AggregateDeclaration,
+    arguments: &[sema::SemanticArgument],
+) -> bool {
+    source.generics.len() == arguments.len()
+        && source
+            .generics
+            .iter()
+            .zip(arguments)
+            .all(|(generic, argument)| {
+                matches!(argument, sema::SemanticArgument::Type(_))
+                    && program.generic_parameter(*generic).is_some_and(|record| {
+                        record.owner == declaration.id
+                            && matches!(
+                                record.kind,
+                                wrela_hir::GenericParameterKind::Type { bound: None }
+                            )
+                    })
+            })
+}
+
+fn generic_structure_source_field_matches(
+    facts: &sema::PartialAnalysis,
+    source_structure: &wrela_hir::AggregateDeclaration,
+    arguments: &[sema::SemanticArgument],
+    source: &wrela_hir::TypeExpression,
+    ty: sema::SemanticTypeId,
+) -> bool {
+    match &source.kind {
+        wrela_hir::TypeExpressionKind::Named {
+            definition: wrela_hir::Definition::Generic(candidate),
+            arguments: nested,
+        } if nested.is_empty() => source_structure
+            .generics
+            .iter()
+            .position(|generic| generic == candidate)
+            .and_then(|index| arguments.get(index))
+            .is_some_and(|argument| {
+                matches!(argument, sema::SemanticArgument::Type(argument) if *argument == ty)
+            }),
+        _ => source_type_matches_semantic(facts, source, ty),
+    }
+}
+
+fn is_stored_copy_scalar(facts: &sema::PartialAnalysis, ty: sema::SemanticTypeId) -> bool {
+    facts.types.get(ty.0 as usize).is_some_and(|record| {
+        record.linearity == sema::Linearity::ScalarCopy
+            && matches!(
+                record.kind,
+                sema::SemanticTypeKind::Bool
+                    | sema::SemanticTypeKind::Integer { .. }
+                    | sema::SemanticTypeKind::Float { bits: 32 | 64 }
+            )
+    })
+}
+
+fn canonical_flat_structure_layout(
+    facts: &sema::PartialAnalysis,
+    fields: &[sema::SemanticField],
+) -> Option<(u64, u32)> {
+    let mut size = 0_u64;
+    let mut alignment = 1_u32;
+    for field in fields {
+        let record = facts.types.get(field.ty.0 as usize)?;
+        if !is_stored_copy_scalar(facts, field.ty) {
+            return None;
+        }
+        let field_size = record.size_upper_bound?;
+        let field_alignment = record.alignment_lower_bound;
+        let mask = u64::from(field_alignment).checked_sub(1)?;
+        size = size
+            .checked_add(mask)
+            .map(|value| value & !mask)?
+            .checked_add(field_size)?;
+        alignment = alignment.max(field_alignment);
+    }
+    let mask = u64::from(alignment).checked_sub(1)?;
+    size = size.checked_add(mask).map(|value| value & !mask)?;
+    Some((size, alignment))
 }
 
 fn generic_enum_source_payload_matches(
@@ -5396,9 +5600,7 @@ impl SourceFunctionLowerer<'_> {
                         .get(previous_record.ty.0 as usize)
                         .map(|record| &record.kind)
                     {
-                        Some(sema::SemanticTypeKind::Structure {
-                            arguments, fields, ..
-                        }) if arguments.is_empty() => fields,
+                        Some(sema::SemanticTypeKind::Structure { fields, .. }) => fields,
                         _ => return Err(self.fact_mismatch("field assignment aggregate type")),
                     };
                     let mut selected = None;
@@ -6759,9 +6961,8 @@ impl SourceFunctionLowerer<'_> {
                                 &record.kind,
                                 sema::SemanticTypeKind::Structure {
                                     declaration: candidate,
-                                    arguments,
                                     ..
-                                } if *candidate == declaration.id && arguments.is_empty()
+                                } if *candidate == declaration.id
                             )
                         });
                 if !nominal_matches || result.is_some() || effects.0 != 0 {
@@ -7651,7 +7852,7 @@ impl SourceFunctionLowerer<'_> {
         if callee_ty != aggregate.ty {
             return Err(self.fact_mismatch("structure constructor nominal type"));
         }
-        let (declaration, semantic_fields) = match self
+        let (declaration, arguments, semantic_fields) = match self
             .input
             .facts()
             .types
@@ -7662,7 +7863,7 @@ impl SourceFunctionLowerer<'_> {
                 declaration,
                 arguments,
                 fields,
-            }) if arguments.is_empty() => (*declaration, fields),
+            }) => (*declaration, arguments, fields),
             _ => return Err(self.fact_mismatch("flat structure semantic type")),
         };
         let declaration_record = self
@@ -7677,6 +7878,12 @@ impl SourceFunctionLowerer<'_> {
         };
         if aggregate.source_argument_count != semantic_fields.len()
             || source_structure.fields.len() != semantic_fields.len()
+            || !generic_structure_source_generics_match(
+                self.input.hir().as_program(),
+                declaration_record,
+                source_structure,
+                arguments,
+            )
         {
             return Err(self.fact_mismatch("structure constructor field arity"));
         }
@@ -7684,7 +7891,15 @@ impl SourceFunctionLowerer<'_> {
             check_cancelled(self.is_cancelled)?;
             if source.name.as_str() != semantic.name
                 || (source.visibility != wrela_hir::Visibility::Private) != semantic.public
-                || !source_type_matches_semantic(self.input.facts(), &source.ty, semantic.ty)
+                || source.default.is_some()
+                || !source.attributes.is_empty()
+                || !generic_structure_source_field_matches(
+                    self.input.facts(),
+                    source_structure,
+                    arguments,
+                    &source.ty,
+                    semantic.ty,
+                )
             {
                 return Err(self.fact_mismatch("structure field semantic identity"));
             }
@@ -7896,9 +8111,7 @@ impl SourceFunctionLowerer<'_> {
             .get(base_fact.ty.0 as usize)
             .map(|record| &record.kind)
         {
-            Some(sema::SemanticTypeKind::Structure {
-                arguments, fields, ..
-            }) if arguments.is_empty() => fields,
+            Some(sema::SemanticTypeKind::Structure { fields, .. }) => fields,
             _ => return Err(self.fact_mismatch("flat structure projection base")),
         };
         let index = usize::try_from(project.field)
@@ -11100,7 +11313,7 @@ fn actor_type_kind_matches(
             },
         ) => left_element == right_element && left_length == right_length,
         (wir::TypeKind::Struct { fields: left }, wir::TypeKind::Struct { fields: right }) => {
-            left.is_empty() && right.is_empty()
+            actor_structure_fields_match(left, right, is_cancelled)?
         }
         (wir::TypeKind::Enum { variants: left }, wir::TypeKind::Enum { variants: right }) => {
             actor_enum_variants_match(left, right, is_cancelled)?
@@ -11117,6 +11330,26 @@ fn actor_type_kind_matches(
         (wir::TypeKind::Reservation, wir::TypeKind::Reservation) => true,
         _ => false,
     })
+}
+
+fn actor_structure_fields_match(
+    left: &[wir::FieldType],
+    right: &[wir::FieldType],
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, LowerError> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left.iter().zip(right) {
+        check_cancelled(is_cancelled)?;
+        if left.ty != right.ty
+            || left.public != right.public
+            || !text_matches(&left.name, &right.name, is_cancelled)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn actor_enum_variants_match(
@@ -11357,6 +11590,47 @@ fn actor_operations_match(
                 checked: rc,
             },
         ) => lv == rv && ld == rd && lc == rc,
+        (
+            wir::SemanticOperation::Aggregate {
+                ty: left_ty,
+                fields: left_fields,
+            },
+            wir::SemanticOperation::Aggregate {
+                ty: right_ty,
+                fields: right_fields,
+            },
+        ) => {
+            left_ty == right_ty
+                && cancellable_slices_equal(left_fields, right_fields, is_cancelled)?
+        }
+        (
+            wir::SemanticOperation::InsertField {
+                aggregate: left_aggregate,
+                field: left_field,
+                value: left_value,
+            },
+            wir::SemanticOperation::InsertField {
+                aggregate: right_aggregate,
+                field: right_field,
+                value: right_value,
+            },
+        ) => {
+            left_aggregate == right_aggregate
+                && left_field == right_field
+                && left_value == right_value
+        }
+        (
+            wir::SemanticOperation::Project {
+                base: left_base,
+                field: left_field,
+                access: left_access,
+            },
+            wir::SemanticOperation::Project {
+                base: right_base,
+                field: right_field,
+                access: right_access,
+            },
+        ) => left_base == right_base && left_field == right_field && left_access == right_access,
         (
             wir::SemanticOperation::ConstructEnum {
                 ty: left_ty,
@@ -16194,47 +16468,191 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn generic_structure_specialization_stops_at_named_lowering_boundary() {
-        let (image, _target) = analyze_minimum();
-        let mut facts = image.into_facts();
-        let scalar = sema::SemanticTypeId(
-            u32::try_from(facts.types.len()).expect("fixture semantic type count"),
+    fn generic_flat_structure_specialization_lowers_constructor_and_projection() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub struct Cell[T]:
+    pub value: T
+    pub stamp: u8
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        cell: Cell[u64] = Cell(value=7, stamp=3)
+        projected: u64 = cell.value
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
         );
-        facts.types.push(sema::SemanticType {
-            id: scalar,
-            kind: sema::SemanticTypeKind::Integer {
-                signed: false,
-                bits: 32,
-                pointer_sized: false,
-            },
-            linearity: sema::Linearity::ScalarCopy,
-            size_upper_bound: Some(4),
-            alignment_lower_bound: 4,
-            source: Some(span(0, 0, 1)),
-        });
+        let facts = image.facts();
+        let (cell_declaration, cell_arguments, cell_fields) = facts
+            .types
+            .iter()
+            .find_map(|ty| match &ty.kind {
+                sema::SemanticTypeKind::Structure {
+                    declaration,
+                    arguments,
+                    fields,
+                } if !arguments.is_empty() => Some((*declaration, arguments, fields)),
+                _ => None,
+            })
+            .expect("semantic Cell specialization");
+        let declaration = image
+            .hir()
+            .as_program()
+            .declaration(cell_declaration)
+            .expect("source Cell declaration");
+        let wrela_hir::DeclarationKind::Structure(source_cell) = &declaration.kind else {
+            panic!("Cell source must remain a structure")
+        };
+        assert!(generic_structure_source_generics_match(
+            image.hir().as_program(),
+            declaration,
+            source_cell,
+            cell_arguments,
+        ));
+        assert!(
+            source_cell
+                .fields
+                .iter()
+                .zip(cell_fields)
+                .all(|(source, semantic)| generic_structure_source_field_matches(
+                    facts,
+                    source_cell,
+                    cell_arguments,
+                    &source.ty,
+                    semantic.ty,
+                ))
+        );
+        let forged_arguments = vec![sema::SemanticArgument::Type(cell_fields[1].ty)];
+        assert!(
+            !generic_structure_source_field_matches(
+                facts,
+                source_cell,
+                &forged_arguments,
+                &source_cell.fields[0].ty,
+                cell_fields[0].ty,
+            ),
+            "same-declaration substitution forgery must not authenticate"
+        );
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("copy-scalar generic flat structure should lower");
+        let wir = lowered.wir().as_wir();
+        let cell = wir
+            .types
+            .iter()
+            .find(|ty| ty.source_name == "Cell")
+            .expect("lowered Cell specialization");
+        assert!(matches!(&cell.kind, wir::TypeKind::Struct { fields }
+            if matches!(fields.as_slice(), [value, stamp]
+                if value.name == "value" && stamp.name == "stamp"
+                    && value.ty != stamp.ty)));
+        assert!(wir.functions.iter().any(|function| {
+            let has_aggregate = function.body.statements.iter().any(|statement| {
+                matches!(statement,
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::Aggregate { ty, fields }, ..
+                    }) if *ty == cell.id && fields.len() == 2)
+            });
+            let has_projection = function.body.statements.iter().any(|statement| {
+                matches!(
+                    statement,
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::Project { field: 0, .. },
+                        ..
+                    })
+                )
+            });
+            has_aggregate && has_projection
+        }));
+
+        let mut forged = wir.clone();
+        let cell = forged
+            .types
+            .iter_mut()
+            .find(|ty| ty.source_name == "Cell")
+            .expect("lowered Cell specialization");
+        let wir::TypeKind::Struct { fields } = &mut cell.kind else {
+            panic!("Cell must remain a structure")
+        };
+        fields[0].name = "forged".to_owned();
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                forged,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
+        ));
+
+        let mut forged_substitution = lowered.wir().as_wir().clone();
+        let cell = forged_substitution
+            .types
+            .iter_mut()
+            .find(|ty| ty.source_name == "Cell")
+            .expect("lowered Cell specialization");
+        let wir::TypeKind::Struct { fields } = &mut cell.kind else {
+            panic!("Cell must remain a structure")
+        };
+        fields[0].ty = fields[1].ty;
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                forged_substitution,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn non_type_generic_structure_specialization_fails_closed_by_name() {
+        let (image, _target) = analyze_minimum();
+        let facts = image.into_facts();
         let specialization = sema::SemanticType {
             id: sema::SemanticTypeId(
                 u32::try_from(facts.types.len()).expect("fixture semantic type count"),
             ),
             kind: sema::SemanticTypeKind::Structure {
                 declaration: DeclarationId(0),
-                arguments: vec![sema::SemanticArgument::Type(scalar)],
-                fields: vec![sema::SemanticField {
-                    name: "value".to_owned(),
-                    ty: scalar,
-                    public: true,
-                }],
+                arguments: vec![sema::SemanticArgument::Constant(sema::ConstantValue::Unit)],
+                fields: Vec::new(),
             },
             linearity: sema::Linearity::ExplicitCopy,
-            size_upper_bound: Some(4),
-            alignment_lower_bound: 4,
+            size_upper_bound: Some(0),
+            alignment_lower_bound: 1,
             source: Some(span(0, 0, 1)),
         };
-
         assert!(matches!(
             validate_supported_source_type(&specialization, &facts),
             Err(LowerError::UnsupportedInput {
-                feature: "semantic-generic-structure-lowering-pending (generic structure specialization)"
+                feature: "semantic-generic-structure-argument-lowering-pending (non-type or non-scalar specialization)"
             })
         ));
     }
