@@ -1967,6 +1967,11 @@ fn assemble_projection(
         // Source semantic facts precede activation lowering. The backend adds
         // exact FlowWir ActivationPlan evidence after that sealed boundary.
         activation_frame_evidence: Vec::new(),
+        // Whole-image region inference and promotion facts (ch03 §7–§8). The
+        // schema carries these ahead of their producer (Lane B task B2b), so
+        // this assembly leaves them empty until that producer is wired.
+        region_assignments: Vec::new(),
+        promotions: Vec::new(),
         image_edges: actor_facts.image_edges,
         work,
         hardware: Vec::new(),

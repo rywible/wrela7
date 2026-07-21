@@ -11,12 +11,13 @@ use crate::{
     ActivationCancellationFact, ActivationFrameEvidenceFact, ActorLoweringFact, ActorLoweringKind,
     AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts,
     BoundFact, HardwareFact, ImageEdgeFact, ImageNodeFact, ImageReport, OptimizationAction,
-    OptimizationDecisionFact, ProofFact, REPORT_SCHEMA_VERSION, RecoveryFact,
-    RegionCapacityEvidenceFact, ReportError, RepresentationFacts, SectionFact, SymbolFact,
-    WorkFact, copy_build_identity, seal_analysis_facts,
+    OptimizationDecisionFact, PromotionFact, ProofFact, REPORT_SCHEMA_VERSION, RecoveryFact,
+    RegionAssignmentFact, RegionCapacityEvidenceFact, RegionClass, ReportError,
+    RepresentationFacts, SectionFact, SymbolFact, WorkFact, copy_build_identity,
+    seal_analysis_facts,
 };
 
-/// Decode and authenticate one canonical schema-v11 image report.
+/// Decode and authenticate one canonical schema-v12 image report.
 ///
 /// The caller supplies the build identity expected at this trust boundary and
 /// all resource ceilings. The decoded facts are resealed through the same
@@ -195,6 +196,20 @@ pub fn decode_image_report_json(
         budget.analysis_payloads([&fact.category, &fact.subject, &fact.result])?;
         Ok(fact)
     })?;
+    parser.field("region_assignments", false)?;
+    let region_assignments = parse_array(&mut parser, |parser| {
+        budget.analysis_item()?;
+        let fact = parse_region_assignment(parser)?;
+        budget.analysis_payload(&fact.allocation)?;
+        Ok(fact)
+    })?;
+    parser.field("promotions", false)?;
+    let promotions = parse_array(&mut parser, |parser| {
+        budget.analysis_item()?;
+        let fact = parse_promotion(parser)?;
+        budget.analysis_payloads([&fact.allocation, &fact.reason])?;
+        Ok(fact)
+    })?;
 
     parser.field("sections", false)?;
     let sections = parse_array(&mut parser, |parser| {
@@ -250,6 +265,8 @@ pub fn decode_image_report_json(
         image_nodes,
         region_capacity_evidence,
         activation_frame_evidence,
+        region_assignments,
+        promotions,
         image_edges,
         work,
         hardware,
@@ -397,6 +414,53 @@ fn parse_region_capacity_evidence(
     Ok(RegionCapacityEvidenceFact {
         region,
         capacity_proof,
+    })
+}
+
+fn parse_region_class(parser: &mut Parser<'_>) -> Result<RegionClass, ReportError> {
+    match parser.string()?.as_str() {
+        "image" => Ok(RegionClass::Image),
+        "task-frame" => Ok(RegionClass::TaskFrame),
+        "call" => Ok(RegionClass::Call),
+        "request" => Ok(RegionClass::Request),
+        "pool" => Ok(RegionClass::Pool),
+        "static" => Ok(RegionClass::Static),
+        _ => Err(ReportError::InvalidEncoding("region class")),
+    }
+}
+
+fn parse_region_assignment(parser: &mut Parser<'_>) -> Result<RegionAssignmentFact, ReportError> {
+    parser.object_start()?;
+    parser.field("allocation", true)?;
+    let allocation = parser.string()?;
+    parser.field("region_class", false)?;
+    let region_class = parse_region_class(parser)?;
+    parser.object_end()?;
+    Ok(RegionAssignmentFact {
+        allocation,
+        region_class,
+    })
+}
+
+fn parse_promotion(parser: &mut Parser<'_>) -> Result<PromotionFact, ReportError> {
+    parser.object_start()?;
+    parser.field("allocation", true)?;
+    let allocation = parser.string()?;
+    parser.field("source_region", false)?;
+    let source_region = parse_region_class(parser)?;
+    parser.field("destination_region", false)?;
+    let destination_region = parse_region_class(parser)?;
+    parser.field("reason", false)?;
+    let reason = parser.string()?;
+    parser.field("proof", false)?;
+    let proof = parser.u32("promotion proof identifier")?;
+    parser.object_end()?;
+    Ok(PromotionFact {
+        allocation,
+        source_region,
+        destination_region,
+        reason,
+        proof,
     })
 }
 
@@ -1294,9 +1358,9 @@ mod tests {
     use crate::{
         ActorLoweringFact, ActorLoweringKind, AnalysisFactLimits, AnalysisFactRequest,
         AnalysisFacts, BackendFactLimits, BackendFacts, BoundFact, HardwareFact, ImageEdgeFact,
-        ImageNodeFact, ImageReport, OptimizationAction, OptimizationDecisionFact, ProofFact,
-        RecoveryFact, RegionCapacityEvidenceFact, ReportError, RepresentationFacts, SectionFact,
-        SymbolFact, WorkFact, seal_analysis_facts,
+        ImageNodeFact, ImageReport, OptimizationAction, OptimizationDecisionFact, PromotionFact,
+        ProofFact, RecoveryFact, RegionAssignmentFact, RegionCapacityEvidenceFact, RegionClass,
+        ReportError, RepresentationFacts, SectionFact, SymbolFact, WorkFact, seal_analysis_facts,
     };
 
     use super::{Parser, decode_image_report_json};
@@ -1439,6 +1503,48 @@ mod tests {
                 },
             ],
             activation_frame_evidence: Vec::new(),
+            region_assignments: vec![
+                RegionAssignmentFact {
+                    allocation: "alloc:0:actor-state".to_owned(),
+                    region_class: RegionClass::Image,
+                },
+                RegionAssignmentFact {
+                    allocation: "alloc:1:frame-live".to_owned(),
+                    region_class: RegionClass::TaskFrame,
+                },
+                RegionAssignmentFact {
+                    allocation: "alloc:2:scratch".to_owned(),
+                    region_class: RegionClass::Call,
+                },
+                RegionAssignmentFact {
+                    allocation: "alloc:3:req-buffer".to_owned(),
+                    region_class: RegionClass::Request,
+                },
+                RegionAssignmentFact {
+                    allocation: "alloc:4:pool-slot".to_owned(),
+                    region_class: RegionClass::Pool,
+                },
+                RegionAssignmentFact {
+                    allocation: "alloc:5:baked-table".to_owned(),
+                    region_class: RegionClass::Static,
+                },
+            ],
+            promotions: vec![
+                PromotionFact {
+                    allocation: "alloc:6:buffer".to_owned(),
+                    source_region: RegionClass::TaskFrame,
+                    destination_region: RegionClass::Image,
+                    reason: "escapes through `self.pending`".to_owned(),
+                    proof: 0,
+                },
+                PromotionFact {
+                    allocation: "alloc:7:log\\雪".to_owned(),
+                    source_region: RegionClass::Call,
+                    destination_region: RegionClass::Pool,
+                    reason: "moved into durable pool 雪".to_owned(),
+                    proof: 1,
+                },
+            ],
             image_edges: vec![ImageEdgeFact {
                 kind: "task-supervision".to_owned(),
                 source: "task:0:alpha".to_owned(),
@@ -1707,15 +1813,15 @@ mod tests {
     #[test]
     fn schema_scalar_enum_and_json_structure_mutations_fail_closed() {
         let json = full_report(ActorLoweringKind::Queued, OptimizationAction::Retained).to_json();
-        let schema = json.replacen("\"schema\":11", "\"schema\":12", 1);
+        let schema = json.replacen("\"schema\":12", "\"schema\":13", 1);
         assert_eq!(
             decode(schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(12))
+            Err(ReportError::UnsupportedSchema(13))
         );
-        let stale_schema = json.replacen("\"schema\":11", "\"schema\":10", 1);
+        let stale_schema = json.replacen("\"schema\":12", "\"schema\":11", 1);
         assert_eq!(
             decode(stale_schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(10))
+            Err(ReportError::UnsupportedSchema(11))
         );
 
         let oversized_u32 = json.replacen(
@@ -1922,6 +2028,8 @@ mod tests {
             analysis.actor_lowerings.len(),
             analysis.image_nodes.len(),
             analysis.region_capacity_evidence.len(),
+            analysis.region_assignments.len(),
+            analysis.promotions.len(),
             analysis.image_edges.len(),
             analysis.work.len(),
             analysis.hardware.len(),

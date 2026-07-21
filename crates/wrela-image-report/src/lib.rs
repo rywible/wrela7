@@ -11,7 +11,13 @@ mod decode;
 pub use decode::decode_image_report_json;
 
 /// Current machine-readable report schema.
-pub const REPORT_SCHEMA_VERSION: u32 = 11;
+///
+/// Bumped 11 → 12 when whole-image region inference facts (`RegionAssignmentFact`
+/// and `PromotionFact`) were added to the sealed analysis section. The decoder
+/// gates on this exact value, so a v11 report is rejected as
+/// [`ReportError::UnsupportedSchema`]; existing v11 fields are unchanged and the
+/// two new arrays are appended, never reflowed into, the analysis section.
+pub const REPORT_SCHEMA_VERSION: u32 = 12;
 
 const CURRENT_SEMANTIC_WIR_VERSION: u32 = 8;
 const CURRENT_FLOW_WIR_VERSION: u32 = 10;
@@ -127,6 +133,66 @@ pub struct ActivationFrameEvidenceFact {
     pub capacity_proof: u32,
 }
 
+/// Region class one allocation is assigned by whole-image region inference.
+///
+/// These are the classes of `docs/language/03-values-views-regions.md` §6: the
+/// image region (§6.1), the task-frame region (§6.2), the call region (§6.3),
+/// the request region (§6.4), an `iso`/pool region (§6.5), and immutable baked
+/// static data (§6.1). Every allocation is assigned exactly one class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RegionClass {
+    Image,
+    TaskFrame,
+    Call,
+    Request,
+    Pool,
+    Static,
+}
+
+impl RegionClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::TaskFrame => "task-frame",
+            Self::Call => "call",
+            Self::Request => "request",
+            Self::Pool => "pool",
+            Self::Static => "static",
+        }
+    }
+}
+
+/// One allocation's inferred region assignment (ch03 §7 region inference).
+///
+/// Records the allocation identity and the exact region class inference placed
+/// it in. The producer that fills this from whole-image analysis is wired
+/// separately (Lane B task B2b); this schema records the fact ahead of that
+/// producer, so ordinary builds leave the vector empty.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RegionAssignmentFact {
+    pub allocation: String,
+    pub region_class: RegionClass,
+}
+
+/// One allocation promoted to a longer-lived region (ch03 §8 promotion and
+/// budgets).
+///
+/// A promotion moves an allocation whose required lifetime cannot be kept local
+/// into a wider region, and only when doing so stays statically bounded. This
+/// retains what §8 requires a promotion to record: the promoted allocation, the
+/// region it was promoted from, the region it was promoted into, the
+/// human-readable reason (the why-chain summary), and the dense `FlowWir` proof
+/// establishing the promotion is bounded. Like [`RegionAssignmentFact`] the
+/// producer is B2b; ordinary builds leave the vector empty.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PromotionFact {
+    pub allocation: String,
+    pub source_region: RegionClass,
+    pub destination_region: RegionClass,
+    pub reason: String,
+    pub proof: u32,
+}
+
 /// One logical scheduling, request, supervision, or hardware edge.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ImageEdgeFact {
@@ -177,6 +243,11 @@ pub struct AnalysisFacts {
     pub image_nodes: Vec<ImageNodeFact>,
     pub region_capacity_evidence: Vec<RegionCapacityEvidenceFact>,
     pub activation_frame_evidence: Vec<ActivationFrameEvidenceFact>,
+    /// Inferred region class per reportable allocation (ch03 §7). Empty until
+    /// the whole-image inference producer (Lane B task B2b) is wired.
+    pub region_assignments: Vec<RegionAssignmentFact>,
+    /// Reported region promotions (ch03 §8). Empty until the producer is wired.
+    pub promotions: Vec<PromotionFact>,
     pub image_edges: Vec<ImageEdgeFact>,
     pub work: Vec<WorkFact>,
     pub hardware: Vec<HardwareFact>,
@@ -1065,6 +1136,65 @@ impl ImageReport {
             json_string_array(&mut output, &fact.why_chain, is_cancelled)?;
             output.push('}');
         }
+        output.push_str("],\"region_assignments\":[");
+        for (index, fact) in self.analysis.region_assignments.iter().enumerate() {
+            if is_cancelled() {
+                return Err(ReportError::Cancelled);
+            }
+            if index != 0 {
+                output.push(',');
+            }
+            output.push('{');
+            json_string(
+                &mut output,
+                "allocation",
+                &fact.allocation,
+                false,
+                is_cancelled,
+            )?;
+            json_string(
+                &mut output,
+                "region_class",
+                fact.region_class.as_str(),
+                true,
+                is_cancelled,
+            )?;
+            output.push('}');
+        }
+        output.push_str("],\"promotions\":[");
+        for (index, fact) in self.analysis.promotions.iter().enumerate() {
+            if is_cancelled() {
+                return Err(ReportError::Cancelled);
+            }
+            if index != 0 {
+                output.push(',');
+            }
+            output.push('{');
+            json_string(
+                &mut output,
+                "allocation",
+                &fact.allocation,
+                false,
+                is_cancelled,
+            )?;
+            json_string(
+                &mut output,
+                "source_region",
+                fact.source_region.as_str(),
+                true,
+                is_cancelled,
+            )?;
+            json_string(
+                &mut output,
+                "destination_region",
+                fact.destination_region.as_str(),
+                true,
+                is_cancelled,
+            )?;
+            json_string(&mut output, "reason", &fact.reason, true, is_cancelled)?;
+            json_number(&mut output, "proof", u64::from(fact.proof), true);
+            output.push('}');
+        }
         output.push_str("],\"sections\":[");
         for (index, fact) in self.backend.sections.iter().enumerate() {
             if is_cancelled() {
@@ -1442,6 +1572,8 @@ fn canonicalize_analysis(
     cancellable_sort(&mut analysis.image_nodes, is_cancelled)?;
     cancellable_sort(&mut analysis.region_capacity_evidence, is_cancelled)?;
     cancellable_sort(&mut analysis.activation_frame_evidence, is_cancelled)?;
+    cancellable_sort(&mut analysis.region_assignments, is_cancelled)?;
+    cancellable_sort(&mut analysis.promotions, is_cancelled)?;
     cancellable_sort(&mut analysis.image_edges, is_cancelled)?;
     cancellable_sort(&mut analysis.work, is_cancelled)?;
     cancellable_sort(&mut analysis.hardware, is_cancelled)?;
@@ -1496,6 +1628,8 @@ fn measure_analysis(
         analysis.image_nodes.len(),
         analysis.region_capacity_evidence.len(),
         analysis.activation_frame_evidence.len(),
+        analysis.region_assignments.len(),
+        analysis.promotions.len(),
         analysis.image_edges.len(),
         analysis.work.len(),
         analysis.hardware.len(),
@@ -1578,6 +1712,13 @@ fn measure_analysis(
     }
     for fact in &analysis.region_capacity_evidence {
         add(&fact.region)?;
+    }
+    for fact in &analysis.region_assignments {
+        add(&fact.allocation)?;
+    }
+    for fact in &analysis.promotions {
+        add(&fact.allocation)?;
+        add(&fact.reason)?;
     }
     for fact in &analysis.activation_frame_evidence {
         for value in [
@@ -1755,6 +1896,12 @@ fn validate_analysis(
         &analysis.activation_frame_evidence,
         is_cancelled,
     )?;
+    require_canonical(
+        "region assignments",
+        &analysis.region_assignments,
+        is_cancelled,
+    )?;
+    require_canonical("promotions", &analysis.promotions, is_cancelled)?;
     require_canonical("image edges", &analysis.image_edges, is_cancelled)?;
     require_canonical("work facts", &analysis.work, is_cancelled)?;
     require_canonical("hardware facts", &analysis.hardware, is_cancelled)?;
@@ -1841,6 +1988,22 @@ fn validate_analysis(
     }
     for fact in &analysis.region_capacity_evidence {
         if !nonempty(&fact.region, is_cancelled)? {
+            return Err(ReportError::InvalidFact);
+        }
+    }
+    for fact in &analysis.region_assignments {
+        if !nonempty(&fact.allocation, is_cancelled)? {
+            return Err(ReportError::InvalidFact);
+        }
+    }
+    for fact in &analysis.promotions {
+        // A promotion moves an allocation between two distinct regions with a
+        // stated reason. A same-region "promotion" or an empty identity/reason
+        // is not a promotion the report can carry.
+        if !nonempty(&fact.allocation, is_cancelled)?
+            || !nonempty(&fact.reason, is_cancelled)?
+            || fact.source_region == fact.destination_region
+        {
             return Err(ReportError::InvalidFact);
         }
     }
@@ -3270,9 +3433,9 @@ mod tests {
         ActivationCancellationFact, ActivationFrameEvidenceFact, AnalysisFactLimits,
         AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts, BoundFact,
         ImageEdgeFact, ImageNodeFact, ImageReport, OptimizationAction, OptimizationDecisionFact,
-        ProofFact, RegionCapacityEvidenceFact, ReportError, SectionFact, SymbolFact,
-        ValidatedAnalysisFacts, WorkFact, cancellable_sort, decode_image_report_json,
-        push_json_string_cancellable, seal_analysis_facts,
+        PromotionFact, ProofFact, RegionAssignmentFact, RegionCapacityEvidenceFact, RegionClass,
+        ReportError, SectionFact, SymbolFact, ValidatedAnalysisFacts, WorkFact, cancellable_sort,
+        decode_image_report_json, push_json_string_cancellable, seal_analysis_facts,
     };
 
     fn build(digest: Sha256Digest) -> BuildIdentity {
@@ -3698,7 +3861,7 @@ mod tests {
         };
         let sealed = seal_analysis_facts(request, facts.clone(), &|| false)
             .expect("exact actor/task/region graph limit");
-        assert_eq!(super::REPORT_SCHEMA_VERSION, 11);
+        assert_eq!(super::REPORT_SCHEMA_VERSION, 12);
         assert_eq!(sealed.as_facts().image_nodes.len(), 8);
         assert_eq!(sealed.as_facts().region_capacity_evidence.len(), 5);
         assert_eq!(sealed.as_facts().activation_frame_evidence.len(), 2);
@@ -3720,7 +3883,7 @@ mod tests {
             BackendFactLimits::standard(),
             &|| false,
         )
-        .expect("schema-v11 activation report");
+        .expect("schema-v12 activation report");
         let json = report.to_json();
         assert!(json.contains("\"activation_frame_evidence\":[{"));
         assert!(json.contains("\"kind\":\"actor-activation-frame-region\""));
@@ -3734,7 +3897,7 @@ mod tests {
                 u64::try_from(json.len()).expect("bounded activation report bytes"),
                 &|| false,
             )
-            .expect("decode exact schema-v11 activation evidence"),
+            .expect("decode exact schema-v12 activation evidence"),
             report
         );
         let corrupt_cancellation = json.replacen(
@@ -4338,7 +4501,7 @@ mod tests {
         let digest = Sha256Digest::from_bytes([0x67; 32]);
         let minimum = assemble(digest, AnalysisFacts::default(), backend(digest))
             .expect("minimum one-block DIR64 relocation evidence");
-        assert_eq!(minimum.schema(), 11);
+        assert_eq!(minimum.schema(), 12);
         assert_eq!(minimum.backend().relocation_directory_bytes, 12);
         assert_eq!(minimum.backend().base_relocation_blocks, 1);
         assert_eq!(minimum.backend().base_relocation_dir64_count, 1);
@@ -4705,5 +4868,250 @@ mod tests {
             Err(ReportError::Cancelled)
         );
         assert!(output.len() < value.len() + 2);
+    }
+
+    fn region_fact_base() -> AnalysisFacts {
+        AnalysisFacts {
+            startup_order: vec!["only".to_owned()],
+            shutdown_order: vec!["only".to_owned()],
+            ..AnalysisFacts::default()
+        }
+    }
+
+    #[test]
+    fn region_assignment_and_promotion_facts_round_trip_canonically_and_encode_identically() {
+        let digest = Sha256Digest::from_bytes([0x71; 32]);
+        let mut facts = region_fact_base();
+        // Deliberately out of canonical order so sealing must sort both vectors.
+        facts.region_assignments = vec![
+            RegionAssignmentFact {
+                allocation: "alloc:2:scratch".to_owned(),
+                region_class: RegionClass::Call,
+            },
+            RegionAssignmentFact {
+                allocation: "alloc:0:actor-state".to_owned(),
+                region_class: RegionClass::Image,
+            },
+            RegionAssignmentFact {
+                allocation: "alloc:1:frame-live".to_owned(),
+                region_class: RegionClass::TaskFrame,
+            },
+            RegionAssignmentFact {
+                allocation: "alloc:3:req-buffer".to_owned(),
+                region_class: RegionClass::Request,
+            },
+            RegionAssignmentFact {
+                allocation: "alloc:4:pool-slot".to_owned(),
+                region_class: RegionClass::Pool,
+            },
+            RegionAssignmentFact {
+                allocation: "alloc:5:baked-table".to_owned(),
+                region_class: RegionClass::Static,
+            },
+        ];
+        facts.promotions = vec![
+            PromotionFact {
+                allocation: "buffer\\雪".to_owned(),
+                source_region: RegionClass::TaskFrame,
+                destination_region: RegionClass::Image,
+                reason: "escapes through `self.pending`".to_owned(),
+                proof: 3,
+            },
+            PromotionFact {
+                allocation: "alloc:0:cursor".to_owned(),
+                source_region: RegionClass::Call,
+                destination_region: RegionClass::Pool,
+                reason: "moved into durable pool".to_owned(),
+                proof: 1,
+            },
+        ];
+        let digest_build = build(digest);
+        let report = assemble(digest, facts, backend(digest)).expect("assemble region report");
+        assert_eq!(report.schema(), 12);
+        // Canonicalization sorted both vectors by their derived total order.
+        assert_eq!(
+            report
+                .analysis()
+                .region_assignments
+                .iter()
+                .map(|fact| fact.allocation.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "alloc:0:actor-state",
+                "alloc:1:frame-live",
+                "alloc:2:scratch",
+                "alloc:3:req-buffer",
+                "alloc:4:pool-slot",
+                "alloc:5:baked-table",
+            ]
+        );
+        assert_eq!(
+            report
+                .analysis()
+                .promotions
+                .iter()
+                .map(|fact| fact.allocation.as_str())
+                .collect::<Vec<_>>(),
+            ["alloc:0:cursor", "buffer\\雪"]
+        );
+        let json = report.to_json();
+        // Both arrays are present with all six region-class spellings and the promotion shape.
+        assert!(json.contains(
+            "\"region_assignments\":[{\"allocation\":\"alloc:0:actor-state\",\"region_class\":\"image\"}"
+        ));
+        for spelling in [
+            "\"region_class\":\"image\"",
+            "\"region_class\":\"task-frame\"",
+            "\"region_class\":\"call\"",
+            "\"region_class\":\"request\"",
+            "\"region_class\":\"pool\"",
+            "\"region_class\":\"static\"",
+        ] {
+            assert!(
+                json.contains(spelling),
+                "missing region-class spelling {spelling}"
+            );
+        }
+        assert!(json.contains(
+            "\"promotions\":[{\"allocation\":\"alloc:0:cursor\",\"source_region\":\"call\",\"destination_region\":\"pool\",\"reason\":\"moved into durable pool\",\"proof\":1}"
+        ));
+        // Repeat encode of the same validated report is byte-identical.
+        assert_eq!(report.to_json(), json);
+        // Decode round-trips to an equal report, and re-encoding stays byte-identical.
+        let decoded = decode_image_report_json(
+            json.as_bytes(),
+            &digest_build,
+            AnalysisFactLimits::standard(),
+            BackendFactLimits::standard(),
+            u64::try_from(json.len()).expect("bounded region report bytes"),
+            &|| false,
+        )
+        .expect("decode region facts");
+        assert_eq!(decoded, report);
+        assert_eq!(decoded.to_json(), json);
+    }
+
+    #[test]
+    fn region_and_promotion_facts_fail_closed_on_invalid_and_noncanonical_shapes() {
+        let digest = Sha256Digest::from_bytes([0x72; 32]);
+        let digest_build = build(digest);
+        let reject = |facts: AnalysisFacts| {
+            let request = AnalysisFactRequest {
+                build: &digest_build,
+                image_name: "image",
+                limits: AnalysisFactLimits::standard(),
+            };
+            assert!(matches!(
+                seal_analysis_facts(request, facts, &|| false),
+                Err(ReportError::InvalidFact | ReportError::NonCanonical(_))
+            ));
+        };
+
+        let mut empty_assignment_allocation = region_fact_base();
+        empty_assignment_allocation.region_assignments = vec![RegionAssignmentFact {
+            allocation: String::new(),
+            region_class: RegionClass::Image,
+        }];
+        reject(empty_assignment_allocation);
+
+        let mut duplicate_assignment = region_fact_base();
+        duplicate_assignment.region_assignments = vec![
+            RegionAssignmentFact {
+                allocation: "alloc:0".to_owned(),
+                region_class: RegionClass::Image,
+            },
+            RegionAssignmentFact {
+                allocation: "alloc:0".to_owned(),
+                region_class: RegionClass::Image,
+            },
+        ];
+        reject(duplicate_assignment);
+
+        let mut empty_promotion_allocation = region_fact_base();
+        empty_promotion_allocation.promotions = vec![PromotionFact {
+            allocation: String::new(),
+            source_region: RegionClass::Call,
+            destination_region: RegionClass::Image,
+            reason: "escapes".to_owned(),
+            proof: 0,
+        }];
+        reject(empty_promotion_allocation);
+
+        let mut empty_promotion_reason = region_fact_base();
+        empty_promotion_reason.promotions = vec![PromotionFact {
+            allocation: "alloc:0".to_owned(),
+            source_region: RegionClass::Call,
+            destination_region: RegionClass::Image,
+            reason: String::new(),
+            proof: 0,
+        }];
+        reject(empty_promotion_reason);
+
+        let mut same_region_promotion = region_fact_base();
+        same_region_promotion.promotions = vec![PromotionFact {
+            allocation: "alloc:0".to_owned(),
+            source_region: RegionClass::Image,
+            destination_region: RegionClass::Image,
+            reason: "no-op".to_owned(),
+            proof: 0,
+        }];
+        reject(same_region_promotion);
+    }
+
+    #[test]
+    fn region_and_promotion_fact_assembly_observes_cancellation() {
+        let digest = Sha256Digest::from_bytes([0x73; 32]);
+        let mut facts = region_fact_base();
+        facts.region_assignments = vec![RegionAssignmentFact {
+            allocation: "alloc:0:actor-state".to_owned(),
+            region_class: RegionClass::Image,
+        }];
+        facts.promotions = vec![PromotionFact {
+            allocation: "alloc:1:buffer".to_owned(),
+            source_region: RegionClass::TaskFrame,
+            destination_region: RegionClass::Image,
+            reason: "escapes through `self.pending`".to_owned(),
+            proof: 0,
+        }];
+        let digest_build = build(digest);
+        let request = AnalysisFactRequest {
+            build: &digest_build,
+            image_name: "image",
+            limits: AnalysisFactLimits::standard(),
+        };
+        // Cancellation observed before any work fails closed.
+        assert_eq!(
+            seal_analysis_facts(request, facts.clone(), &|| true),
+            Err(ReportError::Cancelled)
+        );
+        // Count the cancellation polls a full seal performs.
+        let polls = Cell::new(0_u64);
+        seal_analysis_facts(request, facts.clone(), &|| {
+            polls.set(
+                polls
+                    .get()
+                    .checked_add(1)
+                    .expect("bounded region cancellation polls"),
+            );
+            false
+        })
+        .expect("measure region cancellation polls");
+        let total = polls.get();
+        assert!(total > 0);
+        // Cancelling at each poll index in turn always fails closed, never a partial seal.
+        for stop in 1..=total {
+            let seen = Cell::new(0_u64);
+            assert_eq!(
+                seal_analysis_facts(request, facts.clone(), &|| {
+                    let next = seen
+                        .get()
+                        .checked_add(1)
+                        .expect("bounded region cancellation polls");
+                    seen.set(next);
+                    next == stop
+                }),
+                Err(ReportError::Cancelled)
+            );
+        }
     }
 }
