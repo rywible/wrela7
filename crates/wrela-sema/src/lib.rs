@@ -3278,6 +3278,19 @@ fn validate_exact_expression_fact(
                 )
             }) => {}
         (
+            wrela_hir::ExpressionKind::DotName { candidates, .. },
+            ExpressionResolution::Constructor {
+                ty,
+                variant: Some(variant),
+            },
+            Some(_),
+        ) if *ty == fact.ty
+            && candidates.iter().any(|candidate| {
+                exact_unit_enum_constructor_reference_matches(
+                    analysis, program, candidate, *ty, *variant,
+                )
+            }) => {}
+        (
             wrela_hir::ExpressionKind::Call { callee, arguments },
             ExpressionResolution::Constructor { ty, variant: None },
             Some(_),
@@ -3897,6 +3910,25 @@ fn exact_enum_constructor_reference_matches(
                 && (variant as usize) < variants.len()
         )
     })
+}
+
+fn exact_unit_enum_constructor_reference_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    source: &wrela_hir::ResolvedVariant,
+    ty: SemanticTypeId,
+    variant: u32,
+) -> bool {
+    exact_enum_constructor_reference_matches(analysis, program, source, ty, variant)
+        && analysis.types.get(ty.0 as usize).is_some_and(|record| {
+            matches!(
+                &record.kind,
+                SemanticTypeKind::Enumeration { variants, .. }
+                    if variants
+                        .get(variant as usize)
+                        .is_some_and(|variant| variant.fields.is_empty())
+            )
+        })
 }
 
 fn runtime_enum_arguments_supported(

@@ -9752,19 +9752,17 @@ fn analyze_closed_enum_constructor(
         })?;
     let payload_effects = match variant_payload_ty {
         None => {
-            // Unit variants resolve as *types* in this slice; constructing one
-            // (a fieldless leading-dot variant) routes through the DotName
-            // machinery, which a later slice extends. Fail closed cleanly here
-            // rather than emitting a constructor fact the DotName validator
-            // rejects.
-            return Err(runtime_type_diagnostic(
-                request,
-                call.source,
-                "semantic-runtime-enum-unit-construction-pending",
-                "constructing a unit enum variant is not yet supported at the runtime tier",
-                "this slice admits unit variants into type resolution; their construction is a later slice",
-                "construct a payload-carrying variant, or match on the value",
-            ));
+            if !call.arguments.is_empty() || call.expression != call.callee {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    call.source,
+                    "semantic-runtime-enum-unit-constructor-shape",
+                    "unit enum variant construction takes no argument list",
+                    "a fieldless variant is the complete value and has no payload call",
+                    "write the unit variant without parentheses or arguments",
+                ));
+            }
+            EffectSet(0)
         }
         Some(payload_ty) => {
             // T0.1d: a nongeneric closed enum is admitted as a variant PAYLOAD
@@ -27176,11 +27174,11 @@ fn projection_fixture():
     }
 
     #[test]
-    fn runtime_enum_all_unit_type_resolves_and_construction_fails_closed() {
+    fn runtime_enum_all_unit_type_resolves_and_constructs_leading_dot_variant() {
         // Annotating `selected: Mode` forces resolution of an all-unit enum,
-        // exercising the tag-only (`shared_payload == None`) layout branch;
-        // constructing the unit variant then fails closed cleanly (a later
-        // slice extends unit-variant construction through DotName).
+        // exercising the tag-only (`shared_payload == None`) layout branch.
+        // The fieldless leading-dot variant is a complete constructor and
+        // therefore needs no synthetic payload call.
         let source = dot_variant_actor_source(
             "pub enum Mode:\n    fast\n    slow\n\nasync fn checkpoint():\n    selected: Mode = .fast\n    pass\n\n",
         );
@@ -27191,17 +27189,32 @@ fn projection_fixture():
                 parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
                 &|| false,
             )
-            .expect("all-unit enum construction is a structured source diagnostic");
+            .expect("all-unit enum construction should analyze");
         assert!(
-            output
-                .diagnostics()
-                .iter()
-                .any(|diagnostic| diagnostic.code.as_deref()
-                    == Some("semantic-runtime-enum-unit-construction-pending")),
-            "the all-unit enum type must resolve, then unit construction must fail closed: {:?}",
+            output.diagnostics().is_empty(),
+            "the all-unit enum type and leading-dot unit construction must resolve: {:?}",
             output.diagnostics()
         );
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn runtime_unit_variant_argument_list_fails_closed() {
+        let source = dot_variant_actor_source(
+            "pub enum Mode:\n    fast\n    slow\n\nasync fn checkpoint():\n    selected: Mode = .fast()\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("unit variant calls are a structured source diagnostic");
         assert!(output.has_errors());
+        assert!(output.diagnostics().iter().any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("semantic-runtime-enum-unit-constructor-shape")
+        }));
     }
 
     #[test]

@@ -191,10 +191,11 @@ D2 need this scope substantially complete; B10 needs F5.
 | 1 | B4a cleanup DAG sema analysis | — | **landed** 43d3e279 — free-call scope protocols/calls, lexical activations, reverse-source cleanup DAG + `CleanupAcyclic`, synthetic cycle detector, and named await/receiver/outside-`with` rejections; pass-only cleanup bodies and no lowering (`semantic-with-cleanup-lowering-pending`) |
 | 0 | **T0.1 general nongeneric ADTs — COMPLETE** | — | **landed** — enum type resolution: unit + mixed-arity + heterogeneous-scalar + flat-struct + nongeneric-enum payloads, tagged-union max-slot layout, structural cycle rejection |
 | 0 | · T0.1a unit variants | — | landed ce8385e6 |
+| 0 | · T0.1 unit leading-dot construction tail | T0.1a | **landed in this slice** — fieldless `.variant` constructs directly; an argument list stays named fail-closed as `semantic-runtime-enum-unit-constructor-shape` (`runtime_enum_all_unit_type_resolves_and_constructs_leading_dot_variant`, `runtime_unit_variant_argument_list_fails_closed`) |
 | 0 | · T0.1b heterogeneous scalar payloads | T0.1a | landed 4b5f125a |
 | 0 | · T0.1c flat-struct payloads | T0.1b | landed c509694d |
 | 0 | · T0.1d enum payloads + cycle rejection | T0.1c | landed 0b953537 |
-| 0 | T0.1 deferred tails (fail-closed) | T0.1 | nominal/enum **construction** + **lowering**, generic/view/tuple/array payloads, unit-variant DotName construction — all named-diagnostic fail-closed |
+| 0 | T0.1 deferred tails (fail-closed) | T0.1 | nominal enum-payload **construction** + **lowering**, generic/view/tuple/array payloads — all named-diagnostic fail-closed |
 | 0 | T0.2 ephemeral type kind | T0.1 + a **producer** | **producer-gated** — needs views (B1) or `try send` (B5c) to exercise the `?`-vs-`match`/`is` rule end to end |
 
 | 0 | T0.3 generics/monomorphization (A6) | T0.1 | **scope correction required** — start with type-only generic flat-struct specialization; preserve existing parsed/HIR `region` generics unchanged but exclude region substitution until the source spec (which says no surface region parameter) and normative syntax fixture are reconciled |
