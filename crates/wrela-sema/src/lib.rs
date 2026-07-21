@@ -3006,12 +3006,31 @@ fn exact_source_function_specialization_matches(
     if source.generics.is_empty() {
         return function.generic_arguments.is_empty();
     }
+    let receiver_declaration = crate::interfaces::receiver_concrete_struct(program, declaration);
+    let is_free_function = matches!(
+        declaration_record.owner,
+        wrela_hir::DeclarationOwner::Module(_)
+    ) && source.parameters.iter().all(|parameter| {
+        program
+            .parameter(*parameter)
+            .is_some_and(|parameter| !parameter.receiver)
+    });
+    let is_concrete_method = receiver_declaration.is_some()
+        && source
+            .parameters
+            .first()
+            .and_then(|parameter| program.parameter(*parameter))
+            .is_some_and(|parameter| {
+                parameter.receiver && parameter.access == wrela_hir::AccessMode::Read
+            })
+        && source.parameters.iter().skip(1).all(|parameter| {
+            program
+                .parameter(*parameter)
+                .is_some_and(|parameter| !parameter.receiver)
+        });
     if source.color != FunctionColor::Sync
         || function.role != FunctionRole::Ordinary
-        || !matches!(
-            declaration_record.owner,
-            wrela_hir::DeclarationOwner::Module(_)
-        )
+        || !(is_free_function || is_concrete_method)
         || source.generics.len() != function.generic_arguments.len()
         || source.generics.len() > 26
         || source.parameters.len() != function.parameters.len()
@@ -3064,15 +3083,31 @@ fn exact_source_function_specialization_matches(
             let Some(parameter) = program.parameter(*parameter_id) else {
                 return false;
             };
-            !parameter.receiver
-                && parameter.ty.as_ref().is_some_and(|ty| {
-                    exact_generic_signature_source_type(
-                        analysis,
-                        ty,
-                        &source.generics,
-                        &function.generic_arguments,
-                    ) == Some(semantic.ty)
-                })
+            if parameter.receiver {
+                let Some(receiver_declaration) = receiver_declaration else {
+                    return false;
+                };
+                return semantic.access == AccessMode::Read
+                    && analysis.types.get(semantic.ty.0 as usize).is_some_and(|ty| {
+                        exact_flat_structure_type_matches(analysis, program, ty)
+                            && matches!(
+                                &ty.kind,
+                                SemanticTypeKind::Structure {
+                                    declaration,
+                                    arguments,
+                                    ..
+                                } if *declaration == receiver_declaration && arguments.is_empty()
+                            )
+                    });
+            }
+            parameter.ty.as_ref().is_some_and(|ty| {
+                exact_generic_signature_source_type(
+                    analysis,
+                    ty,
+                    &source.generics,
+                    &function.generic_arguments,
+                ) == Some(semantic.ty)
+            })
         })
 }
 
@@ -6285,7 +6320,6 @@ fn exact_method_call_bindings_match(
         });
     if unique_visible_target != Ok(Some(target_declaration))
         || target_function.color != wrela_hir::FunctionColor::Sync
-        || !target_function.generic_arguments.is_empty()
         || receiver_access != AccessMode::Read
         || target_function.parameters.len() != bindings.len().saturating_add(1)
         || source_arguments.len() != bindings.len()
@@ -6712,7 +6746,6 @@ fn exact_concrete_method_reference_matches(
         != Some(*receiver_declaration)
         || crate::interfaces::declaration_name(program, declaration) != Some(name.as_str())
         || target_record.color != FunctionColor::Sync
-        || !target_record.generic_arguments.is_empty()
         || target_record.parameters.first().is_none_or(|parameter| {
             parameter.access != AccessMode::Read || parameter.ty != base_fact.ty
         })

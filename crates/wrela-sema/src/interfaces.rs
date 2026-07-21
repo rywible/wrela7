@@ -5,10 +5,12 @@
 //!
 //! Scope is deliberately narrow: non-generic `interface` declarations,
 //! `impl Interface for ConcreteStruct` blocks whose method bodies are
-//! ordinary ideas, and desugaring of `+ - < <= > >=` on a nominal struct type
-//! with a unique visible implementation. Everything else (generic
-//! interfaces/impls, generic bounds, enum/non-struct targets) fails closed
-//! with a stable diagnostic from this module.
+//! ordinary ideas, alpha-equivalent ordered unbounded type parameters owned by
+//! an interface requirement and its concrete impl method, and desugaring of
+//! `+ - < <= > >=` on a nominal struct type with a unique visible
+//! implementation. Everything else (generic interfaces/impl targets, generic
+//! bounds, enum/non-struct targets) fails closed with a stable diagnostic from
+//! this module.
 //!
 //! This module is a pure function of the whole-image HIR: it never consults
 //! or mutates analysis state, so both the runtime tier (`analyzer.rs`) and
@@ -272,12 +274,14 @@ fn identify_ops_interface(
 enum ConcreteTypeRef {
     Declaration(DeclarationId),
     Builtin(wrela_hir::Builtin),
+    MethodTypeParameter(usize),
 }
 
 fn concrete_type_ref(
     ty: &TypeExpression,
     self_owner: DeclarationId,
     implementing_type: DeclarationId,
+    method_generics: &[wrela_hir::GenericParameterId],
 ) -> Option<ConcreteTypeRef> {
     match &ty.kind {
         TypeExpressionKind::SelfType { owner } if *owner == self_owner => {
@@ -291,6 +295,13 @@ fn concrete_type_ref(
             definition: Definition::Builtin(builtin),
             arguments,
         } if arguments.is_empty() => Some(ConcreteTypeRef::Builtin(*builtin)),
+        TypeExpressionKind::Named {
+            definition: Definition::Generic(generic),
+            arguments,
+        } if arguments.is_empty() => method_generics
+            .iter()
+            .position(|candidate| candidate == generic)
+            .map(ConcreteTypeRef::MethodTypeParameter),
         _ => None,
     }
 }
@@ -325,8 +336,35 @@ fn implementation_signature_matches(
     if interface_function.color != impl_function.color {
         return false;
     }
-    if !interface_function.generics.is_empty() || !impl_function.generics.is_empty() {
+    if interface_function.generics.len() != impl_function.generics.len()
+        || interface_function.generics.len() > 26
+    {
         return false;
+    }
+    for (interface_generic, impl_generic) in interface_function
+        .generics
+        .iter()
+        .zip(&impl_function.generics)
+    {
+        let (Some(interface_generic), Some(impl_generic)) = (
+            program.generic_parameter(*interface_generic),
+            program.generic_parameter(*impl_generic),
+        ) else {
+            return false;
+        };
+        if interface_generic.owner != requirement
+            || impl_generic.owner != member
+            || !matches!(
+                interface_generic.kind,
+                wrela_hir::GenericParameterKind::Type { bound: None }
+            )
+            || !matches!(
+                impl_generic.kind,
+                wrela_hir::GenericParameterKind::Type { bound: None }
+            )
+        {
+            return false;
+        }
     }
     if interface_function.parameters.len() != impl_function.parameters.len() {
         return false;
@@ -359,8 +397,18 @@ fn implementation_signature_matches(
             return false;
         };
         match (
-            concrete_type_ref(interface_ty, interface_declaration, implementing_type),
-            concrete_type_ref(impl_ty, impl_declaration, implementing_type),
+            concrete_type_ref(
+                interface_ty,
+                interface_declaration,
+                implementing_type,
+                &interface_function.generics,
+            ),
+            concrete_type_ref(
+                impl_ty,
+                impl_declaration,
+                implementing_type,
+                &impl_function.generics,
+            ),
         ) {
             (Some(left), Some(right)) if left == right => {}
             _ => return false,
@@ -370,8 +418,18 @@ fn implementation_signature_matches(
         (None, None) => true,
         (Some(interface_ty), Some(impl_ty)) => matches!(
             (
-                concrete_type_ref(interface_ty, interface_declaration, implementing_type),
-                concrete_type_ref(impl_ty, impl_declaration, implementing_type),
+                concrete_type_ref(
+                    interface_ty,
+                    interface_declaration,
+                    implementing_type,
+                    &interface_function.generics,
+                ),
+                concrete_type_ref(
+                    impl_ty,
+                    impl_declaration,
+                    implementing_type,
+                    &impl_function.generics,
+                ),
             ),
             (Some(left), Some(right)) if left == right
         ),
