@@ -9109,47 +9109,90 @@ fn ensure_closed_scalar_enum_type(
             TypeExpressionKind::Named {
                 definition: Definition::Builtin(_),
                 arguments,
-            } if arguments.is_empty() => semantic_type_from_source(
-                request,
-                partial,
-                &field.ty,
-                &mut *aggregate_work,
-                is_cancelled,
-            )?,
+            } if arguments.is_empty() => {
+                let payload = semantic_type_from_source(
+                    request,
+                    partial,
+                    &field.ty,
+                    &mut *aggregate_work,
+                    is_cancelled,
+                )?;
+                let payload_record = partial
+                    .types
+                    .get(payload.0 as usize)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                if payload_record.linearity != Linearity::ScalarCopy
+                    || !matches!(
+                        payload_record.kind,
+                        SemanticTypeKind::Bool
+                            | SemanticTypeKind::Integer { .. }
+                            | SemanticTypeKind::Float { bits: 32 | 64 }
+                    )
+                {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        field.source,
+                        "semantic-runtime-enum-payload-type",
+                        "runtime enum payload is not a supported copy scalar",
+                        "each variant payload must be a stored boolean, integer, or floating-point scalar",
+                        "use one primitive boolean, integer, or floating-point payload type",
+                    ));
+                }
+                payload
+            }
+            // A flat-struct (nongeneric, all-scalar-field) nominal payload is
+            // admitted as a variant's single field. `ensure_flat_structure_type`
+            // enforces the flat-scalar subset and fails closed
+            // (`semantic-runtime-aggregate-not-supported`) on any structure it
+            // does not accept. A flat struct stores only scalars, so it can
+            // never transitively contain this enum: no payload recursion is
+            // possible. Enum, view, generic, tuple, and array payloads stay
+            // rejected in the fallthrough arm.
+            TypeExpressionKind::Named {
+                definition: Definition::Declaration(resolved),
+                arguments,
+            } if arguments.is_empty() => {
+                let payload_declaration = request
+                    .hir
+                    .resolved_declaration(resolved)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                if !matches!(payload_declaration.kind, DeclarationKind::Structure(_)) {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        field.source,
+                        "semantic-runtime-enum-payload-type",
+                        "runtime enum payload is not a supported copy scalar or flat struct",
+                        "nested enum, generic, view, and non-structure nominal payloads require later ownership lowering",
+                        "use one primitive scalar or one flat scalar-backed structure payload type",
+                    ));
+                }
+                ensure_flat_structure_type(
+                    request,
+                    partial,
+                    payload_declaration.id,
+                    &mut *aggregate_work,
+                    is_cancelled,
+                )?
+            }
             _ => {
                 return Err(runtime_type_diagnostic(
                     request,
                     field.source,
                     "semantic-runtime-enum-payload-type",
-                    "runtime enum payload is not a supported copy scalar",
-                    "nested, generic, view, and nominal payloads require later ownership lowering",
-                    "use one primitive boolean, integer, or floating-point payload type",
+                    "runtime enum payload is not a supported copy scalar or flat struct",
+                    "nested, generic, view, tuple, and array payloads require later ownership lowering",
+                    "use one primitive scalar or one flat scalar-backed structure payload type",
                 ));
             }
         };
+        // Fold this variant's payload (scalar OR flat struct) size and alignment
+        // into the shared tagged-union slot maxima. Both the scalar path and
+        // `ensure_flat_structure_type` populate `size_upper_bound`, so the union
+        // layout generalizes to nominal payloads with no layout-code change.
         let payload_record = partial
             .types
             .get(payload.0 as usize)
             .ok_or(AnalysisFailure::RequestMismatch)?;
-        if payload_record.linearity != Linearity::ScalarCopy
-            || !matches!(
-                payload_record.kind,
-                SemanticTypeKind::Bool
-                    | SemanticTypeKind::Integer { .. }
-                    | SemanticTypeKind::Float { bits: 32 | 64 }
-            )
-        {
-            return Err(runtime_type_diagnostic(
-                request,
-                field.source,
-                "semantic-runtime-enum-payload-type",
-                "runtime enum payload is not a supported copy scalar",
-                "each variant payload must be a stored boolean, integer, or floating-point scalar",
-                "use one primitive boolean, integer, or floating-point payload type",
-            ));
-        }
-        // Heterogeneous payloads are admitted: fold this variant's own scalar
-        // size and alignment into the shared tagged-union slot maxima.
         let payload_size = payload_record
             .size_upper_bound
             .ok_or(AnalysisFailure::RequestMismatch)?;
@@ -23962,12 +24005,20 @@ fn projection_fixture():
         );
     }
 
+    // --- T0.1c: flat-struct nominal payloads in enum variants ---
+
     #[test]
-    fn runtime_enum_rejects_nominal_payload_variant() {
-        // Nominal (struct) payloads remain a later slice: they require
-        // ownership lowering and must still fail closed at type resolution.
+    fn runtime_enum_admits_flat_struct_payload_and_layout_folds_struct() {
+        // A flat-struct (nongeneric, all-scalar-field) payload is now admitted
+        // as a variant's single field. `Detail { code: u32 }` has size 4,
+        // alignment 4; the enum `Report` (unit `empty`, `filled(Detail)`) becomes
+        // a tagged union: one-byte tag padded to a 4-aligned 4-byte payload slot
+        // => size 8, alignment 4. The struct size/alignment come from
+        // `ensure_flat_structure_type`, so the union layout folds it with no
+        // layout-code change. Construction is exercised in a sibling test; here
+        // we assert the enum resolves as a type with the struct-derived layout.
         let source = dot_variant_actor_source(
-            "pub struct Point:\n    pub x: u32\n\npub enum Wrap:\n    boxed(Point)\n\nasync fn checkpoint():\n    state: Wrap = .boxed(Point(x=1))\n    pass\n\n",
+            "pub struct Detail:\n    code: u32\n\npub enum Report:\n    empty\n    filled(Detail)\n\nasync fn checkpoint():\n    state: Report = .filled(Detail(code=1))\n    pass\n\n",
         );
         let fixture = parsed_actor_fixture(&source);
         let changes = no_changes();
@@ -23976,14 +24027,125 @@ fn projection_fixture():
                 parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
                 &|| false,
             )
-            .expect("a nominal-payload variant is a structured source diagnostic");
+            .expect(
+                "a flat-struct-payload enum should analyze to an image or a structured diagnostic",
+            );
+        // The enum must resolve as a semantic type regardless of whether the
+        // construction sub-expression lands clean or fails closed (asserted in
+        // the sibling test); the old nominal-payload rejection must NOT fire.
+        assert!(
+            !output
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_deref()
+                    == Some("semantic-runtime-enum-payload-type")),
+            "a flat-struct payload must be admitted, not rejected as an unsupported payload type: {:?}",
+            output.diagnostics()
+        );
+        let report = output
+            .partial()
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(&ty.kind, SemanticTypeKind::Enumeration { variants, .. }
+                if variants.iter().any(|variant| variant.name == "empty")
+                    && variants.iter().any(|variant| variant.name == "filled"))
+            })
+            .expect("the flat-struct-payload `Report` enum must resolve as a semantic type");
+        assert_eq!(
+            report.size_upper_bound,
+            Some(8),
+            "unit/`Detail(u32)` union: one-byte tag + 4-byte struct payload aligned to 4 => 8 bytes",
+        );
+        assert_eq!(
+            report.alignment_lower_bound, 4,
+            "the union adopts the struct payload alignment (u32 => 4)",
+        );
+    }
+
+    #[test]
+    fn runtime_enum_flat_struct_payload_construction_analyzes_clean() {
+        // Constructing a struct-payload variant `.filled(Detail(code=1))`: the
+        // constructor sets `variant_payload_ty` to the `Detail` struct type and
+        // analyzes the payload expression against it via `analyze_runtime_expression`.
+        // Flat struct-value construction is already plumbed at the runtime tier,
+        // so the payload analyzes CLEANLY (this is the landed behavior; there is
+        // no panic and no internal invariant, so no
+        // `semantic-runtime-enum-struct-payload-construction-pending` guard is
+        // needed this slice).
+        let source = dot_variant_actor_source(
+            "pub struct Detail:\n    code: u32\n\npub enum Report:\n    empty\n    filled(Detail)\n\nasync fn checkpoint():\n    state: Report = .filled(Detail(code=1))\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("struct-payload variant construction should analyze");
+        assert!(
+            output.diagnostics().is_empty(),
+            "constructing `.filled(Detail(code=1))` must analyze cleanly, not fail closed: {:?}",
+            output.diagnostics()
+        );
+        assert!(
+            output.successful().is_some(),
+            "clean struct-payload construction yields a complete image",
+        );
+    }
+
+    #[test]
+    fn runtime_enum_rejects_enum_payload_variant() {
+        // Nested-enum payloads remain a later slice (they require ownership
+        // lowering) and must still fail closed at type resolution: only flat
+        // structs and scalars are admitted this slice.
+        let source = dot_variant_actor_source(
+            "pub enum Inner:\n    a\n    b\n\npub enum Outer:\n    wrap(Inner)\n\nasync fn checkpoint():\n    state: Outer = .wrap(.a)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("an enum-payload variant is a structured source diagnostic");
         assert!(
             output
                 .diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic.code.as_deref()
                     == Some("semantic-runtime-enum-payload-type")),
-            "a struct-payload variant must still fail closed: {:?}",
+            "an enum-payload variant must still fail closed: {:?}",
+            output.diagnostics()
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn runtime_enum_rejects_view_payload_variant() {
+        // Borrowed-view payloads remain fail-closed: a view cannot escape into
+        // runtime value state, so `flagged(view u32)` must reject at the enum
+        // payload boundary with the same payload-type diagnostic.
+        let source = dot_variant_actor_source(
+            "pub enum Viewed:\n    flagged(view u32)\n\nasync fn checkpoint():\n    state: Viewed = .flagged(0)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("a view-payload variant is a structured source diagnostic");
+        assert!(
+            output
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_deref()
+                    == Some("semantic-runtime-enum-payload-type")),
+            "a view-payload variant must still fail closed: {:?}",
             output.diagnostics()
         );
         assert!(output.has_errors());

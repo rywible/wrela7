@@ -1829,6 +1829,30 @@ fn validate_supported_source_type(
                     "semantic-enum-heterogeneous-lowering-pending (per-variant differing scalar enum payloads)",
                 ));
             }
+            // A flat-struct (nominal) payload resolves at the sema tier (T0.1c),
+            // but the machine lowering that packs a struct into the shared
+            // tagged-union slot is a later slice. Any variant carrying a single
+            // non-scalar payload field (only a flat struct can reach here, since
+            // sema rejects every other nominal/view/generic payload) trips this
+            // guard. Fail closed with a named diagnostic rather than falling
+            // through to the generic scalar/flat-structure rejection below or
+            // miscompiling against the scalar-slot layout assumed there.
+            // (`arguments.is_empty()` excludes the generic core Result path.)
+            if arguments.is_empty()
+                && variants.iter().any(|variant| {
+                    matches!(variant.fields.as_slice(), [field]
+                    if facts.types.get(field.ty.0 as usize).is_some_and(|field_ty| {
+                        !(field_ty.linearity == sema::Linearity::ScalarCopy
+                            && matches!(field_ty.kind, sema::SemanticTypeKind::Bool
+                                | sema::SemanticTypeKind::Integer { .. }
+                                | sema::SemanticTypeKind::Float { bits: 32 | 64 }))
+                    }))
+                })
+            {
+                return Err(unsupported(
+                    "semantic-enum-nominal-payload-lowering-pending (flat-struct nominal enum payloads)",
+                ));
+            }
             let layout = variants
                 .first()
                 .and_then(|variant| variant.fields.first())
