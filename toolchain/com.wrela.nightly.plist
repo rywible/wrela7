@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Optional local launchd agent for `cargo xtask nightly`.
+     Install with: launchctl load ~/Library/LaunchAgents/com.wrela.nightly.plist
+     after copying this file and editing WorkingDirectory / PATH. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.wrela.nightly</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>cd "$WRELA_ROOT" &amp;&amp; cargo xtask nightly</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>WRELA_ROOT</key>
+    <string>/Users/REPLACE/projects/wrela7</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/tmp/wrela-nightly.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/wrela-nightly.err</string>
+</dict>
+</plist>

@@ -17,6 +17,7 @@ xtask commands:
   test <slice|crate> [...]   cargo test for one boundary
   lint <slice|crate>         clippy -D warnings for one boundary
   gate <slice|crate> [--full]  complete locked, offline focused gate
+  nightly             clean-worktree local nightly: xgate all, xarch, native --full gates
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1040,6 +1041,22 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("nightly") => {
+            if arguments.next().is_some() {
+                eprintln!("error: xtask nightly accepts no arguments\n\n{HELP}");
+                return ExitCode::from(2);
+            }
+            match workspace_root().and_then(|root| run_nightly(&root)) {
+                Ok(report_path) => {
+                    println!("nightly report: {}", report_path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some(command) => {
             eprintln!("error: unknown xtask command `{command}`\n\n{HELP}");
             ExitCode::from(2)
@@ -1761,6 +1778,151 @@ fn configure_cargo_gate_environment(command: &mut Command) {
     // WRELA_LLVM_* environment come from the workspace .cargo/config.toml
     // [env] table, so the gate itself only needs to stay offline.
     command.env("CARGO_NET_OFFLINE", "true");
+}
+
+/// Local no-CI nightly: evaluate HEAD in a clean git worktree, run the full
+/// workspace gate plus architecture-check and every native `--full` route,
+/// and write a timestamped pass/fail report under `target/gate-reports/`.
+fn run_nightly(root: &Path) -> Result<PathBuf, String> {
+    let reports = root.join("target/gate-reports");
+    fs::create_dir_all(&reports)
+        .map_err(|error| format!("cannot create gate-reports directory: {error}"))?;
+    let stamp = nightly_stamp();
+    let worktree = root.join(format!("target/nightly-worktree-{stamp}"));
+    let report_path = reports.join(format!("nightly-{stamp}.txt"));
+    let mut report = String::new();
+    report.push_str(&format!(
+        "wrela nightly\nstamp: {stamp}\nroot: {}\n",
+        root.display()
+    ));
+
+    let mut failures = Vec::new();
+    if let Err(error) = create_nightly_worktree(root, &worktree) {
+        failures.push(format!("worktree: {error}"));
+        report.push_str(&format!("status: FAIL\nworktree: {error}\n"));
+        write_nightly_report(&report_path, &report)?;
+        return Err(format!(
+            "nightly failed; report at {}: {error}",
+            report_path.display()
+        ));
+    }
+    report.push_str(&format!("worktree: {}\n", worktree.display()));
+
+    report.push_str("step: cargo xtask gate all\n");
+    match run_gate(
+        &worktree,
+        &GateRequest {
+            target: "all".to_owned(),
+            full: false,
+        },
+    ) {
+        Ok(()) => report.push_str("  result: PASS\n"),
+        Err(error) => {
+            report.push_str(&format!("  result: FAIL\n  error: {error}\n"));
+            failures.push(format!("cargo xtask gate all: {error}"));
+        }
+    }
+
+    report.push_str("step: cargo xtask architecture-check\n");
+    match check_architecture(&worktree) {
+        Ok(()) => report.push_str("  result: PASS\n"),
+        Err(error) => {
+            report.push_str(&format!("  result: FAIL\n  error: {error}\n"));
+            failures.push(format!("cargo xtask architecture-check: {error}"));
+        }
+    }
+
+    report.push_str("step: native --full gates\n");
+    match run_nightly_full_gates(&worktree) {
+        Ok(()) => report.push_str("  result: PASS\n"),
+        Err(error) => {
+            report.push_str(&format!("  result: FAIL\n  error: {error}\n"));
+            failures.push(format!("native --full gates: {error}"));
+        }
+    }
+
+    remove_nightly_worktree(root, &worktree);
+
+    if failures.is_empty() {
+        report.push_str("status: PASS\n");
+        write_nightly_report(&report_path, &report)?;
+        Ok(report_path)
+    } else {
+        report.push_str("status: FAIL\n");
+        for failure in &failures {
+            report.push_str(&format!("failure: {failure}\n"));
+        }
+        write_nightly_report(&report_path, &report)?;
+        Err(format!(
+            "nightly failed; report at {}: {}",
+            report_path.display(),
+            failures.join("; ")
+        ))
+    }
+}
+
+fn nightly_stamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos}")
+}
+
+fn create_nightly_worktree(root: &Path, worktree: &Path) -> Result<(), String> {
+    if worktree.exists() {
+        return Err(format!(
+            "nightly worktree path already exists: {}",
+            worktree.display()
+        ));
+    }
+    let status = Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "--detach",
+            &worktree.display().to_string(),
+            "HEAD",
+        ])
+        .current_dir(root)
+        .status()
+        .map_err(|error| format!("cannot create nightly worktree: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("git worktree add failed with {status}"))
+    }
+}
+
+fn remove_nightly_worktree(root: &Path, worktree: &Path) {
+    let _ = Command::new("git")
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            &worktree.display().to_string(),
+        ])
+        .current_dir(root)
+        .status();
+    let _ = fs::remove_dir_all(worktree);
+}
+
+fn run_nightly_full_gates(root: &Path) -> Result<(), String> {
+    let metadata = resolved_cargo_metadata(root)?;
+    for slice in DEVELOPMENT_SLICES {
+        if slice.full_route == FullRoute::None {
+            continue;
+        }
+        let target = gate_target(slice.name)?;
+        let closure = validate_gate_closure(&target, &metadata)?;
+        run_full_route(root, &target, &closure)?;
+    }
+    Ok(())
+}
+
+fn write_nightly_report(path: &Path, body: &str) -> Result<(), String> {
+    fs::write(path, body).map_err(|error| format!("cannot write nightly report: {error}"))
 }
 
 fn run_full_route(root: &Path, target: &GateTarget, closure: &GateClosure) -> Result<(), String> {
