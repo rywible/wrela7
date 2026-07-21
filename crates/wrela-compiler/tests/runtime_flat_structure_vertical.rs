@@ -203,6 +203,31 @@ fn native_pair_field_update_runs():
     return
 "#;
 
+const NATIVE_PAIR_JOIN_SOURCE: &str = r#"module app.duration
+
+pub struct Pair:
+    pub count: u32
+    pub total: u64
+
+pub fn update_across_branch(choose: bool) -> u64:
+    value: Pair = Pair(count=1, total=2)
+    if choose:
+        value.total = 9
+    else:
+        value.total = 7
+    return value.total
+"#;
+
+const NATIVE_PAIR_JOIN_TEST_SOURCE: &str = r#"module app.duration_test
+
+from app.duration import update_across_branch
+
+@test(runtime)
+fn native_pair_survives_branch_join():
+    value: u64 = update_across_branch(true)
+    return
+"#;
+
 struct Fixture {
     hir: Arc<wrela_hir::ValidatedProgram>,
     target: TargetPackage,
@@ -905,6 +930,77 @@ fn two_field_flat_local_reaches_unpacked_machine_wir_and_deterministic_coff() {
                 first.bytes(),
                 second.bytes(),
                 "identical two-field MachineWir emits byte-identical ARM64 COFF"
+            );
+        }
+    }
+}
+
+#[test]
+fn two_field_flat_local_crosses_cfg_join_and_emits_deterministically() {
+    let fixture = fixture(NATIVE_PAIR_JOIN_SOURCE, NATIVE_PAIR_JOIN_TEST_SOURCE);
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed(&fixture),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("branched two-field local lowers to SemanticWir");
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.into_parts().0,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("branched two-field local lowers to FlowWir");
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow.into_parts().0,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("branched two-field FlowWir canonical frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("two-field local crosses a MachineWir CFG join");
+    let machine = prepared.machine().wir().as_wir();
+    let pair = machine
+        .types
+        .iter()
+        .find(|ty| ty.source_name.as_deref() == Some("Pair"))
+        .expect("nominal Pair machine type");
+    assert!(matches!(pair.kind, MachineTypeKind::Struct { .. }));
+    assert!(machine.functions.iter().any(|function| {
+        function.blocks.iter().any(|block| {
+            block
+                .parameters
+                .iter()
+                .any(|parameter| function.values[parameter.0 as usize].ty == pair.id)
+        })
+    }));
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("joined two-field native object emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat joined two-field native object emission");
+            assert_eq!(
+                first.bytes(),
+                second.bytes(),
+                "identical joined aggregate MachineWir emits byte-identical ARM64 COFF"
             );
         }
     }

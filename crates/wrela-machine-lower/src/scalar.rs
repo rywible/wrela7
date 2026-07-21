@@ -3668,49 +3668,49 @@ fn validate_native_struct_locality(
     }
     for block in &function.blocks {
         check_cancelled(is_cancelled)?;
-        if block.parameters.iter().copied().any(native) {
-            return Err(unsupported(
-                "machine-flat-structure-cross-block-lowering-pending",
-            ));
-        }
         for instruction in &block.instructions {
             check_cancelled(is_cancelled)?;
-            for result in instruction
-                .results
-                .iter()
-                .copied()
-                .filter(|value| native(*value))
-            {
-                if !matches!(
+            if instruction.results.iter().copied().any(native)
+                && !matches!(
                     instruction.operation,
                     flow::FlowOperation::MakeAggregate { .. }
                         | flow::FlowOperation::InsertField { .. }
                         | flow::FlowOperation::Move { .. }
                         | flow::FlowOperation::Copy { .. }
-                ) {
+                )
+            {
+                return Err(unsupported(
+                    "machine-flat-structure-operation-lowering-pending",
+                ));
+            }
+        }
+    }
+    for value in function
+        .values
+        .iter()
+        .map(|value| value.id)
+        .filter(|value| native(*value))
+    {
+        check_cancelled(is_cancelled)?;
+        for block in &function.blocks {
+            check_cancelled(is_cancelled)?;
+            for candidate in &block.instructions {
+                check_cancelled(is_cancelled)?;
+                if flow_operation_uses_value(&candidate.operation, value)
+                    && !matches!(
+                        candidate.operation,
+                        flow::FlowOperation::InsertField { .. }
+                            | flow::FlowOperation::ExtractField { .. }
+                            | flow::FlowOperation::Move { .. }
+                            | flow::FlowOperation::Copy { .. }
+                    )
+                {
                     return Err(unsupported(
                         "machine-flat-structure-operation-lowering-pending",
                     ));
                 }
-                for use_block in &function.blocks {
-                    check_cancelled(is_cancelled)?;
-                    for candidate in &use_block.instructions {
-                        check_cancelled(is_cancelled)?;
-                        if flow_operation_uses_value(&candidate.operation, result)
-                            && use_block.id != block.id
-                        {
-                            return Err(unsupported(
-                                "machine-flat-structure-cross-block-lowering-pending",
-                            ));
-                        }
-                    }
-                    if flow_terminator_uses_value(&use_block.terminator, result) {
-                        return Err(unsupported(
-                            "machine-flat-structure-function-boundary-lowering-pending",
-                        ));
-                    }
-                }
             }
+            validate_native_struct_terminator_use(&block.terminator, value)?;
         }
     }
     check_cancelled(is_cancelled)
@@ -3841,34 +3841,36 @@ fn for_each_flow_operation_value(
     }
 }
 
-fn flow_terminator_uses_value(terminator: &flow::Terminator, sought: flow::ValueId) -> bool {
+fn validate_native_struct_terminator_use(
+    terminator: &flow::Terminator,
+    sought: flow::ValueId,
+) -> Result<(), MachineLowerError> {
     match terminator {
-        flow::Terminator::Jump { arguments, .. }
-        | flow::Terminator::Return(arguments)
-        | flow::Terminator::TailCall { arguments, .. } => arguments.contains(&sought),
-        flow::Terminator::Branch {
-            condition,
-            then_arguments,
-            else_arguments,
-            ..
-        } => {
-            *condition == sought
-                || then_arguments.contains(&sought)
-                || else_arguments.contains(&sought)
-        }
-        flow::Terminator::Switch {
-            value,
-            cases,
-            default_arguments,
-            ..
-        } => {
-            *value == sought
-                || default_arguments.contains(&sought)
-                || cases.iter().any(|case| case.arguments.contains(&sought))
-        }
-        flow::Terminator::Suspend { activation, .. } => *activation == sought,
-        flow::Terminator::Trap { detail, .. } => *detail == Some(sought),
-        flow::Terminator::Unreachable => false,
+        flow::Terminator::Jump { .. } => Ok(()),
+        flow::Terminator::Return(values) if values.contains(&sought) => Err(unsupported(
+            "machine-flat-structure-function-boundary-lowering-pending",
+        )),
+        flow::Terminator::TailCall { arguments, .. } if arguments.contains(&sought) => Err(
+            unsupported("machine-flat-structure-function-boundary-lowering-pending"),
+        ),
+        flow::Terminator::Branch { condition, .. }
+        | flow::Terminator::Switch {
+            value: condition, ..
+        } if *condition == sought => Err(unsupported(
+            "machine-flat-structure-operation-lowering-pending",
+        )),
+        flow::Terminator::Switch { .. }
+        | flow::Terminator::Branch { .. }
+        | flow::Terminator::Return(_)
+        | flow::Terminator::TailCall { .. }
+        | flow::Terminator::Unreachable => Ok(()),
+        flow::Terminator::Suspend { activation, .. } if *activation == sought => Err(unsupported(
+            "machine-flat-structure-operation-lowering-pending",
+        )),
+        flow::Terminator::Trap { detail, .. } if *detail == Some(sought) => Err(unsupported(
+            "machine-flat-structure-operation-lowering-pending",
+        )),
+        flow::Terminator::Suspend { .. } | flow::Terminator::Trap { .. } => Ok(()),
     }
 }
 
@@ -7734,7 +7736,7 @@ mod tests {
     }
 
     #[test]
-    fn native_flat_struct_locality_guards_boundaries_and_cross_block_uses_by_name() {
+    fn native_flat_struct_locality_admits_cfg_transfer_and_guards_boundaries_by_name() {
         let types = vec![
             flow::FlowType {
                 id: flow::TypeId(0),
@@ -7792,10 +7794,17 @@ mod tests {
                 source: None,
             },
         ];
+        validate_native_struct_locality(&types, &function, &|| false)
+            .expect("native flat structures may cross exact typed CFG edges");
+
+        let mut unsupported_use = function.clone();
+        unsupported_use.blocks[1].instructions[0].operation = flow::FlowOperation::Drop {
+            value: flow::ValueId(0),
+        };
         assert_eq!(
-            validate_native_struct_locality(&types, &function, &|| false),
+            validate_native_struct_locality(&types, &unsupported_use, &|| false),
             Err(MachineLowerError::UnsupportedInput {
-                feature: "machine-flat-structure-cross-block-lowering-pending",
+                feature: "machine-flat-structure-operation-lowering-pending",
             })
         );
 
