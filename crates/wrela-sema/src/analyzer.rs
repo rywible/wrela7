@@ -918,6 +918,7 @@ impl SemanticAnalyzer for CanonicalSemanticAnalyzer {
         let mut diagnostics = census.diagnostics;
         diagnose_deriving_clauses(&request, &mut diagnostics, is_cancelled)?;
         diagnose_unsupported_initializers(&request, &mut diagnostics, is_cancelled)?;
+        diagnose_driver_handler_waits(&request, &mut diagnostics, is_cancelled)?;
         let (_, interface_diagnostics) = crate::interfaces::collect_interface_model(
             request.hir.as_program(),
             request.standard_library_package,
@@ -1316,6 +1317,156 @@ fn diagnose_unsupported_initializers(
             );
             push_diagnostic(diagnostics, diagnostic, request.limits)?;
         }
+    }
+    Ok(())
+}
+
+/// A public handler declared on a `@driver` struct, retained so the wait-for
+/// graph can reject any that self-wait.
+struct DriverHandler {
+    declaration: DeclarationId,
+    /// Qualified `Struct.method` name for the named rejection.
+    qualified_name: String,
+    /// Where the handler is declared, labelled on the rejection.
+    declaration_source: Span,
+}
+
+/// Reject any public `@driver` handler that self-waits.
+///
+/// The unified wait-for graph (design ch04 §3.1) requires that a public
+/// `@driver` handler is synchronous in revision 0.1: it validates, reserves or
+/// rejects, publishes, and returns without awaiting, so a driver never waits
+/// for work whose producer needs the same driver. This is a declaration-level
+/// property of the handler body: it holds whether or not the driver is ever
+/// installed into an image, so it is decided here, before image evaluation and
+/// independent of the (separate) driver-installation fail-closed. Any `await`
+/// reachable inside a public driver handler is a named rejection that points at
+/// the suspension point and names the offending handler.
+fn diagnose_driver_handler_waits(
+    request: &AnalysisRequest<'_>,
+    diagnostics: &mut Vec<Diagnostic>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), AnalysisFailure> {
+    let program = request.hir.as_program();
+    let mut handlers: Vec<DriverHandler> = Vec::new();
+    for declaration in &program.declarations {
+        check_cancelled(is_cancelled)?;
+        let DeclarationKind::Structure(aggregate) = &declaration.kind else {
+            continue;
+        };
+        let is_driver = declaration.attributes.iter().any(|attribute| {
+            attribute.identity
+                == wrela_hir::AttributeIdentity::Builtin(wrela_hir::BuiltinAttribute::Driver)
+        });
+        if !is_driver {
+            continue;
+        }
+        let struct_name = declaration
+            .name
+            .as_ref()
+            .map(wrela_hir::Name::as_str)
+            .unwrap_or("<driver>");
+        for member_id in &aggregate.members {
+            check_cancelled(is_cancelled)?;
+            let Some(member) = program.declaration(*member_id) else {
+                continue;
+            };
+            if member.visibility != wrela_hir::Visibility::Public {
+                continue;
+            }
+            let DeclarationKind::Function(_) = &member.kind else {
+                continue;
+            };
+            let method_name = member
+                .name
+                .as_ref()
+                .map(wrela_hir::Name::as_str)
+                .unwrap_or("<handler>");
+            let qualified_name = format!("{struct_name}.{method_name}");
+            if u64::try_from(qualified_name.len()).unwrap_or(u64::MAX) > request.limits.fact_bytes {
+                return Err(AnalysisFailure::ResourceLimit {
+                    resource: "driver handler name bytes",
+                    limit: request.limits.fact_bytes,
+                });
+            }
+            handlers
+                .try_reserve(1)
+                .map_err(|_| AnalysisFailure::ResourceLimit {
+                    resource: "driver handlers",
+                    limit: u64::from(request.limits.image_nodes),
+                })?;
+            handlers.push(DriverHandler {
+                declaration: *member_id,
+                qualified_name,
+                declaration_source: member.source,
+            });
+        }
+    }
+    if handlers.is_empty() {
+        return Ok(());
+    }
+    // Attribute the first `await` of each handler to it in one ordered pass over
+    // the expression arena, so the rejection span is deterministic.
+    let mut first_wait: Vec<Option<Span>> = Vec::new();
+    first_wait
+        .try_reserve_exact(handlers.len())
+        .map_err(|_| AnalysisFailure::ResourceLimit {
+            resource: "driver handlers",
+            limit: u64::from(request.limits.image_nodes),
+        })?;
+    first_wait.resize(handlers.len(), None);
+    for expression in &program.expressions {
+        check_cancelled(is_cancelled)?;
+        if !matches!(
+            expression.kind,
+            ExpressionKind::Unary {
+                operator: wrela_hir::UnaryOperator::Await,
+                ..
+            }
+        ) {
+            continue;
+        }
+        let Some(owner) = expression_owner_declaration(program, expression.owner) else {
+            continue;
+        };
+        if let Some(index) = handlers
+            .iter()
+            .position(|handler| handler.declaration == owner)
+            && first_wait[index].is_none()
+        {
+            first_wait[index] = Some(expression.source);
+        }
+    }
+    for (handler, source) in handlers.iter().zip(first_wait.iter()) {
+        check_cancelled(is_cancelled)?;
+        let Some(source) = *source else {
+            continue;
+        };
+        let mut diagnostic = Diagnostic::error(
+            Category::ASYNC,
+            source,
+            format!(
+                "public @driver handler `{}` self-waits at `await`; revision 0.1 driver handlers are synchronous and never self-wait",
+                handler.qualified_name
+            ),
+        );
+        diagnostic.code = Some("semantic-driver-handler-waits".to_owned());
+        diagnostic.labels.push(wrela_diagnostics::Label {
+            span: handler.declaration_source,
+            message: format!(
+                "driver handler `{}` is declared here",
+                handler.qualified_name
+            ),
+        });
+        diagnostic.notes.push(
+            "a driver owns hardware authority; if a handler suspended it could wait on work whose producer needs the same driver, closing a wait-for cycle"
+                .to_owned(),
+        );
+        diagnostic.help.push(
+            "make the driver handler synchronous — validate, reserve or reject, publish, and return a receipt without awaiting"
+                .to_owned(),
+        );
+        push_diagnostic(diagnostics, diagnostic, request.limits)?;
     }
     Ok(())
 }
@@ -18678,8 +18829,16 @@ pub fn boot() -> Image:
             "pub async fn ping(mut self, read borrowed: u32):",
         );
         let zero_mailbox = BOUNDED_ACTOR_SOURCE.replace("mailbox=2", "mailbox=0");
+        // A driver whose public handler is synchronous still fails closed at
+        // installation (drivers are not yet installable). The complementary
+        // case — a driver whose public handler self-waits at `await` — is
+        // rejected earlier, at declaration granularity, and is pinned by
+        // `wait_for_graph_vertical.rs::driver_handler_self_wait_...`.
         let driver = BOUNDED_ACTOR_SOURCE
-            .replace("@service\npub struct Worker", "@driver\npub struct Worker")
+            .replace(
+                "@service\npub struct Worker:\n    pub async fn ping(mut self):\n        await checkpoint()",
+                "@driver\npub struct Worker:\n    pub fn ping(mut self):\n        pass",
+            )
             .replace("img.service(Worker", "img.driver(Worker");
         for (source, code, category) in [
             (
@@ -18728,6 +18887,47 @@ pub fn boot() -> Image:
                 limit: 1,
             })
         ));
+    }
+
+    #[test]
+    fn public_driver_handler_that_self_waits_is_rejected_before_image_evaluation() {
+        // A `@driver` struct declared but never installed still rejects: the
+        // self-wait is a declaration-level property of the public handler, so
+        // the named rejection fires before (and instead of) the driver-install
+        // fail-closed. The private helper's await is not a public handler and
+        // must not be the thing that rejects.
+        const SELF_WAIT_DRIVER: &str = "@driver\npub struct Worker:\n    pub async fn ping(mut self):\n        await checkpoint()";
+        let source = BOUNDED_ACTOR_SOURCE
+            .replace(
+                "@service\npub struct Worker:\n    pub async fn ping(mut self):\n        await checkpoint()",
+                SELF_WAIT_DRIVER,
+            )
+            .replace("img.service(Worker", "img.driver(Worker");
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("self-waiting driver source is recoverable");
+        assert!(output.successful().is_none());
+        let diagnostic = output
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code.as_deref() == Some("semantic-driver-handler-waits"))
+            .expect("self-waiting public driver handler is a named rejection");
+        assert_eq!(diagnostic.category, Category::ASYNC);
+        assert!(diagnostic.message.contains("Worker.ping"));
+        assert!(diagnostic.primary.range.end > diagnostic.primary.range.start);
+        assert!(
+            output
+                .diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code.as_deref()
+                    != Some("semantic-hardware-actor-not-supported")),
+            "declaration-level self-wait rejection pre-empts the install fail-closed"
+        );
     }
 
     #[test]
