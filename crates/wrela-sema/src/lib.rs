@@ -45,6 +45,7 @@ id_type!(TaskId);
 id_type!(DeviceId);
 id_type!(PoolId);
 id_type!(RegionId);
+id_type!(ProjectionProtocolId);
 id_type!(ScopeProtocolId);
 id_type!(BrandId);
 id_type!(ProofId);
@@ -112,6 +113,7 @@ pub struct AnalysisLimits {
     pub values: u32,
     pub expression_facts: u32,
     pub statement_facts: u32,
+    pub projection_protocols: u32,
     pub scope_protocols: u32,
     pub scope_activations: u32,
     pub image_nodes: u32,
@@ -151,6 +153,7 @@ impl AnalysisLimits {
             values: 64_000_000,
             expression_facts: 64_000_000,
             statement_facts: 64_000_000,
+            projection_protocols: 4_000_000,
             scope_protocols: 4_000_000,
             scope_activations: 16_000_000,
             image_nodes: 16_000_000,
@@ -185,6 +188,7 @@ impl AnalysisLimits {
             || self.values == 0
             || self.expression_facts == 0
             || self.statement_facts == 0
+            || self.projection_protocols == 0
             || self.scope_protocols == 0
             || self.scope_activations == 0
             || self.image_nodes == 0
@@ -819,6 +823,30 @@ pub struct Loan {
     pub source: Span,
 }
 
+/// Analysis-tier contract for one source `projection`. Provenance uses exact
+/// HIR parameter identities and is intentionally distinct from allocation
+/// [`RegionId`]s: lexical view analysis must not forge a runtime region before
+/// the region/escape producer exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionProtocol {
+    pub id: ProjectionProtocolId,
+    pub declaration: DeclarationId,
+    pub name: String,
+    pub parameters: Vec<ProjectionParameter>,
+    pub mutable: bool,
+    pub target: SemanticTypeId,
+    pub provenance: Vec<wrela_hir::ParameterId>,
+    pub body: BodyId,
+    pub proof: ProofId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectionParameter {
+    pub parameter: wrela_hir::ParameterId,
+    pub access: AccessMode,
+    pub ty: SemanticTypeId,
+}
+
 /// Fully resolved contract for one source `scope` declaration. Lowering uses
 /// these facts instead of reinterpreting attributes, types, or effects in HIR.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1101,6 +1129,7 @@ pub struct PartialAnalysis {
     pub values: Vec<SemanticValue>,
     pub expressions: Vec<ExpressionFact>,
     pub statements: Vec<StatementFact>,
+    pub projection_protocols: Vec<ProjectionProtocol>,
     pub scope_protocols: Vec<ScopeProtocol>,
     pub scope_activations: Vec<ScopeActivation>,
     pub graph: Option<ImageGraph>,
@@ -1130,6 +1159,7 @@ impl PartialAnalysis {
         if !dense(self.types.iter().map(|item| item.id.0))
             || !dense(self.functions.iter().map(|item| item.id.0))
             || !dense(self.values.iter().map(|item| item.id.0))
+            || !dense(self.projection_protocols.iter().map(|item| item.id.0))
             || !dense(self.scope_protocols.iter().map(|item| item.id.0))
             || !dense(self.proofs.iter().map(|item| item.id.0))
             || !dense(self.baked_artifacts.iter().map(|item| item.id.0))
@@ -1293,6 +1323,14 @@ impl PartialAnalysis {
             return Err(invalid("partial statement facts are not prefix-safe"));
         }
 
+        for protocol in &self.projection_protocols {
+            if !valid_projection_protocol_prefix(protocol, self) {
+                return Err(invalid(
+                    "partial projection protocol contains a dangling or inexact fact",
+                ));
+            }
+        }
+
         for protocol in &self.scope_protocols {
             if protocol.declaration.0 >= self.hir.declarations
                 || protocol.result.0 as usize >= self.types.len()
@@ -1428,6 +1466,7 @@ impl PartialAnalysis {
         if !dense(self.types.iter().map(|item| item.id.0))
             || !dense(self.functions.iter().map(|item| item.id.0))
             || !dense(self.values.iter().map(|item| item.id.0))
+            || !dense(self.projection_protocols.iter().map(|item| item.id.0))
             || !dense(self.scope_protocols.iter().map(|item| item.id.0))
             || !dense(self.proofs.iter().map(|item| item.id.0))
             || !dense(self.baked_artifacts.iter().map(|item| item.id.0))
@@ -1548,6 +1587,13 @@ impl PartialAnalysis {
             .any(|fact| !valid_statement_fact(fact, self, graph))
         {
             return Err(invalid("statement facts are incomplete or noncanonical"));
+        }
+        for protocol in &self.projection_protocols {
+            if !valid_projection_protocol_record(protocol, self, hir.as_program()) {
+                return Err(invalid(
+                    "projection protocol differs from exact HIR semantics",
+                ));
+            }
         }
         for protocol in &self.scope_protocols {
             if protocol.declaration.0 >= self.hir.declarations
@@ -6163,6 +6209,95 @@ fn valid_expression_resolution(
     }
 }
 
+fn valid_projection_protocol_record(
+    protocol: &ProjectionProtocol,
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+) -> bool {
+    let Some(declaration) = program.declaration(protocol.declaration) else {
+        return false;
+    };
+    let wrela_hir::DeclarationKind::Projection(source) = &declaration.kind else {
+        return false;
+    };
+    let wrela_hir::ProjectionCarrierKind::View { mutable, ty } = &source.carrier.kind else {
+        return false;
+    };
+    declaration.name.as_ref().map(wrela_hir::Name::as_str) == Some(protocol.name.as_str())
+        && source.generics.is_empty()
+        && source.body == Some(protocol.body)
+        && *mutable == protocol.mutable
+        && exact_runtime_source_type(analysis, ty) == Some(protocol.target)
+        && protocol.provenance == source.provenance
+        && source.provenance == source.parameters
+        && protocol.provenance.windows(2).all(|pair| pair[0] < pair[1])
+        && protocol.parameters.len() == source.parameters.len()
+        && protocol
+            .parameters
+            .iter()
+            .zip(&source.parameters)
+            .all(|(semantic, parameter_id)| {
+                semantic.parameter == *parameter_id
+                    && program
+                        .parameters
+                        .get(parameter_id.0 as usize)
+                        .is_some_and(|parameter| {
+                            !parameter.receiver
+                                && parameter.access != wrela_hir::AccessMode::Take
+                                && parameter.ty.as_ref().is_some_and(|ty| {
+                                    exact_runtime_source_type(analysis, ty) == Some(semantic.ty)
+                                })
+                                && matches!(
+                                    (parameter.access, semantic.access),
+                                    (wrela_hir::AccessMode::Value, AccessMode::Value)
+                                        | (wrela_hir::AccessMode::Read, AccessMode::Read)
+                                        | (wrela_hir::AccessMode::Mutate, AccessMode::Mutate)
+                                        | (wrela_hir::AccessMode::Take, AccessMode::Take)
+                                )
+                        })
+            })
+        && analysis
+            .proofs
+            .get(protocol.proof.0 as usize)
+            .is_some_and(|proof| {
+                proof.kind == ProofKind::ViewDoesNotEscape
+                    && proof.sources.as_slice() == [declaration.source]
+                    && proof.bound == Some(1)
+            })
+}
+
+fn valid_projection_protocol_prefix(
+    protocol: &ProjectionProtocol,
+    analysis: &PartialAnalysis,
+) -> bool {
+    protocol.declaration.0 < analysis.hir.declarations
+        && !protocol.name.trim().is_empty()
+        && protocol.body.0 < analysis.hir.bodies
+        && (protocol.target.0 as usize) < analysis.types.len()
+        && (protocol.proof.0 as usize) < analysis.proofs.len()
+        && protocol.provenance.windows(2).all(|pair| pair[0] < pair[1])
+        && protocol
+            .provenance
+            .iter()
+            .all(|parameter| parameter.0 < analysis.hir.parameters)
+        && protocol.parameters.iter().all(|parameter| {
+            parameter.parameter.0 < analysis.hir.parameters
+                && (parameter.ty.0 as usize) < analysis.types.len()
+        })
+        && !has_duplicate_ids(
+            protocol
+                .parameters
+                .iter()
+                .map(|parameter| parameter.parameter.0),
+        )
+        && analysis
+            .proofs
+            .get(protocol.proof.0 as usize)
+            .is_some_and(|proof| {
+                proof.kind == ProofKind::ViewDoesNotEscape && proof.bound == Some(1)
+            })
+}
+
 fn valid_scope_protocol_record(
     protocol: &ScopeProtocol,
     analysis: &PartialAnalysis,
@@ -6948,6 +7083,11 @@ fn validate_analysis_top_level_counts(
             limits.statement_facts,
         ),
         (
+            "projection protocols",
+            partial.projection_protocols.len(),
+            limits.projection_protocols,
+        ),
+        (
             "scope protocols",
             partial.scope_protocols.len(),
             limits.scope_protocols,
@@ -7677,6 +7817,7 @@ fn validate_fact_resources(
         partial.values.len(),
         partial.expressions.len(),
         partial.statements.len(),
+        partial.projection_protocols.len(),
         partial.scope_protocols.len(),
         partial.scope_activations.len(),
         partial.proofs.len(),
@@ -7831,6 +7972,13 @@ fn validate_fact_resources(
         meter.edges(&fact.moved_after);
         meter.edges(&fact.live_loans_after);
         meter.edges(&fact.proofs);
+        meter.enforce(limits)?;
+    }
+    for protocol in &partial.projection_protocols {
+        check_analysis_cancelled(is_cancelled)?;
+        meter.text(&protocol.name);
+        meter.edges(&protocol.parameters);
+        meter.edges(&protocol.provenance);
         meter.enforce(limits)?;
     }
     for protocol in &partial.scope_protocols {

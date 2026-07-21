@@ -360,7 +360,22 @@ dependency order once the floor supports them:
 `semantic-runtime-enum-enum-payload-construction-pending`,
 `semantic-enum-heterogeneous-lowering-pending`,
 `semantic-enum-nominal-payload-lowering-pending`,
-`semantic-driver-handler-waits`. (Plus the message change on
+`semantic-driver-handler-waits`,
+`semantic-projection-generic-pending`,
+`semantic-projection-wrapped-carrier-pending`,
+`semantic-projection-body-required`,
+`semantic-projection-receiver-call-pending`,
+`semantic-projection-source-taken`,
+`semantic-projection-await`,
+`semantic-projection-multiple-yields`,
+`semantic-projection-yield-required`,
+`semantic-projection-yield-type`,
+`semantic-projection-mutable-source`,
+`semantic-projection-body-form-pending`,
+`semantic-projection-condition-pending`,
+`semantic-projection-yield-source`,
+`semantic-projection-yield-field`, and
+`semantic-projection-lowering-pending`. (Plus the message change on
 `semantic-runtime-enum-payload-shape`: "exactly one" → "at most one".)
 
 ## 8. Progress ledger

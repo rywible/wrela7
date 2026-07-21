@@ -117,7 +117,7 @@ These are dispatched or landable immediately; none needs Tier 0.
 
 | Slice | Feature | Status |
 |---|---|---|
-| B1a | View/projection static semantics (provenance, lexical lifetime, disjointness; named negatives) | **running** |
+| B1a | View/projection static semantics (provenance, lexical lifetime, disjointness; named negatives) | **B1a.1 landed in this slice** — separate bounded lexical provenance uses exact HIR `ParameterId`s rather than fabricated `RegionId`s; bare-view declarations prove exact-one-yield path shape and mutable-source legality. Projection calls, view values/binding/consumption, lifetime/disjointness diagnostics, carrier rebound, and lowering remain open. |
 | B5b | Unified wait-for graph + `wait-cycle`/self-wait diagnostics | **running** |
 | B2a | Promotion/region report schema (`PromotionFact`/`RegionAssignmentFact`) | **running** |
 | B4a | `with`/scope sema analysis: cleanup DAG + `CleanupAcyclic` + cycle diagnostic | **dispatching** |

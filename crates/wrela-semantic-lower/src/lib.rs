@@ -286,6 +286,11 @@ fn supported_minimum(facts: &sema::PartialAnalysis) -> Result<MinimumFacts<'_>, 
             "semantic-with-cleanup-lowering-pending (scope protocols and activations)",
         ));
     }
+    if !facts.projection_protocols.is_empty() {
+        return Err(unsupported(
+            "semantic-projection-lowering-pending (projection protocols)",
+        ));
+    }
     if !facts.baked_artifacts.is_empty() {
         return Err(unsupported("baked artifacts"));
     }
@@ -399,6 +404,11 @@ fn supported_actor_image<'a>(
     if !facts.scope_protocols.is_empty() || !facts.scope_activations.is_empty() {
         return Err(unsupported(
             "semantic-with-cleanup-lowering-pending (scope protocols and activations in actor images)",
+        ));
+    }
+    if !facts.projection_protocols.is_empty() {
+        return Err(unsupported(
+            "semantic-projection-lowering-pending (projection protocols in actor images)",
         ));
     }
     if !facts.baked_artifacts.is_empty() {
@@ -1609,6 +1619,11 @@ fn supported_generated_tests<'a>(
     if !facts.scope_protocols.is_empty() || !facts.scope_activations.is_empty() {
         return Err(unsupported(
             "semantic-with-cleanup-lowering-pending (scope protocols and activations in generated tests)",
+        ));
+    }
+    if !facts.projection_protocols.is_empty() {
+        return Err(unsupported(
+            "semantic-projection-lowering-pending (projection protocols in generated tests)",
         ));
     }
     if !facts.baked_artifacts.is_empty() {

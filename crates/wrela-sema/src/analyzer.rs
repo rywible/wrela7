@@ -1026,6 +1026,13 @@ impl SemanticAnalyzer for CanonicalSemanticAnalyzer {
             }
         }
 
+        // Image and generated-entry construction still owns the initial dense
+        // semantic IDs. Projection declaration facts are image-independent, so
+        // append them only after the selected mode has populated its root. A
+        // later projection-call increment may also intern one lazily while
+        // analyzing a caller; this complete scan remains idempotent.
+        diagnose_projection_protocols(&request, &mut partial, &mut diagnostics, is_cancelled)?;
+
         cancellable_stable_sort_owned_by(
             &mut partial.expressions,
             u64::from(request.limits.expression_facts),
@@ -1156,6 +1163,7 @@ fn empty_partial(
         values: Vec::new(),
         expressions: Vec::new(),
         statements: Vec::new(),
+        projection_protocols: Vec::new(),
         scope_protocols: Vec::new(),
         scope_activations: Vec::new(),
         graph: None,
@@ -1469,6 +1477,516 @@ fn diagnose_driver_handler_waits(
         push_diagnostic(diagnostics, diagnostic, request.limits)?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionYieldSummary {
+    minimum: u32,
+    maximum: u32,
+    yields: Vec<ExpressionId>,
+}
+
+fn diagnose_projection_protocols(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    diagnostics: &mut Vec<Diagnostic>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), AnalysisFailure> {
+    let mut aggregate_work = RuntimeAggregateWork::default();
+    for declaration in &request.hir.as_program().declarations {
+        check_cancelled(is_cancelled)?;
+        if !matches!(declaration.kind, DeclarationKind::Projection(_)) {
+            continue;
+        }
+        let checkpoint = RuntimeCheckpoint::new(partial);
+        match ensure_projection_protocol(
+            request,
+            partial,
+            declaration.id,
+            &mut aggregate_work,
+            is_cancelled,
+        ) {
+            Ok(_) => {}
+            Err(RuntimeFailure::Diagnostic(diagnostic)) => {
+                checkpoint.rollback(partial);
+                push_diagnostic(diagnostics, *diagnostic, request.limits)?;
+            }
+            Err(RuntimeFailure::Analysis(error)) => {
+                checkpoint.rollback(partial);
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_projection_protocol(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    declaration: DeclarationId,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<ProjectionProtocolId> {
+    if let Some(existing) = partial
+        .projection_protocols
+        .iter()
+        .find(|protocol| protocol.declaration == declaration)
+    {
+        return Ok(existing.id);
+    }
+    let program = request.hir.as_program();
+    let declaration_record = program
+        .declaration(declaration)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let DeclarationKind::Projection(projection) = &declaration_record.kind else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    if !projection.generics.is_empty() {
+        return Err(runtime_type_diagnostic(
+            request,
+            declaration_record.source,
+            "semantic-projection-generic-pending",
+            "generic projection protocols are not yet supported",
+            "the analysis-tier projection contract currently seals nongeneric declarations",
+            "use a nongeneric free projection until generic specialization lands",
+        ));
+    }
+    let wrela_hir::ProjectionCarrierKind::View { mutable, ty } = &projection.carrier.kind else {
+        return Err(runtime_type_diagnostic(
+            request,
+            projection.carrier.source,
+            "semantic-projection-wrapped-carrier-pending",
+            "wrapped projection carriers are not yet supported",
+            "this increment seals one bare view leaf; Option/Result carrier consumption follows",
+            "return a bare view from the projection for now",
+        ));
+    };
+    let body = projection.body.ok_or_else(|| {
+        runtime_type_diagnostic(
+            request,
+            declaration_record.source,
+            "semantic-projection-body-required",
+            "projection declaration requires a body",
+            "a projection protocol must prove one yielded view on every successful path",
+            "add a projection body with exactly one yield",
+        )
+    })?;
+
+    let mut parameters = Vec::new();
+    parameters
+        .try_reserve_exact(projection.parameters.len())
+        .map_err(|_| fact_resource(request, "projection protocol parameters"))?;
+    for parameter_id in &projection.parameters {
+        check_cancelled(is_cancelled)?;
+        let parameter = program
+            .parameters
+            .get(parameter_id.0 as usize)
+            .filter(|parameter| parameter.id == *parameter_id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if parameter.receiver {
+            return Err(runtime_type_diagnostic(
+                request,
+                parameter.source,
+                "semantic-projection-receiver-call-pending",
+                "receiver projection protocols are not yet supported",
+                "method-call resolution is required to bind a projection receiver exactly",
+                "use a module-level free projection until method resolution lands",
+            ));
+        }
+        if parameter.access == wrela_hir::AccessMode::Take {
+            return Err(runtime_type_diagnostic(
+                request,
+                parameter.source,
+                "semantic-projection-source-taken",
+                "projection source parameters cannot transfer ownership",
+                "a yielded view must retain its backing source through the caller's lexical loan",
+                "use read or mut access for a projection source",
+            ));
+        }
+        let parameter_ty = semantic_type_from_source(
+            request,
+            partial,
+            parameter
+                .ty
+                .as_ref()
+                .ok_or(AnalysisFailure::RequestMismatch)?,
+            aggregate_work,
+            is_cancelled,
+        )?;
+        parameters.push(ProjectionParameter {
+            parameter: *parameter_id,
+            access: lower_access(parameter.access),
+            ty: parameter_ty,
+        });
+    }
+    if projection.provenance.as_slice() != projection.parameters.as_slice()
+        || !projection
+            .provenance
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    let target = semantic_type_from_source(request, partial, ty, aggregate_work, is_cancelled)?;
+    if scope_phase_contains_await(program, body, is_cancelled)? {
+        return Err(runtime_type_diagnostic(
+            request,
+            program
+                .body(body)
+                .map_or(declaration_record.source, |body| body.source),
+            "semantic-projection-await",
+            "projection body may not suspend",
+            "projection setup, yield, and teardown are one synchronous lexical activation",
+            "remove await from the projection body",
+        ));
+    }
+    let summary = projection_yield_summary(request, body, is_cancelled)?;
+    if summary.maximum > 1 {
+        return Err(runtime_type_diagnostic(
+            request,
+            declaration_record.source,
+            "semantic-projection-multiple-yields",
+            "projection may expose more than one active yielded view",
+            "every successful projection path must execute exactly one yield",
+            "remove the additional yield or make the paths mutually exclusive",
+        ));
+    }
+    if summary.minimum != 1 || summary.maximum != 1 {
+        return Err(runtime_type_diagnostic(
+            request,
+            declaration_record.source,
+            "semantic-projection-yield-required",
+            "bare-view projection does not yield exactly once on every path",
+            "a bare view has no unsuccessful carrier path, so every path must execute one yield",
+            "add one yield to every path",
+        ));
+    }
+    for expression in summary.yields {
+        let (yield_ty, source_parameter) = projection_yield_expression_type(
+            request,
+            partial,
+            expression,
+            &parameters,
+            is_cancelled,
+        )?;
+        if yield_ty != target {
+            return Err(runtime_type_diagnostic(
+                request,
+                program
+                    .expression(expression)
+                    .map_or(declaration_record.source, |expression| expression.source),
+                "semantic-projection-yield-type",
+                "yielded projection leaf has the wrong type",
+                "the yielded place must have exactly the carrier's declared view target type",
+                "yield a place with the declared target type",
+            ));
+        }
+        let source = parameters
+            .iter()
+            .find(|parameter| parameter.parameter == source_parameter)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if *mutable && source.access != AccessMode::Mutate {
+            return Err(runtime_type_diagnostic(
+                request,
+                program
+                    .expression(expression)
+                    .map_or(declaration_record.source, |expression| expression.source),
+                "semantic-projection-mutable-source",
+                "mutable view requires a mutable projection source",
+                "read-only provenance cannot authorize an exclusive yielded view",
+                "declare the backing projection parameter with mut access",
+            ));
+        }
+    }
+    if partial.projection_protocols.len() >= request.limits.projection_protocols as usize
+        || partial.proofs.len() >= request.limits.proofs as usize
+    {
+        return Err(fact_resource(request, "projection protocols").into());
+    }
+    let id = ProjectionProtocolId(
+        u32::try_from(partial.projection_protocols.len())
+            .map_err(|_| fact_resource(request, "projection protocols"))?,
+    );
+    let proof = ProofId(
+        u32::try_from(partial.proofs.len())
+            .map_err(|_| fact_resource(request, "projection protocol proofs"))?,
+    );
+    let name = declaration_record
+        .name
+        .as_ref()
+        .map(wrela_hir::Name::as_str)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    partial.proofs.push(Proof {
+        id: proof,
+        kind: ProofKind::ViewDoesNotEscape,
+        subject: bounded_test_fact(request, "projection protocol: ", name, is_cancelled)?,
+        sources: vec![declaration_record.source],
+        depends_on: Vec::new(),
+        bound: Some(1),
+        explanation: vec![
+            "every source path of this bare-view projection has exactly one active yield; provenance conservatively includes every declared parameter"
+                .to_owned(),
+        ],
+    });
+    partial.projection_protocols.push(ProjectionProtocol {
+        id,
+        declaration,
+        name: copy_analysis_text(name, request.limits.fact_bytes, is_cancelled)?,
+        parameters,
+        mutable: *mutable,
+        target,
+        provenance: projection.provenance.clone(),
+        body,
+        proof,
+    });
+    Ok(id)
+}
+
+fn projection_yield_summary(
+    request: &AnalysisRequest<'_>,
+    root: BodyId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<ProjectionYieldSummary> {
+    let program = request.hir.as_program();
+    let mut summaries: Vec<Option<ProjectionYieldSummary>> = Vec::new();
+    summaries
+        .try_reserve_exact(program.bodies.len())
+        .map_err(|_| fact_resource(request, "projection body summaries"))?;
+    summaries.resize(program.bodies.len(), None);
+    let mut colors = Vec::new();
+    colors
+        .try_reserve_exact(program.bodies.len())
+        .map_err(|_| fact_resource(request, "projection body colors"))?;
+    colors.resize(program.bodies.len(), 0_u8);
+    let mut stack = vec![(root, false)];
+    while let Some((body_id, exiting)) = stack.pop() {
+        check_cancelled(is_cancelled)?;
+        let index = body_id.0 as usize;
+        let body = program
+            .bodies
+            .get(index)
+            .filter(|body| body.id == body_id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if !exiting {
+            match colors[index] {
+                2 => continue,
+                1 => return Err(AnalysisFailure::RequestMismatch.into()),
+                _ => colors[index] = 1,
+            }
+            stack.push((body_id, true));
+            for statement_id in body.statements.iter().rev() {
+                let statement = program
+                    .statement(*statement_id)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                match &statement.kind {
+                    StatementKind::If {
+                        branches,
+                        else_body,
+                    } => {
+                        for (condition, _) in branches {
+                            if !matches!(
+                                program
+                                    .expression(*condition)
+                                    .map(|expression| &expression.kind),
+                                Some(ExpressionKind::Literal(wrela_hir::Literal::Boolean(_)))
+                            ) {
+                                return Err(runtime_type_diagnostic(
+                                    request,
+                                    program
+                                        .expression(*condition)
+                                        .map_or(statement.source, |expression| expression.source),
+                                    "semantic-projection-condition-pending",
+                                    "projection condition is outside the proven path subset",
+                                    "this increment proves boolean-literal branches without executing or fabricating expression facts",
+                                    "use a boolean literal condition until projection expression analysis lands",
+                                ));
+                            }
+                        }
+                        if let Some(child) = else_body {
+                            stack.push((*child, false));
+                        }
+                        for (_, child) in branches.iter().rev() {
+                            stack.push((*child, false));
+                        }
+                    }
+                    StatementKind::Pass | StatementKind::Yield(_) => {}
+                    _ => {
+                        return Err(runtime_type_diagnostic(
+                            request,
+                            statement.source,
+                            "semantic-projection-body-form-pending",
+                            "projection body statement is outside the current analysis subset",
+                            "this increment proves pass, yield, and conditional single-yield control flow",
+                            "use pass/yield/if until projection teardown operations are modeled",
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
+        let mut summary = ProjectionYieldSummary {
+            minimum: 0,
+            maximum: 0,
+            yields: Vec::new(),
+        };
+        for statement_id in &body.statements {
+            check_cancelled(is_cancelled)?;
+            let statement = program
+                .statement(*statement_id)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            match &statement.kind {
+                StatementKind::Pass => {}
+                StatementKind::Yield(expression) => {
+                    summary.minimum = summary
+                        .minimum
+                        .checked_add(1)
+                        .ok_or_else(|| fact_resource(request, "projection yield paths"))?;
+                    summary.maximum = summary
+                        .maximum
+                        .checked_add(1)
+                        .ok_or_else(|| fact_resource(request, "projection yield paths"))?;
+                    summary
+                        .yields
+                        .try_reserve(1)
+                        .map_err(|_| fact_resource(request, "projection yields"))?;
+                    summary.yields.push(*expression);
+                }
+                StatementKind::If {
+                    branches,
+                    else_body,
+                } => {
+                    let mut branch_minimum = u32::MAX;
+                    let mut branch_maximum = 0_u32;
+                    for (_, child) in branches {
+                        let child = summaries
+                            .get(child.0 as usize)
+                            .and_then(Option::as_ref)
+                            .ok_or(AnalysisFailure::RequestMismatch)?;
+                        branch_minimum = branch_minimum.min(child.minimum);
+                        branch_maximum = branch_maximum.max(child.maximum);
+                        summary
+                            .yields
+                            .try_reserve(child.yields.len())
+                            .map_err(|_| fact_resource(request, "projection yields"))?;
+                        summary.yields.extend_from_slice(&child.yields);
+                    }
+                    if let Some(child) = else_body {
+                        let child = summaries
+                            .get(child.0 as usize)
+                            .and_then(Option::as_ref)
+                            .ok_or(AnalysisFailure::RequestMismatch)?;
+                        branch_minimum = branch_minimum.min(child.minimum);
+                        branch_maximum = branch_maximum.max(child.maximum);
+                        summary
+                            .yields
+                            .try_reserve(child.yields.len())
+                            .map_err(|_| fact_resource(request, "projection yields"))?;
+                        summary.yields.extend_from_slice(&child.yields);
+                    } else {
+                        branch_minimum = 0;
+                    }
+                    if branch_minimum == u32::MAX {
+                        return Err(AnalysisFailure::RequestMismatch.into());
+                    }
+                    summary.minimum = summary
+                        .minimum
+                        .checked_add(branch_minimum)
+                        .ok_or_else(|| fact_resource(request, "projection yield paths"))?;
+                    summary.maximum = summary
+                        .maximum
+                        .checked_add(branch_maximum)
+                        .ok_or_else(|| fact_resource(request, "projection yield paths"))?;
+                }
+                _ => return Err(AnalysisFailure::RequestMismatch.into()),
+            }
+        }
+        colors[index] = 2;
+        summaries[index] = Some(summary);
+    }
+    summaries
+        .get_mut(root.0 as usize)
+        .and_then(Option::take)
+        .ok_or(AnalysisFailure::RequestMismatch.into())
+}
+
+fn projection_yield_expression_type(
+    request: &AnalysisRequest<'_>,
+    partial: &PartialAnalysis,
+    expression: ExpressionId,
+    parameters: &[ProjectionParameter],
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<(SemanticTypeId, wrela_hir::ParameterId)> {
+    let program = request.hir.as_program();
+    let mut fields = Vec::new();
+    let mut current = expression;
+    let source_parameter = loop {
+        check_cancelled(is_cancelled)?;
+        let record = program
+            .expression(current)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        match &record.kind {
+            ExpressionKind::Field { base, name } => {
+                fields
+                    .try_reserve(1)
+                    .map_err(|_| fact_resource(request, "projection yield fields"))?;
+                fields.push(name);
+                current = *base;
+            }
+            ExpressionKind::Reference(Definition::Parameter(parameter)) => break *parameter,
+            _ => {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    record.source,
+                    "semantic-projection-yield-source",
+                    "projection yield is not rooted in a declared source parameter",
+                    "locals, temporaries, and globals cannot back a caller-visible lexical view",
+                    "yield a place rooted in one of the projection parameters",
+                ));
+            }
+        }
+    };
+    let mut ty = parameters
+        .iter()
+        .find(|parameter| parameter.parameter == source_parameter)
+        .map(|parameter| parameter.ty)
+        .ok_or_else(|| {
+            runtime_type_diagnostic(
+                request,
+                program
+                    .expression(current)
+                    .map_or(fallback_span(program), |record| record.source),
+                "semantic-projection-yield-source",
+                "projection yield source is outside the declared provenance set",
+                "only declared projection parameters may back the yielded view",
+                "yield a place rooted in a projection parameter",
+            )
+        })?;
+    for field_name in fields.into_iter().rev() {
+        check_cancelled(is_cancelled)?;
+        let field = partial
+            .types
+            .get(ty.0 as usize)
+            .and_then(|record| match &record.kind {
+                SemanticTypeKind::Structure { fields, .. } => fields
+                    .iter()
+                    .find(|field| field.name == field_name.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                runtime_type_diagnostic(
+                    request,
+                    program
+                        .expression(expression)
+                        .map_or(fallback_span(program), |record| record.source),
+                    "semantic-projection-yield-field",
+                    "projection yield selects an unknown or unsupported field",
+                    "the analysis-tier projection subset follows fields of flat runtime structures",
+                    "yield a declared field of a flat structure parameter",
+                )
+            })?;
+        ty = field.ty;
+    }
+    Ok((ty, source_parameter))
 }
 
 fn test_plan_limits(limits: AnalysisLimits) -> TestPlanLimits {
@@ -3587,6 +4105,7 @@ struct RuntimeCheckpoint {
     expressions: usize,
     statements: usize,
     proofs: usize,
+    projection_protocols: usize,
     scope_protocols: usize,
     scope_activations: usize,
 }
@@ -3600,6 +4119,7 @@ impl RuntimeCheckpoint {
             expressions: partial.expressions.len(),
             statements: partial.statements.len(),
             proofs: partial.proofs.len(),
+            projection_protocols: partial.projection_protocols.len(),
             scope_protocols: partial.scope_protocols.len(),
             scope_activations: partial.scope_activations.len(),
         }
@@ -3612,6 +4132,9 @@ impl RuntimeCheckpoint {
         partial.expressions.truncate(self.expressions);
         partial.statements.truncate(self.statements);
         partial.proofs.truncate(self.proofs);
+        partial
+            .projection_protocols
+            .truncate(self.projection_protocols);
         partial.scope_protocols.truncate(self.scope_protocols);
         partial.scope_activations.truncate(self.scope_activations);
     }
@@ -26455,5 +26978,284 @@ fn scope_binding_is_lexical():
             .expect("cycle scan")
             .expect("synthetic cleanup back edge must be rejected");
         assert_eq!(cycle, vec![StatementId(4), StatementId(7)]);
+    }
+
+    #[test]
+    fn projection_multiple_yields_is_a_named_rejection() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+    yield packet.header
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn projection_contract_is_checked():
+    pass
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(output.has_errors());
+        assert!(
+            output.diagnostics().iter().any(|diagnostic| {
+                diagnostic.code.as_deref() == Some("semantic-projection-multiple-yields")
+            }),
+            "expected semantic-projection-multiple-yields: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn projection_protocol_records_conservative_provenance_and_single_yield() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet, read fallback: Packet) -> view u64:
+    yield packet.header
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn projection_contract_is_checked():
+    pass
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "single-yield projection must analyze cleanly: {:?}",
+            output.diagnostics()
+        );
+        let analyzed = output.successful().expect("sealed projection analysis");
+        let facts = analyzed.facts();
+        let protocol = facts
+            .projection_protocols
+            .first()
+            .expect("projection protocol fact");
+        assert_eq!(facts.projection_protocols.len(), 1);
+        assert_eq!(protocol.name, "header");
+        assert!(!protocol.mutable);
+        assert_eq!(protocol.parameters.len(), 2);
+        assert_eq!(protocol.provenance.len(), 2);
+        assert_eq!(
+            protocol.provenance,
+            protocol
+                .parameters
+                .iter()
+                .map(|parameter| parameter.parameter)
+                .collect::<Vec<_>>(),
+            "implicit provenance conservatively freezes every declared source parameter"
+        );
+        assert!(matches!(
+            facts.types[protocol.target.0 as usize].kind,
+            SemanticTypeKind::Integer {
+                signed: false,
+                bits: 64,
+                ..
+            }
+        ));
+        let proof = &facts.proofs[protocol.proof.0 as usize];
+        assert_eq!(proof.kind, ProofKind::ViewDoesNotEscape);
+        assert_eq!(proof.bound, Some(1));
+
+        let mut forged_provenance = facts.clone();
+        forged_provenance.projection_protocols[0].provenance.pop();
+        assert!(
+            forged_provenance
+                .validate_for_seal(analyzed.hir(), &|| false)
+                .is_err(),
+            "the exact sealer must reject weakened conservative provenance"
+        );
+        let mut forged_access = facts.clone();
+        forged_access.projection_protocols[0].parameters[0].access = crate::AccessMode::Take;
+        assert!(
+            forged_access
+                .validate_for_seal(analyzed.hir(), &|| false)
+                .is_err(),
+            "the exact sealer must reject ownership-taking projection sources"
+        );
+    }
+
+    #[test]
+    fn projection_conditional_single_yield_is_admitted() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    if true:
+        yield packet.header
+    else:
+        yield packet.header
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn projection_contract_is_checked():
+    pass
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "mutually exclusive single-yield branches must analyze: {:?}",
+            output.diagnostics()
+        );
+        assert_eq!(
+            output
+                .successful()
+                .expect("sealed conditional projection")
+                .facts()
+                .projection_protocols
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn projection_unanalyzed_condition_remains_named_and_fail_closed() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    if packet.header == 0:
+        yield packet.header
+    else:
+        yield packet.header
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn projection_contract_is_checked():
+    pass
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(output.has_errors());
+        assert!(
+            output.diagnostics().iter().any(|diagnostic| {
+                diagnostic.code.as_deref() == Some("semantic-projection-condition-pending")
+            }),
+            "expected semantic-projection-condition-pending: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn projection_missing_yield_is_a_named_rejection() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn projection_contract_is_checked():
+    pass
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(output.has_errors());
+        assert!(
+            output.diagnostics().iter().any(|diagnostic| {
+                diagnostic.code.as_deref() == Some("semantic-projection-yield-required")
+            }),
+            "expected semantic-projection-yield-required: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn mutable_projection_requires_mutable_source() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> mut view u64:
+    yield packet.header
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn projection_contract_is_checked():
+    pass
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(output.has_errors());
+        assert!(
+            output.diagnostics().iter().any(|diagnostic| {
+                diagnostic.code.as_deref() == Some("semantic-projection-mutable-source")
+            }),
+            "expected semantic-projection-mutable-source: {:?}",
+            output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn projection_await_is_a_named_rejection() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+async fn checkpoint():
+    pass
+
+projection header(read packet: Packet) -> view u64:
+    await checkpoint()
+    yield packet.header
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn projection_contract_is_checked():
+    pass
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(output.has_errors());
+        assert!(
+            output.diagnostics().iter().any(|diagnostic| {
+                diagnostic.code.as_deref() == Some("semantic-projection-await")
+            }),
+            "expected semantic-projection-await: {:?}",
+            output.diagnostics()
+        );
     }
 }
