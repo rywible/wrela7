@@ -1797,6 +1797,38 @@ fn validate_supported_source_type(
             arguments,
             variants,
         } => {
+            // Every variant is exactly one supported copy scalar (no unit
+            // variants); this is the payload-bearing runtime enum shape the
+            // machine lowering below packs into one shared tagged-union slot.
+            let all_single_scalar_payload = !variants.is_empty()
+                && variants.iter().all(|variant| {
+                    matches!(variant.fields.as_slice(), [field]
+                    if field.name.is_empty()
+                        && field.public
+                        && facts.types.get(field.ty.0 as usize).is_some_and(|field_ty| {
+                        field_ty.linearity == sema::Linearity::ScalarCopy
+                            && matches!(field_ty.kind, sema::SemanticTypeKind::Bool
+                                | sema::SemanticTypeKind::Integer { .. }
+                                | sema::SemanticTypeKind::Float { bits: 32 | 64 })
+                    }))
+                });
+            // Heterogeneous per-variant scalar payloads resolve at the sema
+            // tier (T0.1b), but the tagged-union machine lowering that packs
+            // differing payload types into the shared slot is a later slice.
+            // Fail closed with a named diagnostic here rather than
+            // miscompiling against the first-variant layout assumed below.
+            // (`all_single_scalar_payload` guarantees each `fields[0]` exists;
+            // `arguments.is_empty()` excludes the generic Result path.)
+            if arguments.is_empty()
+                && all_single_scalar_payload
+                && !variants
+                    .windows(2)
+                    .all(|pair| pair[0].fields[0].ty == pair[1].fields[0].ty)
+            {
+                return Err(unsupported(
+                    "semantic-enum-heterogeneous-lowering-pending (per-variant differing scalar enum payloads)",
+                ));
+            }
             let layout = variants
                 .first()
                 .and_then(|variant| variant.fields.first())

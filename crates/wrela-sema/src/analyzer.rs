@@ -7513,8 +7513,9 @@ fn analyze_closed_enum_constructor(
             "construct the exact enum named by the surrounding type",
         ));
     }
-    // `None` marks a unit variant (no payload slot); `Some` carries the shared
-    // scalar payload type. A missing variant/enum is a real internal invariant.
+    // `None` marks a unit variant (no payload slot); `Some` carries THIS
+    // variant's own scalar payload type (payloads may differ per variant). A
+    // missing variant/enum is a real internal invariant.
     let variant_payload_ty = partial
         .types
         .get(ty.0 as usize)
@@ -9059,7 +9060,11 @@ fn ensure_closed_scalar_enum_type(
     variants
         .try_reserve_exact(enumeration.variants.len())
         .map_err(|_| fact_resource(request, "runtime enum variants"))?;
-    let mut shared_payload = None;
+    // Tracks the widest payload slot across every payload-bearing variant as
+    // `(max size, max alignment)`. Each variant keeps its OWN scalar payload
+    // type (heterogeneous payloads are admitted); the machine layout is a
+    // tagged union whose single payload slot is sized/aligned to the maxima.
+    let mut payload_slot: Option<(u64, u32)> = None;
     for variant in &enumeration.variants {
         charge_runtime_aggregate_lookup(request, &mut *aggregate_work, is_cancelled)?;
         let field = match variant.fields.as_slice() {
@@ -9139,21 +9144,20 @@ fn ensure_closed_scalar_enum_type(
                 field.source,
                 "semantic-runtime-enum-payload-type",
                 "runtime enum payload is not a supported copy scalar",
-                "all variants must use one identical stored scalar type",
+                "each variant payload must be a stored boolean, integer, or floating-point scalar",
                 "use one primitive boolean, integer, or floating-point payload type",
             ));
         }
-        if shared_payload.is_some_and(|expected| expected != payload) {
-            return Err(runtime_type_diagnostic(
-                request,
-                field.source,
-                "semantic-runtime-enum-payload-type",
-                "runtime enum variants use different payload types",
-                "the canonical tagged representation has one shared payload slot",
-                "use the same scalar payload type for every variant",
-            ));
-        }
-        shared_payload = Some(payload);
+        // Heterogeneous payloads are admitted: fold this variant's own scalar
+        // size and alignment into the shared tagged-union slot maxima.
+        let payload_size = payload_record
+            .size_upper_bound
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let payload_alignment = payload_record.alignment_lower_bound.max(1);
+        payload_slot = Some(match payload_slot {
+            None => (payload_size, payload_alignment),
+            Some((size, alignment)) => (size.max(payload_size), alignment.max(payload_alignment)),
+        });
         variants.push(SemanticVariant {
             name: copy_analysis_text(
                 variant.name.as_str(),
@@ -9168,22 +9172,14 @@ fn ensure_closed_scalar_enum_type(
         });
     }
     // All-unit enums carry only the one-byte discriminant; enums with any
-    // scalar payload reserve one shared aligned payload slot after the tag.
-    let (size, alignment) = match shared_payload {
+    // scalar payload reserve one shared aligned payload slot after the tag,
+    // sized and aligned to the maxima across every payload-bearing variant.
+    let (size, alignment) = match payload_slot {
         None => (1_u64, 1_u32),
-        Some(payload) => {
-            let payload_record = partial
-                .types
-                .get(payload.0 as usize)
-                .ok_or(AnalysisFailure::RequestMismatch)?;
-            let alignment = payload_record.alignment_lower_bound.max(1);
+        Some((payload_size, alignment)) => {
             let offset = (1_u64 + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
             let size = offset
-                .checked_add(
-                    payload_record
-                        .size_upper_bound
-                        .ok_or(AnalysisFailure::RequestMismatch)?,
-                )
+                .checked_add(payload_size)
                 .and_then(|size| size.checked_add(u64::from(alignment) - 1))
                 .map(|size| size & !(u64::from(alignment) - 1))
                 .ok_or_else(|| fact_resource(request, "runtime enum layout"))?;
@@ -23879,6 +23875,115 @@ fn projection_fixture():
                 .any(|diagnostic| diagnostic.code.as_deref()
                     == Some("semantic-runtime-enum-payload-shape")),
             "a two-field variant must still fail closed: {:?}",
+            output.diagnostics()
+        );
+        assert!(output.has_errors());
+    }
+
+    // --- T0.1b: heterogeneous per-variant scalar enum payloads ---
+
+    #[test]
+    fn runtime_enum_admits_heterogeneous_scalar_payloads() {
+        // Before T0.1b, variants with differing scalar payload types were
+        // rejected with `semantic-runtime-enum-payload-type` ("runtime enum
+        // variants use different payload types"). A `small(u8)` / `large(u64)`
+        // enum must now resolve, and constructing `.small(5)` analyze cleanly.
+        let source = dot_variant_actor_source(
+            "pub enum Reading:\n    small(u8)\n    large(u64)\n\nasync fn checkpoint():\n    state: Reading = .small(5)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("heterogeneous-payload enum should analyze");
+        assert!(
+            output.diagnostics().is_empty(),
+            "differing per-variant scalar payloads must resolve without rejection: {:?}",
+            output.diagnostics()
+        );
+        assert!(
+            !output
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_deref()
+                    == Some("semantic-runtime-enum-payload-type")),
+            "the old shared-payload rejection must not fire for heterogeneous payloads",
+        );
+        assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn runtime_enum_heterogeneous_payload_slot_sizes_to_widest() {
+        // The tagged-union layout reserves one shared payload slot sized and
+        // aligned to the maxima across payload-bearing variants: `small(u8)`
+        // (size 1, align 1) with `large(u64)` (size 8, align 8) yields a
+        // one-byte tag padded to an 8-aligned 8-byte payload slot => size 16.
+        let source = dot_variant_actor_source(
+            "pub enum Reading:\n    small(u8)\n    large(u64)\n\nasync fn checkpoint():\n    state: Reading = .large(9)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("heterogeneous-payload enum should analyze");
+        assert!(
+            output.diagnostics().is_empty(),
+            "constructing the wider `.large` variant must resolve cleanly: {:?}",
+            output.diagnostics()
+        );
+        assert!(
+            output.successful().is_some(),
+            "clean heterogeneous enum analysis yields a complete image",
+        );
+        let reading = output
+            .partial()
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(&ty.kind, SemanticTypeKind::Enumeration { variants, .. }
+                if variants.iter().any(|variant| variant.name == "small")
+                    && variants.iter().any(|variant| variant.name == "large"))
+            })
+            .expect("the heterogeneous `Reading` enum must resolve as a semantic type");
+        assert_eq!(
+            reading.size_upper_bound,
+            Some(16),
+            "u8/u64 union: one-byte tag + u64 payload aligned to 8 => 16 bytes",
+        );
+        assert_eq!(
+            reading.alignment_lower_bound, 8,
+            "the union adopts the widest payload alignment (u64 => 8)",
+        );
+    }
+
+    #[test]
+    fn runtime_enum_rejects_nominal_payload_variant() {
+        // Nominal (struct) payloads remain a later slice: they require
+        // ownership lowering and must still fail closed at type resolution.
+        let source = dot_variant_actor_source(
+            "pub struct Point:\n    pub x: u32\n\npub enum Wrap:\n    boxed(Point)\n\nasync fn checkpoint():\n    state: Wrap = .boxed(Point(x=1))\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("a nominal-payload variant is a structured source diagnostic");
+        assert!(
+            output
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_deref()
+                    == Some("semantic-runtime-enum-payload-type")),
+            "a struct-payload variant must still fail closed: {:?}",
             output.diagnostics()
         );
         assert!(output.has_errors());
