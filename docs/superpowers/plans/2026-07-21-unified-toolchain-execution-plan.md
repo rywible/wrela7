@@ -117,7 +117,7 @@ These are dispatched or landable immediately; none needs Tier 0.
 
 | Slice | Feature | Status |
 |---|---|---|
-| B1a | View/projection static semantics (provenance, lexical lifetime, disjointness; named negatives) | **B1a.1 landed in this slice** — separate bounded lexical provenance uses exact HIR `ParameterId`s rather than fabricated `RegionId`s; bare-view declarations prove exact-one-yield path shape and mutable-source legality. Projection calls, view values/binding/consumption, lifetime/disjointness diagnostics, carrier rebound, and lowering remain open. |
+| B1a | View/projection static semantics (provenance, lexical lifetime, disjointness; named negatives) | **B1a.4 structured acyclic liveness landed** — regionless projection activations now carry canonical per-path terminal references and exact sorted live-after statement witnesses across straight-line, `if`/`else`, and exhaustive enum `match`; full sealing independently re-derives both. Loops, `with`, early exits, receiver/wrapped/generic carriers, and lowering remain named fail-closed. |
 | B5b | Unified wait-for graph + `wait-cycle`/self-wait diagnostics | **running** |
 | B2a | Promotion/region report schema (`PromotionFact`/`RegionAssignmentFact`) | **landed + hardened** |
 | B4a | `with`/scope sema analysis: cleanup DAG + `CleanupAcyclic` + cycle diagnostic | **dispatching** |
@@ -187,7 +187,7 @@ D2 need this scope substantially complete; B10 needs F5.
 |---|---|---|---|
 | 1 | B2a promotion/region report schema | — | **landed** 3eb2cb69; follow-up sealing requires canonical allocation identities, authenticated dense promotion proofs, and empty producer vectors until B2b is reachable |
 | 1 | B5b wait-for graph + diagnostics | — | **landed** 3e216d38 |
-| 1 | B1a view/provenance semantics | lexical provenance model | **B1a.3 direct-root disjointness landed in this slice** — B1a.2's regionless straight-line `LexicalView` now enforces symmetric access exclusion: shared/shared views may coexist, while any live mutable view excludes later access to the same direct named root; distinct roots and post-terminal reborrows remain legal (`live_mut_projection_excludes_later_read_projection`, `shared_projection_views_may_coexist_on_one_source`, `projection_views_on_distinct_roots_may_overlap`, `projection_root_may_be_reborrowed_after_mut_view_terminal_use`). Full sealing independently rejects forged overlapping exclusive intervals. Receiver/wrapped/generic projections, mutation through views, structured control-flow liveness, projected-path disjointness, general ephemeral legality, and lowering remain fail-closed. |
+| 1 | B1a view/provenance semantics | lexical provenance model | **B1a.4 structured acyclic liveness landed in this slice** — the regionless `LexicalView` now authenticates canonical path-terminal references and exact sorted live-after statement IDs across straight-line, `if`/`else`, and exhaustive enum `match`. Backward joins union branch-local terminals or carry one continuation terminal through every arm; branch-local release, source freeze, await, carrier rebound, and direct-root disjointness consult that structured witness. Full sealing recomputes the witness from HIR and rejects omission/substitution (`lexical_projection_terminal_uses_are_exact_across_if_branches`, `lexical_projection_terminal_uses_are_exact_across_match_arms`, `lexical_projection_liveness_flows_to_post_if_continuation`, `structured_view_liveness_names_branch_local_source_mutation`, `branch_local_terminal_use_releases_source_on_that_path`). Loops, `with`, early exits, receiver/wrapped/generic projections, mutation through views, projected-path disjointness, iterator access, and lowering remain named fail-closed. |
 | 1 | B4a cleanup DAG sema analysis | — | **landed** 43d3e279 — free-call scope protocols/calls, lexical activations, reverse-source cleanup DAG + `CleanupAcyclic`, synthetic cycle detector, and named await/receiver/outside-`with` rejections; pass-only cleanup bodies and no lowering (`semantic-with-cleanup-lowering-pending`) |
 | 0 | **T0.1 general nongeneric ADTs — COMPLETE** | — | **landed** — enum type resolution: unit + mixed-arity + heterogeneous-scalar + flat-struct + nongeneric-enum payloads, tagged-union max-slot layout, structural cycle rejection |
 | 0 | · T0.1a unit variants | — | landed ce8385e6 |
@@ -210,8 +210,8 @@ D2 need this scope substantially complete; B10 needs F5.
 | 2 | L2.5 scope-op lowering (B4b/c) | L2.2,B4a | queued |
 | 3 | feature verticals (B1b,B2b/c,B3,B5c,B6–B10,A1/3/4/5/7/8) | tiers 0–2 | queued |
 
-B1a.2 retention and straight-line boundary evidence also includes
-`intervening_control_flow_while_view_is_live_fails_closed`,
+B1a.2/B1a.4 retention and structured boundary evidence also includes
+`lexical_projection_loop_liveness_remains_named_and_fail_closed`,
 `live_projection_source_and_view_carrier_cannot_be_rebound`, and
 `projection_source_may_rebind_after_terminal_view_use`;
 `non_unary_projection_terminal_use_remains_named_and_fail_closed` covers the

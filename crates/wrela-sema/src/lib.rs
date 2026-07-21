@@ -965,6 +965,10 @@ pub struct LexicalView {
     pub sources: Vec<LexicalViewSource>,
     /// Final local-reference uses on all admitted control-flow paths.
     pub terminal_uses: Vec<ExpressionId>,
+    /// Statements after which the activation remains live. This structured
+    /// witness is independent of source-span ordering and therefore preserves
+    /// branch-local lifetimes exactly.
+    pub live_after_statements: Vec<StatementId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8033,6 +8037,11 @@ fn valid_lexical_view_prefix(view: &LexicalView, analysis: &PartialAnalysis) -> 
                         && fact.resolution == ExpressionResolution::Value(view.value)
                 })
         });
+    let live_statements_match = strict_ids(&view.live_after_statements)
+        && view
+            .live_after_statements
+            .iter()
+            .all(|statement| statement.0 < analysis.hir.statements);
     (view.function.0 as usize) < analysis.functions.len()
         && view.expression.0 < analysis.hir.expressions
         && view.initialization.0 < analysis.hir.statements
@@ -8047,6 +8056,7 @@ fn valid_lexical_view_prefix(view: &LexicalView, analysis: &PartialAnalysis) -> 
         && *call_view == view.id
         && sources_match
         && terminal_uses_match
+        && live_statements_match
 }
 
 fn valid_lexical_view_record(
@@ -8119,159 +8129,44 @@ fn valid_lexical_view_record(
                     })
             })
         });
-    let mut terminal_uses_match = true;
-    for terminal in &view.terminal_uses {
-        check_analysis_cancelled(is_cancelled)?;
-        let Some(expression) = program.expression(*terminal) else {
-            return Ok(false);
-        };
-        if expression.kind
-            != wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(view.binding))
-            || expression.source.file != statement.source.file
-            || expression.source.range.start < statement.source.range.start
-        {
-            return Ok(false);
-        }
-        let mut containing = None;
-        let mut containing_width = None;
-        for fact in analysis
-            .statements
-            .iter()
-            .filter(|fact| fact.function == view.function)
-        {
-            check_analysis_cancelled(is_cancelled)?;
-            let Some(candidate) = program.statement(fact.statement) else {
-                return Ok(false);
-            };
-            if candidate.source.file == expression.source.file
-                && candidate.source.range.start <= expression.source.range.start
-                && expression.source.range.end <= candidate.source.range.end
-            {
-                let width = candidate.source.range.end - candidate.source.range.start;
-                if containing_width.is_none_or(|current| width < current) {
-                    containing = Some(fact);
-                    containing_width = Some(width);
-                }
-            }
-        }
-        terminal_uses_match &= containing.is_some_and(|fact| {
-            fact.live_lexical_views_after
-                .binary_search(&view.id)
-                .is_err()
-        });
-    }
-    let mut reference_count = 0_u32;
-    let mut exact_terminal = None;
-    for expression in &program.expressions {
-        check_analysis_cancelled(is_cancelled)?;
-        if expression.kind
-            == wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(view.binding))
-            && expression.source.file == statement.source.file
-            && expression.source.range.start > statement.source.range.end
-        {
-            reference_count =
-                reference_count
-                    .checked_add(1)
-                    .ok_or(AnalysisFailure::ResourceLimit {
-                        resource: "lexical view reference validation",
-                        limit: u64::from(u32::MAX),
-                    })?;
-            exact_terminal = Some(expression.id);
-        }
-    }
-    let exact_terminal_use = reference_count == 1
-        && exact_terminal.is_some_and(|terminal| view.terminal_uses.as_slice() == [terminal]);
-    let Some(terminal) = exact_terminal.and_then(|terminal| program.expression(terminal)) else {
-        return Ok(false);
-    };
-    let mut unary_consumers = 0_u32;
-    for candidate in &program.expressions {
-        check_analysis_cancelled(is_cancelled)?;
-        if let wrela_hir::ExpressionKind::Call { arguments, .. } = &candidate.kind
-            && matches!(
-                arguments.as_slice(),
-                [argument]
-                    if matches!(argument.value, wrela_hir::CallArgumentValue::Value(value) if value == terminal.id)
-            )
-        {
-            unary_consumers =
-                unary_consumers
-                    .checked_add(1)
-                    .ok_or(AnalysisFailure::ResourceLimit {
-                        resource: "lexical view terminal-consumer validation",
-                        limit: u64::from(u32::MAX),
-                    })?;
-        }
-    }
-    if unary_consumers != 1
-        || !matches!(
-            terminal.owner,
-            wrela_hir::ExpressionOwner::Body(body) if body == statement.body
-        )
-    {
-        return Ok(false);
-    }
-    let Some(body) = program.body(statement.body) else {
-        return Ok(false);
-    };
-    let mut initialization_index = None;
-    let mut terminal_index = None;
-    for (index, statement_id) in body.statements.iter().enumerate() {
-        check_analysis_cancelled(is_cancelled)?;
-        if *statement_id == view.initialization {
-            initialization_index = Some(index);
-        }
-        let Some(candidate) = program.statement(*statement_id) else {
-            return Ok(false);
-        };
-        if candidate.source.file == terminal.source.file
-            && candidate.source.range.start <= terminal.source.range.start
-            && terminal.source.range.end <= candidate.source.range.end
-        {
-            terminal_index = Some(index);
-        }
-    }
-    let (Some(initialization_index), Some(terminal_index)) = (initialization_index, terminal_index)
+    let Ok(structured) = analyzer::derive_structured_view_liveness(
+        program,
+        view.initialization,
+        view.binding,
+        is_cancelled,
+    )?
     else {
         return Ok(false);
     };
-    if terminal_index <= initialization_index {
-        return Ok(false);
-    }
-    for statement_id in &body.statements[initialization_index + 1..=terminal_index] {
+    let structured_matches = view.terminal_uses == structured.terminal_uses
+        && view.live_after_statements == structured.live_after_statements;
+    let statement_is_live_before = |candidate: &wrela_hir::Statement| {
+        view.live_after_statements
+            .binary_search(&candidate.id)
+            .is_ok()
+            || view.terminal_uses.iter().any(|terminal| {
+                program.expression(*terminal).is_some_and(|terminal| {
+                    candidate.source.file == terminal.source.file
+                        && candidate.source.range.start <= terminal.source.range.start
+                        && terminal.source.range.end <= candidate.source.range.end
+                })
+            })
+    };
+    for candidate in &program.statements {
         check_analysis_cancelled(is_cancelled)?;
-        let Some(candidate) = program.statement(*statement_id) else {
-            return Ok(false);
-        };
-        if matches!(
-            candidate.kind,
-            wrela_hir::StatementKind::If { .. }
-                | wrela_hir::StatementKind::For { .. }
-                | wrela_hir::StatementKind::While { .. }
-                | wrela_hir::StatementKind::Loop { .. }
-                | wrela_hir::StatementKind::Match { .. }
-                | wrela_hir::StatementKind::With { .. }
-                | wrela_hir::StatementKind::Return(_)
-                | wrela_hir::StatementKind::Break
-                | wrela_hir::StatementKind::Continue
-        ) {
-            return Ok(false);
+        if !statement_is_live_before(candidate) {
+            continue;
         }
         if let wrela_hir::StatementKind::Assign { targets, .. } = &candidate.kind {
-            let rebinds_retained = targets.iter().any(|target| {
-                target.source.range.start < terminal.source.range.start
-                    && match target.root {
-                        wrela_hir::Definition::Local(local) if local == view.binding => true,
-                        wrela_hir::Definition::Local(local) => view.sources.iter().any(|source| {
-                            analysis
-                                .values
-                                .get(source.value.0 as usize)
-                                .is_some_and(|value| {
-                                    value.origin == SemanticValueOrigin::Local(local)
-                                })
-                        }),
-                        _ => false,
-                    }
+            let rebinds_retained = targets.iter().any(|target| match target.root {
+                wrela_hir::Definition::Local(local) if local == view.binding => true,
+                wrela_hir::Definition::Local(local) => view.sources.iter().any(|source| {
+                    analysis
+                        .values
+                        .get(source.value.0 as usize)
+                        .is_some_and(|value| value.origin == SemanticValueOrigin::Local(local))
+                }),
+                _ => false,
             });
             if rebinds_retained {
                 return Ok(false);
@@ -8280,10 +8175,12 @@ fn valid_lexical_view_record(
     }
     for candidate in &program.expressions {
         check_analysis_cancelled(is_cancelled)?;
-        if candidate.source.file != statement.source.file
-            || candidate.source.range.start <= statement.source.range.end
-            || candidate.source.range.start >= terminal.source.range.start
-        {
+        let Some(containing) = analyzer::containing_statement_for_expression(program, candidate)
+            .and_then(|statement| program.statement(statement))
+        else {
+            continue;
+        };
+        if !statement_is_live_before(containing) {
             continue;
         }
         if matches!(
@@ -8324,49 +8221,34 @@ fn valid_lexical_view_record(
             }
         }
     }
-    let mut liveness_is_contiguous = true;
+    let mut liveness_is_exact = true;
     for fact in analysis
         .statements
         .iter()
         .filter(|fact| fact.function == view.function)
     {
         check_analysis_cancelled(is_cancelled)?;
-        let Some(candidate) = program.statement(fact.statement) else {
-            return Ok(false);
-        };
-        let expected_live = candidate.source.file == statement.source.file
-            && candidate.source.range.start >= statement.source.range.start
-            && candidate.source.range.end < terminal.source.range.end;
-        liveness_is_contiguous &= fact
+        let expected_live = fact.statement == view.initialization
+            || view
+                .live_after_statements
+                .binary_search(&fact.statement)
+                .is_ok();
+        liveness_is_exact &= fact
             .live_lexical_views_after
             .binary_search(&view.id)
             .is_ok()
             == expected_live;
     }
-    Ok(call_matches
-        && sources_match
-        && terminal_uses_match
-        && exact_terminal_use
-        && liveness_is_contiguous)
+    Ok(call_matches && sources_match && structured_matches && liveness_is_exact)
 }
 
 fn lexical_view_accesses_are_disjoint(
     analysis: &PartialAnalysis,
-    program: &wrela_hir::Program,
+    _program: &wrela_hir::Program,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<bool, AnalysisFailure> {
     for (index, left) in analysis.lexical_views.iter().enumerate() {
         check_analysis_cancelled(is_cancelled)?;
-        let Some(left_initialization) = program.statement(left.initialization) else {
-            return Ok(false);
-        };
-        let Some(left_terminal) = left
-            .terminal_uses
-            .last()
-            .and_then(|terminal| program.expression(*terminal))
-        else {
-            return Ok(false);
-        };
         for right in &analysis.lexical_views[index + 1..] {
             check_analysis_cancelled(is_cancelled)?;
             if left.function != right.function {
@@ -8384,19 +8266,14 @@ fn lexical_view_accesses_are_disjoint(
             if !conflicting_source {
                 continue;
             }
-            let Some(right_initialization) = program.statement(right.initialization) else {
-                return Ok(false);
-            };
-            let Some(right_terminal) = right
-                .terminal_uses
-                .last()
-                .and_then(|terminal| program.expression(*terminal))
-            else {
-                return Ok(false);
-            };
-            if left_initialization.source.file == right_initialization.source.file
-                && left_initialization.source.range.end < right_terminal.source.range.start
-                && right_initialization.source.range.end < left_terminal.source.range.start
+            if left
+                .live_after_statements
+                .binary_search(&right.initialization)
+                .is_ok()
+                || right
+                    .live_after_statements
+                    .binary_search(&left.initialization)
+                    .is_ok()
             {
                 return Ok(false);
             }
@@ -10550,6 +10427,7 @@ fn validate_fact_resources(
         check_analysis_cancelled(is_cancelled)?;
         meter.edges(&view.sources);
         meter.edges(&view.terminal_uses);
+        meter.edges(&view.live_after_statements);
         meter.enforce(limits)?;
     }
     for protocol in &partial.scope_protocols {

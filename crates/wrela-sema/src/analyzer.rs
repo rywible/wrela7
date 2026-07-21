@@ -8271,14 +8271,8 @@ fn analyze_await_expression(
             .as_program()
             .statement(view.initialization)
             .ok_or(AnalysisFailure::RequestMismatch)?;
-        let terminal = view
-            .terminal_uses
-            .last()
-            .and_then(|terminal| request.hir.as_program().expression(*terminal))
-            .ok_or(AnalysisFailure::RequestMismatch)?;
-        if initialization.source.file == await_expression.source.file
-            && initialization.source.range.end <= await_expression.source.range.start
-            && await_expression.source.range.end <= terminal.source.range.start
+        if let Some(terminal) =
+            lexical_view_blocking_terminal(request.hir.as_program(), view, await_expression.source)
         {
             let protocol = partial
                 .projection_protocols
@@ -8498,17 +8492,10 @@ fn access_runtime_binding(
         }) else {
             continue;
         };
-        let Some(terminal) = view
-            .terminal_uses
-            .last()
-            .and_then(|terminal| request.hir.as_program().expression(*terminal))
+        let Some(terminal) = lexical_view_blocking_terminal(request.hir.as_program(), view, source)
         else {
-            return Err(AnalysisFailure::RequestMismatch.into());
-        };
-        if terminal.source.file != source.file || source.range.start >= terminal.source.range.start
-        {
             continue;
-        }
+        };
         let protocol = partial
             .projection_protocols
             .get(view.protocol.0 as usize)
@@ -8717,15 +8704,10 @@ fn reject_live_lexical_rebind(
         if retained.is_none() && !is_view_binding {
             continue;
         }
-        let terminal = view
-            .terminal_uses
-            .last()
-            .and_then(|terminal| request.hir.as_program().expression(*terminal))
-            .ok_or(AnalysisFailure::RequestMismatch)?;
-        if terminal.source.file != source.file || source.range.start >= terminal.source.range.start
-        {
+        let Some(terminal) = lexical_view_blocking_terminal(request.hir.as_program(), view, source)
+        else {
             continue;
-        }
+        };
         let protocol = partial
             .projection_protocols
             .get(view.protocol.0 as usize)
@@ -13182,30 +13164,14 @@ fn append_statement_fact(
         .statements
         .try_reserve(1)
         .map_err(|_| fact_resource(request, "statement facts"))?;
-    let statement_record = request
-        .hir
-        .as_program()
-        .statement(statement)
-        .ok_or(AnalysisFailure::RequestMismatch)?;
     let mut live_lexical_views_after = Vec::new();
     for view in &partial.lexical_views {
         check_cancelled(is_cancelled)?;
         if view.function != function {
             continue;
         }
-        let initialization = request
-            .hir
-            .as_program()
-            .statement(view.initialization)
-            .ok_or(AnalysisFailure::RequestMismatch)?;
-        let terminal = view
-            .terminal_uses
-            .last()
-            .and_then(|terminal| request.hir.as_program().expression(*terminal))
-            .ok_or(AnalysisFailure::RequestMismatch)?;
-        if statement_record.source.file == initialization.source.file
-            && statement_record.source.range.start >= initialization.source.range.start
-            && statement_record.source.range.end < terminal.source.range.end
+        if statement == view.initialization
+            || view.live_after_statements.binary_search(&statement).is_ok()
         {
             live_lexical_views_after
                 .try_reserve(1)
@@ -13225,6 +13191,379 @@ fn append_statement_fact(
         proofs,
     });
     Ok(())
+}
+
+#[derive(Debug)]
+pub(super) struct StructuredViewLiveness {
+    pub(super) terminal_uses: Vec<ExpressionId>,
+    pub(super) live_after_statements: Vec<StatementId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum StructuredViewLivenessError {
+    UnsupportedControlFlow(Span),
+    UnevenPaths(Span),
+    InvalidUse(Span),
+    Question(Span),
+    Escape(Span),
+    MissingUse(Span),
+}
+
+pub(super) fn containing_statement_for_expression(
+    program: &wrela_hir::Program,
+    expression: &wrela_hir::Expression,
+) -> Option<StatementId> {
+    let wrela_hir::ExpressionOwner::Body(body) = expression.owner else {
+        return None;
+    };
+    let body = program.body(body)?;
+    let mut containing = None;
+    let mut width = None;
+    for statement in &body.statements {
+        let candidate = program.statement(*statement)?;
+        if candidate.source.file == expression.source.file
+            && candidate.source.range.start <= expression.source.range.start
+            && expression.source.range.end <= candidate.source.range.end
+        {
+            let candidate_width = candidate.source.range.end - candidate.source.range.start;
+            if width.is_none_or(|current| candidate_width < current) {
+                containing = Some(candidate.id);
+                width = Some(candidate_width);
+            }
+        }
+    }
+    containing
+}
+
+fn containing_statement_for_span(
+    program: &wrela_hir::Program,
+    source: Span,
+) -> Option<&wrela_hir::Statement> {
+    let mut containing = None;
+    let mut width = None;
+    for candidate in &program.statements {
+        if candidate.source.file == source.file
+            && candidate.source.range.start <= source.range.start
+            && source.range.end <= candidate.source.range.end
+        {
+            let candidate_width = candidate.source.range.end - candidate.source.range.start;
+            if width.is_none_or(|current| candidate_width < current) {
+                containing = Some(candidate);
+                width = Some(candidate_width);
+            }
+        }
+    }
+    containing
+}
+
+fn lexical_view_blocking_terminal<'a>(
+    program: &'a wrela_hir::Program,
+    view: &LexicalView,
+    source: Span,
+) -> Option<&'a wrela_hir::Expression> {
+    let statement = containing_statement_for_span(program, source)?;
+    let terminal_in_statement = view.terminal_uses.iter().find_map(|terminal| {
+        program.expression(*terminal).filter(|terminal| {
+            statement.source.file == terminal.source.file
+                && statement.source.range.start <= terminal.source.range.start
+                && terminal.source.range.end <= statement.source.range.end
+        })
+    });
+    if terminal_in_statement.is_none()
+        && view
+            .live_after_statements
+            .binary_search(&statement.id)
+            .is_err()
+    {
+        return None;
+    }
+    terminal_in_statement.or_else(|| {
+        view.terminal_uses
+            .iter()
+            .filter_map(|terminal| program.expression(*terminal))
+            .find(|terminal| {
+                terminal.source.file == source.file
+                    && source.range.end <= terminal.source.range.start
+            })
+            .or_else(|| {
+                view.terminal_uses
+                    .first()
+                    .and_then(|terminal| program.expression(*terminal))
+            })
+    })
+}
+
+fn direct_statement_view_references(
+    program: &wrela_hir::Program,
+    statement: StatementId,
+    binding: LocalId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<ExpressionId>, AnalysisFailure> {
+    let mut references = Vec::new();
+    for expression in &program.expressions {
+        check_cancelled(is_cancelled)?;
+        if expression.kind == ExpressionKind::Reference(Definition::Local(binding))
+            && containing_statement_for_expression(program, expression) == Some(statement)
+        {
+            references
+                .try_reserve(1)
+                .map_err(|_| AnalysisFailure::ResourceLimit {
+                    resource: "structured lexical-view references",
+                    limit: u64::from(u32::MAX),
+                })?;
+            references.push(expression.id);
+        }
+    }
+    Ok(references)
+}
+
+fn validate_structured_view_reference(
+    program: &wrela_hir::Program,
+    reference: ExpressionId,
+    statement: &wrela_hir::Statement,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Result<(), StructuredViewLivenessError>, AnalysisFailure> {
+    let reference = program
+        .expression(reference)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    for candidate in &program.expressions {
+        check_cancelled(is_cancelled)?;
+        if candidate.kind == ExpressionKind::Try(reference.id) {
+            return Ok(Err(StructuredViewLivenessError::Question(candidate.source)));
+        }
+    }
+    if matches!(statement.kind, StatementKind::Return(_)) {
+        return Ok(Err(StructuredViewLivenessError::Escape(statement.source)));
+    }
+    let mut consumers = 0_u32;
+    for candidate in &program.expressions {
+        check_cancelled(is_cancelled)?;
+        if let ExpressionKind::Call { arguments, .. } = &candidate.kind
+            && matches!(
+                arguments.as_slice(),
+                [argument]
+                    if matches!(argument.value, wrela_hir::CallArgumentValue::Value(value) if value == reference.id)
+            )
+        {
+            consumers = consumers
+                .checked_add(1)
+                .ok_or(AnalysisFailure::ResourceLimit {
+                    resource: "structured lexical-view consumers",
+                    limit: u64::from(u32::MAX),
+                })?;
+        }
+    }
+    if consumers == 1 {
+        Ok(Ok(()))
+    } else {
+        Ok(Err(StructuredViewLivenessError::InvalidUse(
+            reference.source,
+        )))
+    }
+}
+
+pub(super) fn derive_structured_view_liveness(
+    program: &wrela_hir::Program,
+    initialization: StatementId,
+    binding: LocalId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Result<StructuredViewLiveness, StructuredViewLivenessError>, AnalysisFailure> {
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_body(
+        program: &wrela_hir::Program,
+        body: BodyId,
+        start: usize,
+        binding: LocalId,
+        mut live_after: bool,
+        terminal_uses: &mut Vec<ExpressionId>,
+        live_after_statements: &mut Vec<StatementId>,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Result<bool, StructuredViewLivenessError>, AnalysisFailure> {
+        let body_record = program.body(body).ok_or(AnalysisFailure::RequestMismatch)?;
+        for statement_id in body_record.statements[start..].iter().rev() {
+            check_cancelled(is_cancelled)?;
+            let statement = program
+                .statement(*statement_id)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            if live_after {
+                live_after_statements.try_reserve(1).map_err(|_| {
+                    AnalysisFailure::ResourceLimit {
+                        resource: "structured lexical-view liveness",
+                        limit: u64::from(u32::MAX),
+                    }
+                })?;
+                live_after_statements.push(statement.id);
+            }
+            let references =
+                direct_statement_view_references(program, statement.id, binding, is_cancelled)?;
+            for reference in &references {
+                if let Err(error) = validate_structured_view_reference(
+                    program,
+                    *reference,
+                    statement,
+                    is_cancelled,
+                )? {
+                    return Ok(Err(error));
+                }
+            }
+            let mut live_before = match &statement.kind {
+                StatementKind::If {
+                    branches,
+                    else_body,
+                } => {
+                    let mut path_states = Vec::new();
+                    path_states
+                        .try_reserve_exact(branches.len().saturating_add(1))
+                        .map_err(|_| AnalysisFailure::ResourceLimit {
+                            resource: "structured lexical-view branches",
+                            limit: u64::from(u32::MAX),
+                        })?;
+                    for (_, branch) in branches {
+                        let state = match analyze_body(
+                            program,
+                            *branch,
+                            0,
+                            binding,
+                            live_after,
+                            terminal_uses,
+                            live_after_statements,
+                            is_cancelled,
+                        )? {
+                            Ok(state) => state,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        path_states.push(state);
+                    }
+                    if let Some(otherwise) = else_body {
+                        let state = match analyze_body(
+                            program,
+                            *otherwise,
+                            0,
+                            binding,
+                            live_after,
+                            terminal_uses,
+                            live_after_statements,
+                            is_cancelled,
+                        )? {
+                            Ok(state) => state,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        path_states.push(state);
+                    } else {
+                        path_states.push(live_after);
+                    }
+                    let first = path_states.first().copied().unwrap_or(live_after);
+                    if path_states.iter().any(|state| *state != first) {
+                        return Ok(Err(StructuredViewLivenessError::UnevenPaths(
+                            statement.source,
+                        )));
+                    }
+                    first
+                }
+                StatementKind::Match { arms, .. } => {
+                    let mut first = None;
+                    for arm in arms {
+                        let state = match analyze_body(
+                            program,
+                            arm.body,
+                            0,
+                            binding,
+                            live_after,
+                            terminal_uses,
+                            live_after_statements,
+                            is_cancelled,
+                        )? {
+                            Ok(state) => state,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        if first.is_some_and(|expected| expected != state) {
+                            return Ok(Err(StructuredViewLivenessError::UnevenPaths(
+                                statement.source,
+                            )));
+                        }
+                        first = Some(state);
+                    }
+                    first.unwrap_or(live_after)
+                }
+                StatementKind::For { .. }
+                | StatementKind::While { .. }
+                | StatementKind::Loop { .. }
+                | StatementKind::With { .. }
+                | StatementKind::ComptimeIf { .. }
+                    if live_after || !references.is_empty() =>
+                {
+                    return Ok(Err(StructuredViewLivenessError::UnsupportedControlFlow(
+                        statement.source,
+                    )));
+                }
+                StatementKind::Return(_) | StatementKind::Break | StatementKind::Continue
+                    if live_after || !references.is_empty() =>
+                {
+                    return Ok(Err(StructuredViewLivenessError::Escape(statement.source)));
+                }
+                _ => live_after,
+            };
+            if !references.is_empty() {
+                if !live_before {
+                    if references.len() != 1 {
+                        return Ok(Err(StructuredViewLivenessError::InvalidUse(
+                            statement.source,
+                        )));
+                    }
+                    terminal_uses
+                        .try_reserve(1)
+                        .map_err(|_| AnalysisFailure::ResourceLimit {
+                            resource: "structured lexical-view terminals",
+                            limit: u64::from(u32::MAX),
+                        })?;
+                    terminal_uses.push(references[0]);
+                }
+                live_before = true;
+            }
+            live_after = live_before;
+        }
+        Ok(Ok(live_after))
+    }
+
+    let initialization_record = program
+        .statement(initialization)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let body = program
+        .body(initialization_record.body)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let initialization_index = body
+        .statements
+        .iter()
+        .position(|candidate| *candidate == initialization)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let mut terminal_uses = Vec::new();
+    let mut live_after_statements = Vec::new();
+    let live = match analyze_body(
+        program,
+        initialization_record.body,
+        initialization_index + 1,
+        binding,
+        false,
+        &mut terminal_uses,
+        &mut live_after_statements,
+        is_cancelled,
+    )? {
+        Ok(live) => live,
+        Err(error) => return Ok(Err(error)),
+    };
+    if !live {
+        return Ok(Err(StructuredViewLivenessError::MissingUse(
+            initialization_record.source,
+        )));
+    }
+    terminal_uses.sort_unstable();
+    terminal_uses.dedup();
+    live_after_statements.sort_unstable();
+    live_after_statements.dedup();
+    Ok(Ok(StructuredViewLiveness {
+        terminal_uses,
+        live_after_statements,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13313,146 +13652,78 @@ fn record_lexical_view_initialization(
             argument_source: source.source,
         });
     }
-    let initialization_record = request
-        .hir
-        .as_program()
-        .statement(initialization)
-        .ok_or(AnalysisFailure::RequestMismatch)?;
-    let mut terminal_uses = Vec::new();
-    for candidate in &request.hir.as_program().expressions {
-        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
-        if candidate.source.file == initialization_record.source.file
-            && candidate.source.range.start > initialization_record.source.range.end
-            && candidate.kind == ExpressionKind::Reference(Definition::Local(binding))
-        {
-            terminal_uses
-                .try_reserve(1)
-                .map_err(|_| fact_resource(request, "lexical view terminal uses"))?;
-            terminal_uses.push(candidate.id);
-        }
-    }
-    if terminal_uses.len() != 1 {
-        return Err(runtime_type_diagnostic(
-            request,
-            initialization_record.source,
-            "semantic-view-control-flow-pending",
-            "this lexical view does not have one exact straight-line terminal use",
-            "branching, repeated use, and unused-view release require the structured backward liveness increment",
-            "consume the view exactly once later in the same straight-line body",
-        ));
-    }
-    let terminal = request
-        .hir
-        .as_program()
-        .expression(terminal_uses[0])
-        .ok_or(AnalysisFailure::RequestMismatch)?;
-    let mut unary_consumers = 0_u32;
-    for candidate in &request.hir.as_program().expressions {
-        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
-        if candidate.kind == ExpressionKind::Try(terminal.id) {
+    let liveness = match derive_structured_view_liveness(
+        request.hir.as_program(),
+        initialization,
+        binding,
+        is_cancelled,
+    )? {
+        Ok(liveness) => liveness,
+        Err(StructuredViewLivenessError::Question(source)) => {
             return Err(ephemeral_question_diagnostic(
                 request,
-                candidate.source,
+                source,
                 EphemeralKind::View,
             ));
         }
-        if let ExpressionKind::Call { arguments, .. } = &candidate.kind
-            && matches!(
-                arguments.as_slice(),
-                [argument]
-                    if matches!(argument.value, wrela_hir::CallArgumentValue::Value(value) if value == terminal.id)
-            )
-        {
-            unary_consumers = unary_consumers
-                .checked_add(1)
-                .ok_or_else(|| fact_resource(request, "lexical view terminal consumers"))?;
-        }
-    }
-    if unary_consumers != 1 {
-        return Err(runtime_type_diagnostic(
-            request,
-            terminal.source,
-            "semantic-view-terminal-use-pending",
-            "lexical view terminal use must be one unary call argument",
-            "operators, multi-argument calls, and nested expressions require broader ephemeral-consumption rules",
-            "pass the view directly to one unary consumer",
-        ));
-    }
-    let mut terminal_statement = None;
-    let mut terminal_width = None;
-    for candidate in &request.hir.as_program().statements {
-        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
-        if candidate.source.file == terminal.source.file
-            && candidate.source.range.start <= terminal.source.range.start
-            && terminal.source.range.end <= candidate.source.range.end
-        {
-            let width = candidate.source.range.end - candidate.source.range.start;
-            if terminal_width.is_none_or(|current| width < current) {
-                terminal_statement = Some(candidate);
-                terminal_width = Some(width);
-            }
-        }
-    }
-    let terminal_statement = terminal_statement.ok_or(AnalysisFailure::RequestMismatch)?;
-    if terminal_statement.body != initialization_record.body {
-        return Err(runtime_type_diagnostic(
-            request,
-            terminal.source,
-            "semantic-view-control-flow-pending",
-            "lexical view use crosses a structured control-flow boundary",
-            "this increment authenticates one terminal use in the initializer's direct statement sequence",
-            "keep the projection binding and its one use in the same straight-line body",
-        ));
-    }
-    let direct_body = request
-        .hir
-        .as_program()
-        .body(initialization_record.body)
-        .ok_or(AnalysisFailure::RequestMismatch)?;
-    let mut initialization_index = None;
-    let mut terminal_index = None;
-    for (index, candidate) in direct_body.statements.iter().enumerate() {
-        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
-        if *candidate == initialization {
-            initialization_index = Some(index);
-        }
-        if *candidate == terminal_statement.id {
-            terminal_index = Some(index);
-        }
-    }
-    let initialization_index = initialization_index.ok_or(AnalysisFailure::RequestMismatch)?;
-    let terminal_index = terminal_index.ok_or(AnalysisFailure::RequestMismatch)?;
-    if terminal_index <= initialization_index {
-        return Err(AnalysisFailure::RequestMismatch.into());
-    }
-    for statement in &direct_body.statements[initialization_index + 1..=terminal_index] {
-        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
-        let statement = request
-            .hir
-            .as_program()
-            .statement(*statement)
-            .ok_or(AnalysisFailure::RequestMismatch)?;
-        if matches!(
-            statement.kind,
-            StatementKind::If { .. }
-                | StatementKind::For { .. }
-                | StatementKind::While { .. }
-                | StatementKind::Loop { .. }
-                | StatementKind::Match { .. }
-                | StatementKind::With { .. }
-                | StatementKind::Return(_)
-                | StatementKind::Break
-                | StatementKind::Continue
-        ) {
+        Err(StructuredViewLivenessError::InvalidUse(source)) => {
             return Err(runtime_type_diagnostic(
                 request,
-                statement.source,
+                source,
+                "semantic-view-terminal-use-pending",
+                "lexical view use must be one direct unary call argument",
+                "operators, multi-argument calls, and nested expressions require broader ephemeral-consumption rules",
+                "pass the view directly to one unary consumer",
+            ));
+        }
+        Err(StructuredViewLivenessError::Escape(source)) => {
+            return Err(runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-view-escape",
+                "lexical view remains live across an early exit",
+                "a regionless view cannot be returned or carried through break/continue",
+                "consume the view on every path before leaving its lexical activation",
+            ));
+        }
+        Err(StructuredViewLivenessError::UnsupportedControlFlow(source)) => {
+            return Err(runtime_type_diagnostic(
+                request,
+                source,
                 "semantic-view-control-flow-pending",
-                "structured control flow occurs while a lexical view remains live",
-                "source-span order alone cannot prove a view lifetime across branches, loops, or early exits",
+                "loop or with control flow occurs while a lexical view remains live",
+                "this increment authenticates acyclic if/match liveness without inventing a fixed-point witness",
                 "consume the view before this statement or recreate it afterward",
             ));
         }
+        Err(StructuredViewLivenessError::UnevenPaths(source)) => {
+            return Err(runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-view-control-flow-pending",
+                "lexical view has no exact terminal use on every control-flow path",
+                "branch and match joins require the activation to be live on every incoming path or released on every path",
+                "consume the view in every arm or after the structured statement",
+            ));
+        }
+        Err(StructuredViewLivenessError::MissingUse(source)) => {
+            return Err(runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-view-control-flow-pending",
+                "lexical view has no exact terminal use",
+                "unused-view release is outside the current authenticated activation subset",
+                "consume the view directly in a unary call",
+            ));
+        }
+    };
+    let liveness_edges = liveness
+        .terminal_uses
+        .len()
+        .checked_add(liveness.live_after_statements.len())
+        .ok_or_else(|| fact_resource(request, "structured lexical-view liveness"))?;
+    for _ in 0..liveness_edges {
+        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
     }
     partial.lexical_views.push(LexicalView {
         id: view_id,
@@ -13463,7 +13734,8 @@ fn record_lexical_view_initialization(
         binding,
         value,
         sources,
-        terminal_uses,
+        terminal_uses: liveness.terminal_uses,
+        live_after_statements: liveness.live_after_statements,
     });
     Ok(())
 }
@@ -32505,6 +32777,20 @@ fn projection_call_is_lexical():
                 .is_err(),
             "the exact sealer must reject an omitted terminal-use witness"
         );
+        assert!(
+            !view.live_after_statements.is_empty(),
+            "the intervening statement must have an exact structured liveness witness"
+        );
+        let mut forged_liveness = facts.clone();
+        forged_liveness.lexical_views[0]
+            .live_after_statements
+            .clear();
+        assert!(
+            forged_liveness
+                .validate_for_seal(analyzed.hir(), &|| false)
+                .is_err(),
+            "the exact sealer must reject an omitted structured liveness witness"
+        );
 
         let mut forged_program = analyzed.hir().clone().into_program();
         let body = forged_program
@@ -33016,7 +33302,7 @@ async fn view_cannot_cross_await():
     }
 
     #[test]
-    fn lexical_projection_control_flow_remains_named_and_fail_closed() {
+    fn lexical_projection_terminal_uses_are_exact_across_if_branches() {
         const SOURCE: &str = r#"module app
 
 from core.image import Image, Target
@@ -33035,26 +33321,233 @@ pub fn boot() -> Image:
     return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
 
 @test(runtime)
-fn view_control_flow_is_deferred():
+fn view_control_flow_is_structured():
     packet: Packet = Packet(header=7)
     hdr: view u64 = header(packet)
     if true:
         consume(hdr)
+    else:
+        consume(hdr)
 "#;
         let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "branch-local terminal uses must analyze: {:?}",
+            output.diagnostics()
+        );
+        let facts = output.successful().expect("sealed structured view").facts();
+        let view = &facts.lexical_views[0];
+        assert_eq!(view.terminal_uses.len(), 2);
+        assert!(
+            view.terminal_uses.windows(2).all(|pair| pair[0] < pair[1]),
+            "terminal uses stay canonical"
+        );
+    }
+
+    #[test]
+    fn lexical_projection_liveness_flows_to_post_if_continuation() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn intervening_branch_preserves_liveness():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    if true:
+        pass
+    else:
+        pass
+    consume(hdr)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "a post-branch terminal use must stay live through both arms: {:?}",
+            output.diagnostics()
+        );
+        let facts = output
+            .successful()
+            .expect("sealed continuation view")
+            .facts();
+        let view = &facts.lexical_views[0];
+        let branch_passes = facts
+            .statements
+            .iter()
+            .filter(|fact| {
+                fact.function == view.function
+                    && matches!(
+                        output
+                            .successful()
+                            .expect("sealed continuation view")
+                            .hir()
+                            .as_program()
+                            .statement(fact.statement)
+                            .map(|statement| &statement.kind),
+                        Some(StatementKind::Pass)
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(branch_passes.len(), 2);
+        assert!(branch_passes.iter().all(|fact| {
+            fact.live_lexical_views_after
+                .binary_search(&view.id)
+                .is_ok()
+        }));
+    }
+
+    #[test]
+    fn lexical_projection_terminal_uses_are_exact_across_match_arms() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+pub enum Choice:
+    left
+    right
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn match_view_liveness_is_structured():
+    packet: Packet = Packet(header=7)
+    choice: Choice = .left
+    hdr: view u64 = header(packet)
+    match choice:
+        case Choice.left:
+            consume(hdr)
+        case Choice.right:
+            consume(hdr)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "match-arm terminal uses must analyze: {:?}",
+            output.diagnostics()
+        );
         assert_eq!(
             output
-                .diagnostics()
-                .first()
-                .and_then(|diagnostic| diagnostic.code.as_deref()),
-            Some("semantic-view-control-flow-pending"),
-            "view-bearing control flow must not be mistaken for straight-line liveness: {:?}",
+                .successful()
+                .expect("sealed match view")
+                .facts()
+                .lexical_views[0]
+                .terminal_uses
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn structured_view_liveness_names_branch_local_source_mutation() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn touch(mut packet: Packet):
+    pass
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn branch_mutation_is_blocked():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    if true:
+        touch(mut packet)
+    else:
+        pass
+    consume(hdr)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        let diagnostic = output
+            .diagnostics()
+            .first()
+            .expect("structured source-mutation diagnostic");
+        assert_eq!(
+            diagnostic.code.as_deref(),
+            Some("semantic-view-source-mutated")
+        );
+        assert!(diagnostic.message.contains("packet"));
+        assert!(diagnostic.message.contains("header"));
+    }
+
+    #[test]
+    fn branch_local_terminal_use_releases_source_on_that_path() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn touch(mut packet: Packet):
+    pass
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn branch_release_is_path_exact():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    if true:
+        consume(hdr)
+        touch(mut packet)
+    else:
+        consume(hdr)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "a source releases after its branch-local terminal use: {:?}",
             output.diagnostics()
         );
     }
 
     #[test]
-    fn intervening_control_flow_while_view_is_live_fails_closed() {
+    fn lexical_projection_loop_liveness_remains_named_and_fail_closed() {
         const SOURCE: &str = r#"module app
 
 from core.image import Image, Target
@@ -33073,10 +33566,12 @@ pub fn boot() -> Image:
     return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
 
 @test(runtime)
-fn intervening_branch_is_deferred():
+fn loop_view_liveness_is_deferred():
     packet: Packet = Packet(header=7)
     hdr: view u64 = header(packet)
-    if true:
+    index: u8 = 0
+    while index < 1:
+        index += 1
         pass
     consume(hdr)
 "#;
@@ -33087,7 +33582,7 @@ fn intervening_branch_is_deferred():
                 .first()
                 .and_then(|diagnostic| diagnostic.code.as_deref()),
             Some("semantic-view-control-flow-pending"),
-            "an intervening branch must not be represented by source-span liveness: {:?}",
+            "loop-carried view liveness stays named and closed: {:?}",
             output.diagnostics()
         );
     }
