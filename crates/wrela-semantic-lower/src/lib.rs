@@ -2288,15 +2288,6 @@ fn validate_supported_source_type(
                     "semantic-generic-enum-mixed-arity-lowering-pending (unit or non-unary generic enum variants)",
                 ));
             }
-            if !arguments.is_empty()
-                && variants
-                    .windows(2)
-                    .any(|pair| pair[0].fields[0].ty != pair[1].fields[0].ty)
-            {
-                return Err(unsupported(
-                    "semantic-generic-enum-heterogeneous-lowering-pending (differing specialized generic enum payloads)",
-                ));
-            }
             // Every variant is exactly one supported copy scalar (no unit
             // variants); this is the payload-bearing runtime enum shape the
             // machine lowering below packs into one shared tagged-union slot.
@@ -2355,15 +2346,11 @@ fn validate_supported_source_type(
                     "semantic-enum-nominal-payload-lowering-pending (flat-struct or nongeneric-enum nominal enum payloads)",
                 ));
             }
-            let layout = variants
-                .first()
-                .and_then(|variant| variant.fields.first())
-                .and_then(|field| facts.types.get(field.ty.0 as usize))
-                .and_then(canonical_tagged_enum_layout);
+            let layout = canonical_runtime_enum_layout(facts, variants);
             ty.linearity == sema::Linearity::ExplicitCopy
                 && ty.source.is_some()
                 && declaration.0 < facts.hir.declarations
-                && supported_runtime_enum_arguments(arguments, variants)
+                && supported_runtime_enum_type_arguments(arguments)
                 && !variants.is_empty()
                 && variants.len() <= 256
                 && variants.iter().all(|variant| {
@@ -2377,9 +2364,6 @@ fn validate_supported_source_type(
                                 | sema::SemanticTypeKind::Float { bits: 32 | 64 })
                     }))
                 })
-                && variants
-                    .windows(2)
-                    .all(|pair| pair[0].fields[0].ty == pair[1].fields[0].ty)
                 && layout.is_some_and(|(size, alignment)| {
                     ty.size_upper_bound == Some(size) && ty.alignment_lower_bound == alignment
                 })
@@ -2407,20 +2391,10 @@ fn validate_supported_source_type(
     }
 }
 
-fn supported_runtime_enum_arguments(
-    arguments: &[sema::SemanticArgument],
-    variants: &[sema::SemanticVariant],
-) -> bool {
-    if arguments.is_empty() {
-        return true;
-    }
+fn supported_runtime_enum_type_arguments(arguments: &[sema::SemanticArgument]) -> bool {
     arguments
         .iter()
         .all(|argument| matches!(argument, sema::SemanticArgument::Type(_)))
-        && matches!(variants.first().and_then(|variant| variant.fields.first()), Some(first)
-        if variants.iter().all(|variant| {
-            matches!(variant.fields.as_slice(), [field] if field.ty == first.ty)
-        }))
 }
 
 fn supported_core_result_arguments(
@@ -2460,6 +2434,30 @@ fn canonical_tagged_enum_layout(payload: &sema::SemanticType) -> Option<(u64, u3
         1_u64.checked_add(alignment.checked_sub(1)?)? & !alignment.checked_sub(1)?;
     let unpadded = payload_offset.checked_add(payload_size)?;
     let size = unpadded.checked_add(alignment.checked_sub(1)?)? & !alignment.checked_sub(1)?;
+    Some((size, payload_alignment))
+}
+
+fn canonical_runtime_enum_layout(
+    facts: &sema::PartialAnalysis,
+    variants: &[sema::SemanticVariant],
+) -> Option<(u64, u32)> {
+    let mut payload_size = 0_u64;
+    let mut payload_alignment = 1_u32;
+    for variant in variants {
+        let [field] = variant.fields.as_slice() else {
+            return None;
+        };
+        let payload = facts.types.get(field.ty.0 as usize)?;
+        let size = payload.size_upper_bound?;
+        canonical_tagged_enum_layout(payload)?;
+        payload_size = payload_size.max(size);
+        payload_alignment = payload_alignment.max(payload.alignment_lower_bound);
+    }
+    let alignment = u64::from(payload_alignment);
+    let mask = alignment.checked_sub(1)?;
+    let payload_offset = 1_u64.checked_add(mask)? & !mask;
+    let unpadded = payload_offset.checked_add(payload_size)?;
+    let size = unpadded.checked_add(mask)? & !mask;
     Some((size, payload_alignment))
 }
 
@@ -6930,7 +6928,7 @@ impl SourceFunctionLowerer<'_> {
                 }
                 SourceStatementPlan::Match { scrutinee, arms } => {
                     let scrutinee_fact = self.expression_fact(scrutinee)?;
-                    let (declaration, variant_count, payload_ty) = self
+                    let (declaration, semantic_variants) = self
                         .input
                         .facts()
                         .types
@@ -6940,13 +6938,17 @@ impl SourceFunctionLowerer<'_> {
                                 declaration,
                                 arguments,
                                 variants,
-                            } if supported_runtime_enum_arguments(arguments, variants) => variants
-                                .first()
-                                .and_then(|variant| variant.fields.first())
-                                .map(|field| (*declaration, variants.len(), field.ty)),
+                            } if supported_runtime_enum_type_arguments(arguments)
+                                && variants
+                                    .iter()
+                                    .all(|variant| matches!(variant.fields.as_slice(), [_])) =>
+                            {
+                                Some((*declaration, variants))
+                            }
                             _ => None,
                         })
                         .ok_or_else(|| self.fact_mismatch("match scrutinee enum type"))?;
+                    let variant_count = semantic_variants.len();
                     let LoweredExpression::Value(scrutinee) =
                         self.lower_expression(scrutinee, sema::AccessMode::Read, &mut statements)?
                     else {
@@ -7004,6 +7006,11 @@ impl SourceFunctionLowerer<'_> {
                         if candidate.enumeration.declaration != declaration || argument.take {
                             return Err(self.fact_mismatch("match constructor payload access"));
                         }
+                        let payload_ty = semantic_variants
+                            .get(candidate.variant as usize)
+                            .and_then(|variant| variant.fields.first())
+                            .map(|field| field.ty)
+                            .ok_or_else(|| self.fact_mismatch("match variant payload type"))?;
                         let covered = seen_variants
                             .get_mut(candidate.variant as usize)
                             .ok_or_else(|| self.fact_mismatch("match variant range"))?;
@@ -7945,7 +7952,7 @@ impl SourceFunctionLowerer<'_> {
                             arguments,
                             variants,
                         } if *declaration == source.enumeration.declaration
-                            && supported_runtime_enum_arguments(arguments, variants)
+                            && supported_runtime_enum_type_arguments(arguments)
                             && variants.get(variant as usize)
                                 .is_some_and(|candidate| candidate.name == source_variant.name.as_str()))
                     });
@@ -9008,7 +9015,7 @@ impl SourceFunctionLowerer<'_> {
                     arguments,
                     variants,
                     ..
-                } if supported_runtime_enum_arguments(arguments, variants) => variants
+                } if supported_runtime_enum_type_arguments(arguments) => variants
                     .get(aggregate.variant as usize)
                     .and_then(|variant| variant.fields.first())
                     .map(|field| field.ty),
@@ -18067,7 +18074,7 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn heterogeneous_generic_enum_lowering_fails_closed_by_name() {
+    fn heterogeneous_copy_scalar_generic_enum_specialization_lowers_exactly() {
         let image = analyze_parsed_actor_source(
             r#"module app
 
@@ -18084,6 +18091,11 @@ async fn checkpoint():
 pub struct Worker:
     pub async fn ping(mut self):
         value: Either[u8, u64] = Either.first(7)
+        match value:
+            case Either.first(small):
+                pass
+            case Either.second(large):
+                pass
         await checkpoint()
 
 @image
@@ -18093,17 +18105,52 @@ pub fn boot() -> Image:
     return img
 "#,
         );
-        assert!(matches!(
-            CanonicalSemanticLowerer::new().lower(
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
                 LowerRequest {
-                    input: image,
+                    input: image.clone(),
                     limits: LoweringLimits::standard(),
                 },
                 &|| false,
+            )
+            .expect("heterogeneous copy-scalar generic enum specialization should lower");
+        let wir = lowered.wir().as_wir();
+        let either = wir
+            .types
+            .iter()
+            .find(|ty| ty.source_name == "Either")
+            .expect("lowered Either specialization");
+        let wir::TypeKind::Enum { variants } = &either.kind else {
+            panic!("Either must remain an enum")
+        };
+        let [first, second] = variants.as_slice() else {
+            panic!("Either must retain both source variants")
+        };
+        assert_eq!(first.name, "first");
+        assert_eq!(second.name, "second");
+        assert_ne!(first.fields[0].ty, second.fields[0].ty);
+
+        let mut forged = wir.clone();
+        let forged_either = forged
+            .types
+            .iter_mut()
+            .find(|ty| ty.source_name == "Either")
+            .expect("forged Either specialization");
+        let wir::TypeKind::Enum { variants } = &mut forged_either.kind else {
+            panic!("Either must remain an enum")
+        };
+        variants[1].fields[0].ty = variants[0].fields[0].ty;
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                forged,
+                lowered.report().clone(),
+                &|| false,
             ),
-            Err(LowerError::UnsupportedInput {
-                feature: "semantic-generic-enum-heterogeneous-lowering-pending (differing specialized generic enum payloads)"
-            })
+            Err(LowerError::InvalidReport(_))
         ));
     }
 

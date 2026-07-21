@@ -2231,21 +2231,16 @@ fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut ValidationE
             for field in variants.iter().flat_map(|variant| &variant.fields) {
                 use_type!(field.ty);
             }
-            let payload = variants
-                .first()
-                .and_then(|variant| match variant.fields.as_slice() {
-                    [field] => Some(field.ty),
-                    _ => None,
-                });
             let canonical = !variants.is_empty()
                 && variants.len() <= 256
                 && ty.linearity == Linearity::ExplicitCopy
-                && payload.is_some_and(|payload| {
-                    module.types.get(payload.0 as usize).is_some_and(|record| {
-                        record.linearity == Linearity::CopyScalar
-                            && matches!(
-                                record.kind,
-                                TypeKind::Primitive(
+                && variants.iter().enumerate().all(|(index, variant)| {
+                    let scalar_payload = matches!(variant.fields.as_slice(), [field]
+                    if field.name.is_empty()
+                        && field.public
+                        && module.types.get(field.ty.0 as usize).is_some_and(|record| {
+                            record.linearity == Linearity::CopyScalar
+                                && matches!(record.kind, TypeKind::Primitive(
                                     PrimitiveType::Bool
                                         | PrimitiveType::I8
                                         | PrimitiveType::I16
@@ -2259,16 +2254,13 @@ fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut ValidationE
                                         | PrimitiveType::U128
                                         | PrimitiveType::F32
                                         | PrimitiveType::F64
-                                )
-                            )
-                    }) && variants.iter().enumerate().all(|(index, variant)| {
-                        !variant.name.is_empty()
-                            && !variants[..index]
-                                .iter()
-                                .any(|prior| prior.name == variant.name)
-                            && matches!(variant.fields.as_slice(), [field]
-                            if field.ty == payload && field.name.is_empty() && field.public)
-                    })
+                                ))
+                        }));
+                    scalar_payload
+                        && !variant.name.is_empty()
+                        && !variants[..index]
+                            .iter()
+                            .any(|prior| prior.name == variant.name)
                 });
             if !canonical {
                 errors.push(ValidationError::InvalidRecord {
@@ -4841,6 +4833,40 @@ mod tests {
             .expect("256-variant enum");
         assert!(closed_enum_fixture(0).validate().is_err());
         assert!(closed_enum_fixture(257).validate().is_err());
+
+        let mut heterogeneous = closed_enum_fixture(2);
+        heterogeneous.types.push(TypeRecord {
+            id: TypeId(3),
+            source_name: "u16".to_owned(),
+            kind: TypeKind::Primitive(PrimitiveType::U16),
+            linearity: Linearity::CopyScalar,
+            source: None,
+        });
+        let TypeKind::Enum { variants } = &mut heterogeneous.types[2].kind else {
+            unreachable!();
+        };
+        variants[1].fields[0].ty = TypeId(3);
+        let SemanticStatement::Let(statement) = &mut heterogeneous.functions[1].body.statements[0]
+        else {
+            unreachable!();
+        };
+        let SemanticOperation::ConstructEnum { variant, .. } = &mut statement.operation else {
+            unreachable!();
+        };
+        *variant = 0;
+        heterogeneous
+            .clone()
+            .validate()
+            .expect("distinct scalar payload types remain a closed enum");
+        let SemanticStatement::Let(statement) = &mut heterogeneous.functions[1].body.statements[0]
+        else {
+            unreachable!();
+        };
+        let SemanticOperation::ConstructEnum { variant, .. } = &mut statement.operation else {
+            unreachable!();
+        };
+        *variant = 1;
+        assert!(heterogeneous.validate().is_err());
 
         let mut blank = closed_enum_fixture(2);
         let TypeKind::Enum { variants } = &mut blank.types[2].kind else {
