@@ -785,8 +785,8 @@ fn validate_scope_normal_body(
     root: wrela_hir::BodyId,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), LowerError> {
-    let mut pending = vec![root];
-    while let Some(body) = pending.pop() {
+    let mut pending = vec![(root, true)];
+    while let Some((body, direct_cleanup_path)) = pending.pop() {
         check_cancelled(is_cancelled)?;
         let body = program.body(body).ok_or(LowerError::MissingSemanticFact {
             subject: "scope activation".to_owned(),
@@ -819,26 +819,32 @@ fn validate_scope_normal_body(
                 })?
                 .kind
             {
-                wrela_hir::StatementKind::Return(_)
-                | wrela_hir::StatementKind::Break
-                | wrela_hir::StatementKind::Continue => {
+                wrela_hir::StatementKind::Return(_) if !direct_cleanup_path => {
+                    return Err(unsupported(
+                        "semantic-with-structured-return-cleanup-lowering-pending",
+                    ));
+                }
+                wrela_hir::StatementKind::Return(_) => {}
+                wrela_hir::StatementKind::Break | wrela_hir::StatementKind::Continue => {
                     return Err(unsupported(
                         "semantic-with-abnormal-cleanup-lowering-pending (early control-flow exit)",
                     ));
                 }
-                wrela_hir::StatementKind::With { body, .. }
-                | wrela_hir::StatementKind::While { body, .. }
+                wrela_hir::StatementKind::With { body, .. } => {
+                    pending.push((*body, direct_cleanup_path));
+                }
+                wrela_hir::StatementKind::While { body, .. }
                 | wrela_hir::StatementKind::Loop { body }
-                | wrela_hir::StatementKind::For { body, .. } => pending.push(*body),
+                | wrela_hir::StatementKind::For { body, .. } => pending.push((*body, false)),
                 wrela_hir::StatementKind::If {
                     branches,
                     else_body,
                 } => {
-                    pending.extend(branches.iter().map(|(_, body)| *body));
-                    pending.extend(*else_body);
+                    pending.extend(branches.iter().map(|(_, body)| (*body, false)));
+                    pending.extend(else_body.map(|body| (body, false)));
                 }
                 wrela_hir::StatementKind::Match { arms, .. } => {
-                    pending.extend(arms.iter().map(|arm| arm.body));
+                    pending.extend(arms.iter().map(|arm| (arm.body, false)));
                 }
                 _ => {}
             }
@@ -7028,15 +7034,22 @@ impl SourceFunctionLowerer<'_> {
                     if lowered_body.statements.iter().any(|statement| {
                         matches!(
                             statement,
-                            wir::SemanticStatement::Return(_)
-                                | wir::SemanticStatement::Break(_)
-                                | wir::SemanticStatement::Continue(_)
+                            wir::SemanticStatement::Break(_) | wir::SemanticStatement::Continue(_)
                         )
                     }) {
                         return Err(unsupported(
                             "semantic-with-abnormal-cleanup-lowering-pending (lowered early exit)",
                         ));
                     }
+                    let direct_return = matches!(
+                        lowered_body.statements.last(),
+                        Some(wir::SemanticStatement::Return(_))
+                    );
+                    let return_statement = if direct_return {
+                        lowered_body.statements.pop()
+                    } else {
+                        None
+                    };
                     for nested in lowered_body.statements.drain(..) {
                         self.push_statement(&mut statements, nested)?;
                     }
@@ -7055,6 +7068,10 @@ impl SourceFunctionLowerer<'_> {
                         },
                         Some(statement_source),
                     )?;
+                    if let Some(return_statement) = return_statement {
+                        self.push_statement(&mut statements, return_statement)?;
+                    }
+                    returned = direct_return;
                     if let Some(local) = binding {
                         local_state.set_empty(local)?;
                     }
@@ -20108,6 +20125,240 @@ pub fn boot() -> Image:
                 ("exit", wir::ScopeId(1)),
             ]
         );
+    }
+
+    #[test]
+    fn early_return_from_free_scope_runs_cleanup_before_return() {
+        let source = PASS_ONLY_SCOPE_ACTOR_SOURCE.replace(
+            "        with irqs_masked() as mask:\n            pass\n        await checkpoint()",
+            "        with irqs_masked() as mask:\n            return",
+        );
+        let image = analyze_parsed_actor_source(&source);
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("an early return must lower through scope cleanup");
+        let turn = lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .expect("actor turn");
+        assert!(turn.body.statements.iter().any(|statement| matches!(
+            statement,
+            wir::SemanticStatement::Let(wir::LetStatement {
+                operation: wir::SemanticOperation::EnterScope { .. },
+                ..
+            })
+        )));
+        assert!(matches!(
+            &turn.body.statements[turn.body.statements.len() - 3..],
+            [
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::CommitScope { .. },
+                    ..
+                }),
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::ExitScope { .. },
+                    ..
+                }),
+                wir::SemanticStatement::Return(values),
+            ] if values.is_empty()
+        ));
+
+        let mut missing_exit = lowered.wir().as_wir().clone();
+        let turn = missing_exit
+            .functions
+            .iter_mut()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .expect("actor turn");
+        let exit = turn
+            .body
+            .statements
+            .iter()
+            .position(|statement| {
+                matches!(
+                    statement,
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::ExitScope { .. },
+                        ..
+                    })
+                )
+            })
+            .expect("early-return exit marker");
+        turn.body.statements.remove(exit);
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                missing_exit,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidOutput(_)) | Err(LowerError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn nested_free_scope_return_cleans_inner_before_outer() {
+        let source = PASS_ONLY_SCOPE_ACTOR_SOURCE.replace(
+            "        with irqs_masked() as mask:\n            pass\n        await checkpoint()",
+            "        with irqs_masked() as outer:\n            with irqs_masked() as inner:\n                return",
+        );
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: analyze_parsed_actor_source(&source),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("a nested early return must clean both scopes");
+        let turn = lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .expect("actor turn");
+        let markers: Vec<_> = turn
+            .body
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::EnterScope { scope, .. },
+                    ..
+                }) => Some(("enter", *scope)),
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::CommitScope { scope, .. },
+                    ..
+                }) => Some(("commit", *scope)),
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::ExitScope { scope },
+                    ..
+                }) => Some(("exit", *scope)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            markers,
+            [
+                ("enter", wir::ScopeId(1)),
+                ("enter", wir::ScopeId(0)),
+                ("commit", wir::ScopeId(0)),
+                ("exit", wir::ScopeId(0)),
+                ("commit", wir::ScopeId(1)),
+                ("exit", wir::ScopeId(1)),
+            ]
+        );
+        assert!(matches!(
+            turn.body.statements.last(),
+            Some(wir::SemanticStatement::Return(values)) if values.is_empty()
+        ));
+    }
+
+    #[test]
+    fn structured_scope_return_remains_named_fail_closed() {
+        let source = PASS_ONLY_SCOPE_ACTOR_SOURCE.replace(
+            "        with irqs_masked() as mask:\n            pass\n        await checkpoint()",
+            "        with irqs_masked() as mask:\n            if true:\n                return",
+        );
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: analyze_parsed_actor_source(&source),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-with-structured-return-cleanup-lowering-pending",
+            })
+        ));
+    }
+
+    #[test]
+    fn early_return_scope_lowering_has_exact_limit_and_late_cancellation() {
+        let source = PASS_ONLY_SCOPE_ACTOR_SOURCE.replace(
+            "        with irqs_masked() as mask:\n            pass\n        await checkpoint()",
+            "        with irqs_masked() as mask:\n            return",
+        );
+        let image = analyze_parsed_actor_source(&source);
+        let baseline = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("early-return scope baseline");
+        let mut exact = LoweringLimits::standard();
+        exact.operations = baseline.report().operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact early-return operation limit");
+        let mut one_under = exact;
+        one_under.operations -= 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == one_under.operations
+        ));
+
+        let polls = Cell::new(0_u64);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            )
+            .expect("count early-return cancellation polls");
+        let cancel_at = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next == cancel_at
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), cancel_at);
     }
 
     #[test]

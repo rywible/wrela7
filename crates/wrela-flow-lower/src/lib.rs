@@ -10647,6 +10647,20 @@ mod contract_tests {
             })
             .collect();
         assert_eq!(cleanup_calls, [(&[flow::ValueId(4)][..])]);
+        let [block] = turn.blocks.as_slice() else {
+            panic!("scope turn must remain one exact block")
+        };
+        assert!(matches!(
+            block.instructions.last(),
+            Some(flow::Instruction {
+                operation: flow::FlowOperation::Call { function, .. },
+                ..
+            }) if *function == cleanup.id
+        ));
+        assert!(matches!(
+            block.terminator,
+            flow::Terminator::Return(ref values) if values.is_empty()
+        ));
         assert_eq!(output.report().cleanup_edges, 1);
 
         let (validated, report, diagnostics) = output.into_parts();
