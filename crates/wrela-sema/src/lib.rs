@@ -9334,6 +9334,7 @@ fn valid_lexical_view_prefix(view: &LexicalView, analysis: &PartialAnalysis) -> 
                     .live_lexical_views_after
                     .binary_search(&view.id)
                     .is_ok()
+                    != view.terminal_uses.is_empty()
         });
     let Some(expression) = analysis
         .expressions
@@ -9590,7 +9591,8 @@ fn valid_lexical_view_record(
         .filter(|fact| fact.function == view.function)
     {
         check_analysis_cancelled(is_cancelled)?;
-        let expected_live = fact.statement == view.initialization
+        let expected_live = (fact.statement == view.initialization
+            && !view.terminal_uses.is_empty())
             || view
                 .live_after_statements
                 .binary_search(&fact.statement)

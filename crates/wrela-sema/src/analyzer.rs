@@ -15435,7 +15435,7 @@ fn append_statement_fact(
         if view.function != function {
             continue;
         }
-        if statement == view.initialization
+        if (statement == view.initialization && !view.terminal_uses.is_empty())
             || view.live_after_statements.binary_search(&statement).is_ok()
         {
             live_lexical_views_after
@@ -15470,7 +15470,6 @@ pub(super) enum StructuredViewLivenessError {
     InvalidUse(Span),
     Question(Span),
     Escape(Span),
-    MissingUse(Span),
 }
 
 pub(super) fn containing_statement_for_expression(
@@ -15785,7 +15784,7 @@ pub(super) fn derive_structured_view_liveness(
         .ok_or(AnalysisFailure::RequestMismatch)?;
     let mut terminal_uses = Vec::new();
     let mut live_after_statements = Vec::new();
-    let live = match analyze_body(
+    match analyze_body(
         program,
         initialization_record.body,
         initialization_index + 1,
@@ -15795,14 +15794,12 @@ pub(super) fn derive_structured_view_liveness(
         &mut live_after_statements,
         is_cancelled,
     )? {
-        Ok(live) => live,
+        Ok(_) => {}
         Err(error) => return Ok(Err(error)),
-    };
-    if !live {
-        return Ok(Err(StructuredViewLivenessError::MissingUse(
-            initialization_record.source,
-        )));
     }
+    // An activation with no later reference releases at the end of its
+    // initializer. It therefore has no terminal expression and is not live
+    // after any statement; the empty witness is exact rather than missing.
     terminal_uses.sort_unstable();
     terminal_uses.dedup();
     live_after_statements.sort_unstable();
@@ -15941,16 +15938,6 @@ fn record_lexical_view_initialization(
                 "loop or with control flow occurs while a lexical view remains live",
                 "this increment authenticates acyclic if/match liveness without inventing a fixed-point witness",
                 "consume the view before this statement or recreate it afterward",
-            ));
-        }
-        Err(StructuredViewLivenessError::MissingUse(source)) => {
-            return Err(runtime_type_diagnostic(
-                request,
-                source,
-                "semantic-view-control-flow-pending",
-                "lexical view has no exact terminal use",
-                "unused-view release is outside the current authenticated activation subset",
-                "consume the view directly in a unary call",
             ));
         }
     };
@@ -39410,6 +39397,63 @@ fn source_rebind_after_release():
             output.diagnostics().is_empty(),
             "source authority must release after the exact terminal use: {:?}",
             output.diagnostics()
+        );
+    }
+
+    #[test]
+    fn unused_projection_releases_at_the_end_of_its_initializer() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn unused_projection_releases_immediately():
+    packet: Packet = Packet(header=7)
+    unused: view u64 = header(packet)
+    packet = Packet(header=8)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "an unused view must release before the following statement: {:?}",
+            output.diagnostics()
+        );
+        let analyzed = output.successful().expect("sealed unused-view analysis");
+        let facts = analyzed.facts();
+        let view = facts.lexical_views.first().expect("one lexical view");
+        assert!(view.terminal_uses.is_empty());
+        assert!(view.live_after_statements.is_empty());
+        let initialization = facts
+            .statements
+            .iter()
+            .find(|fact| fact.statement == view.initialization)
+            .expect("view initialization statement fact");
+        assert!(
+            !initialization.live_lexical_views_after.contains(&view.id),
+            "the unused view is released at the initializer boundary"
+        );
+
+        let mut forged = facts.clone();
+        let initialization = forged
+            .statements
+            .iter_mut()
+            .find(|fact| fact.statement == view.initialization)
+            .expect("forged view initialization statement fact");
+        initialization.live_lexical_views_after.push(view.id);
+        initialization.live_lexical_views_after.sort_unstable();
+        assert!(
+            forged.validate_for_seal(analyzed.hir(), &|| false).is_err(),
+            "full sealing must reject a falsely retained unused view"
         );
     }
 }
