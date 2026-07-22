@@ -16,7 +16,7 @@ pub use wrela_test_model::{
     TestDescriptor, TestId as ModelTestId, TestKind as ModelTestKind,
 };
 
-pub const SEMANTIC_WIR_VERSION: u32 = 13;
+pub const SEMANTIC_WIR_VERSION: u32 = 14;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 
 macro_rules! id_type {
@@ -121,6 +121,22 @@ pub enum TypeKind {
     },
     Enum {
         variants: Vec<VariantType>,
+    },
+    /// Compiler-authenticated `core.actor.AsyncExit[u64]`. Keeping this
+    /// distinct from a source-constructible enum prevents a structurally
+    /// similar nominal type from acquiring privileged async-outcome authority.
+    AsyncExit {
+        operation_error: TypeId,
+        cancelled: TypeId,
+        deadline_rejected: TypeId,
+        deadline_exceeded: TypeId,
+    },
+    /// The ephemeral result produced only by one authenticated fallible await.
+    /// `declared_error` records the direct callee's pre-widening error type.
+    AsyncOutcome {
+        value: TypeId,
+        declared_error: TypeId,
+        exit: TypeId,
     },
     Function(FunctionType),
     Iso {
@@ -456,6 +472,13 @@ pub enum SemanticOperation {
     },
     Await {
         awaitable: ValueId,
+    },
+    /// Await one direct non-actor `Result[u64,u64]` activation and widen its
+    /// error to the authenticated `AsyncExit[u64]` taxonomy.
+    AwaitAsyncOutcome {
+        awaitable: ValueId,
+        exit: TypeId,
+        proof: ProofId,
     },
     SpawnTask {
         task: TaskId,
@@ -827,6 +850,7 @@ pub enum ProofKind {
     RegionBound,
     CapacityBound,
     ActorReplyExactlyOnce,
+    AsyncOutcomeAuthenticated,
     WaitGraphAcyclic,
     CleanupAcyclic,
     WorkBound,
@@ -1235,6 +1259,8 @@ fn validate_model_resources(
             | TypeKind::StaticString { .. }
             | TypeKind::StaticBytes { .. }
             | TypeKind::BoundedString { .. }
+            | TypeKind::AsyncExit { .. }
+            | TypeKind::AsyncOutcome { .. }
             | TypeKind::Array { .. }
             | TypeKind::Iso { .. }
             | TypeKind::ActorHandle { .. }
@@ -1331,6 +1357,7 @@ fn validate_model_resources(
                             | SemanticOperation::ActorSend { .. }
                             | SemanticOperation::ActorTrySend { .. }
                             | SemanticOperation::Await { .. }
+                            | SemanticOperation::AwaitAsyncOutcome { .. }
                             | SemanticOperation::Cancel { .. }
                             | SemanticOperation::Checkpoint { .. }
                             | SemanticOperation::Allocate { .. }
@@ -2372,6 +2399,58 @@ fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut ValidationE
                 });
             }
         }
+        TypeKind::AsyncExit {
+            operation_error,
+            cancelled,
+            deadline_rejected,
+            deadline_exceeded,
+        } => {
+            use_type!(*operation_error);
+            use_type!(*cancelled);
+            use_type!(*deadline_rejected);
+            use_type!(*deadline_exceeded);
+            let valid = ty.source_name == "AsyncExit"
+                && ty.linearity == Linearity::ExplicitCopy
+                && ty.source.is_some()
+                && canonical_u64(module, *operation_error)
+                && canonical_empty_cause(module, *cancelled, "Cancelled")
+                && canonical_empty_cause(module, *deadline_rejected, "DeadlineRejected")
+                && canonical_empty_cause(module, *deadline_exceeded, "DeadlineExceeded")
+                && cancelled != deadline_rejected
+                && cancelled != deadline_exceeded
+                && deadline_rejected != deadline_exceeded;
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "async exit type",
+                    id: ty.id.0,
+                });
+            }
+        }
+        TypeKind::AsyncOutcome {
+            value,
+            declared_error,
+            exit,
+        } => {
+            use_type!(*value);
+            use_type!(*declared_error);
+            use_type!(*exit);
+            let valid = ty.source_name == "Result"
+                && ty.linearity == Linearity::ExplicitCopy
+                && ty.source.is_some()
+                && canonical_u64(module, *value)
+                && canonical_u64(module, *declared_error)
+                && module.types.get(exit.0 as usize).is_some_and(|record| {
+                    record.id == *exit
+                        && matches!(record.kind, TypeKind::AsyncExit { operation_error, .. }
+                            if operation_error == *declared_error)
+                });
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "async outcome type",
+                    id: ty.id.0,
+                });
+            }
+        }
         TypeKind::Function(function) => {
             for parameter in &function.parameters {
                 use_type!(parameter.ty);
@@ -2398,6 +2477,26 @@ fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut ValidationE
             use_type!(*payload);
         }
     }
+}
+
+fn canonical_u64(module: &SemanticWir, ty: TypeId) -> bool {
+    module.types.get(ty.0 as usize).is_some_and(|record| {
+        record.id == ty
+            && record.source_name == "u64"
+            && record.linearity == Linearity::CopyScalar
+            && record.source.is_none()
+            && record.kind == TypeKind::Primitive(PrimitiveType::U64)
+    })
+}
+
+fn canonical_empty_cause(module: &SemanticWir, ty: TypeId, name: &str) -> bool {
+    module.types.get(ty.0 as usize).is_some_and(|record| {
+        record.id == ty
+            && record.source_name == name
+            && record.linearity == Linearity::ExplicitCopy
+            && record.source.is_some()
+            && matches!(&record.kind, TypeKind::Struct { fields } if fields.is_empty())
+    })
 }
 
 fn canonical_closed_enum_payload(module: &SemanticWir, ty: TypeId) -> bool {
@@ -3893,6 +3992,72 @@ fn validate_operation(
         }
         | SemanticOperation::TestEmit { payload: operand }
         | SemanticOperation::TestFinish { outcome: operand } => value!(*operand),
+        SemanticOperation::AwaitAsyncOutcome {
+            awaitable,
+            exit,
+            proof,
+        } => {
+            value!(*awaitable);
+            require_id(
+                "async outcome exit type",
+                exit.0,
+                module.types.len(),
+                errors,
+            );
+            require_id("async outcome proof", proof.0, module.proofs.len(), errors);
+            let outcome = match results {
+                [result] => function.values.get(result.0 as usize).and_then(|result| {
+                    module
+                        .types
+                        .get(result.ty.0 as usize)
+                        .and_then(|outcome| match outcome.kind {
+                            TypeKind::AsyncOutcome {
+                                value,
+                                declared_error,
+                                exit: outcome_exit,
+                            } => Some((result, value, declared_error, outcome_exit)),
+                            _ => None,
+                        })
+                }),
+                _ => None,
+            };
+            let valid = function.color == FunctionColor::Async
+                && outcome.is_some_and(|(result, value, declared_error, outcome_exit)| {
+                    outcome_exit == *exit
+                        && canonical_u64(module, value)
+                        && canonical_u64(module, declared_error)
+                        && function.values.get(awaitable.0 as usize).is_some_and(|awaitable| {
+                            canonical_declared_async_result(
+                                module,
+                                awaitable.ty,
+                                value,
+                                declared_error,
+                            )
+                        })
+                        && module.proofs.get(proof.0 as usize).is_some_and(|record| {
+                            let source = result.origin;
+                            record.id == *proof
+                                && record.kind == ProofKind::AsyncOutcomeAuthenticated
+                                && record.subject
+                                    == "direct fallible await widens to AsyncExit[u64]"
+                                && record.bound == Some(1)
+                                && source.is_some_and(|source| {
+                                    record.sources.as_slice() == [source]
+                                })
+                                && record.depends_on.as_slice() == [ProofId(0), ProofId(1)]
+                                && record.explanation.as_slice() == [
+                                    "the direct non-actor async callee returns Result[u64,u64]; this await alone widens the error to compiler-authenticated AsyncExit[u64] for immediate match or is consumption",
+                                ]
+                                && function.proofs.binary_search(proof).is_ok()
+                        })
+                });
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "authenticated async outcome await",
+                    id: results.first().map_or(u32::MAX, |result| result.0),
+                });
+            }
+        }
         SemanticOperation::Assert { condition, failure } => {
             value!(*condition);
             if failure.expression.chars().all(char::is_whitespace)
@@ -4256,6 +4421,28 @@ fn validate_operation(
             }
         }
     }
+}
+
+fn canonical_declared_async_result(
+    module: &SemanticWir,
+    ty: TypeId,
+    value: TypeId,
+    error: TypeId,
+) -> bool {
+    module.types.get(ty.0 as usize).is_some_and(|record| {
+        record.id == ty
+            && record.source_name == "Result"
+            && record.linearity == Linearity::ExplicitCopy
+            && record.source.is_some()
+            && matches!(&record.kind, TypeKind::Enum { variants }
+                if matches!(variants.as_slice(), [ok, err]
+                    if ok.name == "Ok"
+                        && matches!(ok.fields.as_slice(), [field]
+                            if field.name.is_empty() && field.public && field.ty == value)
+                        && err.name == "Err"
+                        && matches!(err.fields.as_slice(), [field]
+                            if field.name.is_empty() && field.public && field.ty == error)))
+    })
 }
 
 fn bounded_integer_maximum(kind: &TypeKind) -> Option<u64> {
@@ -5762,7 +5949,7 @@ mod tests {
         closed_enum_fixture(256)
             .validate()
             .expect("256-variant enum");
-        for rejected in [12, 14] {
+        for rejected in [13, 15] {
             let mut wrong_version = closed_enum_fixture(2);
             wrong_version.version = rejected;
             assert!(wrong_version.validate().is_err());

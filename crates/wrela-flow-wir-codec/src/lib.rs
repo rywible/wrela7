@@ -492,7 +492,7 @@ mod tests {
                 profile: digest,
             },
             source_summary: SourceSummary {
-                semantic_wir_version: 13,
+                semantic_wir_version: 14,
                 semantic_functions: 1,
                 hir_files: 1,
                 hir_declarations: 1,

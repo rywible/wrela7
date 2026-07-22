@@ -24,7 +24,7 @@ pub use decode::decode_image_report_json;
 /// [`ReportError::UnsupportedSchema`].
 pub const REPORT_SCHEMA_VERSION: u32 = 17;
 
-const CURRENT_SEMANTIC_WIR_VERSION: u32 = 13;
+const CURRENT_SEMANTIC_WIR_VERSION: u32 = 14;
 const CURRENT_FLOW_WIR_VERSION: u32 = 18;
 const CURRENT_FLOW_WIR_WIRE_VERSION: u32 = 18;
 const CURRENT_MACHINE_WIR_VERSION: u32 = 19;
@@ -3945,7 +3945,7 @@ mod tests {
             sections: Vec::new(),
             symbols: Vec::new(),
             representations: super::RepresentationFacts {
-                semantic_wir_version: 13,
+                semantic_wir_version: 14,
                 flow_wir_version: 18,
                 flow_wir_wire_version: 18,
                 machine_wir_version: 19,
@@ -5493,8 +5493,8 @@ mod tests {
     fn every_non_current_representation_version_fails_closed() {
         let digest = Sha256Digest::from_bytes([0x6a; 32]);
         let mutations: [fn(&mut super::RepresentationFacts); 10] = [
-            |versions| versions.semantic_wir_version = 12,
-            |versions| versions.semantic_wir_version = 14,
+            |versions| versions.semantic_wir_version = 13,
+            |versions| versions.semantic_wir_version = 15,
             |versions| versions.flow_wir_version = 17,
             |versions| versions.flow_wir_version = 19,
             |versions| versions.flow_wir_wire_version = 17,

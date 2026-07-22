@@ -33,7 +33,7 @@ use wrela_target::TargetPackage;
 // Scalar code reservation for the canonical empty body plus the mandatory
 // runtime-entry call, zero-status switch, and status-propagating failure edge.
 const MINIMUM_ENTRY_CODE_BYTES: u64 = 640;
-const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 13;
+const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 14;
 const MINIMUM_BACKEND_PROOF: &str = "the canonical empty Flow image body returns EFI_SUCCESS after successful runtime initialization without backend memory facts";
 const IMAGE_ENTER_RUNTIME_REASON: &str =
     "generated UEFI image entry initializes the target runtime";

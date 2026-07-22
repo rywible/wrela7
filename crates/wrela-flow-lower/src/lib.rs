@@ -296,6 +296,23 @@ fn supported_input<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedSemantic<'a>, LowerError> {
+    let has_async_type = input.types.iter().any(|ty| {
+        matches!(
+            ty.kind,
+            semantic::TypeKind::AsyncExit { .. } | semantic::TypeKind::AsyncOutcome { .. }
+        )
+    });
+    let mut has_async_operation = false;
+    for function in &input.functions {
+        check_cancelled(is_cancelled)?;
+        has_async_operation |=
+            contains_async_outcome_operation(&function.body, limits.model_edges, is_cancelled)?;
+    }
+    if has_async_type || has_async_operation {
+        return Err(unsupported(
+            "flow-async-outcome-lowering-pending (structured async exit delivery)",
+        ));
+    }
     reject_unadmitted_nominal_enum_payload(input, is_cancelled)?;
     if input.tests.is_empty() {
         if input.actors.is_empty()
@@ -311,6 +328,65 @@ fn supported_input<'a>(
         supported_generated_tests(input, limits, is_cancelled)
             .map(SupportedSemantic::GeneratedTests)
     }
+}
+
+fn contains_async_outcome_operation(
+    root: &semantic::SemanticRegion,
+    limit: u64,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, LowerError> {
+    let mut regions = try_vec(1, "semantic async-outcome regions", limit)?;
+    regions.push(root);
+    while let Some(region) = regions.pop() {
+        check_cancelled(is_cancelled)?;
+        for statement in &region.statements {
+            check_cancelled(is_cancelled)?;
+            match statement {
+                semantic::SemanticStatement::Let(semantic::LetStatement {
+                    operation: semantic::SemanticOperation::AwaitAsyncOutcome { .. },
+                    ..
+                }) => return Ok(true),
+                semantic::SemanticStatement::If {
+                    then_region,
+                    else_region,
+                    ..
+                } => {
+                    push_bounded(
+                        &mut regions,
+                        then_region,
+                        "semantic async-outcome regions",
+                        limit,
+                    )?;
+                    push_bounded(
+                        &mut regions,
+                        else_region,
+                        "semantic async-outcome regions",
+                        limit,
+                    )?;
+                }
+                semantic::SemanticStatement::Match { arms, .. } => {
+                    for arm in arms {
+                        push_bounded(
+                            &mut regions,
+                            &arm.body,
+                            "semantic async-outcome regions",
+                            limit,
+                        )?;
+                    }
+                }
+                semantic::SemanticStatement::Loop { body, .. } => {
+                    push_bounded(&mut regions, body, "semantic async-outcome regions", limit)?
+                }
+                semantic::SemanticStatement::Let(_)
+                | semantic::SemanticStatement::Return(_)
+                | semantic::SemanticStatement::Yield(_)
+                | semantic::SemanticStatement::Break(_)
+                | semantic::SemanticStatement::Continue(_)
+                | semantic::SemanticStatement::Unreachable => {}
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn reject_unadmitted_nominal_enum_payload(
@@ -2269,6 +2345,8 @@ fn supported_generated_tests<'a>(
                 }
             }
             semantic::TypeKind::Tuple(_)
+            | semantic::TypeKind::AsyncExit { .. }
+            | semantic::TypeKind::AsyncOutcome { .. }
             | semantic::TypeKind::Iso { .. }
             | semantic::TypeKind::ActorHandle { .. }
             | semantic::TypeKind::Reservation
@@ -4136,6 +4214,8 @@ fn preflight_input(
             | semantic::TypeKind::StaticString { .. }
             | semantic::TypeKind::StaticBytes { .. }
             | semantic::TypeKind::BoundedString { .. }
+            | semantic::TypeKind::AsyncExit { .. }
+            | semantic::TypeKind::AsyncOutcome { .. }
             | semantic::TypeKind::Array { .. }
             | semantic::TypeKind::Iso { .. }
             | semantic::TypeKind::ActorHandle { .. }
@@ -4327,6 +4407,7 @@ fn preflight_input(
                             | semantic::SemanticOperation::ActorSend { .. }
                             | semantic::SemanticOperation::ActorTrySend { .. }
                             | semantic::SemanticOperation::Await { .. }
+                            | semantic::SemanticOperation::AwaitAsyncOutcome { .. }
                             | semantic::SemanticOperation::Cancel { .. }
                             | semantic::SemanticOperation::Checkpoint { .. }
                             | semantic::SemanticOperation::Allocate { .. }
@@ -4778,6 +4859,8 @@ fn lower_generated_type(
             capacity: *capacity,
         },
         semantic::TypeKind::Tuple(_)
+        | semantic::TypeKind::AsyncExit { .. }
+        | semantic::TypeKind::AsyncOutcome { .. }
         | semantic::TypeKind::Iso { .. }
         | semantic::TypeKind::ActorHandle { .. }
         | semantic::TypeKind::Reservation
@@ -7425,6 +7508,7 @@ fn lower_generated_operation(
         | semantic::SemanticOperation::ActorSend { .. }
         | semantic::SemanticOperation::ActorTrySend { .. }
         | semantic::SemanticOperation::Await { .. }
+        | semantic::SemanticOperation::AwaitAsyncOutcome { .. }
         | semantic::SemanticOperation::SpawnTask { .. }
         | semantic::SemanticOperation::Cancel { .. }
         | semantic::SemanticOperation::Checkpoint { .. }
@@ -7588,6 +7672,10 @@ fn lower_proof_kind(kind: &semantic::ProofKind) -> flow::ProofKind {
         semantic::ProofKind::RegionBound => flow::ProofKind::RegionBound,
         semantic::ProofKind::CapacityBound => flow::ProofKind::CapacityBound,
         semantic::ProofKind::ActorReplyExactlyOnce => flow::ProofKind::ActorReplyExactlyOnce,
+        // The supported-input boundary rejects this authority before any Flow
+        // proof translation. Keep the match total without adding a FlowWir
+        // representation or version claim.
+        semantic::ProofKind::AsyncOutcomeAuthenticated => flow::ProofKind::TypeChecked,
         semantic::ProofKind::WaitGraphAcyclic => flow::ProofKind::WaitGraphAcyclic,
         semantic::ProofKind::CleanupAcyclic => flow::ProofKind::CleanupAcyclic,
         semantic::ProofKind::WorkBound => flow::ProofKind::WorkBound,
@@ -9372,7 +9460,7 @@ mod contract_tests {
         CanonicalFlowLowerer, FlowLowerer, LowerError, LowerRequest, LoweringLimits,
         LoweringReport, actor_flow_program_matches, exact_enum_type_test_match_protocol,
         lower_generated_operation, lower_proof_kind, measure_actor_flow_output_resources,
-        preflight_input, seal, supported_actor_image, supported_source_value_type,
+        preflight_input, seal, supported_actor_image, supported_input, supported_source_value_type,
     };
     use wrela_build_model::{BuildIdentity, LanguageRevision, Sha256Digest, TargetIdentity};
     use wrela_flow_wir as flow;
@@ -10098,6 +10186,22 @@ mod contract_tests {
             ),
             Err(LowerError::UnsupportedInput {
                 feature: "flow-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
+            })
+        ));
+    }
+
+    #[test]
+    fn authenticated_async_outcome_stops_at_named_flow_boundary() {
+        let mut module = fixture().into_wir();
+        module.types[0].kind = semantic::TypeKind::AsyncOutcome {
+            value: semantic::TypeId(0),
+            declared_error: semantic::TypeId(0),
+            exit: semantic::TypeId(0),
+        };
+        assert!(matches!(
+            supported_input(&module, LoweringLimits::standard(), &|| false),
+            Err(LowerError::UnsupportedInput {
+                feature: "flow-async-outcome-lowering-pending (structured async exit delivery)",
             })
         ));
     }

@@ -462,16 +462,23 @@ it. It injects phase implementations and bounded host capabilities, while
   preserves the analyzer's exact proof-kind vocabulary and every proof source,
   as well as function instance keys, attached proof IDs, recursive-depth
   bounds, and the HIR declaration/file bounds used to validate provenance.
-- SemanticWir v13 retains exact SSA aggregate field replacement as `InsertField`.
+- SemanticWir v14 retains exact SSA aggregate field replacement as `InsertField`.
   Validation joins the prior aggregate's struct type, selected field, inserted
   value type, and single result of the unchanged aggregate type; FlowWir v18
   preserves the same operation and independently repeats that join.
-- SemanticWir v13 retains compiler-minted plain byte literals as
+- SemanticWir v14 retains compiler-minted plain byte literals as
   `StaticBytes { bytes }` plus an exact decoded `Constant::Bytes`. Validation
   authenticates the canonical `Static[Bytes[N]]` identity, explicit-copy
   linearity, decoded extent, byte-constant result type, and resource bounds.
   Flow lowering rejects the type by name at `flow-static-bytes-lowering-pending`
   until a runtime storage and consumer ABI is specified.
+- SemanticWir v14 retains the exact privileged fallible-await profile as
+  distinct `AsyncExit` and ephemeral `AsyncOutcome` types plus
+  `AwaitAsyncOutcome` and `AsyncOutcomeAuthenticated` proof authority. The
+  validator joins the direct callee's declared `Result[u64,u64]`, the effective
+  `Result[u64,AsyncExit[u64]]`, all three sealed zero-size cause identities, the
+  await source, and the base type/effect proofs. Flow lowering fails closed at
+  `flow-async-outcome-lowering-pending`; no runtime delivery ABI is claimed.
 - MachineWir v19 retains same-block nongeneric flat values with two or more
   primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
   `InsertField`, and `ExtractField` carry exact SSA joins through independent
@@ -1135,7 +1142,7 @@ it. It injects phase implementations and bounded host capabilities, while
 - That schema is the only accepted report shape. Its tag rejects stale or
   mismatched artifacts at the trust boundary; there is no legacy reader,
   migration, adapter, or fallback contract. Its embedded interface facts must
-  be exactly SemanticWir 13, FlowWir 18, Flow wire 18, MachineWir 19, and runtime
+  be exactly SemanticWir 14, FlowWir 18, Flow wire 18, MachineWir 19, and runtime
   ABI 2; nonzero stale or future values are rejected rather than tolerated.
 - Schema v10 also projects sealed actor, task, reportable region, and async
   activation plans into

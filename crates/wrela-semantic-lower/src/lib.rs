@@ -213,6 +213,7 @@ struct ActorImageFacts<'a> {
     constructor: wrela_hir::DeclarationId,
     wait_proof: sema::ProofId,
     supervision_proof: sema::ProofId,
+    async_outcomes: AsyncOutcomeLoweringContext,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -243,6 +244,43 @@ struct ProjectionActivationLowering {
 struct ProjectionLoweringContext {
     activations: Vec<ProjectionActivationLowering>,
     declarations: Vec<wrela_hir::DeclarationId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AsyncOutcomeActivation {
+    function: sema::FunctionInstanceId,
+    expression: wrela_hir::ExpressionId,
+    declared_result: sema::SemanticTypeId,
+    effective_result: sema::SemanticTypeId,
+    exit: sema::SemanticTypeId,
+    proof: wir::ProofId,
+    source: Span,
+}
+
+#[derive(Debug, Default)]
+struct AsyncOutcomeLoweringContext {
+    activations: Vec<AsyncOutcomeActivation>,
+}
+
+impl AsyncOutcomeLoweringContext {
+    fn activation(
+        &self,
+        function: sema::FunctionInstanceId,
+        expression: wrela_hir::ExpressionId,
+    ) -> Option<AsyncOutcomeActivation> {
+        self.activations
+            .iter()
+            .find(|activation| {
+                activation.function == function && activation.expression == expression
+            })
+            .copied()
+    }
+
+    fn admits_type(&self, ty: sema::SemanticTypeId) -> bool {
+        self.activations
+            .iter()
+            .any(|activation| activation.effective_result == ty || activation.exit == ty)
+    }
 }
 
 impl ProjectionLoweringContext {
@@ -291,7 +329,6 @@ fn supported_input<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedInput<'a>, LowerError> {
-    validate_async_outcome_lowering_boundary(input.facts())?;
     validate_admission_result_lowering_boundary(input.facts())?;
     validate_generic_function_lowering_boundary(input)?;
     validate_method_call_lowering_boundary(input.facts())?;
@@ -305,10 +342,12 @@ fn supported_input<'a>(
             {
                 supported_actor_image(input, limits, is_cancelled).map(SupportedInput::ActorImage)
             } else {
+                validate_async_outcome_lowering_boundary(input.facts())?;
                 supported_minimum(input.facts()).map(SupportedInput::Minimum)
             }
         }
         sema::AnalysisRoot::GeneratedTestHarness { .. } => {
+            validate_async_outcome_lowering_boundary(input.facts())?;
             supported_generated_tests(input, limits, is_cancelled)
                 .map(SupportedInput::GeneratedTests)
         }
@@ -327,6 +366,471 @@ fn validate_async_outcome_lowering_boundary(
     } else {
         Ok(())
     }
+}
+
+fn authenticated_async_outcomes(
+    input: &AnalyzedImage,
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<AsyncOutcomeLoweringContext, LowerError> {
+    let facts = input.facts();
+    let program = input.hir().as_program();
+    let count = facts
+        .values
+        .iter()
+        .filter(|value| {
+            value.class == sema::SemanticValueClass::Ephemeral(sema::EphemeralKind::AsyncOutcome)
+        })
+        .count();
+    let mut activations = try_vec(count, "SemanticWir async outcomes", limits.model_edges)?;
+    for value in facts.values.iter().filter(|value| {
+        value.class == sema::SemanticValueClass::Ephemeral(sema::EphemeralKind::AsyncOutcome)
+    }) {
+        check_cancelled(is_cancelled)?;
+        let await_fact = facts
+            .expressions
+            .iter()
+            .find(|fact| {
+                fact.function == value.function
+                    && fact.result == Some(value.id)
+                    && fact.ty == value.ty
+                    && fact.resolution
+                        == sema::ExpressionResolution::Builtin(sema::IntrinsicOperation::Await)
+            })
+            .ok_or_else(|| unsupported("semantic-async-outcome-authentication (await producer)"))?;
+        let await_expression = program
+            .expression(await_fact.expression)
+            .ok_or_else(|| unsupported("semantic-async-outcome-authentication (await source)"))?;
+        let wrela_hir::ExpressionKind::Unary {
+            operator: wrela_hir::UnaryOperator::Await,
+            operand,
+        } = await_expression.kind
+        else {
+            return Err(unsupported(
+                "semantic-async-outcome-authentication (await syntax)",
+            ));
+        };
+        let operand_fact = facts
+            .expressions
+            .iter()
+            .find(|fact| fact.function == value.function && fact.expression == operand)
+            .ok_or_else(|| unsupported("semantic-async-outcome-authentication (direct callee)"))?;
+        let sema::ExpressionResolution::DirectCall {
+            function: callee, ..
+        } = operand_fact.resolution
+        else {
+            return Err(unsupported(
+                "semantic-async-outcome-authentication (non-actor direct call)",
+            ));
+        };
+        let source_call_is_nullary = program.expression(operand).is_some_and(|expression| {
+            matches!(&expression.kind, wrela_hir::ExpressionKind::Call { arguments, .. }
+                if arguments.is_empty())
+        });
+        let callee = facts.functions.get(callee.0 as usize).filter(|callee| {
+            callee.id == operand_fact_direct_target(operand_fact)
+                && callee.role == sema::FunctionRole::Ordinary
+                && callee.color == wrela_hir::FunctionColor::Async
+                && callee.parameters.is_empty()
+                && callee.result == operand_fact.ty
+        });
+        if !source_call_is_nullary || callee.is_none() {
+            return Err(unsupported(
+                "semantic-async-outcome-authentication (direct nullary async helper)",
+            ));
+        }
+        let direct_match = program.statements.iter().any(|statement| {
+            matches!(statement.kind, wrela_hir::StatementKind::Match { scrutinee, .. }
+                if scrutinee == await_fact.expression)
+        });
+        let direct_is = program.expressions.iter().any(|expression| {
+            matches!(expression.kind, wrela_hir::ExpressionKind::IsPattern { value, .. }
+                if value == await_fact.expression)
+        });
+        if direct_match == direct_is
+            || await_fact.effects.0 != operand_fact.effects.0 | sema::EffectSet::SUSPEND
+        {
+            return Err(unsupported(
+                "semantic-async-outcome-authentication (immediate match or is consumer)",
+            ));
+        }
+        let (value_ty, exit_ty) = exact_async_outcome_type(input, value.ty, operand_fact.ty)?;
+        if !canonical_u64_semantic(facts, value_ty) {
+            return Err(unsupported(
+                "semantic-async-outcome-authentication (u64 payload)",
+            ));
+        }
+        let proof_index = facts
+            .proofs
+            .len()
+            .checked_add(activations.len())
+            .and_then(|index| u32::try_from(index).ok())
+            .ok_or(LowerError::ResourceLimit {
+                resource: "SemanticWir async outcome proofs",
+                limit: limits.model_edges,
+            })?;
+        activations.push(AsyncOutcomeActivation {
+            function: value.function,
+            expression: await_fact.expression,
+            declared_result: operand_fact.ty,
+            effective_result: value.ty,
+            exit: exit_ty,
+            proof: wir::ProofId(proof_index),
+            source: await_expression.source,
+        });
+    }
+    Ok(AsyncOutcomeLoweringContext { activations })
+}
+
+fn operand_fact_direct_target(fact: &sema::ExpressionFact) -> sema::FunctionInstanceId {
+    match fact.resolution {
+        sema::ExpressionResolution::DirectCall { function, .. } => function,
+        _ => sema::FunctionInstanceId(u32::MAX),
+    }
+}
+
+fn canonical_u64_semantic(facts: &sema::PartialAnalysis, ty: sema::SemanticTypeId) -> bool {
+    facts.types.get(ty.0 as usize).is_some_and(|record| {
+        record.id == ty
+            && record.kind
+                == sema::SemanticTypeKind::Integer {
+                    signed: false,
+                    bits: 64,
+                    pointer_sized: false,
+                }
+            && record.linearity == sema::Linearity::ScalarCopy
+            && record.size_upper_bound == Some(8)
+            && record.alignment_lower_bound == 8
+            && record.source.is_none()
+    })
+}
+
+fn exact_async_outcome_type(
+    input: &AnalyzedImage,
+    effective: sema::SemanticTypeId,
+    declared: sema::SemanticTypeId,
+) -> Result<(sema::SemanticTypeId, sema::SemanticTypeId), LowerError> {
+    let facts = input.facts();
+    let effective_record = facts
+        .types
+        .get(effective.0 as usize)
+        .filter(|record| record.id == effective)
+        .ok_or_else(|| unsupported("semantic-async-outcome-authentication (effective type)"))?;
+    let declared_record = facts
+        .types
+        .get(declared.0 as usize)
+        .filter(|record| record.id == declared)
+        .ok_or_else(|| unsupported("semantic-async-outcome-authentication (declared type)"))?;
+    let sema::SemanticTypeKind::Enumeration {
+        declaration,
+        arguments,
+        variants,
+    } = &effective_record.kind
+    else {
+        return Err(unsupported(
+            "semantic-async-outcome-authentication (effective Result)",
+        ));
+    };
+    let [
+        sema::SemanticArgument::Type(value),
+        sema::SemanticArgument::Type(exit),
+    ] = arguments.as_slice()
+    else {
+        return Err(unsupported(
+            "semantic-async-outcome-authentication (effective arguments)",
+        ));
+    };
+    let declaration_record = input
+        .hir()
+        .as_program()
+        .declaration(*declaration)
+        .ok_or_else(|| unsupported("semantic-async-outcome-authentication (Result source)"))?;
+    let wrela_hir::DeclarationKind::Enumeration(source_result) = &declaration_record.kind else {
+        return Err(unsupported(
+            "semantic-async-outcome-authentication (Result declaration)",
+        ));
+    };
+    if !core_result_source_matches_semantic(
+        input.hir().as_program(),
+        declaration_record,
+        source_result,
+        arguments,
+        variants,
+    ) || effective_record.linearity != sema::Linearity::ExplicitCopy
+        || effective_record.size_upper_bound
+            != authenticated_tagged_enum_layout(facts, variants).map(|layout| layout.0)
+        || effective_record.alignment_lower_bound
+            != authenticated_tagged_enum_layout(facts, variants).map_or(0, |layout| layout.1)
+    {
+        return Err(unsupported(
+            "semantic-async-outcome-authentication (effective Result identity)",
+        ));
+    }
+    let sema::SemanticTypeKind::Enumeration {
+        declaration: declared_declaration,
+        arguments: declared_arguments,
+        variants: declared_variants,
+    } = &declared_record.kind
+    else {
+        return Err(unsupported(
+            "semantic-async-outcome-authentication (declared Result)",
+        ));
+    };
+    if declared_declaration != declaration
+        || !matches!(declared_arguments.as_slice(), [sema::SemanticArgument::Type(ok), sema::SemanticArgument::Type(err)]
+            if ok == value && err == value)
+        || !core_result_source_matches_semantic(
+            input.hir().as_program(),
+            declaration_record,
+            source_result,
+            declared_arguments,
+            declared_variants,
+        )
+    {
+        return Err(unsupported(
+            "semantic-async-outcome-authentication (declared Result identity)",
+        ));
+    }
+    authenticate_async_exit(input, *exit, *value)?;
+    Ok((*value, *exit))
+}
+
+fn authenticate_async_exit(
+    input: &AnalyzedImage,
+    exit: sema::SemanticTypeId,
+    operation_error: sema::SemanticTypeId,
+) -> Result<(), LowerError> {
+    let facts = input.facts();
+    let program = input.hir().as_program();
+    let record = facts
+        .types
+        .get(exit.0 as usize)
+        .filter(|record| record.id == exit)
+        .ok_or_else(|| unsupported("semantic-async-outcome-authentication (AsyncExit type)"))?;
+    let sema::SemanticTypeKind::Enumeration {
+        declaration,
+        arguments,
+        variants,
+    } = &record.kind
+    else {
+        return Err(unsupported(
+            "semantic-async-outcome-authentication (AsyncExit enumeration)",
+        ));
+    };
+    let source_record = program
+        .declaration(*declaration)
+        .ok_or_else(|| unsupported("semantic-async-outcome-authentication (AsyncExit source)"))?;
+    let source_module = program
+        .modules
+        .get(source_record.module.0 as usize)
+        .ok_or_else(|| unsupported("semantic-async-outcome-authentication (core.actor module)"))?;
+    let core_package = program
+        .packages
+        .package(program.packages.root())
+        .and_then(|root| {
+            root.dependencies
+                .iter()
+                .find(|dependency| dependency.alias.as_str() == "core")
+                .map(|dependency| dependency.package)
+        })
+        .ok_or_else(|| unsupported("semantic-async-outcome-authentication (core package)"))?;
+    let wrela_hir::DeclarationKind::Enumeration(source) = &source_record.kind else {
+        return Err(unsupported(
+            "semantic-async-outcome-authentication (AsyncExit declaration)",
+        ));
+    };
+    let [generic] = source.generics.as_slice() else {
+        return Err(unsupported(
+            "semantic-async-outcome-authentication (AsyncExit generic)",
+        ));
+    };
+    let exact_generic = program
+        .generic_parameter(*generic)
+        .is_some_and(|parameter| {
+            parameter.owner == *declaration
+                && matches!(
+                    parameter.kind,
+                    wrela_hir::GenericParameterKind::Type { bound: None }
+                )
+        });
+    if source_record.visibility != wrela_hir::Visibility::Public
+        || source_record
+            .name
+            .as_ref()
+            .is_none_or(|name| name.as_str() != "AsyncExit")
+        || source_module.package != core_package
+        || source_module.path.dotted() != "actor"
+        || !exact_generic
+        || !source.members.is_empty()
+        || !source.deriving.is_empty()
+        || arguments.as_slice() != [sema::SemanticArgument::Type(operation_error)]
+        || variants.len() != 4
+        || source.variants.len() != 4
+        || record.linearity != sema::Linearity::ExplicitCopy
+        || record.size_upper_bound
+            != authenticated_tagged_enum_layout(facts, variants).map(|layout| layout.0)
+        || record.alignment_lower_bound
+            != authenticated_tagged_enum_layout(facts, variants).map_or(0, |layout| layout.1)
+    {
+        return Err(unsupported(
+            "semantic-async-outcome-authentication (AsyncExit identity)",
+        ));
+    }
+    let expected_names = [
+        "Operation",
+        "Cancelled",
+        "DeadlineRejected",
+        "DeadlineExceeded",
+    ];
+    let mut cause_types = [sema::SemanticTypeId(0); 3];
+    for (index, ((variant, source_variant), expected_name)) in variants
+        .iter()
+        .zip(&source.variants)
+        .zip(expected_names)
+        .enumerate()
+    {
+        let [field] = variant.fields.as_slice() else {
+            return Err(unsupported(
+                "semantic-async-outcome-authentication (AsyncExit payload)",
+            ));
+        };
+        let [source_field] = source_variant.fields.as_slice() else {
+            return Err(unsupported(
+                "semantic-async-outcome-authentication (AsyncExit source payload)",
+            ));
+        };
+        if variant.name != expected_name
+            || source_variant.name.as_str() != expected_name
+            || !field.name.is_empty()
+            || !field.public
+            || source_field.name.is_some()
+        {
+            return Err(unsupported(
+                "semantic-async-outcome-authentication (AsyncExit variant identity)",
+            ));
+        }
+        if index == 0 {
+            if field.ty != operation_error
+                || !matches!(&source_field.ty.kind,
+                    wrela_hir::TypeExpressionKind::Named {
+                        definition: wrela_hir::Definition::Generic(candidate),
+                        arguments,
+                    } if candidate == generic && arguments.is_empty())
+            {
+                return Err(unsupported(
+                    "semantic-async-outcome-authentication (operation error payload)",
+                ));
+            }
+        } else {
+            let resolved = match &source_field.ty.kind {
+                wrela_hir::TypeExpressionKind::Named {
+                    definition: wrela_hir::Definition::Declaration(resolved),
+                    arguments,
+                } if arguments.is_empty() => resolved,
+                _ => {
+                    return Err(unsupported(
+                        "semantic-async-outcome-authentication (cause source type)",
+                    ));
+                }
+            };
+            authenticate_async_cause(input, field.ty, resolved.declaration, expected_name)?;
+            cause_types[index - 1] = field.ty;
+        }
+    }
+    if cause_types[0] == cause_types[1]
+        || cause_types[0] == cause_types[2]
+        || cause_types[1] == cause_types[2]
+    {
+        return Err(unsupported(
+            "semantic-async-outcome-authentication (distinct cause identities)",
+        ));
+    }
+    Ok(())
+}
+
+fn authenticate_async_cause(
+    input: &AnalyzedImage,
+    ty: sema::SemanticTypeId,
+    declaration: wrela_hir::DeclarationId,
+    name: &str,
+) -> Result<(), LowerError> {
+    let facts = input.facts();
+    let program = input.hir().as_program();
+    let record = facts
+        .types
+        .get(ty.0 as usize)
+        .filter(|record| record.id == ty)
+        .ok_or_else(|| unsupported("semantic-async-outcome-authentication (cause type)"))?;
+    let source = program
+        .declaration(declaration)
+        .ok_or_else(|| unsupported("semantic-async-outcome-authentication (cause source)"))?;
+    let module = program
+        .modules
+        .get(source.module.0 as usize)
+        .ok_or_else(|| unsupported("semantic-async-outcome-authentication (cause module)"))?;
+    let core_package = program
+        .packages
+        .package(program.packages.root())
+        .and_then(|root| {
+            root.dependencies
+                .iter()
+                .find(|dependency| dependency.alias.as_str() == "core")
+                .map(|dependency| dependency.package)
+        });
+    let exact_source = matches!(&source.kind,
+        wrela_hir::DeclarationKind::Structure(structure)
+            if structure.generics.is_empty()
+                && structure.fields.is_empty()
+                && structure.implements.is_empty());
+    if !matches!(&record.kind,
+        sema::SemanticTypeKind::Structure {
+            declaration: candidate,
+            arguments,
+            fields,
+        } if *candidate == declaration && arguments.is_empty() && fields.is_empty())
+        || source.visibility != wrela_hir::Visibility::Public
+        || source.name.as_ref().map(wrela_hir::Name::as_str) != Some(name)
+        || Some(module.package) != core_package
+        || module.path.dotted() != "actor"
+        || !exact_source
+        || record.linearity != sema::Linearity::ExplicitCopy
+        || record.size_upper_bound != Some(0)
+        || record.alignment_lower_bound != 1
+        || record.source != Some(source.source)
+    {
+        return Err(unsupported(
+            "semantic-async-outcome-authentication (sealed cause identity)",
+        ));
+    }
+    Ok(())
+}
+
+fn authenticated_tagged_enum_layout(
+    facts: &sema::PartialAnalysis,
+    variants: &[sema::SemanticVariant],
+) -> Option<(u64, u32)> {
+    let mut payload_size = 0_u64;
+    let mut payload_alignment = 1_u32;
+    for variant in variants {
+        let field = match variant.fields.as_slice() {
+            [] => continue,
+            [field] => field,
+            _ => return None,
+        };
+        let payload = facts.types.get(field.ty.0 as usize)?;
+        let size = payload.size_upper_bound?;
+        if payload.alignment_lower_bound == 0 || !payload.alignment_lower_bound.is_power_of_two() {
+            return None;
+        }
+        payload_size = payload_size.max(size);
+        payload_alignment = payload_alignment.max(payload.alignment_lower_bound);
+    }
+    let alignment = u64::from(payload_alignment);
+    let mask = alignment.checked_sub(1)?;
+    let payload_offset = 1_u64.checked_add(mask)? & !mask;
+    let unpadded = payload_offset.checked_add(payload_size)?;
+    let size = unpadded.checked_add(mask)? & !mask;
+    Some((size, payload_alignment))
 }
 
 fn validate_admission_result_lowering_boundary(
@@ -701,9 +1205,12 @@ fn supported_actor_image<'a>(
         .first()
         .ok_or_else(|| unsupported("actor images without the canonical unit type"))?;
     require_unit_type(unit)?;
+    let async_outcomes = authenticated_async_outcomes(input, limits, is_cancelled)?;
     for ty in &facts.types {
         check_cancelled(is_cancelled)?;
-        validate_actor_source_type(input, ty)?;
+        if !async_outcomes.admits_type(ty.id) {
+            validate_actor_source_type(input, ty)?;
+        }
     }
     let entry = facts
         .functions
@@ -734,7 +1241,8 @@ fn supported_actor_image<'a>(
     }
     validate_actor_graph_contract(input, facts, graph, limits, is_cancelled)?;
     validate_actor_source_functions(input, graph, entry.id, limits, is_cancelled)?;
-    let wait_proof = validate_actor_wait_contract(input, graph, entry, limits, is_cancelled)?;
+    let wait_proof =
+        validate_actor_wait_contract(input, graph, entry, &async_outcomes, limits, is_cancelled)?;
     let supervision_proof =
         validate_static_supervision_contract(facts, graph, entry, limits, is_cancelled)?;
     validate_actor_proof_contract(
@@ -753,6 +1261,7 @@ fn supported_actor_image<'a>(
         constructor,
         wait_proof,
         supervision_proof,
+        async_outcomes,
     })
 }
 
@@ -1866,6 +2375,7 @@ fn validate_actor_wait_contract(
     input: &AnalyzedImage,
     graph: &sema::ImageGraph,
     entry: &sema::FunctionInstance,
+    async_outcomes: &AsyncOutcomeLoweringContext,
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<sema::ProofId, LowerError> {
@@ -1918,12 +2428,18 @@ fn validate_actor_wait_contract(
             _ => return Err(unsupported("non-direct actor await operands")),
         };
         let proofs_match = cancellable_slices_equal(&fact.proofs, &function.proofs, is_cancelled)?;
+        let type_matches = async_outcomes
+            .activation(fact.function, fact.expression)
+            .map_or(fact.ty == operand_fact.ty, |activation| {
+                activation.effective_result == fact.ty
+                    && activation.declared_result == operand_fact.ty
+            });
         if facts
             .functions
             .get(target.0 as usize)
             .is_none_or(|target| target.color != wrela_hir::FunctionColor::Async)
             || fact.result.is_none()
-            || fact.ty != operand_fact.ty
+            || !type_matches
             || fact.effects.0 != operand_fact.effects.0 | sema::EffectSet::SUSPEND
             || !proofs_match
         {
@@ -3921,8 +4437,9 @@ fn lower_actor_image(
 ) -> Result<(SemanticWir, LoweringReport), LowerError> {
     check_cancelled(is_cancelled)?;
     let scope_context = lower_scope_context(actor, limits, is_cancelled)?;
-    let types = lower_actor_types(actor.input, limits, is_cancelled)?;
+    let types = lower_actor_types(actor.input, &actor.async_outcomes, limits, is_cancelled)?;
     let mut proofs = lower_proofs(actor.facts, limits, is_cancelled)?;
+    append_async_outcome_proofs(&actor.async_outcomes, &mut proofs, limits, is_cancelled)?;
     if proofs.get(actor.wait_proof.0 as usize).is_none_or(|proof| {
         proof.id != wir::ProofId(actor.wait_proof.0)
             || proof.kind != wir::ProofKind::WaitGraphAcyclic
@@ -3959,6 +4476,7 @@ fn lower_actor_image(
                 function,
                 Some(&scope_context),
                 None,
+                Some(&actor.async_outcomes),
                 limits,
                 is_cancelled,
             )?
@@ -4111,6 +4629,7 @@ fn lower_actor_image(
 
 fn lower_actor_types(
     input: &AnalyzedImage,
+    async_outcomes: &AsyncOutcomeLoweringContext,
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<wir::TypeRecord>, LowerError> {
@@ -4122,6 +4641,82 @@ fn lower_actor_types(
     )?;
     for ty in &facts.types {
         check_cancelled(is_cancelled)?;
+        if let Some(activation) = async_outcomes
+            .activations
+            .iter()
+            .find(|activation| activation.effective_result == ty.id)
+        {
+            let sema::SemanticTypeKind::Enumeration { arguments, .. } = &ty.kind else {
+                return Err(unsupported(
+                    "semantic-async-outcome-authentication (effective lowering type)",
+                ));
+            };
+            let [
+                sema::SemanticArgument::Type(value),
+                sema::SemanticArgument::Type(exit),
+            ] = arguments.as_slice()
+            else {
+                return Err(unsupported(
+                    "semantic-async-outcome-authentication (effective lowering arguments)",
+                ));
+            };
+            if *exit != activation.exit {
+                return Err(unsupported(
+                    "semantic-async-outcome-authentication (effective lowering identity)",
+                ));
+            }
+            output.push(wir::TypeRecord {
+                id: wir::TypeId(ty.id.0),
+                source_name: copy_text("Result", limits.payload_bytes)?,
+                kind: wir::TypeKind::AsyncOutcome {
+                    value: wir::TypeId(value.0),
+                    declared_error: wir::TypeId(value.0),
+                    exit: wir::TypeId(exit.0),
+                },
+                linearity: lower_linearity(ty.linearity),
+                source: ty.source,
+            });
+            continue;
+        }
+        if async_outcomes
+            .activations
+            .iter()
+            .any(|activation| activation.exit == ty.id)
+        {
+            let sema::SemanticTypeKind::Enumeration { variants, .. } = &ty.kind else {
+                return Err(unsupported(
+                    "semantic-async-outcome-authentication (AsyncExit lowering type)",
+                ));
+            };
+            let [operation, cancelled, rejected, exceeded] = variants.as_slice() else {
+                return Err(unsupported(
+                    "semantic-async-outcome-authentication (AsyncExit lowering variants)",
+                ));
+            };
+            let ([operation], [cancelled], [rejected], [exceeded]) = (
+                operation.fields.as_slice(),
+                cancelled.fields.as_slice(),
+                rejected.fields.as_slice(),
+                exceeded.fields.as_slice(),
+            ) else {
+                return Err(unsupported(
+                    "semantic-async-outcome-authentication (AsyncExit lowering payloads)",
+                ));
+            };
+            output.push(wir::TypeRecord {
+                id: wir::TypeId(ty.id.0),
+                source_name: copy_text("AsyncExit", limits.payload_bytes)?,
+                kind: wir::TypeKind::AsyncExit {
+                    operation_error: wir::TypeId(operation.ty.0),
+                    cancelled: wir::TypeId(cancelled.ty.0),
+                    deadline_rejected: wir::TypeId(rejected.ty.0),
+                    deadline_exceeded: wir::TypeId(exceeded.ty.0),
+                },
+                linearity: lower_linearity(ty.linearity),
+                source: ty.source,
+            });
+            continue;
+        }
         let (source_name, kind) = match &ty.kind {
             sema::SemanticTypeKind::Unit => (
                 copy_text("unit", limits.payload_bytes)?,
@@ -5915,6 +6510,7 @@ fn lower_generated_tests(
             function,
             None,
             Some(&generated.projection_context),
+            None,
             limits,
             is_cancelled,
         )?;
@@ -6127,11 +6723,56 @@ fn lower_proofs(
     Ok(proofs)
 }
 
+fn append_async_outcome_proofs(
+    context: &AsyncOutcomeLoweringContext,
+    proofs: &mut Vec<wir::ProofRecord>,
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), LowerError> {
+    for activation in &context.activations {
+        check_cancelled(is_cancelled)?;
+        if activation.proof.0 as usize != proofs.len()
+            || proofs.first().is_none_or(|proof| {
+                proof.id != wir::ProofId(0) || proof.kind != wir::ProofKind::TypeChecked
+            })
+            || proofs.get(1).is_none_or(|proof| {
+                proof.id != wir::ProofId(1) || proof.kind != wir::ProofKind::EffectsAllowed
+            })
+        {
+            return Err(unsupported(
+                "semantic-async-outcome-authentication (proof authority)",
+            ));
+        }
+        push_bounded_id(
+            proofs,
+            wir::ProofRecord {
+                id: activation.proof,
+                kind: wir::ProofKind::AsyncOutcomeAuthenticated,
+                subject: copy_text(
+                    "direct fallible await widens to AsyncExit[u64]",
+                    limits.payload_bytes,
+                )?,
+                bound: Some(1),
+                sources: vec![activation.source],
+                depends_on: vec![wir::ProofId(0), wir::ProofId(1)],
+                explanation: vec![copy_text(
+                    "the direct non-actor async callee returns Result[u64,u64]; this await alone widens the error to compiler-authenticated AsyncExit[u64] for immediate match or is consumption",
+                    limits.payload_bytes,
+                )?],
+            },
+            "SemanticWir proofs",
+            limits.model_edges,
+        )?;
+    }
+    Ok(())
+}
+
 fn lower_source_function(
     input: &AnalyzedImage,
     function: &sema::FunctionInstance,
     scope_context: Option<&ScopeLoweringContext>,
     projection_context: Option<&ProjectionLoweringContext>,
+    async_outcome_context: Option<&AsyncOutcomeLoweringContext>,
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(wir::SemanticFunction, u64), LowerError> {
@@ -6221,6 +6862,7 @@ fn lower_source_function(
         function,
         scope_context,
         projection_context,
+        async_outcome_context,
         root_body: body,
         value_map: &value_map,
         limits,
@@ -6848,6 +7490,7 @@ struct SourceFunctionLowerer<'a> {
     function: &'a sema::FunctionInstance,
     scope_context: Option<&'a ScopeLoweringContext>,
     projection_context: Option<&'a ProjectionLoweringContext>,
+    async_outcome_context: Option<&'a AsyncOutcomeLoweringContext>,
     root_body: wrela_hir::BodyId,
     value_map: &'a SourceValueMap,
     limits: LoweringLimits,
@@ -10988,7 +11631,7 @@ impl SourceFunctionLowerer<'_> {
                 {
                     return Err(self.fact_mismatch("await function color or access"));
                 }
-                let operand_fact = self.expression_fact(operand)?;
+                let operand_fact = self.expression_fact(operand)?.clone();
                 let target = match operand_fact.resolution {
                     sema::ExpressionResolution::DirectCall {
                         function: target, ..
@@ -11000,13 +11643,19 @@ impl SourceFunctionLowerer<'_> {
                     } => target,
                     _ => return Err(self.fact_mismatch("await direct activation")),
                 };
+                let async_outcome = self
+                    .async_outcome_context
+                    .and_then(|context| context.activation(self.function.id, expression));
                 if self
                     .input
                     .facts()
                     .functions
                     .get(target.0 as usize)
                     .is_none_or(|target| target.color != wrela_hir::FunctionColor::Async)
-                    || operand_fact.ty != ty
+                    || async_outcome.map_or(operand_fact.ty != ty, |activation| {
+                        activation.declared_result != operand_fact.ty
+                            || activation.effective_result != ty
+                    })
                     || effects.0 != operand_fact.effects.0 | sema::EffectSet::SUSPEND
                 {
                     return Err(self.fact_mismatch("await semantic state"));
@@ -11033,6 +11682,32 @@ impl SourceFunctionLowerer<'_> {
                     return Err(self.fact_mismatch("await activation value"));
                 };
                 let result = self.lowered_expression_result(expression, result, ty, source)?;
+                if let Some(activation) = async_outcome {
+                    if activation.source != source
+                        || matches!(
+                            operand_fact.resolution,
+                            sema::ExpressionResolution::ActorRequest { .. }
+                        )
+                    {
+                        return Err(self.fact_mismatch("authenticated async outcome identity"));
+                    }
+                    push_bounded_proof(
+                        &mut self.required_proofs,
+                        activation.proof,
+                        self.limits.model_edges,
+                    )?;
+                    self.push_let(
+                        statements,
+                        result,
+                        wir::SemanticOperation::AwaitAsyncOutcome {
+                            awaitable,
+                            exit: wir::TypeId(activation.exit.0),
+                            proof: activation.proof,
+                        },
+                        Some(source),
+                    )?;
+                    return Ok(LoweredExpression::Value(result));
+                }
                 self.push_let(
                     statements,
                     result,
@@ -16327,6 +17002,8 @@ fn measure_model_resources(
             | TypeKind::StaticString { .. }
             | TypeKind::StaticBytes { .. }
             | TypeKind::BoundedString { .. }
+            | TypeKind::AsyncExit { .. }
+            | TypeKind::AsyncOutcome { .. }
             | TypeKind::Array { .. }
             | TypeKind::Iso { .. }
             | TypeKind::ActorHandle { .. }
@@ -16415,6 +17092,7 @@ fn measure_model_resources(
                             | SemanticOperation::ActorSend { .. }
                             | SemanticOperation::ActorTrySend { .. }
                             | SemanticOperation::Await { .. }
+                            | SemanticOperation::AwaitAsyncOutcome { .. }
                             | SemanticOperation::Cancel { .. }
                             | SemanticOperation::Checkpoint { .. }
                             | SemanticOperation::Allocate { .. }
@@ -17008,6 +17686,32 @@ fn actor_type_kind_matches(
         (wir::TypeKind::Enum { variants: left }, wir::TypeKind::Enum { variants: right }) => {
             actor_enum_variants_match(left, right, is_cancelled)?
         }
+        (
+            wir::TypeKind::AsyncExit {
+                operation_error: lo,
+                cancelled: lc,
+                deadline_rejected: lr,
+                deadline_exceeded: le,
+            },
+            wir::TypeKind::AsyncExit {
+                operation_error: ro,
+                cancelled: rc,
+                deadline_rejected: rr,
+                deadline_exceeded: re,
+            },
+        ) => lo == ro && lc == rc && lr == rr && le == re,
+        (
+            wir::TypeKind::AsyncOutcome {
+                value: lv,
+                declared_error: ld,
+                exit: le,
+            },
+            wir::TypeKind::AsyncOutcome {
+                value: rv,
+                declared_error: rd,
+                exit: re,
+            },
+        ) => lv == rv && ld == rd && le == re,
         (wir::TypeKind::Function(left), wir::TypeKind::Function(right)) => {
             left.color == right.color
                 && left.result == right.result
@@ -17393,6 +18097,18 @@ fn actor_operations_match(
             wir::SemanticOperation::Await { awaitable: left },
             wir::SemanticOperation::Await { awaitable: right },
         ) => left == right,
+        (
+            wir::SemanticOperation::AwaitAsyncOutcome {
+                awaitable: la,
+                exit: le,
+                proof: lp,
+            },
+            wir::SemanticOperation::AwaitAsyncOutcome {
+                awaitable: ra,
+                exit: re,
+                proof: rp,
+            },
+        ) => la == ra && le == re && lp == rp,
         (
             wir::SemanticOperation::Call {
                 function: lf,
@@ -25977,7 +26693,7 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn fallible_async_outcome_stops_at_named_semantic_lowering_boundary() {
+    fn fallible_async_outcome_lowers_to_authenticated_semantic_wir() {
         let image = analyze_parsed_actor_source(
             r#"module app
 
@@ -26013,18 +26729,228 @@ pub fn boot() -> Image:
     return img
 "#,
         );
-        assert!(matches!(
-            CanonicalSemanticLowerer::new().lower(
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
                 LowerRequest {
-                    input: image,
+                    input: image.clone(),
                     limits: LoweringLimits::standard(),
                 },
                 &|| false,
-            ),
-            Err(LowerError::UnsupportedInput {
-                feature: "semantic-async-outcome-lowering-pending (structured async exit delivery)"
-            })
+            )
+            .expect("authenticated AsyncExit outcome should reach SemanticWir");
+        let module = lowered.wir().as_wir();
+        assert_eq!(module.version, wir::SEMANTIC_WIR_VERSION);
+        let outcome = module
+            .types
+            .iter()
+            .find(|ty| matches!(ty.kind, wir::TypeKind::AsyncOutcome { .. }))
+            .expect("one authenticated ephemeral Result outcome");
+        let wir::TypeKind::AsyncOutcome {
+            value,
+            declared_error,
+            exit,
+        } = &outcome.kind
+        else {
+            unreachable!()
+        };
+        let (value, declared_error, exit) = (*value, *declared_error, *exit);
+        assert_eq!(value, declared_error);
+        assert!(matches!(
+            module.types[exit.0 as usize].kind,
+            wir::TypeKind::AsyncExit {
+                operation_error,
+                ..
+            } if operation_error == declared_error
         ));
+        let (operation_exit, authority) = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::AwaitAsyncOutcome { exit, proof, .. },
+                    ..
+                }) => Some((*exit, *proof)),
+                _ => None,
+            })
+            .expect("one authenticated async-outcome await operation");
+        assert_eq!(operation_exit, exit);
+        assert!(matches!(
+            &module.proofs[authority.0 as usize],
+            wir::ProofRecord {
+                kind: wir::ProofKind::AsyncOutcomeAuthenticated,
+                bound: Some(1),
+                depends_on,
+                ..
+            } if depends_on.as_slice() == [wir::ProofId(0), wir::ProofId(1)]
+        ));
+
+        let exact_operations = lowered.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact AsyncExit SemanticWir operation limit");
+        let mut one_under = exact;
+        one_under.operations = exact_operations - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == exact_operations - 1
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("count AsyncExit SemanticWir cancellation polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+
+        let mut forged_type = module.clone();
+        let exit_record = &mut forged_type.types[exit.0 as usize];
+        let wir::TypeKind::AsyncExit {
+            cancelled,
+            deadline_rejected,
+            ..
+        } = &mut exit_record.kind
+        else {
+            unreachable!()
+        };
+        *deadline_rejected = *cancelled;
+        assert!(forged_type.validate().is_err());
+
+        let mut forged_operation = module.clone();
+        let operation = forged_operation
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::AwaitAsyncOutcome { proof, .. },
+                    ..
+                }) => Some(proof),
+                _ => None,
+            })
+            .expect("mutable async-outcome authority");
+        *operation = wir::ProofId(0);
+        assert!(forged_operation.validate().is_err());
+
+        let mut forged_proof = module.clone();
+        forged_proof.proofs[authority.0 as usize].subject = "ordinary await".to_owned();
+        assert!(forged_proof.validate().is_err());
+
+        let mut forged_sealed = module.clone();
+        let wir::TypeKind::AsyncOutcome { exit, .. } =
+            &mut forged_sealed.types[outcome.id.0 as usize].kind
+        else {
+            unreachable!()
+        };
+        *exit = value;
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                forged_sealed,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidOutput(_)) | Err(LowerError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn fallible_async_outcome_direct_is_lowers_through_same_authenticated_await() {
+        for pattern in ["Result.Ok(_)", "Result.Err(_)"] {
+            let source = format!(
+                r#"module app
+
+from core.actor import AsyncExit
+from core.image import Image, Target
+from core.result import Result
+
+async fn checkpoint() -> Result[u64, u64]:
+    return Result.Ok(7)
+
+@service
+pub struct Worker:
+    @task
+    async fn consume(mut self):
+        selected: bool = await checkpoint() is {pattern}
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#,
+            );
+            let image = analyze_parsed_actor_source(&source);
+            let lowered = CanonicalSemanticLowerer::new()
+                .lower(
+                    LowerRequest {
+                        input: image,
+                        limits: LoweringLimits::standard(),
+                    },
+                    &|| false,
+                )
+                .expect("direct is consumer should preserve authenticated async await");
+            assert!(
+                lowered
+                    .wir()
+                    .as_wir()
+                    .functions
+                    .iter()
+                    .flat_map(|function| &function.body.statements)
+                    .any(|statement| matches!(
+                        statement,
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            operation: wir::SemanticOperation::AwaitAsyncOutcome { .. },
+                            ..
+                        })
+                    ))
+            );
+        }
     }
 
     #[test]
