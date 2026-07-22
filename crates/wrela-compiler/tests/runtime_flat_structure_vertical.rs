@@ -824,7 +824,7 @@ fn read_only_scalar_view_projection_reaches_semantic_wir() {
     )
     .expect("scalar view projection reaches MachineWir");
     let machine = prepared.machine().wir().as_wir();
-    assert_eq!(machine.version, 15);
+    assert_eq!(machine.version, 16);
     let machine_projects = machine
         .functions
         .iter()
@@ -1598,7 +1598,7 @@ fn two_field_flat_local_reaches_unpacked_machine_wir_and_deterministic_coff() {
         &fixture.build,
         &never_cancelled,
     )
-    .expect("two-field local reaches MachineWir v15");
+    .expect("two-field local reaches MachineWir v16");
     let machine = prepared.machine().wir().as_wir();
     let pair = machine
         .types

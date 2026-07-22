@@ -1097,6 +1097,12 @@ pub(super) fn machine_wir_equal(
             |left, right| Ok(activation_equal(left, right)),
         )?
         && slice_equal_by(
+            &left.schedulers,
+            &right.schedulers,
+            is_cancelled,
+            |left, right| Ok(left == right),
+        )?
+        && slice_equal_by(
             &left.region_storage,
             &right.region_storage,
             is_cancelled,

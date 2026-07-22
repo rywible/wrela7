@@ -7,7 +7,10 @@ use wrela_backend::{
     CanonicalBackendContentHasher, CanonicalFlowOptimizer, CanonicalMachineLowerer, CodegenError,
     MachineLowerError, MachineLoweringLimits, OptimizationLimits, OptimizationProfile,
     emit_prepared_object, flow_wir as flow, llvm_backend_available,
-    machine_wir::{MachineActivationSchedule, MachineOperation, ValidationError},
+    machine_wir::{
+        MachineActivationSchedule, MachineOperation, ValidationError,
+        ValidationFailure as MachineValidationFailure, ValidationLimits as MachineValidationLimits,
+    },
     prepare_canonical_frame_for_codegen, prepare_for_codegen,
 };
 use wrela_build_model::{
@@ -528,6 +531,85 @@ fn run_actor_send_vertical(application_source: &str, recurring: bool) {
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
             .expect("real actor send reaches sealed MachineWir");
     let machine = prepared.machine().wir().as_wir();
+    assert_eq!(machine.schedulers.len(), 1);
+    assert_eq!(machine.schedulers[0].core, 0);
+    assert_eq!(
+        machine.schedulers[0].actors,
+        flow.schedulers[0]
+            .actors
+            .iter()
+            .map(|actor| actor.0)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        machine.schedulers[0].tasks,
+        flow.schedulers[0]
+            .tasks
+            .iter()
+            .map(|task| task.0)
+            .collect::<Vec<_>>()
+    );
+    let mut wrong_scheduler_core = machine.clone();
+    wrong_scheduler_core.schedulers[0].core = 1;
+    let errors = wrong_scheduler_core
+        .validate_for_target(&target)
+        .expect_err("MachineWir must reject nonzero scheduler ownership independently");
+    assert!(errors.0.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidRecord {
+            kind: "scheduler ownership partition",
+            id: 1,
+        }
+    )));
+    let mut omitted_scheduler_actor = machine.clone();
+    omitted_scheduler_actor.schedulers[0].actors.clear();
+    let errors = omitted_scheduler_actor
+        .validate_for_target(&target)
+        .expect_err("MachineWir must reject an incomplete scheduler partition");
+    assert!(errors.0.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidRecord {
+            kind: "scheduler ownership partition",
+            ..
+        }
+    )));
+
+    let standard_machine_validation = MachineValidationLimits::standard();
+    let mut lower_edges = 1_u64;
+    let mut upper_edges = standard_machine_validation.model_edges;
+    while lower_edges < upper_edges {
+        let midpoint = lower_edges + (upper_edges - lower_edges) / 2;
+        let mut limits = standard_machine_validation;
+        limits.model_edges = midpoint;
+        match machine
+            .clone()
+            .validate_with_limits(&target, limits, &never_cancelled)
+        {
+            Ok(_) => upper_edges = midpoint,
+            Err(MachineValidationFailure::ResourceLimit {
+                resource: "model edges",
+                ..
+            }) => lower_edges = midpoint + 1,
+            other => panic!("Machine scheduler edge-bound search changed class: {other:?}"),
+        }
+    }
+    let mut exact_machine_validation = standard_machine_validation;
+    exact_machine_validation.model_edges = lower_edges;
+    machine
+        .clone()
+        .validate_with_limits(&target, exact_machine_validation, &never_cancelled)
+        .expect("Machine scheduler ownership accepts its exact model-edge bound");
+    let mut below_machine_validation = exact_machine_validation;
+    below_machine_validation.model_edges -= 1;
+    assert_eq!(
+        machine
+            .clone()
+            .validate_with_limits(&target, below_machine_validation, &never_cancelled,),
+        Err(MachineValidationFailure::ResourceLimit {
+            resource: "model edges",
+            limit: below_machine_validation.model_edges,
+        })
+    );
     let expected_schedule = if recurring {
         MachineActivationSchedule::SchedulerFifo
     } else {

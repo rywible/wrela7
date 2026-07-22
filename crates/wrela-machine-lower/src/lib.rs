@@ -1320,6 +1320,7 @@ fn lower_minimum(
         globals: Vec::new(),
         functions,
         activations: Vec::new(),
+        schedulers: Vec::new(),
         region_storage: Vec::new(),
         interrupts: Vec::new(),
         tests: Vec::new(),
@@ -1497,9 +1498,27 @@ fn flow_mapping_matches(
     let machine = output.as_wir();
     if flow.functions.len() != machine.functions.len()
         || flow.tests.len() != machine.tests.len()
+        || flow.schedulers.len() != machine.schedulers.len()
         || machine.image_entry.0 != flow.image_entry.0
     {
         return Ok(false);
+    }
+    for (source, lowered) in flow.schedulers.iter().zip(&machine.schedulers) {
+        check_cancelled(is_cancelled)?;
+        if lowered.core != source.core
+            || !lowered
+                .actors
+                .iter()
+                .copied()
+                .eq(source.actors.iter().map(|actor| actor.0))
+            || !lowered
+                .tasks
+                .iter()
+                .copied()
+                .eq(source.tasks.iter().map(|task| task.0))
+        {
+            return Ok(false);
+        }
     }
     for (index, (source, lowered)) in flow.functions.iter().zip(&machine.functions).enumerate() {
         check_cancelled(is_cancelled)?;
@@ -2077,11 +2096,17 @@ fn model_resources(
         wir.globals.len(),
         wir.functions.len(),
         wir.activations.len(),
+        wir.schedulers.len(),
         wir.interrupts.len(),
         wir.tests.len(),
         wir.proofs.len(),
     ] {
         meter.add_edges(count)?;
+    }
+    for scheduler in &wir.schedulers {
+        check_cancelled(is_cancelled)?;
+        meter.edges(&scheduler.actors)?;
+        meter.edges(&scheduler.tasks)?;
     }
     let immediate =
         |value: &MachineImmediate, meter: &mut ResourceMeter| -> Result<(), MachineLowerError> {
@@ -6560,7 +6585,7 @@ mod contract_tests {
         .expect("float not-equal FlowWir reaches MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 15);
+        assert_eq!(machine.version, 16);
         assert!(matches!(machine.types[8].kind, MachineTypeKind::Float32));
         assert!(matches!(machine.types[9].kind, MachineTypeKind::Float64));
         let float_function = &machine.functions[3];
@@ -6668,7 +6693,7 @@ mod contract_tests {
         .expect("unary and lossless casts reach MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 15);
+        assert_eq!(machine.version, 16);
         assert!(matches!(
             machine.types[10].kind,
             MachineTypeKind::Integer { bits: 16 }

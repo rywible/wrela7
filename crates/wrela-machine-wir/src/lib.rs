@@ -19,7 +19,7 @@ use wrela_target::{InterruptDomain, TargetError, TargetPackage};
 use wrela_test_model::{GuestTestOutcome, TestEvent, TestEventKind, TestId};
 use wrela_test_protocol::{CanonicalTestEventCodec, ProtocolLimits, TestEventCodec};
 
-pub const MACHINE_WIR_VERSION: u32 = 15;
+pub const MACHINE_WIR_VERSION: u32 = 16;
 pub const REGION_STORAGE_SECTION_PREFIX: &str = ".data$wrela$region$";
 pub const REGION_STORAGE_SYMBOL_PREFIX: &str = "__wrela_region_storage_";
 
@@ -764,7 +764,7 @@ pub struct MachineFunction {
     pub source: Option<Span>,
 }
 
-/// The only scheduler ownership admitted by MachineWir v15. An actor turn is
+/// The only scheduler ownership admitted by MachineWir v16. An actor turn is
 /// compiled but remains dormant until a real mailbox admission operation
 /// exists; a single-slot static task is invoked exactly once during startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -827,6 +827,18 @@ pub struct MachineActivationPlan {
     pub source: Span,
 }
 
+/// Exact per-core ownership authority retained from FlowWir. This record does
+/// not claim a ready queue, dispatch policy, parking, or runtime execution;
+/// those remain separate lowering obligations. Keeping the partition at the
+/// machine boundary prevents later runtime work from silently recovering a
+/// global scheduler after Flow ownership has been authenticated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineSchedulerPlan {
+    pub core: u32,
+    pub actors: Vec<u32>,
+    pub tasks: Vec<u32>,
+}
+
 /// Closed identity of statically reserved storage in the currently supported
 /// actor image. These categories describe allocation only; they do not imply a
 /// mailbox producer, scheduler, or runtime dispatch operation.
@@ -836,7 +848,7 @@ pub enum MachineRegionStorageKind {
         actor: u32,
         mailbox_capacity: u32,
     },
-    /// Canonical, actor-owned persistent state cell. MachineWir v15 admits
+    /// Canonical, actor-owned persistent state cell. MachineWir v16 admits
     /// exactly one zero-initialized `u64` cell for a stateful actor; richer
     /// state layouts remain outside this closed representation.
     ActorState {
@@ -984,6 +996,7 @@ pub struct MachineWir {
     pub globals: Vec<MachineGlobal>,
     pub functions: Vec<MachineFunction>,
     pub activations: Vec<MachineActivationPlan>,
+    pub schedulers: Vec<MachineSchedulerPlan>,
     pub region_storage: Vec<MachineRegionStorage>,
     pub interrupts: Vec<InterruptEntry>,
     pub tests: Vec<MachineTestEntry>,
@@ -1263,6 +1276,7 @@ fn model_resource_usage(
     meter.arena("globals", module.globals.len())?;
     meter.arena("functions", module.functions.len())?;
     meter.arena("activations", module.activations.len())?;
+    meter.arena("schedulers", module.schedulers.len())?;
     meter.arena("region storage", module.region_storage.len())?;
     meter.arena("interrupts", module.interrupts.len())?;
     meter.arena("tests", module.tests.len())?;
@@ -1412,6 +1426,12 @@ fn model_resource_usage(
         // The record contains only fixed-width facts. Charge one edge for its
         // independently indexed caller/callee join.
         meter.edges(1)?;
+    }
+
+    for scheduler in &module.schedulers {
+        meter.poll()?;
+        meter.edge_slice(&scheduler.actors)?;
+        meter.edge_slice(&scheduler.tasks)?;
     }
 
     for storage in &module.region_storage {
@@ -2372,6 +2392,7 @@ fn validate_module(
         validate_function(module, function, &mut errors);
     }
     validate_activations(module, &mut errors);
+    validate_scheduler_ownership(module, &mut errors);
     validate_region_storage(module, &mut errors);
     validate_actor_message_contract(module, &mut errors);
     validate_actor_wait_proof(module, &mut errors);
@@ -3925,6 +3946,102 @@ fn validate_activations(module: &MachineWir, errors: &mut ValidationContext<'_>)
                 id: function.id.0,
             });
         }
+    }
+}
+
+fn validate_scheduler_ownership(module: &MachineWir, errors: &mut ValidationContext<'_>) {
+    let has_owned_work = module.functions.iter().any(|function| {
+        matches!(
+            function.role,
+            MachineFunctionRole::ActorTurn(_) | MachineFunctionRole::TaskEntry(_)
+        )
+    }) || module
+        .region_storage
+        .iter()
+        .any(|storage| matches!(storage.kind, MachineRegionStorageKind::ActorMailbox { .. }));
+    if !has_owned_work {
+        if !module.schedulers.is_empty() {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "scheduler ownership partition",
+                id: module
+                    .schedulers
+                    .first()
+                    .map_or(0, |scheduler| scheduler.core),
+            });
+        }
+        return;
+    }
+
+    let [scheduler] = module.schedulers.as_slice() else {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "scheduler ownership partition",
+            id: module
+                .schedulers
+                .first()
+                .map_or(0, |scheduler| scheduler.core),
+        });
+        return;
+    };
+    let mut valid = scheduler.core == 0
+        && scheduler
+            .actors
+            .iter()
+            .enumerate()
+            .all(|(index, actor)| usize::try_from(*actor).ok() == Some(index))
+        && scheduler
+            .tasks
+            .iter()
+            .enumerate()
+            .all(|(index, task)| usize::try_from(*task).ok() == Some(index));
+    let Some(mut actor_owners) = errors.filled(scheduler.actors.len(), false) else {
+        return;
+    };
+    let Some(mut task_owners) = errors.filled(scheduler.tasks.len(), false) else {
+        return;
+    };
+    for storage in &module.region_storage {
+        if !errors.poll() {
+            return;
+        }
+        if let MachineRegionStorageKind::ActorMailbox { actor, .. } = storage.kind {
+            if let Some(owned) = actor_owners.get_mut(actor as usize) {
+                *owned = true;
+            } else {
+                valid = false;
+            }
+        }
+    }
+    for function in &module.functions {
+        if !errors.poll() {
+            return;
+        }
+        match function.role {
+            MachineFunctionRole::ActorTurn(actor) => {
+                if actor_owners.get(actor as usize).is_none() {
+                    valid = false;
+                }
+            }
+            MachineFunctionRole::TaskEntry(task) => {
+                if let Some(owned) = task_owners.get_mut(task as usize) {
+                    *owned = true;
+                } else {
+                    valid = false;
+                }
+            }
+            MachineFunctionRole::Ordinary
+            | MachineFunctionRole::Isr(_)
+            | MachineFunctionRole::Cleanup
+            | MachineFunctionRole::ImageEntry
+            | MachineFunctionRole::Test => {}
+        }
+    }
+    valid &=
+        actor_owners.into_iter().all(|owned| owned) && task_owners.into_iter().all(|owned| owned);
+    if !valid {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "scheduler ownership partition",
+            id: scheduler.core,
+        });
     }
 }
 
@@ -8305,6 +8422,7 @@ mod tests {
                 source: None,
             }],
             activations: Vec::new(),
+            schedulers: Vec::new(),
             region_storage: Vec::new(),
             interrupts: Vec::new(),
             tests: Vec::new(),
@@ -9322,8 +9440,8 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_accepts_only_exact_machine_wir_v15() {
-        assert_eq!(MACHINE_WIR_VERSION, 15);
+    fn current_schema_accepts_only_exact_machine_wir_v16() {
+        assert_eq!(MACHINE_WIR_VERSION, 16);
         assert_eq!(
             CheckedIntegerOp::ShiftLeft.invalid_shift_count_fatal_code(),
             Some(RuntimeFatalCode::InvalidShiftCount)
@@ -9346,12 +9464,12 @@ mod tests {
         );
         assert_eq!(CheckedIntegerOp::Add.invalid_shift_count_fatal_code(), None);
         let (module, target) = fixture();
-        for rejected in [14, 16] {
+        for rejected in [15, 17] {
             let mut changed = module.clone();
             changed.version = rejected;
             let errors = changed
                 .validate_for_target(&target)
-                .expect_err("only exact-current MachineWir v15 is accepted");
+                .expect_err("only exact-current MachineWir v16 is accepted");
             assert!(
                 errors
                     .0

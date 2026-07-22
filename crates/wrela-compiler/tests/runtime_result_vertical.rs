@@ -745,7 +745,7 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
         )
         .expect("runtime-result MachineWir preparation");
         let machine = prepared.machine().wir().as_wir();
-        assert_eq!(machine.version, 15);
+        assert_eq!(machine.version, 16);
         assert!(
             machine
                 .types
@@ -1450,7 +1450,7 @@ fn match_second() -> u64:
     )
     .expect("all-unit generic enum MachineWir preparation");
     let machine = prepared.machine().wir().as_wir();
-    assert_eq!(machine.version, 15);
+    assert_eq!(machine.version, 16);
     assert!(machine.types.iter().any(|ty| {
         matches!(&ty.kind, MachineTypeKind::TaggedEnum {
             payload: None,
@@ -2198,7 +2198,7 @@ fn checked_in_runtime_result_try_reaches_exact_early_return_switch() {
         )
         .expect("runtime-result Try MachineWir preparation");
         let machine = prepared.machine().wir().as_wir();
-        assert_eq!(machine.version, 15);
+        assert_eq!(machine.version, 16);
         let machine_propagation = machine
             .functions
             .iter()

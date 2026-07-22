@@ -7,10 +7,10 @@ use wrela_machine_wir::{
     MachineActivationPlan, MachineActivationSchedule, MachineAssertionFailure, MachineBlock,
     MachineFence, MachineFunction, MachineFunctionOrigin, MachineFunctionRole, MachineGlobal,
     MachineImmediate, MachineInstruction, MachineOperation, MachineRegionStorage,
-    MachineRegionStorageId, MachineRegionStorageKind, MachineTarget, MachineTerminator,
-    MachineTestEntry, MachineTestId, MachineTestKind, MachineType, MachineTypeId, MachineTypeKind,
-    MachineUnaryOp, MachineValue, MachineWir, MemorySemantics, ProofId,
-    REGION_STORAGE_SECTION_PREFIX, REGION_STORAGE_SYMBOL_PREFIX, ScalarFailureKind,
+    MachineRegionStorageId, MachineRegionStorageKind, MachineSchedulerPlan, MachineTarget,
+    MachineTerminator, MachineTestEntry, MachineTestId, MachineTestKind, MachineType,
+    MachineTypeId, MachineTypeKind, MachineUnaryOp, MachineValue, MachineWir, MemorySemantics,
+    ProofId, REGION_STORAGE_SECTION_PREFIX, REGION_STORAGE_SYMBOL_PREFIX, ScalarFailureKind,
     ScalarFailureProvenance, Section, SectionId, SectionKind, StackSlot, StackSlotId, Symbol,
     SymbolDefinition, SymbolId, SymbolVisibility, ValueId,
 };
@@ -241,6 +241,7 @@ pub(super) fn lower_scalar_image(
         is_cancelled,
     )?;
     let tests = lower_tests(input, request.limits, is_cancelled)?;
+    let schedulers = lower_schedulers(input, request.limits, is_cancelled)?;
 
     let mut features = try_vec(
         backend.llvm_features().len(),
@@ -308,6 +309,7 @@ pub(super) fn lower_scalar_image(
         globals,
         functions,
         activations: std::mem::take(&mut plan.activations),
+        schedulers,
         region_storage: std::mem::take(&mut plan.region_storage),
         interrupts: Vec::new(),
         tests,
@@ -438,6 +440,48 @@ pub(super) fn lower_scalar_image(
     };
     check_cancelled(is_cancelled)?;
     Ok((wir, report))
+}
+
+fn lower_schedulers(
+    input: &flow::FlowWir,
+    limits: MachineLoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<MachineSchedulerPlan>, MachineLowerError> {
+    let mut schedulers = try_vec(
+        input.schedulers.len(),
+        "MachineWir model edges",
+        limits.model_edges,
+        is_cancelled,
+    )?;
+    for scheduler in &input.schedulers {
+        check_cancelled(is_cancelled)?;
+        let mut actors = try_vec(
+            scheduler.actors.len(),
+            "MachineWir model edges",
+            limits.model_edges,
+            is_cancelled,
+        )?;
+        for actor in &scheduler.actors {
+            check_cancelled(is_cancelled)?;
+            actors.push(actor.0);
+        }
+        let mut tasks = try_vec(
+            scheduler.tasks.len(),
+            "MachineWir model edges",
+            limits.model_edges,
+            is_cancelled,
+        )?;
+        for task in &scheduler.tasks {
+            check_cancelled(is_cancelled)?;
+            tasks.push(task.0);
+        }
+        schedulers.push(MachineSchedulerPlan {
+            core: scheduler.core,
+            actors,
+            tasks,
+        });
+    }
+    Ok(schedulers)
 }
 
 fn discover_actor_dispatch(

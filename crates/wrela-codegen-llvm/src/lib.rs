@@ -1099,6 +1099,7 @@ mod contract_tests {
                 source: None,
             }],
             activations: Vec::new(),
+            schedulers: Vec::new(),
             region_storage: Vec::new(),
             interrupts: Vec::new(),
             tests: Vec::new(),
@@ -5357,7 +5358,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn real_checked_scalar_surface_reaches_machine_v15_and_textual_llvm() {
+    fn real_checked_scalar_surface_reaches_machine_v16_and_textual_llvm() {
         let cases = [
             (
                 semantic::BinaryOperator::Add,
@@ -5416,7 +5417,7 @@ mod contract_tests {
                     right: semantic::ValueId(1),
                     arithmetic,
                 });
-            assert_eq!(machine.as_wir().version, 15);
+            assert_eq!(machine.as_wir().version, 16);
             assert!(
                 machine
                     .as_wir()

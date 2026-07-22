@@ -466,14 +466,14 @@ it. It injects phase implementations and bounded host capabilities, while
   Validation joins the prior aggregate's struct type, selected field, inserted
   value type, and single result of the unchanged aggregate type; FlowWir v15
   preserves the same operation and independently repeats that join.
-- MachineWir v15 retains same-block nongeneric flat values with two or more
+- MachineWir v16 retains same-block nongeneric flat values with two or more
   primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
   `InsertField`, and `ExtractField` carry exact SSA joins through independent
   validation, equality, and resource metering; LLVM renders them with
   first-class `insertvalue`/`extractvalue`. One-field `u64` structs retain the
   established erased bitcast representation. Aggregate function/block
   boundaries, packed/empty/non-flat structs, and nested aggregates fail closed.
-- MachineWir v15 also makes a closed enum's shared payload type optional. An
+- MachineWir v16 also makes a closed enum's shared payload type optional. An
   all-unit enum must have no payload type, an all-false per-tag presence map,
   size/alignment `1/1`, payload-free constructors, and no payload projection;
   any payload-bearing enum must retain the canonical scalar payload type and at
@@ -590,9 +590,12 @@ it. It injects phase implementations and bounded host capabilities, while
   zero must own every dense actor and task ID exactly once and in canonical
   order; images without actors or tasks must carry no scheduler plan. Flow
   lowering produces this partition, canonical wire v15 round-trips it, and
-  Machine lowering reauthenticates it before erasing it for the existing
-  same-core fused profiles. This is ownership authority only: it does not claim
-  a runtime dispatch loop, priority/fairness policy, parking, or resumption.
+  Machine lowering reauthenticates and retains the same partition as explicit
+  `MachineSchedulerPlan` authority for the existing same-core fused profiles.
+  Machine validation independently requires core zero and exact dense coverage
+  of every actor-turn/task-entry owner. This is ownership authority only: it
+  does not claim a runtime dispatch loop, priority/fairness policy, parking, or
+  resumption.
 - Every region records its closed class, owner, byte capacity, alignment,
   exact `CapacityBound` proof, and source span. Validation joins those fields
   rather than allowing report or Machine consumers to infer region provenance.
@@ -789,7 +792,7 @@ it. It injects phase implementations and bounded host capabilities, while
   and the unique `ImageClosed` root must close over activation capacities and a
   `TypeChecked`/`EffectsAllowed` ancestry. This is a compiled startup-task
   subset, not mailbox admission, recurring scheduling, or cancellation
-  execution. MachineWir v15 extends that same sealed plan to the exact
+  execution. MachineWir v16 extends that same sealed plan to the exact
   constant-`u64` delivery profile described below while preserving unit.
 - Floating not-equal is explicitly unordered-or-not-equal, matching the source
   language rule that NaN compares unequal to itself. Version 5 also makes
@@ -805,21 +808,21 @@ it. It injects phase implementations and bounded host capabilities, while
   runtime requirements, the unique UEFI entry, the closed set of no-argument
   interrupt handlers, and target/build consistency. Firmware and interrupt
   entries cannot be ordinary direct or tail-call targets.
-- MachineWir v15 admits one exact same-core typed-reply profile. The caller is
+- MachineWir v16 admits one exact same-core typed-reply profile. The caller is
   a single-flight task entry with one 16-byte, 8-aligned stack slot; request,
   mailbox receive, and target resolve must agree on actor, method, capacity
   permit, and `ActorReplyExactlyOnce` proof. The request carries distinct
   state-mismatch and duplicate-resolve fatal provenances, and the target must
   have no parameters and return exact `u64`. Reserve/commit/dispatch and
   activation records are forbidden in this profile.
-- MachineWir v15 also admits one exact structured scope-return activation
+- MachineWir v16 also admits one exact structured scope-return activation
   shape: a five-block actor caller branches to an authenticated generated
   cleanup plus return, or to the same cleanup followed by its already-proved
   immediate unit activation and resume. Validation rejoins the flat state,
   generated-cleanup origin, both calls, branch/jump targets, activation call,
   and empty resume. Deleting or substituting either cleanup invalidates the
   activation plan; arbitrary branched activation callers remain invalid.
-- MachineWir v15 also admits the first typed internal-async delivery without a
+- MachineWir v16 also admits the first typed internal-async delivery without a
   schema change: the existing activation plan may bind an ordinary no-argument
   callee whose complete body is one exact unsigned-`u64` constant and return.
   The caller's internal call defines that same `u64` directly, its resume block
@@ -843,6 +846,10 @@ it. It injects phase implementations and bounded host capabilities, while
   runtime-intrinsic selection, and conversion of Flow proofs into backend facts.
 - Rejects target/build mismatch, overflow, resource excess, unsupported target,
   or any required intrinsic without a target runtime implementation.
+- Retains the exact FlowWir core-zero actor/task ownership partition in
+  MachineWir, charges the plan and both owner lists to finite model-edge
+  policy, and rechecks the mapping during sealing. No runtime scheduler state
+  or behavior is synthesized from that authority.
 - The revision 0.1 production lowerer accepts the canonical minimum image and
   the sealed synchronous scalar/control-flow surface after `none` or any
   canonical revision-2 development/performance/size profile. It preserves the
@@ -940,7 +947,7 @@ it. It injects phase implementations and bounded host capabilities, while
   `TestEmit` result, exact-zero switch, and unchanged-status return. It cannot
   erase, merge, or substitute those guards; independent textual and native
   evidence checks the two-emission fixture before accepting the object.
-- For the sealed MachineWir v15 typed-reply profile, LLVM allocates the exact
+- For the sealed MachineWir v16 typed-reply profile, LLVM allocates the exact
   16-byte caller slot and emits atomic state transitions around the exact
   direct same-core target call. State mismatch and duplicate resolution route
   to fatal codes 7 and 8. `ActorReplyResolve` is a validated authority marker
@@ -1090,7 +1097,7 @@ it. It injects phase implementations and bounded host capabilities, while
 - That schema is the only accepted report shape. Its tag rejects stale or
   mismatched artifacts at the trust boundary; there is no legacy reader,
   migration, adapter, or fallback contract. Its embedded interface facts must
-  be exactly SemanticWir 12, FlowWir 15, Flow wire 15, MachineWir 15, and runtime
+  be exactly SemanticWir 12, FlowWir 15, Flow wire 15, MachineWir 16, and runtime
   ABI 2; nonzero stale or future values are rejected rather than tolerated.
 - Schema v10 also projects sealed actor, task, reportable region, and async
   activation plans into

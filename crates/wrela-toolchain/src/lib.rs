@@ -340,7 +340,7 @@ impl ToolchainCompatibility {
             semantic_wir: 12,
             flow_wir: 15,
             flow_wir_wire: 15,
-            machine_wir: 15,
+            machine_wir: 16,
             runtime_abi: 2,
             image_report: 14,
             test_plan: 2,
@@ -1231,14 +1231,14 @@ mod tests {
             ..compatibility.clone()
         };
         assert!(manifest.validate(&incompatible).is_err());
-        for machine_wir in [14, 16] {
+        for machine_wir in [15, 17] {
             let incompatible = ToolchainCompatibility {
                 machine_wir,
                 ..compatibility.clone()
             };
             assert!(
                 manifest.validate(&incompatible).is_err(),
-                "MachineWir {machine_wir} must not cross the exact v15 distribution boundary"
+                "MachineWir {machine_wir} must not cross the exact v16 distribution boundary"
             );
         }
     }
