@@ -3321,6 +3321,9 @@ fn validate_reachable_source_functions(
             sema::ExpressionResolution::DirectCall {
                 function: target, ..
             }
+            | sema::ExpressionResolution::MethodCall {
+                function: target, ..
+            }
             | sema::ExpressionResolution::OperatorCall {
                 function: target, ..
             } => target,
