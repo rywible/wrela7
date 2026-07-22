@@ -9938,6 +9938,12 @@ impl SourceFunctionLowerer<'_> {
                             effects: fact.effects,
                         })
                     }
+                    (
+                        wrela_hir::ExpressionKind::IsPattern { .. },
+                        sema::ExpressionResolution::EnumTypeTest { .. },
+                    ) => {
+                        return Err(unsupported("semantic-runtime-is-lowering-pending"));
+                    }
                     _ => {
                         return Err(unsupported(
                             "ordinary source expressions outside scalar bodies",
@@ -22309,6 +22315,52 @@ pub fn boot() -> Image:
             ),
             Err(LowerError::InvalidReport(_)) | Err(LowerError::InvalidOutput(_))
         ));
+    }
+
+    #[test]
+    fn authenticated_enum_type_test_stops_at_named_lowering_boundary() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub enum Status[T]:
+    idle
+    active(T)
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        state: Status[u8] = Status.active(1)
+        active: bool = state is Status.active(_)
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let result = CanonicalSemanticLowerer::new().lower(
+            LowerRequest {
+                input: image,
+                limits: LoweringLimits::standard(),
+            },
+            &|| false,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(LowerError::UnsupportedInput {
+                    feature: "semantic-runtime-is-lowering-pending"
+                })
+            ),
+            "unexpected enum type-test lowering result: {result:?}"
+        );
     }
 
     #[test]

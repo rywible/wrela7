@@ -797,6 +797,13 @@ pub enum ExpressionResolution {
         left_field: ValueId,
         right_field: ValueId,
     },
+    /// One exact closed-enum tag test. The scrutinee remains a borrowed value;
+    /// the expression result is the separately recorded boolean value.
+    EnumTypeTest {
+        enumeration: SemanticTypeId,
+        variant: u32,
+        scrutinee: ValueId,
+    },
     ActorRequest {
         actor: ActorId,
         method: FunctionInstanceId,
@@ -4247,18 +4254,26 @@ fn validate_exact_expression_fact(
             ) => {}
         (
             wrela_hir::ExpressionKind::IsPattern { value, pattern, .. },
-            ExpressionResolution::Value(value_result),
-            Some(result),
-        ) if *value_result == result
-            && exact_enum_is_matches(
-                analysis,
-                program,
-                function.id,
-                *value,
-                *pattern,
-                fact,
-                is_cancelled,
-            )? => {}
+            ExpressionResolution::EnumTypeTest {
+                enumeration,
+                variant,
+                scrutinee,
+            },
+            Some(_),
+        ) if exact_enum_is_matches(
+            analysis,
+            program,
+            fact,
+            ExactEnumTypeTest {
+                function: function.id,
+                value: *value,
+                pattern: *pattern,
+                enumeration: *enumeration,
+                variant: *variant,
+                scrutinee: *scrutinee,
+            },
+            is_cancelled,
+        )? => {}
         (
             wrela_hir::ExpressionKind::Binary {
                 operator,
@@ -4479,19 +4494,32 @@ fn exact_inline_if_matches(
     effects.0 == fact.effects.0
 }
 
-fn exact_enum_is_matches(
-    analysis: &PartialAnalysis,
-    program: &wrela_hir::Program,
+#[derive(Clone, Copy)]
+struct ExactEnumTypeTest {
     function: FunctionInstanceId,
     value: ExpressionId,
     pattern: wrela_hir::PatternId,
+    enumeration: SemanticTypeId,
+    variant: u32,
+    scrutinee: ValueId,
+}
+
+fn exact_enum_is_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
     fact: &ExpressionFact,
+    identity: ExactEnumTypeTest,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<bool, AnalysisFailure> {
-    let Some(value_fact) = exact_child_expression(analysis, function, value) else {
+    let Some(value_fact) = exact_child_expression(analysis, identity.function, identity.value)
+    else {
         return Ok(false);
     };
-    if fact.effects != value_fact.effects
+    let exact_scrutinee = value_fact.result == Some(identity.scrutinee)
+        || matches!(value_fact.resolution, ExpressionResolution::Value(value) if value == identity.scrutinee);
+    if value_fact.ty != identity.enumeration
+        || !exact_scrutinee
+        || fact.effects != value_fact.effects
         || !matches!(
             exact_scalar_type(analysis, fact.ty),
             Some(ExactScalarType::Bool)
@@ -4499,7 +4527,7 @@ fn exact_enum_is_matches(
     {
         return Ok(false);
     }
-    let Some(pattern) = program.patterns.get(pattern.0 as usize) else {
+    let Some(pattern) = program.patterns.get(identity.pattern.0 as usize) else {
         return Ok(false);
     };
     let [alternative] = pattern.alternatives.as_slice() else {
@@ -4516,13 +4544,15 @@ fn exact_enum_is_matches(
     let [candidate] = candidates.as_slice() else {
         return Ok(false);
     };
-    if !exact_enum_constructor_reference_matches(
-        analysis,
-        program,
-        candidate,
-        value_fact.ty,
-        candidate.variant,
-    ) {
+    if candidate.variant != identity.variant
+        || !exact_enum_constructor_reference_matches(
+            analysis,
+            program,
+            candidate,
+            value_fact.ty,
+            identity.variant,
+        )
+    {
         return Ok(false);
     }
     let Some(payload_ty) = analysis
@@ -9506,6 +9536,26 @@ fn valid_expression_resolution(
                     && value_has_type(*left_field, field.ty)
                     && value_has_type(*right_field, field.ty)
             }),
+        ExpressionResolution::EnumTypeTest {
+            enumeration,
+            variant,
+            scrutinee,
+        } => {
+            analysis
+                .types
+                .get(enumeration.0 as usize)
+                .and_then(|record| match &record.kind {
+                    SemanticTypeKind::Enumeration { variants, .. } => {
+                        variants.get(*variant as usize)
+                    }
+                    _ => None,
+                })
+                .is_some()
+                && analysis
+                    .values
+                    .get(scrutinee.0 as usize)
+                    .is_some_and(|record| record.function == function && record.ty == *enumeration)
+        }
         ExpressionResolution::ActorRequest {
             actor,
             method,
@@ -10294,6 +10344,7 @@ fn valid_expression_region(
             | ExpressionResolution::ProjectionCall { .. }
             | ExpressionResolution::OperatorCall { .. }
             | ExpressionResolution::DerivedEquality { .. }
+            | ExpressionResolution::EnumTypeTest { .. }
             | ExpressionResolution::ActorRequest { .. }
             | ExpressionResolution::Closure { .. }
             | ExpressionResolution::Builtin(_) => fact.region.is_none(),
@@ -12363,6 +12414,7 @@ fn validate_fact_resources(
             | ExpressionResolution::OptionTry { .. }
             | ExpressionResolution::ClosedRange { .. }
             | ExpressionResolution::DerivedEquality { .. }
+            | ExpressionResolution::EnumTypeTest { .. }
             | ExpressionResolution::ActorRequest { .. }
             | ExpressionResolution::Field { .. }
             | ExpressionResolution::Index { .. }

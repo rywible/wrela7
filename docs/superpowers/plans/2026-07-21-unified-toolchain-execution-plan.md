@@ -234,6 +234,13 @@ B1a.3's cross-view boundary is covered by a distinct-root positive whose HIR
 and exact call facts are forged into individually valid same-root views; the
 full sealer rejects their overlapping exclusive intervals.
 
+A3 `is` analysis now records an exact `EnumTypeTest` identity instead of a
+generic boolean-value resolution. The fact authenticates enum type, variant,
+and borrowed scrutinee; full sealing rejects valid-tag substitution
+(`runtime_adt_is_tests_unit_variant_without_binding`). Execution remains
+deliberately fail-closed at `semantic-runtime-is-lowering-pending`
+(`authenticated_enum_type_test_stops_at_named_lowering_boundary`).
+
 **Sequencing note (2026-07-21):** T0.1 (ADT type resolution) is complete. T0.2
 was producer-gated until B1a supplied the first real ephemeral value. The
 regionless view producer and shared typed-value classification now land

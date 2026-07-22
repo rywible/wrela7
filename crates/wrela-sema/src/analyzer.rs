@@ -8119,6 +8119,7 @@ fn analyze_closed_enum_is_pattern(
         state,
         is_cancelled,
     )?;
+    let enumeration_ty = scrutinee.ty;
     let enumeration = partial
         .types
         .get(scrutinee.ty.0 as usize)
@@ -8295,7 +8296,14 @@ fn analyze_closed_enum_is_pattern(
             expression,
             ty: bool_ty,
             result: Some(result),
-            resolution: ExpressionResolution::Value(result),
+            resolution: ExpressionResolution::EnumTypeTest {
+                enumeration: enumeration_ty,
+                variant: candidate.variant,
+                scrutinee: scrutinee
+                    .referenced
+                    .or(scrutinee.result)
+                    .ok_or(AnalysisFailure::RequestMismatch)?,
+            },
             effects: scrutinee.effects,
             ownership_before: OwnershipState::Owned,
             ownership_after: OwnershipState::Owned,
@@ -36092,7 +36100,50 @@ fn projection_fixture():
             "`is` over a unit ADT variant must analyze cleanly: {:?}",
             output.diagnostics()
         );
-        assert!(output.successful().is_some());
+        let analyzed = output.successful().expect("sealed unit enum type test");
+        let type_test = analyzed
+            .facts()
+            .expressions
+            .iter()
+            .find(|fact| {
+                fixture
+                    .fixture
+                    .hir
+                    .as_program()
+                    .expression(fact.expression)
+                    .is_some_and(|record| matches!(record.kind, ExpressionKind::IsPattern { .. }))
+            })
+            .expect("unit enum type-test fact");
+        let ExpressionResolution::EnumTypeTest {
+            enumeration,
+            variant,
+            scrutinee,
+        } = type_test.resolution
+        else {
+            panic!(
+                "the enum and variant must be explicit authenticated facts: {:?}",
+                type_test.resolution
+            );
+        };
+        assert_eq!(variant, 0);
+        assert_eq!(
+            analyzed.facts().values[scrutinee.0 as usize].ty,
+            enumeration
+        );
+        let mut forged = analyzed.facts().clone();
+        let forged_variant = forged
+            .expressions
+            .iter_mut()
+            .find_map(|fact| match &mut fact.resolution {
+                ExpressionResolution::EnumTypeTest { variant, .. } => Some(variant),
+                _ => None,
+            })
+            .expect("forged enum type-test fact");
+        *forged_variant = 1;
+        assert!(
+            forged.validate_for_seal(analyzed.hir(), &|| false).is_err(),
+            "full sealing must reject a different valid variant"
+        );
     }
 
     #[test]

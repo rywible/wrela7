@@ -119,6 +119,16 @@ payloads, and `take` remain named fail-closed
 `runtime_adt_match_alternative_tails_fail_closed_by_name`). Fixed-array and
 broader alternative forms are not claimed.
 
+A3 `is` evidence for rows 2.3.3 and 2.8 now carries an explicit authenticated
+`EnumTypeTest` expression resolution: the exact semantic enum type, variant
+index, and borrowed scrutinee value are sealed independently of the boolean
+result. `runtime_adt_is_tests_unit_variant_without_binding` proves that changing
+the fact to another valid variant is rejected by full sealing; payload-wildcard
+analysis remains covered by `runtime_adt_is_tests_payload_variant_with_wildcard`.
+Semantic lowering fails closed by name at `semantic-runtime-is-lowering-pending`
+(`authenticated_enum_type_test_stops_at_named_lowering_boundary`); native tag
+testing and success-dominated payload bindings are not claimed.
+
 B1a.2 retention-boundary evidence additionally includes
 `continuation_anchored_bounded_while_keeps_view_live_exactly`,
 `lexical_view_loop_local_nested_and_transfer_tails_fail_closed_by_name`,

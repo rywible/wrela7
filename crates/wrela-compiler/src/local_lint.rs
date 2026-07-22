@@ -345,6 +345,7 @@ impl CanonicalSemanticLinter {
                 | ExpressionResolution::ProjectionCall { .. }
                 | ExpressionResolution::OperatorCall { .. }
                 | ExpressionResolution::DerivedEquality { .. }
+                | ExpressionResolution::EnumTypeTest { .. }
                 | ExpressionResolution::ActorRequest { .. }
                 | ExpressionResolution::Field { .. }
                 | ExpressionResolution::Index { .. }
