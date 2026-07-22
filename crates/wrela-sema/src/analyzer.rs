@@ -5776,6 +5776,16 @@ fn analyze_closed_range_for(
         aggregate_work,
         is_cancelled,
     )?;
+    // Retain the exact comparison result type required by the canonical
+    // lowering of this analyzed iterator. The range expression itself is
+    // intentionally not a first-class value, but its loop header is.
+    let _condition_ty = ensure_primitive_type(
+        request,
+        partial,
+        PrimitiveSemanticType::Bool,
+        aggregate_work,
+        is_cancelled,
+    )?;
     let mut state = RuntimeState {
         locals: &mut *locals,
         parameters: &mut *parameters,

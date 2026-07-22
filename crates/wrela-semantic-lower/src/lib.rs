@@ -5604,6 +5604,11 @@ enum SourceStatementPlan {
         condition: wrela_hir::ExpressionId,
         body: wrela_hir::BodyId,
     },
+    ForRange {
+        binding: wrela_hir::LocalId,
+        iterable: wrela_hir::ExpressionId,
+        body: wrela_hir::BodyId,
+    },
     With {
         value: wrela_hir::ExpressionId,
         binding: Option<wrela_hir::LocalId>,
@@ -5949,6 +5954,17 @@ impl SourceFunctionLowerer<'_> {
                             body: *body,
                         }
                     }
+                    wrela_hir::StatementKind::For {
+                        take_binding: false,
+                        binding,
+                        take_iterable: false,
+                        iterable,
+                        body,
+                    } => SourceStatementPlan::ForRange {
+                        binding: *binding,
+                        iterable: *iterable,
+                        body: *body,
+                    },
                     wrela_hir::StatementKind::With {
                         value,
                         binding,
@@ -6016,6 +6032,11 @@ impl SourceFunctionLowerer<'_> {
                 }
                 SourceStatementPlan::While { condition, body } => {
                     let mut effects = self.expression_fact(*condition)?.effects;
+                    effects.0 |= self.body_statement_effects(*body)?.0;
+                    effects
+                }
+                SourceStatementPlan::ForRange { iterable, body, .. } => {
+                    let mut effects = self.expression_fact(*iterable)?.effects;
                     effects.0 |= self.body_statement_effects(*body)?.0;
                     effects
                 }
@@ -6871,6 +6892,22 @@ impl SourceFunctionLowerer<'_> {
                         },
                     )?;
                 }
+                SourceStatementPlan::ForRange {
+                    binding,
+                    iterable,
+                    body,
+                } => {
+                    self.lower_closed_literal_range(
+                        binding,
+                        iterable,
+                        body,
+                        statement_source,
+                        depth,
+                        &statement_definitions,
+                        local_state,
+                        &mut statements,
+                    )?;
+                }
                 SourceStatementPlan::With {
                     value,
                     binding,
@@ -7155,6 +7192,303 @@ impl SourceFunctionLowerer<'_> {
             parameters: Vec::new(),
             statements,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_closed_literal_range(
+        &mut self,
+        binding: wrela_hir::LocalId,
+        iterable: wrela_hir::ExpressionId,
+        body: wrela_hir::BodyId,
+        statement_source: Span,
+        depth: u32,
+        definitions: &[sema::LocalDefinition],
+        local_state: &SourceLocalState,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<(), LowerError> {
+        check_cancelled(self.is_cancelled)?;
+        let body_effects = self.body_statement_effects(body)?;
+        if body_effects.0 & sema::EffectSet::SUSPEND != 0 {
+            return Err(unsupported(
+                "semantic-for-range-suspension-lowering-pending (await in loop body)",
+            ));
+        }
+        self.validate_range_body_has_no_abnormal_exit(body)?;
+        self.push_seen_expression(iterable)?;
+
+        let (start_expression, end_expression, range_source) = self
+            .input
+            .hir()
+            .as_program()
+            .expression(iterable)
+            .and_then(|expression| match expression.kind {
+                wrela_hir::ExpressionKind::Range {
+                    start,
+                    end,
+                    inclusive: false,
+                } => Some((start, end, expression.source)),
+                _ => None,
+            })
+            .ok_or_else(|| self.fact_mismatch("closed range HIR shape"))?;
+        let range_fact = self.expression_fact(iterable)?;
+        let (start_value, end_value, maximum_iterations) = match range_fact.resolution {
+            sema::ExpressionResolution::ClosedRange {
+                start,
+                end,
+                inclusive: false,
+                maximum_iterations,
+            } => (start, end, maximum_iterations),
+            _ => return Err(self.fact_mismatch("closed range semantic resolution")),
+        };
+        let element_ty = range_fact.ty;
+        let start_fact = self.expression_fact(start_expression)?;
+        let end_fact = self.expression_fact(end_expression)?;
+        if range_fact.function != self.function.id
+            || range_fact.category != sema::ValueCategory::Value
+            || range_fact.region.is_some()
+            || range_fact.result.is_some()
+            || range_fact.ownership_before != sema::OwnershipState::Owned
+            || range_fact.ownership_after != sema::OwnershipState::Owned
+            || range_fact.proofs != self.function.proofs
+            || range_fact.effects.0 != (start_fact.effects.0 | end_fact.effects.0)
+            || start_fact.result != Some(start_value)
+            || end_fact.result != Some(end_value)
+            || start_fact.ty != element_ty
+            || end_fact.ty != element_ty
+            || !matches!(
+                self.input
+                    .facts()
+                    .types
+                    .get(element_ty.0 as usize)
+                    .map(|ty| &ty.kind),
+                Some(sema::SemanticTypeKind::Integer {
+                    signed: false,
+                    bits: 64,
+                    pointer_sized: false,
+                })
+            )
+        {
+            return Err(self.fact_mismatch("closed range semantic fact"));
+        }
+        let [definition] = definitions else {
+            return Err(self.fact_mismatch("closed range binding definition"));
+        };
+        let local = self
+            .input
+            .hir()
+            .as_program()
+            .locals
+            .get(binding.0 as usize)
+            .filter(|local| local.id == binding && local.body == body && local.ty.is_none())
+            .ok_or_else(|| self.fact_mismatch("closed range binding provenance"))?;
+        let binding_record = self
+            .input
+            .facts()
+            .values
+            .get(definition.value.0 as usize)
+            .filter(|value| {
+                value.function == self.function.id
+                    && value.ty == element_ty
+                    && value.origin == sema::SemanticValueOrigin::Local(binding)
+                    && value.source == Some(local.source)
+                    && value.source_name.as_deref() == Some(local.name.as_str())
+            })
+            .ok_or_else(|| self.fact_mismatch("closed range binding semantic value"))?;
+        if definition.local != binding
+            || binding_record.id != definition.value
+            || local_state.get(binding).is_some()
+        {
+            return Err(self.fact_mismatch("closed range binding identity"));
+        }
+        let bool_ty = self
+            .input
+            .facts()
+            .types
+            .iter()
+            .find(|ty| matches!(ty.kind, sema::SemanticTypeKind::Bool))
+            .map(|ty| ty.id)
+            .ok_or_else(|| self.fact_mismatch("closed range condition type"))?;
+
+        let LoweredExpression::Value(start) =
+            self.lower_expression(start_expression, sema::AccessMode::Value, statements)?
+        else {
+            return Err(self.fact_mismatch("closed range start value"));
+        };
+        let LoweredExpression::Value(end) =
+            self.lower_expression(end_expression, sema::AccessMode::Value, statements)?
+        else {
+            return Err(self.fact_mismatch("closed range end value"));
+        };
+        if start != self.value_map.get(start_value)? || end != self.value_map.get(end_value)? {
+            return Err(self.fact_mismatch("closed range endpoint identity"));
+        }
+
+        let header = self.value_map.get(definition.value)?;
+        let exit = self.allocate_synthetic_value(element_ty, statement_source)?;
+        let condition = self.allocate_synthetic_value(bool_ty, range_source)?;
+        let one = self.allocate_synthetic_value(element_ty, statement_source)?;
+        let next = self.allocate_synthetic_value(element_ty, statement_source)?;
+        let mut header_statements = Vec::new();
+        self.push_let(
+            &mut header_statements,
+            condition,
+            wir::SemanticOperation::Binary {
+                operator: wir::BinaryOperator::Less,
+                left: header,
+                right: end,
+                arithmetic: wir::ArithmeticMode::Checked,
+            },
+            Some(range_source),
+        )?;
+
+        let mut body_state = local_state.copy(self.limits)?;
+        body_state.set(binding, definition.value)?;
+        let mut then_region = self.lower_body(body, depth + 2, &mut body_state)?;
+        if matches!(
+            then_region.statements.last(),
+            Some(
+                wir::SemanticStatement::Return(_)
+                    | wir::SemanticStatement::Break(_)
+                    | wir::SemanticStatement::Continue(_)
+                    | wir::SemanticStatement::Unreachable
+            )
+        ) {
+            return Err(unsupported(
+                "semantic-for-range-abnormal-control-lowering-pending (lowered early exit)",
+            ));
+        }
+        self.push_let(
+            &mut then_region.statements,
+            one,
+            wir::SemanticOperation::Constant(wir::Constant::Unsigned { bits: 64, value: 1 }),
+            Some(statement_source),
+        )?;
+        self.push_let(
+            &mut then_region.statements,
+            next,
+            wir::SemanticOperation::Binary {
+                operator: wir::BinaryOperator::Add,
+                left: header,
+                right: one,
+                arithmetic: wir::ArithmeticMode::Checked,
+            },
+            Some(statement_source),
+        )?;
+        self.push_statement(
+            &mut then_region.statements,
+            wir::SemanticStatement::Continue(one_value_vec(next, self.limits.model_edges)?),
+        )?;
+        let else_region = wir::SemanticRegion {
+            parameters: Vec::new(),
+            statements: vec![wir::SemanticStatement::Break(one_value_vec(
+                header,
+                self.limits.model_edges,
+            )?)],
+        };
+        self.push_statement(
+            &mut header_statements,
+            wir::SemanticStatement::If {
+                condition,
+                then_region,
+                else_region,
+                results: Vec::new(),
+                source: Some(statement_source),
+            },
+        )?;
+        let represented_bound = maximum_iterations.max(1);
+        if represented_bound > self.function.uninterrupted_work_bound.unwrap_or(0) {
+            return Err(self.fact_mismatch("closed range uninterrupted-work proof"));
+        }
+        self.push_statement(
+            statements,
+            wir::SemanticStatement::Loop {
+                body: wir::SemanticRegion {
+                    parameters: one_value_vec(header, self.limits.model_edges)?,
+                    statements: header_statements,
+                },
+                carried: vec![start, header, exit],
+                uninterrupted_bound: Some(represented_bound),
+                source: Some(statement_source),
+            },
+        )
+    }
+
+    fn validate_range_body_has_no_abnormal_exit(
+        &self,
+        root: wrela_hir::BodyId,
+    ) -> Result<(), LowerError> {
+        let mut pending = try_vec(1, "closed range body validation", self.limits.model_edges)?;
+        pending.push(root);
+        while let Some(body) = pending.pop() {
+            check_cancelled(self.is_cancelled)?;
+            let body = self
+                .input
+                .hir()
+                .as_program()
+                .body(body)
+                .ok_or_else(|| self.fact_mismatch("closed range nested body"))?;
+            for statement in &body.statements {
+                check_cancelled(self.is_cancelled)?;
+                match &self
+                    .input
+                    .hir()
+                    .as_program()
+                    .statement(*statement)
+                    .ok_or_else(|| self.fact_mismatch("closed range nested statement"))?
+                    .kind
+                {
+                    wrela_hir::StatementKind::Return(_)
+                    | wrela_hir::StatementKind::Break
+                    | wrela_hir::StatementKind::Continue => {
+                        return Err(unsupported(
+                            "semantic-for-range-abnormal-control-lowering-pending (return, break, or continue)",
+                        ));
+                    }
+                    wrela_hir::StatementKind::With { body, .. }
+                    | wrela_hir::StatementKind::While { body, .. }
+                    | wrela_hir::StatementKind::Loop { body }
+                    | wrela_hir::StatementKind::For { body, .. } => push_bounded_id(
+                        &mut pending,
+                        *body,
+                        "closed range body validation",
+                        self.limits.model_edges,
+                    )?,
+                    wrela_hir::StatementKind::If {
+                        branches,
+                        else_body,
+                    } => {
+                        for (_, body) in branches {
+                            push_bounded_id(
+                                &mut pending,
+                                *body,
+                                "closed range body validation",
+                                self.limits.model_edges,
+                            )?;
+                        }
+                        if let Some(body) = else_body {
+                            push_bounded_id(
+                                &mut pending,
+                                *body,
+                                "closed range body validation",
+                                self.limits.model_edges,
+                            )?;
+                        }
+                    }
+                    wrela_hir::StatementKind::Match { arms, .. } => {
+                        for arm in arms {
+                            push_bounded_id(
+                                &mut pending,
+                                arm.body,
+                                "closed range body validation",
+                                self.limits.model_edges,
+                            )?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     fn lower_scope_acquisition(
@@ -12844,6 +13178,33 @@ fn actor_regions_match(
                             limits.model_edges,
                         )?;
                     }
+                }
+                (
+                    wir::SemanticStatement::Loop {
+                        body: left_body,
+                        carried: left_carried,
+                        uninterrupted_bound: left_bound,
+                        source: left_source,
+                    },
+                    wir::SemanticStatement::Loop {
+                        body: right_body,
+                        carried: right_carried,
+                        uninterrupted_bound: right_bound,
+                        source: right_source,
+                    },
+                ) => {
+                    if left_bound != right_bound
+                        || left_source != right_source
+                        || !cancellable_slices_equal(left_carried, right_carried, is_cancelled)?
+                    {
+                        return Ok(false);
+                    }
+                    push_bounded_id(
+                        &mut work,
+                        (left_body, right_body),
+                        "actor SemanticWir comparison",
+                        limits.model_edges,
+                    )?;
                 }
                 (wir::SemanticStatement::Return(left), wir::SemanticStatement::Return(right))
                 | (wir::SemanticStatement::Yield(left), wir::SemanticStatement::Yield(right))
@@ -18841,6 +19202,307 @@ pub fn boot() -> Image:
             ),
             Err(LowerError::UnsupportedInput {
                 feature: "semantic-scope-parameter-lowering-pending (parameterized acquisition)",
+            })
+        ));
+    }
+
+    #[test]
+    fn closed_literal_range_lowers_to_exact_bounded_semantic_loop() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        for index in 0 .. 4:
+            pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("closed literal range should lower");
+        let turn = lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .expect("actor turn");
+        let loops: Vec<_> = turn
+            .body
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Loop {
+                    body,
+                    carried,
+                    uninterrupted_bound,
+                    ..
+                } => Some((body, carried, uninterrupted_bound)),
+                _ => None,
+            })
+            .collect();
+        let [(body, carried, uninterrupted_bound)] = loops.as_slice() else {
+            panic!("one exact lowered range loop")
+        };
+        assert_eq!(body.parameters.len(), 1);
+        assert_eq!(carried.len(), 3);
+        assert_eq!(**uninterrupted_bound, Some(4));
+
+        let mut forged = lowered.wir().as_wir().clone();
+        let bound = forged
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Loop {
+                    uninterrupted_bound,
+                    ..
+                } => Some(uninterrupted_bound),
+                _ => None,
+            })
+            .expect("forged range bound");
+        *bound = Some(3);
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                forged,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn range_lowering_has_exact_operation_limit_and_late_cancellation() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        for index in 0 .. 4:
+            pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let baseline = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("range lowering baseline");
+        let exact_operations = baseline.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact range operation limit");
+        let mut one_under = exact;
+        one_under.operations = exact_operations - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == exact_operations - 1
+        ));
+
+        let polls = Cell::new(0_u64);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            )
+            .expect("count exact range cancellation polls");
+        let cancel_at = polls.get();
+        let polls = Cell::new(0_u64);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next == cancel_at
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), cancel_at);
+    }
+
+    #[test]
+    fn range_lowering_keeps_zero_trip_and_control_tails_explicit() {
+        let zero_trip = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        for index in 8 .. 3:
+            pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: zero_trip,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("descending range has a proved zero-trip lowering");
+        assert!(
+            lowered
+                .wir()
+                .as_wir()
+                .functions
+                .iter()
+                .flat_map(|function| &function.body.statements)
+                .any(|statement| matches!(
+                    statement,
+                    wir::SemanticStatement::Loop {
+                        uninterrupted_bound: Some(1),
+                        ..
+                    }
+                ))
+        );
+
+        let early_exit = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        for index in 0 .. 4:
+            break
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: early_exit,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-for-range-abnormal-control-lowering-pending (return, break, or continue)"
+            })
+        ));
+
+        let suspension = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        for index in 0 .. 4:
+            await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: suspension,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-for-range-suspension-lowering-pending (await in loop body)"
             })
         ));
     }
