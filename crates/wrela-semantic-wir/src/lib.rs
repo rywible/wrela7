@@ -2261,24 +2261,7 @@ fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut ValidationE
                         || matches!(variant.fields.as_slice(), [field]
                         if field.name.is_empty()
                             && field.public
-                            && module.types.get(field.ty.0 as usize).is_some_and(|record| {
-                                record.linearity == Linearity::CopyScalar
-                                    && matches!(record.kind, TypeKind::Primitive(
-                                        PrimitiveType::Bool
-                                            | PrimitiveType::I8
-                                            | PrimitiveType::I16
-                                            | PrimitiveType::I32
-                                            | PrimitiveType::I64
-                                            | PrimitiveType::I128
-                                            | PrimitiveType::U8
-                                            | PrimitiveType::U16
-                                            | PrimitiveType::U32
-                                            | PrimitiveType::U64
-                                            | PrimitiveType::U128
-                                            | PrimitiveType::F32
-                                            | PrimitiveType::F64
-                                    ))
-                            }));
+                            && canonical_closed_enum_payload(module, field.ty));
                     supported_shape
                         && !variant.name.is_empty()
                         && !variants[..index]
@@ -2318,6 +2301,47 @@ fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut ValidationE
             use_type!(*payload);
         }
     }
+}
+
+fn canonical_closed_enum_payload(module: &SemanticWir, ty: TypeId) -> bool {
+    let Some(record) = module
+        .types
+        .get(ty.0 as usize)
+        .filter(|record| record.id == ty)
+    else {
+        return false;
+    };
+    if canonical_closed_enum_scalar_payload(record) {
+        return true;
+    }
+    record.linearity == Linearity::ExplicitCopy
+        && matches!(&record.kind, TypeKind::Struct { fields }
+        if fields.iter().all(|field| {
+            module.types.get(field.ty.0 as usize).is_some_and(|field_ty|
+                field_ty.id == field.ty && canonical_closed_enum_scalar_payload(field_ty))
+        }))
+}
+
+fn canonical_closed_enum_scalar_payload(record: &TypeRecord) -> bool {
+    record.linearity == Linearity::CopyScalar
+        && matches!(
+            record.kind,
+            TypeKind::Primitive(
+                PrimitiveType::Bool
+                    | PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64
+                    | PrimitiveType::I128
+                    | PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64
+                    | PrimitiveType::U128
+                    | PrimitiveType::F32
+                    | PrimitiveType::F64
+            )
+        )
 }
 
 fn validate_constant(
@@ -5317,6 +5341,51 @@ mod tests {
         };
         *payload = None;
         assert!(mixed_arity.validate().is_err());
+    }
+
+    #[test]
+    fn closed_enum_accepts_exact_flat_structure_payload_and_rejects_nominal_forgery() {
+        let mut module = closed_enum_fixture(1);
+        module.types.push(TypeRecord {
+            id: TypeId(3),
+            source_name: "u16".to_owned(),
+            kind: TypeKind::Primitive(PrimitiveType::U16),
+            linearity: Linearity::CopyScalar,
+            source: None,
+        });
+        module.types[1] = TypeRecord {
+            id: TypeId(1),
+            source_name: "Detail".to_owned(),
+            kind: TypeKind::Struct {
+                fields: vec![FieldType {
+                    name: "word".to_owned(),
+                    ty: TypeId(3),
+                    public: true,
+                }],
+            },
+            linearity: Linearity::ExplicitCopy,
+            source: None,
+        };
+        module
+            .clone()
+            .validate()
+            .expect("flat-structure enum payload");
+
+        let TypeKind::Struct { fields } = &mut module.types[1].kind else {
+            panic!("fixture structure payload")
+        };
+        fields[0].ty = TypeId(2);
+        let errors = module
+            .validate()
+            .expect_err("enum-valued nominal field forgery must fail")
+            .0;
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidRecord {
+                kind: "closed enum type",
+                id: 2
+            }
+        )));
     }
 
     #[test]

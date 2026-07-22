@@ -296,6 +296,7 @@ fn supported_input<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedSemantic<'a>, LowerError> {
+    reject_pending_nominal_enum_payload(input, is_cancelled)?;
     if input.tests.is_empty() {
         if input.actors.is_empty()
             && input.tasks.is_empty()
@@ -310,6 +311,32 @@ fn supported_input<'a>(
         supported_generated_tests(input, limits, is_cancelled)
             .map(SupportedSemantic::GeneratedTests)
     }
+}
+
+fn reject_pending_nominal_enum_payload(
+    input: &semantic::SemanticWir,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), LowerError> {
+    for ty in &input.types {
+        check_cancelled(is_cancelled)?;
+        let semantic::TypeKind::Enum { variants } = &ty.kind else {
+            continue;
+        };
+        for field in variants.iter().flat_map(|variant| &variant.fields) {
+            check_cancelled(is_cancelled)?;
+            if input.types.get(field.ty.0 as usize).is_some_and(|payload| {
+                payload.id == field.ty
+                    && payload.linearity == semantic::Linearity::ExplicitCopy
+                    && matches!(&payload.kind, semantic::TypeKind::Struct { fields }
+                        if fields.iter().all(|field| scalar_primitive(input, field.ty).is_some()))
+            }) {
+                return Err(unsupported(
+                    "flow-enum-nominal-payload-lowering-pending (flat-structure enum payload)",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn supported_minimum(input: &semantic::SemanticWir) -> Result<MinimumSemantic<'_>, LowerError> {
@@ -8974,6 +9001,64 @@ mod contract_tests {
             !supported_source_value_type(&module, semantic::TypeId(3)),
             "crafted nested aggregate fields must not enter the flat scalar lowering subset"
         );
+    }
+
+    #[test]
+    fn flat_structure_enum_payload_stops_at_named_flow_boundary() {
+        let mut module = fixture().into_wir();
+        module.types.extend([
+            semantic::TypeRecord {
+                id: semantic::TypeId(1),
+                source_name: "u8".to_owned(),
+                kind: semantic::TypeKind::Primitive(semantic::PrimitiveType::U8),
+                linearity: semantic::Linearity::CopyScalar,
+                source: Some(span(0, 1, 2)),
+            },
+            semantic::TypeRecord {
+                id: semantic::TypeId(2),
+                source_name: "Detail".to_owned(),
+                kind: semantic::TypeKind::Struct {
+                    fields: vec![semantic::FieldType {
+                        name: "word".to_owned(),
+                        ty: semantic::TypeId(1),
+                        public: true,
+                    }],
+                },
+                linearity: semantic::Linearity::ExplicitCopy,
+                source: Some(span(0, 3, 4)),
+            },
+            semantic::TypeRecord {
+                id: semantic::TypeId(3),
+                source_name: "Envelope".to_owned(),
+                kind: semantic::TypeKind::Enum {
+                    variants: vec![semantic::VariantType {
+                        name: "detail".to_owned(),
+                        fields: vec![semantic::FieldType {
+                            name: String::new(),
+                            ty: semantic::TypeId(2),
+                            public: true,
+                        }],
+                    }],
+                },
+                linearity: semantic::Linearity::ExplicitCopy,
+                source: Some(span(0, 5, 6)),
+            },
+        ]);
+        let input = module
+            .validate()
+            .expect("valid SemanticWir flat-structure enum payload");
+        assert!(matches!(
+            CanonicalFlowLowerer::new().lower(
+                LowerRequest {
+                    input,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
+            Err(LowerError::UnsupportedInput {
+                feature: "flow-enum-nominal-payload-lowering-pending (flat-structure enum payload)"
+            })
+        ));
     }
 
     fn actor_fixture() -> semantic::ValidatedSemanticWir {

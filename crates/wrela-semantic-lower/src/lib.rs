@@ -3168,12 +3168,9 @@ fn validate_supported_source_type(
             // argument boundary.
             if variants.iter().any(|variant| {
                 matches!(variant.fields.as_slice(), [field]
-                if facts.types.get(field.ty.0 as usize).is_some_and(|field_ty| {
-                    !(field_ty.linearity == sema::Linearity::ScalarCopy
-                        && matches!(field_ty.kind, sema::SemanticTypeKind::Bool
-                            | sema::SemanticTypeKind::Integer { .. }
-                            | sema::SemanticTypeKind::Float { bits: 32 | 64 }))
-                }))
+                    if arguments.is_empty() && !is_stored_copy_scalar(facts, field.ty)
+                        || !arguments.is_empty()
+                            && !supported_runtime_enum_payload(facts, field.ty))
             }) {
                 return Err(unsupported(
                     "semantic-enum-nominal-payload-lowering-pending (flat-struct or nongeneric-enum nominal enum payloads)",
@@ -3191,12 +3188,11 @@ fn validate_supported_source_type(
                         || matches!(variant.fields.as_slice(), [field]
                         if field.name.is_empty()
                             && field.public
-                            && facts.types.get(field.ty.0 as usize).is_some_and(|field_ty| {
-                            field_ty.linearity == sema::Linearity::ScalarCopy
-                                && matches!(field_ty.kind, sema::SemanticTypeKind::Bool
-                                    | sema::SemanticTypeKind::Integer { .. }
-                                    | sema::SemanticTypeKind::Float { bits: 32 | 64 })
-                        }))
+                            && (if arguments.is_empty() {
+                                is_stored_copy_scalar(facts, field.ty)
+                            } else {
+                                supported_runtime_enum_payload(facts, field.ty)
+                            }))
                 })
                 && layout.is_some_and(|(size, alignment)| {
                     ty.size_upper_bound == Some(size) && ty.alignment_lower_bound == alignment
@@ -3245,21 +3241,56 @@ fn supported_core_result_arguments(
                             if *payload == ok_field.ty)))
 }
 
-fn canonical_tagged_enum_layout(payload: &sema::SemanticType) -> Option<(u64, u32)> {
-    let (payload_size, payload_alignment) = match payload.kind {
+fn supported_runtime_enum_payload(facts: &sema::PartialAnalysis, ty: sema::SemanticTypeId) -> bool {
+    let Some(payload) = facts.types.get(ty.0 as usize) else {
+        return false;
+    };
+    match &payload.kind {
+        sema::SemanticTypeKind::Bool
+        | sema::SemanticTypeKind::Integer { .. }
+        | sema::SemanticTypeKind::Float { bits: 32 | 64 } => {
+            payload.linearity == sema::Linearity::ScalarCopy
+        }
+        sema::SemanticTypeKind::Structure {
+            arguments, fields, ..
+        } if arguments.is_empty() => {
+            canonical_flat_structure_layout(facts, fields).is_some_and(|(size, alignment)| {
+                payload.size_upper_bound == Some(size) && payload.alignment_lower_bound == alignment
+            })
+        }
+        _ => false,
+    }
+}
+
+fn canonical_tagged_enum_layout(
+    facts: &sema::PartialAnalysis,
+    payload: &sema::SemanticType,
+) -> Option<(u64, u32)> {
+    let (payload_size, payload_alignment) = match &payload.kind {
         sema::SemanticTypeKind::Bool => (1_u64, 1_u32),
         sema::SemanticTypeKind::Integer {
             bits: 8 | 16 | 32 | 64 | 128,
             ..
         }
         | sema::SemanticTypeKind::Float { bits: 32 | 64 } => {
-            let bits = match payload.kind {
+            let bits = match &payload.kind {
                 sema::SemanticTypeKind::Integer { bits, .. }
                 | sema::SemanticTypeKind::Float { bits } => bits,
                 _ => unreachable!(),
             };
             let bytes = u64::from(bits.div_ceil(8));
             (bytes, u32::try_from(bytes).ok()?)
+        }
+        sema::SemanticTypeKind::Structure {
+            arguments, fields, ..
+        } if arguments.is_empty() => {
+            let layout = canonical_flat_structure_layout(facts, fields)?;
+            if payload.size_upper_bound != Some(layout.0)
+                || payload.alignment_lower_bound != layout.1
+            {
+                return None;
+            }
+            layout
         }
         _ => return None,
     };
@@ -3285,7 +3316,7 @@ fn canonical_runtime_enum_layout(
         };
         let payload = facts.types.get(field.ty.0 as usize)?;
         let size = payload.size_upper_bound?;
-        canonical_tagged_enum_layout(payload)?;
+        canonical_tagged_enum_layout(facts, payload)?;
         payload_size = payload_size.max(size);
         payload_alignment = payload_alignment.max(payload.alignment_lower_bound);
     }
@@ -5595,6 +5626,17 @@ fn generic_enum_source_payload_matches(
             .is_some_and(|argument| {
                 matches!(argument, sema::SemanticArgument::Type(argument) if *argument == ty)
             }),
+        wrela_hir::TypeExpressionKind::Named {
+            definition: wrela_hir::Definition::Declaration(resolved),
+            arguments: nested,
+        } if nested.is_empty() => facts.types.get(ty.0 as usize).is_some_and(|semantic| {
+            matches!(&semantic.kind, sema::SemanticTypeKind::Structure {
+                declaration,
+                arguments,
+                ..
+            } if *declaration == resolved.declaration && arguments.is_empty())
+                && supported_runtime_enum_payload(facts, ty)
+        }),
         _ => source_type_matches_semantic(facts, source, ty),
     }
 }
@@ -9564,7 +9606,8 @@ impl SourceFunctionLowerer<'_> {
                         result: fact.result,
                     },
                     (
-                        wrela_hir::ExpressionKind::Field { .. },
+                        wrela_hir::ExpressionKind::Field { .. }
+                        | wrela_hir::ExpressionKind::DotName { .. },
                         sema::ExpressionResolution::Constructor {
                             ty,
                             variant: Some(variant),
@@ -13404,6 +13447,33 @@ fn resolved_enum_constructor_from_hir(
                 enumeration: source.clone(),
                 variant,
             })
+        }
+        wrela_hir::ExpressionKind::DotName {
+            spelling,
+            candidates,
+        } => {
+            let [source] = candidates.as_slice() else {
+                return None;
+            };
+            let declaration =
+                program
+                    .declaration(source.enumeration.declaration)
+                    .filter(|record| {
+                        record.module == source.enumeration.module
+                            && program
+                                .modules
+                                .get(source.enumeration.module.0 as usize)
+                                .is_some_and(|module| module.package == source.enumeration.package)
+                    })?;
+            let wrela_hir::DeclarationKind::Enumeration(enumeration) = &declaration.kind else {
+                return None;
+            };
+            let index = usize::try_from(source.variant).ok()?;
+            enumeration
+                .variants
+                .get(index)
+                .filter(|variant| variant.name == *spelling)?;
+            Some(source.clone())
         }
         _ => None,
     }
@@ -21769,7 +21839,7 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn generic_enum_fixed_flat_payload_stops_at_named_lowering_boundary() {
+    fn generic_enum_fixed_flat_payload_lowers_to_exact_semantic_enum() {
         let image = analyze_parsed_actor_source(
             r#"module app
 
@@ -21799,6 +21869,76 @@ pub fn boot() -> Image:
     return img
 "#,
         );
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("generic enum fixed flat payload reaches SemanticWir");
+        let model = output.wir().as_wir();
+        let envelope = model
+            .types
+            .iter()
+            .find(|ty| ty.source_name == "Envelope")
+            .expect("lowered Envelope specialization");
+        assert!(matches!(&envelope.kind, wir::TypeKind::Enum { variants }
+            if matches!(variants.as_slice(), [detail, value]
+                if matches!(detail.fields.as_slice(), [field]
+                    if matches!(model.types[field.ty.0 as usize].kind,
+                        wir::TypeKind::Struct { .. }))
+                    && value.fields.len() == 1)));
+        let constructors = model
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation:
+                        wir::SemanticOperation::ConstructEnum {
+                            ty,
+                            variant,
+                            payload,
+                        },
+                    ..
+                }) if *ty == envelope.id => Some((*variant, payload.is_some())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(constructors, [(0, true), (1, true)]);
+    }
+
+    #[test]
+    fn nongeneric_flat_payload_retains_named_semantic_lowering_boundary() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub struct Detail:
+    pub word: u8
+
+pub enum Envelope:
+    detail(Detail)
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        detail: Envelope = .detail(Detail(7))
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
         let result = CanonicalSemanticLowerer::new().lower(
             LowerRequest {
                 input: image,
@@ -21806,15 +21946,12 @@ pub fn boot() -> Image:
             },
             &|| false,
         );
-        assert!(
-            matches!(
-                result,
-                Err(LowerError::UnsupportedInput {
-                    feature: "semantic-enum-nominal-payload-lowering-pending (flat-struct or nongeneric-enum nominal enum payloads)"
-                })
-            ),
-            "unexpected generic nominal-payload lowering result: {result:?}"
-        );
+        assert!(matches!(
+            result,
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-enum-nominal-payload-lowering-pending (flat-struct or nongeneric-enum nominal enum payloads)"
+            })
+        ));
     }
 
     #[test]
