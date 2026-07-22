@@ -3437,7 +3437,7 @@ mod contract_tests {
             entry: FlowBlockId(0),
             stack_bound: 8,
             frame_bound: 8,
-            proofs: vec![FlowProofId(7)],
+            proofs: vec![FlowProofId(8)],
             source: Some(source),
         });
         flow.functions.push(FlowFunction {
@@ -3469,7 +3469,8 @@ mod contract_tests {
             FlowProofId(4),
             FlowProofId(5),
             FlowProofId(6),
-            FlowProofId(8),
+            FlowProofId(7),
+            FlowProofId(9),
         ];
         flow.actors.push(ActorPlan {
             id: ActorId(0),
@@ -3538,6 +3539,15 @@ mod contract_tests {
             },
             FlowProof {
                 id: FlowProofId(6),
+                kind: ProofKind::SupervisionComplete,
+                subject: "complete static actor/task parent topology".to_owned(),
+                sources: vec![source],
+                depends_on: vec![FlowProofId(0)],
+                bound: Some(1),
+                explanation: vec!["the static actor parent graph is acyclic and every static @task is owned by exactly its declaring actor; restart policy and failure delivery are not claimed".to_owned()],
+            },
+            FlowProof {
+                id: FlowProofId(7),
                 kind: ProofKind::CapacityBound,
                 subject: "base actor allocation".to_owned(),
                 sources: vec![source, source],
@@ -3547,12 +3557,13 @@ mod contract_tests {
                     FlowProofId(3),
                     FlowProofId(4),
                     FlowProofId(5),
+                    FlowProofId(6),
                 ],
                 bound: Some(24),
                 explanation: vec!["mailbox plus root turn frame".to_owned()],
             },
             FlowProof {
-                id: FlowProofId(7),
+                id: FlowProofId(8),
                 kind: ProofKind::CapacityBound,
                 subject: "call activation".to_owned(),
                 sources: vec![source],
@@ -3561,11 +3572,11 @@ mod contract_tests {
                 explanation: vec!["one helper frame".to_owned()],
             },
             FlowProof {
-                id: FlowProofId(8),
+                id: FlowProofId(9),
                 kind: ProofKind::ImageClosed,
                 subject: "closed actor image".to_owned(),
                 sources: vec![source],
-                depends_on: vec![FlowProofId(6), FlowProofId(7)],
+                depends_on: vec![FlowProofId(7), FlowProofId(8)],
                 bound: Some(32),
                 explanation: vec!["base plus helper activation".to_owned()],
             },
@@ -3601,7 +3612,7 @@ mod contract_tests {
                 alignment: 8,
                 reset_function: None,
                 owner: PlanOwner::Actor(ActorId(0)),
-                capacity_proof: FlowProofId(7),
+                capacity_proof: FlowProofId(8),
                 source,
             },
         ];
@@ -3613,7 +3624,7 @@ mod contract_tests {
             frame_bytes: 8,
             maximum_live: 1,
             cancellation: ActivationCancellation::DropCalleeThenPropagate,
-            capacity_proof: FlowProofId(7),
+            capacity_proof: FlowProofId(8),
             source,
         });
         flow.startup_order = vec![PlanOwner::Runtime, PlanOwner::Actor(ActorId(0))];
@@ -3670,13 +3681,13 @@ mod contract_tests {
             explanation: vec!["one canonical zero u64 actor state cell".to_owned()],
         });
         flow.proofs.sort_unstable_by_key(|proof| proof.id);
-        let base = &mut flow.proofs[7];
-        assert_eq!(base.id, FlowProofId(7));
+        let base = &mut flow.proofs[8];
+        assert_eq!(base.id, FlowProofId(8));
         base.depends_on.push(state_proof);
         base.depends_on.sort_unstable();
         base.bound = Some(32);
-        let closed = &mut flow.proofs[9];
-        assert_eq!(closed.id, FlowProofId(9));
+        let closed = &mut flow.proofs[10];
+        assert_eq!(closed.id, FlowProofId(10));
         closed.bound = Some(40);
         flow.functions[0].proofs.push(state_proof);
         flow.functions[0].proofs.sort_unstable();
@@ -5768,7 +5779,7 @@ mod contract_tests {
                 frame_bytes: 8,
                 maximum_live: 1,
                 cancellation: ActivationCancellation::DropCalleeThenPropagate,
-                capacity_proof: FlowProofId(7),
+                capacity_proof: FlowProofId(8),
                 ..
             }]
         ));
@@ -5780,13 +5791,13 @@ mod contract_tests {
                 class: RegionClass::TaskFrame,
                 capacity_bytes: 8,
                 owner: PlanOwner::Actor(ActorId(0)),
-                capacity_proof: FlowProofId(7),
+                capacity_proof: FlowProofId(8),
                 ..
             }) if name == "async-unit.async-activation-frame"
         ));
-        assert_eq!(flow.functions[1].proofs, [FlowProofId(7)]);
+        assert_eq!(flow.functions[1].proofs, [FlowProofId(8)]);
         assert!(matches!(
-            flow.proofs.get(7),
+            flow.proofs.get(8),
             Some(FlowProof {
                 kind: ProofKind::CapacityBound,
                 bound: Some(1),
@@ -5812,6 +5823,26 @@ mod contract_tests {
             ),
             Err(MachineLowerError::UnsupportedInput {
                 feature: "actor activation images with exactly one static task",
+            })
+        );
+    }
+
+    #[test]
+    fn nested_actor_supervision_fails_closed_before_machine_topology_erasure() {
+        let (optimized, _, _) = async_activation_fixture();
+        let (validated, _) = optimized.into_parts();
+        let mut flow = validated.into_wir();
+        let mut runtime_parent = flow.actors[0].clone();
+        runtime_parent.id = ActorId(1);
+        runtime_parent.name = "runtime-parent".to_owned();
+        runtime_parent.turn_functions.clear();
+        flow.actors[0].supervisor = Some(ActorId(1));
+        flow.actors.push(runtime_parent);
+
+        assert_eq!(
+            crate::scalar::test_lower_activation_subset(&flow),
+            Err(MachineLowerError::UnsupportedInput {
+                feature: "machine-supervision-policy-lowering-pending (nested actor parents)",
             })
         );
     }

@@ -18961,7 +18961,14 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 }
             }
             ExpressionKind::Call { callee, arguments } => {
-                if let Some((image, install_kind)) = self.image_install_target(*callee) {
+                if self.image_supervise_target(*callee).is_some() {
+                    Err(self.diagnostic_category(
+                        Category::ACTOR,
+                        expression.source,
+                        "semantic-supervision-policy-pending",
+                        "explicit supervision policy requires restart, intensity, and failure-delivery semantics that are not implemented",
+                    ))
+                } else if let Some((image, install_kind)) = self.image_install_target(*callee) {
                     self.evaluate_image_install(
                         image,
                         install_kind,
@@ -20905,6 +20912,23 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             return None;
         };
         EvaluatedActorKind::from_install_method(name.as_str()).map(|kind| (*image, kind))
+    }
+
+    fn image_supervise_target(&self, callee: ExpressionId) -> Option<LocalId> {
+        let ExpressionKind::Field { base, name } = &self.program.expression(callee)?.kind else {
+            return None;
+        };
+        if name.as_str() != "supervise" {
+            return None;
+        }
+        let ExpressionKind::Reference(Definition::Local(image)) = self
+            .program
+            .expression(*base)
+            .map(|expression| &expression.kind)?
+        else {
+            return None;
+        };
+        Some(*image)
     }
 
     fn actor_handle_target(
@@ -23837,6 +23861,7 @@ fn populate_actor_image(
     infer_actor_state_promotions(request, partial, is_cancelled)?;
 
     let wait_proof = analyze_wait_graph(request, partial, is_cancelled)?;
+    let supervision_proof = append_static_supervision_proof(request, partial, is_cancelled)?;
     let regions = &partial
         .graph
         .as_ref()
@@ -23852,6 +23877,7 @@ fn populate_actor_image(
         partial,
         &plans,
         wait_proof,
+        supervision_proof,
         &capacity_proofs,
         is_cancelled,
     )?;
@@ -23865,7 +23891,7 @@ fn populate_actor_image(
         .ok_or(AnalysisFailure::RequestMismatch)?;
     let additional_proofs = capacity_proofs
         .len()
-        .checked_add(2)
+        .checked_add(3)
         .ok_or_else(|| fact_resource(request, "image entry proof references"))?;
     entry
         .proofs
@@ -23881,6 +23907,7 @@ fn populate_actor_image(
         .ok_or_else(|| fact_resource(request, "image startup work"))?,
     );
     entry.proofs.push(wait_proof);
+    entry.proofs.push(supervision_proof);
     entry.proofs.extend(capacity_proofs);
     entry.proofs.push(closed_proof);
     cancellable_stable_sort_by(
@@ -24908,11 +24935,89 @@ fn wait_cycle_diagnostic(
     Ok(RuntimeFailure::Diagnostic(Box::new(diagnostic)))
 }
 
+fn append_static_supervision_proof(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<ProofId, AnalysisFailure> {
+    check_cancelled(is_cancelled)?;
+    if partial.proofs.len() >= request.limits.proofs as usize {
+        return Err(fact_resource(request, "static supervision proof"));
+    }
+    let graph = partial
+        .graph
+        .as_ref()
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let node_count = graph
+        .actors
+        .len()
+        .checked_add(graph.tasks.len())
+        .ok_or_else(|| fact_resource(request, "static supervision nodes"))?;
+    let mut sources = Vec::new();
+    sources
+        .try_reserve_exact(node_count)
+        .map_err(|_| fact_resource(request, "static supervision proof sources"))?;
+    for actor in &graph.actors {
+        check_cancelled(is_cancelled)?;
+        if actor.supervisor.is_some() {
+            return Err(AnalysisFailure::RequestMismatch);
+        }
+        sources.push(actor.source);
+    }
+    for task in &graph.tasks {
+        check_cancelled(is_cancelled)?;
+        let supervisor_id = task.supervisor.ok_or(AnalysisFailure::RequestMismatch)?;
+        let supervisor = graph
+            .actors
+            .get(supervisor_id.0 as usize)
+            .filter(|actor| actor.id == supervisor_id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let function = partial
+            .functions
+            .get(task.entry.0 as usize)
+            .filter(|function| function.role == FunctionRole::TaskEntry(task.id))
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if supervisor.id != supervisor_id || function.source != Some(task.source) {
+            return Err(AnalysisFailure::RequestMismatch);
+        }
+        sources.push(task.source);
+    }
+    let id = ProofId(
+        u32::try_from(partial.proofs.len())
+            .map_err(|_| fact_resource(request, "static supervision proof"))?,
+    );
+    partial
+        .proofs
+        .try_reserve(1)
+        .map_err(|_| fact_resource(request, "static supervision proof"))?;
+    partial.proofs.push(Proof {
+        id,
+        kind: ProofKind::SupervisionComplete,
+        subject: copy_analysis_text(
+            "complete static actor/task parent topology",
+            request.limits.fact_bytes,
+            is_cancelled,
+        )?,
+        sources,
+        depends_on: vec![ProofId(0)],
+        bound: Some(
+            u64::try_from(node_count)
+                .map_err(|_| fact_resource(request, "static supervision nodes"))?,
+        ),
+        explanation: vec![
+            "the static actor parent graph is acyclic and every static @task is owned by exactly its declaring actor; restart policy and failure delivery are not claimed"
+                .to_owned(),
+        ],
+    });
+    Ok(id)
+}
+
 fn append_actor_image_closed_proof(
     request: &AnalysisRequest<'_>,
     partial: &mut PartialAnalysis,
     plans: &[ActorPlan],
     wait_proof: ProofId,
+    supervision_proof: ProofId,
     capacity_proofs: &[ProofId],
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<ProofId, AnalysisFailure> {
@@ -24921,9 +25026,9 @@ fn append_actor_image_closed_proof(
     }
     let mut dependencies = Vec::new();
     dependencies
-        .try_reserve_exact(capacity_proofs.len().saturating_add(3))
+        .try_reserve_exact(capacity_proofs.len().saturating_add(4))
         .map_err(|_| fact_resource(request, "closed actor image proof dependencies"))?;
-    dependencies.extend([ProofId(0), ProofId(1), wait_proof]);
+    dependencies.extend([ProofId(0), ProofId(1), wait_proof, supervision_proof]);
     dependencies.extend_from_slice(capacity_proofs);
     cancellable_stable_sort_by(
         &mut dependencies,
@@ -28580,6 +28685,25 @@ pub fn boot() -> Image:
                 proof.kind == ProofKind::WaitGraphAcyclic && proof.bound == Some(2)
             })
         );
+        let supervision = facts
+            .proofs
+            .iter()
+            .find(|proof| proof.kind == ProofKind::SupervisionComplete)
+            .expect("static supervision topology proof");
+        assert_eq!(supervision.bound, Some(2));
+        assert_eq!(supervision.depends_on.as_slice(), [ProofId(0)]);
+        assert_eq!(
+            supervision.sources.as_slice(),
+            [graph.actors[0].source, graph.tasks[0].source]
+        );
+        assert_eq!(graph.actors[0].supervisor, None);
+        assert_eq!(graph.tasks[0].supervisor, Some(ActorId(0)));
+        let closed = facts
+            .proofs
+            .iter()
+            .find(|proof| proof.kind == ProofKind::ImageClosed)
+            .expect("closed actor image proof");
+        assert!(closed.depends_on.contains(&supervision.id));
         assert!(facts.proofs.iter().any(|proof| {
             proof.kind == ProofKind::CleanupAcyclic
                 && proof
@@ -28602,6 +28726,106 @@ pub fn boot() -> Image:
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn explicit_supervision_policy_fails_closed_until_runtime_semantics_exist() {
+        let source = BOUNDED_ACTOR_SOURCE.replace(
+            "    installed = img.service(Worker, mailbox=2)\n    return img",
+            "    installed = img.service(Worker, mailbox=2)\n    policy = img.supervise(installed)\n    return img",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("explicit supervision policy is a source diagnostic");
+        assert!(output.successful().is_none());
+        assert!(matches!(
+            output.diagnostics(),
+            [diagnostic]
+                if diagnostic.code.as_deref() == Some("semantic-supervision-policy-pending")
+                    && diagnostic.category == Category::ACTOR
+                    && diagnostic.message.contains("restart")
+        ));
+    }
+
+    #[test]
+    fn static_supervision_proof_budget_is_exact() {
+        let fixture = parsed_actor_fixture(BOUNDED_ACTOR_SOURCE);
+        let changes = no_changes();
+        let baseline = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("baseline actor analysis");
+        let admitted = u32::try_from(
+            baseline
+                .successful()
+                .expect("sealed baseline actor image")
+                .facts()
+                .proofs
+                .len(),
+        )
+        .expect("bounded proof count");
+        let mut exact = AnalysisLimits::standard();
+        exact.proofs = admitted;
+        assert!(
+            CanonicalSemanticAnalyzer::new()
+                .analyze(parsed_actor_request(&fixture, &changes, exact), &|| false)
+                .expect("exact proof budget analysis")
+                .successful()
+                .is_some()
+        );
+        let mut one_under = AnalysisLimits::standard();
+        one_under.proofs = admitted - 1;
+        let one_under_result = CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, one_under), &|| {
+                false
+            });
+        assert!(
+            matches!(
+                one_under_result,
+                Err(AnalysisFailure::ResourceLimit {
+                    resource: "closed actor image proof",
+                    limit,
+                }) if limit == 1_000_000_000
+            ),
+            "one-under result: {one_under_result:?}"
+        );
+    }
+
+    #[test]
+    fn static_supervision_pipeline_polls_late_cancellation_exactly() {
+        let fixture = parsed_actor_fixture(BOUNDED_ACTOR_SOURCE);
+        let changes = no_changes();
+        let baseline_polls = Cell::new(0_u64);
+        let baseline = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| {
+                    baseline_polls.set(baseline_polls.get() + 1);
+                    false
+                },
+            )
+            .expect("counted baseline actor analysis");
+        assert!(baseline.successful().is_some());
+        let exact_late_poll = baseline_polls.get();
+        assert!(exact_late_poll > 1);
+        let cancelled_polls = Cell::new(0_u64);
+        let cancelled = CanonicalSemanticAnalyzer::new().analyze(
+            parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+            &|| {
+                let next = cancelled_polls.get() + 1;
+                cancelled_polls.set(next);
+                next == exact_late_poll
+            },
+        );
+        assert!(matches!(cancelled, Err(AnalysisFailure::Cancelled)));
+        assert_eq!(cancelled_polls.get(), exact_late_poll);
     }
 
     #[test]

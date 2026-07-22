@@ -2884,7 +2884,7 @@ mod tests {
         function.color = FunctionColor::Async;
         function.stack_bound = 8;
         function.frame_bound = 8;
-        function.proofs = vec![ProofId(7)];
+        function.proofs = vec![ProofId(8)];
         function.values = vec![
             Value {
                 id: ValueId(0),
@@ -2952,8 +2952,14 @@ mod tests {
             proofs: vec![ProofId(2)],
             source: Some(source),
         });
-        model.functions[0].proofs =
-            vec![ProofId(3), ProofId(4), ProofId(5), ProofId(6), ProofId(8)];
+        model.functions[0].proofs = vec![
+            ProofId(3),
+            ProofId(4),
+            ProofId(5),
+            ProofId(6),
+            ProofId(7),
+            ProofId(9),
+        ];
         let FlowOperation::AsyncCall { function, .. } =
             &mut model.functions[1].blocks[0].instructions[0].operation
         else {
@@ -3027,15 +3033,31 @@ mod tests {
             },
             Proof {
                 id: ProofId(6),
+                kind: ProofKind::SupervisionComplete,
+                subject: "complete static actor/task parent topology".to_owned(),
+                sources: vec![source],
+                depends_on: vec![ProofId(0)],
+                bound: Some(1),
+                explanation: vec!["the static actor parent graph is acyclic and every static @task is owned by exactly its declaring actor; restart policy and failure delivery are not claimed".to_owned()],
+            },
+            Proof {
+                id: ProofId(7),
                 kind: ProofKind::CapacityBound,
                 subject: "base actor allocation".to_owned(),
                 sources: vec![source, source],
-                depends_on: vec![ProofId(0), ProofId(1), ProofId(3), ProofId(4), ProofId(5)],
+                depends_on: vec![
+                    ProofId(0),
+                    ProofId(1),
+                    ProofId(3),
+                    ProofId(4),
+                    ProofId(5),
+                    ProofId(6),
+                ],
                 bound: Some(24),
                 explanation: vec!["mailbox plus root turn frame".to_owned()],
             },
             Proof {
-                id: ProofId(7),
+                id: ProofId(8),
                 kind: ProofKind::CapacityBound,
                 subject: "call activation".to_owned(),
                 sources: vec![source],
@@ -3044,11 +3066,11 @@ mod tests {
                 explanation: vec!["one helper frame".to_owned()],
             },
             Proof {
-                id: ProofId(8),
+                id: ProofId(9),
                 kind: ProofKind::ImageClosed,
                 subject: "closed actor image".to_owned(),
                 sources: vec![source],
-                depends_on: vec![ProofId(6), ProofId(7)],
+                depends_on: vec![ProofId(7), ProofId(8)],
                 bound: Some(32),
                 explanation: vec!["base plus helper activation".to_owned()],
             },
@@ -3084,7 +3106,7 @@ mod tests {
                 alignment: 8,
                 reset_function: None,
                 owner: PlanOwner::Actor(ActorId(0)),
-                capacity_proof: ProofId(7),
+                capacity_proof: ProofId(8),
                 source,
             },
         ];
@@ -3096,7 +3118,7 @@ mod tests {
             frame_bytes: 8,
             maximum_live: 1,
             cancellation: ActivationCancellation::DropCalleeThenPropagate,
-            capacity_proof: ProofId(7),
+            capacity_proof: ProofId(8),
             source,
         }];
         model.startup_order = vec![PlanOwner::Runtime, PlanOwner::Actor(ActorId(0))];

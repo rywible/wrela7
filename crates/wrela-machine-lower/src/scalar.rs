@@ -1448,6 +1448,11 @@ fn lower_activation_subset(
     if !has_surface {
         return Ok(Vec::new());
     }
+    if input.actors.iter().any(|actor| actor.supervisor.is_some()) {
+        return Err(unsupported(
+            "machine-supervision-policy-lowering-pending (nested actor parents)",
+        ));
+    }
     let (actor, app) = match input.actors.as_slice() {
         [actor] => (actor, None),
         [service, app]
@@ -1919,6 +1924,11 @@ fn lower_activation_subset(
     }
     check_cancelled(is_cancelled)?;
     Ok(output)
+}
+
+#[cfg(test)]
+pub(super) fn test_lower_activation_subset(input: &flow::FlowWir) -> Result<(), MachineLowerError> {
+    lower_activation_subset(input, None, MachineLoweringLimits::standard(), &|| false).map(drop)
 }
 
 fn flow_type_is_exact_u64(input: &flow::FlowWir, ty: flow::TypeId) -> bool {

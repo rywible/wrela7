@@ -3219,6 +3219,7 @@ mod tests {
                     ProofId(6),
                     ProofId(7),
                     ProofId(8),
+                    ProofId(9),
                 ]
             } else {
                 Vec::new()
@@ -3457,6 +3458,15 @@ mod tests {
                 },
                 Proof {
                     id: ProofId(8),
+                    kind: ProofKind::SupervisionComplete,
+                    subject: "complete static actor/task parent topology".to_owned(),
+                    sources: vec![source, source, source],
+                    depends_on: vec![ProofId(0)],
+                    bound: Some(3),
+                    explanation: vec!["the static actor parent graph is acyclic and every static @task is owned by exactly its declaring actor; restart policy and failure delivery are not claimed".to_owned()],
+                },
+                Proof {
+                    id: ProofId(9),
                     kind: ProofKind::ImageClosed,
                     subject: "closed actor/task report fixture".to_owned(),
                     sources: vec![source, source, source],
@@ -3469,6 +3479,7 @@ mod tests {
                         ProofId(5),
                         ProofId(6),
                         ProofId(7),
+                        ProofId(8),
                     ],
                     bound: Some(226),
                     explanation: vec!["all actor and task capacities are closed".to_owned()],
@@ -3562,7 +3573,14 @@ mod tests {
                     entry: BlockId(0),
                     stack_bound: 0,
                     frame_bound: 0,
-                    proofs: vec![ProofId(3), ProofId(4), ProofId(5), ProofId(6), ProofId(8)],
+                    proofs: vec![
+                        ProofId(3),
+                        ProofId(4),
+                        ProofId(5),
+                        ProofId(6),
+                        ProofId(7),
+                        ProofId(9),
+                    ],
                     source: None,
                 },
                 FlowFunction {
@@ -3621,7 +3639,7 @@ mod tests {
                     entry: BlockId(0),
                     stack_bound: 8,
                     frame_bound: 8,
-                    proofs: vec![ProofId(7)],
+                    proofs: vec![ProofId(8)],
                     source: Some(source),
                 },
                 FlowFunction {
@@ -3693,7 +3711,7 @@ mod tests {
                     alignment: 8,
                     reset_function: None,
                     owner: PlanOwner::Actor(ActorId(0)),
-                    capacity_proof: ProofId(7),
+                    capacity_proof: ProofId(8),
                     source,
                 },
             ],
@@ -3705,7 +3723,7 @@ mod tests {
                 frame_bytes: 8,
                 maximum_live: 1,
                 cancellation: ActivationCancellation::DropCalleeThenPropagate,
-                capacity_proof: ProofId(7),
+                capacity_proof: ProofId(8),
                 source,
             }],
             proofs: vec![
@@ -3765,15 +3783,31 @@ mod tests {
                 },
                 Proof {
                     id: ProofId(6),
+                    kind: ProofKind::SupervisionComplete,
+                    subject: "complete static actor/task parent topology".to_owned(),
+                    sources: vec![source],
+                    depends_on: vec![ProofId(0)],
+                    bound: Some(1),
+                    explanation: vec!["the static actor parent graph is acyclic and every static @task is owned by exactly its declaring actor; restart policy and failure delivery are not claimed".to_owned()],
+                },
+                Proof {
+                    id: ProofId(7),
                     kind: ProofKind::CapacityBound,
                     subject: "base actor allocation".to_owned(),
                     sources: vec![source, source],
-                    depends_on: vec![ProofId(0), ProofId(1), ProofId(3), ProofId(4), ProofId(5)],
+                    depends_on: vec![
+                        ProofId(0),
+                        ProofId(1),
+                        ProofId(3),
+                        ProofId(4),
+                        ProofId(5),
+                        ProofId(6),
+                    ],
                     bound: Some(24),
                     explanation: vec!["mailbox plus root turn frame".to_owned()],
                 },
                 Proof {
-                    id: ProofId(7),
+                    id: ProofId(8),
                     kind: ProofKind::CapacityBound,
                     subject: "call activation".to_owned(),
                     sources: vec![source],
@@ -3782,11 +3816,11 @@ mod tests {
                     explanation: vec!["one helper frame".to_owned()],
                 },
                 Proof {
-                    id: ProofId(8),
+                    id: ProofId(9),
                     kind: ProofKind::ImageClosed,
                     subject: "closed actor image".to_owned(),
                     sources: vec![source],
-                    depends_on: vec![ProofId(6), ProofId(7)],
+                    depends_on: vec![ProofId(7), ProofId(8)],
                     bound: Some(32),
                     explanation: vec!["base plus helper activation".to_owned()],
                 },
@@ -3813,14 +3847,15 @@ mod tests {
         let source = flow.activations[0].source;
         flow.name = "task-activation-report-image".to_owned();
         flow.functions[1].role = FunctionRole::TaskEntry(TaskId(0));
-        flow.functions[1].proofs = vec![ProofId(8)];
+        flow.functions[1].proofs = vec![ProofId(9)];
         flow.functions[0].proofs = vec![
             ProofId(3),
             ProofId(4),
             ProofId(5),
             ProofId(6),
             ProofId(7),
-            ProofId(9),
+            ProofId(8),
+            ProofId(10),
         ];
         flow.functions.push(FlowFunction {
             id: FunctionId(3),
@@ -3899,12 +3934,12 @@ mod tests {
                 alignment: 8,
                 reset_function: None,
                 owner: PlanOwner::Task(TaskId(0)),
-                capacity_proof: ProofId(8),
+                capacity_proof: ProofId(9),
                 source,
             },
         ];
         flow.activations[0].region = RegionId(3);
-        flow.activations[0].capacity_proof = ProofId(8);
+        flow.activations[0].capacity_proof = ProofId(9);
         flow.proofs = vec![
             Proof {
                 id: ProofId(0),
@@ -3971,6 +4006,15 @@ mod tests {
             },
             Proof {
                 id: ProofId(7),
+                kind: ProofKind::SupervisionComplete,
+                subject: "complete static actor/task parent topology".to_owned(),
+                sources: vec![source, source],
+                depends_on: vec![ProofId(0)],
+                bound: Some(2),
+                explanation: vec!["the static actor parent graph is acyclic and every static @task is owned by exactly its declaring actor; restart policy and failure delivery are not claimed".to_owned()],
+            },
+            Proof {
+                id: ProofId(8),
                 kind: ProofKind::CapacityBound,
                 subject: "base actor and task allocation".to_owned(),
                 sources: vec![source, source],
@@ -3981,12 +4025,13 @@ mod tests {
                     ProofId(4),
                     ProofId(5),
                     ProofId(6),
+                    ProofId(7),
                 ],
                 bound: Some(25),
                 explanation: vec!["actor and task root frames are closed".to_owned()],
             },
             Proof {
-                id: ProofId(8),
+                id: ProofId(9),
                 kind: ProofKind::CapacityBound,
                 subject: "task helper activation".to_owned(),
                 sources: vec![source],
@@ -3995,11 +4040,11 @@ mod tests {
                 explanation: vec!["one suspended task helper frame".to_owned()],
             },
             Proof {
-                id: ProofId(9),
+                id: ProofId(10),
                 kind: ProofKind::ImageClosed,
                 subject: "closed task activation image".to_owned(),
                 sources: vec![source],
-                depends_on: vec![ProofId(7), ProofId(8)],
+                depends_on: vec![ProofId(8), ProofId(9)],
                 bound: Some(33),
                 explanation: vec!["base allocation plus task helper activation".to_owned()],
             },
@@ -4149,6 +4194,12 @@ mod tests {
     #[test]
     fn validated_flow_projects_canonical_actor_task_report_graph() {
         let (flow, target) = actor_report_flow_fixture();
+        let mut cyclic = flow.as_wir().clone();
+        cyclic.actors[0].supervisor = Some(ActorId(1));
+        assert!(
+            cyclic.validate().is_err(),
+            "the authenticated actor-parent forest rejects a mutual cycle"
+        );
         let projected = analysis_facts(flow.as_wir(), &target, &|| false)
             .expect("project validated actor report facts");
         for (kind, name, owner, source, bytes) in [
@@ -4184,6 +4235,7 @@ mod tests {
                 && edge.capacity == Some(2)
                 && edge.priority == Some(3)
         }));
+        assert_eq!(projected.proofs[8].category, "supervision-complete");
         assert_eq!(projected.region_capacity_evidence.len(), 5);
         assert_eq!(
             exact_region_capacity_proof(flow.as_wir(), ProofId(3)),
@@ -4367,7 +4419,7 @@ mod tests {
         assert_eq!(activation.source, "file:0:bytes:0..0");
         assert_eq!(activation.frame_bytes, 8);
         assert_eq!(activation.maximum_live, 1);
-        assert_eq!(activation.capacity_proof, 7);
+        assert_eq!(activation.capacity_proof, 8);
         assert!(projected.image_nodes.iter().any(|node| {
             node.kind == "actor-activation-frame-region"
                 && node.name == activation.region
@@ -4376,9 +4428,9 @@ mod tests {
                 && node.static_bytes == 8
         }));
         assert!(projected.region_capacity_evidence.iter().any(|evidence| {
-            evidence.region == activation.region && evidence.capacity_proof == 7
+            evidence.region == activation.region && evidence.capacity_proof == 8
         }));
-        let proof = &projected.proofs[7];
+        let proof = &projected.proofs[8];
         assert_eq!(proof.bound, Some(1));
         assert_eq!(proof.sources, ["file:0:bytes:0..0"]);
         assert_eq!(proof.depends_on, [2]);
@@ -4470,7 +4522,7 @@ mod tests {
         assert_eq!(activation.caller, "function:1:async-unit");
         assert_eq!(activation.callee, "function:2:async-helper");
         assert_eq!(activation.owner, "task:0:task");
-        assert_eq!(activation.capacity_proof, 8);
+        assert_eq!(activation.capacity_proof, 9);
         assert!(projected.image_nodes.iter().any(|node| {
             node.kind == "task-activation-frame-region"
                 && node.name == activation.region

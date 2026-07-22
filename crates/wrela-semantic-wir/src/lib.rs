@@ -1911,6 +1911,7 @@ fn validate_module(
     }
     validate_activation_plans(module, &mut errors);
     validate_actor_capacity_contract(module, &mut errors);
+    validate_static_supervision_contract(module, &mut errors);
     for scope in &module.scopes {
         if errors.poll() {
             break;
@@ -2891,6 +2892,7 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
         .and_then(|base| activation_bytes.and_then(|activation| base.checked_add(activation)));
     valid &= total == Some(module.static_bytes) && total == Some(module.peak_bytes);
     let mut wait_proof = None;
+    let mut supervision_proof = None;
     let mut final_proof = None;
     for proof in &module.proofs {
         if errors.poll() {
@@ -2905,6 +2907,10 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
                 valid &= final_proof.is_none();
                 final_proof = Some(proof);
             }
+            ProofKind::SupervisionComplete => {
+                valid &= supervision_proof.is_none();
+                supervision_proof = Some(proof.id);
+            }
             _ => {}
         }
     }
@@ -2916,7 +2922,8 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
             .proofs
             .get(1)
             .is_some_and(|proof| proof.id == ProofId(1) && proof.kind == ProofKind::EffectsAllowed)
-        && wait_proof.is_some();
+        && wait_proof.is_some()
+        && supervision_proof.is_some();
     let Some(final_proof) = final_proof else {
         valid = false;
         if !valid {
@@ -2939,10 +2946,10 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
             .filter(|proof| proof.kind == ProofKind::CapacityBound && proof.bound == base_bytes)
     };
     valid &= base_proof.is_some();
-    if let (Some(base_proof), Some(wait_proof), Some(base_region_count)) =
-        (base_proof, wait_proof, base_region_count)
+    if let (Some(base_proof), Some(wait_proof), Some(supervision_proof), Some(base_region_count)) =
+        (base_proof, wait_proof, supervision_proof, base_region_count)
     {
-        let Some(expected_dependencies) = base_region_count.checked_add(3) else {
+        let Some(expected_dependencies) = base_region_count.checked_add(4) else {
             errors.push(ValidationError::InvalidRecord {
                 kind: "actor capacity closure",
                 id: 0,
@@ -2954,7 +2961,7 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
             errors.scratch_allocation_failed();
             return;
         }
-        expected.extend([ProofId(0), ProofId(1), wait_proof]);
+        expected.extend([ProofId(0), ProofId(1), wait_proof, supervision_proof]);
         for region in module.regions.iter().take(base_region_count) {
             if errors.poll() {
                 return;
@@ -2974,7 +2981,8 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
         if let Some(entry) = module.functions.get(module.image_entry.0 as usize) {
             valid &= entry.proofs.binary_search(&final_proof.id).is_ok()
                 && entry.proofs.binary_search(&base_proof.id).is_ok()
-                && entry.proofs.binary_search(&wait_proof).is_ok();
+                && entry.proofs.binary_search(&wait_proof).is_ok()
+                && entry.proofs.binary_search(&supervision_proof).is_ok();
             for region in module.regions.iter().take(base_region_count) {
                 if errors.poll() {
                     return;
@@ -3027,6 +3035,152 @@ fn validate_actor_capacity_contract(module: &SemanticWir, errors: &mut Validatio
         errors.push(ValidationError::InvalidRecord {
             kind: "actor capacity closure",
             id: 0,
+        });
+    }
+}
+
+fn validate_static_supervision_contract(
+    module: &SemanticWir,
+    errors: &mut ValidationErrorSink<'_>,
+) {
+    if module.actors.is_empty() {
+        return;
+    }
+    let mut supervision = None;
+    let mut image_closed = None;
+    for proof in &module.proofs {
+        if errors.poll() {
+            return;
+        }
+        match proof.kind {
+            ProofKind::SupervisionComplete if supervision.is_some() => {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "actor supervision proof",
+                    id: proof.id.0,
+                });
+            }
+            ProofKind::SupervisionComplete => supervision = Some(proof),
+            ProofKind::ImageClosed => image_closed = Some(proof),
+            _ => {}
+        }
+    }
+    let Some(proof) = supervision else {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "actor supervision proof",
+            id: 0,
+        });
+        return;
+    };
+    let node_count = module.actors.len().checked_add(module.tasks.len());
+    let mut expected_sources = Vec::new();
+    let Some(node_count_usize) = node_count else {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "actor supervision proof",
+            id: proof.id.0,
+        });
+        return;
+    };
+    if expected_sources
+        .try_reserve_exact(node_count_usize)
+        .is_err()
+    {
+        errors.scratch_allocation_failed();
+        return;
+    }
+    for actor in &module.actors {
+        if errors.poll() {
+            return;
+        }
+        let source = module
+            .regions
+            .iter()
+            .find(|region| region.owner == ImageOwner::Actor(actor.id))
+            .map(|region| region.source);
+        let mut cursor = actor.supervisor;
+        let mut ancestry_valid = true;
+        for _ in 0..module.actors.len() {
+            let Some(parent) = cursor else {
+                break;
+            };
+            if parent == actor.id {
+                ancestry_valid = false;
+                break;
+            }
+            let Some(parent_record) = module.actors.get(parent.0 as usize) else {
+                ancestry_valid = false;
+                break;
+            };
+            cursor = parent_record.supervisor;
+        }
+        ancestry_valid &= cursor.is_none();
+        if !ancestry_valid || source.is_none() {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "actor supervision topology",
+                id: actor.id.0,
+            });
+        }
+        if let Some(source) = source {
+            expected_sources.push(source);
+        }
+    }
+    for task in &module.tasks {
+        if errors.poll() {
+            return;
+        }
+        let parent_matches = task.supervisor.is_some_and(|actor| {
+            module
+                .actors
+                .get(actor.0 as usize)
+                .is_some_and(|candidate| candidate.id == actor)
+        });
+        let entry_matches = module
+            .functions
+            .get(task.entry.0 as usize)
+            .is_some_and(|function| function.role == FunctionRole::TaskEntry(task.id));
+        let source = module
+            .regions
+            .iter()
+            .find(|region| region.owner == ImageOwner::Task(task.id))
+            .map(|region| region.source);
+        if !parent_matches || !entry_matches || source.is_none() {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "actor supervision topology",
+                id: task.id.0,
+            });
+        }
+        if let Some(source) = source {
+            expected_sources.push(source);
+        }
+    }
+    let exact = u64::try_from(node_count_usize).ok();
+    let entry_has_proof = module
+        .functions
+        .get(module.image_entry.0 as usize)
+        .is_some_and(|entry| entry.proofs.contains(&proof.id));
+    let closure_reaches = image_closed.is_some_and(|closed| {
+        closed.id == proof.id
+            || closed.depends_on.contains(&proof.id)
+            || closed.depends_on.iter().any(|dependency| {
+                module
+                    .proofs
+                    .get(dependency.0 as usize)
+                    .is_some_and(|parent| parent.depends_on.contains(&proof.id))
+            })
+    });
+    if proof.subject != "complete static actor/task parent topology"
+        || proof.bound != exact
+        || proof.depends_on.as_slice() != [ProofId(0)]
+        || proof.sources != expected_sources
+        || proof.explanation.as_slice()
+            != [
+                "the static actor parent graph is acyclic and every static @task is owned by exactly its declaring actor; restart policy and failure delivery are not claimed",
+            ]
+        || !entry_has_proof
+        || !closure_reaches
+    {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "actor supervision proof",
+            id: proof.id.0,
         });
     }
 }
@@ -4527,8 +4681,14 @@ mod tests {
         module.source_summary.hir_declarations = 3;
         module.source_summary.reachable_declarations = 3;
         module.source_summary.monomorphized_instantiations = 3;
-        module.functions[0].proofs =
-            vec![ProofId(3), ProofId(4), ProofId(5), ProofId(6), ProofId(8)];
+        module.functions[0].proofs = vec![
+            ProofId(3),
+            ProofId(4),
+            ProofId(5),
+            ProofId(6),
+            ProofId(7),
+            ProofId(9),
+        ];
         let mut caller = source_function(1, 3);
         caller.name = "actor-turn".to_owned();
         caller.role = FunctionRole::ActorTurn(ActorId(0));
@@ -4569,7 +4729,7 @@ mod tests {
         ];
         caller.stack_bound = 8;
         caller.frame_bound = 8;
-        caller.proofs = vec![ProofId(7)];
+        caller.proofs = vec![ProofId(8)];
         let mut callee = source_function(2, 4);
         callee.name = "async-helper".to_owned();
         callee.color = FunctionColor::Async;
@@ -4648,14 +4808,29 @@ mod tests {
             ),
             proof(
                 6,
-                ProofKind::CapacityBound,
-                "base actor allocation",
-                vec![source, source],
-                vec![ProofId(0), ProofId(1), ProofId(3), ProofId(4), ProofId(5)],
-                Some(24),
+                ProofKind::SupervisionComplete,
+                "complete static actor/task parent topology",
+                vec![source],
+                vec![ProofId(0)],
+                Some(1),
             ),
             proof(
                 7,
+                ProofKind::CapacityBound,
+                "base actor allocation",
+                vec![source, source],
+                vec![
+                    ProofId(0),
+                    ProofId(1),
+                    ProofId(3),
+                    ProofId(4),
+                    ProofId(5),
+                    ProofId(6),
+                ],
+                Some(24),
+            ),
+            proof(
+                8,
                 ProofKind::CapacityBound,
                 "call activation",
                 vec![source],
@@ -4663,14 +4838,15 @@ mod tests {
                 Some(1),
             ),
             proof(
-                8,
+                9,
                 ProofKind::ImageClosed,
                 "closed actor image",
                 vec![source],
-                vec![ProofId(6), ProofId(7)],
+                vec![ProofId(7), ProofId(8)],
                 Some(32),
             ),
         ];
+        module.proofs[6].explanation = vec!["the static actor parent graph is acyclic and every static @task is owned by exactly its declaring actor; restart policy and failure delivery are not claimed".to_owned()];
         module.regions = vec![
             RegionRecord {
                 id: RegionId(0),
@@ -4699,7 +4875,7 @@ mod tests {
                 capacity_bytes: 8,
                 alignment: 8,
                 owner: ImageOwner::Actor(ActorId(0)),
-                proof: ProofId(7),
+                proof: ProofId(8),
                 source,
             },
         ];
@@ -4711,7 +4887,7 @@ mod tests {
             frame_bytes: 8,
             maximum_live: 1,
             cancellation: ActivationCancellation::DropCalleeThenPropagate,
-            capacity_proof: ProofId(7),
+            capacity_proof: ProofId(8),
             source,
         }];
         module.startup_order = vec![ImageOwner::Runtime, ImageOwner::Actor(ActorId(0))];
@@ -4727,6 +4903,20 @@ mod tests {
             .validate()
             .expect("valid source-level actor activation contract");
 
+        let mut substituted_supervision = async_actor_fixture();
+        substituted_supervision.proofs[6].kind = ProofKind::Ownership;
+        assert!(substituted_supervision.validate().is_err());
+
+        let mut detached_supervision = async_actor_fixture();
+        detached_supervision.proofs[7]
+            .depends_on
+            .retain(|dependency| *dependency != ProofId(6));
+        assert!(detached_supervision.validate().is_err());
+
+        let mut nested_actor_parent = async_actor_fixture();
+        nested_actor_parent.actors[0].supervisor = Some(ActorId(0));
+        assert!(nested_actor_parent.validate().is_err());
+
         let mut missing_caller_attachment = async_actor_fixture();
         missing_caller_attachment.functions[1].proofs.clear();
         assert!(missing_caller_attachment.validate().is_err());
@@ -4736,7 +4926,7 @@ mod tests {
         assert!(substituted_source.validate().is_err());
 
         let mut substituted_base_source = async_actor_fixture();
-        substituted_base_source.proofs[6].sources[1].range.start += 1;
+        substituted_base_source.proofs[7].sources[1].range.start += 1;
         assert!(substituted_base_source.validate().is_err());
 
         let mut omitted_cleanup = async_actor_fixture();
@@ -4746,8 +4936,8 @@ mod tests {
         let mut over_live = async_actor_fixture();
         over_live.activations[0].maximum_live = 2;
         over_live.regions[2].capacity_bytes = 16;
-        over_live.proofs[7].bound = Some(2);
-        over_live.proofs[8].bound = Some(40);
+        over_live.proofs[8].bound = Some(2);
+        over_live.proofs[9].bound = Some(40);
         over_live.static_bytes = 40;
         over_live.peak_bytes = 40;
         assert!(over_live.validate().is_err());

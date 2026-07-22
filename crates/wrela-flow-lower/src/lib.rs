@@ -8838,17 +8838,21 @@ mod contract_tests {
             proof(6, semantic::ProofKind::ViewDoesNotEscape, &[5], None),
             proof(7, semantic::ProofKind::WaitGraphAcyclic, &[6], Some(0)),
             proof(8, semantic::ProofKind::CleanupAcyclic, &[7], Some(0)),
+            proof(9, semantic::ProofKind::SupervisionComplete, &[0], Some(2)),
             proof(
-                9,
+                10,
                 semantic::ProofKind::ImageClosed,
-                &[0, 1, 2, 3, 4, 7],
+                &[0, 1, 2, 3, 4, 7, 9],
                 Some(64),
             ),
         ];
         module.proofs[2].sources = vec![span(0, 110, 111)];
         module.proofs[3].sources = vec![turn_source];
         module.proofs[4].sources = vec![task_source];
-        module.proofs[9].sources = vec![module.proofs[0].sources[0], turn_source];
+        module.proofs[9].subject = "complete static actor/task parent topology".to_owned();
+        module.proofs[9].sources = vec![turn_source, task_source];
+        module.proofs[9].explanation = vec!["the static actor parent graph is acyclic and every static @task is owned by exactly its declaring actor; restart policy and failure delivery are not claimed".to_owned()];
+        module.proofs[10].sources = vec![module.proofs[0].sources[0], turn_source];
         module.functions = vec![
             semantic::SemanticFunction {
                 id: semantic::FunctionId(0),
@@ -9023,6 +9027,7 @@ mod contract_tests {
                     semantic::ProofId(4),
                     semantic::ProofId(7),
                     semantic::ProofId(9),
+                    semantic::ProofId(10),
                 ],
                 source: None,
                 stack_bound: 0,
@@ -9103,9 +9108,9 @@ mod contract_tests {
         let mut module = actor_fixture().into_wir();
         let state_source = span(0, 45, 49);
         let mut closed = module.proofs.pop().expect("closed actor proof");
-        assert_eq!(closed.id, semantic::ProofId(9));
+        assert_eq!(closed.id, semantic::ProofId(10));
         module.proofs.push(semantic::ProofRecord {
-            id: semantic::ProofId(9),
+            id: semantic::ProofId(10),
             kind: semantic::ProofKind::CapacityBound,
             subject: "actor state: Worker".to_owned(),
             bound: Some(1),
@@ -9113,16 +9118,16 @@ mod contract_tests {
             depends_on: Vec::new(),
             explanation: vec!["one canonical zero u64 actor state cell".to_owned()],
         });
-        closed.id = semantic::ProofId(10);
+        closed.id = semantic::ProofId(11);
         closed.bound = Some(72);
-        closed.depends_on.push(semantic::ProofId(9));
+        closed.depends_on.push(semantic::ProofId(10));
         closed.depends_on.sort_unstable();
         module.proofs.push(closed);
         let entry = &mut module.functions[3];
-        entry.proofs.retain(|proof| *proof != semantic::ProofId(9));
+        entry.proofs.retain(|proof| *proof != semantic::ProofId(10));
         entry
             .proofs
-            .extend([semantic::ProofId(9), semantic::ProofId(10)]);
+            .extend([semantic::ProofId(10), semantic::ProofId(11)]);
         entry.proofs.sort_unstable();
         module.regions.insert(
             1,
@@ -9133,7 +9138,7 @@ mod contract_tests {
                 capacity_bytes: 8,
                 alignment: 8,
                 owner: semantic::ImageOwner::Actor(semantic::ActorId(0)),
-                proof: semantic::ProofId(9),
+                proof: semantic::ProofId(10),
                 source: state_source,
             },
         );
@@ -9155,9 +9160,9 @@ mod contract_tests {
         ty.kind = semantic::TypeKind::Primitive(semantic::PrimitiveType::U64);
 
         let mut closed = module.proofs.pop().expect("closed actor-state proof");
-        assert_eq!(closed.id, semantic::ProofId(10));
+        assert_eq!(closed.id, semantic::ProofId(11));
         module.proofs.push(semantic::ProofRecord {
-            id: semantic::ProofId(10),
+            id: semantic::ProofId(11),
             kind: semantic::ProofKind::RegionBound,
             subject: "alloc:Worker.value:80".to_owned(),
             bound: Some(8),
@@ -9165,19 +9170,19 @@ mod contract_tests {
             depends_on: Vec::new(),
             explanation: vec!["actor state store outlives its non-reentrant turn frame".to_owned()],
         });
-        closed.id = semantic::ProofId(11);
+        closed.id = semantic::ProofId(12);
         module.proofs.push(closed);
         for function in &mut module.functions {
             for proof in &mut function.proofs {
-                if *proof == semantic::ProofId(10) {
-                    *proof = semantic::ProofId(11);
+                if *proof == semantic::ProofId(11) {
+                    *proof = semantic::ProofId(12);
                 }
             }
         }
 
         let turn = &mut module.functions[1];
         turn.values.truncate(2);
-        turn.proofs.push(semantic::ProofId(10));
+        turn.proofs.push(semantic::ProofId(11));
         turn.proofs.sort_unstable();
         turn.body.statements = vec![
             semantic::SemanticStatement::Let(semantic::LetStatement {
@@ -9193,7 +9198,7 @@ mod contract_tests {
                 operation: semantic::SemanticOperation::Promote {
                     value: semantic::ValueId(1),
                     destination: semantic::RegionId(1),
-                    proof: semantic::ProofId(10),
+                    proof: semantic::ProofId(11),
                 },
                 source: Some(promotion_source),
             }),
@@ -9203,7 +9208,7 @@ mod contract_tests {
                     actor: semantic::ActorId(0),
                     region: semantic::RegionId(1),
                     value: semantic::ValueId(1),
-                    proof: semantic::ProofId(9),
+                    proof: semantic::ProofId(10),
                 },
                 source: Some(promotion_source),
             }),
@@ -9233,7 +9238,7 @@ mod contract_tests {
             source: Some(cleanup_source),
         });
         module.proofs.push(semantic::ProofRecord {
-            id: semantic::ProofId(10),
+            id: semantic::ProofId(11),
             kind: semantic::ProofKind::CleanupAcyclic,
             subject: "scope protocol cleanup: irqs_masked".to_owned(),
             bound: Some(1),
@@ -9242,12 +9247,12 @@ mod contract_tests {
             explanation: vec!["one pass-only exit helper".to_owned()],
         });
         module.proofs.push(semantic::ProofRecord {
-            id: semantic::ProofId(11),
+            id: semantic::ProofId(12),
             kind: semantic::ProofKind::CleanupAcyclic,
             subject: "scope activation cleanup: irqs_masked".to_owned(),
             bound: Some(0),
             sources: vec![scope_source],
-            depends_on: vec![semantic::ProofId(10)],
+            depends_on: vec![semantic::ProofId(11)],
             explanation: vec!["one normal-exit activation".to_owned()],
         });
         let image_entry = module.functions.pop().expect("actor image entry");
@@ -9272,7 +9277,7 @@ mod contract_tests {
                 statements: vec![semantic::SemanticStatement::Return(Vec::new())],
             },
             effects: semantic::EffectSet(0),
-            proofs: vec![semantic::ProofId(10)],
+            proofs: vec![semantic::ProofId(11)],
             source: Some(cleanup_source),
             stack_bound: 0,
             frame_bound: 0,
@@ -9352,7 +9357,7 @@ mod contract_tests {
             suspend_safe: false,
             dependencies: Vec::new(),
             reverse_source_order: 0,
-            cleanup_proof: semantic::ProofId(11),
+            cleanup_proof: semantic::ProofId(12),
             source: scope_source,
         });
         module.source_summary.reachable_declarations = 5;
@@ -9426,12 +9431,12 @@ mod contract_tests {
         let mut module = actor_scope_fixture().into_wir();
         let outer_source = span(0, 61, 69);
         module.proofs.push(semantic::ProofRecord {
-            id: semantic::ProofId(12),
+            id: semantic::ProofId(13),
             kind: semantic::ProofKind::CleanupAcyclic,
             subject: "scope activation cleanup: outer irqs_masked".to_owned(),
             bound: Some(1),
             sources: vec![outer_source],
-            depends_on: vec![semantic::ProofId(10), semantic::ProofId(11)],
+            depends_on: vec![semantic::ProofId(11), semantic::ProofId(12)],
             explanation: vec!["outer cleanup follows its inner activation".to_owned()],
         });
         module.scopes.push(semantic::ScopePlan {
@@ -9443,7 +9448,7 @@ mod contract_tests {
             suspend_safe: false,
             dependencies: vec![semantic::ScopeId(0)],
             reverse_source_order: 1,
-            cleanup_proof: semantic::ProofId(12),
+            cleanup_proof: semantic::ProofId(13),
             source: outer_source,
         });
         let turn = &mut module.functions[1];
@@ -9568,11 +9573,11 @@ mod contract_tests {
         ];
         turn.effects =
             semantic::EffectSet(semantic::EffectSet::ACTOR_CALL | semantic::EffectSet::SUSPEND);
-        turn.proofs.push(semantic::ProofId(10));
+        turn.proofs.push(semantic::ProofId(11));
         let activation_source = span(0, 82, 91);
-        module.proofs[9].kind = semantic::ProofKind::CapacityBound;
+        module.proofs[10].kind = semantic::ProofKind::CapacityBound;
         module.proofs.push(semantic::ProofRecord {
-            id: semantic::ProofId(10),
+            id: semantic::ProofId(11),
             kind: semantic::ProofKind::CapacityBound,
             subject: "async helper activation".to_owned(),
             bound: Some(1),
@@ -9581,15 +9586,15 @@ mod contract_tests {
             explanation: vec!["one immediate helper activation".to_owned()],
         });
         module.proofs.push(semantic::ProofRecord {
-            id: semantic::ProofId(11),
+            id: semantic::ProofId(12),
             kind: semantic::ProofKind::ImageClosed,
             subject: "closed actor image with activation".to_owned(),
             bound: Some(80),
             sources: vec![activation_source],
-            depends_on: vec![semantic::ProofId(9), semantic::ProofId(10)],
+            depends_on: vec![semantic::ProofId(10), semantic::ProofId(11)],
             explanation: vec!["base image plus helper activation".to_owned()],
         });
-        module.functions[3].proofs.push(semantic::ProofId(11));
+        module.functions[3].proofs.push(semantic::ProofId(12));
         module.regions.push(semantic::RegionRecord {
             id: semantic::RegionId(3),
             name: "Worker.ping.async-activation-frame".to_owned(),
@@ -9597,7 +9602,7 @@ mod contract_tests {
             capacity_bytes: 16,
             alignment: 8,
             owner: semantic::ImageOwner::Actor(semantic::ActorId(0)),
-            proof: semantic::ProofId(10),
+            proof: semantic::ProofId(11),
             source: activation_source,
         });
         module.activations.push(semantic::ActivationPlan {
@@ -9608,7 +9613,7 @@ mod contract_tests {
             frame_bytes: 16,
             maximum_live: 1,
             cancellation: semantic::ActivationCancellation::DropCalleeThenPropagate,
-            capacity_proof: semantic::ProofId(10),
+            capacity_proof: semantic::ProofId(11),
             source: activation_source,
         });
         module.static_bytes = 80;
@@ -9681,12 +9686,12 @@ mod contract_tests {
             }),
         );
         let removed = module.proofs.pop().expect("first activation closure proof");
-        assert_eq!(removed.id, semantic::ProofId(11));
+        assert_eq!(removed.id, semantic::ProofId(12));
         module.functions[3].proofs.pop();
-        module.functions[1].proofs.push(semantic::ProofId(11));
+        module.functions[1].proofs.push(semantic::ProofId(12));
         let second_source = span(0, 98, 103);
         module.proofs.push(semantic::ProofRecord {
-            id: semantic::ProofId(11),
+            id: semantic::ProofId(12),
             kind: semantic::ProofKind::CapacityBound,
             subject: "second async helper activation".to_owned(),
             bound: Some(1),
@@ -9695,19 +9700,19 @@ mod contract_tests {
             explanation: vec!["one second immediate helper activation".to_owned()],
         });
         module.proofs.push(semantic::ProofRecord {
-            id: semantic::ProofId(12),
+            id: semantic::ProofId(13),
             kind: semantic::ProofKind::ImageClosed,
             subject: "closed actor image with two activations".to_owned(),
             bound: Some(96),
             sources: vec![span(0, 82, 91), second_source],
             depends_on: vec![
-                semantic::ProofId(9),
                 semantic::ProofId(10),
                 semantic::ProofId(11),
+                semantic::ProofId(12),
             ],
             explanation: vec!["base image plus two helper activations".to_owned()],
         });
-        module.functions[3].proofs.push(semantic::ProofId(12));
+        module.functions[3].proofs.push(semantic::ProofId(13));
         module.regions.push(semantic::RegionRecord {
             id: semantic::RegionId(4),
             name: "Worker.ping.async-activation-frame".to_owned(),
@@ -9715,7 +9720,7 @@ mod contract_tests {
             capacity_bytes: 16,
             alignment: 8,
             owner: semantic::ImageOwner::Actor(semantic::ActorId(0)),
-            proof: semantic::ProofId(11),
+            proof: semantic::ProofId(12),
             source: second_source,
         });
         module.activations.push(semantic::ActivationPlan {
@@ -9726,7 +9731,7 @@ mod contract_tests {
             frame_bytes: 16,
             maximum_live: 1,
             cancellation: semantic::ActivationCancellation::DropCalleeThenPropagate,
-            capacity_proof: semantic::ProofId(11),
+            capacity_proof: semantic::ProofId(12),
             source: second_source,
         });
         module.static_bytes = 96;
@@ -11487,7 +11492,7 @@ mod contract_tests {
         );
         assert_eq!(
             cleanup.proofs,
-            [flow::ProofId(10), flow::ProofId(11)],
+            [flow::ProofId(11), flow::ProofId(12)],
             "the generated function retains both helper authority and activation cleanup proof"
         );
         let turn = &wir.functions[1];
@@ -11961,7 +11966,7 @@ mod contract_tests {
                 instructions: 3,
                 async_states: 0,
                 cleanup_edges: 0,
-                output_proofs: 10,
+                output_proofs: 11,
             }
         );
     }

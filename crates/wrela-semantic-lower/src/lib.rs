@@ -212,6 +212,7 @@ struct ActorImageFacts<'a> {
     entry: &'a sema::FunctionInstance,
     constructor: wrela_hir::DeclarationId,
     wait_proof: sema::ProofId,
+    supervision_proof: sema::ProofId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -734,7 +735,16 @@ fn supported_actor_image<'a>(
     validate_actor_graph_contract(input, facts, graph, limits, is_cancelled)?;
     validate_actor_source_functions(input, graph, entry.id, limits, is_cancelled)?;
     let wait_proof = validate_actor_wait_contract(input, graph, entry, limits, is_cancelled)?;
-    validate_actor_proof_contract(facts, graph, entry, wait_proof, is_cancelled)?;
+    let supervision_proof =
+        validate_static_supervision_contract(facts, graph, entry, limits, is_cancelled)?;
+    validate_actor_proof_contract(
+        facts,
+        graph,
+        entry,
+        wait_proof,
+        supervision_proof,
+        is_cancelled,
+    )?;
     Ok(ActorImageFacts {
         input,
         facts,
@@ -742,7 +752,82 @@ fn supported_actor_image<'a>(
         entry,
         constructor,
         wait_proof,
+        supervision_proof,
     })
+}
+
+fn validate_static_supervision_contract(
+    facts: &sema::PartialAnalysis,
+    graph: &sema::ImageGraph,
+    entry: &sema::FunctionInstance,
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<sema::ProofId, LowerError> {
+    let mut candidates = facts
+        .proofs
+        .iter()
+        .filter(|proof| proof.kind == sema::ProofKind::SupervisionComplete);
+    let proof = candidates.next().ok_or(LowerError::MissingSemanticFact {
+        subject: "actor image".to_owned(),
+        fact: "static supervision topology proof",
+    })?;
+    if candidates.next().is_some() {
+        return Err(unsupported("multiple static supervision topology proofs"));
+    }
+    let node_count =
+        graph
+            .actors
+            .len()
+            .checked_add(graph.tasks.len())
+            .ok_or(LowerError::ResourceLimit {
+                resource: "static supervision topology",
+                limit: limits.model_edges,
+            })?;
+    let mut expected_sources = try_vec(
+        node_count,
+        "static supervision topology sources",
+        limits.model_edges,
+    )?;
+    for actor in &graph.actors {
+        check_cancelled(is_cancelled)?;
+        if actor.supervisor.is_some() {
+            return Err(unsupported("nested static actor supervision topology"));
+        }
+        expected_sources.push(actor.source);
+    }
+    for task in &graph.tasks {
+        check_cancelled(is_cancelled)?;
+        let parent = task
+            .supervisor
+            .and_then(|id| graph.actors.get(id.0 as usize))
+            .filter(|actor| Some(actor.id) == task.supervisor);
+        let entry_matches = facts
+            .functions
+            .get(task.entry.0 as usize)
+            .is_some_and(|function| {
+                function.role == sema::FunctionRole::TaskEntry(task.id)
+                    && function.source == Some(task.source)
+            });
+        if parent.is_none() || !entry_matches {
+            return Err(unsupported("static task supervision parent substitution"));
+        }
+        expected_sources.push(task.source);
+    }
+    if proof.subject != "complete static actor/task parent topology"
+        || proof.sources != expected_sources
+        || proof.depends_on.as_slice() != [sema::ProofId(0)]
+        || proof.bound != u64::try_from(node_count).ok()
+        || proof.explanation.as_slice()
+            != [
+                "the static actor parent graph is acyclic and every static @task is owned by exactly its declaring actor; restart policy and failure delivery are not claimed",
+            ]
+        || entry.proofs.binary_search(&proof.id).is_err()
+    {
+        return Err(unsupported(
+            "static supervision topology proof substitution",
+        ));
+    }
+    Ok(proof.id)
 }
 
 fn validate_actor_scope_subset(
@@ -2244,6 +2329,7 @@ fn validate_actor_proof_contract(
     graph: &sema::ImageGraph,
     entry: &sema::FunctionInstance,
     wait_proof: sema::ProofId,
+    supervision_proof: sema::ProofId,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), LowerError> {
     if entry.effects.0 != sema::EffectSet::FIRMWARE | sema::EffectSet::ACTOR | sema::EffectSet::TASK
@@ -2303,6 +2389,7 @@ fn validate_actor_proof_contract(
         })?;
     if closed.bound != Some(graph.static_bytes)
         || closed.depends_on.binary_search(&wait_proof).is_err()
+        || closed.depends_on.binary_search(&supervision_proof).is_err()
         || entry.proofs.binary_search(&closed.id).is_err()
         || closed.depends_on.windows(2).any(|pair| pair[0] >= pair[1])
     {
@@ -3707,6 +3794,17 @@ fn lower_actor_image(
     }) {
         return Err(LowerError::InternalInvariant(
             "lowered actor wait proof lost its exact identity".to_owned(),
+        ));
+    }
+    if proofs
+        .get(actor.supervision_proof.0 as usize)
+        .is_none_or(|proof| {
+            proof.id != wir::ProofId(actor.supervision_proof.0)
+                || proof.kind != wir::ProofKind::SupervisionComplete
+        })
+    {
+        return Err(LowerError::InternalInvariant(
+            "lowered static supervision proof lost its exact identity".to_owned(),
         ));
     }
     let mut functions = try_vec(

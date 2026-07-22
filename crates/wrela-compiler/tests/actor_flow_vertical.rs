@@ -511,6 +511,19 @@ fn parsed_actor_source_delivers_exact_u64_immediate_async_results_to_actor_and_t
         .find(|proof| proof.kind == flow::ProofKind::WaitGraphAcyclic)
         .expect("wait-graph proof");
     assert_eq!(wait.bound, Some(2));
+    let supervision = flow
+        .proofs
+        .iter()
+        .find(|proof| proof.kind == flow::ProofKind::SupervisionComplete)
+        .expect("static supervision-topology proof");
+    assert_eq!(supervision.bound, Some(2));
+    assert_eq!(supervision.depends_on.as_slice(), [flow::ProofId(0)]);
+    assert_eq!(supervision.sources.len(), 2);
+    assert!(flow_closed.depends_on.iter().any(|dependency| {
+        flow.proofs[dependency.0 as usize]
+            .depends_on
+            .contains(&supervision.id)
+    }));
     let encoded = encode_and_verify(
         &CanonicalFlowWirCodec,
         EncodeRequest {
@@ -640,6 +653,21 @@ fn parsed_actor_source_delivers_exact_u64_immediate_async_results_to_actor_and_t
         .find(|proof| proof.id == wait.id)
         .expect("optimized wait-graph proof");
     assert_eq!(optimized_wait.kind, flow::ProofKind::WaitGraphAcyclic);
+    let optimized_supervision = prepared
+        .optimized()
+        .wir()
+        .as_wir()
+        .proofs
+        .iter()
+        .find(|proof| proof.id == supervision.id)
+        .expect("optimized static supervision-topology proof");
+    assert_eq!(
+        optimized_supervision.kind,
+        flow::ProofKind::SupervisionComplete
+    );
+    assert_eq!(optimized_supervision.sources, supervision.sources);
+    assert_eq!(optimized_supervision.depends_on, supervision.depends_on);
+    assert_eq!(optimized_supervision.bound, supervision.bound);
     let machine = prepared.machine().wir().as_wir();
     assert_eq!(machine.version, 15);
     assert_eq!(machine.activations.len(), 2);
@@ -686,6 +714,30 @@ fn parsed_actor_source_delivers_exact_u64_immediate_async_results_to_actor_and_t
     assert_eq!(machine_wait.bound, wait.bound);
     assert_eq!(machine_wait.depends_on.len(), wait.depends_on.len());
     assert_eq!(machine_wait.sources, wait.sources);
+    let machine_supervision = machine
+        .proofs
+        .iter()
+        .find(|proof| proof.kind == BackendProofKind::SupervisionComplete)
+        .expect("MachineWir static supervision-topology proof");
+    assert_eq!(
+        machine_supervision.source_proofs.as_slice(),
+        [supervision.id.0]
+    );
+    assert_eq!(machine_supervision.bound, supervision.bound);
+    assert_eq!(machine_supervision.sources, supervision.sources);
+    let mut substituted_supervision = machine.clone();
+    substituted_supervision.proofs[machine_supervision.id.0 as usize].kind =
+        BackendProofKind::Ownership;
+    let errors = substituted_supervision
+        .validate_for_target(&target)
+        .expect_err("actor supervision topology proof kind cannot be substituted");
+    assert!(errors.0.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidRecord {
+            kind: "actor supervision proof",
+            ..
+        }
+    )));
     let mut substituted_wait_proof = machine.clone();
     substituted_wait_proof.proofs[machine_wait.id.0 as usize].kind = BackendProofKind::Ownership;
     let errors = substituted_wait_proof

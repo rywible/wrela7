@@ -2375,6 +2375,7 @@ fn validate_module(
     validate_region_storage(module, &mut errors);
     validate_actor_message_contract(module, &mut errors);
     validate_actor_wait_proof(module, &mut errors);
+    validate_static_supervision_proof(module, &mut errors);
     validate_tests(module, &mut errors);
     validate_interrupt_entries(module, target, &mut errors);
     validate_interrupt_metadata(module, &mut errors);
@@ -2946,6 +2947,141 @@ fn validate_actor_wait_proof(module: &MachineWir, errors: &mut ValidationContext
         errors.push(ValidationError::InvalidRecord {
             kind: "actor wait proof",
             id: 0,
+        });
+    }
+}
+
+fn validate_static_supervision_proof(module: &MachineWir, errors: &mut ValidationContext<'_>) {
+    let actor_count = module
+        .region_storage
+        .iter()
+        .filter(|storage| matches!(storage.kind, MachineRegionStorageKind::ActorMailbox { .. }))
+        .count();
+    if actor_count == 0 {
+        return;
+    }
+    let task_count = module
+        .region_storage
+        .iter()
+        .filter(|storage| {
+            matches!(
+                storage.kind,
+                MachineRegionStorageKind::TaskEntryFrame { .. }
+            )
+        })
+        .count();
+    let mut supervision = None;
+    let mut image_closed = None;
+    for proof in &module.proofs {
+        if !errors.poll() {
+            return;
+        }
+        match proof.kind {
+            BackendProofKind::SupervisionComplete if supervision.is_some() => {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "actor supervision proof",
+                    id: proof.id.0,
+                });
+            }
+            BackendProofKind::SupervisionComplete => supervision = Some(proof),
+            BackendProofKind::ImageClosed => image_closed = Some(proof),
+            _ => {}
+        }
+    }
+    let Some(proof) = supervision else {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "actor supervision proof",
+            id: 0,
+        });
+        return;
+    };
+    let mut source_index = 0usize;
+    let mut topology_matches = true;
+    for storage in &module.region_storage {
+        if !errors.poll() {
+            return;
+        }
+        if matches!(storage.kind, MachineRegionStorageKind::ActorMailbox { .. }) {
+            topology_matches &= proof.sources.get(source_index) == Some(&storage.source);
+            source_index = source_index.saturating_add(1);
+        }
+    }
+    for storage in &module.region_storage {
+        if !errors.poll() {
+            return;
+        }
+        let MachineRegionStorageKind::TaskEntryFrame { task, .. } = storage.kind else {
+            continue;
+        };
+        topology_matches &= proof.sources.get(source_index) == Some(&storage.source);
+        source_index = source_index.saturating_add(1);
+        let task_activation = module.activations.iter().find(|activation| {
+            matches!(
+                activation.owner,
+                MachineActivationOwner::Task {
+                    task: owner_task,
+                    ..
+                } if owner_task == task
+            )
+        });
+        let parent_matches = task_activation.map_or_else(
+            || {
+                module
+                    .functions
+                    .iter()
+                    .filter(|function| function.role == MachineFunctionRole::TaskEntry(task))
+                    .count()
+                    == 1
+            },
+            |activation| {
+                matches!(
+                    activation.owner,
+                    MachineActivationOwner::Task {
+                        supervisor: Some(actor),
+                        ..
+                    } if module.region_storage.iter().any(|candidate| {
+                        matches!(candidate.kind,
+                            MachineRegionStorageKind::ActorMailbox {
+                                actor: candidate_actor,
+                                ..
+                            } if candidate_actor == actor)
+                    })
+                )
+            },
+        );
+        topology_matches &= parent_matches;
+    }
+    let exact_bound = actor_count
+        .checked_add(task_count)
+        .and_then(|count| u64::try_from(count).ok());
+    let entry_has_proof = module
+        .functions
+        .get(module.image_entry.0 as usize)
+        .is_some_and(|entry| entry.proofs.contains(&proof.id));
+    let closure_reaches = image_closed.is_some_and(|closed| {
+        closed.depends_on.contains(&proof.id)
+            || closed.depends_on.iter().any(|dependency| {
+                module
+                    .proofs
+                    .get(dependency.0 as usize)
+                    .is_some_and(|parent| parent.depends_on.contains(&proof.id))
+            })
+    });
+    let typed_dependency = proof.depends_on.as_slice() == [ProofId(0)]
+        && module.proofs.first().is_some_and(|typed| {
+            typed.id == ProofId(0) && typed.kind == BackendProofKind::TypeChecked
+        });
+    if proof.source_proofs.as_slice() != [proof.id.0]
+        || proof.bound != exact_bound
+        || proof.sources.len() != source_index
+        || !topology_matches
+        || !typed_dependency
+        || !entry_has_proof
+        || !closure_reaches
+    {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "actor supervision proof",
+            id: proof.id.0,
         });
     }
 }

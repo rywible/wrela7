@@ -2092,7 +2092,7 @@ mod contract_tests {
             entry: flow::BlockId(0),
             stack_bound: 8,
             frame_bound: 8,
-            proofs: vec![flow::ProofId(7)],
+            proofs: vec![flow::ProofId(8)],
             source: Some(source),
         });
         wir.functions.push(flow::FlowFunction {
@@ -2124,7 +2124,8 @@ mod contract_tests {
             flow::ProofId(4),
             flow::ProofId(5),
             flow::ProofId(6),
-            flow::ProofId(8),
+            flow::ProofId(7),
+            flow::ProofId(9),
         ];
         wir.actors = vec![flow::ActorPlan {
             id: flow::ActorId(0),
@@ -2193,6 +2194,15 @@ mod contract_tests {
             },
             flow::Proof {
                 id: flow::ProofId(6),
+                kind: flow::ProofKind::SupervisionComplete,
+                subject: "complete static actor/task parent topology".to_owned(),
+                sources: vec![source],
+                depends_on: vec![flow::ProofId(0)],
+                bound: Some(1),
+                explanation: vec!["the static actor parent graph is acyclic and every static @task is owned by exactly its declaring actor; restart policy and failure delivery are not claimed".to_owned()],
+            },
+            flow::Proof {
+                id: flow::ProofId(7),
                 kind: flow::ProofKind::CapacityBound,
                 subject: "base actor allocation".to_owned(),
                 sources: vec![source, source],
@@ -2202,12 +2212,13 @@ mod contract_tests {
                     flow::ProofId(3),
                     flow::ProofId(4),
                     flow::ProofId(5),
+                    flow::ProofId(6),
                 ],
                 bound: Some(24),
                 explanation: vec!["mailbox plus root turn frame".to_owned()],
             },
             flow::Proof {
-                id: flow::ProofId(7),
+                id: flow::ProofId(8),
                 kind: flow::ProofKind::CapacityBound,
                 subject: "call activation".to_owned(),
                 sources: vec![source],
@@ -2216,11 +2227,11 @@ mod contract_tests {
                 explanation: vec!["one helper frame".to_owned()],
             },
             flow::Proof {
-                id: flow::ProofId(8),
+                id: flow::ProofId(9),
                 kind: flow::ProofKind::ImageClosed,
                 subject: "closed actor image".to_owned(),
                 sources: vec![source],
-                depends_on: vec![flow::ProofId(6), flow::ProofId(7)],
+                depends_on: vec![flow::ProofId(7), flow::ProofId(8)],
                 bound: Some(32),
                 explanation: vec!["base plus helper activation".to_owned()],
             },
@@ -2256,7 +2267,7 @@ mod contract_tests {
                 alignment: 8,
                 reset_function: None,
                 owner: flow::PlanOwner::Actor(flow::ActorId(0)),
-                capacity_proof: flow::ProofId(7),
+                capacity_proof: flow::ProofId(8),
                 source,
             },
         ];
@@ -2268,7 +2279,7 @@ mod contract_tests {
             frame_bytes: 8,
             maximum_live: 1,
             cancellation: flow::ActivationCancellation::DropCalleeThenPropagate,
-            capacity_proof: flow::ProofId(7),
+            capacity_proof: flow::ProofId(8),
             source,
         }];
         wir.startup_order = vec![
@@ -2929,7 +2940,7 @@ mod contract_tests {
                 .expect("async FlowWir optimizes");
             let function = &output.wir().as_wir().functions[1];
             assert_eq!(function.color, flow::FunctionColor::Async);
-            assert_eq!(function.proofs, [flow::ProofId(7)]);
+            assert_eq!(function.proofs, [flow::ProofId(8)]);
             assert_eq!(
                 output.wir().as_wir().functions[2].proofs,
                 [flow::ProofId(2)]
@@ -2941,7 +2952,8 @@ mod contract_tests {
                     flow::ProofId(4),
                     flow::ProofId(5),
                     flow::ProofId(6),
-                    flow::ProofId(8),
+                    flow::ProofId(7),
+                    flow::ProofId(9),
                 ]
             );
             assert!(matches!(
