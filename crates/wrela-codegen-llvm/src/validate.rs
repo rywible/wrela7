@@ -279,6 +279,7 @@ fn validate_scalar_surface(
             && !supported_runtime_fixed_array(machine, ty.id)
             && !supported_static_byte_array(machine, ty.id)
             && !supported_static_string_type(ty)
+            && !supported_static_bytes_type(ty)
             && !supported_passive_function_type(machine, ty.id, is_cancelled)?
         {
             return Err(CodegenError::UnsupportedMachineContract(
@@ -287,6 +288,7 @@ fn validate_scalar_surface(
         }
     }
     validate_static_string_profile(request, is_cancelled)?;
+    validate_static_bytes_profile(request, is_cancelled)?;
     let valid_proofs = validate_proofs(request, is_cancelled)?;
     validate_static_globals(request, is_cancelled)?;
     validate_sections_and_symbols(request, is_cancelled)?;
@@ -2297,6 +2299,8 @@ fn validate_operation(
         | MachineOperation::Fence(_) => {}
         MachineOperation::Immediate(MachineImmediate::Bytes(bytes))
             if static_string_instruction_matches(machine, function, instruction, bytes) => {}
+        MachineOperation::Immediate(MachineImmediate::Bytes(bytes))
+            if static_bytes_instruction_matches(machine, function, instruction, bytes) => {}
         MachineOperation::MakeArray { ty, elements } => {
             let valid = matches!(instruction.results.as_slice(), [result]
                 if value_type(machine, function, *result) == Some(*ty))
@@ -3000,6 +3004,7 @@ fn supported_scalar_type(kind: &MachineTypeKind, size: u64, alignment: u32) -> b
         | MachineTypeKind::Vector { .. }
         | MachineTypeKind::Array { .. }
         | MachineTypeKind::StaticString { .. }
+        | MachineTypeKind::StaticBytes { .. }
         | MachineTypeKind::Struct { .. }
         | MachineTypeKind::TaggedEnum { .. }
         | MachineTypeKind::Function { .. } => false,
@@ -3010,6 +3015,15 @@ fn supported_static_string_type(ty: &wrela_machine_wir::MachineType) -> bool {
     matches!(ty.kind, MachineTypeKind::StaticString { bytes }
         if bytes > 0
             && ty.source_name.as_deref() == Some("Static[Str]")
+            && ty.size == bytes
+            && ty.alignment == 1)
+}
+
+fn supported_static_bytes_type(ty: &wrela_machine_wir::MachineType) -> bool {
+    matches!(ty.kind, MachineTypeKind::StaticBytes { bytes }
+        if bytes > 0
+            && ty.source_name.as_deref()
+                == Some(format!("Static[Bytes[{bytes}]]").as_str())
             && ty.size == bytes
             && ty.alignment == 1)
 }
@@ -3054,6 +3068,180 @@ fn static_string_instruction_matches(
             .source_name
             .as_deref()
             .is_some_and(|name| !name.is_empty())
+}
+
+fn static_bytes_instruction_matches(
+    machine: &wrela_machine_wir::MachineWir,
+    function: &MachineFunction,
+    instruction: &MachineInstruction,
+    bytes: &[u8],
+) -> bool {
+    let [result] = instruction.results.as_slice() else {
+        return false;
+    };
+    let Some(value) = function.values.get(result.0 as usize) else {
+        return false;
+    };
+    let Some(ty) = machine.types.get(value.ty.0 as usize) else {
+        return false;
+    };
+    matches!(
+        function.origin,
+        MachineFunctionOrigin::SourceSemantic { .. }
+    ) && function.role == MachineFunctionRole::Test
+        && function.parameters.is_empty()
+        && machine
+            .types
+            .get(function.result.0 as usize)
+            .is_some_and(|ty| ty.kind == MachineTypeKind::Void)
+        && supported_static_bytes_type(ty)
+        && matches!(ty.kind, MachineTypeKind::StaticBytes { bytes: extent }
+            if usize::try_from(extent).ok() == Some(bytes.len()))
+        && instruction.source.is_some_and(|literal| {
+            literal.range.start < literal.range.end
+                && function.source.is_some_and(|owner| {
+                    owner.file == literal.file
+                        && owner.range.start <= literal.range.start
+                        && owner.range.end >= literal.range.end
+                })
+        })
+        && value
+            .source_name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+}
+
+fn validate_static_bytes_profile(
+    request: &CodegenRequest<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), CodegenError> {
+    let machine = request.module.as_wir();
+    let static_types = machine
+        .types
+        .iter()
+        .filter(|ty| matches!(ty.kind, MachineTypeKind::StaticBytes { .. }))
+        .count();
+    if static_types == 0 {
+        return Ok(());
+    }
+    let invalid = || {
+        CodegenError::UnsupportedMachineContract(
+            "static bytes outside one exact generated source-test local",
+        )
+    };
+    if static_types != 1
+        || machine
+            .types
+            .iter()
+            .any(|ty| matches!(ty.kind, MachineTypeKind::StaticString { .. }))
+        || machine.tests.len() != 1
+        || !machine
+            .functions
+            .get(machine.image_entry.0 as usize)
+            .is_some_and(|entry| {
+                matches!(
+                    entry.origin,
+                    MachineFunctionOrigin::GeneratedTestHarness { .. }
+                )
+            })
+    {
+        return Err(invalid());
+    }
+
+    let static_type = machine
+        .types
+        .iter()
+        .find(|ty| matches!(ty.kind, MachineTypeKind::StaticBytes { .. }))
+        .map(|ty| ty.id)
+        .ok_or_else(invalid)?;
+    if machine
+        .globals
+        .iter()
+        .any(|global| global.ty == static_type)
+    {
+        return Err(invalid());
+    }
+    let mut static_value = None;
+    let mut literals = 0_u64;
+    for function in &machine.functions {
+        check_cancelled(is_cancelled)?;
+        if function.result == static_type {
+            return Err(invalid());
+        }
+        for value in &function.values {
+            check_cancelled(is_cancelled)?;
+            if value.ty == static_type && static_value.replace((function.id, value.id)).is_some() {
+                return Err(invalid());
+            }
+        }
+        if function.parameters.iter().any(|value| {
+            function
+                .values
+                .get(value.0 as usize)
+                .is_some_and(|v| v.ty == static_type)
+        }) {
+            return Err(invalid());
+        }
+        for block in &function.blocks {
+            check_cancelled(is_cancelled)?;
+            if block.parameters.iter().any(|value| {
+                function
+                    .values
+                    .get(value.0 as usize)
+                    .is_some_and(|v| v.ty == static_type)
+            }) {
+                return Err(invalid());
+            }
+            for instruction in &block.instructions {
+                check_cancelled(is_cancelled)?;
+                if instruction.results.iter().any(|result| {
+                    function
+                        .values
+                        .get(result.0 as usize)
+                        .is_some_and(|value| value.ty == static_type)
+                }) {
+                    let MachineOperation::Immediate(MachineImmediate::Bytes(bytes)) =
+                        &instruction.operation
+                    else {
+                        return Err(invalid());
+                    };
+                    if !static_bytes_instruction_matches(machine, function, instruction, bytes) {
+                        return Err(invalid());
+                    }
+                    literals = literals.saturating_add(1);
+                }
+            }
+        }
+    }
+    let Some((owner, value)) = static_value else {
+        return Err(invalid());
+    };
+    if literals != 1
+        || machine
+            .tests
+            .first()
+            .is_none_or(|test| test.function != owner)
+    {
+        return Err(invalid());
+    }
+    let function = machine
+        .functions
+        .get(owner.0 as usize)
+        .filter(|function| function.id == owner)
+        .ok_or_else(invalid)?;
+    for block in &function.blocks {
+        check_cancelled(is_cancelled)?;
+        for instruction in &block.instructions {
+            check_cancelled(is_cancelled)?;
+            if machine_operation_uses_value(&instruction.operation, value) {
+                return Err(invalid());
+            }
+        }
+        if machine_terminator_uses_value(&block.terminator, value) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 fn validate_static_string_profile(

@@ -839,15 +839,6 @@ fn discover_actor_dispatch(
             }
         }
     }
-    if input
-        .types
-        .iter()
-        .any(|ty| matches!(ty.kind, flow::FlowTypeKind::StaticBytes { .. }))
-    {
-        return Err(unsupported(
-            "machine-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
-        ));
-    }
     if input.types.iter().any(|ty| {
         matches!(
             ty.kind,
@@ -1192,6 +1183,7 @@ fn preflight(
         )?;
     }
     validate_static_string_profile(input, is_cancelled)?;
+    validate_static_bytes_profile(input, is_cancelled)?;
     let void_type = find_void_type(input, is_cancelled)?;
     validate_payload_types(input, &test_payloads, request.limits, is_cancelled)?;
     validate_proof_closure(
@@ -3885,6 +3877,9 @@ fn require_supported_type(
         {
             Ok(())
         }
+        flow::FlowTypeKind::StaticBytes { .. } if exact_static_bytes_type(types, ty).is_some() => {
+            Ok(())
+        }
         flow::FlowTypeKind::Scalar(flow::ScalarType::Character)
         | flow::FlowTypeKind::StaticString { .. }
         | flow::FlowTypeKind::BoundedString { .. } => Err(unsupported(
@@ -3902,6 +3897,18 @@ fn exact_static_string_type(types: &[flow::FlowType], ty: &flow::FlowType) -> Op
     };
     (bytes > 0
         && ty.name.as_deref() == Some("Static[Str]")
+        && ty.copyable
+        && !ty.strict_linear
+        && canonical_u8_type(types).is_some())
+    .then_some(bytes)
+}
+
+fn exact_static_bytes_type(types: &[flow::FlowType], ty: &flow::FlowType) -> Option<u64> {
+    let flow::FlowTypeKind::StaticBytes { bytes } = ty.kind else {
+        return None;
+    };
+    (bytes > 0
+        && ty.name.as_deref() == Some(format!("Static[Bytes[{bytes}]]").as_str())
         && ty.copyable
         && !ty.strict_linear
         && canonical_u8_type(types).is_some())
@@ -3949,6 +3956,163 @@ fn static_string_literal_matches(
                 .as_deref()
                 .is_some_and(|name| !name.is_empty())
     })
+}
+
+fn static_bytes_literal_matches(
+    input: &flow::FlowWir,
+    function: &flow::FlowFunction,
+    instruction: &flow::Instruction,
+    bytes: &[u8],
+) -> bool {
+    let [result] = instruction.results.as_slice() else {
+        return false;
+    };
+    let Some(value) = function.values.get(result.0 as usize) else {
+        return false;
+    };
+    let Some(ty) = input.types.get(value.ty.0 as usize) else {
+        return false;
+    };
+    exact_static_bytes_type(&input.types, ty).is_some_and(|extent| {
+        let source_matches =
+            value
+                .source
+                .zip(instruction.source)
+                .is_some_and(|(binding, literal)| {
+                    binding == literal
+                        && literal.range.start < literal.range.end
+                        && function.source.is_some_and(|function| {
+                            function.file == literal.file
+                                && function.range.start <= literal.range.start
+                                && function.range.end >= literal.range.end
+                        })
+                });
+        usize::try_from(extent).ok() == Some(bytes.len())
+            && source_matches
+            && value
+                .source_name
+                .as_deref()
+                .is_some_and(|name| !name.is_empty())
+    })
+}
+
+pub(super) fn validate_static_bytes_profile(
+    input: &flow::FlowWir,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), MachineLowerError> {
+    let feature = "machine-static-bytes-lowering-pending (runtime byte storage and consumer ABI)";
+    let static_types = input
+        .types
+        .iter()
+        .filter(|ty| matches!(ty.kind, flow::FlowTypeKind::StaticBytes { .. }))
+        .count();
+    if static_types == 0 {
+        return Ok(());
+    }
+    if static_types != 1
+        || input
+            .types
+            .iter()
+            .any(|ty| matches!(ty.kind, flow::FlowTypeKind::StaticString { .. }))
+        || input.tests.len() != 1
+        || !input
+            .functions
+            .get(input.image_entry.0 as usize)
+            .is_some_and(|entry| {
+                matches!(
+                    entry.origin,
+                    flow::FunctionOrigin::GeneratedTestHarness { .. }
+                )
+            })
+    {
+        return Err(unsupported(feature));
+    }
+
+    let mut values = 0_u64;
+    let mut literals = 0_u64;
+    let mut literal = None;
+    for function in &input.functions {
+        check_cancelled(is_cancelled)?;
+        let exact_source = matches!(function.origin, flow::FunctionOrigin::SourceSemantic { .. })
+            && function.role == flow::FunctionRole::Test
+            && function.color == flow::FunctionColor::Sync
+            && function.parameters.is_empty()
+            && function.result_types.is_empty();
+        for value in &function.values {
+            check_cancelled(is_cancelled)?;
+            if input
+                .types
+                .get(value.ty.0 as usize)
+                .is_some_and(|ty| matches!(ty.kind, flow::FlowTypeKind::StaticBytes { .. }))
+            {
+                if !exact_source {
+                    return Err(unsupported(feature));
+                }
+                values = values.saturating_add(1);
+            }
+        }
+        for block in &function.blocks {
+            check_cancelled(is_cancelled)?;
+            if block.parameters.iter().any(|value| {
+                function.values.get(value.0 as usize).is_some_and(|value| {
+                    input
+                        .types
+                        .get(value.ty.0 as usize)
+                        .is_some_and(|ty| matches!(ty.kind, flow::FlowTypeKind::StaticBytes { .. }))
+                })
+            }) {
+                return Err(unsupported(feature));
+            }
+            for instruction in &block.instructions {
+                check_cancelled(is_cancelled)?;
+                if instruction.results.first().is_some_and(|result| {
+                    function.values.get(result.0 as usize).is_some_and(|value| {
+                        input.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                            matches!(ty.kind, flow::FlowTypeKind::StaticBytes { .. })
+                        })
+                    })
+                }) {
+                    let flow::FlowOperation::Immediate(flow::Immediate::Bytes(bytes)) =
+                        &instruction.operation
+                    else {
+                        return Err(unsupported(feature));
+                    };
+                    if !exact_source
+                        || !static_bytes_literal_matches(input, function, instruction, bytes)
+                        || literal
+                            .replace((function.id, instruction.results[0]))
+                            .is_some()
+                    {
+                        return Err(unsupported(feature));
+                    }
+                    literals = literals.saturating_add(1);
+                }
+            }
+        }
+    }
+    let Some((owner, value)) = literal else {
+        return Err(unsupported(feature));
+    };
+    if values != 1 || literals != 1 {
+        return Err(unsupported(feature));
+    }
+    for function in &input.functions {
+        check_cancelled(is_cancelled)?;
+        for block in &function.blocks {
+            check_cancelled(is_cancelled)?;
+            for instruction in &block.instructions {
+                check_cancelled(is_cancelled)?;
+                if function.id == owner && flow_operation_uses_value(&instruction.operation, value)
+                {
+                    return Err(unsupported(feature));
+                }
+            }
+            if function.id == owner && flow_terminator_uses_value(&block.terminator, value) {
+                return Err(unsupported(feature));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn validate_static_string_profile(
@@ -6811,6 +6975,11 @@ fn validate_supported_operation(
         {
             Ok(())
         }
+        flow::FlowOperation::Immediate(flow::Immediate::Bytes(bytes))
+            if static_bytes_literal_matches(input, function, instruction, bytes) =>
+        {
+            Ok(())
+        }
         flow::FlowOperation::Immediate(flow::Immediate::Bytes(_)) => {
             let [result] = instruction.results.as_slice() else {
                 return Err(unsupported(
@@ -7114,6 +7283,12 @@ fn lower_types(
                     "machine-bounded-string-lowering-pending (runtime storage and formatting ABI)",
                 ))?;
                 (MachineTypeKind::StaticString { bytes }, bytes, 1)
+            }
+            flow::FlowTypeKind::StaticBytes { .. } => {
+                let bytes = exact_static_bytes_type(&input.types, ty).ok_or(unsupported(
+                    "machine-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
+                ))?;
+                (MachineTypeKind::StaticBytes { bytes }, bytes, 1)
             }
             flow::FlowTypeKind::Function { parameters, result } => lower_passive_function_type(
                 &input.types,
@@ -9124,6 +9299,18 @@ fn lower_operation(
                 is_cancelled,
             )?)
         }
+        flow::FlowOperation::Immediate(immediate @ flow::Immediate::Bytes(bytes))
+            if static_bytes_literal_matches(input, function, instruction, bytes) =>
+        {
+            MachineOperation::Immediate(lower_immediate(
+                input,
+                function,
+                instruction,
+                immediate,
+                limits,
+                is_cancelled,
+            )?)
+        }
         flow::FlowOperation::Immediate(flow::Immediate::Bytes(_)) => {
             let result = require_single_result(instruction)?;
             let payload = plan
@@ -9823,6 +10010,17 @@ fn lower_immediate(
                 && result_flow_type.copyable
                 && !result_flow_type.strict_linear
                 && std::str::from_utf8(bytes).is_ok() =>
+        {
+            Ok(MachineImmediate::Bytes(copy_bytes(
+                bytes,
+                limits.payload_bytes,
+                is_cancelled,
+            )?))
+        }
+        flow::Immediate::Bytes(bytes)
+            if matches!(result_flow_type.kind, flow::FlowTypeKind::StaticBytes { bytes: extent }
+                if extent > 0 && usize::try_from(extent).ok() == Some(bytes.len()))
+                && exact_static_bytes_type(&input.types, result_flow_type).is_some() =>
         {
             Ok(MachineImmediate::Bytes(copy_bytes(
                 bytes,
@@ -11251,18 +11449,72 @@ mod tests {
 
     #[test]
     fn static_bytes_identity_stops_at_named_machine_abi_boundary() {
-        let ty = flow::FlowType {
+        let canonical = flow::FlowType {
             id: flow::TypeId(0),
             kind: flow::FlowTypeKind::StaticBytes { bytes: 3 },
             name: Some("Static[Bytes[3]]".to_owned()),
             copyable: true,
             strict_linear: false,
         };
+        for adjacent in [
+            flow::FlowType {
+                kind: flow::FlowTypeKind::StaticBytes { bytes: 0 },
+                name: Some("Static[Bytes[0]]".to_owned()),
+                ..canonical.clone()
+            },
+            flow::FlowType {
+                name: Some("Static[Bytes[4]]".to_owned()),
+                ..canonical.clone()
+            },
+            flow::FlowType {
+                copyable: false,
+                ..canonical.clone()
+            },
+            flow::FlowType {
+                strict_linear: true,
+                ..canonical
+            },
+        ] {
+            assert_eq!(
+                require_supported_type(&[], &adjacent, false, false),
+                Err(MachineLowerError::UnsupportedInput {
+                    feature: "machine-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn exact_nonempty_static_bytes_type_is_preserved_nominally() {
+        let u8_type = flow::FlowType {
+            id: flow::TypeId(0),
+            kind: flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                signed: false,
+                bits: 8,
+            }),
+            name: Some("u8".to_owned()),
+            copyable: true,
+            strict_linear: false,
+        };
+        let static_bytes = flow::FlowType {
+            id: flow::TypeId(1),
+            kind: flow::FlowTypeKind::StaticBytes { bytes: 3 },
+            name: Some("Static[Bytes[3]]".to_owned()),
+            copyable: true,
+            strict_linear: false,
+        };
         assert_eq!(
-            require_supported_type(&[], &ty, false, false),
-            Err(MachineLowerError::UnsupportedInput {
-                feature: "machine-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
-            })
+            require_supported_type(
+                &[u8_type.clone(), static_bytes.clone()],
+                &static_bytes,
+                false,
+                false,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            exact_static_bytes_type(&[u8_type, static_bytes.clone()], &static_bytes),
+            Some(3)
         );
     }
 

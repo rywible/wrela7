@@ -1229,11 +1229,14 @@ fn render_immediate(
             ir.push(", i64 0\n")
         }
         MachineImmediate::Bytes(bytes) => {
-            let MachineTypeKind::StaticString { bytes: extent } = type_kind(machine, result_ty)?
-            else {
-                return Err(CodegenError::UnsupportedMachineContract(
-                    "byte-string immediate outside exact static text",
-                ));
+            let extent = match type_kind(machine, result_ty)? {
+                MachineTypeKind::StaticString { bytes }
+                | MachineTypeKind::StaticBytes { bytes } => bytes,
+                _ => {
+                    return Err(CodegenError::UnsupportedMachineContract(
+                        "byte-string immediate outside exact static literal",
+                    ));
+                }
             };
             if *extent == 0 || usize::try_from(*extent).ok() != Some(bytes.len()) {
                 return Err(CodegenError::UnsupportedMachineContract(
@@ -3822,6 +3825,11 @@ fn render_type(
             ir.push("]")
         }
         MachineTypeKind::StaticString { bytes } => {
+            ir.push("[")?;
+            ir.number(u128::from(*bytes))?;
+            ir.push(" x i8]")
+        }
+        MachineTypeKind::StaticBytes { bytes } => {
             ir.push("[")?;
             ir.number(u128::from(*bytes))?;
             ir.push(" x i8]")

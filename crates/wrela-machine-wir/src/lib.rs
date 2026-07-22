@@ -19,7 +19,7 @@ use wrela_target::{InterruptDomain, TargetError, TargetPackage};
 use wrela_test_model::{GuestTestOutcome, TestEvent, TestEventKind, TestId};
 use wrela_test_protocol::{CanonicalTestEventCodec, ProtocolLimits, TestEventCodec};
 
-pub const MACHINE_WIR_VERSION: u32 = 20;
+pub const MACHINE_WIR_VERSION: u32 = 21;
 pub const REGION_STORAGE_SECTION_PREFIX: &str = ".data$wrela$region$";
 pub const REGION_STORAGE_SYMBOL_PREFIX: &str = "__wrela_region_storage_";
 
@@ -84,6 +84,12 @@ pub enum MachineTypeKind {
     /// an exact nonempty target byte array. Runtime strings and formatting do
     /// not use this representation.
     StaticString {
+        bytes: u64,
+    },
+    /// One compiler-authenticated immutable byte literal carried inline as
+    /// an exact nonempty target byte array. No consumer or storage ABI is
+    /// implied by this inert representation.
+    StaticBytes {
         bytes: u64,
     },
     Struct {
@@ -795,7 +801,7 @@ pub struct MachineFunction {
     pub source: Option<Span>,
 }
 
-/// The only scheduler ownership admitted by MachineWir v20. An actor turn is
+/// The only scheduler ownership admitted by MachineWir v21. An actor turn is
 /// compiled but remains dormant until a real mailbox admission operation
 /// exists; a single-slot static task is invoked exactly once during startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -879,7 +885,7 @@ pub enum MachineRegionStorageKind {
         actor: u32,
         mailbox_capacity: u32,
     },
-    /// Canonical, actor-owned persistent state cell. MachineWir v20 admits
+    /// Canonical, actor-owned persistent state cell. MachineWir v21 admits
     /// exactly one zero-initialized `u64` cell for a stateful actor; richer
     /// state layouts remain outside this closed representation.
     ActorState {
@@ -1337,7 +1343,8 @@ fn model_resource_usage(
             | MachineTypeKind::Pointer { .. }
             | MachineTypeKind::Vector { .. }
             | MachineTypeKind::Array { .. }
-            | MachineTypeKind::StaticString { .. } => {}
+            | MachineTypeKind::StaticString { .. }
+            | MachineTypeKind::StaticBytes { .. } => {}
         }
     }
     for section in &module.sections {
@@ -2430,6 +2437,7 @@ fn validate_module(
         validate_function(module, function, &mut errors);
     }
     validate_static_string_profile(module, &mut errors);
+    validate_static_bytes_profile(module, &mut errors);
     validate_activations(module, &mut errors);
     validate_scheduler_ownership(module, &mut errors);
     validate_region_storage(module, &mut errors);
@@ -2610,6 +2618,160 @@ fn validate_static_string_profile(module: &MachineWir, errors: &mut ValidationCo
     }
 }
 
+fn validate_static_bytes_profile(module: &MachineWir, errors: &mut ValidationContext<'_>) {
+    let mut static_type = None;
+    let mut valid = true;
+    for ty in &module.types {
+        if !errors.poll() {
+            return;
+        }
+        if matches!(ty.kind, MachineTypeKind::StaticBytes { .. }) {
+            valid &= static_type.replace(ty.id).is_none();
+        } else if matches!(ty.kind, MachineTypeKind::StaticString { .. }) && static_type.is_some() {
+            valid = false;
+        }
+    }
+    let Some(static_type) = static_type else {
+        return;
+    };
+    valid &= !module
+        .types
+        .iter()
+        .any(|ty| matches!(ty.kind, MachineTypeKind::StaticString { .. }))
+        && module.tests.len() == 1
+        && module
+            .functions
+            .get(module.image_entry.0 as usize)
+            .is_some_and(|entry| {
+                matches!(
+                    entry.origin,
+                    MachineFunctionOrigin::GeneratedTestHarness { .. }
+                )
+            });
+    for global in &module.globals {
+        if !errors.poll() {
+            return;
+        }
+        valid &= global.ty != static_type;
+    }
+
+    let mut static_value = None;
+    let mut literal_count = 0_u64;
+    for function in &module.functions {
+        if !errors.poll() {
+            return;
+        }
+        valid &= function.result != static_type;
+        for value in &function.values {
+            if !errors.poll() {
+                return;
+            }
+            if value.ty == static_type {
+                valid &= static_value.replace((function.id, value.id)).is_none();
+                valid &= matches!(
+                    function.origin,
+                    MachineFunctionOrigin::SourceSemantic { .. }
+                ) && function.role == MachineFunctionRole::Test
+                    && function.parameters.is_empty()
+                    && module
+                        .types
+                        .get(function.result.0 as usize)
+                        .is_some_and(|result| result.kind == MachineTypeKind::Void);
+            }
+        }
+        valid &= function.parameters.iter().all(|parameter| {
+            function
+                .values
+                .get(parameter.0 as usize)
+                .is_none_or(|value| value.ty != static_type)
+        });
+        for block in &function.blocks {
+            if !errors.poll() {
+                return;
+            }
+            valid &= block.parameters.iter().all(|parameter| {
+                function
+                    .values
+                    .get(parameter.0 as usize)
+                    .is_none_or(|value| value.ty != static_type)
+            });
+            for instruction in &block.instructions {
+                if !errors.poll() {
+                    return;
+                }
+                if instruction.results.iter().any(|result| {
+                    function
+                        .values
+                        .get(result.0 as usize)
+                        .is_some_and(|value| value.ty == static_type)
+                }) {
+                    let MachineOperation::Immediate(MachineImmediate::Bytes(bytes)) =
+                        &instruction.operation
+                    else {
+                        valid = false;
+                        continue;
+                    };
+                    valid &= static_bytes_immediate_matches(
+                        module,
+                        function,
+                        instruction,
+                        static_type,
+                        bytes,
+                    );
+                    literal_count = literal_count.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    let Some((owner, value)) = static_value else {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "static bytes profile",
+            id: static_type.0,
+        });
+        return;
+    };
+    valid &= literal_count == 1
+        && module
+            .tests
+            .first()
+            .is_some_and(|test| test.function == owner)
+        && module
+            .functions
+            .get(owner.0 as usize)
+            .is_some_and(|function| function.id == owner);
+    if let Some(function) = module.functions.get(owner.0 as usize) {
+        for block in &function.blocks {
+            if !errors.poll() {
+                return;
+            }
+            for instruction in &block.instructions {
+                if !errors.poll() {
+                    return;
+                }
+                let mut used = false;
+                for_each_operation_value(&instruction.operation, |candidate| {
+                    used |= candidate == value;
+                    true
+                });
+                valid &= !used;
+            }
+            let mut used = false;
+            for_each_terminator_value(&block.terminator, |candidate| {
+                used |= candidate == value;
+                true
+            });
+            valid &= !used;
+        }
+    }
+    if !valid {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "static bytes profile",
+            id: static_type.0,
+        });
+    }
+}
+
 fn validate_target_and_layout(
     module: &MachineWir,
     target: &TargetPackage,
@@ -2721,6 +2883,14 @@ fn validate_type(module: &MachineWir, ty: &MachineType, errors: &mut ValidationC
             if *bytes == 0 || ty.size != *bytes || ty.alignment != 1 {
                 errors.push(ValidationError::InvalidRecord {
                     kind: "static string type",
+                    id: ty.id.0,
+                });
+            }
+        }
+        MachineTypeKind::StaticBytes { bytes } => {
+            if *bytes == 0 || ty.size != *bytes || ty.alignment != 1 {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "static bytes type",
                     id: ty.id.0,
                 });
             }
@@ -7035,6 +7205,17 @@ fn validate_operation_types(
                                     bytes,
                                 )
                         })
+                    }) && result_ty(0).is_some_and(|ty| {
+                        module.types.get(ty.0 as usize).is_some_and(|record| {
+                            !matches!(record.kind, MachineTypeKind::StaticBytes { .. })
+                                || static_bytes_immediate_matches(
+                                    module,
+                                    function,
+                                    instruction,
+                                    ty,
+                                    bytes,
+                                )
+                        })
                     }),
                     _ => true,
                 }
@@ -7457,6 +7638,49 @@ fn static_string_immediate_matches(
         && ty.size == bytes.len() as u64
         && ty.alignment == 1
         && std::str::from_utf8(bytes).is_ok()
+        && matches!(
+            function.origin,
+            MachineFunctionOrigin::SourceSemantic { .. }
+        )
+        && function.role == MachineFunctionRole::Test
+        && function.parameters.is_empty()
+        && module
+            .types
+            .get(function.result.0 as usize)
+            .is_some_and(|result| result.kind == MachineTypeKind::Void)
+        && instruction.source.is_some_and(|literal| {
+            literal.range.start < literal.range.end
+                && function.source.is_some_and(|owner| {
+                    owner.file == literal.file
+                        && owner.range.start <= literal.range.start
+                        && owner.range.end >= literal.range.end
+                })
+        })
+        && instruction.results.first().is_some_and(|result| {
+            function.values.get(result.0 as usize).is_some_and(|value| {
+                value
+                    .source_name
+                    .as_deref()
+                    .is_some_and(|name| !name.is_empty())
+            })
+        })
+}
+
+fn static_bytes_immediate_matches(
+    module: &MachineWir,
+    function: &MachineFunction,
+    instruction: &MachineInstruction,
+    expected: MachineTypeId,
+    bytes: &[u8],
+) -> bool {
+    let Some(ty) = module.types.get(expected.0 as usize) else {
+        return false;
+    };
+    matches!(ty.kind, MachineTypeKind::StaticBytes { bytes: extent }
+        if extent > 0 && usize::try_from(extent).ok() == Some(bytes.len()))
+        && ty.source_name.as_deref() == Some(format!("Static[Bytes[{}]]", bytes.len()).as_str())
+        && ty.size == bytes.len() as u64
+        && ty.alignment == 1
         && matches!(
             function.origin,
             MachineFunctionOrigin::SourceSemantic { .. }
@@ -8368,7 +8592,8 @@ fn function_requires_simd(
             MachineTypeKind::Void
             | MachineTypeKind::Integer { .. }
             | MachineTypeKind::Pointer { .. }
-            | MachineTypeKind::StaticString { .. } => {}
+            | MachineTypeKind::StaticString { .. }
+            | MachineTypeKind::StaticBytes { .. } => {}
         }
     }
     false
@@ -10158,8 +10383,8 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_accepts_only_exact_machine_wir_v20() {
-        assert_eq!(MACHINE_WIR_VERSION, 20);
+    fn current_schema_accepts_only_exact_machine_wir_v21() {
+        assert_eq!(MACHINE_WIR_VERSION, 21);
         assert_eq!(
             CheckedIntegerOp::ShiftLeft.invalid_shift_count_fatal_code(),
             Some(RuntimeFatalCode::InvalidShiftCount)
@@ -10182,12 +10407,12 @@ mod tests {
         );
         assert_eq!(CheckedIntegerOp::Add.invalid_shift_count_fatal_code(), None);
         let (module, target) = fixture();
-        for rejected in [19, 21] {
+        for rejected in [20, 22] {
             let mut changed = module.clone();
             changed.version = rejected;
             let errors = changed
                 .validate_for_target(&target)
-                .expect_err("only exact-current MachineWir v20 is accepted");
+                .expect_err("only exact-current MachineWir v21 is accepted");
             assert!(
                 errors
                     .0

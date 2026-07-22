@@ -186,6 +186,10 @@ fn type_kind_equal(
             MachineTypeKind::StaticString { bytes: right },
         ) => left == right,
         (
+            MachineTypeKind::StaticBytes { bytes: left },
+            MachineTypeKind::StaticBytes { bytes: right },
+        ) => left == right,
+        (
             MachineTypeKind::Struct {
                 fields: left_fields,
                 packed: left_packed,
@@ -1236,6 +1240,26 @@ mod tests {
                 &|| false,
             )
             .expect("same-length byte comparison remains cancellable")
+        );
+    }
+
+    #[test]
+    fn same_length_static_bytes_content_substitution_is_not_equal() {
+        assert!(
+            !immediate_equal(
+                &MachineImmediate::Bytes(vec![0, 0x7f, 0xff]),
+                &MachineImmediate::Bytes(vec![0, 0x2a, 0xff]),
+                &|| false,
+            )
+            .expect("same-length arbitrary byte comparison remains cancellable")
+        );
+        assert!(
+            !type_kind_equal(
+                &MachineTypeKind::StaticString { bytes: 3 },
+                &MachineTypeKind::StaticBytes { bytes: 3 },
+                &|| false,
+            )
+            .expect("static string and static bytes stay nominally distinct")
         );
     }
 }

@@ -443,7 +443,7 @@ fn fixed_array_iteration_and_patterns_reach_flow_machine_and_deterministic_nativ
         "the same canonical Flow frame must produce byte-identical MachineWir"
     );
     let machine = prepared.machine().wir().as_wir();
-    assert_eq!(machine.version, 20);
+    assert_eq!(machine.version, 21);
     assert!(machine.types.iter().any(|ty| {
         ty.kind == MachineTypeKind::StaticString { bytes: 5 }
             && ty.size == 5

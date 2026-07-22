@@ -2812,6 +2812,37 @@ mod contract_tests {
         (machine, target)
     }
 
+    fn static_bytes_runtime_test_fixture() -> (ValidatedMachineWir, TargetPackage) {
+        let (validated, target, _) = runtime_test_fixture();
+        let mut machine = validated.into_wir();
+        machine.types.push(MachineType {
+            id: MachineTypeId(9),
+            kind: MachineTypeKind::StaticBytes { bytes: 3 },
+            size: 3,
+            alignment: 1,
+            source_name: Some("Static[Bytes[3]]".to_owned()),
+        });
+        let test = &mut machine.functions[1];
+        test.values.push(MachineValue {
+            id: ValueId(0),
+            ty: MachineTypeId(9),
+            source_name: Some("packet".to_owned()),
+        });
+        test.blocks[0].instructions.push(MachineInstruction {
+            id: InstructionId(0),
+            results: vec![ValueId(0)],
+            operation: MachineOperation::Immediate(MachineImmediate::Bytes(vec![0, 0x7f, 0xff])),
+            source: Some(Span {
+                file: FileId(0),
+                range: TextRange { start: 8, end: 11 },
+            }),
+        });
+        let machine = machine
+            .validate_for_target(&target)
+            .expect("exact arbitrary static bytes remain valid MachineWir");
+        (machine, target)
+    }
+
     fn runtime_test_fixture_with_frames(
         frames: Vec<Vec<u8>>,
     ) -> (ValidatedMachineWir, TargetPackage, Vec<Vec<u8>>) {
@@ -5389,7 +5420,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn real_checked_scalar_surface_reaches_machine_v20_and_textual_llvm() {
+    fn real_checked_scalar_surface_reaches_machine_v21_and_textual_llvm() {
         let cases = [
             (
                 semantic::BinaryOperator::Add,
@@ -5448,7 +5479,7 @@ mod contract_tests {
                     right: semantic::ValueId(1),
                     arithmetic,
                 });
-            assert_eq!(machine.as_wir().version, 20);
+            assert_eq!(machine.as_wir().version, 21);
             assert!(
                 machine
                     .as_wir()
@@ -6093,6 +6124,55 @@ mod contract_tests {
             |candidate| candidate.functions[1].role = MachineFunctionRole::ActorTurn(0),
             "MachineWir rejects an actor-owned static-string literal",
         );
+    }
+
+    #[test]
+    fn exact_static_bytes_render_and_llvm_rejects_profile_forgeries() {
+        let (machine, target) = static_bytes_runtime_test_fixture();
+        let request = CodegenRequest {
+            module: &machine,
+            target: target.backend(),
+            options: CodegenOptions::standard(),
+        };
+        super::preflight(&request, &|| false).expect("exact static bytes codegen preflight");
+        let rendered = super::ir::render_module(&request, &|| false)
+            .expect("exact static bytes render to LLVM IR");
+        let rendered = std::str::from_utf8(&rendered).expect("rendered LLVM text");
+        assert!(rendered.contains("%v0 = freeze [3 x i8] [i8 0, i8 127, i8 255]"));
+
+        let mut consumed = machine.as_wir().clone();
+        consumed.functions[1].values.push(MachineValue {
+            id: ValueId(1),
+            ty: MachineTypeId(9),
+            source_name: Some("copied".to_owned()),
+        });
+        consumed.functions[1].blocks[0]
+            .instructions
+            .push(MachineInstruction {
+                id: InstructionId(1),
+                results: vec![ValueId(1)],
+                operation: MachineOperation::Copy { value: ValueId(0) },
+                source: Some(Span {
+                    file: FileId(0),
+                    range: TextRange { start: 16, end: 21 },
+                }),
+            });
+        assert!(consumed.validate_for_target(&target).is_err());
+
+        for mutate in [
+            |candidate: &mut MachineWir| candidate.functions[1].parameters.push(ValueId(0)),
+            |candidate: &mut MachineWir| candidate.functions[1].result = MachineTypeId(9),
+            |candidate: &mut MachineWir| {
+                candidate.functions[1].blocks[0].parameters.push(ValueId(0))
+            },
+            |candidate: &mut MachineWir| {
+                candidate.functions[1].role = MachineFunctionRole::ActorTurn(0)
+            },
+        ] {
+            let mut candidate = machine.as_wir().clone();
+            mutate(&mut candidate);
+            assert!(candidate.validate_for_target(&target).is_err());
+        }
     }
 
     #[test]

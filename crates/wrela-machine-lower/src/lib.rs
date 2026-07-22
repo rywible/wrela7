@@ -2199,7 +2199,8 @@ fn model_resources(
             | MachineTypeKind::Pointer { .. }
             | MachineTypeKind::Vector { .. }
             | MachineTypeKind::Array { .. }
-            | MachineTypeKind::StaticString { .. } => {}
+            | MachineTypeKind::StaticString { .. }
+            | MachineTypeKind::StaticBytes { .. } => {}
         }
     }
     for section in &wir.sections {
@@ -4852,6 +4853,55 @@ mod contract_tests {
         (optimize(validated), target, build)
     }
 
+    fn production_static_bytes_fixture()
+    -> (OptimizedFlowWir, TargetPackage, ValidatedBuildConfiguration) {
+        let (optimized, target, build) = production_generated_test_fixture();
+        let (validated, _) = optimized.into_parts();
+        let mut flow = validated.into_wir();
+        let ty = TypeId(flow.types.len() as u32);
+        flow.types.push(FlowType {
+            id: ty,
+            kind: FlowTypeKind::StaticBytes { bytes: 3 },
+            name: Some("Static[Bytes[3]]".to_owned()),
+            copyable: true,
+            strict_linear: false,
+        });
+        let test_id = flow.tests[0].function;
+        let function = flow
+            .functions
+            .get_mut(test_id.0 as usize)
+            .expect("generated source test function");
+        let owner = function.source.expect("source test span");
+        assert_eq!(function.color, wrela_flow_wir::FunctionColor::Sync);
+        assert_eq!(function.role, FunctionRole::Test);
+        let value = FlowValueId(function.values.len() as u32);
+        function.values.push(FlowValue {
+            id: value,
+            ty,
+            source_name: Some("packet".to_owned()),
+            source: Some(span(owner.file.0, owner.range.start + 5, owner.range.end)),
+        });
+        let instruction_id = FlowInstructionId(
+            function
+                .blocks
+                .iter()
+                .map(|block| block.instructions.len() as u32)
+                .sum(),
+        );
+        function.blocks[function.entry.0 as usize]
+            .instructions
+            .push(FlowInstruction {
+                id: instruction_id,
+                results: vec![value],
+                operation: FlowOperation::Immediate(FlowImmediate::Bytes(vec![0, 0x7f, 0xff])),
+                source: Some(span(owner.file.0, owner.range.start + 5, owner.range.end)),
+            });
+        let validated = flow
+            .validate()
+            .expect("exact source-local static bytes are valid FlowWir");
+        (optimize(validated), target, build)
+    }
+
     fn lower(
         optimized: &OptimizedFlowWir,
         target: &TargetPackage,
@@ -5298,6 +5348,124 @@ mod contract_tests {
         assert_eq!(
             seal(&request, candidate, report, &|| false),
             Err(MachineLowerError::OutputDoesNotImplementInput)
+        );
+    }
+
+    #[test]
+    fn static_bytes_public_seal_rejects_same_length_content_substitution() {
+        let (optimized, target, build) = production_static_bytes_fixture();
+        let output = lower(
+            &optimized,
+            &target,
+            &build,
+            MachineLoweringLimits::standard(),
+            &|| false,
+        )
+        .expect("exact static bytes reach MachineWir");
+        let (validated, report) = output.into_parts();
+        let mut candidate = validated.into_wir();
+        let bytes = candidate
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match &mut instruction.operation {
+                MachineOperation::Immediate(MachineImmediate::Bytes(bytes))
+                    if bytes.as_slice() == [0, 0x7f, 0xff] =>
+                {
+                    Some(bytes)
+                }
+                _ => None,
+            })
+            .expect("exact static-bytes machine immediate");
+        bytes.copy_from_slice(&[0, 0x2a, 0xff]);
+        candidate
+            .clone()
+            .validate_for_target(&target)
+            .expect("same-length arbitrary bytes remain structurally valid MachineWir");
+        let request = MachineLoweringRequest {
+            input: &optimized,
+            target: &target,
+            build: &build,
+            limits: MachineLoweringLimits::standard(),
+        };
+        assert_eq!(
+            seal(&request, candidate, report, &|| false),
+            Err(MachineLowerError::OutputDoesNotImplementInput)
+        );
+    }
+
+    #[test]
+    fn static_bytes_machine_profile_rejects_consumer_multiple_color_actor_and_string_tails() {
+        let (optimized, _, _) = production_static_bytes_fixture();
+        let base = optimized.wir().as_wir().clone();
+        let static_ty = base
+            .types
+            .iter()
+            .find(|ty| matches!(ty.kind, FlowTypeKind::StaticBytes { .. }))
+            .expect("static-bytes Flow type")
+            .id;
+        let (owner, value) = base
+            .functions
+            .iter()
+            .find_map(|function| {
+                function
+                    .values
+                    .iter()
+                    .find(|value| value.ty == static_ty)
+                    .map(|value| (function.id, value.id))
+            })
+            .expect("static-bytes Flow value");
+        let expected = Err(MachineLowerError::UnsupportedInput {
+            feature: "machine-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
+        });
+
+        let mut consumed = base.clone();
+        consumed.functions[owner.0 as usize].blocks[0].terminator =
+            FlowTerminator::Return(vec![value]);
+        assert_eq!(
+            super::scalar::validate_static_bytes_profile(&consumed, &|| false),
+            expected
+        );
+
+        let mut multiple = base.clone();
+        multiple.types.push(FlowType {
+            id: TypeId(multiple.types.len() as u32),
+            kind: FlowTypeKind::StaticBytes { bytes: 3 },
+            name: Some("Static[Bytes[3]]".to_owned()),
+            copyable: true,
+            strict_linear: false,
+        });
+        assert_eq!(
+            super::scalar::validate_static_bytes_profile(&multiple, &|| false),
+            expected
+        );
+
+        let mut asynchronous = base.clone();
+        asynchronous.functions[owner.0 as usize].color = wrela_flow_wir::FunctionColor::Async;
+        assert_eq!(
+            super::scalar::validate_static_bytes_profile(&asynchronous, &|| false),
+            expected
+        );
+
+        let mut actor = base.clone();
+        actor.functions[owner.0 as usize].role = FunctionRole::ActorTurn(ActorId(0));
+        assert_eq!(
+            super::scalar::validate_static_bytes_profile(&actor, &|| false),
+            expected
+        );
+
+        let mut with_string = base;
+        with_string.types.push(FlowType {
+            id: TypeId(with_string.types.len() as u32),
+            kind: FlowTypeKind::StaticString { bytes: 1 },
+            name: Some("Static[Str]".to_owned()),
+            copyable: true,
+            strict_linear: false,
+        });
+        assert_eq!(
+            super::scalar::validate_static_bytes_profile(&with_string, &|| false),
+            expected
         );
     }
 
@@ -6820,7 +6988,7 @@ mod contract_tests {
         .expect("float not-equal FlowWir reaches MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 20);
+        assert_eq!(machine.version, 21);
         assert!(matches!(machine.types[8].kind, MachineTypeKind::Float32));
         assert!(matches!(machine.types[9].kind, MachineTypeKind::Float64));
         let float_function = &machine.functions[3];
@@ -6928,7 +7096,7 @@ mod contract_tests {
         .expect("unary and lossless casts reach MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 20);
+        assert_eq!(machine.version, 21);
         assert!(matches!(
             machine.types[10].kind,
             MachineTypeKind::Integer { bits: 16 }

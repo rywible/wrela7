@@ -6878,6 +6878,7 @@ fn lower_generated_function(
     let mut values = try_vec(function.values.len(), "FlowWir values", limits.model_edges)?;
     for value in &function.values {
         check_cancelled(is_cancelled)?;
+        let source = static_bytes_flow_value_source(input, function, value)?;
         values.push(flow::Value {
             id: flow::ValueId(value.id.0),
             ty: activation_values
@@ -6890,7 +6891,7 @@ fn lower_generated_function(
                 .as_deref()
                 .map(|name| copy_text(name, limits.payload_bytes))
                 .transpose()?,
-            source: value.origin,
+            source,
         });
     }
     let mut pending_blocks = try_vec(1, "FlowWir blocks", limits.blocks)?;
@@ -7902,6 +7903,66 @@ fn lower_generated_function(
         proofs: function_proofs,
         source: function.source,
     })
+}
+
+fn static_bytes_flow_value_source(
+    input: &semantic::SemanticWir,
+    function: &semantic::SemanticFunction,
+    value: &semantic::SemanticValue,
+) -> Result<Option<semantic::Span>, LowerError> {
+    let Some(ty) = input.types.get(value.ty.0 as usize) else {
+        return Ok(value.origin);
+    };
+    let semantic::TypeKind::StaticBytes { bytes: extent } = ty.kind else {
+        return Ok(value.origin);
+    };
+    let binding = value.origin.ok_or(unsupported(
+        "flow-static-bytes-lowering-pending (nonlocal byte binding provenance)",
+    ))?;
+    let mut definition = None;
+    for statement in &function.body.statements {
+        let semantic::SemanticStatement::Let(statement) = statement else {
+            continue;
+        };
+        let [result] = statement.results.as_slice() else {
+            continue;
+        };
+        let semantic::SemanticOperation::Constant(semantic::Constant::Bytes(bytes)) =
+            &statement.operation
+        else {
+            continue;
+        };
+        if *result != value.id {
+            continue;
+        }
+        let literal = statement.source.ok_or(unsupported(
+            "flow-static-bytes-lowering-pending (nonlocal byte binding provenance)",
+        ))?;
+        let source_matches = binding == literal
+            || (binding.file == literal.file
+                && binding.range.start < binding.range.end
+                && literal.range.start < literal.range.end
+                && binding.range.end <= literal.range.start
+                && literal.range.start.saturating_sub(binding.range.end) <= 8
+                && function.source.is_some_and(|owner| {
+                    owner.file == literal.file
+                        && owner.range.start <= binding.range.start
+                        && owner.range.end >= literal.range.end
+                }));
+        if !source_matches
+            || usize::try_from(extent).ok() != Some(bytes.len())
+            || definition.replace(literal).is_some()
+        {
+            return Err(unsupported(
+                "flow-static-bytes-lowering-pending (nonlocal byte binding provenance)",
+            ));
+        }
+    }
+    definition
+        .ok_or(unsupported(
+            "flow-static-bytes-lowering-pending (nonlocal byte binding provenance)",
+        ))
+        .map(Some)
 }
 
 fn generated_cleanup_function_id(

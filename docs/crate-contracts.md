@@ -473,9 +473,9 @@ it. It injects phase implementations and bounded host capabilities, while
   FlowWir v19 retains that exact type identity, decoded byte immediate, and
   value/instruction source identity; independent validation joins extent,
   result type, canonical name, and source, while the canonical codec and
-  optimizer preserve the model. Machine lowering rejects the type by name at
-  `machine-static-bytes-lowering-pending` until runtime storage and a consumer
-  ABI are specified.
+  optimizer preserve the model. Flow lowering alone authenticates the exact
+  synchronous color and binding-to-literal provenance before retaining only
+  the literal span downstream.
 - MachineWir v20 retains one exact nonempty UTF-8 `Static[Str]` value for the
   sealed generated source-test profile. The Flow lowerer authenticates the
   synchronous function color and exact binding-to-literal relationship before
@@ -486,8 +486,22 @@ it. It injects phase implementations and bounded host capabilities, while
   and renders the literal as `[N x i8]`. The unused literal has no claimed
   runtime observation; repeat COFF proves deterministic artifact emission only.
   Consumers, multiple values, actor/async owners, empty/invalid UTF-8 literals,
-  bounded formatting, static bytes, and broader string storage remain named
+  bounded formatting, static-byte consumers/storage, and broader string storage remain named
   fail-closed.
+- MachineWir v21 appends a distinct nominal `StaticBytes { bytes }` identity
+  for one exact nonempty arbitrary byte literal in one generated synchronous
+  source-Test local. Machine validation independently requires the canonical
+  `Static[Bytes[N]]` name, exact extent and inline content, sole source-Test
+  ownership, and no parameter/result/block/global/operation/terminator
+  transport or use. LLVM independently repeats the retained extent/content/
+  inert-profile checks and renders `[N x i8]`; it deliberately performs no
+  UTF-8 validation, so bytes such as `0xff` remain valid. The public Machine
+  seal compares the full payload and rejects a same-length substitution.
+  Static-string coexistence, consumers, storage, multiple values, actor/async
+  ownership, empty literals, bounded formatting, and broader byte operations
+  remain fail-closed at `machine-static-bytes-lowering-pending (runtime byte
+  storage and consumer ABI)` or the existing bounded-string boundary. The
+  unused literal has no claimed runtime observation.
 - SemanticWir v15 retains the exact privileged fallible-await profile as
   distinct `AsyncExit` and ephemeral `AsyncOutcome` types plus
   `AwaitAsyncOutcome` and `AsyncOutcomeAuthenticated` proof authority. The
@@ -1171,7 +1185,7 @@ it. It injects phase implementations and bounded host capabilities, while
 - That schema is the only accepted report shape. Its tag rejects stale or
   mismatched artifacts at the trust boundary; there is no legacy reader,
   migration, adapter, or fallback contract. Its embedded interface facts must
-  be exactly SemanticWir 14, FlowWir 19, Flow wire 19, MachineWir 19, and runtime
+  be exactly SemanticWir 15, FlowWir 19, Flow wire 19, MachineWir 21, and runtime
   ABI 2; nonzero stale or future values are rejected rather than tolerated.
 - Schema v10 also projects sealed actor, task, reportable region, and async
   activation plans into
