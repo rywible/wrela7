@@ -11,10 +11,11 @@ use crate::{
     ActivationCancellationFact, ActivationFrameEvidenceFact, ActorLoweringFact, ActorLoweringKind,
     ActorPlacementInputFact, AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts,
     BackendFactLimits, BackendFacts, BoundFact, HardwareFact, ImageEdgeFact, ImageNodeFact,
-    ImageReport, OptimizationAction, OptimizationDecisionFact, PromotionFact, ProofFact,
-    REPORT_SCHEMA_VERSION, RecoveryFact, RegionAssignmentFact, RegionCapacityEvidenceFact,
-    RegionClass, ReportError, RepresentationFacts, SchedulerOwnershipFact, SectionFact, SymbolFact,
-    WorkFact, copy_build_identity, seal_analysis_facts,
+    ImageReport, IsoPoolFact, OptimizationAction, OptimizationDecisionFact, PromotionFact,
+    ProofFact, REPORT_SCHEMA_VERSION, RecoveryFact, RegionAssignmentFact,
+    RegionCapacityEvidenceFact, RegionClass, ReportError, RepresentationFacts,
+    SchedulerOwnershipFact, SectionFact, SymbolFact, WorkFact, copy_build_identity,
+    seal_analysis_facts,
 };
 
 /// Decode and authenticate one canonical schema-v16 image report.
@@ -127,6 +128,24 @@ pub fn decode_image_report_json(
         budget.analysis_item()?;
         let fact = parse_image_node(parser)?;
         budget.analysis_payloads([&fact.kind, &fact.name, &fact.owner, &fact.source])?;
+        Ok(fact)
+    })?;
+    parser.field("iso_pools", false)?;
+    let iso_pools = parse_array(&mut parser, |parser| {
+        budget.analysis_item()?;
+        let fact = parse_iso_pool(parser)?;
+        budget.analysis_payloads([
+            &fact.pool,
+            &fact.brand,
+            &fact.region,
+            &fact.payload_type,
+            &fact.owner,
+            &fact.source,
+            &fact.brand_source,
+            &fact.slots_source,
+            &fact.maximum_payload_source,
+            &fact.payload_source,
+        ])?;
         Ok(fact)
     })?;
     parser.field("region_capacity_evidence", false)?;
@@ -276,6 +295,7 @@ pub fn decode_image_report_json(
         proofs,
         actor_lowerings,
         image_nodes,
+        iso_pools,
         region_capacity_evidence,
         activation_frame_evidence,
         region_assignments,
@@ -414,6 +434,58 @@ fn parse_image_node(parser: &mut Parser<'_>) -> Result<ImageNodeFact, ReportErro
         owner,
         source,
         static_bytes,
+    })
+}
+
+fn parse_iso_pool(parser: &mut Parser<'_>) -> Result<IsoPoolFact, ReportError> {
+    parser.object_start()?;
+    parser.field("pool", true)?;
+    let pool = parser.string()?;
+    parser.field("brand", false)?;
+    let brand = parser.string()?;
+    parser.field("region", false)?;
+    let region = parser.string()?;
+    parser.field("payload_type", false)?;
+    let payload_type = parser.string()?;
+    parser.field("owner", false)?;
+    let owner = parser.string()?;
+    parser.field("source", false)?;
+    let source = parser.string()?;
+    parser.field("brand_source", false)?;
+    let brand_source = parser.string()?;
+    parser.field("slots_source", false)?;
+    let slots_source = parser.string()?;
+    parser.field("maximum_payload_source", false)?;
+    let maximum_payload_source = parser.string()?;
+    parser.field("payload_source", false)?;
+    let payload_source = parser.string()?;
+    parser.field("slots", false)?;
+    let slots = parser.u64("iso pool slot count")?;
+    parser.field("maximum_payload_bytes", false)?;
+    let maximum_payload_bytes = parser.u64("iso pool maximum payload bytes")?;
+    parser.field("payload_bytes", false)?;
+    let payload_bytes = parser.u64("iso pool payload bytes")?;
+    parser.field("alignment", false)?;
+    let alignment = parser.u32("iso pool alignment")?;
+    parser.field("capacity_proof", false)?;
+    let capacity_proof = parser.u32("iso pool capacity proof identifier")?;
+    parser.object_end()?;
+    Ok(IsoPoolFact {
+        pool,
+        brand,
+        region,
+        payload_type,
+        owner,
+        source,
+        brand_source,
+        slots_source,
+        maximum_payload_source,
+        payload_source,
+        slots,
+        maximum_payload_bytes,
+        payload_bytes,
+        alignment,
+        capacity_proof,
     })
 }
 
@@ -1571,6 +1643,7 @@ mod tests {
                     static_bytes: 16,
                 },
             ],
+            iso_pools: Vec::new(),
             region_capacity_evidence: vec![
                 RegionCapacityEvidenceFact {
                     region: "region:0:alpha-frame".to_owned(),
@@ -1902,15 +1975,15 @@ mod tests {
     #[test]
     fn schema_scalar_enum_and_json_structure_mutations_fail_closed() {
         let json = full_report(ActorLoweringKind::Queued, OptimizationAction::Retained).to_json();
-        let schema = json.replacen("\"schema\":16", "\"schema\":17", 1);
+        let schema = json.replacen("\"schema\":17", "\"schema\":18", 1);
         assert_eq!(
             decode(schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(17))
+            Err(ReportError::UnsupportedSchema(18))
         );
-        let stale_schema = json.replacen("\"schema\":16", "\"schema\":15", 1);
+        let stale_schema = json.replacen("\"schema\":17", "\"schema\":16", 1);
         assert_eq!(
             decode(stale_schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(15))
+            Err(ReportError::UnsupportedSchema(16))
         );
 
         let oversized_u32 = json.replacen(

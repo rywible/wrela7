@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use wrela_image_report::{
     AnalysisFactRequest as ReportRequest, AnalysisFacts, BoundFact, ImageEdgeFact, ImageNodeFact,
-    PromotionFact, ProofFact, RegionAssignmentFact, RegionCapacityEvidenceFact,
+    IsoPoolFact, PromotionFact, ProofFact, RegionAssignmentFact, RegionCapacityEvidenceFact,
     ValidatedAnalysisFacts, WorkFact, seal_analysis_facts,
 };
 use wrela_sema::{
@@ -73,10 +73,18 @@ struct ActorReportFacts {
     promotions: Vec<PromotionFact>,
 }
 
+#[derive(Debug, Default)]
+struct PoolReportFacts {
+    image_nodes: Vec<ImageNodeFact>,
+    region_capacity_evidence: Vec<RegionCapacityEvidenceFact>,
+    iso_pools: Vec<IsoPoolFact>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectionKind {
     Scalar,
     Actor,
+    Pool,
 }
 
 fn supported_projection<'a>(
@@ -105,6 +113,10 @@ fn supported_projection<'a>(
         AnalysisRoot::DeclaredImage { .. } if !graph.actors.is_empty() => (
             supported_actor_image(analysis, graph, limits, is_cancelled)?,
             ProjectionKind::Actor,
+        ),
+        AnalysisRoot::DeclaredImage { .. } if !graph.pools.is_empty() => (
+            supported_pool_image(analysis, graph, limits, is_cancelled)?,
+            ProjectionKind::Pool,
         ),
         AnalysisRoot::DeclaredImage { .. } => {
             require_empty_runtime_graph(graph)?;
@@ -889,6 +901,222 @@ fn supported_declared_image(
     Ok(1)
 }
 
+fn supported_pool_image(
+    analysis: &wrela_sema::AnalyzedImage,
+    graph: &wrela_sema::ImageGraph,
+    limits: wrela_image_report::AnalysisFactLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<u64, AnalysisFactAssemblyError> {
+    let facts = analysis.facts();
+    let constructor = match facts.root {
+        AnalysisRoot::DeclaredImage {
+            declaration,
+            test_group: None,
+            ..
+        } => declaration,
+        _ => return Err(unsupported("iso pools outside ordinary declared images")),
+    };
+    if facts.compiled_test_group.is_some()
+        || !facts.values.is_empty()
+        || !facts.expressions.is_empty()
+        || !facts.statements.is_empty()
+        || !facts.actor_state_accesses.is_empty()
+        || !facts.region_assignments.is_empty()
+        || !facts.promotions.is_empty()
+        || !graph.actors.is_empty()
+        || !graph.tasks.is_empty()
+        || !graph.devices.is_empty()
+        || graph.pools.is_empty()
+        || graph.pools.len() != graph.brands.len()
+        || graph.pools.len() != graph.regions.len()
+    {
+        return Err(unsupported("runtime graphs outside the pool-only slice"));
+    }
+    let [entry] = facts.functions.as_slice() else {
+        return Err(unsupported("pool images with source runtime functions"));
+    };
+    let expected_work = 1u64
+        .checked_add(u64::try_from(graph.pools.len()).map_err(|_| {
+            AnalysisFactAssemblyError::ResourceLimit {
+                resource: "iso pool work bound",
+                limit: limits.items,
+            }
+        })?)
+        .ok_or(AnalysisFactAssemblyError::ResourceLimit {
+            resource: "iso pool work bound",
+            limit: limits.items,
+        })?;
+    if entry.id != graph.entry
+        || entry.origin != (FunctionOrigin::GeneratedImageEntry { constructor })
+        || entry.role != FunctionRole::ImageEntry
+        || entry.color != wrela_hir::FunctionColor::Sync
+        || !entry.generic_arguments.is_empty()
+        || !entry.parameters.is_empty()
+        || entry.result != wrela_sema::SemanticTypeId(0)
+        || entry.effects != wrela_sema::EffectSet(wrela_sema::EffectSet::FIRMWARE)
+        || entry.stack_bytes_bound != 0
+        || entry.frame_bytes_bound != 0
+        || entry.uninterrupted_work_bound != Some(expected_work)
+        || entry.recursive_depth_bound != Some(1)
+        || entry.source.is_some()
+        || entry.proofs.len() != facts.proofs.len()
+        || entry
+            .proofs
+            .iter()
+            .enumerate()
+            .any(|(index, proof)| proof.0 as usize != index)
+    {
+        return Err(unsupported("noncanonical generated pool image entry"));
+    }
+    let expected_proofs =
+        graph
+            .pools
+            .len()
+            .checked_add(3)
+            .ok_or(AnalysisFactAssemblyError::ResourceLimit {
+                resource: "iso pool proofs",
+                limit: limits.items,
+            })?;
+    if facts.proofs.len() != expected_proofs
+        || !matches!(
+            facts.proofs.first().map(|proof| &proof.kind),
+            Some(ProofKind::TypeChecked)
+        )
+        || !matches!(
+            facts.proofs.get(1).map(|proof| &proof.kind),
+            Some(ProofKind::EffectsAllowed)
+        )
+        || !matches!(
+            facts.proofs.last().map(|proof| &proof.kind),
+            Some(ProofKind::ImageClosed)
+        )
+    {
+        return Err(unsupported("noncanonical pool proof closure"));
+    }
+    let program = analysis.hir().as_program();
+    let mut static_bytes = 0u64;
+    let mut reachable = try_vec(
+        graph.pools.len().saturating_mul(2).saturating_add(1),
+        "iso pool reachable declarations",
+        limits.items,
+    )?;
+    reachable.push(constructor);
+    for (index, pool) in graph.pools.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        let index_u32 =
+            u32::try_from(index).map_err(|_| AnalysisFactAssemblyError::ResourceLimit {
+                resource: "iso pool identities",
+                limit: limits.items,
+            })?;
+        let brand = &graph.brands[index];
+        let region = &graph.regions[index];
+        let payload = facts.types.get(pool.payload.0 as usize).ok_or(
+            AnalysisFactAssemblyError::InvalidSemanticFacts("iso pool payload type is absent"),
+        )?;
+        let (payload_declaration, payload_fields) = match &payload.kind {
+            SemanticTypeKind::Structure {
+                declaration,
+                fields,
+                ..
+            } => (*declaration, fields),
+            _ => return Err(unsupported("iso pool payloads outside flat structures")),
+        };
+        let brand_declaration = program.declaration(brand.declaration).ok_or(
+            AnalysisFactAssemblyError::InvalidSemanticFacts("iso pool brand declaration is absent"),
+        )?;
+        let payload_declaration_record = program.declaration(payload_declaration).ok_or(
+            AnalysisFactAssemblyError::InvalidSemanticFacts(
+                "iso pool payload declaration is absent",
+            ),
+        )?;
+        let brand_name = brand_declaration
+            .name
+            .as_ref()
+            .map(wrela_hir::Name::as_str)
+            .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                "iso pool brand is unnamed",
+            ))?;
+        let payload_bytes = payload.size_upper_bound.filter(|bytes| *bytes != 0).ok_or(
+            AnalysisFactAssemblyError::InvalidSemanticFacts("iso pool payload size is absent"),
+        )?;
+        let maximum_payload_bytes = region
+            .capacity_bytes
+            .checked_div(pool.capacity)
+            .filter(|_| pool.capacity != 0 && region.capacity_bytes % pool.capacity == 0);
+        let capacity_proof = facts.proofs.get(region.proof.0 as usize).filter(|proof| {
+            proof.id == region.proof
+                && matches!(proof.kind, ProofKind::CapacityBound)
+                && proof.bound == Some(pool.capacity)
+                && proof.sources.len() == 4
+        });
+        if pool.id != wrela_sema::PoolId(index_u32)
+            || pool.brand != wrela_sema::BrandId(index_u32)
+            || brand.id != pool.brand
+            || brand.owner != ImageOwner::Pool(pool.id)
+            || region.id != wrela_sema::RegionId(index_u32)
+            || region.class != RegionClass::Pool(pool.id)
+            || region.owner != ImageOwner::Pool(pool.id)
+            || pool.name != brand_name
+            || region.name != pool.name
+            || pool.source != region.source
+            || !pool.reachable_devices.is_empty()
+            || payload_fields.is_empty()
+            || payload.alignment_lower_bound != pool.alignment
+            || region.alignment != pool.alignment
+            || !pool.alignment.is_power_of_two()
+            || maximum_payload_bytes.is_none_or(|maximum| maximum < payload_bytes)
+            || capacity_proof.is_none()
+            || !matches!(brand_declaration.kind, wrela_hir::DeclarationKind::Brand)
+            || payload.source != Some(payload_declaration_record.source)
+        {
+            return Err(unsupported("noncanonical iso pool/brand/region contract"));
+        }
+        if !facts.types.iter().any(|ty| {
+            matches!(
+                ty.kind,
+                SemanticTypeKind::Iso { brand: iso_brand, payload: iso_payload }
+                    if iso_brand == brand.id && iso_payload == pool.payload
+            ) && ty.linearity == Linearity::StrictLinear
+                && ty.size_upper_bound.is_none()
+                && ty.alignment_lower_bound == 1
+                && ty.source == Some(pool.source)
+        }) {
+            return Err(unsupported("iso pool handle type is absent"));
+        }
+        static_bytes = static_bytes.checked_add(region.capacity_bytes).ok_or(
+            AnalysisFactAssemblyError::ResourceLimit {
+                resource: "iso pool static bytes",
+                limit: limits.payload_bytes,
+            },
+        )?;
+        reachable.extend([brand.declaration, payload_declaration]);
+    }
+    let expected_startup = std::iter::once(ImageOwner::Runtime)
+        .chain(graph.pools.iter().map(|pool| ImageOwner::Pool(pool.id)));
+    let expected_shutdown = graph
+        .pools
+        .iter()
+        .rev()
+        .map(|pool| ImageOwner::Pool(pool.id))
+        .chain(std::iter::once(ImageOwner::Runtime));
+    if graph.startup_order.iter().copied().ne(expected_startup)
+        || graph.shutdown_order.iter().copied().ne(expected_shutdown)
+        || graph.static_bytes != static_bytes
+        || graph.peak_bytes != static_bytes
+        || facts.proofs.last().and_then(|proof| proof.bound) != Some(static_bytes)
+    {
+        return Err(unsupported(
+            "noncanonical iso pool image capacity or owner order",
+        ));
+    }
+    reachable.sort_unstable();
+    reachable.dedup();
+    u64::try_from(reachable.len()).map_err(|_| AnalysisFactAssemblyError::ResourceLimit {
+        resource: "iso pool reachable declarations",
+        limit: limits.items,
+    })
+}
+
 fn supported_generated_test_image(
     analysis: &wrela_sema::AnalyzedImage,
     graph: &wrela_sema::ImageGraph,
@@ -1667,7 +1895,7 @@ fn preflight_projection(
             "FlowFunction.stack_bound",
             "FlowFunction.frame_bound",
         ),
-        ProjectionKind::Actor => (
+        ProjectionKind::Actor | ProjectionKind::Pool => (
             "Semantic.ImageGraph.static_bytes",
             "Semantic.ImageGraph.peak_bytes",
             "Semantic.FunctionInstance.stack_bytes_bound",
@@ -1711,6 +1939,8 @@ fn preflight_projection(
 
     if projection.kind == ProjectionKind::Actor {
         preflight_actor_facts(projection, &mut budget, is_cancelled)?;
+    } else if projection.kind == ProjectionKind::Pool {
+        preflight_pool_facts(projection, &mut budget, is_cancelled)?;
     }
 
     for proof in &projection.semantic.proofs {
@@ -1754,6 +1984,97 @@ fn preflight_projection(
         &mut budget,
     )?;
     check_cancelled(is_cancelled)
+}
+
+fn preflight_pool_facts(
+    projection: &SupportedProjection<'_>,
+    budget: &mut Budget,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), AnalysisFactAssemblyError> {
+    let graph = projection.graph;
+    for (index, pool) in graph.pools.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        let brand = &graph.brands[index];
+        let region = &graph.regions[index];
+        let payload = &projection.semantic.types[pool.payload.0 as usize];
+        if !matches!(payload.kind, SemanticTypeKind::Structure { .. }) {
+            return Err(unsupported("iso pool payloads outside flat structures"));
+        }
+        let pool_identity = pool_identity(pool, budget)?;
+        let brand_identity = raw_brand_identity(brand, &pool.name, budget.limits.payload_bytes)?;
+        budget.text(&brand_identity)?;
+        let region_identity = region_identity(region, budget)?;
+        let payload_identity =
+            raw_type_identity(payload, "pool-payload", budget.limits.payload_bytes)?;
+        budget.text(&payload_identity)?;
+        let pool_source = source_identity(pool.source, budget)?;
+        let proof = &projection.semantic.proofs[region.proof.0 as usize];
+        for source in &proof.sources[1..] {
+            let _ = source_identity(*source, budget)?;
+        }
+        let payload_source =
+            payload
+                .source
+                .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                    "iso pool payload source is absent",
+                ))?;
+        let _ = source_identity(payload_source, budget)?;
+        for (category, owner, source, unit) in [
+            (
+                "pool-slots",
+                pool_identity.as_str(),
+                "Semantic.PoolNode.capacity",
+                "slots",
+            ),
+            (
+                "pool-maximum-payload",
+                pool_identity.as_str(),
+                "Semantic.Region.capacity_bytes/Semantic.PoolNode.capacity",
+                "bytes",
+            ),
+            (
+                "pool-payload",
+                payload_identity.as_str(),
+                "Semantic.SemanticType.size_upper_bound",
+                "bytes",
+            ),
+            (
+                "region-capacity",
+                region_identity.as_str(),
+                "Semantic.Region.capacity_bytes",
+                "bytes",
+            ),
+            (
+                "region-alignment",
+                region_identity.as_str(),
+                "Semantic.Region.alignment",
+                "bytes",
+            ),
+        ] {
+            budget.item()?;
+            for value in [category, owner, source, unit] {
+                budget.text(value)?;
+            }
+        }
+        // Logical pool node, physical region node, capacity evidence, and the
+        // explicit pool/brand/region contract.
+        for _ in 0..4 {
+            budget.item()?;
+        }
+        for value in [
+            "iso-pool",
+            "runtime",
+            "iso-pool-region",
+            pool_identity.as_str(),
+            brand_identity.as_str(),
+            region_identity.as_str(),
+            payload_identity.as_str(),
+            pool_source.as_str(),
+        ] {
+            budget.text(value)?;
+        }
+    }
+    Ok(())
 }
 
 fn preflight_actor_facts(
@@ -1869,8 +2190,8 @@ fn assemble_projection(
 ) -> Result<AnalysisFacts, AnalysisFactAssemblyError> {
     let mut budget = Budget::new(limits);
 
-    let actor_bound_count = if projection.kind == ProjectionKind::Actor {
-        projection
+    let runtime_bound_count = match projection.kind {
+        ProjectionKind::Actor => projection
             .graph
             .actors
             .len()
@@ -1884,9 +2205,14 @@ fn assemble_projection(
             .ok_or(AnalysisFactAssemblyError::ResourceLimit {
                 resource: "analysis bounds",
                 limit: limits.items,
-            })?
-    } else {
-        0
+            })?,
+        ProjectionKind::Pool => projection.graph.pools.len().checked_mul(5).ok_or(
+            AnalysisFactAssemblyError::ResourceLimit {
+                resource: "analysis bounds",
+                limit: limits.items,
+            },
+        )?,
+        ProjectionKind::Scalar => 0,
     };
     let bound_count = projection
         .semantic
@@ -1894,7 +2220,7 @@ fn assemble_projection(
         .len()
         .checked_mul(2)
         .and_then(|count| count.checked_add(2))
-        .and_then(|count| count.checked_add(actor_bound_count))
+        .and_then(|count| count.checked_add(runtime_bound_count))
         .ok_or(AnalysisFactAssemblyError::ResourceLimit {
             resource: "analysis bounds",
             limit: limits.items,
@@ -1907,7 +2233,7 @@ fn assemble_projection(
             "FlowFunction.stack_bound",
             "FlowFunction.frame_bound",
         ),
-        ProjectionKind::Actor => (
+        ProjectionKind::Actor | ProjectionKind::Pool => (
             "Semantic.ImageGraph.static_bytes",
             "Semantic.ImageGraph.peak_bytes",
             "Semantic.FunctionInstance.stack_bytes_bound",
@@ -1962,7 +2288,7 @@ fn assemble_projection(
             // Actor source functions retain their proven semantic work bound.
             // Scalar report behavior remains unchanged until FlowWir exposes
             // checkpoint facts for that established path.
-            uninterrupted_work: (projection.kind == ProjectionKind::Actor)
+            uninterrupted_work: (projection.kind != ProjectionKind::Scalar)
                 .then_some(function.uninterrupted_work_bound)
                 .flatten(),
             checkpoint_count: 0,
@@ -1973,6 +2299,11 @@ fn assemble_projection(
         assemble_actor_facts(projection, &mut bounds, &mut budget, is_cancelled)?
     } else {
         ActorReportFacts::default()
+    };
+    let pool_facts = if projection.kind == ProjectionKind::Pool {
+        assemble_pool_facts(projection, &mut bounds, &mut budget, is_cancelled)?
+    } else {
+        PoolReportFacts::default()
     };
 
     let mut proofs = try_vec(
@@ -2065,8 +2396,17 @@ fn assemble_projection(
         bounds,
         proofs,
         actor_lowerings: Vec::new(),
-        image_nodes: actor_facts.image_nodes,
-        region_capacity_evidence: actor_facts.region_capacity_evidence,
+        image_nodes: if projection.kind == ProjectionKind::Pool {
+            pool_facts.image_nodes
+        } else {
+            actor_facts.image_nodes
+        },
+        region_capacity_evidence: if projection.kind == ProjectionKind::Pool {
+            pool_facts.region_capacity_evidence
+        } else {
+            actor_facts.region_capacity_evidence
+        },
+        iso_pools: pool_facts.iso_pools,
         // Source semantic facts precede activation lowering. The backend adds
         // exact FlowWir ActivationPlan evidence after that sealed boundary.
         activation_frame_evidence: Vec::new(),
@@ -2289,6 +2629,183 @@ fn assemble_actor_facts(
     })
 }
 
+fn assemble_pool_facts(
+    projection: &SupportedProjection<'_>,
+    bounds: &mut Vec<BoundFact>,
+    budget: &mut Budget,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<PoolReportFacts, AnalysisFactAssemblyError> {
+    let graph = projection.graph;
+    let node_count = graph
+        .pools
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| budget.resource("analysis image nodes"))?;
+    let mut nodes = try_vec(node_count, "analysis image nodes", budget.limits.items)?;
+    let mut region_capacity_evidence = try_vec(
+        graph.regions.len(),
+        "analysis region capacity evidence",
+        budget.limits.items,
+    )?;
+    let mut iso_pools = try_vec(
+        graph.pools.len(),
+        "analysis iso pool contracts",
+        budget.limits.items,
+    )?;
+    for (index, pool) in graph.pools.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        let brand =
+            graph
+                .brands
+                .get(index)
+                .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                    "iso pool brand is absent",
+                ))?;
+        let region =
+            graph
+                .regions
+                .get(index)
+                .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                    "iso pool region is absent",
+                ))?;
+        let payload = projection
+            .semantic
+            .types
+            .get(pool.payload.0 as usize)
+            .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                "iso pool payload type is absent",
+            ))?;
+        let proof = projection
+            .semantic
+            .proofs
+            .get(region.proof.0 as usize)
+            .filter(|proof| {
+                proof.id == region.proof
+                    && matches!(proof.kind, ProofKind::CapacityBound)
+                    && proof.sources.len() == 4
+            })
+            .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                "iso pool capacity proof is absent",
+            ))?;
+        let payload_bytes =
+            payload
+                .size_upper_bound
+                .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                    "iso pool payload size is absent",
+                ))?;
+        let maximum_payload_bytes = region
+            .capacity_bytes
+            .checked_div(pool.capacity)
+            .filter(|_| pool.capacity != 0 && region.capacity_bytes % pool.capacity == 0)
+            .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                "iso pool maximum payload is not exact",
+            ))?;
+        let pool_identity = pool_identity(pool, budget)?;
+        let brand_identity = raw_brand_identity(brand, &pool.name, budget.limits.payload_bytes)?;
+        budget.text(&brand_identity)?;
+        let region_identity = region_identity(region, budget)?;
+        let payload_identity =
+            raw_type_identity(payload, "pool-payload", budget.limits.payload_bytes)?;
+        budget.text(&payload_identity)?;
+        let pool_source = source_identity(pool.source, budget)?;
+        let brand_source = source_identity(proof.sources[1], budget)?;
+        let slots_source = source_identity(proof.sources[2], budget)?;
+        let maximum_payload_source = source_identity(proof.sources[3], budget)?;
+        let payload_source = source_identity(
+            payload
+                .source
+                .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                    "iso pool payload source is absent",
+                ))?,
+            budget,
+        )?;
+        bounds.push(bound(
+            "pool-slots",
+            &pool_identity,
+            "Semantic.PoolNode.capacity",
+            pool.capacity,
+            "slots",
+            budget,
+        )?);
+        bounds.push(bound(
+            "pool-maximum-payload",
+            &pool_identity,
+            "Semantic.Region.capacity_bytes/Semantic.PoolNode.capacity",
+            maximum_payload_bytes,
+            "bytes",
+            budget,
+        )?);
+        bounds.push(bound(
+            "pool-payload",
+            &payload_identity,
+            "Semantic.SemanticType.size_upper_bound",
+            payload_bytes,
+            "bytes",
+            budget,
+        )?);
+        bounds.push(bound(
+            "region-capacity",
+            &region_identity,
+            "Semantic.Region.capacity_bytes",
+            region.capacity_bytes,
+            "bytes",
+            budget,
+        )?);
+        bounds.push(bound(
+            "region-alignment",
+            &region_identity,
+            "Semantic.Region.alignment",
+            u64::from(region.alignment),
+            "bytes",
+            budget,
+        )?);
+        budget.item()?;
+        nodes.push(ImageNodeFact {
+            kind: copy_text("iso-pool", budget)?,
+            name: copy_text(&pool_identity, budget)?,
+            owner: copy_text("runtime", budget)?,
+            source: copy_text(&pool_source, budget)?,
+            static_bytes: 0,
+        });
+        budget.item()?;
+        nodes.push(ImageNodeFact {
+            kind: copy_text("iso-pool-region", budget)?,
+            name: copy_text(&region_identity, budget)?,
+            owner: copy_text(&pool_identity, budget)?,
+            source: copy_text(&pool_source, budget)?,
+            static_bytes: region.capacity_bytes,
+        });
+        budget.item()?;
+        region_capacity_evidence.push(RegionCapacityEvidenceFact {
+            region: copy_text(&region_identity, budget)?,
+            capacity_proof: region.proof.0,
+        });
+        budget.item()?;
+        iso_pools.push(IsoPoolFact {
+            pool: copy_text(&pool_identity, budget)?,
+            brand: copy_text(&brand_identity, budget)?,
+            region: copy_text(&region_identity, budget)?,
+            payload_type: copy_text(&payload_identity, budget)?,
+            owner: copy_text(&pool_identity, budget)?,
+            source: copy_text(&pool_source, budget)?,
+            brand_source: copy_text(&brand_source, budget)?,
+            slots_source: copy_text(&slots_source, budget)?,
+            maximum_payload_source: copy_text(&maximum_payload_source, budget)?,
+            payload_source: copy_text(&payload_source, budget)?,
+            slots: pool.capacity,
+            maximum_payload_bytes,
+            payload_bytes,
+            alignment: region.alignment,
+            capacity_proof: region.proof.0,
+        });
+    }
+    Ok(PoolReportFacts {
+        image_nodes: nodes,
+        region_capacity_evidence,
+        iso_pools,
+    })
+}
+
 const fn report_region_class(class: RegionClass) -> wrela_image_report::RegionClass {
     match class {
         RegionClass::Image => wrela_image_report::RegionClass::Image,
@@ -2332,22 +2849,22 @@ fn projection_matches(
 ) -> Result<bool, AnalysisFactAssemblyError> {
     let graph = projection.graph;
     let semantic = projection.semantic;
-    let actor_bound_count = if projection.kind == ProjectionKind::Actor {
-        graph
+    let runtime_bound_count = match projection.kind {
+        ProjectionKind::Actor => graph
             .tasks
             .len()
             .checked_mul(2)
             .and_then(|tasks| graph.actors.len().checked_add(tasks))
-            .and_then(|count| count.checked_add(graph.regions.len().checked_mul(2)?))
-    } else {
-        Some(0)
+            .and_then(|count| count.checked_add(graph.regions.len().checked_mul(2)?)),
+        ProjectionKind::Pool => graph.pools.len().checked_mul(5),
+        ProjectionKind::Scalar => Some(0),
     };
     let expected_bounds = semantic
         .functions
         .len()
         .checked_mul(2)
         .and_then(|count| count.checked_add(2))
-        .and_then(|count| count.checked_add(actor_bound_count?));
+        .and_then(|count| count.checked_add(runtime_bound_count?));
     let (static_source, peak_source, stack_source, frame_source) = match projection.kind {
         ProjectionKind::Scalar => (
             "FlowWir.static_bytes",
@@ -2355,7 +2872,7 @@ fn projection_matches(
             "FlowFunction.stack_bound",
             "FlowFunction.frame_bound",
         ),
-        ProjectionKind::Actor => (
+        ProjectionKind::Actor | ProjectionKind::Pool => (
             "Semantic.ImageGraph.static_bytes",
             "Semantic.ImageGraph.peak_bytes",
             "Semantic.FunctionInstance.stack_bytes_bound",
@@ -2411,7 +2928,7 @@ fn projection_matches(
                 && fact.stack_bytes == function.stack_bytes_bound
                 && fact.frame_bytes == function.frame_bytes_bound
                 && fact.uninterrupted_work
-                    == if projection.kind == ProjectionKind::Actor {
+                    == if projection.kind != ProjectionKind::Scalar {
                         function.uninterrupted_work_bound
                     } else {
                         None
@@ -2430,12 +2947,21 @@ fn projection_matches(
             }
         }
     }
-    let actor_facts_match = if projection.kind == ProjectionKind::Actor {
-        actor_projection_matches(projection, facts, &mut bounds_match, is_cancelled)?
-    } else {
-        facts.image_nodes.is_empty()
-            && facts.image_edges.is_empty()
-            && facts.region_capacity_evidence.is_empty()
+    let runtime_facts_match = match projection.kind {
+        ProjectionKind::Actor => {
+            facts.iso_pools.is_empty()
+                && actor_projection_matches(projection, facts, &mut bounds_match, is_cancelled)?
+        }
+        ProjectionKind::Pool => {
+            facts.image_edges.is_empty()
+                && pool_projection_matches(projection, facts, &mut bounds_match, is_cancelled)?
+        }
+        ProjectionKind::Scalar => {
+            facts.image_nodes.is_empty()
+                && facts.image_edges.is_empty()
+                && facts.region_capacity_evidence.is_empty()
+                && facts.iso_pools.is_empty()
+        }
     };
     let region_inference_matches = if projection.kind == ProjectionKind::Actor {
         region_inference_projection_matches(projection, facts, is_cancelled)?
@@ -2450,7 +2976,7 @@ fn projection_matches(
             && bounds_match
             && proofs_match
             && facts.actor_lowerings.is_empty()
-            && actor_facts_match
+            && runtime_facts_match
             && region_inference_matches
             && work_matches
             && facts.hardware.is_empty()
@@ -2652,6 +3178,130 @@ fn actor_projection_matches(
     Ok(nodes_match && edges_match && region_capacity_evidence_match)
 }
 
+fn pool_projection_matches(
+    projection: &SupportedProjection<'_>,
+    facts: &AnalysisFacts,
+    bounds_match: &mut bool,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, AnalysisFactAssemblyError> {
+    let graph = projection.graph;
+    if facts.image_nodes.len() != graph.pools.len().saturating_mul(2)
+        || facts.region_capacity_evidence.len() != graph.regions.len()
+        || facts.iso_pools.len() != graph.pools.len()
+    {
+        return Ok(false);
+    }
+    let mut matches = true;
+    for (index, pool) in graph.pools.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        let brand = &graph.brands[index];
+        let region = &graph.regions[index];
+        let payload = &projection.semantic.types[pool.payload.0 as usize];
+        let proof = &projection.semantic.proofs[region.proof.0 as usize];
+        let pool_identity = raw_pool_identity(pool, u64::MAX)?;
+        let brand_identity = raw_brand_identity(brand, &pool.name, u64::MAX)?;
+        let region_identity = raw_region_identity(region, u64::MAX)?;
+        let payload_identity = raw_type_identity(payload, "pool-payload", u64::MAX)?;
+        let source = raw_source_identity(pool.source, u64::MAX)?;
+        let brand_source = raw_source_identity(proof.sources[1], u64::MAX)?;
+        let slots_source = raw_source_identity(proof.sources[2], u64::MAX)?;
+        let maximum_payload_source = raw_source_identity(proof.sources[3], u64::MAX)?;
+        let payload_source = raw_source_identity(
+            payload
+                .source
+                .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                    "iso pool payload source is absent",
+                ))?,
+            u64::MAX,
+        )?;
+        let payload_bytes =
+            payload
+                .size_upper_bound
+                .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                    "iso pool payload size is absent",
+                ))?;
+        let maximum_payload_bytes = region.capacity_bytes / pool.capacity;
+        *bounds_match &= facts.bounds.iter().any(|fact| {
+            bound_matches(
+                fact,
+                "pool-slots",
+                &pool_identity,
+                "Semantic.PoolNode.capacity",
+                pool.capacity,
+                "slots",
+            )
+        }) && facts.bounds.iter().any(|fact| {
+            bound_matches(
+                fact,
+                "pool-maximum-payload",
+                &pool_identity,
+                "Semantic.Region.capacity_bytes/Semantic.PoolNode.capacity",
+                maximum_payload_bytes,
+                "bytes",
+            )
+        }) && facts.bounds.iter().any(|fact| {
+            bound_matches(
+                fact,
+                "pool-payload",
+                &payload_identity,
+                "Semantic.SemanticType.size_upper_bound",
+                payload_bytes,
+                "bytes",
+            )
+        }) && facts.bounds.iter().any(|fact| {
+            bound_matches(
+                fact,
+                "region-capacity",
+                &region_identity,
+                "Semantic.Region.capacity_bytes",
+                region.capacity_bytes,
+                "bytes",
+            )
+        }) && facts.bounds.iter().any(|fact| {
+            bound_matches(
+                fact,
+                "region-alignment",
+                &region_identity,
+                "Semantic.Region.alignment",
+                u64::from(region.alignment),
+                "bytes",
+            )
+        });
+        matches &= facts.image_nodes.iter().any(|node| {
+            node.kind == "iso-pool"
+                && node.name == pool_identity
+                && node.owner == "runtime"
+                && node.source == source
+                && node.static_bytes == 0
+        }) && facts.image_nodes.iter().any(|node| {
+            node.kind == "iso-pool-region"
+                && node.name == region_identity
+                && node.owner == pool_identity
+                && node.source == source
+                && node.static_bytes == region.capacity_bytes
+        }) && facts.region_capacity_evidence.iter().any(|evidence| {
+            evidence.region == region_identity && evidence.capacity_proof == region.proof.0
+        }) && facts.iso_pools.iter().any(|fact| {
+            fact.pool == pool_identity
+                && fact.brand == brand_identity
+                && fact.region == region_identity
+                && fact.payload_type == payload_identity
+                && fact.owner == pool_identity
+                && fact.source == source
+                && fact.brand_source == brand_source
+                && fact.slots_source == slots_source
+                && fact.maximum_payload_source == maximum_payload_source
+                && fact.payload_source == payload_source
+                && fact.slots == pool.capacity
+                && fact.maximum_payload_bytes == maximum_payload_bytes
+                && fact.payload_bytes == payload_bytes
+                && fact.alignment == region.alignment
+                && fact.capacity_proof == region.proof.0
+        });
+    }
+    Ok(matches)
+}
+
 fn owner_order_matches(
     graph: &wrela_sema::ImageGraph,
     actual: &[String],
@@ -2818,6 +3468,38 @@ fn raw_task_identity(
     raw_named_identity("task", u64::from(task.id.0), &task.name, limit)
 }
 
+fn pool_identity(
+    pool: &wrela_sema::PoolNode,
+    budget: &mut Budget,
+) -> Result<String, AnalysisFactAssemblyError> {
+    let output = raw_pool_identity(pool, budget.limits.payload_bytes)?;
+    budget.text(&output)?;
+    Ok(output)
+}
+
+fn raw_pool_identity(
+    pool: &wrela_sema::PoolNode,
+    limit: u64,
+) -> Result<String, AnalysisFactAssemblyError> {
+    raw_named_identity("pool", u64::from(pool.id.0), &pool.name, limit)
+}
+
+fn raw_brand_identity(
+    brand: &wrela_sema::BrandBinding,
+    name: &str,
+    limit: u64,
+) -> Result<String, AnalysisFactAssemblyError> {
+    raw_named_identity("brand", u64::from(brand.id.0), name, limit)
+}
+
+fn raw_type_identity(
+    ty: &wrela_sema::SemanticType,
+    name: &str,
+    limit: u64,
+) -> Result<String, AnalysisFactAssemblyError> {
+    raw_named_identity("type", u64::from(ty.id.0), name, limit)
+}
+
 fn region_identity(
     region: &wrela_sema::Region,
     budget: &mut Budget,
@@ -2907,9 +3589,17 @@ fn raw_image_owner_identity(
                 "task image owner is foreign",
             ))
             .and_then(|task| raw_task_identity(task, limit)),
-        ImageOwner::Device(_) | ImageOwner::Pool(_) | ImageOwner::Artifact(_) => {
-            Err(unsupported("image owners outside the actor/task slice"))
-        }
+        ImageOwner::Pool(id) => graph
+            .pools
+            .get(id.0 as usize)
+            .filter(|pool| pool.id == id)
+            .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                "pool image owner is foreign",
+            ))
+            .and_then(|pool| raw_pool_identity(pool, limit)),
+        ImageOwner::Device(_) | ImageOwner::Artifact(_) => Err(unsupported(
+            "image owners outside the actor/task/pool slice",
+        )),
     }
 }
 
@@ -3156,6 +3846,21 @@ pub struct Worker:
 pub fn boot() -> Image:
     img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
     installed = img.service(Worker, mailbox=2)
+    return img
+"#;
+    const ISO_POOL_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+brand Payloads
+
+pub struct Payload:
+    pub value: u64
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="pool-image", target=Target.aarch64_qemu_virt_uefi)
+    payloads = img.iso_pool[Payload](brand=Payloads, slots=2, max_payload=64)
     return img
 "#;
 
@@ -3562,13 +4267,13 @@ pub fn boot() -> Image:
         }
     }
 
-    fn analyze_parsed_actor() -> wrela_sema::AnalyzedImage {
+    fn analyze_parsed_image(source: &str, image_name: &str) -> wrela_sema::AnalyzedImage {
         let base = producer_fixture();
         let mut sources = SourceDatabase::default();
         let application_file = sources
             .add(SourceInput {
                 path: "app.wr".to_owned(),
-                text: BOUNDED_ACTOR_SOURCE.to_owned(),
+                text: source.to_owned(),
                 digest: Sha256Digest::from_bytes([0xa1; 32]),
             })
             .expect("actor application source");
@@ -3672,7 +4377,7 @@ pub fn boot() -> Image:
                     target: base.target.semantic(),
                     build: &base.build,
                     mode: AnalysisMode::Image {
-                        name: "actor-image",
+                        name: image_name,
                         entry,
                     },
                     changes: &changes,
@@ -3690,6 +4395,10 @@ pub fn boot() -> Image:
             .successful()
             .expect("sealed parsed actor image")
             .clone()
+    }
+
+    fn analyze_parsed_actor() -> wrela_sema::AnalyzedImage {
+        analyze_parsed_image(BOUNDED_ACTOR_SOURCE, "actor-image")
     }
 
     fn producer_request<'a>(
@@ -4374,6 +5083,128 @@ pub fn boot() -> Image:
             .filter(|instruction| matches!(instruction.operation, FlowOperation::Promote { .. }))
             .count();
         assert_eq!(promotions, 1);
+    }
+
+    #[test]
+    fn parsed_iso_pool_projects_exact_pool_brand_region_and_capacity_evidence() {
+        let image = analyze_parsed_image(ISO_POOL_SOURCE, "pool-image");
+        let sealed = CanonicalAnalysisFactAssembler::new()
+            .assemble(
+                AnalysisFactRequest {
+                    analysis: &image,
+                    limits: wrela_image_report::AnalysisFactLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("pool report projection");
+        let graph = image.facts().graph.as_ref().expect("pool graph");
+        let facts = sealed.as_facts();
+        assert_eq!(facts.image_nodes.len(), 2);
+        assert_eq!(facts.region_capacity_evidence.len(), 1);
+        assert_eq!(facts.startup_order, ["runtime", "pool:0:Payloads"]);
+        assert_eq!(facts.shutdown_order, ["pool:0:Payloads", "runtime"]);
+        assert_eq!(graph.static_bytes, 128);
+        assert!(matches!(
+            facts.iso_pools.as_slice(),
+            [IsoPoolFact {
+                pool,
+                brand,
+                region,
+                payload_type,
+                owner,
+                slots: 2,
+                maximum_payload_bytes: 64,
+                payload_bytes: 8,
+                alignment: 8,
+                capacity_proof,
+                ..
+            }] if pool == "pool:0:Payloads"
+                && brand == "brand:0:Payloads"
+                && region == "region:0:Payloads"
+                && payload_type.starts_with("type:")
+                && owner == pool
+                && facts.proofs[*capacity_proof as usize].category == "capacity-bound"
+        ));
+        let exact_items = [
+            facts.bounds.len(),
+            facts.proofs.len(),
+            facts.actor_lowerings.len(),
+            facts.image_nodes.len(),
+            facts.iso_pools.len(),
+            facts.region_capacity_evidence.len(),
+            facts.activation_frame_evidence.len(),
+            facts.region_assignments.len(),
+            facts.promotions.len(),
+            facts.image_edges.len(),
+            facts.work.len(),
+            facts.hardware.len(),
+            facts.recovery.len(),
+            facts.actor_placement_inputs.len(),
+            facts.scheduler_ownership.len(),
+            facts.startup_order.len(),
+            facts.shutdown_order.len(),
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, count| {
+            total.checked_add(u64::try_from(count).ok()?)
+        })
+        .expect("pool fact item count");
+        let mut exact = wrela_image_report::AnalysisFactLimits::standard();
+        exact.items = exact_items;
+        CanonicalAnalysisFactAssembler::new()
+            .assemble(
+                AnalysisFactRequest {
+                    analysis: &image,
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact pool report item limit");
+        exact.items -= 1;
+        assert!(matches!(
+            CanonicalAnalysisFactAssembler::new().assemble(
+                AnalysisFactRequest {
+                    analysis: &image,
+                    limits: exact,
+                },
+                &|| false,
+            ),
+            Err(AnalysisFactAssemblyError::ResourceLimit {
+                resource: "analysis fact items",
+                limit,
+            }) if limit == exact_items - 1
+        ));
+
+        let polls = Cell::new(0u64);
+        CanonicalAnalysisFactAssembler::new()
+            .assemble(
+                AnalysisFactRequest {
+                    analysis: &image,
+                    limits: wrela_image_report::AnalysisFactLimits::standard(),
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("baseline pool report polls");
+        let cancel_at = (polls.get() / 2).max(2);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalAnalysisFactAssembler::new().assemble(
+                AnalysisFactRequest {
+                    analysis: &image,
+                    limits: wrela_image_report::AnalysisFactLimits::standard(),
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= cancel_at
+                },
+            ),
+            Err(AnalysisFactAssemblyError::Cancelled)
+        ));
+        assert!(polls.get() > 1);
     }
 
     #[test]

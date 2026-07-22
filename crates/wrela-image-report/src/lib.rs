@@ -18,10 +18,11 @@ pub use decode::decode_image_report_json;
 /// Version 14 introduced the machine-representation version binding. Version 15
 /// retains the authenticated FlowWir scheduler ownership partition. Version 16
 /// adds the exact all-or-empty actor placement input set and binds reports to
-/// the current MachineWir v17 contract. The decoder gates on this exact value,
-/// so every older
-/// representation is rejected as [`ReportError::UnsupportedSchema`].
-pub const REPORT_SCHEMA_VERSION: u32 = 16;
+/// the current MachineWir v17 contract. Version 17 adds exact
+/// source-authenticated iso-pool/brand/region contracts. The decoder gates on
+/// this exact value, so every older representation is rejected as
+/// [`ReportError::UnsupportedSchema`].
+pub const REPORT_SCHEMA_VERSION: u32 = 17;
 
 const CURRENT_SEMANTIC_WIR_VERSION: u32 = 12;
 const CURRENT_FLOW_WIR_VERSION: u32 = 16;
@@ -102,6 +103,29 @@ pub struct ImageNodeFact {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RegionCapacityEvidenceFact {
     pub region: String,
+    pub capacity_proof: u32,
+}
+
+/// Exact source-authenticated contract for one generative iso pool.
+///
+/// This is static image evidence only. It does not claim that pool allocation,
+/// transfer, or reclamation has been lowered into the runtime.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IsoPoolFact {
+    pub pool: String,
+    pub brand: String,
+    pub region: String,
+    pub payload_type: String,
+    pub owner: String,
+    pub source: String,
+    pub brand_source: String,
+    pub slots_source: String,
+    pub maximum_payload_source: String,
+    pub payload_source: String,
+    pub slots: u64,
+    pub maximum_payload_bytes: u64,
+    pub payload_bytes: u64,
+    pub alignment: u32,
     pub capacity_proof: u32,
 }
 
@@ -274,6 +298,9 @@ pub struct AnalysisFacts {
     pub actor_lowerings: Vec<ActorLoweringFact>,
     pub image_nodes: Vec<ImageNodeFact>,
     pub region_capacity_evidence: Vec<RegionCapacityEvidenceFact>,
+    /// Exact pool/brand/region joins for pool-only images. Empty until a
+    /// source-authenticated iso-pool producer is present.
+    pub iso_pools: Vec<IsoPoolFact>,
     pub activation_frame_evidence: Vec<ActivationFrameEvidenceFact>,
     /// Inferred region class per reportable allocation (ch03 §7). Empty for
     /// images without a supported whole-image allocation producer.
@@ -990,6 +1017,72 @@ impl ImageReport {
             json_number(&mut output, "static_bytes", fact.static_bytes, true);
             output.push('}');
         }
+        output.push_str("],\"iso_pools\":[");
+        for (index, fact) in self.analysis.iso_pools.iter().enumerate() {
+            if is_cancelled() {
+                return Err(ReportError::Cancelled);
+            }
+            if index != 0 {
+                output.push(',');
+            }
+            output.push('{');
+            json_string(&mut output, "pool", &fact.pool, false, is_cancelled)?;
+            json_string(&mut output, "brand", &fact.brand, true, is_cancelled)?;
+            json_string(&mut output, "region", &fact.region, true, is_cancelled)?;
+            json_string(
+                &mut output,
+                "payload_type",
+                &fact.payload_type,
+                true,
+                is_cancelled,
+            )?;
+            json_string(&mut output, "owner", &fact.owner, true, is_cancelled)?;
+            json_string(&mut output, "source", &fact.source, true, is_cancelled)?;
+            json_string(
+                &mut output,
+                "brand_source",
+                &fact.brand_source,
+                true,
+                is_cancelled,
+            )?;
+            json_string(
+                &mut output,
+                "slots_source",
+                &fact.slots_source,
+                true,
+                is_cancelled,
+            )?;
+            json_string(
+                &mut output,
+                "maximum_payload_source",
+                &fact.maximum_payload_source,
+                true,
+                is_cancelled,
+            )?;
+            json_string(
+                &mut output,
+                "payload_source",
+                &fact.payload_source,
+                true,
+                is_cancelled,
+            )?;
+            json_number(&mut output, "slots", fact.slots, true);
+            json_number(
+                &mut output,
+                "maximum_payload_bytes",
+                fact.maximum_payload_bytes,
+                true,
+            );
+            json_number(&mut output, "payload_bytes", fact.payload_bytes, true);
+            json_number(&mut output, "alignment", u64::from(fact.alignment), true);
+            json_number(
+                &mut output,
+                "capacity_proof",
+                u64::from(fact.capacity_proof),
+                true,
+            );
+            output.push('}');
+        }
         output.push_str("],\"region_capacity_evidence\":[");
         for (index, fact) in self.analysis.region_capacity_evidence.iter().enumerate() {
             if is_cancelled() {
@@ -1645,6 +1738,7 @@ fn canonicalize_analysis(
     cancellable_sort(&mut analysis.proofs, is_cancelled)?;
     cancellable_sort(&mut analysis.actor_lowerings, is_cancelled)?;
     cancellable_sort(&mut analysis.image_nodes, is_cancelled)?;
+    cancellable_sort(&mut analysis.iso_pools, is_cancelled)?;
     cancellable_sort(&mut analysis.region_capacity_evidence, is_cancelled)?;
     cancellable_sort(&mut analysis.activation_frame_evidence, is_cancelled)?;
     cancellable_sort(&mut analysis.region_assignments, is_cancelled)?;
@@ -1707,6 +1801,7 @@ fn measure_analysis(
         analysis.proofs.len(),
         analysis.actor_lowerings.len(),
         analysis.image_nodes.len(),
+        analysis.iso_pools.len(),
         analysis.region_capacity_evidence.len(),
         analysis.activation_frame_evidence.len(),
         analysis.region_assignments.len(),
@@ -1790,6 +1885,22 @@ fn measure_analysis(
     }
     for fact in &analysis.image_nodes {
         for value in [&fact.kind, &fact.name, &fact.owner, &fact.source] {
+            add(value)?;
+        }
+    }
+    for fact in &analysis.iso_pools {
+        for value in [
+            &fact.pool,
+            &fact.brand,
+            &fact.region,
+            &fact.payload_type,
+            &fact.owner,
+            &fact.source,
+            &fact.brand_source,
+            &fact.slots_source,
+            &fact.maximum_payload_source,
+            &fact.payload_source,
+        ] {
             add(value)?;
         }
     }
@@ -1979,6 +2090,7 @@ fn validate_analysis(
     require_canonical("proofs", &analysis.proofs, is_cancelled)?;
     require_canonical("actor lowerings", &analysis.actor_lowerings, is_cancelled)?;
     require_canonical("image nodes", &analysis.image_nodes, is_cancelled)?;
+    require_canonical("iso pools", &analysis.iso_pools, is_cancelled)?;
     require_canonical(
         "region capacity evidence",
         &analysis.region_capacity_evidence,
@@ -2398,6 +2510,111 @@ fn validate_image_graph(
         }
     }
 
+    let mut iso_pool_node_count = 0usize;
+    let mut iso_pool_region_count = 0usize;
+    for node in &analysis.image_nodes {
+        match node.kind.as_str() {
+            "iso-pool" => iso_pool_node_count = iso_pool_node_count.saturating_add(1),
+            "iso-pool-region" => iso_pool_region_count = iso_pool_region_count.saturating_add(1),
+            _ => {}
+        }
+    }
+    if iso_pool_node_count != analysis.iso_pools.len()
+        || iso_pool_region_count != analysis.iso_pools.len()
+    {
+        return Err(ReportError::InvalidFact);
+    }
+    for (index, fact) in analysis.iso_pools.iter().enumerate() {
+        if is_cancelled() {
+            return Err(ReportError::Cancelled);
+        }
+        let pool_id = canonical_named_identity_id(&fact.pool, "pool", is_cancelled)?
+            .ok_or(ReportError::InvalidFact)?;
+        let brand_id = canonical_named_identity_id(&fact.brand, "brand", is_cancelled)?
+            .ok_or(ReportError::InvalidFact)?;
+        let region_id = canonical_named_identity_id(&fact.region, "region", is_cancelled)?
+            .ok_or(ReportError::InvalidFact)?;
+        if usize::try_from(pool_id).map_err(|_| ReportError::MeasurementOverflow)? != index
+            || pool_id != brand_id
+            || pool_id != region_id
+            || !canonical_named_identity(&fact.payload_type, "type", is_cancelled)?
+            || !text_equal_cancellable(&fact.owner, &fact.pool, is_cancelled)?
+            || !canonical_source_identity(&fact.source, is_cancelled)?
+            || !canonical_source_identity(&fact.brand_source, is_cancelled)?
+            || !canonical_source_identity(&fact.slots_source, is_cancelled)?
+            || !canonical_source_identity(&fact.maximum_payload_source, is_cancelled)?
+            || !canonical_source_identity(&fact.payload_source, is_cancelled)?
+            || fact.slots == 0
+            || fact.maximum_payload_bytes == 0
+            || fact.payload_bytes == 0
+            || fact.payload_bytes > fact.maximum_payload_bytes
+            || !fact.alignment.is_power_of_two()
+        {
+            return Err(ReportError::InvalidFact);
+        }
+        let pool = indexed_image_node(analysis, &nodes, &fact.pool, is_cancelled)?
+            .filter(|node| node.kind == "iso-pool")
+            .ok_or(ReportError::InvalidFact)?;
+        let region = indexed_image_node(analysis, &nodes, &fact.region, is_cancelled)?
+            .filter(|node| node.kind == "iso-pool-region")
+            .ok_or(ReportError::InvalidFact)?;
+        let evidence = region_evidence
+            .binary_search_by_key(&region_id, |(id, _)| *id)
+            .ok()
+            .and_then(|position| region_evidence.get(position))
+            .and_then(|(_, position)| analysis.region_capacity_evidence.get(*position))
+            .ok_or(ReportError::InvalidFact)?;
+        let proof = analysis
+            .proofs
+            .get(
+                usize::try_from(fact.capacity_proof)
+                    .map_err(|_| ReportError::MeasurementOverflow)?,
+            )
+            .filter(|proof| {
+                proof.id == fact.capacity_proof
+                    && proof.category == "capacity-bound"
+                    && proof.bound == Some(fact.slots)
+            })
+            .ok_or(ReportError::InvalidFact)?;
+        let slots = unique_bound(analysis, "pool-slots", &fact.pool, is_cancelled)?;
+        let maximum = unique_bound(analysis, "pool-maximum-payload", &fact.pool, is_cancelled)?;
+        let payload = unique_bound(analysis, "pool-payload", &fact.payload_type, is_cancelled)?;
+        let capacity = unique_bound(analysis, "region-capacity", &fact.region, is_cancelled)?;
+        let alignment = unique_bound(analysis, "region-alignment", &fact.region, is_cancelled)?;
+        let backing_bytes = fact
+            .slots
+            .checked_mul(fact.maximum_payload_bytes)
+            .ok_or(ReportError::MeasurementOverflow)?;
+        if pool.owner != "runtime"
+            || pool.static_bytes != 0
+            || !text_equal_cancellable(&pool.source, &fact.source, is_cancelled)?
+            || !text_equal_cancellable(&region.owner, &fact.pool, is_cancelled)?
+            || !text_equal_cancellable(&region.source, &fact.source, is_cancelled)?
+            || region.static_bytes != backing_bytes
+            || evidence.capacity_proof != fact.capacity_proof
+            || !text_equal_cancellable(&evidence.region, &fact.region, is_cancelled)?
+            || proof.sources.as_slice()
+                != [
+                    fact.source.as_str(),
+                    fact.brand_source.as_str(),
+                    fact.slots_source.as_str(),
+                    fact.maximum_payload_source.as_str(),
+                ]
+            || slots.amount != fact.slots
+            || slots.unit != "slots"
+            || maximum.amount != fact.maximum_payload_bytes
+            || maximum.unit != "bytes"
+            || payload.amount != fact.payload_bytes
+            || payload.unit != "bytes"
+            || capacity.amount != backing_bytes
+            || capacity.unit != "bytes"
+            || alignment.amount != u64::from(fact.alignment)
+            || alignment.unit != "bytes"
+        {
+            return Err(ReportError::InvalidFact);
+        }
+    }
+
     let activation_limit = u64::try_from(analysis.activation_frame_evidence.len())
         .map_err(|_| ReportError::MeasurementOverflow)?;
     let mut activation_regions = Vec::new();
@@ -2698,6 +2915,34 @@ fn validate_image_graph(
                     return Err(ReportError::InvalidFact);
                 }
             }
+            "iso-pool" => {
+                let slots = unique_bound(analysis, "pool-slots", &node.name, is_cancelled)?;
+                let maximum =
+                    unique_bound(analysis, "pool-maximum-payload", &node.name, is_cancelled)?;
+                if node.owner != "runtime"
+                    || node.static_bytes != 0
+                    || slots.unit != "slots"
+                    || slots.amount == 0
+                    || maximum.unit != "bytes"
+                    || maximum.amount == 0
+                {
+                    return Err(ReportError::InvalidFact);
+                }
+            }
+            "iso-pool-region" => {
+                let capacity = unique_bound(analysis, "region-capacity", &node.name, is_cancelled)?;
+                let alignment =
+                    unique_bound(analysis, "region-alignment", &node.name, is_cancelled)?;
+                if indexed_image_node(analysis, &nodes, &node.owner, is_cancelled)?
+                    .is_none_or(|owner| owner.kind != "iso-pool")
+                    || capacity.unit != "bytes"
+                    || capacity.amount != node.static_bytes
+                    || alignment.unit != "bytes"
+                    || !alignment.amount.is_power_of_two()
+                {
+                    return Err(ReportError::InvalidFact);
+                }
+            }
             _ => return Err(ReportError::InvalidFact),
         }
     }
@@ -2712,6 +2957,7 @@ fn is_reportable_region_kind(kind: &str) -> bool {
             | "task-frame-region"
             | "actor-activation-frame-region"
             | "task-activation-frame-region"
+            | "iso-pool-region"
     )
 }
 
@@ -2722,6 +2968,8 @@ fn valid_image_node(
     let (identity_kind, owner_kind, structural_source) = match node.kind.as_str() {
         "actor" => ("actor", None, Some("FlowWir.ActorPlan")),
         "task" => ("task", Some("actor"), Some("FlowWir.TaskPlan")),
+        "iso-pool" => ("pool", None, None),
+        "iso-pool-region" => ("region", Some("pool"), None),
         "actor-mailbox-region" | "actor-turn-frame-region" | "actor-activation-frame-region" => {
             ("region", Some("actor"), None)
         }
@@ -3665,7 +3913,7 @@ mod tests {
     use super::{
         ActivationCancellationFact, ActivationFrameEvidenceFact, ActorPlacementInputFact,
         AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts,
-        BoundFact, ImageEdgeFact, ImageNodeFact, ImageReport, OptimizationAction,
+        BoundFact, ImageEdgeFact, ImageNodeFact, ImageReport, IsoPoolFact, OptimizationAction,
         OptimizationDecisionFact, PromotionFact, ProofFact, RegionAssignmentFact,
         RegionCapacityEvidenceFact, RegionClass, ReportError, SchedulerOwnershipFact, SectionFact,
         SymbolFact, ValidatedAnalysisFacts, WorkFact, cancellable_sort, decode_image_report_json,
@@ -4056,6 +4304,103 @@ mod tests {
         }
     }
 
+    fn iso_pool_facts() -> AnalysisFacts {
+        AnalysisFacts {
+            bounds: vec![
+                BoundFact {
+                    category: "pool-slots".to_owned(),
+                    owner: "pool:0:Payloads".to_owned(),
+                    source: "Semantic.PoolNode.capacity".to_owned(),
+                    amount: 2,
+                    unit: "slots".to_owned(),
+                },
+                BoundFact {
+                    category: "pool-maximum-payload".to_owned(),
+                    owner: "pool:0:Payloads".to_owned(),
+                    source: "Semantic.Region.capacity_bytes/Semantic.PoolNode.capacity".to_owned(),
+                    amount: 64,
+                    unit: "bytes".to_owned(),
+                },
+                BoundFact {
+                    category: "pool-payload".to_owned(),
+                    owner: "type:2:pool-payload".to_owned(),
+                    source: "Semantic.SemanticType.size_upper_bound".to_owned(),
+                    amount: 8,
+                    unit: "bytes".to_owned(),
+                },
+                BoundFact {
+                    category: "region-capacity".to_owned(),
+                    owner: "region:0:Payloads".to_owned(),
+                    source: "Semantic.Region.capacity_bytes".to_owned(),
+                    amount: 128,
+                    unit: "bytes".to_owned(),
+                },
+                BoundFact {
+                    category: "region-alignment".to_owned(),
+                    owner: "region:0:Payloads".to_owned(),
+                    source: "Semantic.Region.alignment".to_owned(),
+                    amount: 8,
+                    unit: "bytes".to_owned(),
+                },
+            ],
+            proofs: vec![ProofFact {
+                id: 0,
+                category: "capacity-bound".to_owned(),
+                subject: "iso pool slots: Payloads".to_owned(),
+                result: "proved".to_owned(),
+                bound: Some(2),
+                sources: vec![
+                    "file:0:bytes:100..170".to_owned(),
+                    "file:0:bytes:125..133".to_owned(),
+                    "file:0:bytes:141..142".to_owned(),
+                    "file:0:bytes:156..158".to_owned(),
+                ],
+                depends_on: Vec::new(),
+                why_chain: vec!["exact generative pool capacity".to_owned()],
+            }],
+            image_nodes: vec![
+                ImageNodeFact {
+                    kind: "iso-pool".to_owned(),
+                    name: "pool:0:Payloads".to_owned(),
+                    owner: "runtime".to_owned(),
+                    source: "file:0:bytes:100..170".to_owned(),
+                    static_bytes: 0,
+                },
+                ImageNodeFact {
+                    kind: "iso-pool-region".to_owned(),
+                    name: "region:0:Payloads".to_owned(),
+                    owner: "pool:0:Payloads".to_owned(),
+                    source: "file:0:bytes:100..170".to_owned(),
+                    static_bytes: 128,
+                },
+            ],
+            region_capacity_evidence: vec![RegionCapacityEvidenceFact {
+                region: "region:0:Payloads".to_owned(),
+                capacity_proof: 0,
+            }],
+            iso_pools: vec![IsoPoolFact {
+                pool: "pool:0:Payloads".to_owned(),
+                brand: "brand:0:Payloads".to_owned(),
+                region: "region:0:Payloads".to_owned(),
+                payload_type: "type:2:pool-payload".to_owned(),
+                owner: "pool:0:Payloads".to_owned(),
+                source: "file:0:bytes:100..170".to_owned(),
+                brand_source: "file:0:bytes:125..133".to_owned(),
+                slots_source: "file:0:bytes:141..142".to_owned(),
+                maximum_payload_source: "file:0:bytes:156..158".to_owned(),
+                payload_source: "file:0:bytes:20..60".to_owned(),
+                slots: 2,
+                maximum_payload_bytes: 64,
+                payload_bytes: 8,
+                alignment: 8,
+                capacity_proof: 0,
+            }],
+            startup_order: vec!["runtime".to_owned(), "pool:0:Payloads".to_owned()],
+            shutdown_order: vec!["pool:0:Payloads".to_owned(), "runtime".to_owned()],
+            ..AnalysisFacts::default()
+        }
+    }
+
     #[test]
     fn actor_task_region_graph_is_canonical_bounded_and_cancellable() {
         let digest = Sha256Digest::from_bytes([0x44; 32]);
@@ -4095,7 +4440,7 @@ mod tests {
         };
         let sealed = seal_analysis_facts(request, facts.clone(), &|| false)
             .expect("exact actor/task/region graph limit");
-        assert_eq!(super::REPORT_SCHEMA_VERSION, 16);
+        assert_eq!(super::REPORT_SCHEMA_VERSION, 17);
         assert_eq!(sealed.as_facts().image_nodes.len(), 8);
         assert_eq!(sealed.as_facts().region_capacity_evidence.len(), 5);
         assert_eq!(sealed.as_facts().activation_frame_evidence.len(), 2);
@@ -4276,6 +4621,142 @@ mod tests {
             }),
             Err(ReportError::Cancelled)
         );
+    }
+
+    #[test]
+    fn iso_pool_contract_is_exact_independently_sealed_bounded_and_cancellable() {
+        let digest = Sha256Digest::from_bytes([0x47; 32]);
+        let build = build(digest);
+        let facts = iso_pool_facts();
+        let measured = super::measure_analysis(
+            &facts,
+            "pool-image",
+            AnalysisFactLimits::standard(),
+            &|| false,
+        )
+        .expect("measure exact pool facts");
+        let exact = AnalysisFactLimits {
+            items: measured.0,
+            proof_edges: measured.1,
+            payload_bytes: measured.2,
+        };
+        let sealed = seal_analysis_facts(
+            AnalysisFactRequest {
+                build: &build,
+                image_name: "pool-image",
+                limits: exact,
+            },
+            facts.clone(),
+            &|| false,
+        )
+        .expect("exact pool report limit");
+        assert_eq!(sealed.as_facts().iso_pools, facts.iso_pools);
+        let encoded = ImageReport::new(
+            build.clone(),
+            "pool-image".to_owned(),
+            sealed,
+            backend(digest),
+            BackendFactLimits::standard(),
+            &|| false,
+        )
+        .expect("pool image report")
+        .to_json();
+        let decoded = decode_image_report_json(
+            encoded.as_bytes(),
+            &build,
+            exact,
+            BackendFactLimits::standard(),
+            u64::MAX,
+            &|| false,
+        )
+        .expect("canonical pool report round trip");
+        assert_eq!(decoded.analysis().iso_pools, facts.iso_pools);
+
+        for (resource, limits) in [
+            (
+                "analysis fact items",
+                AnalysisFactLimits {
+                    items: exact.items - 1,
+                    ..exact
+                },
+            ),
+            (
+                "analysis proof edges",
+                AnalysisFactLimits {
+                    proof_edges: exact.proof_edges - 1,
+                    ..exact
+                },
+            ),
+            (
+                "analysis fact payload",
+                AnalysisFactLimits {
+                    payload_bytes: exact.payload_bytes - 1,
+                    ..exact
+                },
+            ),
+        ] {
+            assert!(matches!(
+                seal_analysis_facts(
+                    AnalysisFactRequest {
+                        build: &build,
+                        image_name: "pool-image",
+                        limits,
+                    },
+                    facts.clone(),
+                    &|| false,
+                ),
+                Err(ReportError::ResourceLimit { resource: actual, .. }) if actual == resource
+            ));
+        }
+
+        let mut forged = facts.clone();
+        forged.iso_pools[0].maximum_payload_bytes = 63;
+        assert!(matches!(
+            seal_analysis_facts(
+                AnalysisFactRequest {
+                    build: &build,
+                    image_name: "pool-image",
+                    limits: AnalysisFactLimits::standard(),
+                },
+                forged,
+                &|| false,
+            ),
+            Err(ReportError::InvalidFact)
+        ));
+
+        let polls = Cell::new(0u32);
+        seal_analysis_facts(
+            AnalysisFactRequest {
+                build: &build,
+                image_name: "pool-image",
+                limits: AnalysisFactLimits::standard(),
+            },
+            facts.clone(),
+            &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            },
+        )
+        .expect("baseline pool report polls");
+        let final_poll = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            seal_analysis_facts(
+                AnalysisFactRequest {
+                    build: &build,
+                    image_name: "pool-image",
+                    limits: AnalysisFactLimits::standard(),
+                },
+                facts,
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(ReportError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
     }
 
     #[test]
@@ -4856,7 +5337,7 @@ mod tests {
         let digest = Sha256Digest::from_bytes([0x67; 32]);
         let minimum = assemble(digest, AnalysisFacts::default(), backend(digest))
             .expect("minimum one-block DIR64 relocation evidence");
-        assert_eq!(minimum.schema(), 16);
+        assert_eq!(minimum.schema(), 17);
         assert_eq!(minimum.backend().relocation_directory_bytes, 12);
         assert_eq!(minimum.backend().base_relocation_blocks, 1);
         assert_eq!(minimum.backend().base_relocation_dir64_count, 1);
@@ -5313,7 +5794,7 @@ mod tests {
         ];
         let digest_build = build(digest);
         let report = assemble(digest, facts, backend(digest)).expect("assemble region report");
-        assert_eq!(report.schema(), 16);
+        assert_eq!(report.schema(), 17);
         // Canonicalization sorted both vectors by their derived total order.
         assert_eq!(
             report
