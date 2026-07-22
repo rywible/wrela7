@@ -202,6 +202,7 @@ struct GeneratedTestFacts<'a> {
     group: &'a FullImageTestGroup,
     harness: &'a sema::FunctionInstance,
     test_functions: Vec<sema::FunctionInstanceId>,
+    projection_context: ProjectionLoweringContext,
 }
 
 struct ActorImageFacts<'a> {
@@ -223,6 +224,56 @@ struct ScopeActivationLowering {
 #[derive(Debug)]
 struct ScopeLoweringContext {
     activations: Vec<ScopeActivationLowering>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProjectionActivationLowering {
+    function: sema::FunctionInstanceId,
+    protocol: sema::ProjectionProtocolId,
+    expression: wrela_hir::ExpressionId,
+    result: sema::ValueId,
+    argument: wrela_hir::ExpressionId,
+    terminal: wrela_hir::ExpressionId,
+    field: u32,
+    proof: sema::ProofId,
+}
+
+#[derive(Debug)]
+struct ProjectionLoweringContext {
+    activations: Vec<ProjectionActivationLowering>,
+    declarations: Vec<wrela_hir::DeclarationId>,
+}
+
+impl ProjectionLoweringContext {
+    fn activation(
+        &self,
+        function: sema::FunctionInstanceId,
+        expression: wrela_hir::ExpressionId,
+    ) -> Option<ProjectionActivationLowering> {
+        self.activations
+            .iter()
+            .find(|activation| {
+                activation.function == function && activation.expression == expression
+            })
+            .copied()
+    }
+
+    fn admits_value(&self, function: sema::FunctionInstanceId, value: sema::ValueId) -> bool {
+        self.activations
+            .iter()
+            .any(|activation| activation.function == function && activation.result == value)
+    }
+
+    fn admits_expression(
+        &self,
+        function: sema::FunctionInstanceId,
+        expression: wrela_hir::ExpressionId,
+    ) -> bool {
+        self.activations.iter().any(|activation| {
+            activation.function == function
+                && (activation.expression == expression || activation.terminal == expression)
+        })
+    }
 }
 
 impl ScopeLoweringContext {
@@ -2287,11 +2338,6 @@ fn supported_generated_tests<'a>(
             "semantic-with-cleanup-lowering-pending (scope protocols and activations in generated tests)",
         ));
     }
-    if !facts.projection_protocols.is_empty() || !facts.lexical_views.is_empty() {
-        return Err(unsupported(
-            "semantic-projection-lowering-pending (projection protocols in generated tests)",
-        ));
-    }
     if !facts.baked_artifacts.is_empty() {
         return Err(unsupported("baked artifacts in generated tests"));
     }
@@ -2405,6 +2451,7 @@ fn supported_generated_tests<'a>(
         test_functions.push(function.id);
     }
     validate_reachable_source_functions(input, &test_functions, harness.id, limits, is_cancelled)?;
+    let projection_context = supported_projection_lowering_context(input, limits, is_cancelled)?;
     let expected_events = u32::try_from(group.tests.len())
         .ok()
         .and_then(|count| count.checked_mul(2))
@@ -2422,7 +2469,456 @@ fn supported_generated_tests<'a>(
         group,
         harness,
         test_functions,
+        projection_context,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SupportedProjectionProtocol {
+    id: sema::ProjectionProtocolId,
+    declaration: wrela_hir::DeclarationId,
+    parameter: wrela_hir::ParameterId,
+    parameter_ty: sema::SemanticTypeId,
+    target: sema::SemanticTypeId,
+    field: u32,
+    proof: sema::ProofId,
+}
+
+fn supported_projection_lowering_context(
+    input: &AnalyzedImage,
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<ProjectionLoweringContext, LowerError> {
+    const PENDING: &str = "semantic-projection-lowering-pending (outside generated read-only scalar projection subset)";
+    let facts = input.facts();
+    let program = input.hir().as_program();
+    let mut protocols = try_vec(
+        facts.projection_protocols.len(),
+        "projection lowering protocols",
+        limits.model_edges,
+    )?;
+    let mut declarations = try_vec(
+        facts.projection_protocols.len(),
+        "projection lowering declarations",
+        limits.model_edges,
+    )?;
+    for protocol in &facts.projection_protocols {
+        check_cancelled(is_cancelled)?;
+        if protocol.id.0 as usize != protocols.len() {
+            return Err(unsupported(PENDING));
+        }
+        let declaration = program
+            .declaration(protocol.declaration)
+            .ok_or_else(|| unsupported(PENDING))?;
+        let wrela_hir::DeclarationKind::Projection(source) = &declaration.kind else {
+            return Err(unsupported(PENDING));
+        };
+        let ([parameter], [semantic_parameter], [provenance]) = (
+            source.parameters.as_slice(),
+            protocol.parameters.as_slice(),
+            protocol.provenance.as_slice(),
+        ) else {
+            return Err(unsupported(PENDING));
+        };
+        let wrela_hir::ProjectionCarrierKind::View {
+            mutable: false,
+            ty: carrier_target,
+        } = &source.carrier.kind
+        else {
+            return Err(unsupported(PENDING));
+        };
+        if !source.generics.is_empty()
+            || !declaration.attributes.is_empty()
+            || !matches!(declaration.owner, wrela_hir::DeclarationOwner::Module(_))
+            || source.body != Some(protocol.body)
+            || *parameter != semantic_parameter.parameter
+            || *provenance != *parameter
+            || protocol.mutable
+            || semantic_parameter.access != sema::AccessMode::Read
+            || !source_type_matches_semantic(facts, carrier_target, protocol.target)
+        {
+            return Err(unsupported(PENDING));
+        }
+        let source_parameter = program
+            .parameters
+            .get(parameter.0 as usize)
+            .filter(|record| {
+                record.id == *parameter
+                    && record.owner == wrela_hir::CallableOwner::Declaration(protocol.declaration)
+                    && !record.receiver
+                    && record.access == wrela_hir::AccessMode::Read
+                    && record.ty.as_ref().is_some_and(|ty| {
+                        source_nominal_structure_matches(facts, ty, semantic_parameter.ty)
+                    })
+            })
+            .ok_or_else(|| unsupported(PENDING))?;
+        let _ = source_parameter;
+        if !is_stored_copy_scalar(facts, protocol.target) {
+            return Err(unsupported(PENDING));
+        }
+        let Some(sema::SemanticTypeKind::Structure {
+            arguments, fields, ..
+        }) = facts
+            .types
+            .get(semantic_parameter.ty.0 as usize)
+            .map(|ty| &ty.kind)
+        else {
+            return Err(unsupported(PENDING));
+        };
+        if !arguments.is_empty()
+            || fields.is_empty()
+            || fields
+                .iter()
+                .any(|field| !is_stored_copy_scalar(facts, field.ty))
+        {
+            return Err(unsupported(PENDING));
+        }
+        let body = program
+            .body(protocol.body)
+            .filter(|body| body.owner == wrela_hir::BodyOwner::Declaration(protocol.declaration))
+            .ok_or_else(|| unsupported(PENDING))?;
+        let [yield_statement] = body.statements.as_slice() else {
+            return Err(unsupported(PENDING));
+        };
+        let yield_expression = program
+            .statement(*yield_statement)
+            .and_then(|statement| match statement.kind {
+                wrela_hir::StatementKind::Yield(expression)
+                    if statement.body == protocol.body && statement.attributes.is_empty() =>
+                {
+                    Some(expression)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| unsupported(PENDING))?;
+        let (base, field_name) = program
+            .expression(yield_expression)
+            .and_then(|expression| match &expression.kind {
+                wrela_hir::ExpressionKind::Field { base, name } => Some((*base, name)),
+                _ => None,
+            })
+            .ok_or_else(|| unsupported(PENDING))?;
+        if !program.expression(base).is_some_and(|expression| {
+            matches!(
+                expression.kind,
+                wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Parameter(candidate))
+                    if candidate == *parameter
+            )
+        }) {
+            return Err(unsupported(PENDING));
+        }
+        let field = fields
+            .iter()
+            .position(|field| field.name == field_name.as_str() && field.ty == protocol.target)
+            .and_then(|index| u32::try_from(index).ok())
+            .ok_or_else(|| unsupported(PENDING))?;
+        let proof = facts
+            .proofs
+            .get(protocol.proof.0 as usize)
+            .filter(|proof| {
+                proof.id == protocol.proof
+                    && proof.kind == sema::ProofKind::ViewDoesNotEscape
+                    && proof.sources.as_slice() == [declaration.source]
+                    && proof.depends_on.is_empty()
+                    && proof.bound == Some(1)
+            })
+            .ok_or_else(|| unsupported(PENDING))?;
+        let _ = proof;
+        declarations.push(protocol.declaration);
+        protocols.push(SupportedProjectionProtocol {
+            id: protocol.id,
+            declaration: protocol.declaration,
+            parameter: *parameter,
+            parameter_ty: semantic_parameter.ty,
+            target: protocol.target,
+            field,
+            proof: protocol.proof,
+        });
+    }
+
+    let mut activations = try_vec(
+        facts.lexical_views.len(),
+        "projection lowering activations",
+        limits.model_edges,
+    )?;
+    for view in &facts.lexical_views {
+        check_cancelled(is_cancelled)?;
+        if view.id.0 as usize != activations.len() {
+            return Err(unsupported(PENDING));
+        }
+        let protocol = protocols
+            .get(view.protocol.0 as usize)
+            .filter(|protocol| protocol.id == view.protocol)
+            .ok_or_else(|| unsupported(PENDING))?;
+        let function = facts
+            .functions
+            .get(view.function.0 as usize)
+            .filter(|function| {
+                function.id == view.function
+                    && function.role == sema::FunctionRole::Test
+                    && function.color == wrela_hir::FunctionColor::Sync
+                    && function.generic_arguments.is_empty()
+            })
+            .ok_or_else(|| unsupported(PENDING))?;
+        let sema::FunctionOrigin::Source {
+            declaration: function_declaration,
+            body: function_body,
+        } = function.origin
+        else {
+            return Err(unsupported(PENDING));
+        };
+        let [source] = view.sources.as_slice() else {
+            return Err(unsupported(PENDING));
+        };
+        let [terminal] = view.terminal_uses.as_slice() else {
+            return Err(unsupported(PENDING));
+        };
+        let call = program
+            .expression(view.expression)
+            .ok_or_else(|| unsupported(PENDING))?;
+        let (callee, argument) = match &call.kind {
+            wrela_hir::ExpressionKind::Call { callee, arguments } => {
+                let [argument] = arguments.as_slice() else {
+                    return Err(unsupported(PENDING));
+                };
+                let wrela_hir::CallArgumentValue::Value(argument_expression) = argument.value
+                else {
+                    return Err(unsupported(PENDING));
+                };
+                if argument.name.is_some() {
+                    return Err(unsupported(PENDING));
+                }
+                (*callee, argument_expression)
+            }
+            _ => return Err(unsupported(PENDING)),
+        };
+        let callee_matches = program.expression(callee).is_some_and(|expression| {
+            matches!(
+                expression.kind,
+                wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(
+                    wrela_hir::ResolvedDeclaration { declaration, .. }
+                )) if declaration == protocol.declaration
+            )
+        });
+        let call_fact = facts
+            .expressions
+            .iter()
+            .find(|fact| fact.function == view.function && fact.expression == view.expression)
+            .ok_or_else(|| unsupported(PENDING))?;
+        let argument_fact = facts
+            .expressions
+            .iter()
+            .find(|fact| fact.function == view.function && fact.expression == argument)
+            .ok_or_else(|| unsupported(PENDING))?;
+        let bindings_match = matches!(
+            &call_fact.resolution,
+            sema::ExpressionResolution::ProjectionCall {
+                protocol: candidate,
+                arguments,
+                view: candidate_view,
+            } if *candidate == protocol.id
+                && *candidate_view == view.id
+                && matches!(arguments.as_slice(), [binding]
+                    if binding.source_index == 0
+                        && binding.parameter_index == 0
+                        && binding.access == sema::AccessMode::Read
+                        && binding.value == source.value)
+        );
+        let source_value_matches = argument_fact.result == Some(source.value)
+            || argument_fact.resolution == sema::ExpressionResolution::Value(source.value);
+        if !callee_matches
+            || call_fact.ty != protocol.target
+            || call_fact.category != sema::ValueCategory::SharedView
+            || call_fact.region.is_some()
+            || call_fact.effects.0 != 0
+            || call_fact.result != Some(view.value)
+            || call_fact.proofs != function.proofs
+            || !bindings_match
+            || source.parameter != protocol.parameter
+            || source.access != sema::AccessMode::Read
+            || !source_value_matches
+            || argument_fact.ty != protocol.parameter_ty
+            || source.argument_source
+                != program
+                    .expression(argument)
+                    .map_or(call.source, |e| e.source)
+            || view.expression != call.id
+        {
+            return Err(unsupported(PENDING));
+        }
+        let initialization = program
+            .statement(view.initialization)
+            .filter(|statement| {
+                statement.body == function_body
+                    && matches!(statement.kind,
+                        wrela_hir::StatementKind::Initialize { local, value }
+                            if local == view.binding && value == view.expression)
+            })
+            .ok_or_else(|| unsupported(PENDING))?;
+        let local = program
+            .locals
+            .get(view.binding.0 as usize)
+            .filter(|local| {
+                local.id == view.binding
+                    && local.body == function_body
+                    && local.ty.as_ref().is_some_and(|ty| {
+                        matches!(&ty.kind, wrela_hir::TypeExpressionKind::View {
+                            mutable: false,
+                            target,
+                        } if source_type_matches_semantic(facts, target, protocol.target))
+                    })
+            })
+            .ok_or_else(|| unsupported(PENDING))?;
+        let value = facts
+            .values
+            .get(view.value.0 as usize)
+            .filter(|value| {
+                value.id == view.value
+                    && value.function == view.function
+                    && value.ty == protocol.target
+                    && value.category == sema::ValueCategory::SharedView
+                    && value.class == sema::SemanticValueClass::Ephemeral(sema::EphemeralKind::View)
+                    && value.origin == sema::SemanticValueOrigin::Local(view.binding)
+                    && value.source == Some(local.source)
+                    && value.source_name.as_deref() == Some(local.name.as_str())
+            })
+            .ok_or_else(|| unsupported(PENDING))?;
+        let _ = (initialization, value, function_declaration);
+        let terminal_fact = facts
+            .expressions
+            .iter()
+            .find(|fact| fact.function == view.function && fact.expression == *terminal)
+            .filter(|fact| {
+                fact.ty == protocol.target
+                    && fact.category == sema::ValueCategory::SharedView
+                    && fact.region.is_none()
+                    && fact.effects.0 == 0
+                    && fact.result.is_none()
+                    && fact.resolution == sema::ExpressionResolution::Value(view.value)
+                    && fact.proofs == function.proofs
+            })
+            .ok_or_else(|| unsupported(PENDING))?;
+        let _ = terminal_fact;
+        if !program.expression(*terminal).is_some_and(|expression| {
+            matches!(
+                expression.kind,
+                wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(local))
+                    if local == view.binding
+            )
+        }) {
+            return Err(unsupported(PENDING));
+        }
+        let mut terminal_calls = program.expressions.iter().filter(|expression| {
+            matches!(&expression.kind, wrela_hir::ExpressionKind::Call { arguments, .. }
+                if matches!(arguments.as_slice(), [argument]
+                    if argument.name.is_none()
+                        && matches!(argument.value,
+                            wrela_hir::CallArgumentValue::Value(value) if value == *terminal)))
+        });
+        let terminal_call = terminal_calls.next().ok_or_else(|| unsupported(PENDING))?;
+        if terminal_calls.next().is_some() {
+            return Err(unsupported(PENDING));
+        }
+        let terminal_call_fact = facts
+            .expressions
+            .iter()
+            .find(|fact| fact.function == view.function && fact.expression == terminal_call.id)
+            .ok_or_else(|| unsupported(PENDING))?;
+        let unary_read_matches = matches!(
+            &terminal_call_fact.resolution,
+            sema::ExpressionResolution::DirectCall { function: target, arguments }
+                if matches!(arguments.as_slice(), [binding]
+                    if binding.source_index == 0
+                        && binding.parameter_index == 0
+                        && matches!(binding.access, sema::AccessMode::Value | sema::AccessMode::Read)
+                        && binding.value == view.value)
+                    && facts.functions.get(target.0 as usize).is_some_and(|callee| {
+                        callee.id == *target
+                            && callee.parameters.len() == 1
+                            && callee.parameters[0].ty == protocol.target
+                            && matches!(callee.parameters[0].access,
+                                sema::AccessMode::Value | sema::AccessMode::Read)
+                    })
+        );
+        let root = program
+            .body(function_body)
+            .ok_or_else(|| unsupported(PENDING))?;
+        let init_index = root
+            .statements
+            .iter()
+            .position(|statement| *statement == view.initialization)
+            .ok_or_else(|| unsupported(PENDING))?;
+        let terminal_statement_index = root
+            .statements
+            .iter()
+            .position(|statement| {
+                program.statement(*statement).is_some_and(|statement| {
+                    matches!(statement.kind,
+                        wrela_hir::StatementKind::Expression(expression)
+                            if expression == terminal_call.id)
+                })
+            })
+            .ok_or_else(|| unsupported(PENDING))?;
+        let straight_line = root.statements.iter().all(|statement| {
+            program.statement(*statement).is_some_and(|statement| {
+                matches!(
+                    statement.kind,
+                    wrela_hir::StatementKind::Initialize { .. }
+                        | wrela_hir::StatementKind::Expression(_)
+                        | wrela_hir::StatementKind::Pass
+                        | wrela_hir::StatementKind::Return(_)
+                )
+            })
+        });
+        if !unary_read_matches || !straight_line || init_index >= terminal_statement_index {
+            return Err(unsupported(PENDING));
+        }
+        activations.push(ProjectionActivationLowering {
+            function: view.function,
+            protocol: protocol.id,
+            expression: view.expression,
+            result: view.value,
+            argument,
+            terminal: *terminal,
+            field: protocol.field,
+            proof: protocol.proof,
+        });
+    }
+    cancellable_sort(
+        &mut declarations,
+        "projection lowering declarations",
+        limits.model_edges,
+        is_cancelled,
+    )?;
+    cancellable_dedup(&mut declarations, is_cancelled)?;
+    Ok(ProjectionLoweringContext {
+        activations,
+        declarations,
+    })
+}
+
+fn source_nominal_structure_matches(
+    facts: &sema::PartialAnalysis,
+    source: &wrela_hir::TypeExpression,
+    ty: sema::SemanticTypeId,
+) -> bool {
+    let wrela_hir::TypeExpressionKind::Named {
+        definition:
+            wrela_hir::Definition::Declaration(wrela_hir::ResolvedDeclaration { declaration, .. }),
+        arguments,
+    } = &source.kind
+    else {
+        return false;
+    };
+    arguments.is_empty()
+        && matches!(
+            facts.types.get(ty.0 as usize).map(|record| &record.kind),
+            Some(sema::SemanticTypeKind::Structure {
+                declaration: candidate,
+                arguments,
+                ..
+            }) if candidate == declaration && arguments.is_empty()
+        )
 }
 
 fn validate_supported_source_type(
@@ -3214,6 +3710,7 @@ fn lower_actor_image(
                 actor.input,
                 function,
                 Some(&scope_context),
+                None,
                 limits,
                 is_cancelled,
             )?
@@ -5101,8 +5598,14 @@ fn lower_generated_tests(
         if function.id == generated.harness.id {
             continue;
         }
-        let (lowered, operations) =
-            lower_source_function(generated.input, function, None, limits, is_cancelled)?;
+        let (lowered, operations) = lower_source_function(
+            generated.input,
+            function,
+            None,
+            Some(&generated.projection_context),
+            limits,
+            is_cancelled,
+        )?;
         source_operations =
             source_operations
                 .checked_add(operations)
@@ -5316,6 +5819,7 @@ fn lower_source_function(
     input: &AnalyzedImage,
     function: &sema::FunctionInstance,
     scope_context: Option<&ScopeLoweringContext>,
+    projection_context: Option<&ProjectionLoweringContext>,
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(wir::SemanticFunction, u64), LowerError> {
@@ -5343,8 +5847,13 @@ fn lower_source_function(
         ));
     }
 
-    let (mut values, value_map) =
-        lower_source_values(input.facts(), function, limits, is_cancelled)?;
+    let (mut values, value_map) = lower_source_values(
+        input.facts(),
+        function,
+        projection_context,
+        limits,
+        is_cancelled,
+    )?;
     let mut parameters = try_vec(
         function.parameters.len(),
         "SemanticWir function parameters",
@@ -5399,6 +5908,7 @@ fn lower_source_function(
         input,
         function,
         scope_context,
+        projection_context,
         root_body: body,
         value_map: &value_map,
         limits,
@@ -5611,6 +6121,7 @@ impl SourceValueMap {
 fn lower_source_values(
     facts: &sema::PartialAnalysis,
     function: &sema::FunctionInstance,
+    projection_context: Option<&ProjectionLoweringContext>,
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(Vec<wir::SemanticValue>, SourceValueMap), LowerError> {
@@ -5627,7 +6138,11 @@ fn lower_source_values(
         .filter(|value| value.function == function.id)
     {
         check_cancelled(is_cancelled)?;
-        if value.category != sema::ValueCategory::Value {
+        if value.category != sema::ValueCategory::Value
+            && !(value.category == sema::ValueCategory::SharedView
+                && projection_context
+                    .is_some_and(|context| context.admits_value(function.id, value.id)))
+        {
             return Err(unsupported("non-value scalar semantic values"));
         }
         let id =
@@ -5738,6 +6253,14 @@ struct ProjectInput {
     field: u32,
     ty: sema::SemanticTypeId,
     result: Option<sema::ValueId>,
+    effects: sema::EffectSet,
+}
+
+struct ProjectionCallInput {
+    expression: wrela_hir::ExpressionId,
+    source: Span,
+    callee: wrela_hir::ExpressionId,
+    activation: ProjectionActivationLowering,
     effects: sema::EffectSet,
 }
 
@@ -5900,6 +6423,7 @@ enum SourceExpressionPlan {
     InitializerAggregate(InitializerAggregateInput),
     EnumAggregate(EnumAggregateInput),
     Project(ProjectInput),
+    ProjectionCall(ProjectionCallInput),
     ActorStateLoad(sema::ActorStateAccess),
     DirectCall(DirectCallInput),
     MethodCall(MethodCallInput),
@@ -5942,6 +6466,7 @@ struct SourceFunctionLowerer<'a> {
     input: &'a AnalyzedImage,
     function: &'a sema::FunctionInstance,
     scope_context: Option<&'a ScopeLoweringContext>,
+    projection_context: Option<&'a ProjectionLoweringContext>,
     root_body: wrela_hir::BodyId,
     value_map: &'a SourceValueMap,
     limits: LoweringLimits,
@@ -8416,7 +8941,15 @@ impl SourceFunctionLowerer<'_> {
                 }
                 proofs
             });
-            if fact.category != sema::ValueCategory::Value
+            let admitted_projection_view = fact.category == sema::ValueCategory::SharedView
+                && matches!(
+                    requested_access,
+                    sema::AccessMode::Value | sema::AccessMode::Read
+                )
+                && self.projection_context.is_some_and(|context| {
+                    context.admits_expression(self.function.id, expression_id)
+                });
+            if fact.category != sema::ValueCategory::Value && !admitted_projection_view
                 || actor_state_access.as_ref().map_or_else(
                     || fact.region.is_some() || fact.proofs != self.function.proofs,
                     |access| {
@@ -8633,6 +9166,48 @@ impl SourceFunctionLowerer<'_> {
                         result: fact.result,
                         effects: fact.effects,
                     }),
+                    (
+                        wrela_hir::ExpressionKind::Call { callee, arguments },
+                        sema::ExpressionResolution::ProjectionCall {
+                            protocol,
+                            arguments: bindings,
+                            view,
+                        },
+                    ) => {
+                        let activation = self
+                            .projection_context
+                            .and_then(|context| {
+                                context.activation(self.function.id, expression_id)
+                            })
+                            .ok_or_else(|| {
+                                unsupported(
+                                    "semantic-projection-lowering-pending (projection activation outside authenticated context)",
+                                )
+                            })?;
+                        if activation.protocol != *protocol
+                            || fact.result != Some(activation.result)
+                            || arguments.len() != 1
+                            || bindings.len() != 1
+                            || *view
+                                != self
+                                    .input
+                                    .facts()
+                                    .lexical_views
+                                    .get(view.0 as usize)
+                                    .filter(|record| record.expression == expression_id)
+                                    .map(|record| record.id)
+                                    .ok_or_else(|| self.fact_mismatch("projection lexical view"))?
+                        {
+                            return Err(self.fact_mismatch("projection call context"));
+                        }
+                        SourceExpressionPlan::ProjectionCall(ProjectionCallInput {
+                            expression: expression_id,
+                            source: expression.source,
+                            callee: *callee,
+                            activation,
+                            effects: fact.effects,
+                        })
+                    }
                     (
                         wrela_hir::ExpressionKind::Call { callee, arguments },
                         sema::ExpressionResolution::DirectCall {
@@ -9134,6 +9709,9 @@ impl SourceFunctionLowerer<'_> {
             }
             SourceExpressionPlan::Project(project) => {
                 self.lower_flat_projection(project, statements)
+            }
+            SourceExpressionPlan::ProjectionCall(project) => {
+                self.lower_projection_call(project, statements)
             }
             SourceExpressionPlan::ActorStateLoad(access) => {
                 let expression = self
@@ -10046,6 +10624,11 @@ impl SourceFunctionLowerer<'_> {
         if record.function != self.function.id
             || record.ty != reference.ty
             || record.category != sema::ValueCategory::Value
+                && !(record.category == sema::ValueCategory::SharedView
+                    && self.projection_context.is_some_and(|context| {
+                        context.admits_value(self.function.id, record.id)
+                            && context.admits_expression(self.function.id, reference.expression)
+                    }))
             || reference.effects.0 != 0
         {
             return Err(self.fact_mismatch("local reference value"));
@@ -10114,7 +10697,11 @@ impl SourceFunctionLowerer<'_> {
             .filter(|record| {
                 record.function == self.function.id
                     && record.ty == ty
-                    && record.category == sema::ValueCategory::Value
+                    && (record.category == sema::ValueCategory::Value
+                        || record.category == sema::ValueCategory::SharedView
+                            && self.projection_context.is_some_and(|context| {
+                                context.admits_value(self.function.id, record.id)
+                            }))
             })
             .ok_or_else(|| self.fact_mismatch("expression result value"))?;
         let provenance_matches = match record.origin {
@@ -10619,6 +11206,63 @@ impl SourceFunctionLowerer<'_> {
             wir::SemanticOperation::Project {
                 base,
                 field: project.field,
+                access: wir::AccessMode::Read,
+            },
+            Some(project.source),
+        )?;
+        Ok(LoweredExpression::Value(result))
+    }
+
+    fn lower_projection_call(
+        &mut self,
+        project: ProjectionCallInput,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<LoweredExpression, LowerError> {
+        if project.effects.0 != 0 || project.activation.expression != project.expression {
+            return Err(self.fact_mismatch("projection call effects or identity"));
+        }
+        let callee = self.expression_fact(project.callee)?;
+        if callee.result.is_some()
+            || callee.effects.0 != 0
+            || callee.category != sema::ValueCategory::Value
+            || callee.region.is_some()
+            || callee.proofs != self.function.proofs
+            || callee.resolution
+                != sema::ExpressionResolution::Projection(project.activation.protocol)
+        {
+            return Err(self.fact_mismatch("projection callee fact"));
+        }
+        self.push_seen_expression(project.callee)?;
+        let LoweredExpression::Value(base) = self.lower_expression(
+            project.activation.argument,
+            sema::AccessMode::Read,
+            statements,
+        )?
+        else {
+            return Err(self.fact_mismatch("projection source value"));
+        };
+        let result = self.lowered_expression_result(
+            project.expression,
+            project.activation.result,
+            self.expression_fact(project.expression)?.ty,
+            project.source,
+        )?;
+        let proof = wir::ProofId(project.activation.proof.0);
+        if self
+            .function
+            .proofs
+            .binary_search(&project.activation.proof)
+            .is_err()
+            && !self.required_proofs.contains(&proof)
+        {
+            push_bounded_proof(&mut self.required_proofs, proof, self.limits.model_edges)?;
+        }
+        self.push_let(
+            statements,
+            result,
+            wir::SemanticOperation::Project {
+                base,
+                field: project.activation.field,
                 access: wir::AccessMode::Read,
             },
             Some(project.source),
@@ -12477,6 +13121,7 @@ fn generated_reachable_declarations(
         .functions
         .len()
         .checked_add(generated.facts.types.len())
+        .and_then(|count| count.checked_add(generated.projection_context.declarations.len()))
         .ok_or(LowerError::ResourceLimit {
             resource: "generated reachable declarations",
             limit: limits.model_edges,
@@ -12501,6 +13146,10 @@ fn generated_reachable_declarations(
         if let sema::SemanticTypeKind::Structure { declaration, .. } = ty.kind {
             declarations.push(declaration);
         }
+    }
+    for declaration in &generated.projection_context.declarations {
+        check_cancelled(is_cancelled)?;
+        declarations.push(*declaration);
     }
     cancellable_sort(
         &mut declarations,
@@ -12606,6 +13255,8 @@ fn preflight_input(
         facts.statements.len(),
         facts.scope_protocols.len(),
         facts.scope_activations.len(),
+        facts.projection_protocols.len(),
+        facts.lexical_views.len(),
         facts.proofs.len(),
         facts.baked_artifacts.len(),
         facts.comptime_test_results.len(),
@@ -12730,6 +13381,38 @@ fn preflight_input(
             )?;
         }
     }
+    for protocol in &facts.projection_protocols {
+        check_cancelled(is_cancelled)?;
+        for count in [protocol.parameters.len(), protocol.provenance.len()] {
+            add_bounded(
+                &mut edges,
+                count,
+                "semantic model edges",
+                limits.model_edges,
+            )?;
+        }
+        add_bounded(
+            &mut payload,
+            protocol.name.len(),
+            "semantic payload bytes",
+            limits.payload_bytes,
+        )?;
+    }
+    for view in &facts.lexical_views {
+        check_cancelled(is_cancelled)?;
+        for count in [
+            view.sources.len(),
+            view.terminal_uses.len(),
+            view.live_after_statements.len(),
+        ] {
+            add_bounded(
+                &mut edges,
+                count,
+                "semantic model edges",
+                limits.model_edges,
+            )?;
+        }
+    }
     for expression in &facts.expressions {
         check_cancelled(is_cancelled)?;
         add_bounded(
@@ -12739,7 +13422,8 @@ fn preflight_input(
             limits.model_edges,
         )?;
         if let sema::ExpressionResolution::DirectCall { arguments, .. }
-        | sema::ExpressionResolution::OperatorCall { arguments, .. } = &expression.resolution
+        | sema::ExpressionResolution::OperatorCall { arguments, .. }
+        | sema::ExpressionResolution::ProjectionCall { arguments, .. } = &expression.resolution
         {
             add_bounded(
                 &mut edges,
@@ -12786,6 +13470,7 @@ fn preflight_input(
             statement.initialized_after.len(),
             statement.moved_after.len(),
             statement.live_loans_after.len(),
+            statement.live_lexical_views_after.len(),
             statement.proofs.len(),
         ] {
             add_bounded(

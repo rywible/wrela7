@@ -529,6 +529,16 @@ it. It injects phase implementations and bounded host capabilities, while
   canonical actor-state plain write additionally retains its exact
   `RegionBound` proof as a no-result `Promote` immediately before the concrete
   store, and attaches that proof to the actor-turn function authority set.
+- Generated synchronous tests admit one projection-lowering profile only: a
+  free nongeneric bare immutable projection with one read parameter backed by
+  a nongeneric flat copy-scalar aggregate, one direct primitive field yield,
+  one explicit view local, and one straight-line unary terminal read. A
+  fallible, cancellation-polled context authenticates the retained HIR,
+  protocol, activation, source, terminal use, and exact `ViewDoesNotEscape`
+  proof before emitting the existing `Project` operation. It also meters
+  projection/view fact edges and payload, attaches the proof to the caller,
+  and counts the projection declaration in exact reachable provenance.
+  Every other projection shape keeps the named lowering boundary.
 - The exact typed-reply subset lowers one awaited installed-actor request to
   `ActorReplyRequest` and injects one `ActorReplyResolve` before the target's
   sole exact-`u64` return. Both operations carry the same sorted
@@ -886,6 +896,13 @@ it. It injects phase implementations and bounded host capabilities, while
 - LLVM performs mechanical translation and backend optimization only. It cannot
   establish a language capacity/safety proof or invent `noalias`, `inbounds`,
   non-null, alignment, or overflow facts.
+- A function-type record with no surviving first-class value is passive
+  provenance. Its parameters may therefore retain a canonical flat-scalar
+  struct layout in addition to the existing scalar forms; this narrowly lets
+  an authenticated, erased projection callable coexist with the concrete
+  `ExtractField` instruction. Aggregate values and executable signatures still
+  pass their independent operation/function validation and are not inferred
+  from this passive record.
 - The target machine is created only from target-owned
   `aarch64-unknown-uefi`, pinned data layout, `cortex-a57`, and
   `+reserve-x18`; LLVM's reported layout must equal the package before codegen.

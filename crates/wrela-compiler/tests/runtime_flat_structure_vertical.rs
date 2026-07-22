@@ -40,6 +40,7 @@ use wrela_semantic_lower::{
     LowerRequest as SemanticLowerRequest, LoweredSemanticStatement,
     LoweringLimits as SemanticLoweringLimits, SemanticArithmeticMode, SemanticLowerer,
     SemanticOperation, SemanticTypeId, SemanticTypeKind as LoweredSemanticTypeKind,
+    seal as seal_semantic,
 };
 use wrela_source::{SourceDatabase, SourceInput};
 use wrela_syntax::{ParseLimits, ParseRequest, SyntaxParser, WrelaSyntaxParser};
@@ -226,6 +227,31 @@ from app.duration import update_and_read
 @test(runtime)
 fn native_pair_field_update_runs():
     value: u64 = update_and_read()
+    return
+"#;
+
+const SCALAR_VIEW_SOURCE: &str = r#"module app.duration
+
+pub struct Packet:
+    pub header: u64
+    pub stamp: u8
+
+pub projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+pub fn consume(value: u64):
+    pass
+"#;
+
+const SCALAR_VIEW_TEST_SOURCE: &str = r#"module app.duration_test
+
+from app.duration import Packet, consume, header
+
+@test(runtime)
+fn scalar_view_projection_reaches_native():
+    packet: Packet = Packet(header=42, stamp=1)
+    observed: view u64 = header(packet)
+    consume(observed)
     return
 "#;
 
@@ -491,6 +517,375 @@ fn analyzed(fixture: &Fixture) -> AnalyzedImage {
         output.diagnostics()
     );
     output.into_parts().0.expect("sealed semantic image")
+}
+
+#[test]
+fn read_only_scalar_view_projection_reaches_semantic_wir() {
+    let fixture = fixture(SCALAR_VIEW_SOURCE, SCALAR_VIEW_TEST_SOURCE);
+    let analyzed = analyzed(&fixture);
+    assert_eq!(analyzed.facts().projection_protocols.len(), 1);
+    assert_eq!(analyzed.facts().lexical_views.len(), 1);
+    let projection_proof = analyzed.facts().projection_protocols[0].proof;
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("authenticated read-only scalar view lowers to SemanticWir");
+    let semantic_model = semantic.wir().as_wir();
+    assert_eq!(semantic_model.version, 12);
+    assert_eq!(
+        semantic_model.source_summary.reachable_declarations, 4,
+        "test, unary consumer, Packet, and the projection declaration are reachable"
+    );
+    let proof = &semantic_model.proofs[projection_proof.0 as usize];
+    assert_eq!(
+        proof.kind,
+        wrela_semantic_lower::semantic_wir::ProofKind::ViewDoesNotEscape
+    );
+    assert_eq!(proof.bound, Some(1));
+    let project_functions = semantic_model
+        .functions
+        .iter()
+        .filter(|function| {
+            function.body.statements.iter().any(|statement| {
+                matches!(
+                    statement,
+                    LoweredSemanticStatement::Let(statement)
+                        if matches!(statement.operation, SemanticOperation::Project {
+                            field: 0,
+                            access: wrela_semantic_lower::SemanticAccessMode::Read,
+                            ..
+                        }) && statement.results.len() == 1
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let [project_function] = project_functions.as_slice() else {
+        panic!("exactly one source function must contain the scalar projection")
+    };
+    assert!(
+        project_function
+            .proofs
+            .contains(&wrela_semantic_lower::semantic_wir::ProofId(
+                projection_proof.0
+            ))
+    );
+
+    let (semantic_wir, _) = semantic.into_parts();
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("scalar view projection lowers to FlowWir");
+    assert!(flow.diagnostics().is_empty());
+    let flow_model = flow.wir().as_wir();
+    assert_eq!(flow_model.version, 14);
+    let flow_projects = flow_model
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                FlowOperation::ExtractField { field: 0, .. }
+            ) && instruction.results.len() == 1
+        })
+        .count();
+    assert_eq!(flow_projects, 1);
+
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("scalar view FlowWir v14 canonical frame");
+    let decoded = CanonicalFlowWirCodec
+        .decode(
+            DecodeRequest {
+                bytes: encoded.bytes(),
+                limits: CodecLimits::standard(),
+                expected_build: Some(fixture.build.identity()),
+            },
+            &never_cancelled,
+        )
+        .expect("scalar view FlowWir v14 decode");
+    assert_eq!(decoded, flow_wir);
+
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("scalar view projection reaches MachineWir");
+    let machine = prepared.machine().wir().as_wir();
+    assert_eq!(machine.version, 15);
+    let machine_projects = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                MachineOperation::ExtractField { field: 0, .. }
+            ) && instruction.results.len() == 1
+        })
+        .count();
+    assert_eq!(machine_projects, 1);
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("scalar view native object emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat scalar view native object emission");
+            assert_eq!(
+                first.bytes(),
+                second.bytes(),
+                "identical scalar-view MachineWir must emit byte-identical ARM64 COFF"
+            );
+        }
+    }
+}
+
+#[test]
+fn scalar_view_project_sealer_rejects_field_access_and_deletion_forgeries() {
+    let fixture = fixture(SCALAR_VIEW_SOURCE, SCALAR_VIEW_TEST_SOURCE);
+    let analyzed = analyzed(&fixture);
+    let lowered = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("baseline scalar view lowering");
+    let baseline = lowered.wir().as_wir().clone();
+    let request = SemanticLowerRequest {
+        input: analyzed,
+        limits: SemanticLoweringLimits::standard(),
+    };
+
+    fn project(
+        model: &mut wrela_semantic_lower::semantic_wir::SemanticWir,
+    ) -> &mut wrela_semantic_lower::semantic_wir::LetStatement {
+        model
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.body.statements)
+            .find_map(|statement| match statement {
+                LoweredSemanticStatement::Let(statement)
+                    if matches!(statement.operation, SemanticOperation::Project { .. }) =>
+                {
+                    Some(statement)
+                }
+                _ => None,
+            })
+            .expect("scalar projection operation")
+    }
+
+    let mut wrong_field = baseline.clone();
+    let SemanticOperation::Project { field, .. } = &mut project(&mut wrong_field).operation else {
+        unreachable!()
+    };
+    *field = 1;
+    assert!(
+        seal_semantic(
+            &request,
+            wrong_field,
+            lowered.report().clone(),
+            &never_cancelled,
+        )
+        .is_err()
+    );
+
+    let mut wrong_access = baseline.clone();
+    let SemanticOperation::Project { access, .. } = &mut project(&mut wrong_access).operation
+    else {
+        unreachable!()
+    };
+    *access = wrela_semantic_lower::SemanticAccessMode::Mutate;
+    assert!(
+        seal_semantic(
+            &request,
+            wrong_access,
+            lowered.report().clone(),
+            &never_cancelled,
+        )
+        .is_err()
+    );
+
+    let mut deleted = baseline;
+    let owner = deleted
+        .functions
+        .iter_mut()
+        .find(|function| {
+            function.body.statements.iter().any(|statement| {
+                matches!(statement,
+                    LoweredSemanticStatement::Let(statement)
+                        if matches!(statement.operation, SemanticOperation::Project { .. }))
+            })
+        })
+        .expect("projection owner");
+    owner.body.statements.retain(|statement| {
+        !matches!(statement,
+            LoweredSemanticStatement::Let(statement)
+                if matches!(statement.operation, SemanticOperation::Project { .. }))
+    });
+    assert!(
+        seal_semantic(
+            &request,
+            deleted,
+            lowered.report().clone(),
+            &never_cancelled,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn scalar_view_projection_has_exact_operation_bound_and_late_cancellation() {
+    let fixture = fixture(SCALAR_VIEW_SOURCE, SCALAR_VIEW_TEST_SOURCE);
+    let analyzed = analyzed(&fixture);
+    let baseline = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("baseline scalar view lowering");
+    let exact = baseline.report().operations;
+    assert!(exact > 1);
+    let mut exact_limits = SemanticLoweringLimits::standard();
+    exact_limits.operations = exact;
+    CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: exact_limits,
+            },
+            &never_cancelled,
+        )
+        .expect("the exact scalar-view operation bound is admitted");
+    let mut one_under = exact_limits;
+    one_under.operations = exact - 1;
+    assert!(matches!(
+        CanonicalSemanticLowerer::new().lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: one_under,
+            },
+            &never_cancelled,
+        ),
+        Err(SemanticLowerError::ResourceLimit {
+            resource: "SemanticWir operations",
+            limit,
+        }) if limit == exact - 1
+    ));
+
+    let polls = Cell::new(0_u32);
+    CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            },
+        )
+        .expect("count scalar-view lowering cancellation polls");
+    let cancel_at = polls.get().saturating_sub(2);
+    let cancelled = Cell::new(0_u32);
+    assert!(matches!(
+        CanonicalSemanticLowerer::new().lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &|| {
+                let next = cancelled.get().saturating_add(1);
+                cancelled.set(next);
+                next >= cancel_at
+            },
+        ),
+        Err(SemanticLowerError::Cancelled)
+    ));
+    assert!(cancelled.get() >= cancel_at);
+
+    let mut exact_edges = SemanticLoweringLimits::standard();
+    exact_edges.model_edges = 123;
+    CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: exact_edges,
+            },
+            &never_cancelled,
+        )
+        .expect("the exact projection-aware model-edge bound is admitted");
+    let mut one_edge_under = exact_edges;
+    one_edge_under.model_edges = 122;
+    assert!(matches!(
+        CanonicalSemanticLowerer::new().lower(
+            SemanticLowerRequest {
+                input: analyzed,
+                limits: one_edge_under,
+            },
+            &never_cancelled,
+        ),
+        Err(SemanticLowerError::ResourceLimit {
+            resource: "semantic model edges",
+            limit: 122,
+        })
+    ));
+}
+
+#[test]
+fn multi_source_projection_lowering_tail_stays_named_and_fail_closed() {
+    let source = SCALAR_VIEW_SOURCE.replace(
+        "read packet: Packet",
+        "read packet: Packet, read fallback: Packet",
+    );
+    let tests =
+        SCALAR_VIEW_TEST_SOURCE.replace("header(packet)", "header(packet=packet, fallback=packet)");
+    let fixture = fixture(&source, &tests);
+    let error = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed(&fixture),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect_err("multi-source projection lowering remains deferred");
+    assert!(matches!(
+        error,
+        SemanticLowerError::UnsupportedInput {
+            feature: "semantic-projection-lowering-pending (outside generated read-only scalar projection subset)"
+        }
+    ));
 }
 
 #[test]

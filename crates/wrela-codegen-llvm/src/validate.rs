@@ -2698,7 +2698,13 @@ fn supported_passive_function_type(
     }
     for (index, parameter) in parameters.iter().enumerate() {
         check_periodically(index, is_cancelled)?;
-        if !is_basic_scalar(machine, *parameter) {
+        // Function type records are provenance-only once the lowering surface
+        // has proved that no function-typed value survives. Retaining a
+        // canonical flat-copy aggregate parameter in that passive signature
+        // must not reject an otherwise scalarized projection activation.
+        if !is_basic_scalar(machine, *parameter)
+            && !supported_struct_layout(&machine.types, *parameter)
+        {
             return Ok(false);
         }
     }
