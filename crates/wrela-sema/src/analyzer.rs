@@ -5911,6 +5911,15 @@ fn analyze_runtime_body(
                     let RuntimeBindingOrigin::Local(local) = current.origin else {
                         continue;
                     };
+                    if partial
+                        .values
+                        .get(current.value.0 as usize)
+                        .is_some_and(|value| {
+                            value.class == SemanticValueClass::Ephemeral(EphemeralKind::View)
+                        })
+                    {
+                        continue;
+                    }
                     let ty = partial
                         .values
                         .get(current.value.0 as usize)
@@ -5950,6 +5959,15 @@ fn analyze_runtime_body(
                     let RuntimeBindingOrigin::Local(local) = current.origin else {
                         continue;
                     };
+                    if partial
+                        .values
+                        .get(current.value.0 as usize)
+                        .is_some_and(|value| {
+                            value.class == SemanticValueClass::Ephemeral(EphemeralKind::View)
+                        })
+                    {
+                        continue;
+                    }
                     let ty = partial.values[current.value.0 as usize].ty;
                     let local_record = &request.hir.as_program().locals[index];
                     let exit = append_semantic_value(
@@ -16101,6 +16119,7 @@ pub(super) fn derive_structured_view_liveness(
         start: usize,
         binding: LocalId,
         mut live_after: bool,
+        inside_loop: bool,
         terminal_uses: &mut Vec<ExpressionId>,
         live_after_statements: &mut Vec<StatementId>,
         is_cancelled: &dyn Fn() -> bool,
@@ -16145,6 +16164,7 @@ pub(super) fn derive_structured_view_liveness(
                             0,
                             binding,
                             live_after,
+                            inside_loop,
                             terminal_uses,
                             live_after_statements,
                             is_cancelled,
@@ -16161,6 +16181,7 @@ pub(super) fn derive_structured_view_liveness(
                             0,
                             binding,
                             live_after,
+                            inside_loop,
                             terminal_uses,
                             live_after_statements,
                             is_cancelled,
@@ -16183,6 +16204,7 @@ pub(super) fn derive_structured_view_liveness(
                             0,
                             binding,
                             live_after,
+                            inside_loop,
                             terminal_uses,
                             live_after_statements,
                             is_cancelled,
@@ -16194,8 +16216,37 @@ pub(super) fn derive_structured_view_liveness(
                     }
                     any_path_live
                 }
+                StatementKind::While { condition, body } => {
+                    if inside_loop
+                        || bounded_while_shape(program, *condition, *body).is_none()
+                        || !references.is_empty()
+                    {
+                        return Ok(Err(StructuredViewLivenessError::UnsupportedControlFlow(
+                            statement.source,
+                        )));
+                    }
+                    let body_live = match analyze_body(
+                        program,
+                        *body,
+                        0,
+                        binding,
+                        live_after,
+                        true,
+                        terminal_uses,
+                        live_after_statements,
+                        is_cancelled,
+                    )? {
+                        Ok(state) => state,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    if !live_after && body_live {
+                        return Ok(Err(StructuredViewLivenessError::UnsupportedControlFlow(
+                            statement.source,
+                        )));
+                    }
+                    live_after || body_live
+                }
                 StatementKind::For { .. }
-                | StatementKind::While { .. }
                 | StatementKind::Loop { .. }
                 | StatementKind::With { .. }
                 | StatementKind::ComptimeIf { .. }
@@ -16256,6 +16307,7 @@ pub(super) fn derive_structured_view_liveness(
         initialization_record.body,
         initialization_index + 1,
         binding,
+        false,
         false,
         &mut terminal_uses,
         &mut live_after_statements,
@@ -16402,12 +16454,186 @@ fn record_lexical_view_initialization(
                 request,
                 source,
                 "semantic-view-control-flow-pending",
-                "loop or with control flow occurs while a lexical view remains live",
-                "this increment authenticates acyclic if/match liveness without inventing a fixed-point witness",
-                "consume the view before this statement or recreate it afterward",
+                "control flow is outside the authenticated lexical-view liveness subset",
+                "only an outer canonical bounded while whose post-loop continuation already retains the view has an exact fixed-point witness",
+                "move the terminal use after one canonical loop, or consume and recreate the view around this statement",
             ));
         }
     };
+    let statement_is_live_before = |candidate: &wrela_hir::Statement| {
+        liveness
+            .live_after_statements
+            .binary_search(&candidate.id)
+            .is_ok()
+            || liveness.terminal_uses.iter().any(|terminal| {
+                request
+                    .hir
+                    .as_program()
+                    .expression(*terminal)
+                    .is_some_and(|terminal| {
+                        candidate.source.file == terminal.source.file
+                            && candidate.source.range.start <= terminal.source.range.start
+                            && terminal.source.range.end <= candidate.source.range.end
+                    })
+            })
+    };
+    for candidate in &request.hir.as_program().expressions {
+        check_cancelled(is_cancelled)?;
+        let Some(statement) =
+            containing_statement_for_expression(request.hir.as_program(), candidate)
+                .and_then(|statement| request.hir.as_program().statement(statement))
+        else {
+            continue;
+        };
+        if !statement_is_live_before(statement) {
+            continue;
+        }
+        let ExpressionKind::Call { arguments, .. } = &candidate.kind else {
+            continue;
+        };
+        for argument in arguments {
+            check_cancelled(is_cancelled)?;
+            let wrela_hir::CallArgumentValue::Exclusive { place, .. } = &argument.value else {
+                continue;
+            };
+            let Some(retained) = sources.iter().find(|source| {
+                partial
+                    .values
+                    .get(source.value.0 as usize)
+                    .is_some_and(|value| match (value.origin, &place.root) {
+                        (SemanticValueOrigin::Local(expected), Definition::Local(actual)) => {
+                            expected == *actual
+                        }
+                        (
+                            SemanticValueOrigin::Parameter(expected),
+                            Definition::Parameter(actual),
+                        ) => expected == *actual,
+                        _ => false,
+                    })
+            }) else {
+                continue;
+            };
+            let parameter_name = request
+                .hir
+                .as_program()
+                .parameters
+                .get(retained.parameter.0 as usize)
+                .and_then(|parameter| parameter.name.as_ref())
+                .map_or("_", wrela_hir::Name::as_str);
+            let terminal = liveness
+                .terminal_uses
+                .first()
+                .and_then(|terminal| request.hir.as_program().expression(*terminal));
+            let mut diagnostic = Diagnostic::error(
+                Category::OWNERSHIP,
+                argument.source,
+                format!(
+                    "cannot mutate frozen projection parameter `{parameter_name}` while view from `{}` remains live",
+                    protocol.name
+                ),
+            );
+            diagnostic.code = Some("semantic-view-source-mutated".to_owned());
+            diagnostic
+                .labels
+                .try_reserve_exact(2)
+                .map_err(|_| fact_resource(request, "view source preflight diagnostic labels"))?;
+            diagnostic.labels.push(wrela_diagnostics::Label {
+                span: retained.argument_source,
+                message: format!(
+                    "`{parameter_name}` is frozen by projection `{}`",
+                    protocol.name
+                ),
+            });
+            if let Some(terminal) = terminal {
+                diagnostic.labels.push(wrela_diagnostics::Label {
+                    span: terminal.source,
+                    message: "this terminal use keeps the view live".to_owned(),
+                });
+            }
+            diagnostic.notes.push(
+                "a continuation-anchored loop retains the same immutable view value on every iteration"
+                    .to_owned(),
+            );
+            diagnostic.help.push(
+                "move the mutation after the terminal use or project from a distinct source"
+                    .to_owned(),
+            );
+            return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
+        }
+    }
+    for statement in &request.hir.as_program().statements {
+        check_cancelled(is_cancelled)?;
+        if !statement_is_live_before(statement) {
+            continue;
+        }
+        let StatementKind::Assign { targets, .. } = &statement.kind else {
+            continue;
+        };
+        let rebound = targets.iter().find_map(|target| {
+            let Definition::Local(local) = target.root else {
+                return None;
+            };
+            if local == binding {
+                return Some((None, "view carrier"));
+            }
+            sources.iter().find_map(|source| {
+                partial
+                    .values
+                    .get(source.value.0 as usize)
+                    .is_some_and(|value| value.origin == SemanticValueOrigin::Local(local))
+                    .then(|| {
+                        let name = request
+                            .hir
+                            .as_program()
+                            .parameters
+                            .get(source.parameter.0 as usize)
+                            .and_then(|parameter| parameter.name.as_ref())
+                            .map_or("view carrier", wrela_hir::Name::as_str);
+                        (Some(source), name)
+                    })
+            })
+        });
+        let Some((retained, retained_name)) = rebound else {
+            continue;
+        };
+        let mut diagnostic = Diagnostic::error(
+            Category::OWNERSHIP,
+            statement.source,
+            format!(
+                "cannot rebind `{retained_name}` while projection `{}` remains live",
+                protocol.name
+            ),
+        );
+        diagnostic.code = Some("semantic-projection-carrier-rebound".to_owned());
+        diagnostic
+            .labels
+            .try_reserve_exact(2)
+            .map_err(|_| fact_resource(request, "view rebind preflight diagnostic labels"))?;
+        diagnostic.labels.push(wrela_diagnostics::Label {
+            span: retained.map_or(statement.source, |source| source.argument_source),
+            message: format!(
+                "`{retained_name}` is retained by projection `{}`",
+                protocol.name
+            ),
+        });
+        if let Some(terminal) = liveness
+            .terminal_uses
+            .first()
+            .and_then(|terminal| request.hir.as_program().expression(*terminal))
+        {
+            diagnostic.labels.push(wrela_diagnostics::Label {
+                span: terminal.source,
+                message: "the blocking view's terminal use is here".to_owned(),
+            });
+        }
+        diagnostic.notes.push(
+            "a continuation-anchored loop retains the same view and source identities".to_owned(),
+        );
+        diagnostic
+            .help
+            .push("move the assignment after the terminal use".to_owned());
+        return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
+    }
     let liveness_edges = liveness
         .terminal_uses
         .len()
@@ -39844,7 +40070,7 @@ fn branch_release_is_path_exact():
     }
 
     #[test]
-    fn lexical_projection_loop_liveness_remains_named_and_fail_closed() {
+    fn continuation_anchored_bounded_while_keeps_view_live_exactly() {
         const SOURCE: &str = r#"module app
 
 from core.image import Image, Target
@@ -39863,7 +40089,7 @@ pub fn boot() -> Image:
     return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
 
 @test(runtime)
-fn loop_view_liveness_is_deferred():
+fn loop_view_liveness_is_continuation_anchored():
     packet: Packet = Packet(header=7)
     hdr: view u64 = header(packet)
     index: u8 = 0
@@ -39873,14 +40099,192 @@ fn loop_view_liveness_is_deferred():
     consume(hdr)
 "#;
         let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "the post-loop terminal use anchors the canonical loop fixed point: {:?}",
+            output.diagnostics(),
+        );
+        let analyzed = output.successful().expect("continuation-anchored view");
+        let view = analyzed
+            .facts()
+            .lexical_views
+            .first()
+            .expect("lexical view");
+        assert_eq!(view.terminal_uses.len(), 1);
+        let program = analyzed.hir().as_program();
+        let while_statement = program
+            .statements
+            .iter()
+            .find(|statement| matches!(statement.kind, StatementKind::While { .. }))
+            .expect("bounded while statement");
+        assert!(view.live_after_statements.contains(&while_statement.id));
+        let StatementKind::While { body, .. } = while_statement.kind else {
+            unreachable!()
+        };
+        for statement in &program.body(body).expect("while body").statements {
+            assert!(view.live_after_statements.contains(statement));
+        }
+        let removed = *program
+            .body(body)
+            .expect("while body")
+            .statements
+            .last()
+            .expect("while body statement");
+        let mut forged = analyzed.facts().clone();
+        forged.lexical_views[0]
+            .live_after_statements
+            .retain(|statement| *statement != removed);
+        assert!(
+            forged.validate_for_seal(analyzed.hir(), &|| false).is_err(),
+            "the full sealer must independently rederive loop-body liveness"
+        );
+    }
+
+    #[test]
+    fn lexical_view_loop_local_nested_and_transfer_tails_fail_closed_by_name() {
+        const PREFIX: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+"#;
+        let cases = [
+            (
+                r#"
+@test(runtime)
+fn loop_local_use_has_no_continuation_anchor():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    index: u8 = 0
+    while index < 1:
+        index += 1
+        consume(hdr)
+"#,
+                "semantic-view-control-flow-pending",
+            ),
+            (
+                r#"
+@test(runtime)
+fn nested_loop_fixed_point_is_deferred():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    outer: u8 = 0
+    inner: u8 = 0
+    while outer < 1:
+        outer += 1
+        while inner < 1:
+            inner += 1
+    consume(hdr)
+"#,
+                "semantic-view-control-flow-pending",
+            ),
+            (
+                r#"
+@test(runtime)
+fn loop_break_cannot_carry_a_view():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    index: u8 = 0
+    while index < 1:
+        index += 1
+        break
+    consume(hdr)
+"#,
+                "semantic-view-escape",
+            ),
+            (
+                r#"
+@test(runtime)
+fn loop_continue_cannot_carry_a_view():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    index: u8 = 0
+    while index < 1:
+        index += 1
+        continue
+    consume(hdr)
+"#,
+                "semantic-view-escape",
+            ),
+        ];
+        for (tail, expected) in cases {
+            let output = compile_scope_fixture(&format!("{PREFIX}{tail}"));
+            assert_eq!(
+                output
+                    .diagnostics()
+                    .first()
+                    .and_then(|diagnostic| diagnostic.code.as_deref()),
+                Some(expected),
+                "missing {expected}: {:?}",
+                output.diagnostics()
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_anchored_loop_keeps_projection_source_frozen() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn touch(mut packet: Packet):
+    pass
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn loop_retention_freezes_source():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    index: u8 = 0
+    while index < 1:
+        index += 1
+        touch(mut packet)
+    consume(hdr)
+"#;
+        let output = compile_scope_fixture(SOURCE);
         assert_eq!(
             output
                 .diagnostics()
                 .first()
                 .and_then(|diagnostic| diagnostic.code.as_deref()),
-            Some("semantic-view-control-flow-pending"),
-            "loop-carried view liveness stays named and closed: {:?}",
+            Some("semantic-view-source-mutated"),
+            "the loop body remains inside the retained-source interval: {:?}",
             output.diagnostics()
+        );
+        let rebound = compile_scope_fixture(
+            &SOURCE.replace("touch(mut packet)", "packet = Packet(header=8)"),
+        );
+        assert_eq!(
+            rebound
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.as_deref()),
+            Some("semantic-projection-carrier-rebound"),
+            "loop-held source identity cannot be rebound: {:?}",
+            rebound.diagnostics()
         );
     }
 
