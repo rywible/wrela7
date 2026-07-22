@@ -167,10 +167,9 @@ impl RegionClass {
 /// Records the allocation identity and the exact region class inference placed
 /// it in. Allocation identities use the canonical producer form
 /// `alloc:<dense-u32-id>:<nonempty-name>`. IDs are dense and unique across the
-/// assignment vector. The producer that fills this from
-/// whole-image analysis is wired separately (Lane B task B2b); this schema
-/// records the fact ahead of that producer, so ordinary builds leave the vector
-/// empty.
+/// assignment vector. Stateful actor direct stores now fill this from sealed
+/// whole-image escape analysis; images without a supported allocation producer
+/// leave the vector empty.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RegionAssignmentFact {
     pub allocation: String,
@@ -186,8 +185,9 @@ pub struct RegionAssignmentFact {
 /// region it was promoted from, the region it was promoted into, the
 /// human-readable reason (the why-chain summary), and an authenticated dense
 /// `FlowWir` proof ID establishing the promotion is bounded. Like
-/// [`RegionAssignmentFact`] the producer is B2b; ordinary builds leave the
-/// vector empty.
+/// [`RegionAssignmentFact`], the supported actor-state producer authenticates
+/// these rows against the exact semantic value, source/destination regions,
+/// and `RegionBound` proof.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PromotionFact {
     pub allocation: String,
@@ -247,10 +247,11 @@ pub struct AnalysisFacts {
     pub image_nodes: Vec<ImageNodeFact>,
     pub region_capacity_evidence: Vec<RegionCapacityEvidenceFact>,
     pub activation_frame_evidence: Vec<ActivationFrameEvidenceFact>,
-    /// Inferred region class per reportable allocation (ch03 §7). Empty until
-    /// the whole-image inference producer (Lane B task B2b) is wired.
+    /// Inferred region class per reportable allocation (ch03 §7). Empty for
+    /// images without a supported whole-image allocation producer.
     pub region_assignments: Vec<RegionAssignmentFact>,
-    /// Reported region promotions (ch03 §8). Empty until the producer is wired.
+    /// Reported region promotions (ch03 §8). Empty when no value escapes its
+    /// inferred source lifetime.
     pub promotions: Vec<PromotionFact>,
     pub image_edges: Vec<ImageEdgeFact>,
     pub work: Vec<WorkFact>,

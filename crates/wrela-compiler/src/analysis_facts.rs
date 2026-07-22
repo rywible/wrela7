@@ -2,7 +2,8 @@ use std::fmt::Write;
 
 use wrela_image_report::{
     AnalysisFactRequest as ReportRequest, AnalysisFacts, BoundFact, ImageEdgeFact, ImageNodeFact,
-    ProofFact, RegionCapacityEvidenceFact, ValidatedAnalysisFacts, WorkFact, seal_analysis_facts,
+    PromotionFact, ProofFact, RegionAssignmentFact, RegionCapacityEvidenceFact,
+    ValidatedAnalysisFacts, WorkFact, seal_analysis_facts,
 };
 use wrela_sema::{
     AnalysisRoot, FunctionOrigin, FunctionRole, ImageOwner, Linearity, PartialAnalysis, ProofKind,
@@ -68,6 +69,8 @@ struct ActorReportFacts {
     image_nodes: Vec<ImageNodeFact>,
     image_edges: Vec<ImageEdgeFact>,
     region_capacity_evidence: Vec<RegionCapacityEvidenceFact>,
+    region_assignments: Vec<RegionAssignmentFact>,
+    promotions: Vec<PromotionFact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,6 +381,15 @@ fn validate_actor_graph(
         .actors
         .len()
         .checked_mul(2)
+        .and_then(|count| {
+            count.checked_add(
+                graph
+                    .regions
+                    .iter()
+                    .filter(|region| region.name.ends_with(".state"))
+                    .count(),
+            )
+        })
         .and_then(|count| count.checked_add(graph.tasks.len()))
         .ok_or(AnalysisFactAssemblyError::ResourceLimit {
             resource: "actor graph regions",
@@ -404,17 +416,12 @@ fn validate_actor_graph(
         ));
     }
     let mut static_bytes = 0u64;
+    let mut actor_region_cursor = 0usize;
     for (index, actor) in graph.actors.iter().enumerate() {
         check_cancelled(is_cancelled)?;
-        let mailbox_index =
-            index
-                .checked_mul(2)
-                .ok_or(AnalysisFactAssemblyError::ResourceLimit {
-                    resource: "actor region identity",
-                    limit: limits.items,
-                })?;
-        let turn_index =
-            mailbox_index
+        let mailbox_index = actor_region_cursor;
+        actor_region_cursor =
+            actor_region_cursor
                 .checked_add(1)
                 .ok_or(AnalysisFactAssemblyError::ResourceLimit {
                     resource: "actor region identity",
@@ -445,6 +452,26 @@ fn validate_actor_graph(
         let mailbox = graph.regions.get(mailbox_index).ok_or(
             AnalysisFactAssemblyError::InvalidSemanticFacts("actor mailbox region is absent"),
         )?;
+        let state = graph.regions.get(actor_region_cursor).filter(|region| {
+            region.owner == ImageOwner::Actor(actor.id)
+                && joined_name_matches(&region.name, &actor.name, ".state")
+        });
+        if state.is_some() {
+            actor_region_cursor = actor_region_cursor.checked_add(1).ok_or(
+                AnalysisFactAssemblyError::ResourceLimit {
+                    resource: "actor region identity",
+                    limit: limits.items,
+                },
+            )?;
+        }
+        let turn_index = actor_region_cursor;
+        actor_region_cursor =
+            actor_region_cursor
+                .checked_add(1)
+                .ok_or(AnalysisFactAssemblyError::ResourceLimit {
+                    resource: "actor region identity",
+                    limit: limits.items,
+                })?;
         let turn = graph.regions.get(turn_index).ok_or(
             AnalysisFactAssemblyError::InvalidSemanticFacts("actor turn-frame region is absent"),
         )?;
@@ -482,23 +509,27 @@ fn validate_actor_graph(
         {
             return Err(unsupported("actor capacity proof or region substitution"));
         }
+        if let Some(state) = state {
+            if state.id.0 as usize + 1 != turn_index
+                || state.class != RegionClass::Image
+                || state.capacity_bytes != 8
+                || state.alignment != 8
+                || !capacity_proof_matches(facts, state.proof, 1)
+                || entry.proofs.binary_search(&state.proof).is_err()
+            {
+                return Err(unsupported("actor state capacity proof substitution"));
+            }
+        }
         static_bytes = static_bytes
             .checked_add(mailbox_bytes)
             .and_then(|bytes| bytes.checked_add(turn_bytes))
+            .and_then(|bytes| bytes.checked_add(if state.is_some() { 8 } else { 0 }))
             .ok_or(AnalysisFactAssemblyError::ResourceLimit {
                 resource: "actor static bytes",
                 limit: limits.payload_bytes,
             })?;
     }
-    let task_region_start =
-        graph
-            .actors
-            .len()
-            .checked_mul(2)
-            .ok_or(AnalysisFactAssemblyError::ResourceLimit {
-                resource: "task region identity",
-                limit: limits.items,
-            })?;
+    let task_region_start = actor_region_cursor;
     for (index, task) in graph.tasks.iter().enumerate() {
         check_cancelled(is_cancelled)?;
         let function = facts
@@ -1756,6 +1787,24 @@ fn preflight_actor_facts(
         budget.item()?;
         budget.text(&identity)?;
     }
+    for assignment in &projection.semantic.region_assignments {
+        check_cancelled(is_cancelled)?;
+        budget.item()?;
+        budget.text(&format!("alloc:{}:{}", assignment.id.0, assignment.name))?;
+    }
+    for promotion in &projection.semantic.promotions {
+        check_cancelled(is_cancelled)?;
+        let assignment = projection
+            .semantic
+            .region_assignments
+            .get(promotion.allocation.0 as usize)
+            .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                "promotion allocation is absent",
+            ))?;
+        budget.item()?;
+        budget.text(&format!("alloc:{}:{}", assignment.id.0, assignment.name))?;
+        budget.text(&promotion.reason)?;
+    }
     Ok(())
 }
 
@@ -1967,11 +2016,8 @@ fn assemble_projection(
         // Source semantic facts precede activation lowering. The backend adds
         // exact FlowWir ActivationPlan evidence after that sealed boundary.
         activation_frame_evidence: Vec::new(),
-        // Whole-image region inference and promotion facts (ch03 §7–§8). The
-        // schema carries these ahead of their producer (Lane B task B2b), so
-        // this assembly leaves them empty until that producer is wired.
-        region_assignments: Vec::new(),
-        promotions: Vec::new(),
+        region_assignments: actor_facts.region_assignments,
+        promotions: actor_facts.promotions,
         image_edges: actor_facts.image_edges,
         work,
         hardware: Vec::new(),
@@ -2113,11 +2159,84 @@ fn assemble_actor_facts(
             static_bytes: region.capacity_bytes,
         });
     }
+    let mut region_assignments = try_vec(
+        projection.semantic.region_assignments.len(),
+        "analysis region assignments",
+        budget.limits.items,
+    )?;
+    for assignment in &projection.semantic.region_assignments {
+        check_cancelled(is_cancelled)?;
+        let region = graph
+            .regions
+            .get(assignment.region.0 as usize)
+            .filter(|region| region.id == assignment.region)
+            .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                "region assignment destination is absent",
+            ))?;
+        let allocation = format!("alloc:{}:{}", assignment.id.0, assignment.name);
+        budget.item()?;
+        region_assignments.push(RegionAssignmentFact {
+            allocation: copy_text(&allocation, budget)?,
+            region_class: report_region_class(region.class),
+        });
+    }
+    let mut promotions = try_vec(
+        projection.semantic.promotions.len(),
+        "analysis promotions",
+        budget.limits.items,
+    )?;
+    for promotion in &projection.semantic.promotions {
+        check_cancelled(is_cancelled)?;
+        let assignment = projection
+            .semantic
+            .region_assignments
+            .get(promotion.allocation.0 as usize)
+            .filter(|assignment| assignment.id == promotion.allocation)
+            .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                "promotion allocation is absent",
+            ))?;
+        let source = graph
+            .regions
+            .get(promotion.source_region.0 as usize)
+            .filter(|region| region.id == promotion.source_region)
+            .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                "promotion source region is absent",
+            ))?;
+        let destination = graph
+            .regions
+            .get(promotion.destination.0 as usize)
+            .filter(|region| region.id == promotion.destination)
+            .ok_or(AnalysisFactAssemblyError::InvalidSemanticFacts(
+                "promotion destination region is absent",
+            ))?;
+        let allocation = format!("alloc:{}:{}", assignment.id.0, assignment.name);
+        budget.item()?;
+        promotions.push(PromotionFact {
+            allocation: copy_text(&allocation, budget)?,
+            source_region: report_region_class(source.class),
+            destination_region: report_region_class(destination.class),
+            reason: copy_text(&promotion.reason, budget)?,
+            proof: promotion.proof.0,
+        });
+    }
     Ok(ActorReportFacts {
         image_nodes: nodes,
         image_edges: edges,
         region_capacity_evidence,
+        region_assignments,
+        promotions,
     })
+}
+
+const fn report_region_class(class: RegionClass) -> wrela_image_report::RegionClass {
+    match class {
+        RegionClass::Image => wrela_image_report::RegionClass::Image,
+        RegionClass::Call => wrela_image_report::RegionClass::Call,
+        RegionClass::TaskFrame => wrela_image_report::RegionClass::TaskFrame,
+        RegionClass::Request => wrela_image_report::RegionClass::Request,
+        RegionClass::Pool(_) => wrela_image_report::RegionClass::Pool,
+        RegionClass::Static => wrela_image_report::RegionClass::Static,
+    }
 }
 
 fn seal_projection(
@@ -2257,6 +2376,11 @@ fn projection_matches(
             && facts.image_edges.is_empty()
             && facts.region_capacity_evidence.is_empty()
     };
+    let region_inference_matches = if projection.kind == ProjectionKind::Actor {
+        region_inference_projection_matches(projection, facts, is_cancelled)?
+    } else {
+        facts.region_assignments.is_empty() && facts.promotions.is_empty()
+    };
     Ok(
         facts.reachable_declarations == projection.reachable_declarations
             && u64::try_from(semantic.functions.len())
@@ -2266,12 +2390,7 @@ fn projection_matches(
             && proofs_match
             && facts.actor_lowerings.is_empty()
             && actor_facts_match
-            // Region inference and promotion remain producer-empty in this
-            // projection. The public report sealer validates their shape, but
-            // cannot authenticate them against semantic facts until B2b wires
-            // the producer, so any caller-supplied row must fail closed here.
-            && facts.region_assignments.is_empty()
-            && facts.promotions.is_empty()
+            && region_inference_matches
             && work_matches
             && facts.hardware.is_empty()
             && facts.recovery.is_empty()
@@ -2279,6 +2398,65 @@ fn projection_matches(
             && owner_order_matches(graph, &facts.startup_order, &graph.startup_order)?
             && owner_order_matches(graph, &facts.shutdown_order, &graph.shutdown_order)?,
     )
+}
+
+fn region_inference_projection_matches(
+    projection: &SupportedProjection<'_>,
+    facts: &AnalysisFacts,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, AnalysisFactAssemblyError> {
+    if projection.semantic.region_assignments.len() != facts.region_assignments.len()
+        || projection.semantic.promotions.len() != facts.promotions.len()
+    {
+        return Ok(false);
+    }
+    for (assignment, projected) in projection
+        .semantic
+        .region_assignments
+        .iter()
+        .zip(&facts.region_assignments)
+    {
+        check_cancelled(is_cancelled)?;
+        let Some(region) = projection.graph.regions.get(assignment.region.0 as usize) else {
+            return Ok(false);
+        };
+        if projected.allocation != format!("alloc:{}:{}", assignment.id.0, assignment.name)
+            || projected.region_class != report_region_class(region.class)
+        {
+            return Ok(false);
+        }
+    }
+    for (promotion, projected) in projection.semantic.promotions.iter().zip(&facts.promotions) {
+        check_cancelled(is_cancelled)?;
+        let Some(assignment) = projection
+            .semantic
+            .region_assignments
+            .get(promotion.allocation.0 as usize)
+        else {
+            return Ok(false);
+        };
+        let (Some(source), Some(destination)) = (
+            projection
+                .graph
+                .regions
+                .get(promotion.source_region.0 as usize),
+            projection
+                .graph
+                .regions
+                .get(promotion.destination.0 as usize),
+        ) else {
+            return Ok(false);
+        };
+        if projected.allocation != format!("alloc:{}:{}", assignment.id.0, assignment.name)
+            || projected.source_region != report_region_class(source.class)
+            || projected.destination_region != report_region_class(destination.class)
+            || projected.reason != promotion.reason
+            || projected.proof != promotion.proof.0
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn actor_projection_matches(
@@ -2850,6 +3028,10 @@ mod tests {
         BuildConfiguration, BuildIdentity, BuildProfile, LanguageRevision, Sha256Digest,
         TargetIdentity, ValidatedBuildConfiguration, seal_build_configuration,
     };
+    use wrela_flow_lower::{
+        CanonicalFlowLowerer, FlowLowerer, LowerError as FlowLowerError,
+        LowerRequest as FlowLowerRequest, LoweringLimits as FlowLoweringLimits,
+    };
     use wrela_hir::{
         AggregateDeclaration, AssignmentOperator, Attribute, AttributeIdentity, Body, BodyId,
         BodyOwner, BuiltinAttribute, CallArgument, Declaration, DeclarationId, DeclarationKind,
@@ -2876,7 +3058,7 @@ mod tests {
     };
     use wrela_semantic_lower::{
         CanonicalSemanticLowerer, LowerRequest as SemanticLowerRequest,
-        LoweringLimits as SemanticLoweringLimits, SemanticLowerer,
+        LoweringLimits as SemanticLoweringLimits, SemanticLowerer, semantic_wir,
     };
     use wrela_source::{FileId, SourceDatabase, SourceInput, Span, TextRange};
     use wrela_syntax::{ParseLimits, ParseRequest, SyntaxParser, WrelaSyntaxParser};
@@ -2898,7 +3080,10 @@ async fn checkpoint():
 
 @service
 pub struct Worker:
+    value: u64 = 0
+
     pub async fn ping(mut self):
+        self.value = 7
         await checkpoint()
 
     @task
@@ -3622,6 +3807,8 @@ pub fn boot() -> Image:
             expressions: Vec::new(),
             statements: Vec::new(),
             actor_state_accesses: Vec::new(),
+            region_assignments: Vec::new(),
+            promotions: Vec::new(),
             projection_protocols: Vec::new(),
             lexical_views: Vec::new(),
             scope_protocols: Vec::new(),
@@ -3901,8 +4088,60 @@ pub fn boot() -> Image:
             facts.reachable_declarations,
             semantic_wir.source_summary.reachable_declarations
         );
-        assert_eq!(facts.image_nodes.len(), 5);
+        assert_eq!(
+            facts.image_nodes.len(),
+            graph.actors.len() + graph.tasks.len() + graph.regions.len()
+        );
         assert_eq!(facts.image_edges.len(), 1);
+        assert!(semantic_wir.functions.iter().any(|function| {
+            function.body.statements.iter().any(|statement| {
+                matches!(
+                    statement,
+                    semantic_wir::SemanticStatement::Let(
+                        semantic_wir::LetStatement {
+                            operation: semantic_wir::SemanticOperation::Promote {
+                                destination,
+                                proof,
+                                ..
+                            },
+                            results,
+                            ..
+                        }
+                    ) if results.is_empty()
+                        && semantic_wir.regions[destination.0 as usize].class
+                            == semantic_wir::RegionClass::Image
+                        && semantic_wir.proofs[proof.0 as usize].kind
+                            == semantic_wir::ProofKind::RegionBound
+                )
+            })
+        }));
+        let mut forged_semantic = semantic_wir.clone();
+        let promotion_proof = semantic.promotions[0].proof;
+        forged_semantic.proofs[promotion_proof.0 as usize].kind =
+            semantic_wir::ProofKind::CapacityBound;
+        assert!(
+            forged_semantic.validate().is_err(),
+            "a promotion cannot borrow a capacity proof"
+        );
+        assert!(matches!(
+            facts.region_assignments.as_slice(),
+            [RegionAssignmentFact {
+                allocation,
+                region_class: wrela_image_report::RegionClass::Image,
+            }] if allocation == "alloc:0:actor-state-store"
+        ));
+        assert!(matches!(
+            facts.promotions.as_slice(),
+            [PromotionFact {
+                allocation,
+                source_region: wrela_image_report::RegionClass::TaskFrame,
+                destination_region: wrela_image_report::RegionClass::Image,
+                reason,
+                proof,
+            }] if allocation == "alloc:0:actor-state-store"
+                && reason == "actor state store outlives its non-reentrant turn frame"
+                && facts.proofs[*proof as usize].category == "region-bound"
+        ));
         assert_eq!(
             facts
                 .image_nodes
@@ -4053,6 +4292,19 @@ pub fn boot() -> Image:
         assert_eq!(facts.region_capacity_evidence.len(), graph.regions.len());
         assert!(facts.hardware.is_empty());
         assert!(facts.recovery.is_empty());
+        let (semantic_wir, _) = lowered.into_parts();
+        assert!(matches!(
+            CanonicalFlowLowerer::new().lower(
+                FlowLowerRequest {
+                    input: semantic_wir,
+                    limits: FlowLoweringLimits::standard(),
+                },
+                &|| false,
+            ),
+            Err(FlowLowerError::UnsupportedInput {
+                feature: "semantic-promotion-lowering-pending",
+            })
+        ));
     }
 
     #[test]
@@ -4149,6 +4401,40 @@ pub fn boot() -> Image:
             Err(AnalysisFactAssemblyError::InvalidSemanticFacts(_))
         ));
 
+        let mut wrong_assignment = baseline.clone();
+        wrong_assignment.region_assignments[0].allocation =
+            "alloc:0:substituted-state-store".to_owned();
+        assert!(matches!(
+            seal_projection(
+                &projection,
+                ReportRequest {
+                    build: &image.facts().build,
+                    image_name: &projection.graph.name,
+                    limits,
+                },
+                wrong_assignment,
+                &|| false,
+            ),
+            Err(AnalysisFactAssemblyError::InvalidSemanticFacts(_))
+                | Err(AnalysisFactAssemblyError::Report(_))
+        ));
+
+        let mut wrong_promotion = baseline.clone();
+        wrong_promotion.promotions[0].reason = "substituted escape".to_owned();
+        assert!(matches!(
+            seal_projection(
+                &projection,
+                ReportRequest {
+                    build: &image.facts().build,
+                    image_name: &projection.graph.name,
+                    limits,
+                },
+                wrong_promotion,
+                &|| false,
+            ),
+            Err(AnalysisFactAssemblyError::InvalidSemanticFacts(_))
+        ));
+
         let mut wrong_capacity = baseline;
         let mailbox = wrong_capacity
             .bounds
@@ -4240,6 +4526,8 @@ pub fn boot() -> Image:
             facts.image_nodes.len(),
             facts.image_edges.len(),
             facts.region_capacity_evidence.len(),
+            facts.region_assignments.len(),
+            facts.promotions.len(),
             facts.work.len(),
             facts.hardware.len(),
             facts.recovery.len(),

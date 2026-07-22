@@ -45,6 +45,7 @@ id_type!(TaskId);
 id_type!(DeviceId);
 id_type!(PoolId);
 id_type!(RegionId);
+id_type!(AllocationId);
 id_type!(ProjectionProtocolId);
 id_type!(LexicalViewId);
 id_type!(ScopeProtocolId);
@@ -906,7 +907,7 @@ pub struct StatementFact {
 /// One authenticated access to the canonical actor-owned state cell.  Actor
 /// instances remain erased language values: this record binds the source
 /// receiver and declared field to the independently planned image region.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActorStateAccess {
     pub function: FunctionInstanceId,
     pub actor: ActorId,
@@ -937,6 +938,33 @@ pub enum ActorStateAccessKind {
         current: ValueId,
         result: ValueId,
     },
+}
+
+/// One runtime value whose required lifetime has been classified by the
+/// whole-image escape analysis. IDs are dense in deterministic source order;
+/// `name` is the stable suffix used by public analysis reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionAssignment {
+    pub id: AllocationId,
+    pub name: String,
+    pub function: FunctionInstanceId,
+    pub statement: StatementId,
+    pub value: ValueId,
+    pub region: RegionId,
+    pub source: Span,
+}
+
+/// Authenticated widening of one allocation from a turn-local region into a
+/// longer-lived destination region.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Promotion {
+    pub allocation: AllocationId,
+    pub value: ValueId,
+    pub source_region: RegionId,
+    pub destination: RegionId,
+    pub proof: ProofId,
+    pub reason: String,
+    pub source: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1291,6 +1319,8 @@ pub struct PartialAnalysis {
     pub expressions: Vec<ExpressionFact>,
     pub statements: Vec<StatementFact>,
     pub actor_state_accesses: Vec<ActorStateAccess>,
+    pub region_assignments: Vec<RegionAssignment>,
+    pub promotions: Vec<Promotion>,
     pub projection_protocols: Vec<ProjectionProtocol>,
     pub lexical_views: Vec<LexicalView>,
     pub scope_protocols: Vec<ScopeProtocol>,
@@ -1322,6 +1352,7 @@ impl PartialAnalysis {
         if !dense(self.types.iter().map(|item| item.id.0))
             || !dense(self.functions.iter().map(|item| item.id.0))
             || !dense(self.values.iter().map(|item| item.id.0))
+            || !dense(self.region_assignments.iter().map(|item| item.id.0))
             || !dense(self.projection_protocols.iter().map(|item| item.id.0))
             || !dense(self.lexical_views.iter().map(|item| item.id.0))
             || !dense(self.scope_protocols.iter().map(|item| item.id.0))
@@ -1346,6 +1377,34 @@ impl PartialAnalysis {
             shutdown_order: Vec::new(),
         };
         let graph = self.graph.as_ref().unwrap_or(&empty_graph);
+
+        if self.region_assignments.iter().any(|assignment| {
+            assignment.name.trim().is_empty()
+                || assignment.function.0 as usize >= self.functions.len()
+                || assignment.statement.0 >= self.hir.statements
+                || assignment.value.0 as usize >= self.values.len()
+                || assignment.region.0 as usize >= graph.regions.len()
+                || !valid_span(assignment.source, self.hir.files)
+        }) || !self
+            .promotions
+            .windows(2)
+            .all(|pair| pair[0].allocation < pair[1].allocation)
+            || self.promotions.iter().any(|promotion| {
+                promotion.allocation.0 as usize >= self.region_assignments.len()
+                    || self.region_assignments[promotion.allocation.0 as usize].id
+                        != promotion.allocation
+                    || promotion.value.0 as usize >= self.values.len()
+                    || promotion.source_region.0 as usize >= graph.regions.len()
+                    || promotion.destination.0 as usize >= graph.regions.len()
+                    || promotion.proof.0 as usize >= self.proofs.len()
+                    || promotion.reason.trim().is_empty()
+                    || !valid_span(promotion.source, self.hir.files)
+            })
+        {
+            return Err(invalid(
+                "partial region inference contains a dangling or invalid reference",
+            ));
+        }
 
         for ty in &self.types {
             if !matches!(ty.kind, SemanticTypeKind::Error) && !valid_semantic_type(ty, self, graph)
@@ -1640,6 +1699,7 @@ impl PartialAnalysis {
         if !dense(self.types.iter().map(|item| item.id.0))
             || !dense(self.functions.iter().map(|item| item.id.0))
             || !dense(self.values.iter().map(|item| item.id.0))
+            || !dense(self.region_assignments.iter().map(|item| item.id.0))
             || !dense(self.projection_protocols.iter().map(|item| item.id.0))
             || !dense(self.lexical_views.iter().map(|item| item.id.0))
             || !dense(self.scope_protocols.iter().map(|item| item.id.0))
@@ -1894,6 +1954,11 @@ impl PartialAnalysis {
         if !valid_actor_state_accesses(self, hir.as_program(), graph) {
             return Err(invalid(
                 "actor state accesses differ from their exact HIR receiver, field, region, or capacity proof",
+            ));
+        }
+        if !valid_region_inference(self, hir.as_program(), graph) {
+            return Err(invalid(
+                "region assignments or promotions differ from exact actor-state escapes",
             ));
         }
         if self.baked_artifacts.iter().any(|artifact| {
@@ -9837,6 +9902,96 @@ fn valid_actor_state_accesses(
                     return false;
                 }
             }
+        }
+    }
+    true
+}
+
+pub(crate) const ACTOR_STATE_PROMOTION_REASON: &str =
+    "actor state store outlives its non-reentrant turn frame";
+
+fn valid_region_inference(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    graph: &ImageGraph,
+) -> bool {
+    let direct_write_count = analysis
+        .actor_state_accesses
+        .iter()
+        .filter(|access| matches!(access.kind, ActorStateAccessKind::Write { .. }))
+        .count();
+    if analysis.region_assignments.len() != direct_write_count
+        || analysis.promotions.len() != direct_write_count
+    {
+        return false;
+    }
+    for (index, ((assignment, promotion), access)) in analysis
+        .region_assignments
+        .iter()
+        .zip(&analysis.promotions)
+        .zip(
+            analysis
+                .actor_state_accesses
+                .iter()
+                .filter(|access| matches!(access.kind, ActorStateAccessKind::Write { .. })),
+        )
+        .enumerate()
+    {
+        let ActorStateAccessKind::Write {
+            statement, value, ..
+        } = access.kind
+        else {
+            return false;
+        };
+        let Some(source_region) = graph.regions.get(promotion.source_region.0 as usize) else {
+            return false;
+        };
+        let Some(destination) = graph.regions.get(assignment.region.0 as usize) else {
+            return false;
+        };
+        let allocation = format!("alloc:{}:{}", assignment.id.0, assignment.name);
+        let source_statement = program.statement(statement);
+        if assignment.id.0 as usize != index
+            || assignment.name != "actor-state-store"
+            || assignment.function != access.function
+            || assignment.statement != statement
+            || assignment.value != value
+            || assignment.region != access.region
+            || assignment.source != access.source
+            || promotion.allocation != assignment.id
+            || promotion.value != value
+            || promotion.destination != assignment.region
+            || promotion.reason != ACTOR_STATE_PROMOTION_REASON
+            || promotion.source != access.source
+            || source_region.class != RegionClass::TaskFrame
+            || source_region.owner != ImageOwner::Actor(access.actor)
+            || !source_region.name.ends_with(".turn-frame")
+            || destination.class != RegionClass::Image
+            || destination.owner != ImageOwner::Actor(access.actor)
+            || source_statement.is_none_or(|statement| {
+                statement.attributes.iter().any(|attribute| {
+                    matches!(
+                        attribute.identity,
+                        wrela_hir::AttributeIdentity::Builtin(
+                            wrela_hir::BuiltinAttribute::NoPromote
+                        )
+                    )
+                })
+            })
+            || analysis
+                .proofs
+                .get(promotion.proof.0 as usize)
+                .is_none_or(|proof| {
+                    proof.id != promotion.proof
+                        || proof.kind != ProofKind::RegionBound
+                        || proof.subject != allocation
+                        || proof.sources.as_slice() != [access.source]
+                        || !proof.depends_on.is_empty()
+                        || proof.bound != Some(8)
+                        || proof.explanation.as_slice() != [ACTOR_STATE_PROMOTION_REASON]
+                })
+        {
+            return false;
         }
     }
     true

@@ -1006,10 +1006,12 @@ it. It injects phase implementations and bounded host capabilities, while
   assignment and to an exact `region-bound`/`proved` proof whose subject is that
   allocation and whose finite bound is nonzero. Both vectors are canonicalized,
   item/payload bounded, cancellation-aware, and round-trip through canonical
-  JSON and the decoder. The compiler frontend does not yet populate them (Lane
-  B task B2b), so ordinary builds leave both empty. Adding the arrays produced
-  schema v12; exact identity/assignment/proof sealing bumps 12 to 13. The decoder
-  accepts only the exact current version.
+  JSON and the decoder. The compiler frontend populates them for the bounded
+  direct actor-state store producer, authenticating a `TaskFrame`→`Image`
+  escape and its exact eight-byte `RegionBound` proof; images without that
+  producer leave both empty. Adding the arrays produced schema v12; exact
+  identity/assignment/proof sealing bumps 12 to 13. The decoder accepts only
+  the exact current version.
 - Consumer needs met: the report exposes logical image topology and physical
   lowering, bounds, proof why-chains, actor paths, stack/frame/work/checkpoints,
   hardware/recovery, startup/shutdown, all IR/ABI versions, runtime intrinsics,

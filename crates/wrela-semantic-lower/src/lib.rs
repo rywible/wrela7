@@ -6575,6 +6575,47 @@ impl SourceFunctionLowerer<'_> {
                     else {
                         return Err(self.fact_mismatch("actor state store value"));
                     };
+                    let assignment = self
+                        .input
+                        .facts()
+                        .region_assignments
+                        .iter()
+                        .find(|assignment| {
+                            assignment.function == self.function.id
+                                && assignment.statement == statement_id
+                        })
+                        .ok_or_else(|| self.fact_mismatch("actor state region assignment"))?;
+                    let promotion = self
+                        .input
+                        .facts()
+                        .promotions
+                        .iter()
+                        .find(|promotion| promotion.allocation == assignment.id)
+                        .ok_or_else(|| self.fact_mismatch("actor state promotion"))?;
+                    if assignment.value
+                        != match access.kind {
+                            sema::ActorStateAccessKind::Write { value, .. } => value,
+                            _ => return Err(self.fact_mismatch("actor state direct write")),
+                        }
+                        || assignment.region != access.region
+                        || promotion.value != assignment.value
+                        || promotion.destination != access.region
+                        || promotion.source != statement_source
+                    {
+                        return Err(self.fact_mismatch("actor state promotion provenance"));
+                    }
+                    self.push_statement(
+                        &mut statements,
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            results: Vec::new(),
+                            operation: wir::SemanticOperation::Promote {
+                                value,
+                                destination: wir::RegionId(promotion.destination.0),
+                                proof: wir::ProofId(promotion.proof.0),
+                            },
+                            source: Some(statement_source),
+                        }),
+                    )?;
                     self.push_statement(
                         &mut statements,
                         wir::SemanticStatement::Let(wir::LetStatement {
@@ -13973,6 +14014,18 @@ fn actor_operations_match(
                 proof: rp,
             },
         ) => la == ra && lr == rr && lv == rv && lp == rp,
+        (
+            wir::SemanticOperation::Promote {
+                value: lv,
+                destination: ld,
+                proof: lp,
+            },
+            wir::SemanticOperation::Promote {
+                value: rv,
+                destination: rd,
+                proof: rp,
+            },
+        ) => lv == rv && ld == rd && lp == rp,
         (
             wir::SemanticOperation::EnterScope {
                 scope: left_scope,

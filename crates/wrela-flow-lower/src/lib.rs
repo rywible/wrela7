@@ -1617,6 +1617,9 @@ fn validate_actor_source_function(
                             return Err(unsupported("async await result delivery"));
                         }
                     }
+                    semantic::SemanticOperation::Promote { .. } => {
+                        return Err(unsupported("semantic-promotion-lowering-pending"));
+                    }
                     _ => {
                         return Err(unsupported(
                             "actor runtime operation without exact FlowWir lowering",

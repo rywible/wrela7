@@ -3625,6 +3625,19 @@ fn validate_operation(
                 errors,
             );
             require_id("promotion proof", proof.0, module.proofs.len(), errors);
+            if !valid_promotion_operation(
+                module,
+                function,
+                results,
+                *promoted,
+                *destination,
+                *proof,
+            ) {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "promotion",
+                    id: proof.0,
+                });
+            }
         }
         SemanticOperation::EnterScope { scope, state } => {
             require_id("entered scope", scope.0, module.scopes.len(), errors);
@@ -3742,6 +3755,44 @@ fn valid_actor_state_operation(
             None => matches!(results, [result] if u64_value(*result)),
             Some(value) => results.is_empty() && u64_value(value),
         }
+}
+
+fn valid_promotion_operation(
+    module: &SemanticWir,
+    function: &SemanticFunction,
+    results: &[ValueId],
+    value: ValueId,
+    destination: RegionId,
+    proof: ProofId,
+) -> bool {
+    let FunctionRole::ActorTurn(actor) = function.role else {
+        return false;
+    };
+    let Some(value) = function.values.get(value.0 as usize) else {
+        return false;
+    };
+    let Some(ty) = module.types.get(value.ty.0 as usize) else {
+        return false;
+    };
+    let Some(region) = module.regions.get(destination.0 as usize) else {
+        return false;
+    };
+    let Some(proof) = module.proofs.get(proof.0 as usize) else {
+        return false;
+    };
+    results.is_empty()
+        && ty.kind == TypeKind::Primitive(PrimitiveType::U64)
+        && region.owner == ImageOwner::Actor(actor)
+        && region.class == RegionClass::Image
+        && region.capacity_bytes == 8
+        && region.alignment == 8
+        && proof.kind == ProofKind::RegionBound
+        && proof.subject.starts_with("alloc:")
+        && proof.bound == Some(8)
+        && proof.sources.len() == 1
+        && proof.depends_on.is_empty()
+        && proof.explanation.as_slice()
+            == ["actor state store outlives its non-reentrant turn frame"]
 }
 
 fn use_value(function: &SemanticFunction, value: ValueId, errors: &mut ValidationErrorSink<'_>) {

@@ -801,6 +801,7 @@ const fn builtin_attribute_has_semantic_consumer(builtin: wrela_hir::BuiltinAttr
             | wrela_hir::BuiltinAttribute::Driver
             | wrela_hir::BuiltinAttribute::Task
             | wrela_hir::BuiltinAttribute::Test
+            | wrela_hir::BuiltinAttribute::NoPromote
     )
 }
 
@@ -858,7 +859,7 @@ const fn unimplemented_builtin_attribute_message(
             "built-in attribute `@suspend_safe` is recognized but its semantic contract is not implemented"
         }
         wrela_hir::BuiltinAttribute::NoPromote => {
-            "built-in attribute `@no_promote` is recognized but its semantic contract is not implemented"
+            "implemented built-in attribute cannot produce an unimplemented diagnostic"
         }
         wrela_hir::BuiltinAttribute::Budget => {
             "built-in attribute `@budget` is recognized but its semantic contract is not implemented"
@@ -1164,6 +1165,8 @@ fn empty_partial(
         expressions: Vec::new(),
         statements: Vec::new(),
         actor_state_accesses: Vec::new(),
+        region_assignments: Vec::new(),
+        promotions: Vec::new(),
         projection_protocols: Vec::new(),
         lexical_views: Vec::new(),
         scope_protocols: Vec::new(),
@@ -4407,6 +4410,9 @@ struct RuntimeCheckpoint {
     values: usize,
     expressions: usize,
     statements: usize,
+    actor_state_accesses: usize,
+    region_assignments: usize,
+    promotions: usize,
     proofs: usize,
     projection_protocols: usize,
     lexical_views: usize,
@@ -4422,6 +4428,9 @@ impl RuntimeCheckpoint {
             values: partial.values.len(),
             expressions: partial.expressions.len(),
             statements: partial.statements.len(),
+            actor_state_accesses: partial.actor_state_accesses.len(),
+            region_assignments: partial.region_assignments.len(),
+            promotions: partial.promotions.len(),
             proofs: partial.proofs.len(),
             projection_protocols: partial.projection_protocols.len(),
             lexical_views: partial.lexical_views.len(),
@@ -4436,6 +4445,11 @@ impl RuntimeCheckpoint {
         partial.values.truncate(self.values);
         partial.expressions.truncate(self.expressions);
         partial.statements.truncate(self.statements);
+        partial
+            .actor_state_accesses
+            .truncate(self.actor_state_accesses);
+        partial.region_assignments.truncate(self.region_assignments);
+        partial.promotions.truncate(self.promotions);
         partial.proofs.truncate(self.proofs);
         partial
             .projection_protocols
@@ -13106,6 +13120,236 @@ fn analyze_actor_state_assignment(
     Ok(Some(EffectSet(outcome.effects.0 | EffectSet::ACTOR)))
 }
 
+fn no_promote_attribute(attributes: &[wrela_hir::Attribute]) -> Option<&wrela_hir::Attribute> {
+    attributes.iter().find(|attribute| {
+        matches!(
+            attribute.identity,
+            wrela_hir::AttributeIdentity::Builtin(wrela_hir::BuiltinAttribute::NoPromote)
+        )
+    })
+}
+
+fn no_promote_escape_diagnostic(
+    request: &AnalysisRequest<'_>,
+    source: Span,
+    allocation: &str,
+) -> RuntimeFailure {
+    let build = || -> Result<Diagnostic, AnalysisFailure> {
+        let message = format!(
+            "@no_promote forbids allocation `{allocation}` from being promoted under build profile `{}`",
+            request.build.profile.name
+        );
+        let mut diagnostic = Diagnostic::error(Category::OWNERSHIP, source, message);
+        diagnostic.code = Some(copy_static_analysis_text(
+            "semantic-no-promote-escape",
+            request.limits.fact_bytes,
+        )?);
+        diagnostic.notes.push(copy_static_analysis_text(
+            ACTOR_STATE_PROMOTION_REASON,
+            request.limits.fact_bytes,
+        )?);
+        diagnostic.help.push(copy_static_analysis_text(
+            "remove @no_promote or keep the value within the actor turn",
+            request.limits.fact_bytes,
+        )?);
+        Ok(diagnostic)
+    };
+    match build() {
+        Ok(diagnostic) => RuntimeFailure::Diagnostic(Box::new(diagnostic)),
+        Err(error) => RuntimeFailure::Analysis(error),
+    }
+}
+
+fn no_promote_target_diagnostic(request: &AnalysisRequest<'_>, source: Span) -> RuntimeFailure {
+    let message = format!(
+        "@no_promote is not supported on this source target under build profile `{}`",
+        request.build.profile.name
+    );
+    let mut diagnostic = Diagnostic::error(Category::OWNERSHIP, source, message);
+    diagnostic.code = Some("semantic-no-promote-target".to_owned());
+    diagnostic.help.push(
+        "place @no_promote on a function, actor, or supported allocation declaration".to_owned(),
+    );
+    RuntimeFailure::Diagnostic(Box::new(diagnostic))
+}
+
+fn infer_actor_state_promotions(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<()> {
+    let program = request.hir.as_program();
+    let mut direct_write_count = 0usize;
+    for access in &partial.actor_state_accesses {
+        check_cancelled(is_cancelled)?;
+        if matches!(access.kind, ActorStateAccessKind::Write { .. }) {
+            direct_write_count = direct_write_count
+                .checked_add(1)
+                .ok_or_else(|| fact_resource(request, "actor state promotion facts"))?;
+        }
+    }
+    if direct_write_count > request.limits.image_nodes as usize
+        || partial
+            .proofs
+            .len()
+            .checked_add(direct_write_count)
+            .is_none_or(|count| count > request.limits.proofs as usize)
+    {
+        return Err(fact_resource(request, "actor state promotion facts").into());
+    }
+    let mut direct_writes = Vec::new();
+    direct_writes
+        .try_reserve_exact(direct_write_count)
+        .map_err(|_| fact_resource(request, "actor state promotion work"))?;
+    for access in &partial.actor_state_accesses {
+        check_cancelled(is_cancelled)?;
+        if let ActorStateAccessKind::Write {
+            statement, value, ..
+        } = access.kind
+        {
+            direct_writes.push((*access, statement, value));
+        }
+    }
+    partial
+        .region_assignments
+        .try_reserve_exact(direct_write_count)
+        .map_err(|_| fact_resource(request, "actor state region assignments"))?;
+    partial
+        .promotions
+        .try_reserve_exact(direct_write_count)
+        .map_err(|_| fact_resource(request, "actor state promotions"))?;
+
+    for (access, statement, value) in direct_writes {
+        check_cancelled(is_cancelled)?;
+        let id = AllocationId(
+            u32::try_from(partial.region_assignments.len())
+                .map_err(|_| fact_resource(request, "actor state region assignments"))?,
+        );
+        let allocation = format!("alloc:{}:actor-state-store", id.0);
+        let statement_record = program
+            .statement(statement)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let function = partial
+            .functions
+            .get(access.function.0 as usize)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let FunctionOrigin::Source { declaration, .. } = function.origin else {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        };
+        let method = program
+            .declaration(declaration)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let graph = partial
+            .graph
+            .as_ref()
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let actor = graph
+            .actors
+            .get(access.actor.0 as usize)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let class_declaration = actor_class_declaration(partial, actor.class)?;
+        let class = program
+            .declaration(class_declaration)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let class_field_attribute = match &class.kind {
+            DeclarationKind::Structure(aggregate) => aggregate
+                .fields
+                .get(access.field as usize)
+                .and_then(|field| no_promote_attribute(&field.attributes)),
+            _ => None,
+        };
+        if let Some(attribute) = no_promote_attribute(&method.attributes)
+            .or_else(|| no_promote_attribute(&class.attributes))
+            .or(class_field_attribute)
+            .or_else(|| no_promote_attribute(&statement_record.attributes))
+        {
+            return Err(no_promote_escape_diagnostic(
+                request,
+                attribute.source,
+                &allocation,
+            ));
+        }
+        let source_region = graph
+            .regions
+            .iter()
+            .find(|region| {
+                region.owner == ImageOwner::Actor(access.actor)
+                    && region.class == RegionClass::TaskFrame
+                    && region.name.ends_with(".turn-frame")
+            })
+            .map(|region| region.id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let proof = ProofId(
+            u32::try_from(partial.proofs.len())
+                .map_err(|_| fact_resource(request, "actor state promotion proofs"))?,
+        );
+        partial.proofs.push(Proof {
+            id: proof,
+            kind: ProofKind::RegionBound,
+            subject: copy_analysis_text(&allocation, request.limits.fact_bytes, is_cancelled)?,
+            sources: vec![access.source],
+            depends_on: Vec::new(),
+            bound: Some(8),
+            explanation: vec![ACTOR_STATE_PROMOTION_REASON.to_owned()],
+        });
+        partial.region_assignments.push(RegionAssignment {
+            id,
+            name: "actor-state-store".to_owned(),
+            function: access.function,
+            statement,
+            value,
+            region: access.region,
+            source: access.source,
+        });
+        partial.promotions.push(Promotion {
+            allocation: id,
+            value,
+            source_region,
+            destination: access.region,
+            proof,
+            reason: ACTOR_STATE_PROMOTION_REASON.to_owned(),
+            source: access.source,
+        });
+    }
+
+    let graph = partial
+        .graph
+        .as_ref()
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    for declaration in &program.declarations {
+        check_cancelled(is_cancelled)?;
+        let allowed_declaration = matches!(declaration.kind, DeclarationKind::Function(_))
+            || matches!(declaration.kind, DeclarationKind::Structure(_))
+                && graph.actors.iter().any(|actor| {
+                    actor_class_declaration(partial, actor.class) == Ok(declaration.id)
+                });
+        if let Some(attribute) = no_promote_attribute(&declaration.attributes)
+            && (!allowed_declaration || !attribute.arguments.is_empty())
+        {
+            return Err(no_promote_target_diagnostic(request, attribute.source));
+        }
+        if let DeclarationKind::Structure(aggregate) = &declaration.kind {
+            for field in &aggregate.fields {
+                if let Some(attribute) = no_promote_attribute(&field.attributes)
+                    && (!attribute.arguments.is_empty()
+                        || !graph.actors.iter().any(|actor| {
+                            actor_class_declaration(partial, actor.class) == Ok(declaration.id)
+                        }))
+                {
+                    return Err(no_promote_target_diagnostic(request, attribute.source));
+                }
+            }
+        }
+    }
+    for statement in &program.statements {
+        check_cancelled(is_cancelled)?;
+        if let Some(attribute) = no_promote_attribute(&statement.attributes) {
+            return Err(no_promote_target_diagnostic(request, attribute.source));
+        }
+    }
+    Ok(())
+}
+
 fn runtime_function_module(
     request: &AnalysisRequest<'_>,
     partial: &PartialAnalysis,
@@ -21418,6 +21662,7 @@ fn inspect_actor_plans(
                 ));
             }
             let mut task_attribute = None;
+            let mut no_promote_attribute = None;
             let mut method_attribute_invalid = false;
             for attribute in &member.attributes {
                 check_cancelled(is_cancelled)?;
@@ -21427,19 +21672,26 @@ fn inspect_actor_plans(
                     if task_attribute.replace(attribute).is_some() {
                         method_attribute_invalid = true;
                     }
+                } else if attribute.identity
+                    == wrela_hir::AttributeIdentity::Builtin(wrela_hir::BuiltinAttribute::NoPromote)
+                {
+                    if no_promote_attribute.replace(attribute).is_some() {
+                        method_attribute_invalid = true;
+                    }
                 } else {
                     method_attribute_invalid = true;
                 }
             }
             if method_attribute_invalid
                 || task_attribute.is_some_and(|attribute| !attribute.arguments.is_empty())
+                || no_promote_attribute.is_some_and(|attribute| !attribute.arguments.is_empty())
             {
                 return Err(actor_runtime_diagnostic(
                     Category::ACTOR,
                     member.source,
                     "semantic-actor-method-attribute",
                     "actor method attributes are outside the supported static task subset",
-                    "use a bare @task attribute or no method attribute",
+                    "use at most one bare @task and one bare @no_promote attribute",
                 ));
             }
             let role = if task_attribute.is_none() {
@@ -22544,6 +22796,8 @@ fn populate_actor_image(
             )?;
         }
     }
+
+    infer_actor_state_promotions(request, partial, is_cancelled)?;
 
     let wait_proof = analyze_wait_graph(request, partial, is_cancelled)?;
     let regions = &partial
@@ -26341,10 +26595,122 @@ pub fn boot() -> Image:
         let access = &facts.actor_state_accesses[0];
         assert_eq!(facts.actor_state_accesses[1].region, access.region);
         assert_eq!(facts.actor_state_accesses[1].capacity, access.capacity);
+        let [assignment] = facts.region_assignments.as_slice() else {
+            panic!("one direct state store must receive one inferred region assignment");
+        };
+        let [promotion] = facts.promotions.as_slice() else {
+            panic!("one direct state store must receive one inferred promotion");
+        };
+        assert_eq!(assignment.id, AllocationId(0));
+        assert_eq!(assignment.name, "actor-state-store");
+        assert_eq!(assignment.region, access.region);
+        assert_eq!(promotion.allocation, assignment.id);
+        assert_eq!(promotion.destination, assignment.region);
+        assert_eq!(
+            promotion.value,
+            match facts.actor_state_accesses[1].kind {
+                ActorStateAccessKind::Write { value, .. } => value,
+                _ => unreachable!("second access is the direct write"),
+            }
+        );
+        assert_eq!(
+            facts.proofs[promotion.proof.0 as usize].kind,
+            ProofKind::RegionBound
+        );
 
         let mut forged = facts.clone();
         forged.actor_state_accesses[0].region = RegionId(0);
         assert!(forged.validate_for_seal(image.hir(), &|| false).is_err());
+
+        let mut forged_assignment = facts.clone();
+        forged_assignment.region_assignments[0].name = "substituted-store".to_owned();
+        forged_assignment
+            .validate_partial_structure()
+            .expect("named assignment substitution remains prefix-valid");
+        assert!(
+            forged_assignment
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut forged_promotion = facts.clone();
+        forged_promotion.promotions[0].destination = forged_promotion.promotions[0].source_region;
+        forged_promotion
+            .validate_partial_structure()
+            .expect("promotion region substitution remains prefix-valid");
+        assert!(
+            forged_promotion
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn no_promote_rejects_the_exact_actor_state_escape_and_names_the_profile() {
+        for source in [
+            STATE_ACCESS_ACTOR_SOURCE.replace(
+                "    pub async fn ping(mut self):",
+                "    @no_promote\n    pub async fn ping(mut self):",
+            ),
+            STATE_ACCESS_ACTOR_SOURCE.replace(
+                "@service\npub struct Worker:",
+                "@service\n@no_promote\npub struct Worker:",
+            ),
+            STATE_ACCESS_ACTOR_SOURCE
+                .replace("    value: u64 = 0", "    @no_promote\n    value: u64 = 0"),
+        ] {
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("@no_promote escape is a source diagnostic");
+            let [diagnostic] = output.diagnostics() else {
+                panic!(
+                    "one exact @no_promote rejection expected: {:?}",
+                    output.diagnostics()
+                );
+            };
+            assert_eq!(
+                diagnostic.code.as_deref(),
+                Some("semantic-no-promote-escape")
+            );
+            assert!(diagnostic.message.contains("alloc:0:actor-state-store"));
+            assert!(diagnostic.message.contains("development"));
+            assert!(output.successful().is_none());
+        }
+    }
+
+    #[test]
+    fn no_promote_on_a_nonpromoting_function_is_satisfied() {
+        let source = STATE_ACCESS_ACTOR_SOURCE.replace(
+            "    @task\n    async fn pulse(mut self):",
+            "    @task\n    @no_promote\n    async fn pulse(mut self):",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("nonpromoting @no_promote scope analyzes");
+        assert!(
+            output.diagnostics().is_empty(),
+            "nonpromoting function must satisfy @no_promote: {:?}",
+            output.diagnostics()
+        );
+        assert_eq!(
+            output
+                .successful()
+                .expect("sealed no-promote constraint")
+                .facts()
+                .promotions
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -26862,11 +27228,6 @@ fn partial_initializer_is_rejected():
                 "@suspend_safe",
                 Category::ASYNC,
             ),
-            (
-                BuiltinAttribute::NoPromote,
-                "@no_promote",
-                Category::OWNERSHIP,
-            ),
             (BuiltinAttribute::Budget, "@budget", Category::CAPACITY),
             (
                 BuiltinAttribute::Uninterrupted,
@@ -26908,7 +27269,7 @@ fn partial_initializer_is_rejected():
         let program = fixture.fixture.hir.as_program();
         let baseline = census_builtin_attributes(program, AnalysisLimits::standard(), &|| false)
             .expect("baseline attribute census");
-        assert_eq!(baseline.diagnostics.len(), 11);
+        assert_eq!(baseline.diagnostics.len(), 10);
         assert!(baseline.work_units > 11);
 
         let mut limits = AnalysisLimits::standard();
@@ -26931,7 +27292,7 @@ fn partial_initializer_is_rejected():
         let exact_diagnostic_bytes = baseline.diagnostic_bytes;
         let changes = no_changes();
         let mut limits = AnalysisLimits::standard();
-        limits.diagnostic_count = 11;
+        limits.diagnostic_count = 10;
         limits.diagnostic_bytes = exact_diagnostic_bytes;
         let exact = CanonicalSemanticAnalyzer::new()
             .analyze(
@@ -26939,7 +27300,7 @@ fn partial_initializer_is_rejected():
                 &|| false,
             )
             .expect("exact diagnostic bounds");
-        assert_eq!(exact.diagnostics().len(), 11);
+        assert_eq!(exact.diagnostics().len(), 10);
 
         limits.diagnostic_bytes = exact_diagnostic_bytes - 1;
         assert!(matches!(
@@ -26953,7 +27314,7 @@ fn partial_initializer_is_rejected():
             }) if limit == exact_diagnostic_bytes - 1
         ));
         limits.diagnostic_bytes = exact_diagnostic_bytes;
-        limits.diagnostic_count = 10;
+        limits.diagnostic_count = 9;
         assert!(matches!(
             CanonicalSemanticAnalyzer::new().analyze(
                 parsed_comptime_discovery_request(&fixture, &changes, limits),
@@ -26961,7 +27322,7 @@ fn partial_initializer_is_rejected():
             ),
             Err(AnalysisFailure::ResourceLimit {
                 resource: "semantic diagnostics",
-                limit: 10,
+                limit: 9,
             })
         ));
 
@@ -26993,7 +27354,7 @@ fn partial_initializer_is_rejected():
     }
 
     #[test]
-    fn builtin_attribute_census_names_exactly_the_six_existing_semantic_consumers() {
+    fn builtin_attribute_census_names_exactly_the_seven_existing_semantic_consumers() {
         for implemented in [
             BuiltinAttribute::Image,
             BuiltinAttribute::App,
@@ -27001,6 +27362,7 @@ fn partial_initializer_is_rejected():
             BuiltinAttribute::Driver,
             BuiltinAttribute::Task,
             BuiltinAttribute::Test,
+            BuiltinAttribute::NoPromote,
         ] {
             assert!(builtin_attribute_has_semantic_consumer(implemented));
         }
@@ -27013,7 +27375,6 @@ fn partial_initializer_is_rejected():
             BuiltinAttribute::Offset,
             BuiltinAttribute::LayoutAssert,
             BuiltinAttribute::SuspendSafe,
-            BuiltinAttribute::NoPromote,
             BuiltinAttribute::Budget,
             BuiltinAttribute::Uninterrupted,
         ] {
