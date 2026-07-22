@@ -2130,11 +2130,14 @@ fn model_resources(
             MachineTypeKind::Struct { fields, .. } => meter.edges(fields)?,
             MachineTypeKind::TaggedEnum {
                 payload,
-                payload_variants,
+                storage,
+                variant_payloads,
                 ..
             } => {
-                meter.add_edges(1 + usize::from(payload.is_some()))?;
-                meter.edges(payload_variants)?;
+                meter.add_edges(
+                    1 + usize::from(payload.is_some()) + usize::from(storage.is_some()),
+                )?;
+                meter.edges(variant_payloads)?;
             }
             MachineTypeKind::Function { parameters, .. } => meter.edges(parameters)?,
             MachineTypeKind::Void
@@ -6585,7 +6588,7 @@ mod contract_tests {
         .expect("float not-equal FlowWir reaches MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 16);
+        assert_eq!(machine.version, 17);
         assert!(matches!(machine.types[8].kind, MachineTypeKind::Float32));
         assert!(matches!(machine.types[9].kind, MachineTypeKind::Float64));
         let float_function = &machine.functions[3];
@@ -6693,7 +6696,7 @@ mod contract_tests {
         .expect("unary and lossless casts reach MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 16);
+        assert_eq!(machine.version, 17);
         assert!(matches!(
             machine.types[10].kind,
             MachineTypeKind::Integer { bits: 16 }

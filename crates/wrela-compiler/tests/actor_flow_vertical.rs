@@ -794,7 +794,7 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
 
     let prepared =
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
-            .expect("real parsed actor source reaches sealed MachineWir v16");
+            .expect("real parsed actor source reaches sealed MachineWir v17");
     let optimized_wait = prepared
         .optimized()
         .wir()
@@ -820,7 +820,7 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
     assert_eq!(optimized_supervision.depends_on, supervision.depends_on);
     assert_eq!(optimized_supervision.bound, supervision.bound);
     let machine = prepared.machine().wir().as_wir();
-    assert_eq!(machine.version, 16);
+    assert_eq!(machine.version, 17);
     assert_eq!(machine.activations.len(), 4);
     assert_eq!(machine.region_storage.len(), flow.regions.len());
     assert_eq!(machine.region_storage.len(), 7);

@@ -19,7 +19,7 @@ use wrela_target::{InterruptDomain, TargetError, TargetPackage};
 use wrela_test_model::{GuestTestOutcome, TestEvent, TestEventKind, TestId};
 use wrela_test_protocol::{CanonicalTestEventCodec, ProtocolLimits, TestEventCodec};
 
-pub const MACHINE_WIR_VERSION: u32 = 16;
+pub const MACHINE_WIR_VERSION: u32 = 17;
 pub const REGION_STORAGE_SECTION_PREFIX: &str = ".data$wrela$region$";
 pub const REGION_STORAGE_SYMBOL_PREFIX: &str = "__wrela_region_storage_";
 
@@ -86,17 +86,27 @@ pub enum MachineTypeKind {
     },
     /// Closed enum represented canonically as `{u8 tag}` for an all-unit
     /// shape or `{u8 tag, payload}` when any variant carries a payload.
+    /// `payload` is the physical shared-slot type for a uniform scalar enum;
+    /// `storage` is the exact size/alignment of a heterogeneous shared slot.
+    /// Exactly one is present when any variant carries a payload.
     TaggedEnum {
         tag: MachineTypeId,
         payload: Option<MachineTypeId>,
+        storage: Option<MachineEnumStorage>,
         variants: u16,
-        /// One exact payload-presence bit per discriminant, in tag order.
-        payload_variants: Vec<bool>,
+        /// One exact logical payload type per discriminant, in tag order.
+        variant_payloads: Vec<Option<MachineTypeId>>,
     },
     Function {
         parameters: Vec<MachineTypeId>,
         result: MachineTypeId,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineEnumStorage {
+    pub size: u64,
+    pub alignment: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -764,7 +774,7 @@ pub struct MachineFunction {
     pub source: Option<Span>,
 }
 
-/// The only scheduler ownership admitted by MachineWir v16. An actor turn is
+/// The only scheduler ownership admitted by MachineWir v17. An actor turn is
 /// compiled but remains dormant until a real mailbox admission operation
 /// exists; a single-slot static task is invoked exactly once during startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -848,7 +858,7 @@ pub enum MachineRegionStorageKind {
         actor: u32,
         mailbox_capacity: u32,
     },
-    /// Canonical, actor-owned persistent state cell. MachineWir v16 admits
+    /// Canonical, actor-owned persistent state cell. MachineWir v17 admits
     /// exactly one zero-initialized `u64` cell for a stateful actor; richer
     /// state layouts remain outside this closed representation.
     ActorState {
@@ -1291,11 +1301,12 @@ fn model_resource_usage(
             MachineTypeKind::Struct { fields, .. } => meter.edge_slice(fields)?,
             MachineTypeKind::TaggedEnum {
                 payload,
-                payload_variants,
+                storage,
+                variant_payloads,
                 ..
             } => {
-                meter.edges(1 + u64::from(payload.is_some()))?;
-                meter.edge_slice(payload_variants)?;
+                meter.edges(1 + u64::from(payload.is_some()) + u64::from(storage.is_some()))?;
+                meter.edge_slice(variant_payloads)?;
             }
             MachineTypeKind::Function { parameters, .. } => meter.edge_slice(parameters)?,
             MachineTypeKind::Void
@@ -2569,8 +2580,9 @@ fn validate_type(module: &MachineWir, ty: &MachineType, errors: &mut ValidationC
         MachineTypeKind::TaggedEnum {
             tag,
             payload,
+            storage,
             variants,
-            payload_variants,
+            variant_payloads,
         } => {
             require_id("tagged enum tag type", tag.0, module.types.len(), errors);
             if let Some(payload) = payload {
@@ -2605,26 +2617,93 @@ fn validate_type(module: &MachineWir, ty: &MachineType, errors: &mut ValidationC
                     expected == Some((payload.size, payload.alignment))
                 })
             });
-            let layout_valid = payload.is_some_and(|payload| {
-                module.types.get(payload.0 as usize).is_some_and(|payload| {
-                    let alignment = payload.alignment.max(1);
-                    let offset = (1_u64 + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
-                    offset
-                        .checked_add(payload.size)
-                        .map(|size| (size + u64::from(alignment) - 1) & !(u64::from(alignment) - 1))
-                        == Some(ty.size)
-                        && ty.alignment == alignment
+            let logical_payloads = variant_payloads
+                .iter()
+                .filter_map(|payload| *payload)
+                .collect::<Vec<_>>();
+            let uniform_payload = logical_payloads
+                .first()
+                .copied()
+                .filter(|first| logical_payloads.iter().all(|payload| payload == first));
+            let exact_heterogeneous_profile = match logical_payloads.as_slice() {
+                [left, right] if left != right => {
+                    let scalar = |id: MachineTypeId| {
+                        module.types.get(id.0 as usize).is_some_and(|record| {
+                            matches!(
+                                record.kind,
+                                MachineTypeKind::Integer {
+                                    bits: 8 | 16 | 32 | 64 | 128
+                                } | MachineTypeKind::Float32
+                                    | MachineTypeKind::Float64
+                            )
+                        })
+                    };
+                    let flat = |id: MachineTypeId| {
+                        module.types.get(id.0 as usize).is_some_and(|record| {
+                            record.source_name.is_some()
+                                && matches!(&record.kind, MachineTypeKind::Struct {
+                                    fields,
+                                    packed: false,
+                                } if !fields.is_empty() && fields.iter().all(|field| scalar(field.ty)))
+                        })
+                    };
+                    (flat(*left) && scalar(*right)) || (scalar(*left) && flat(*right))
+                }
+                _ => false,
+            };
+            let storage_valid = storage.is_some_and(|storage| {
+                let derived = logical_payloads
+                    .iter()
+                    .try_fold((0_u64, 1_u32), |state, id| {
+                        module
+                            .types
+                            .get(id.0 as usize)
+                            .map(|record| (state.0.max(record.size), state.1.max(record.alignment)))
+                    });
+                derived.is_some_and(|(size, alignment)| {
+                    let alignment = alignment.max(1);
+                    let size = size
+                        .checked_add(u64::from(alignment) - 1)
+                        .map(|size| size & !(u64::from(alignment) - 1));
+                    size == Some(storage.size)
+                        && storage.alignment == alignment
+                        && storage.alignment.is_power_of_two()
+                        && storage.alignment <= module.layout.maximum_object_alignment
                 })
             });
-            let has_payload = payload_variants.iter().any(|present| *present);
+            let physical = payload
+                .and_then(|payload| {
+                    module
+                        .types
+                        .get(payload.0 as usize)
+                        .map(|record| (record.size, record.alignment))
+                })
+                .or_else(|| storage.map(|storage| (storage.size, storage.alignment)));
+            let layout_valid = physical.is_some_and(|(payload_size, payload_alignment)| {
+                let alignment = payload_alignment.max(1);
+                let offset = (1_u64 + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
+                offset
+                    .checked_add(payload_size)
+                    .map(|size| (size + u64::from(alignment) - 1) & !(u64::from(alignment) - 1))
+                    == Some(ty.size)
+                    && ty.alignment == alignment
+            });
+            let has_payload = !logical_payloads.is_empty();
             let representation_valid = if has_payload {
-                payload.is_some() && payload_valid && layout_valid
+                layout_valid
+                    && match (uniform_payload, payload, storage) {
+                        (Some(logical), Some(physical), None) => {
+                            logical == *physical && payload_valid
+                        }
+                        (None, None, Some(_)) => exact_heterogeneous_profile && storage_valid,
+                        _ => false,
+                    }
             } else {
-                payload.is_none() && ty.size == 1 && ty.alignment == 1
+                payload.is_none() && storage.is_none() && ty.size == 1 && ty.alignment == 1
             };
             if *variants == 0
                 || *variants > 256
-                || usize::from(*variants) != payload_variants.len()
+                || usize::from(*variants) != variant_payloads.len()
                 || !tag_valid
                 || !representation_valid
             {
@@ -6838,18 +6917,17 @@ fn validate_operation_types(
                 && result_ty(0) == Some(*ty)
                 && module.types.get(ty.0 as usize).is_some_and(|record| {
                     matches!(&record.kind, MachineTypeKind::TaggedEnum {
-                        payload: expected,
                         variants,
-                        payload_variants,
+                        variant_payloads,
                         ..
                     } if u16::from(*variant) < *variants
-                        && payload_variants.get(usize::from(*variant)).copied()
-                            == Some(payload.is_some())
-                            && match payload {
-                                None => true,
-                                Some(payload) => expected
-                                    .is_some_and(|expected| value_ty(*payload) == Some(expected)),
-                            })
+                        && variant_payloads.get(usize::from(*variant)).is_some_and(|expected| {
+                            match (expected, payload) {
+                                (None, None) => true,
+                                (Some(expected), Some(payload)) => value_ty(*payload) == Some(*expected),
+                                _ => false,
+                            }
+                        }))
                 })
         }
         MachineOperation::EnumTag { value } => {
@@ -6868,10 +6946,18 @@ fn validate_operation_types(
                     .and_then(|ty| module.types.get(ty.0 as usize))
                     .and_then(|record| match &record.kind {
                         MachineTypeKind::TaggedEnum {
-                            payload: Some(payload),
-                            payload_variants,
+                            variant_payloads,
                             ..
-                        } if payload_variants.iter().any(|present| *present) => Some(*payload),
+                        } => {
+                            let mut payload = None;
+                            for candidate in variant_payloads.iter().flatten() {
+                                if payload.is_some_and(|payload| payload != *candidate) {
+                                    return None;
+                                }
+                                payload = Some(*candidate);
+                            }
+                            payload
+                        }
                         _ => None,
                     })
                     .is_some_and(|expected| result_ty(0) == Some(expected))
@@ -8446,8 +8532,9 @@ mod tests {
             kind: MachineTypeKind::TaggedEnum {
                 tag: MachineTypeId(3),
                 payload: Some(MachineTypeId(3)),
+                storage: None,
                 variants,
-                payload_variants: vec![true; usize::from(variants)],
+                variant_payloads: vec![Some(MachineTypeId(3)); usize::from(variants)],
             },
             size: 2,
             alignment: 1,
@@ -8977,12 +9064,12 @@ mod tests {
 
         let (mut mixed_arity, target) = closed_enum_fixture(2);
         let MachineTypeKind::TaggedEnum {
-            payload_variants, ..
+            variant_payloads, ..
         } = &mut mixed_arity.types[4].kind
         else {
             unreachable!();
         };
-        payload_variants[0] = false;
+        variant_payloads[0] = None;
         mixed_arity
             .clone()
             .validate_for_target(&target)
@@ -9046,14 +9133,16 @@ mod tests {
         all_unit.types[4].alignment = 1;
         let MachineTypeKind::TaggedEnum {
             payload,
-            payload_variants,
+            storage,
+            variant_payloads,
             ..
         } = &mut all_unit.types[4].kind
         else {
             unreachable!();
         };
         *payload = None;
-        payload_variants.fill(false);
+        *storage = None;
+        variant_payloads.fill(None);
         let MachineOperation::MakeEnum { payload, .. } =
             &mut all_unit.functions[1].blocks[0].instructions[0].operation
         else {
@@ -9141,6 +9230,102 @@ mod tests {
                 source: None,
             });
         assert!(forged_projection.validate_for_target(&target).is_err());
+    }
+
+    #[test]
+    fn heterogeneous_enum_authenticates_nominal_payload_storage_and_constructor() {
+        let (mut module, target) = closed_enum_fixture(2);
+        module.types.push(MachineType {
+            id: MachineTypeId(5),
+            kind: MachineTypeKind::Struct {
+                fields: vec![MachineField {
+                    ty: MachineTypeId(3),
+                    offset: 0,
+                }],
+                packed: false,
+            },
+            size: 1,
+            alignment: 1,
+            source_name: Some("Detail".to_owned()),
+        });
+        module.types[4].kind = MachineTypeKind::TaggedEnum {
+            tag: MachineTypeId(3),
+            payload: None,
+            storage: Some(MachineEnumStorage {
+                size: 1,
+                alignment: 1,
+            }),
+            variants: 2,
+            variant_payloads: vec![Some(MachineTypeId(5)), Some(MachineTypeId(3))],
+        };
+        module.functions[1].blocks[0].instructions.remove(2);
+        module.functions[1].values.remove(3);
+        module.functions[1].blocks[0].terminator = MachineTerminator::Return(vec![ValueId(2)]);
+        module
+            .clone()
+            .validate_for_target(&target)
+            .expect("exact heterogeneous enum constructor");
+
+        let (exact, usage) = exact_validation_policy(&module);
+        module
+            .clone()
+            .validate_with_limits(&target, exact, &|| false)
+            .expect("exact heterogeneous enum validation bound");
+        assert_eq!(
+            module.clone().validate_with_limits(
+                &target,
+                ValidationLimits {
+                    model_edges: usage.model_edges - 1,
+                    ..exact
+                },
+                &|| false,
+            ),
+            Err(ValidationFailure::ResourceLimit {
+                resource: "model edges",
+                limit: usage.model_edges - 1,
+            })
+        );
+        let polls = Cell::new(0_u64);
+        module
+            .clone()
+            .validate_with_limits(&target, exact, &|| {
+                polls.set(polls.get() + 1);
+                false
+            })
+            .expect("measure heterogeneous enum cancellation polls");
+        let cancellation_at = polls.get() - 1;
+        let polls = Cell::new(0_u64);
+        assert_eq!(
+            module.clone().validate_with_limits(&target, exact, &|| {
+                let next = polls.get() + 1;
+                polls.set(next);
+                next >= cancellation_at
+            }),
+            Err(ValidationFailure::Cancelled)
+        );
+
+        let mut forged_nominal = module.clone();
+        forged_nominal.types[5].source_name = None;
+        assert!(forged_nominal.validate_for_target(&target).is_err());
+
+        let mut forged_storage = module.clone();
+        let MachineTypeKind::TaggedEnum { storage, .. } = &mut forged_storage.types[4].kind else {
+            unreachable!();
+        };
+        *storage = Some(MachineEnumStorage {
+            size: 2,
+            alignment: 1,
+        });
+        assert!(forged_storage.validate_for_target(&target).is_err());
+
+        let mut forged_tag_payload = module;
+        let MachineOperation::MakeEnum { variant, .. } =
+            &mut forged_tag_payload.functions[1].blocks[0].instructions[0].operation
+        else {
+            unreachable!();
+        };
+        *variant = 0;
+        assert!(forged_tag_payload.validate_for_target(&target).is_err());
     }
 
     #[test]
@@ -9440,8 +9625,8 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_accepts_only_exact_machine_wir_v16() {
-        assert_eq!(MACHINE_WIR_VERSION, 16);
+    fn current_schema_accepts_only_exact_machine_wir_v17() {
+        assert_eq!(MACHINE_WIR_VERSION, 17);
         assert_eq!(
             CheckedIntegerOp::ShiftLeft.invalid_shift_count_fatal_code(),
             Some(RuntimeFatalCode::InvalidShiftCount)
@@ -9464,12 +9649,12 @@ mod tests {
         );
         assert_eq!(CheckedIntegerOp::Add.invalid_shift_count_fatal_code(), None);
         let (module, target) = fixture();
-        for rejected in [15, 17] {
+        for rejected in [16, 18] {
             let mut changed = module.clone();
             changed.version = rejected;
             let errors = changed
                 .validate_for_target(&target)
-                .expect_err("only exact-current MachineWir v16 is accepted");
+                .expect_err("only exact-current MachineWir v17 is accepted");
             assert!(
                 errors
                     .0

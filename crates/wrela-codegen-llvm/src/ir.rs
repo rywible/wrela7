@@ -723,6 +723,49 @@ fn render_instruction(
             let result = required_result(result)?;
             match payload {
                 Some(payload) => {
+                    let storage = match type_kind(machine, *ty)? {
+                        MachineTypeKind::TaggedEnum { storage, .. } => *storage,
+                        _ => None,
+                    };
+                    if let Some(storage) = storage {
+                        let payload_ty = value_type(function, *payload)?;
+                        let payload_alignment = machine
+                            .types
+                            .get(payload_ty.0 as usize)
+                            .ok_or(CodegenError::UnsupportedMachineContract(
+                                "an enum payload has no machine type",
+                            ))?
+                            .alignment;
+                        ir.push("  %t")?;
+                        ir.number(u128::from(instruction.id.0))?;
+                        ir.push("_enum_slot = alloca ")?;
+                        render_enum_storage(ir, storage)?;
+                        ir.push(", align ")?;
+                        ir.number(u128::from(storage.alignment))?;
+                        ir.push("\n  store ")?;
+                        render_enum_storage(ir, storage)?;
+                        ir.push(" zeroinitializer, ptr %t")?;
+                        ir.number(u128::from(instruction.id.0))?;
+                        ir.push("_enum_slot, align ")?;
+                        ir.number(u128::from(storage.alignment))?;
+                        ir.push("\n  store ")?;
+                        render_value_type(ir, machine, function, *payload)?;
+                        ir.push(" %v")?;
+                        ir.number(u128::from(payload.0))?;
+                        ir.push(", ptr %t")?;
+                        ir.number(u128::from(instruction.id.0))?;
+                        ir.push("_enum_slot, align ")?;
+                        ir.number(u128::from(payload_alignment))?;
+                        ir.push("\n  %t")?;
+                        ir.number(u128::from(instruction.id.0))?;
+                        ir.push("_enum_bits = load ")?;
+                        render_enum_storage(ir, storage)?;
+                        ir.push(", ptr %t")?;
+                        ir.number(u128::from(instruction.id.0))?;
+                        ir.push("_enum_slot, align ")?;
+                        ir.number(u128::from(storage.alignment))?;
+                        ir.push("\n")?;
+                    }
                     ir.push("  %t")?;
                     ir.number(u128::from(instruction.id.0))?;
                     ir.push("_enum_tag = insertvalue ")?;
@@ -736,9 +779,16 @@ fn render_instruction(
                     ir.push(" %t")?;
                     ir.number(u128::from(instruction.id.0))?;
                     ir.push("_enum_tag, ")?;
-                    render_value_type(ir, machine, function, *payload)?;
-                    ir.push(" %v")?;
-                    ir.number(u128::from(payload.0))?;
+                    if let Some(storage) = storage {
+                        render_enum_storage(ir, storage)?;
+                        ir.push(" %t")?;
+                        ir.number(u128::from(instruction.id.0))?;
+                        ir.push("_enum_bits")?;
+                    } else {
+                        render_value_type(ir, machine, function, *payload)?;
+                        ir.push(" %v")?;
+                        ir.number(u128::from(payload.0))?;
+                    }
                     ir.push(", 1\n")?;
                 }
                 None => {
@@ -3613,12 +3663,20 @@ fn render_type(
             render_type(ir, machine, *element)?;
             ir.push("]")
         }
-        MachineTypeKind::TaggedEnum { tag, payload, .. } => {
+        MachineTypeKind::TaggedEnum {
+            tag,
+            payload,
+            storage,
+            ..
+        } => {
             ir.push("{ ")?;
             render_type(ir, machine, *tag)?;
             if let Some(payload) = payload {
                 ir.push(", ")?;
                 render_type(ir, machine, *payload)?;
+            } else if let Some(storage) = storage {
+                ir.push(", ")?;
+                render_enum_storage(ir, *storage)?;
             }
             ir.push(" }")
         }
@@ -3639,6 +3697,30 @@ fn render_type(
             "non-scalar LLVM type",
         )),
     }
+}
+
+fn render_enum_storage(
+    ir: &mut IrText,
+    storage: wrela_machine_wir::MachineEnumStorage,
+) -> Result<(), CodegenError> {
+    if storage.size == 0
+        || !storage.alignment.is_power_of_two()
+        || storage.size % u64::from(storage.alignment) != 0
+        || storage.alignment > 16
+    {
+        return Err(CodegenError::UnsupportedMachineContract(
+            "an invalid heterogeneous enum storage layout",
+        ));
+    }
+    ir.push("{ i")?;
+    ir.number(u128::from(storage.alignment) * 8)?;
+    let tail = storage.size - u64::from(storage.alignment);
+    if tail != 0 {
+        ir.push(", [")?;
+        ir.number(u128::from(tail))?;
+        ir.push(" x i8]")?;
+    }
+    ir.push(" }")
 }
 
 fn required_result(result: Option<ValueId>) -> Result<ValueId, CodegenError> {

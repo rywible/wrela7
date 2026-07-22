@@ -2218,9 +2218,6 @@ fn validate_operation(
         | MachineOperation::MakeStruct { .. }
         | MachineOperation::InsertField { .. }
         | MachineOperation::ExtractField { .. }
-        | MachineOperation::MakeEnum { .. }
-        | MachineOperation::EnumTag { .. }
-        | MachineOperation::EnumPayload { .. }
         | MachineOperation::GlobalAddress(_)
         | MachineOperation::ActorReserve { .. }
         | MachineOperation::ActorCommit { .. }
@@ -2230,6 +2227,73 @@ fn validate_operation(
         | MachineOperation::MailboxDispatch { .. }
         | MachineOperation::TestAssert { .. }
         | MachineOperation::Fence(_) => {}
+        MachineOperation::MakeEnum {
+            ty,
+            variant,
+            payload,
+        } => {
+            let result_valid = matches!(instruction.results.as_slice(), [result]
+                if value_type(machine, function, *result) == Some(*ty));
+            let operation_valid = machine.types.get(ty.0 as usize).is_some_and(|record| {
+                supported_enum_type(machine, *ty)
+                    && matches!(&record.kind, MachineTypeKind::TaggedEnum {
+                        variants,
+                        variant_payloads,
+                        ..
+                    } if u16::from(*variant) < *variants
+                        && variant_payloads.get(usize::from(*variant)).is_some_and(|expected| {
+                            match (expected, payload) {
+                                (None, None) => true,
+                                (Some(expected), Some(payload)) => {
+                                    value_type(machine, function, *payload) == Some(*expected)
+                                }
+                                _ => false,
+                            }
+                        }))
+            });
+            if !result_valid || !operation_valid {
+                return Err(unsupported());
+            }
+        }
+        MachineOperation::EnumTag { value } => {
+            let valid = value_type(machine, function, *value).is_some_and(|enum_ty| {
+                machine.types.get(enum_ty.0 as usize).is_some_and(|record| {
+                    supported_enum_type(machine, enum_ty)
+                        && matches!((&record.kind, instruction.results.as_slice()),
+                            (MachineTypeKind::TaggedEnum { tag, .. }, [result])
+                                if value_type(machine, function, *result) == Some(*tag))
+                })
+            });
+            if !valid {
+                return Err(unsupported());
+            }
+        }
+        MachineOperation::EnumPayload { value } => {
+            let valid = value_type(machine, function, *value).is_some_and(|enum_ty| {
+                machine.types.get(enum_ty.0 as usize).is_some_and(|record| {
+                    let MachineTypeKind::TaggedEnum {
+                        variant_payloads, ..
+                    } = &record.kind
+                    else {
+                        return false;
+                    };
+                    let mut expected = None;
+                    for payload in variant_payloads.iter().flatten() {
+                        if expected.is_some_and(|expected| expected != *payload) {
+                            return false;
+                        }
+                        expected = Some(*payload);
+                    }
+                    supported_enum_type(machine, enum_ty)
+                        && matches!((expected, instruction.results.as_slice()),
+                            (Some(expected), [result])
+                                if value_type(machine, function, *result) == Some(expected))
+                })
+            });
+            if !valid {
+                return Err(unsupported());
+            }
+        }
         MachineOperation::Call {
             function: callee,
             arguments,
@@ -2801,8 +2865,9 @@ fn supported_enum_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeI
     let MachineTypeKind::TaggedEnum {
         tag,
         payload,
+        storage,
         variants,
-        payload_variants,
+        variant_payloads,
     } = &ty.kind
     else {
         return false;
@@ -2812,29 +2877,80 @@ fn supported_enum_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeI
     };
     let common = *variants != 0
         && *variants <= 256
-        && usize::from(*variants) == payload_variants.len()
+        && usize::from(*variants) == variant_payloads.len()
         && tag_ty.kind == MachineTypeKind::Integer { bits: 8 }
         && tag_ty.size == 1
         && tag_ty.alignment == 1;
     if !common {
         return false;
     }
-    if payload_variants.iter().any(|present| *present) {
-        let Some(payload_ty) = payload.and_then(|payload| machine.types.get(payload.0 as usize))
-        else {
+    let mut logical_payload = None;
+    let mut heterogeneous = false;
+    let mut maximum_size = 0_u64;
+    let mut maximum_alignment = 1_u32;
+    let mut nominal_count = 0_u8;
+    let mut scalar_count = 0_u8;
+    for logical in variant_payloads.iter().flatten() {
+        let Some(logical_ty) = machine.types.get(logical.0 as usize) else {
             return false;
         };
-        let alignment = payload_ty.alignment.max(1);
+        if logical_payload.is_some_and(|payload| payload != *logical) {
+            heterogeneous = true;
+        }
+        logical_payload.get_or_insert(*logical);
+        maximum_size = maximum_size.max(logical_ty.size);
+        maximum_alignment = maximum_alignment.max(logical_ty.alignment);
+        if supported_scalar_type(&logical_ty.kind, logical_ty.size, logical_ty.alignment) {
+            scalar_count = scalar_count.saturating_add(1);
+        } else if logical_ty.source_name.is_some()
+            && supported_struct_layout(&machine.types, *logical)
+        {
+            nominal_count = nominal_count.saturating_add(1);
+        } else {
+            return false;
+        }
+    }
+    if let Some(logical_payload) = logical_payload {
+        let (payload_size, alignment) = if heterogeneous {
+            let Some(storage) = storage else {
+                return false;
+            };
+            if payload.is_some()
+                || nominal_count != 1
+                || scalar_count != 1
+                || variant_payloads.len() != 2
+                || storage.alignment != maximum_alignment.max(1)
+                || !storage.alignment.is_power_of_two()
+                || storage.alignment > machine.layout.maximum_object_alignment
+                || maximum_size
+                    .checked_add(u64::from(storage.alignment) - 1)
+                    .map(|size| size & !(u64::from(storage.alignment) - 1))
+                    != Some(storage.size)
+            {
+                return false;
+            }
+            (storage.size, storage.alignment)
+        } else {
+            let Some(payload_ty) =
+                payload.and_then(|payload| machine.types.get(payload.0 as usize))
+            else {
+                return false;
+            };
+            if storage.is_some()
+                || payload != &Some(logical_payload)
+                || !supported_scalar_type(&payload_ty.kind, payload_ty.size, payload_ty.alignment)
+            {
+                return false;
+            }
+            (payload_ty.size, payload_ty.alignment.max(1))
+        };
         let payload_offset = (1_u64 + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
         let size = payload_offset
-            .checked_add(payload_ty.size)
+            .checked_add(payload_size)
             .map(|size| (size + u64::from(alignment) - 1) & !(u64::from(alignment) - 1));
-        !matches!(payload_ty.kind, MachineTypeKind::Void)
-            && supported_scalar_type(&payload_ty.kind, payload_ty.size, payload_ty.alignment)
-            && ty.alignment == alignment
-            && size == Some(ty.size)
+        ty.alignment == alignment && size == Some(ty.size)
     } else {
-        payload.is_none() && ty.size == 1 && ty.alignment == 1
+        payload.is_none() && storage.is_none() && ty.size == 1 && ty.alignment == 1
     }
 }
 

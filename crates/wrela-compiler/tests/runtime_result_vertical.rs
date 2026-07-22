@@ -1,17 +1,21 @@
 #![forbid(unsafe_code)]
 
+use std::cell::Cell;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use wrela_backend::{
-    CodegenError, MachineLowerError, emit_prepared_object, llvm_backend_available,
+    BackendContentHasher, BackendPreparationOptions, BackendPreparationServices,
+    CanonicalBackendContentHasher, CanonicalFlowOptimizer, CanonicalMachineLowerer, CodegenError,
+    MachineLowerError, MachineLoweringLimits, OptimizationLimits, OptimizationProfile,
+    emit_prepared_object, llvm_backend_available,
     machine_wir::{
-        MachineFunctionOrigin, MachineOperation, MachineTerminator, MachineTypeKind,
+        MachineFunctionOrigin, MachineOperation, MachineTerminator, MachineTypeId, MachineTypeKind,
         ValidationError,
     },
-    prepare_canonical_frame_for_codegen,
+    prepare_canonical_frame_for_codegen, prepare_for_codegen,
 };
 use wrela_build_model::{
     BuildConfiguration, BuildIdentity, BuildProfile, LanguageRevision, Sha256Digest,
@@ -745,7 +749,7 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
         )
         .expect("runtime-result MachineWir preparation");
         let machine = prepared.machine().wir().as_wir();
-        assert_eq!(machine.version, 16);
+        assert_eq!(machine.version, 17);
         assert!(
             machine
                 .types
@@ -903,9 +907,9 @@ fn match_value() -> u64:
     assert!(machine.types.iter().any(|ty| {
         matches!(&ty.kind, MachineTypeKind::TaggedEnum {
             variants: 2,
-            payload_variants,
+            variant_payloads,
             ..
-        } if payload_variants.as_slice() == [false, true])
+        } if matches!(variant_payloads.as_slice(), [None, Some(_)]))
     }));
     let machine_enum_constructors = machine
         .functions
@@ -939,7 +943,7 @@ fn match_value() -> u64:
 }
 
 #[test]
-fn fixed_flat_generic_enum_payload_reaches_exact_flow_and_named_machine_boundary() {
+fn fixed_flat_generic_enum_payload_reaches_exact_machine_and_native_coff() {
     let fixture = source_fixture_for(
         r#"module runtime_result.image
 
@@ -1033,19 +1037,142 @@ fn fixed_flat_generic_enum_runtime():
         &never_cancelled,
     )
     .expect("fixed flat generic enum FlowWir v15 frame");
-    let error = prepare_canonical_frame_for_codegen(
+    let prepared = prepare_canonical_frame_for_codegen(
         encoded.bytes(),
         &fixture.target,
         &fixture.build,
         &never_cancelled,
     )
-    .expect_err("nominal enum payload must retain the Machine lowering boundary");
-    assert!(matches!(
-        error.machine_lower_error(),
-        Some(MachineLowerError::UnsupportedInput {
-            feature: "machine-enum-nominal-payload-lowering-pending (flat-structure enum payload)"
+    .expect("fixed flat generic enum MachineWir preparation");
+    let machine = prepared.machine().wir().as_wir();
+    let detail = machine
+        .types
+        .iter()
+        .find(|ty| ty.source_name.as_deref() == Some("Detail"))
+        .expect("exact Detail MachineWir type");
+    let envelope = machine
+        .types
+        .iter()
+        .find(|ty| ty.source_name.as_deref() == Some("Envelope"))
+        .expect("exact Envelope MachineWir type");
+    assert!(matches!(&envelope.kind, MachineTypeKind::TaggedEnum {
+        variant_payloads,
+        ..
+    } if variant_payloads.as_slice() == [Some(detail.id), Some(MachineTypeId(1))]));
+
+    let codec = CanonicalFlowWirCodec;
+    let hasher = CanonicalBackendContentHasher::new();
+    let optimizer = CanonicalFlowOptimizer::new();
+    let machine_lowerer = CanonicalMachineLowerer::new();
+    let expected_digest = hasher
+        .sha256(encoded.bytes(), &never_cancelled)
+        .expect("fixed flat generic enum frame digest");
+    let optimization = OptimizationProfile::from_build_policy(
+        &fixture.build.profile.optimization,
+        fixture.build.identity.compiler,
+    )
+    .expect("fixed flat generic enum optimization profile");
+    let prepare_with = |machine_limits: MachineLoweringLimits, is_cancelled: &dyn Fn() -> bool| {
+        prepare_for_codegen(
+            BackendPreparationServices {
+                codec: &codec,
+                hasher: &hasher,
+                optimizer: &optimizer,
+                machine_lowerer: &machine_lowerer,
+            },
+            encoded.bytes(),
+            expected_digest,
+            &fixture.target,
+            &fixture.build,
+            BackendPreparationOptions {
+                codec_limits: CodecLimits::standard(),
+                optimization: optimization.clone(),
+                optimization_limits: OptimizationLimits::standard(),
+                machine_limits,
+            },
+            is_cancelled,
+        )
+    };
+    let instruction_count = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .map(|block| block.instructions.len() as u64)
+        .sum::<u64>();
+    let mut exact_limits = MachineLoweringLimits::standard();
+    exact_limits.types = machine.types.len() as u64;
+    exact_limits.functions = machine.functions.len() as u64;
+    exact_limits.sections = machine.sections.len() as u32;
+    exact_limits.symbols = machine.symbols.len() as u32;
+    exact_limits.globals = machine.globals.len() as u32;
+    exact_limits.instructions = instruction_count;
+    exact_limits.stack_slots = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_slots.len() as u64)
+        .sum::<u64>()
+        .max(1);
+    exact_limits.proofs = machine.proofs.len() as u32;
+    exact_limits.static_bytes = machine
+        .sections
+        .iter()
+        .map(|section| section.reserved_bytes)
+        .sum();
+    exact_limits.stack_bytes_per_function = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_bytes)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    exact_limits = exact_limits.with_aligned_validation();
+    let exact = prepare_with(exact_limits, &never_cancelled)
+        .expect("fixed flat generic enum accepts exact MachineWir instruction ceiling");
+    assert_eq!(exact.machine().wir().as_wir(), machine);
+    let mut one_under = exact_limits;
+    one_under.instructions -= 1;
+    one_under = one_under.with_aligned_validation();
+    let one_under_error = prepare_with(one_under, &never_cancelled)
+        .expect_err("one fewer fixed-flat-enum MachineWir instruction must fail");
+    assert_eq!(
+        one_under_error.machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir instructions",
+            limit: instruction_count - 1,
         })
-    ));
+    );
+    let polls = Cell::new(0_u64);
+    prepare_with(MachineLoweringLimits::standard(), &|| {
+        polls.set(polls.get().saturating_add(1));
+        false
+    })
+    .expect("count fixed flat generic enum MachineWir cancellation polls");
+    let cancellation_at = polls.get().saturating_sub(2);
+    assert!(cancellation_at > 2);
+    let cancelled_polls = Cell::new(0_u64);
+    let cancellation = prepare_with(MachineLoweringLimits::standard(), &|| {
+        let next = cancelled_polls.get().saturating_add(1);
+        cancelled_polls.set(next);
+        next >= cancellation_at
+    })
+    .expect_err("late fixed flat generic enum MachineWir cancellation must propagate");
+    assert!(cancellation.is_cancelled());
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("fixed flat generic enum native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat fixed flat generic enum native emission");
+            assert_eq!(first.bytes(), second.bytes());
+            let digest = HASHER.sha256(first.bytes());
+            assert_eq!(digest, HASHER.sha256(second.bytes()));
+            inspect_native_object(first.bytes(), digest);
+        }
+    }
 }
 
 #[test]
@@ -1450,14 +1577,14 @@ fn match_second() -> u64:
     )
     .expect("all-unit generic enum MachineWir preparation");
     let machine = prepared.machine().wir().as_wir();
-    assert_eq!(machine.version, 16);
+    assert_eq!(machine.version, 17);
     assert!(machine.types.iter().any(|ty| {
         matches!(&ty.kind, MachineTypeKind::TaggedEnum {
             payload: None,
             variants: 2,
-            payload_variants,
+            variant_payloads,
             ..
-        } if payload_variants.as_slice() == [false, false] && ty.size == 1 && ty.alignment == 1)
+        } if variant_payloads.as_slice() == [None, None] && ty.size == 1 && ty.alignment == 1)
     }));
     let machine_enum_constructors = machine
         .functions
@@ -2198,7 +2325,7 @@ fn checked_in_runtime_result_try_reaches_exact_early_return_switch() {
         )
         .expect("runtime-result Try MachineWir preparation");
         let machine = prepared.machine().wir().as_wir();
-        assert_eq!(machine.version, 16);
+        assert_eq!(machine.version, 17);
         let machine_propagation = machine
             .functions
             .iter()

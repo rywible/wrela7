@@ -198,20 +198,23 @@ fn type_kind_equal(
             MachineTypeKind::TaggedEnum {
                 tag: left_tag,
                 payload: left_payload,
+                storage: left_storage,
                 variants: left_variants,
-                payload_variants: left_payload_variants,
+                variant_payloads: left_variant_payloads,
             },
             MachineTypeKind::TaggedEnum {
                 tag: right_tag,
                 payload: right_payload,
+                storage: right_storage,
                 variants: right_variants,
-                payload_variants: right_payload_variants,
+                variant_payloads: right_variant_payloads,
             },
         ) => {
             left_tag == right_tag
                 && left_payload == right_payload
+                && left_storage == right_storage
                 && left_variants == right_variants
-                && fixed_slice_equal(left_payload_variants, right_payload_variants, is_cancelled)?
+                && fixed_slice_equal(left_variant_payloads, right_variant_payloads, is_cancelled)?
         }
         (
             MachineTypeKind::Function {
