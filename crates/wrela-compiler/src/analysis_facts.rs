@@ -5086,6 +5086,95 @@ pub fn boot() -> Image:
     }
 
     #[test]
+    fn checked_subtract_escape_projects_and_reaches_flow_exactly() {
+        let source = BOUNDED_ACTOR_SOURCE.replace("self.value = 7", "self.value -= 1");
+        let image = analyze_parsed_image(&source, "actor-image");
+        let facts = CanonicalAnalysisFactAssembler::new()
+            .assemble(
+                AnalysisFactRequest {
+                    analysis: &image,
+                    limits: wrela_image_report::AnalysisFactLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("checked subtract promotion reaches the image report");
+        assert!(matches!(
+            facts.as_facts().region_assignments.as_slice(),
+            [RegionAssignmentFact {
+                allocation,
+                region_class: wrela_image_report::RegionClass::Image,
+            }] if allocation == "alloc:0:actor-state-compound-store"
+        ));
+        assert!(matches!(
+            facts.as_facts().promotions.as_slice(),
+            [PromotionFact {
+                allocation,
+                source_region: wrela_image_report::RegionClass::TaskFrame,
+                destination_region: wrela_image_report::RegionClass::Image,
+                proof,
+                ..
+            }] if allocation == "alloc:0:actor-state-compound-store"
+                && facts.as_facts().proofs[*proof as usize].category == "region-bound"
+        ));
+
+        let semantic = CanonicalSemanticLowerer::new()
+            .lower(
+                SemanticLowerRequest {
+                    input: image,
+                    limits: SemanticLoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("checked subtract promotion reaches SemanticWir");
+        assert!(semantic.wir().as_wir().functions.iter().any(|function| {
+            function.body.statements.iter().any(|statement| {
+                matches!(
+                    statement,
+                    semantic_wir::SemanticStatement::Let(semantic_wir::LetStatement {
+                        operation: semantic_wir::SemanticOperation::Binary {
+                            operator: semantic_wir::BinaryOperator::Subtract,
+                            arithmetic: semantic_wir::ArithmeticMode::Checked,
+                            ..
+                        },
+                        ..
+                    })
+                )
+            })
+        }));
+        let (semantic, _) = semantic.into_parts();
+        let flow = CanonicalFlowLowerer::new()
+            .lower(
+                FlowLowerRequest {
+                    input: semantic,
+                    limits: FlowLoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("checked subtract promotion reaches FlowWir");
+        let operations = flow
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| {
+                matches!(
+                    instruction.operation,
+                    FlowOperation::Binary {
+                        op: wrela_flow_lower::FlowBinaryOp::SubChecked,
+                        ..
+                    } | FlowOperation::Promote { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            operations, 2,
+            "one checked subtract and one promotion marker"
+        );
+    }
+
+    #[test]
     fn parsed_iso_pool_projects_exact_pool_brand_region_and_capacity_evidence() {
         let image = analyze_parsed_image(ISO_POOL_SOURCE, "pool-image");
         let sealed = CanonicalAnalysisFactAssembler::new()

@@ -1080,6 +1080,7 @@ pub enum ActorStateAccessKind {
     },
     CompoundAssign {
         statement: StatementId,
+        operator: wrela_hir::AssignmentOperator,
         value_expression: ExpressionId,
         value: ValueId,
         current: ValueId,
@@ -12822,6 +12823,7 @@ fn valid_actor_state_accesses(
             }
             ActorStateAccessKind::CompoundAssign {
                 statement,
+                operator: access_operator,
                 value_expression,
                 value,
                 current,
@@ -12892,7 +12894,12 @@ fn valid_actor_state_accesses(
                         })
                 });
                 if record.source != access.source
-                    || operator != wrela_hir::AssignmentOperator::Add
+                    || !matches!(
+                        operator,
+                        wrela_hir::AssignmentOperator::Add
+                            | wrela_hir::AssignmentOperator::Subtract
+                    )
+                    || operator != access_operator
                     || source_value != value_expression
                     || target.root != wrela_hir::Definition::Parameter(access.receiver)
                     || !matches!(target.projections.as_slice(), [wrela_hir::PlaceProjection::Field(name)] if name.as_str() == field.name.as_str())

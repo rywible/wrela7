@@ -16123,15 +16123,15 @@ fn analyze_actor_state_assignment(
     };
     if !matches!(
         operator,
-        AssignmentOperator::Assign | AssignmentOperator::Add
+        AssignmentOperator::Assign | AssignmentOperator::Add | AssignmentOperator::Subtract
     ) {
         return Err(runtime_type_diagnostic(
             request,
             target.source,
             "semantic-actor-state-compound-assignment-pending",
             "this compound actor state assignment is not yet supported",
-            "the canonical state path authenticates plain assignment and checked u64 addition only",
-            "use `self.value = replacement` or `self.value += increment`",
+            "the canonical state path authenticates plain assignment and checked u64 addition or subtraction only",
+            "use `self.value = replacement`, `self.value += increment`, or `self.value -= decrement`",
         ));
     }
     let receiver_binding = parameters
@@ -16183,7 +16183,10 @@ fn analyze_actor_state_assignment(
         is_cancelled,
     )?;
     let value = outcome.result.ok_or(AnalysisFailure::RequestMismatch)?;
-    let compound_values = if operator == AssignmentOperator::Add {
+    let compound_values = if matches!(
+        operator,
+        AssignmentOperator::Add | AssignmentOperator::Subtract
+    ) {
         let current = append_semantic_value(
             request,
             partial,
@@ -16228,6 +16231,7 @@ fn analyze_actor_state_assignment(
         kind: match compound_values {
             Some((current, result)) => ActorStateAccessKind::CompoundAssign {
                 statement,
+                operator,
                 value_expression,
                 value,
                 current,
@@ -34072,8 +34076,55 @@ pub fn boot() -> Image:
     }
 
     #[test]
+    fn actor_state_checked_subtract_promotes_the_checked_result() {
+        let source = STATE_ACCESS_ACTOR_SOURCE.replace("self.value = 7", "self.value -= 1");
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("checked-subtract actor state analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "checked-subtract actor state must analyze: {:?}",
+            output.diagnostics()
+        );
+        let image = output
+            .successful()
+            .expect("sealed checked-subtract actor state");
+        let facts = image.facts();
+        let [promotion] = facts.promotions.as_slice() else {
+            panic!("checked subtract must infer one promotion")
+        };
+        let ActorStateAccessKind::CompoundAssign { value, result, .. } =
+            facts.actor_state_accesses[1].kind
+        else {
+            panic!("checked subtract must retain one compound access")
+        };
+        assert_eq!(promotion.value, result);
+        assert_ne!(promotion.value, value, "the RHS is not the escaped value");
+
+        let mut forged = facts.clone();
+        let ActorStateAccessKind::CompoundAssign { operator, .. } =
+            &mut forged.actor_state_accesses[1].kind
+        else {
+            unreachable!("checked subtract compound access")
+        };
+        *operator = AssignmentOperator::Add;
+        forged
+            .validate_partial_structure()
+            .expect("operator substitution remains prefix-valid");
+        assert!(
+            forged.validate_for_seal(image.hir(), &|| false).is_err(),
+            "the source-authenticated subtract operator cannot be substituted"
+        );
+    }
+
+    #[test]
     fn actor_state_other_compound_assignments_fail_closed_by_name() {
-        for operator in ["-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="] {
+        for operator in ["*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="] {
             let source = STATE_ACCESS_ACTOR_SOURCE
                 .replace("self.value = 7", &format!("self.value {operator} 1"));
             let fixture = parsed_actor_fixture(&source);

@@ -8191,9 +8191,10 @@ impl SourceFunctionLowerer<'_> {
                     local_state.set(local, definition.value)?;
                 }
                 SourceStatementPlan::ActorStateCompoundAssign { access, value } => {
-                    let (value_fact, current, result) = match access.kind {
+                    let (value_fact, operator, current, result) = match access.kind {
                         sema::ActorStateAccessKind::CompoundAssign {
                             statement,
+                            operator,
                             value_expression,
                             value: semantic_value,
                             current,
@@ -8203,7 +8204,7 @@ impl SourceFunctionLowerer<'_> {
                             if value_fact.result != Some(semantic_value) {
                                 return Err(self.fact_mismatch("actor state compound RHS"));
                             }
-                            (value_fact, current, result)
+                            (value_fact, operator, current, result)
                         }
                         _ => return Err(self.fact_mismatch("actor state compound fact")),
                     };
@@ -8269,13 +8270,18 @@ impl SourceFunctionLowerer<'_> {
                     else {
                         return Err(self.fact_mismatch("actor state compound RHS value"));
                     };
+                    let operator = match operator {
+                        wrela_hir::AssignmentOperator::Add => wir::BinaryOperator::Add,
+                        wrela_hir::AssignmentOperator::Subtract => wir::BinaryOperator::Subtract,
+                        _ => return Err(self.fact_mismatch("actor state compound operator")),
+                    };
                     let semantic_result = result;
                     let result = self.value_map.get(semantic_result)?;
                     self.push_let(
                         &mut statements,
                         result,
                         wir::SemanticOperation::Binary {
-                            operator: wir::BinaryOperator::Add,
+                            operator,
                             left: current,
                             right,
                             arithmetic: wir::ArithmeticMode::Checked,
@@ -22261,6 +22267,129 @@ pub fn boot() -> Image:
             Err(LowerError::Cancelled)
         ));
         assert_eq!(polls.get(), cancel_at);
+    }
+
+    #[test]
+    fn checked_actor_state_subtract_retains_operator_and_promotes_its_result() {
+        let source = PROMOTED_STATE_ACTOR_SOURCE.replace("self.value += 7", "self.value -= 7");
+        let image = analyze_parsed_actor_source(&source);
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("checked actor-state subtraction lowers");
+        let baseline = output.wir().as_wir();
+        let turn = baseline
+            .functions
+            .iter()
+            .find(|function| function.role == wir::FunctionRole::ActorTurn(wir::ActorId(0)))
+            .expect("subtraction actor turn");
+        let operations = turn
+            .body
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(statement)
+                    if matches!(
+                        statement.operation,
+                        wir::SemanticOperation::ActorStateLoad { .. }
+                            | wir::SemanticOperation::Binary { .. }
+                            | wir::SemanticOperation::Promote { .. }
+                            | wir::SemanticOperation::ActorStateStore { .. }
+                    ) =>
+                {
+                    Some(statement)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [
+            direct_promotion,
+            direct_store,
+            load,
+            subtract,
+            promotion,
+            store,
+        ] = operations.as_slice()
+        else {
+            panic!("exact direct plus subtract operation sequence")
+        };
+        assert!(matches!(
+            direct_promotion.operation,
+            wir::SemanticOperation::Promote { .. }
+        ));
+        assert!(matches!(
+            direct_store.operation,
+            wir::SemanticOperation::ActorStateStore { .. }
+        ));
+        assert!(matches!(
+            load.operation,
+            wir::SemanticOperation::ActorStateLoad { .. }
+        ));
+        let wir::SemanticOperation::Binary {
+            operator: wir::BinaryOperator::Subtract,
+            right,
+            arithmetic: wir::ArithmeticMode::Checked,
+            ..
+        } = subtract.operation
+        else {
+            panic!("checked actor-state subtraction")
+        };
+        let [result] = subtract.results.as_slice() else {
+            panic!("one checked subtraction result")
+        };
+        let wir::SemanticOperation::Promote { value, .. } = promotion.operation else {
+            panic!("subtract result promotion")
+        };
+        let wir::SemanticOperation::ActorStateStore { value: stored, .. } = store.operation else {
+            panic!("subtract result store")
+        };
+        assert_eq!(value, *result);
+        assert_eq!(stored, *result);
+        assert_ne!(value, right, "the subtract RHS is not the escaped value");
+        assert_eq!(subtract.source, promotion.source);
+        assert_eq!(promotion.source, store.source);
+
+        let mut forged = baseline.clone();
+        let forged_turn = forged
+            .functions
+            .iter_mut()
+            .find(|function| function.role == wir::FunctionRole::ActorTurn(wir::ActorId(0)))
+            .expect("forged subtract turn");
+        let forged_binary = forged_turn
+            .body
+            .statements
+            .iter_mut()
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(statement)
+                    if matches!(statement.operation, wir::SemanticOperation::Binary { .. }) =>
+                {
+                    Some(statement)
+                }
+                _ => None,
+            })
+            .next()
+            .expect("forged subtract operation");
+        let wir::SemanticOperation::Binary { operator, .. } = &mut forged_binary.operation else {
+            unreachable!("filtered binary")
+        };
+        *operator = wir::BinaryOperator::Add;
+        let request = LowerRequest {
+            input: image,
+            limits: LoweringLimits::standard(),
+        };
+        let forged_result = seal(&request, forged, output.report().clone(), &|| false);
+        assert!(
+            matches!(
+                forged_result,
+                Err(LowerError::InvalidReport(_)) | Err(LowerError::InvalidOutput(_))
+            ),
+            "operator substitution must be rejected as output forgery: {forged_result:?}"
+        );
     }
 
     #[test]
