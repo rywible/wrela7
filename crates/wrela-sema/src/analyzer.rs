@@ -18695,22 +18695,14 @@ fn ensure_closed_scalar_enum_type_resolved(
             // resolution-in-progress stack, failing closed with
             // `semantic-runtime-enum-recursive-payload` instead of looping. A
             // flat struct stores only scalars, so it can never transitively
-            // contain an enum. Generic (argument-bearing OR generic-declaration)
-            // enums, view, tuple, and array payloads stay rejected here.
+            // contain an enum. Argument-bearing nominal payloads, generic
+            // payload declarations, views, tuples, and arrays stay rejected
+            // here. A generic outer enum may use the exact nongeneric
+            // flat-structure branch below.
             TypeExpressionKind::Named {
                 definition: Definition::Declaration(resolved),
                 arguments,
             } if arguments.is_empty() => {
-                if !semantic_arguments.is_empty() {
-                    return Err(runtime_type_diagnostic(
-                        request,
-                        field.source,
-                        "semantic-runtime-generic-enum-payload-type",
-                        "runtime generic enum payload is outside the scalar specialization subset",
-                        "this closed-world increment substitutes only primitive stored-copy type parameters and primitive scalar fields",
-                        "use a primitive scalar or one of this enum's unbounded type parameters as the payload",
-                    ));
-                }
                 let payload_declaration = request
                     .hir
                     .resolved_declaration(resolved)
@@ -18724,6 +18716,16 @@ fn ensure_closed_scalar_enum_type_resolved(
                         is_cancelled,
                     )?,
                     DeclarationKind::Enumeration(payload_enum) => {
+                        if !semantic_arguments.is_empty() {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                field.source,
+                                "semantic-runtime-generic-enum-payload-type",
+                                "runtime generic enum has an unsupported fixed enum payload",
+                                "this bounded increment authenticates fixed nongeneric flat-structure payloads but not nested enum payload layouts inside a generic specialization",
+                                "use a primitive scalar, one unbounded type parameter, or one nongeneric flat structure payload",
+                            ));
+                        }
                         // Keep the existing generic rejection: a generic enum
                         // payload is not part of this bounded slice and stays
                         // rejected under the uniform payload-type diagnostic
@@ -38484,9 +38486,9 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn generic_enum_nominal_payload_tail_fails_closed_by_name() {
+    fn generic_enum_fixed_flat_structure_payload_specializes() {
         let source = dot_variant_actor_source(
-            "pub struct Detail:\n    pub word: u8\n\npub enum Envelope[T]:\n    detail(Detail)\n    value(T)\n\nasync fn checkpoint():\n    item: Envelope[u8] = .value(1)\n    pass\n\n",
+            "pub struct Detail:\n    pub word: u8\n\npub enum Envelope[T]:\n    detail(Detail)\n    value(T)\n\nasync fn checkpoint():\n    detail: Envelope[u8] = .detail(Detail(7))\n    value: Envelope[u8] = .value(9)\n    pass\n\n",
         );
         let fixture = parsed_actor_fixture(&source);
         let changes = no_changes();
@@ -38495,13 +38497,128 @@ pub fn boot() -> Image:
                 parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
                 &|| false,
             )
-            .expect("generic enum nominal payload tail should fail by name");
+            .expect("generic enum fixed flat payload analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "fixed flat payload should specialize: {:?}",
+            output.diagnostics()
+        );
+        let successful = output.successful().expect("sealed generic enum payload");
+        let facts = successful.facts();
+        let envelope = fixture
+            .fixture
+            .hir
+            .as_program()
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name.as_ref().map(Name::as_str) == Some("Envelope"))
+            .expect("Envelope declaration");
+        let specialized = facts
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(&ty.kind, SemanticTypeKind::Enumeration { declaration, arguments, .. }
+                    if *declaration == envelope.id && !arguments.is_empty())
+            })
+            .expect("Envelope[u8]");
+        let SemanticTypeKind::Enumeration { variants, .. } = &specialized.kind else {
+            unreachable!()
+        };
+        assert!(matches!(variants.as_slice(), [detail, value]
+            if matches!(detail.fields.as_slice(), [field]
+                if matches!(facts.types[field.ty.0 as usize].kind,
+                    SemanticTypeKind::Structure { arguments: ref args, .. } if args.is_empty()))
+                && matches!(value.fields.as_slice(), [field]
+                    if matches!(facts.types[field.ty.0 as usize].kind,
+                        SemanticTypeKind::Integer { bits: 8, .. }))));
+
+        let specialized_id = specialized.id;
+        let scalar_payload = variants[1].fields[0].ty;
+        let mut forged = facts.clone();
+        let SemanticTypeKind::Enumeration { variants, .. } =
+            &mut forged.types[specialized_id.0 as usize].kind
+        else {
+            unreachable!()
+        };
+        variants[0].fields[0].ty = scalar_payload;
+        forged
+            .validate_partial_structure()
+            .expect("payload-type substitution remains prefix-valid");
+        assert!(
+            forged
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err(),
+            "full sealing must rederive the fixed nominal payload identity"
+        );
+        const EXACT_TYPES: u32 = 6;
+        assert_eq!(facts.types.len(), EXACT_TYPES as usize);
+
+        let mut exact = AnalysisLimits::standard();
+        exact.types = EXACT_TYPES;
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| false)
+            .expect("exact fixed-payload generic enum type limit");
+        let mut one_under = exact;
+        one_under.types = EXACT_TYPES - 1;
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, one_under),
+                &|| false,
+            ),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "semantic types",
+                limit,
+            }) if limit == AnalysisLimits::standard().fact_edges
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            })
+            .expect("count fixed-payload generic enum polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, exact),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn generic_enum_fixed_enum_payload_tail_fails_closed_by_name() {
+        let source = dot_variant_actor_source(
+            "pub enum Detail:\n    word(u8)\n\npub enum Envelope[T]:\n    detail(Detail)\n    value(T)\n\nasync fn checkpoint():\n    item: Envelope[u8] = .value(1)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("generic enum fixed enum payload tail should fail by name");
         assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
         assert_eq!(
             output.diagnostics()[0].code.as_deref(),
             Some("semantic-runtime-generic-enum-payload-type")
         );
         assert!(output.has_errors());
+    }
+
+    #[test]
+    fn generic_enum_nominal_payload_tail_fails_closed_by_name() {
+        generic_enum_fixed_enum_payload_tail_fails_closed_by_name();
     }
 
     #[test]

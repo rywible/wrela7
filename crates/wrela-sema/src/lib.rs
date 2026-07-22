@@ -6272,6 +6272,49 @@ fn exact_flat_structure_type_matches(
         && semantic.alignment_lower_bound == alignment
 }
 
+fn exact_fixed_flat_structure_payload_type(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    source: &wrela_hir::TypeExpression,
+) -> Option<SemanticTypeId> {
+    let wrela_hir::TypeExpressionKind::Named {
+        definition: wrela_hir::Definition::Declaration(resolved),
+        arguments,
+    } = &source.kind
+    else {
+        return None;
+    };
+    if !arguments.is_empty() {
+        return None;
+    }
+    let mut matches = analysis.types.iter().filter(|semantic| {
+        matches!(&semantic.kind, SemanticTypeKind::Structure {
+            declaration,
+            arguments,
+            ..
+        } if *declaration == resolved.declaration && arguments.is_empty())
+            && exact_flat_structure_type_matches(analysis, program, semantic)
+    });
+    let ty = matches.next()?.id;
+    matches.next().is_none().then_some(ty)
+}
+
+fn exact_generic_enum_payload_layout(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    ty: SemanticTypeId,
+) -> Option<(u64, u32)> {
+    exact_stored_copy_scalar_layout(analysis, ty).or_else(|| {
+        let semantic = analysis.types.get(ty.0 as usize)?;
+        matches!(&semantic.kind, SemanticTypeKind::Structure { arguments, .. } if arguments.is_empty())
+            .then_some(())?;
+        exact_flat_structure_type_matches(analysis, program, semantic).then_some((
+            semantic.size_upper_bound?,
+            semantic.alignment_lower_bound,
+        ))
+    })
+}
+
 fn exact_generic_enum_type_matches(
     analysis: &PartialAnalysis,
     program: &wrela_hir::Program,
@@ -6347,6 +6390,12 @@ fn exact_generic_enum_type_matches(
                         SemanticArgument::Type(ty) => Some(*ty),
                         SemanticArgument::Constant(_) | SemanticArgument::Region(_) => None,
                     }),
+                wrela_hir::TypeExpressionKind::Named {
+                    definition: wrela_hir::Definition::Declaration(_),
+                    arguments: source_arguments,
+                } if source_arguments.is_empty() => {
+                    exact_fixed_flat_structure_payload_type(analysis, program, &field.ty)
+                }
                 _ => None,
             },
             _ => return false,
@@ -6356,7 +6405,8 @@ fn exact_generic_enum_type_matches(
             (Some(expected), [field])
                 if field.name.is_empty() && field.public && field.ty == expected =>
             {
-                let Some((size, alignment)) = exact_stored_copy_scalar_layout(analysis, expected)
+                let Some((size, alignment)) =
+                    exact_generic_enum_payload_layout(analysis, program, expected)
                 else {
                     return false;
                 };

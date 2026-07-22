@@ -3162,19 +3162,19 @@ fn validate_supported_source_type(
             // non-scalar field here is exactly one of those two nominal shapes.
             // Fail closed with a named diagnostic rather than falling through to
             // the generic scalar/flat-structure rejection below or miscompiling
-            // against the scalar-slot layout assumed there. (`arguments.is_empty()`
-            // excludes the generic core Result path.)
-            if arguments.is_empty()
-                && variants.iter().any(|variant| {
-                    matches!(variant.fields.as_slice(), [field]
-                    if facts.types.get(field.ty.0 as usize).is_some_and(|field_ty| {
-                        !(field_ty.linearity == sema::Linearity::ScalarCopy
-                            && matches!(field_ty.kind, sema::SemanticTypeKind::Bool
-                                | sema::SemanticTypeKind::Integer { .. }
-                                | sema::SemanticTypeKind::Float { bits: 32 | 64 }))
-                    }))
-                })
-            {
+            // against the scalar-slot layout assumed there. Generic
+            // specializations may now retain one fixed flat-structure payload,
+            // so the guard intentionally applies on both sides of the generic
+            // argument boundary.
+            if variants.iter().any(|variant| {
+                matches!(variant.fields.as_slice(), [field]
+                if facts.types.get(field.ty.0 as usize).is_some_and(|field_ty| {
+                    !(field_ty.linearity == sema::Linearity::ScalarCopy
+                        && matches!(field_ty.kind, sema::SemanticTypeKind::Bool
+                            | sema::SemanticTypeKind::Integer { .. }
+                            | sema::SemanticTypeKind::Float { bits: 32 | 64 }))
+                }))
+            }) {
                 return Err(unsupported(
                     "semantic-enum-nominal-payload-lowering-pending (flat-struct or nongeneric-enum nominal enum payloads)",
                 ));
@@ -21766,6 +21766,55 @@ pub fn boot() -> Image:
                 feature: "semantic-generic-structure-argument-lowering-pending (non-type or non-scalar specialization)"
             })
         ));
+    }
+
+    #[test]
+    fn generic_enum_fixed_flat_payload_stops_at_named_lowering_boundary() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub struct Detail:
+    pub word: u8
+
+pub enum Envelope[T]:
+    detail(Detail)
+    value(T)
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        detail: Envelope[u8] = .detail(Detail(7))
+        value: Envelope[u8] = .value(9)
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let result = CanonicalSemanticLowerer::new().lower(
+            LowerRequest {
+                input: image,
+                limits: LoweringLimits::standard(),
+            },
+            &|| false,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(LowerError::UnsupportedInput {
+                    feature: "semantic-enum-nominal-payload-lowering-pending (flat-struct or nongeneric-enum nominal enum payloads)"
+                })
+            ),
+            "unexpected generic nominal-payload lowering result: {result:?}"
+        );
     }
 
     #[test]
