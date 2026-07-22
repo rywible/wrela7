@@ -22249,6 +22249,52 @@ pub fn boot() -> Image:
     }
 
     #[test]
+    fn bounded_static_text_interpolation_stops_at_named_semantic_lowering_boundary() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+fn render_status():
+    label = "ready"
+    rendered = f"state={label}"
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    @task
+    async fn pulse(mut self):
+        render_status()
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#,
+        );
+        let result = CanonicalSemanticLowerer::new().lower(
+            LowerRequest {
+                input: image,
+                limits: LoweringLimits::standard(),
+            },
+            &|| false,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(LowerError::UnsupportedInput {
+                    feature: "semantic-bounded-string-lowering-pending (BoundedString has no SemanticWir storage, formatting operation, or ABI representation)"
+                })
+            ),
+            "unexpected bounded static text interpolation lowering result: {result:?}"
+        );
+    }
+
+    #[test]
     fn core_option_scalar_question_lowers_to_exact_some_none_match() {
         const EXACT_OPERATIONS: u64 = 6;
         let image = analyze_parsed_actor_source_with_option(

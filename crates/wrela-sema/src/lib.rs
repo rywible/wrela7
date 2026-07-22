@@ -857,6 +857,14 @@ pub enum BoundedInterpolationPart {
         ty: SemanticTypeId,
         maximum_bytes: u64,
     },
+    /// An exact immutable UTF-8 value. `ty` retains its compiler-minted
+    /// `StaticString { bytes }` extent so the seal can authenticate the
+    /// formatted bound without trusting this witness.
+    StaticString {
+        expression: ExpressionId,
+        value: ValueId,
+        ty: SemanticTypeId,
+    },
     Character {
         expression: ExpressionId,
         value: ValueId,
@@ -879,6 +887,7 @@ fn bounded_interpolation_maximum_bytes(kind: &SemanticTypeKind) -> Option<u64> {
     match kind {
         SemanticTypeKind::Bool => Some(5),
         SemanticTypeKind::Character => Some(4),
+        SemanticTypeKind::StaticString { bytes } => Some(*bytes),
         SemanticTypeKind::Integer { signed, bits, .. } if (1..=128).contains(bits) => {
             let magnitude = if *signed {
                 1_u128 << u32::from(bits - 1)
@@ -9071,6 +9080,49 @@ fn exact_bounded_interpolation_matches(
                     format: None,
                     format_source: None,
                 },
+                BoundedInterpolationPart::StaticString {
+                    expression: resolved_expression,
+                    value,
+                    ty,
+                },
+            ) if expression == resolved_expression => {
+                let Some(child) = exact_child_expression(analysis, function, *expression) else {
+                    return false;
+                };
+                let resolved_value = match child.resolution {
+                    ExpressionResolution::Value(value) => Some(value),
+                    _ => child.result,
+                };
+                let Some(bytes) = analysis
+                    .values
+                    .get(value.0 as usize)
+                    .filter(|record| {
+                        record.function == function && record.ty == *ty && child.ty == *ty
+                    })
+                    .and_then(|_| analysis.types.get(ty.0 as usize))
+                    .and_then(|record| match record.kind {
+                        SemanticTypeKind::StaticString { bytes } => Some(bytes),
+                        _ => None,
+                    })
+                else {
+                    return false;
+                };
+                if resolved_value != Some(*value) {
+                    return false;
+                }
+                let Some(next) = expected_capacity.checked_add(bytes) else {
+                    return false;
+                };
+                expected_capacity = next;
+                value_count = value_count.saturating_add(1);
+                effects |= child.effects.0;
+            }
+            (
+                wrela_hir::InterpolationPart::Value {
+                    expression,
+                    format: None,
+                    format_source: None,
+                },
                 BoundedInterpolationPart::Integer {
                     expression: resolved_expression,
                     value,
@@ -9979,6 +10031,12 @@ fn valid_expression_resolution(
                             .and_then(|ty| bounded_interpolation_maximum_bytes(&ty.kind))
                             == Some(*maximum_bytes)
                     }
+                    BoundedInterpolationPart::StaticString { value, ty, .. } => analysis
+                        .values
+                        .get(value.0 as usize)
+                        .filter(|record| record.function == function && record.ty == *ty)
+                        .and_then(|_| analysis.types.get(ty.0 as usize))
+                        .is_some_and(|ty| matches!(ty.kind, SemanticTypeKind::StaticString { .. })),
                     BoundedInterpolationPart::Bool { value, .. } => analysis
                         .values
                         .get(value.0 as usize)
