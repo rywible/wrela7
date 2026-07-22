@@ -5898,10 +5898,15 @@ impl<'a, 'diag> Parser<'a, 'diag> {
             && !self.at(TokenKind::Newline)
         {
             let start = self.position;
-            let named = self.at(TokenKind::Identifier)
+            // `brand` is a reserved declaration keyword, but it is also the
+            // normative named argument of image pool intrinsics. Keep the
+            // exception local to argument-label position; it must not become
+            // a general expression identifier.
+            let named = (self.at(TokenKind::Identifier)
+                || self.at(TokenKind::Keyword(Keyword::Brand)))
                 && self.nth_kind(1) == Some(TokenKind::Operator(Operator::Assign));
             let name = if named {
-                let name = self.parse_identifier(depth + 1)?;
+                let name = self.identifier_from_current(depth + 1)?;
                 self.bump()?;
                 name
             } else {

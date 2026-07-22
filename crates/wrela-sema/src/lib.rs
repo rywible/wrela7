@@ -2058,6 +2058,11 @@ impl PartialAnalysis {
                 "image graph contains invalid references, bounds, or order",
             ));
         }
+        if !valid_iso_pool_contracts(self, hir.as_program(), graph) {
+            return Err(invalid(
+                "branded iso pool facts differ from the exact image-builder source",
+            ));
+        }
         if !valid_static_supervision_contract(self, hir.as_program(), graph, is_cancelled)? {
             return Err(invalid(
                 "static supervision topology or proof closure differs from the exact actor image",
@@ -11234,6 +11239,292 @@ fn valid_image_graph(graph: &ImageGraph, analysis: &PartialAnalysis) -> bool {
         && graph.shutdown_order.len() == shutdown.len()
         && startup == required
         && shutdown == required
+}
+
+fn valid_iso_pool_contracts(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    graph: &ImageGraph,
+) -> bool {
+    if graph.pools.is_empty() {
+        return graph.brands.is_empty()
+            && !analysis
+                .types
+                .iter()
+                .any(|ty| matches!(ty.kind, SemanticTypeKind::Iso { .. }));
+    }
+    // This first source-authenticated increment is deliberately pool-only.
+    // Actor constructor injection and runtime pool handles remain sealed.
+    if !graph.actors.is_empty()
+        || !graph.tasks.is_empty()
+        || !graph.devices.is_empty()
+        || graph.pools.len() != graph.brands.len()
+        || graph.pools.len() != graph.regions.len()
+    {
+        return false;
+    }
+    let iso_call_count = program
+        .expressions
+        .iter()
+        .filter(|expression| {
+            let wrela_hir::ExpressionKind::Call { callee, .. } = expression.kind else {
+                return false;
+            };
+            let Some(wrela_hir::Expression {
+                kind: wrela_hir::ExpressionKind::Index { base, .. },
+                ..
+            }) = program.expression(callee)
+            else {
+                return false;
+            };
+            matches!(
+                program.expression(*base).map(|value| &value.kind),
+                Some(wrela_hir::ExpressionKind::Field { name, .. })
+                    if name.as_str() == "iso_pool"
+            )
+        })
+        .count();
+    if iso_call_count != graph.pools.len() {
+        return false;
+    }
+
+    let mut static_bytes = 0u64;
+    let mut expected_capacity_proofs = Vec::new();
+    if expected_capacity_proofs
+        .try_reserve_exact(graph.pools.len())
+        .is_err()
+    {
+        return false;
+    }
+    for (index, pool) in graph.pools.iter().enumerate() {
+        let Ok(index_u32) = u32::try_from(index) else {
+            return false;
+        };
+        let expected_pool = PoolId(index_u32);
+        let expected_brand = BrandId(index_u32);
+        if pool.id != expected_pool || pool.brand != expected_brand {
+            return false;
+        }
+        let Some(call) = program.expressions.iter().find(|expression| {
+            expression.source == pool.source
+                && matches!(expression.kind, wrela_hir::ExpressionKind::Call { .. })
+        }) else {
+            return false;
+        };
+        let wrela_hir::ExpressionKind::Call { callee, arguments } = &call.kind else {
+            return false;
+        };
+        let Some(wrela_hir::Expression {
+            kind:
+                wrela_hir::ExpressionKind::Index {
+                    base,
+                    index: payload_index,
+                },
+            ..
+        }) = program.expression(*callee)
+        else {
+            return false;
+        };
+        let Some(wrela_hir::Expression {
+            kind: wrela_hir::ExpressionKind::Field { name, .. },
+            ..
+        }) = program.expression(*base)
+        else {
+            return false;
+        };
+        if name.as_str() != "iso_pool" {
+            return false;
+        }
+        let Some(wrela_hir::Expression {
+            kind: wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(payload)),
+            source: _,
+            ..
+        }) = program.expression(*payload_index)
+        else {
+            return false;
+        };
+        if payload.declaration
+            != analysis
+                .types
+                .get(pool.payload.0 as usize)
+                .and_then(|ty| match ty.kind {
+                    SemanticTypeKind::Structure { declaration, .. } => Some(declaration),
+                    _ => None,
+                })
+                .unwrap_or(DeclarationId(u32::MAX))
+        {
+            return false;
+        }
+        let mut brand_source = None;
+        let mut brand_declaration = None;
+        let mut slots_source = None;
+        let mut slots = None;
+        let mut maximum_source = None;
+        let mut maximum = None;
+        for argument in arguments {
+            let Some(value) = argument.expression().and_then(|id| program.expression(id)) else {
+                return false;
+            };
+            match argument.name.as_ref().map(wrela_hir::Name::as_str) {
+                Some("brand") if brand_source.is_none() => {
+                    let wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(
+                        declaration,
+                    )) = &value.kind
+                    else {
+                        return false;
+                    };
+                    brand_source = Some(value.source);
+                    brand_declaration = Some(declaration.declaration);
+                }
+                Some("slots") if slots_source.is_none() => {
+                    let wrela_hir::ExpressionKind::Literal(wrela_hir::Literal::Integer(value_text)) =
+                        &value.kind
+                    else {
+                        return false;
+                    };
+                    slots_source = Some(value.source);
+                    slots =
+                        parse_hir_integer(value_text).and_then(|value| u64::try_from(value).ok());
+                }
+                Some("max_payload") if maximum_source.is_none() => {
+                    let wrela_hir::ExpressionKind::Literal(wrela_hir::Literal::Integer(value_text)) =
+                        &value.kind
+                    else {
+                        return false;
+                    };
+                    maximum_source = Some(value.source);
+                    maximum =
+                        parse_hir_integer(value_text).and_then(|value| u64::try_from(value).ok());
+                }
+                _ => return false,
+            }
+        }
+        let (
+            Some(brand_source),
+            Some(brand_declaration),
+            Some(slots_source),
+            Some(slots),
+            Some(maximum_source),
+            Some(maximum),
+        ) = (
+            brand_source,
+            brand_declaration,
+            slots_source,
+            slots,
+            maximum_source,
+            maximum,
+        )
+        else {
+            return false;
+        };
+        let Some(brand) = graph.brands.get(index) else {
+            return false;
+        };
+        let Some(brand_record) = program.declaration(brand_declaration) else {
+            return false;
+        };
+        if brand.id != expected_brand
+            || brand.declaration != brand_declaration
+            || brand.owner != ImageOwner::Pool(expected_pool)
+            || brand.source != brand_source
+            || !matches!(brand_record.kind, wrela_hir::DeclarationKind::Brand)
+            || brand_record.name.as_ref().map(wrela_hir::Name::as_str) != Some(pool.name.as_str())
+            || pool.capacity != slots
+        {
+            return false;
+        }
+        let Some(payload_record) = analysis.types.get(pool.payload.0 as usize) else {
+            return false;
+        };
+        if payload_record
+            .size_upper_bound
+            .is_none_or(|size| size == 0 || size > maximum)
+            || pool.alignment != payload_record.alignment_lower_bound
+        {
+            return false;
+        }
+        let Some(capacity_bytes) = slots.checked_mul(maximum) else {
+            return false;
+        };
+        static_bytes = match static_bytes.checked_add(capacity_bytes) {
+            Some(value) => value,
+            None => return false,
+        };
+        let Some(region) = graph.regions.get(index) else {
+            return false;
+        };
+        let Some(proof) = analysis.proofs.get(region.proof.0 as usize) else {
+            return false;
+        };
+        if region.id != RegionId(index_u32)
+            || region.name != pool.name
+            || region.class != RegionClass::Pool(expected_pool)
+            || region.capacity_bytes != capacity_bytes
+            || region.alignment != pool.alignment
+            || region.owner != ImageOwner::Pool(expected_pool)
+            || region.source != pool.source
+            || proof.kind != ProofKind::CapacityBound
+            || proof.bound != Some(slots)
+            || proof.sources.as_slice() != [pool.source, brand_source, slots_source, maximum_source]
+        {
+            return false;
+        }
+        expected_capacity_proofs.push(region.proof);
+        let iso_matches = analysis
+            .types
+            .iter()
+            .filter(|ty| {
+                matches!(
+                    ty,
+                    SemanticType {
+                        kind: SemanticTypeKind::Iso { brand, payload },
+                        linearity: Linearity::StrictLinear,
+                        size_upper_bound: None,
+                        alignment_lower_bound: 1,
+                        source: Some(source),
+                        ..
+                    } if *brand == expected_brand
+                        && *payload == pool.payload
+                        && *source == pool.source
+                )
+            })
+            .count();
+        if iso_matches != 1 {
+            return false;
+        }
+    }
+    if graph.static_bytes != static_bytes || graph.peak_bytes != static_bytes {
+        return false;
+    }
+    let Some(entry) = analysis.functions.get(graph.entry.0 as usize) else {
+        return false;
+    };
+    let mut closed_proofs = entry.proofs.iter().filter_map(|id| {
+        analysis
+            .proofs
+            .get(id.0 as usize)
+            .filter(|proof| proof.kind == ProofKind::ImageClosed)
+    });
+    let Some(closed) = closed_proofs.next() else {
+        return false;
+    };
+    if closed_proofs.next().is_some() {
+        return false;
+    }
+    let mut expected_dependencies = Vec::new();
+    if expected_dependencies
+        .try_reserve_exact(expected_capacity_proofs.len().saturating_add(2))
+        .is_err()
+    {
+        return false;
+    }
+    expected_dependencies.extend([ProofId(0), ProofId(1)]);
+    expected_dependencies.extend_from_slice(&expected_capacity_proofs);
+    closed.bound == Some(static_bytes)
+        && closed.depends_on == expected_dependencies
+        && expected_capacity_proofs
+            .iter()
+            .all(|proof| entry.proofs.binary_search(proof).is_ok())
 }
 
 fn valid_static_supervision_contract(

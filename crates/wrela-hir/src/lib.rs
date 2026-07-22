@@ -45,6 +45,17 @@ impl Name {
         }
     }
 
+    /// Construct a call argument label. The image-pool intrinsic reserves the
+    /// declaration keyword `brand` as its normative label; no other keyword is
+    /// admitted through this role-specific constructor.
+    pub fn new_argument_label(value: String) -> Result<Self, InvalidName> {
+        if is_valid_source_identifier(&value) || value == "brand" {
+            Ok(Self(value))
+        } else {
+            Err(InvalidName)
+        }
+    }
+
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -53,6 +64,11 @@ impl Name {
     #[must_use]
     pub fn is_valid(&self) -> bool {
         is_valid_source_identifier(self.as_str())
+    }
+
+    #[must_use]
+    pub fn is_valid_argument_label(&self) -> bool {
+        self.is_valid() || self.as_str() == "brand"
     }
 }
 
@@ -2877,6 +2893,17 @@ fn validate_name(name: &Name, kind: &'static str, errors: &mut ValidationErrorSi
     }
 }
 
+fn validate_argument_name(name: &Name, errors: &mut ValidationErrorSink) {
+    if errors.poll() {
+        return;
+    }
+    if !name.is_valid_argument_label() {
+        errors.push(ValidationError::InvalidName {
+            kind: "call argument",
+        });
+    }
+}
+
 fn declaration_generics(declaration: &Declaration) -> &[GenericParameterId] {
     match &declaration.kind {
         DeclarationKind::Function(value) => &value.generics,
@@ -5072,7 +5099,7 @@ fn validate_expression(
                     return;
                 }
                 if let Some(name) = &argument.name {
-                    validate_name(name, "call argument", errors);
+                    validate_argument_name(name, errors);
                     if names.iter().any(|existing| existing == name) {
                         errors.push(ValidationError::InvalidRecord {
                             arena: "call argument",

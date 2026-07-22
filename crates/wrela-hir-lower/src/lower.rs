@@ -726,6 +726,18 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
         })
     }
 
+    fn call_argument_name(
+        &self,
+        identifier: &syntax::Identifier,
+    ) -> Result<hir::Name, LowerFailure> {
+        let spelling = clone_text(&identifier.spelling, self.request.limits.payload_bytes)?;
+        hir::Name::new_argument_label(spelling).map_err(|_| {
+            LowerFailure::InternalInvariant(
+                "validated syntax contained an invalid call argument label".to_owned(),
+            )
+        })
+    }
+
     fn collect_modules(&mut self) -> Result<(), LowerFailure> {
         reserve(
             &mut self.program.modules,
@@ -5885,7 +5897,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                                     name: argument
                                         .name
                                         .as_ref()
-                                        .map(|name| self.name(name))
+                                        .map(|name| self.call_argument_name(name))
                                         .transpose()?,
                                     value: argument_value,
                                     source: argument.meta.span,

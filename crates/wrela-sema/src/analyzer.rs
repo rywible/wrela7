@@ -20022,6 +20022,9 @@ struct EvaluatedImage {
     /// Actor records contain checked ranges into `names` and are `Copy`, so
     /// dropping an image is O(1) even when evaluation stops at cancellation.
     actors: Vec<EvaluatedActor>,
+    /// Image-only pool declarations. Runtime handle creation and storage are a
+    /// later lowering boundary; these records retain the exact source mint.
+    pools: Vec<EvaluatedIsoPool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20063,6 +20066,19 @@ struct EvaluatedActor {
     mailbox_source: Span,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EvaluatedIsoPool {
+    payload: DeclarationId,
+    brand: DeclarationId,
+    slots: u64,
+    maximum_payload_bytes: u64,
+    source: Span,
+    payload_source: Span,
+    brand_source: Span,
+    slots_source: Span,
+    maximum_payload_source: Span,
+}
+
 impl EvaluatedImage {
     fn name(&self) -> Option<&str> {
         self.names.get(..usize::try_from(self.name_len).ok()?)
@@ -20101,6 +20117,11 @@ enum ComptimeValue {
     ActorHandle {
         actor: u32,
         class: DeclarationId,
+    },
+    /// Proof-only result of one image pool declaration. Any runtime use stays
+    /// behind the named pool-handle boundary.
+    DeclaredIsoPool {
+        pool: u32,
     },
     /// Flat, nominal comptime-only structure value. Field values are stored in
     /// source declaration order and are restricted by the closure checker to
@@ -20159,6 +20180,7 @@ impl ComptimeValue {
             | Self::ActorClass { .. }
             | Self::InstalledActor { .. }
             | Self::ActorHandle { .. }
+            | Self::DeclaredIsoPool { .. }
             | Self::Image(_) => None,
         }
     }
@@ -20493,6 +20515,7 @@ fn comptime_structure_payload_bytes(field_count: usize) -> Option<u64> {
         .and_then(|bytes| u64::try_from(bytes).ok())
 }
 const COMPTIME_ACTOR_BYTES: usize = 64;
+const COMPTIME_POOL_BYTES: usize = 64;
 const COMPTIME_SOURCE_COPY_CHUNK_BYTES: usize = 64;
 const COMPTIME_SYNTAX_DEPTH: u32 = 32;
 // Each source invocation currently uses a small, fixed chain of Rust frames.
@@ -20899,7 +20922,17 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 }
             }
             ExpressionKind::Call { callee, arguments } => {
-                if self.image_supervise_target(*callee).is_some() {
+                if let Some((image, payload, payload_source)) = self.image_iso_pool_target(*callee)
+                {
+                    self.evaluate_image_iso_pool(
+                        image,
+                        payload,
+                        payload_source,
+                        arguments,
+                        expression.source,
+                        depth + 1,
+                    )
+                } else if self.image_supervise_target(*callee).is_some() {
                     Err(self.diagnostic_category(
                         Category::ACTOR,
                         expression.source,
@@ -21000,6 +21033,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                         name_len,
                         name_source,
                         actors: Vec::new(),
+                        pools: Vec::new(),
                     }))
                 }
             }
@@ -21954,6 +21988,12 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                         .checked_add(COMPTIME_ACTOR_BYTES)
                         .ok_or_else(|| self.evaluator_byte_failure())?;
                 }
+                for _pool in &value.pools {
+                    self.work()?;
+                    bytes = bytes
+                        .checked_add(COMPTIME_POOL_BYTES)
+                        .ok_or_else(|| self.evaluator_byte_failure())?;
+                }
                 bytes
             }
             ComptimeValue::Boolean(_)
@@ -21964,6 +22004,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             | ComptimeValue::ActorClass { .. }
             | ComptimeValue::InstalledActor { .. }
             | ComptimeValue::ActorHandle { .. }
+            | ComptimeValue::DeclaredIsoPool { .. }
             | ComptimeValue::Unit => 0,
         };
         self.retain(payload)?;
@@ -21978,11 +22019,20 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                     self.work()?;
                     actors.push(*actor);
                 }
+                let mut pools = Vec::new();
+                pools
+                    .try_reserve_exact(value.pools.len())
+                    .map_err(|_| self.evaluator_byte_failure())?;
+                for pool in &value.pools {
+                    self.work()?;
+                    pools.push(*pool);
+                }
                 ComptimeValue::Image(EvaluatedImage {
                     names: self.copy_precharged_text(&value.names)?,
                     name_len: value.name_len,
                     name_source: value.name_source,
                     actors,
+                    pools,
                 })
             }
             ComptimeValue::Structure {
@@ -22019,6 +22069,9 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                 actor: *actor,
                 class: *class,
             },
+            ComptimeValue::DeclaredIsoPool { pool } => {
+                ComptimeValue::DeclaredIsoPool { pool: *pool }
+            }
             ComptimeValue::Unit => ComptimeValue::Unit,
         })
     }
@@ -22852,6 +22905,256 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
         EvaluatedActorKind::from_install_method(name.as_str()).map(|kind| (*image, kind))
     }
 
+    fn image_iso_pool_target(
+        &self,
+        callee: ExpressionId,
+    ) -> Option<(LocalId, DeclarationId, Span)> {
+        let ExpressionKind::Index { base, index } = &self.program.expression(callee)?.kind else {
+            return None;
+        };
+        let ExpressionKind::Field {
+            base: image_base,
+            name,
+        } = &self.program.expression(*base)?.kind
+        else {
+            return None;
+        };
+        if name.as_str() != "iso_pool" {
+            return None;
+        }
+        let ExpressionKind::Reference(Definition::Local(image)) = self
+            .program
+            .expression(*image_base)
+            .map(|value| &value.kind)?
+        else {
+            return None;
+        };
+        let payload_expression = self.program.expression(*index)?;
+        let ExpressionKind::Reference(Definition::Declaration(payload)) = &payload_expression.kind
+        else {
+            return None;
+        };
+        let declaration = self.request.hir.resolved_declaration(payload)?;
+        matches!(declaration.kind, DeclarationKind::Structure(_)).then_some((
+            *image,
+            declaration.id,
+            payload_expression.source,
+        ))
+    }
+
+    fn evaluate_image_iso_pool(
+        &mut self,
+        image: LocalId,
+        payload: DeclarationId,
+        payload_source: Span,
+        arguments: &[wrela_hir::CallArgument],
+        source: Span,
+        depth: u32,
+    ) -> Result<ComptimeValue, EvaluationFailure> {
+        if arguments.len() != 3 {
+            return Err(self.diagnostic_category(
+                Category::CAPACITY,
+                source,
+                "semantic-iso-pool-shape",
+                "iso_pool requires exactly `brand`, `slots`, and `max_payload` arguments",
+            ));
+        }
+        let mut brand = None;
+        let mut slots = None;
+        let mut maximum_payload = None;
+        for argument in arguments {
+            self.work()?;
+            let expression = argument
+                .expression()
+                .ok_or_else(|| self.unsupported(argument.source))?;
+            let expression_source = self
+                .program
+                .expression(expression)
+                .map_or(argument.source, |value| value.source);
+            match argument.name.as_ref().map(wrela_hir::Name::as_str) {
+                Some("brand") if brand.is_none() => {
+                    let Some(ExpressionKind::Reference(Definition::Declaration(resolved))) =
+                        self.program.expression(expression).map(|value| &value.kind)
+                    else {
+                        return Err(self.diagnostic_category(
+                            Category::OWNERSHIP,
+                            expression_source,
+                            "semantic-iso-pool-brand",
+                            "iso_pool brand must name one source brand declaration",
+                        ));
+                    };
+                    let declaration = self
+                        .request
+                        .hir
+                        .resolved_declaration(resolved)
+                        .filter(|record| matches!(record.kind, DeclarationKind::Brand))
+                        .ok_or_else(|| {
+                            self.diagnostic_category(
+                                Category::OWNERSHIP,
+                                expression_source,
+                                "semantic-iso-pool-brand",
+                                "iso_pool brand must name one source brand declaration",
+                            )
+                        })?;
+                    brand = Some((declaration.id, expression_source));
+                }
+                Some("slots") if slots.is_none() => {
+                    let value = self.evaluate_expression(expression, None, depth)?;
+                    let ComptimeValue::Integer(value) = value else {
+                        return Err(self.diagnostic_category(
+                            Category::CAPACITY,
+                            expression_source,
+                            "semantic-iso-pool-capacity",
+                            "iso_pool slots must be a nonzero compile-time unsigned integer",
+                        ));
+                    };
+                    let value = (!value.signed
+                        || value.signed_value().is_some_and(|value| value >= 0))
+                    .then_some(value.raw)
+                    .and_then(|value| u64::try_from(value).ok())
+                    .filter(|value| *value != 0)
+                    .ok_or_else(|| {
+                        self.diagnostic_category(
+                            Category::CAPACITY,
+                            expression_source,
+                            "semantic-iso-pool-capacity",
+                            "iso_pool slots must be a nonzero compile-time unsigned integer",
+                        )
+                    })?;
+                    slots = Some((value, expression_source));
+                }
+                Some("max_payload") if maximum_payload.is_none() => {
+                    let value = self.evaluate_expression(expression, None, depth)?;
+                    let ComptimeValue::Integer(value) = value else {
+                        return Err(self.diagnostic_category(
+                            Category::CAPACITY,
+                            expression_source,
+                            "semantic-iso-pool-payload-capacity",
+                            "iso_pool max_payload must be a nonzero compile-time unsigned byte count",
+                        ));
+                    };
+                    let value = (!value.signed
+                        || value.signed_value().is_some_and(|value| value >= 0))
+                    .then_some(value.raw)
+                    .and_then(|value| u64::try_from(value).ok())
+                    .filter(|value| *value != 0)
+                    .ok_or_else(|| {
+                        self.diagnostic_category(
+                            Category::CAPACITY,
+                            expression_source,
+                            "semantic-iso-pool-payload-capacity",
+                            "iso_pool max_payload must be a nonzero compile-time unsigned byte count",
+                        )
+                    })?;
+                    maximum_payload = Some((value, expression_source));
+                }
+                _ => {
+                    return Err(self.diagnostic_category(
+                        Category::CAPACITY,
+                        argument.source,
+                        "semantic-iso-pool-shape",
+                        "iso_pool requires each of `brand`, `slots`, and `max_payload` exactly once",
+                    ));
+                }
+            }
+        }
+        let (brand, brand_source) = brand.ok_or_else(|| self.unsupported(source))?;
+        let (slots, slots_source) = slots.ok_or_else(|| self.unsupported(source))?;
+        let (maximum_payload_bytes, maximum_payload_source) =
+            maximum_payload.ok_or_else(|| self.unsupported(source))?;
+        slots.checked_mul(maximum_payload_bytes).ok_or_else(|| {
+            self.diagnostic_category(
+                Category::CAPACITY,
+                maximum_payload_source,
+                "semantic-iso-pool-capacity-overflow",
+                "iso_pool backing byte capacity exceeds the target-independent u64 fact domain",
+            )
+        })?;
+
+        let current = self.load_local(image, source)?;
+        let ComptimeValue::Image(current_image) = &current else {
+            return Err(self.diagnostic_category(
+                Category::IMAGE,
+                source,
+                "semantic-iso-pool-base",
+                "iso_pool must target an initialized local Image value",
+            ));
+        };
+        if let Some(previous) = current_image.pools.iter().find(|pool| pool.brand == brand) {
+            let mut diagnostic = match self.diagnostic_category(
+                Category::OWNERSHIP,
+                brand_source,
+                "semantic-iso-pool-brand-reused",
+                "one source brand cannot be minted by more than one image pool",
+            ) {
+                EvaluationFailure::Diagnostic(diagnostic) => diagnostic,
+                EvaluationFailure::Analysis(_) => unreachable!(),
+            };
+            diagnostic.labels.try_reserve_exact(1).map_err(|_| {
+                EvaluationFailure::Analysis(AnalysisFailure::ResourceLimit {
+                    resource: "comptime evaluator bytes",
+                    limit: self.byte_limit,
+                })
+            })?;
+            diagnostic.labels.push(wrela_diagnostics::Label {
+                span: previous.brand_source,
+                message: "this pool first minted the same brand".to_owned(),
+            });
+            return Err(EvaluationFailure::Diagnostic(diagnostic));
+        }
+        let required_nodes = current_image
+            .pools
+            .len()
+            .checked_add(1)
+            .and_then(|pools| pools.checked_mul(3))
+            .ok_or(EvaluationFailure::Analysis(
+                AnalysisFailure::ResourceLimit {
+                    resource: "image pool nodes",
+                    limit: u64::from(self.request.limits.image_nodes),
+                },
+            ))?;
+        if required_nodes > self.request.limits.image_nodes as usize {
+            return Err(EvaluationFailure::Analysis(
+                AnalysisFailure::ResourceLimit {
+                    resource: "image pool nodes",
+                    limit: u64::from(self.request.limits.image_nodes),
+                },
+            ));
+        }
+        let pool = u32::try_from(current_image.pools.len()).map_err(|_| {
+            EvaluationFailure::Analysis(AnalysisFailure::ResourceLimit {
+                resource: "image pool nodes",
+                limit: u64::from(self.request.limits.image_nodes),
+            })
+        })?;
+        self.dispose_temporary_value(current, source)?;
+        self.retain(COMPTIME_POOL_BYTES)?;
+        let byte_limit = self.byte_limit;
+        let Some(ComptimeValue::Image(current_image)) = self.local_mut(image) else {
+            return Err(EvaluationFailure::Analysis(
+                AnalysisFailure::RequestMismatch,
+            ));
+        };
+        current_image.pools.try_reserve(1).map_err(|_| {
+            EvaluationFailure::Analysis(AnalysisFailure::ResourceLimit {
+                resource: "comptime evaluator bytes",
+                limit: byte_limit,
+            })
+        })?;
+        current_image.pools.push(EvaluatedIsoPool {
+            payload,
+            brand,
+            slots,
+            maximum_payload_bytes,
+            source,
+            payload_source,
+            brand_source,
+            slots_source,
+            maximum_payload_source,
+        });
+        Ok(ComptimeValue::DeclaredIsoPool { pool })
+    }
+
     fn image_supervise_target(&self, callee: ExpressionId) -> Option<LocalId> {
         let ExpressionKind::Field { base, name } = &self.program.expression(callee)?.kind else {
             return None;
@@ -23344,10 +23647,17 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                     .checked_mul(COMPTIME_ACTOR_BYTES)
                     .and_then(|bytes| u64::try_from(bytes).ok())
                     .ok_or_else(|| self.evaluator_byte_failure())?;
+                let pool_bytes = image
+                    .pools
+                    .len()
+                    .checked_mul(COMPTIME_POOL_BYTES)
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .ok_or_else(|| self.evaluator_byte_failure())?;
                 let names_bytes =
                     u64::try_from(image.names.len()).map_err(|_| self.evaluator_byte_failure())?;
                 let payload = actor_bytes
                     .checked_add(names_bytes)
+                    .and_then(|bytes| bytes.checked_add(pool_bytes))
                     .ok_or_else(|| self.evaluator_byte_failure())?;
                 for actor in &image.actors {
                     self.work()?;
@@ -23356,6 +23666,10 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
                     ))?;
                 }
                 drop(std::mem::take(&mut image.actors));
+                for _pool in &image.pools {
+                    self.work()?;
+                }
+                drop(std::mem::take(&mut image.pools));
                 self.work()?;
                 drop(std::mem::take(&mut image.names));
                 Ok(payload)
@@ -23368,6 +23682,7 @@ impl<'request, 'input> ImageEvaluator<'request, 'input> {
             | ComptimeValue::ActorClass { .. }
             | ComptimeValue::InstalledActor { .. }
             | ComptimeValue::ActorHandle { .. }
+            | ComptimeValue::DeclaredIsoPool { .. }
             | ComptimeValue::Unit => Ok(0),
         }
     }
@@ -24218,11 +24533,42 @@ fn populate_evaluated_image(
         is_cancelled,
     )?;
     let actors = std::mem::take(&mut image.actors);
+    let pools = std::mem::take(&mut image.pools);
     let names = std::mem::take(&mut image.names);
     let checkpoint = RuntimeCheckpoint::new(partial);
     populate_minimum_image(request, partial, constructor, image_name)?;
-    if actors.is_empty() {
+    if actors.is_empty() && pools.is_empty() {
         return Ok(None);
+    }
+    if !actors.is_empty() && !pools.is_empty() {
+        checkpoint.rollback(partial);
+        partial.graph = None;
+        let mut diagnostic = Diagnostic::error(
+            Category::IMAGE,
+            pools[0].source,
+            "iso pools and installed actors are not yet closed by one image-lowering profile",
+        );
+        diagnostic.code = Some("semantic-iso-pool-actor-integration-pending".to_owned());
+        diagnostic.help.push(
+            "build the exact pool-only image while actor constructor injection and pool-handle lowering remain sealed"
+                .to_owned(),
+        );
+        return Ok(Some(diagnostic));
+    }
+    if actors.is_empty() {
+        return match populate_iso_pool_image(request, partial, &pools, is_cancelled) {
+            Ok(()) => Ok(None),
+            Err(RuntimeFailure::Diagnostic(diagnostic)) => {
+                checkpoint.rollback(partial);
+                partial.graph = None;
+                Ok(Some(*diagnostic))
+            }
+            Err(RuntimeFailure::Analysis(error)) => {
+                checkpoint.rollback(partial);
+                partial.graph = None;
+                Err(error)
+            }
+        };
     }
     match populate_actor_image(request, partial, actors, &names, is_cancelled) {
         Ok(()) => Ok(None),
@@ -24237,6 +24583,271 @@ fn populate_evaluated_image(
             Err(error)
         }
     }
+}
+
+fn populate_iso_pool_image(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    pools: &[EvaluatedIsoPool],
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<()> {
+    check_cancelled(is_cancelled)?;
+    let Some(mut graph) = partial.graph.take() else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    if partial.proofs.last().map(|proof| (proof.id, &proof.kind))
+        != Some((ProofId(2), &ProofKind::ImageClosed))
+    {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    partial.proofs.pop();
+    let entry = partial
+        .functions
+        .get_mut(graph.entry.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if entry.proofs.pop() != Some(ProofId(2)) {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+
+    let required_nodes = pools
+        .len()
+        .checked_mul(3)
+        .ok_or_else(|| fact_resource(request, "image pool nodes"))?;
+    if required_nodes > request.limits.image_nodes as usize {
+        return Err(AnalysisFailure::ResourceLimit {
+            resource: "image pool nodes",
+            limit: u64::from(request.limits.image_nodes),
+        }
+        .into());
+    }
+    graph
+        .pools
+        .try_reserve_exact(pools.len())
+        .map_err(|_| fact_resource(request, "image pools"))?;
+    graph
+        .brands
+        .try_reserve_exact(pools.len())
+        .map_err(|_| fact_resource(request, "image pool brands"))?;
+    graph
+        .regions
+        .try_reserve_exact(pools.len())
+        .map_err(|_| fact_resource(request, "image pool regions"))?;
+    let mut aggregate_work = RuntimeAggregateWork::default();
+    let mut capacity_proofs = Vec::new();
+    capacity_proofs
+        .try_reserve_exact(pools.len())
+        .map_err(|_| fact_resource(request, "image pool capacity proofs"))?;
+    let mut static_bytes = 0u64;
+    for (index, pool) in pools.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        let pool_id =
+            PoolId(u32::try_from(index).map_err(|_| fact_resource(request, "image pools"))?);
+        let brand_id =
+            BrandId(u32::try_from(index).map_err(|_| fact_resource(request, "image pool brands"))?);
+        let payload = ensure_flat_structure_type(
+            request,
+            partial,
+            pool.payload,
+            &mut aggregate_work,
+            is_cancelled,
+        )?;
+        let payload_record = partial
+            .types
+            .get(payload.0 as usize)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let payload_bytes = payload_record
+            .size_upper_bound
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if payload_bytes == 0 || payload_bytes > pool.maximum_payload_bytes {
+            let mut diagnostic = Diagnostic::error(
+                Category::CAPACITY,
+                pool.maximum_payload_source,
+                "iso_pool max_payload is smaller than its exact payload type",
+            );
+            diagnostic.code = Some("semantic-iso-pool-payload-capacity".to_owned());
+            diagnostic.labels.push(wrela_diagnostics::Label {
+                span: pool.payload_source,
+                message: format!("this payload requires {payload_bytes} bytes"),
+            });
+            diagnostic.help.push(format!(
+                "set max_payload to at least {payload_bytes} bytes for this payload"
+            ));
+            return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
+        }
+        let alignment = payload_record.alignment_lower_bound;
+        let capacity_bytes = pool
+            .slots
+            .checked_mul(pool.maximum_payload_bytes)
+            .ok_or_else(|| fact_resource(request, "image pool backing bytes"))?;
+        static_bytes = static_bytes
+            .checked_add(capacity_bytes)
+            .ok_or_else(|| fact_resource(request, "image static bytes"))?;
+        let declaration = request
+            .hir
+            .as_program()
+            .declaration(pool.brand)
+            .filter(|record| matches!(record.kind, DeclarationKind::Brand))
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let name = copy_analysis_text(
+            declaration
+                .name
+                .as_ref()
+                .map(wrela_hir::Name::as_str)
+                .ok_or(AnalysisFailure::RequestMismatch)?,
+            request.limits.fact_bytes,
+            is_cancelled,
+        )?;
+        let capacity_proof = append_capacity_proof(
+            request,
+            partial,
+            bounded_actor_text(request, "iso pool slots: ", "", &name, is_cancelled)?,
+            vec![
+                pool.source,
+                pool.brand_source,
+                pool.slots_source,
+                pool.maximum_payload_source,
+            ],
+            pool.slots,
+            "the source-minted brand names exactly one pool, every slot reserves max_payload bytes, and the exact flat payload fits that reservation",
+        )?;
+        capacity_proofs.push(capacity_proof);
+        graph.brands.push(BrandBinding {
+            id: brand_id,
+            declaration: pool.brand,
+            owner: ImageOwner::Pool(pool_id),
+            source: pool.brand_source,
+        });
+        let region_name = copy_analysis_text(&name, request.limits.fact_bytes, is_cancelled)?;
+        graph.pools.push(PoolNode {
+            id: pool_id,
+            name,
+            brand: brand_id,
+            payload,
+            capacity: pool.slots,
+            alignment,
+            reachable_devices: Vec::new(),
+            source: pool.source,
+        });
+        graph.regions.push(Region {
+            id: RegionId(
+                u32::try_from(index).map_err(|_| fact_resource(request, "image pool regions"))?,
+            ),
+            name: region_name,
+            class: RegionClass::Pool(pool_id),
+            capacity_bytes,
+            alignment,
+            owner: ImageOwner::Pool(pool_id),
+            proof: capacity_proof,
+            source: pool.source,
+        });
+        if partial.types.len() >= request.limits.types as usize {
+            return Err(fact_resource(request, "iso pool handle types").into());
+        }
+        let iso_id = SemanticTypeId(
+            u32::try_from(partial.types.len())
+                .map_err(|_| fact_resource(request, "iso pool handle types"))?,
+        );
+        partial
+            .types
+            .try_reserve(1)
+            .map_err(|_| fact_resource(request, "iso pool handle types"))?;
+        partial.types.push(SemanticType {
+            id: iso_id,
+            kind: SemanticTypeKind::Iso {
+                brand: brand_id,
+                payload,
+            },
+            linearity: Linearity::StrictLinear,
+            size_upper_bound: None,
+            alignment_lower_bound: 1,
+            source: Some(pool.source),
+        });
+    }
+    graph.static_bytes = static_bytes;
+    graph.peak_bytes = static_bytes;
+    graph.startup_order.clear();
+    graph
+        .startup_order
+        .try_reserve_exact(pools.len().saturating_add(1))
+        .map_err(|_| fact_resource(request, "iso pool startup owners"))?;
+    graph.startup_order.push(ImageOwner::Runtime);
+    graph
+        .startup_order
+        .extend(graph.pools.iter().map(|pool| ImageOwner::Pool(pool.id)));
+    graph.shutdown_order.clear();
+    graph
+        .shutdown_order
+        .try_reserve_exact(pools.len().saturating_add(1))
+        .map_err(|_| fact_resource(request, "iso pool shutdown owners"))?;
+    graph.shutdown_order.extend(
+        graph
+            .pools
+            .iter()
+            .rev()
+            .map(|pool| ImageOwner::Pool(pool.id)),
+    );
+    graph.shutdown_order.push(ImageOwner::Runtime);
+    partial.graph = Some(graph);
+
+    let closed_proof = ProofId(
+        u32::try_from(partial.proofs.len())
+            .map_err(|_| fact_resource(request, "closed iso pool image proof"))?,
+    );
+    if partial.proofs.len() >= request.limits.proofs as usize {
+        return Err(fact_resource(request, "closed iso pool image proof").into());
+    }
+    let mut dependencies = Vec::new();
+    dependencies
+        .try_reserve_exact(capacity_proofs.len().saturating_add(2))
+        .map_err(|_| fact_resource(request, "closed iso pool proof dependencies"))?;
+    dependencies.extend([ProofId(0), ProofId(1)]);
+    dependencies.extend_from_slice(&capacity_proofs);
+    let mut sources = Vec::new();
+    sources
+        .try_reserve_exact(pools.len())
+        .map_err(|_| fact_resource(request, "closed iso pool proof sources"))?;
+    sources.extend(pools.iter().map(|pool| pool.source));
+    partial
+        .proofs
+        .try_reserve(1)
+        .map_err(|_| fact_resource(request, "closed iso pool image proof"))?;
+    partial.proofs.push(Proof {
+        id: closed_proof,
+        kind: ProofKind::ImageClosed,
+        subject: copy_analysis_text(
+            "closed branded iso pool image",
+            request.limits.fact_bytes,
+            is_cancelled,
+        )?,
+        sources,
+        depends_on: dependencies,
+        bound: Some(static_bytes),
+        explanation: vec![
+            "every source brand is minted exactly once; pool slots and backing bytes are fixed before boot; runtime allocation and transfer remain sealed"
+                .to_owned(),
+        ],
+    });
+    let graph = partial
+        .graph
+        .as_ref()
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let entry = partial
+        .functions
+        .get_mut(graph.entry.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    entry
+        .proofs
+        .try_reserve(capacity_proofs.len().saturating_add(1))
+        .map_err(|_| fact_resource(request, "image entry pool proof references"))?;
+    entry.proofs.extend_from_slice(&capacity_proofs);
+    entry.proofs.push(closed_proof);
+    entry.uninterrupted_work_bound = Some(
+        1u64.checked_add(
+            u64::try_from(pools.len()).map_err(|_| fact_resource(request, "image pool startup"))?,
+        )
+        .ok_or_else(|| fact_resource(request, "image pool startup"))?,
+    );
+    Ok(())
 }
 
 fn inspect_actor_plans(
@@ -29227,6 +29838,292 @@ pub struct Packet:
                 source: None,
                 ..
             }]
+        ));
+    }
+
+    const ISO_POOL_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+brand Payloads
+
+pub struct Payload:
+    pub value: u64
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    payloads = img.iso_pool[Payload](brand=Payloads, slots=2, max_payload=64)
+    return img
+"#;
+
+    #[test]
+    fn image_iso_pool_mints_one_exact_brand_and_capacity_region() {
+        let fixture = parsed_actor_fixture(ISO_POOL_SOURCE);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("iso pool analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "iso pool must analyze: {:?}",
+            output.diagnostics()
+        );
+        let image = output.successful().expect("sealed iso pool image");
+        let facts = image.facts();
+        let graph = facts.graph.as_ref().expect("image graph");
+        assert!(matches!(
+            graph.brands.as_slice(),
+            [BrandBinding {
+                id: BrandId(0),
+                declaration,
+                owner: ImageOwner::Pool(PoolId(0)),
+                ..
+            }] if *declaration == fixture
+                .fixture
+                .hir
+                .as_program()
+                .declarations
+                .iter()
+                .find(|declaration| matches!(declaration.kind, DeclarationKind::Brand))
+                .expect("brand declaration")
+                .id
+        ));
+        assert!(matches!(
+            graph.pools.as_slice(),
+            [PoolNode {
+                id: PoolId(0),
+                brand: BrandId(0),
+                capacity: 2,
+                alignment: 8,
+                ..
+            }]
+        ));
+        assert!(graph.regions.iter().any(|region| {
+            region.class == RegionClass::Pool(PoolId(0))
+                && region.capacity_bytes == 128
+                && region.alignment == 8
+                && facts
+                    .proofs
+                    .get(region.proof.0 as usize)
+                    .is_some_and(|proof| {
+                        proof.kind == ProofKind::CapacityBound && proof.bound == Some(2)
+                    })
+        }));
+        assert_eq!(graph.static_bytes, 128);
+        assert_eq!(graph.peak_bytes, 128);
+        assert!(facts.types.iter().any(|ty| {
+            matches!(
+                ty,
+                SemanticType {
+                    kind: SemanticTypeKind::Iso {
+                        brand: BrandId(0),
+                        payload,
+                    },
+                    linearity: Linearity::StrictLinear,
+                    size_upper_bound: None,
+                    alignment_lower_bound: 1,
+                    ..
+                } if *payload == graph.pools[0].payload
+            )
+        }));
+    }
+
+    #[test]
+    fn image_iso_pool_brands_are_generative_and_cannot_be_reused() {
+        let distinct = ISO_POOL_SOURCE
+            .replace("brand Payloads", "brand Payloads\nbrand OtherPayloads")
+            .replace(
+                "    return img",
+                "    other = img.iso_pool[Payload](brand=OtherPayloads, slots=1, max_payload=8)\n    return img",
+            );
+        let fixture = parsed_actor_fixture(&distinct);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("distinct iso pool analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "{:?}",
+            output.diagnostics()
+        );
+        let facts = output.successful().expect("sealed pools").facts();
+        let graph = facts.graph.as_ref().expect("pool graph");
+        assert_eq!(graph.brands.len(), 2);
+        assert_ne!(graph.brands[0].id, graph.brands[1].id);
+        let iso: Vec<_> = facts
+            .types
+            .iter()
+            .filter_map(|ty| match ty.kind {
+                SemanticTypeKind::Iso { brand, payload } => Some((brand, payload)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            iso,
+            vec![
+                (BrandId(0), graph.pools[0].payload),
+                (BrandId(1), graph.pools[1].payload),
+            ]
+        );
+
+        let reused = ISO_POOL_SOURCE.replace(
+            "    return img",
+            "    other = img.iso_pool[Payload](brand=Payloads, slots=1, max_payload=8)\n    return img",
+        );
+        let fixture = parsed_actor_fixture(&reused);
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("brand reuse is recoverable");
+        assert!(matches!(
+            output.diagnostics(),
+            [diagnostic]
+                if diagnostic.code.as_deref() == Some("semantic-iso-pool-brand-reused")
+                    && diagnostic.labels.len() == 1
+        ));
+    }
+
+    #[test]
+    fn image_iso_pool_full_seal_rejects_brand_and_capacity_forgery() {
+        let distinct = ISO_POOL_SOURCE
+            .replace("brand Payloads", "brand Payloads\nbrand OtherPayloads")
+            .replace(
+                "    return img",
+                "    other = img.iso_pool[Payload](brand=OtherPayloads, slots=1, max_payload=8)\n    return img",
+            );
+        let fixture = parsed_actor_fixture(&distinct);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("iso pool analysis");
+        let successful = output.successful().expect("sealed pools");
+
+        let mut brand_forgery = successful.facts().clone();
+        brand_forgery.graph.as_mut().expect("graph").pools[0].brand = BrandId(1);
+        brand_forgery
+            .validate_partial_structure()
+            .expect("in-range brand substitution is prefix-valid");
+        assert!(
+            brand_forgery
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err(),
+            "full sealing must rederive each pool's exact source brand"
+        );
+
+        let mut capacity_forgery = successful.facts().clone();
+        capacity_forgery.graph.as_mut().expect("graph").regions[0].capacity_bytes = 64;
+        capacity_forgery
+            .validate_partial_structure()
+            .expect("nonzero in-range capacity substitution is prefix-valid");
+        assert!(
+            capacity_forgery
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err(),
+            "full sealing must recompute slots multiplied by max_payload"
+        );
+    }
+
+    #[test]
+    fn image_iso_pool_capacity_and_image_node_bounds_are_exact_and_cancellable() {
+        let undersized = ISO_POOL_SOURCE.replace("max_payload=64", "max_payload=4");
+        let fixture = parsed_actor_fixture(&undersized);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("undersized pool is recoverable");
+        assert!(matches!(
+            output.diagnostics(),
+            [diagnostic]
+                if diagnostic.code.as_deref() == Some("semantic-iso-pool-payload-capacity")
+                    && diagnostic.labels.len() == 1
+        ));
+
+        let fixture = parsed_actor_fixture(ISO_POOL_SOURCE);
+        let mut exact = AnalysisLimits::standard();
+        exact.image_nodes = 3;
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| false)
+            .expect("exact pool node limit");
+        assert!(output.successful().is_some());
+        let mut one_under = exact;
+        one_under.image_nodes = 2;
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new()
+                .analyze(parsed_actor_request(&fixture, &changes, one_under), &|| {
+                    false
+                },),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "image pool nodes",
+                limit: 2,
+            })
+        ));
+
+        let polls = Cell::new(0u32);
+        CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("baseline pool polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn image_iso_pool_actor_integration_stays_named_fail_closed() {
+        let mixed = BOUNDED_ACTOR_SOURCE
+            .replace(
+                "from core.image import Image, Target",
+                "from core.image import Image, Target\n\nbrand Payloads\n\npub struct Payload:\n    pub value: u64",
+            )
+            .replace(
+                "    installed = img.service(Worker, mailbox=2)",
+                "    payloads = img.iso_pool[Payload](brand=Payloads, slots=2, max_payload=8)\n    installed = img.service(Worker, mailbox=2)",
+            );
+        let fixture = parsed_actor_fixture(&mixed);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("mixed pool actor image is recoverable");
+        assert!(matches!(
+            output.diagnostics(),
+            [diagnostic]
+                if diagnostic.code.as_deref()
+                    == Some("semantic-iso-pool-actor-integration-pending")
         ));
     }
 
@@ -34300,6 +35197,7 @@ fn cleanup_fixture():
                 name_len: u32::try_from(image_name.len()).expect("bounded image-name length"),
                 name_source: source,
                 actors,
+                pools: Vec::new(),
             }
         };
         let payload_bytes = |image: &EvaluatedImage| {
@@ -34521,6 +35419,7 @@ fn cleanup_fixture():
                 name_len: u32::try_from(base_name.len()).expect("bounded base image name"),
                 name_source: source,
                 actors: Vec::new(),
+                pools: Vec::new(),
             })
         };
         let changes = no_changes();
