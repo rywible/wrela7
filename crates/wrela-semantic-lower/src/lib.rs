@@ -3231,14 +3231,19 @@ fn supported_core_result_arguments(
     arguments: &[sema::SemanticArgument],
     variants: &[sema::SemanticVariant],
 ) -> bool {
-    matches!(arguments, [sema::SemanticArgument::Type(ok), sema::SemanticArgument::Type(err)] if ok == err)
-        && matches!(variants, [ok, err]
+    matches!(
+        arguments,
+        [
+            sema::SemanticArgument::Type(_),
+            sema::SemanticArgument::Type(_)
+        ]
+    ) && matches!(variants, [ok, err]
             if ok.name == "Ok"
                 && err.name == "Err"
                 && matches!((ok.fields.as_slice(), err.fields.as_slice()), ([ok_field], [err_field])
-                    if ok_field.ty == err_field.ty
-                        && matches!(arguments, [sema::SemanticArgument::Type(payload), _]
-                            if *payload == ok_field.ty)))
+                    if matches!(arguments,
+                        [sema::SemanticArgument::Type(ok_ty), sema::SemanticArgument::Type(err_ty)]
+                            if ok_field.ty == *ok_ty && err_field.ty == *err_ty)))
 }
 
 fn supported_runtime_enum_payload(facts: &sema::PartialAnalysis, ty: sema::SemanticTypeId) -> bool {
@@ -5461,11 +5466,15 @@ fn core_result_source_matches_semantic(
             .is_some_and(|module| {
                 Some(module.package) == core_package && module.path.dotted() == "result"
             })
+        && source_enum.members.is_empty()
+        && source_enum.deriving.is_empty()
         && matches!(source_enum.generics.as_slice(), [ok_generic, err_generic]
         if program.generic_parameter(*ok_generic).is_some_and(|generic| {
-            matches!(generic.kind, wrela_hir::GenericParameterKind::Type { .. })
+            generic.owner == declaration.id
+                && matches!(generic.kind, wrela_hir::GenericParameterKind::Type { bound: None })
         }) && program.generic_parameter(*err_generic).is_some_and(|generic| {
-            matches!(generic.kind, wrela_hir::GenericParameterKind::Type { .. })
+            generic.owner == declaration.id
+                && matches!(generic.kind, wrela_hir::GenericParameterKind::Type { bound: None })
         }))
         && matches!(source_enum.variants.as_slice(), [ok, err]
             if exact_core_result_source_variant(ok, "Ok", source_enum.generics[0])
@@ -5668,8 +5677,10 @@ fn lower_runtime_enum_variant_fields(
                         definition: wrela_hir::Definition::Generic(candidate),
                         arguments,
                     } if candidate == generic && arguments.is_empty())
-                            && matches!(arguments, [sema::SemanticArgument::Type(payload), _]
-                            if *payload == field.ty)
+                            && arguments.get(variant_index).is_some_and(|argument| {
+                                matches!(argument, sema::SemanticArgument::Type(payload)
+                                    if *payload == field.ty)
+                            })
                     })
             } else if specialized_generic_enum {
                 generic_enum_source_payload_matches(
@@ -11040,13 +11051,14 @@ impl SourceFunctionLowerer<'_> {
                 .fields
                 .first()
                 .is_none_or(|field| field.ty != result_try.payload_type)
-            || variants[1]
-                .fields
-                .first()
-                .is_none_or(|field| field.ty != result_try.payload_type)
         {
             return Err(self.fact_mismatch("postfix question canonical Result identity"));
         }
+        let err_payload_type = variants[1]
+            .fields
+            .first()
+            .map(|field| field.ty)
+            .ok_or_else(|| self.fact_mismatch("postfix question Err payload type"))?;
         let internal = |value: sema::ValueId, ty: sema::SemanticTypeId| {
             self.input
                 .facts()
@@ -11068,7 +11080,7 @@ impl SourceFunctionLowerer<'_> {
         };
         let ok_payload = internal(result_try.ok_payload, result_try.payload_type)
             .ok_or_else(|| self.fact_mismatch("postfix question Ok payload"))?;
-        let err_payload = internal(result_try.err_payload, result_try.payload_type)
+        let err_payload = internal(result_try.err_payload, err_payload_type)
             .ok_or_else(|| self.fact_mismatch("postfix question Err payload"))?;
         let propagated = internal(result_try.propagated, result_try.result_type)
             .ok_or_else(|| self.fact_mismatch("postfix question propagated Err"))?;
@@ -23945,6 +23957,110 @@ pub fn boot() -> Image:
             ),
             Err(LowerError::InvalidReport(_))
         ));
+    }
+
+    #[test]
+    fn asymmetric_core_result_lowers_exact_payloads_and_question_propagation() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+from core.result import Result
+
+fn source(flag: bool) -> Result[u8, u64]:
+    if flag:
+        return Result.Ok(7)
+    return Result.Err(9)
+
+fn propagate(flag: bool) -> Result[u8, u64]:
+    payload: u8 = source(flag)?
+    return Result.Ok(payload)
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        outcome: Result[u8, u64] = propagate(true)
+        match outcome:
+            case Result.Ok(value):
+                pass
+            case Result.Err(error):
+                pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("asymmetric core Result should lower to SemanticWir");
+        let result = lowered
+            .wir()
+            .as_wir()
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(&ty.kind, wir::TypeKind::Enum { variants }
+                    if ty.source_name == "Result"
+                        && matches!(variants.as_slice(), [ok, err]
+                            if ok.fields[0].ty != err.fields[0].ty))
+            })
+            .expect("asymmetric Result SemanticWir type");
+        let wir::TypeKind::Enum { variants } = &result.kind else {
+            unreachable!("selected Result enum")
+        };
+        assert!(lowered.wir().as_wir().functions.iter().any(|function| {
+            function.body.statements.iter().any(|statement| {
+                matches!(statement,
+                    wir::SemanticStatement::Match { arms, .. }
+                        if matches!(arms.as_slice(), [ok, err]
+                            if ok.bindings.len() == 1
+                                && err.bindings.len() == 1
+                                && function.values[ok.bindings[0].0 as usize].ty
+                                    == variants[0].fields[0].ty
+                                && function.values[err.bindings[0].0 as usize].ty
+                                    == variants[1].fields[0].ty))
+            })
+        }));
+
+        let mut forged = lowered.wir().as_wir().clone();
+        let forged_result = forged
+            .types
+            .iter_mut()
+            .find(|ty| ty.id == result.id)
+            .expect("mutable asymmetric Result SemanticWir type");
+        let wir::TypeKind::Enum { variants } = &mut forged_result.kind else {
+            unreachable!("selected Result enum")
+        };
+        variants[1].fields[0].ty = variants[0].fields[0].ty;
+        let forged_result = seal(
+            &LowerRequest {
+                input: image,
+                limits: LoweringLimits::standard(),
+            },
+            forged,
+            lowered.report().clone(),
+            &|| false,
+        );
+        assert!(
+            matches!(
+                forged_result,
+                Err(LowerError::InvalidOutput(_) | LowerError::InvalidReport(_))
+            ),
+            "{forged_result:?}"
+        );
     }
 
     #[test]

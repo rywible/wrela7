@@ -9089,7 +9089,7 @@ fn analyze_result_try_expression(
             source,
             "semantic-runtime-try-result-required",
             "postfix question operand is not the authenticated core Result specialization",
-            "R3 accepts only owned rvalues of core.result.Result[S, S]",
+            "R3 accepts only owned rvalues of core.result.Result[T, E]",
             "return or construct a supported core Result value before applying `?`",
         ));
     };
@@ -9219,31 +9219,37 @@ fn analyze_result_try_expression(
         });
     }
     let supported = is_exact_core_result_declaration(request, &resolved, result_declaration)
-        && matches!(arguments.as_slice(), [SemanticArgument::Type(ok), SemanticArgument::Type(err)] if ok == err)
+        && matches!(arguments.as_slice(), [SemanticArgument::Type(ok), SemanticArgument::Type(err)]
+            if runtime_scalar_type(partial, *ok).is_some()
+                && runtime_scalar_type(partial, *err).is_some())
         && matches!(variants.as_slice(), [ok, err]
             if ok.name == "Ok"
                 && err.name == "Err"
                 && matches!((ok.fields.as_slice(), err.fields.as_slice()), ([ok_field], [err_field])
-                    if ok_field.ty == err_field.ty));
+                    if matches!(arguments.as_slice(), [SemanticArgument::Type(ok), SemanticArgument::Type(err)]
+                        if ok_field.ty == *ok && err_field.ty == *err)));
     if !supported {
         return Err(runtime_type_diagnostic(
             request,
             source,
             "semantic-runtime-try-result-required",
             "postfix question operand is not the authenticated core Result specialization",
-            "R3 accepts only exact core.result.Result[S, S] with its canonical Ok and Err variants",
-            "use the supported core Result declaration with one identical copy-scalar payload",
+            "R3 accepts only exact core.result.Result[T, E] with its canonical Ok and Err variants",
+            "use the supported core Result declaration with two stored copy-scalar payloads",
         ));
     }
-    let payload_type = variants[0].fields[0].ty;
-    if runtime_scalar_type(partial, payload_type).is_none() {
+    let ok_payload_type = variants[0].fields[0].ty;
+    let err_payload_type = variants[1].fields[0].ty;
+    if runtime_scalar_type(partial, ok_payload_type).is_none()
+        || runtime_scalar_type(partial, err_payload_type).is_none()
+    {
         return Err(runtime_type_diagnostic(
             request,
             source,
             "semantic-runtime-try-result-required",
             "postfix question Result payload is outside the supported scalar subset",
             "linear, nominal, and aggregate propagation require later cleanup semantics",
-            "use Result[S, S] with a supported copy scalar S",
+            "use Result[T, E] with supported copy scalars T and E",
         ));
     }
     let enclosing_result = partial
@@ -9258,19 +9264,19 @@ fn analyze_result_try_expression(
             "semantic-runtime-try-enclosing-result",
             "postfix question requires the enclosing function to return the same Result type",
             "the Err branch returns early without conversion or From semantics",
-            "change the function result to the exact operand Result[S, S] specialization",
+            "change the function result to the exact operand Result[T, E] specialization",
         ));
     }
     if expression_request
         .expected
-        .is_some_and(|expected| expected != payload_type)
+        .is_some_and(|expected| expected != ok_payload_type)
     {
         return Err(runtime_type_diagnostic(
             request,
             source,
             "semantic-runtime-try-result-required",
             "postfix question payload does not match its required context",
-            "the Ok branch yields the exact scalar stored by Result[S, S]",
+            "the Ok branch yields the exact T scalar stored by Result[T, E]",
             "use the propagated scalar directly or change the surrounding type",
         ));
     }
@@ -9288,15 +9294,15 @@ fn analyze_result_try_expression(
             is_cancelled,
         )
     };
-    let ok_payload = append_internal(partial, payload_type)?;
-    let err_payload = append_internal(partial, payload_type)?;
+    let ok_payload = append_internal(partial, ok_payload_type)?;
+    let err_payload = append_internal(partial, err_payload_type)?;
     let propagated = append_internal(partial, result_type)?;
     let result = expression_result(
         request,
         partial,
         function,
         (expression, source),
-        payload_type,
+        ok_payload_type,
         expression_request.desired_result,
         is_cancelled,
     )?;
@@ -9306,7 +9312,7 @@ fn analyze_result_try_expression(
         RuntimeExpressionFact {
             function,
             expression,
-            ty: payload_type,
+            ty: ok_payload_type,
             result: Some(result),
             resolution: ExpressionResolution::ResultTry {
                 result_type,
@@ -9322,7 +9328,7 @@ fn analyze_result_try_expression(
         },
     )?;
     Ok(RuntimeExpression {
-        ty: payload_type,
+        ty: ok_payload_type,
         result: Some(result),
         referenced: None,
         effects: operand_outcome.effects,
@@ -14142,9 +14148,9 @@ fn analyze_closed_enum_constructor(
             let (code, message, explanation, help) = if core_result {
                 (
                     "semantic-runtime-result-constructor-context",
-                    "core Result constructor requires an exact contextual Result[T, T] type",
+                    "core Result constructor requires an exact contextual Result[T, E] type",
                     "R2 does not infer generic Result arguments from a context-free payload",
-                    "add an explicit Result[T, T] local, parameter, or return type",
+                    "add an explicit Result[T, E] local, parameter, or return type",
                 )
             } else {
                 (
@@ -14170,7 +14176,7 @@ fn analyze_closed_enum_constructor(
                 ..
             } if *declaration == resolved.enumeration.declaration
                 && if core_result {
-                    matches!(arguments.as_slice(), [SemanticArgument::Type(left), SemanticArgument::Type(right)] if left == right)
+                    matches!(arguments.as_slice(), [SemanticArgument::Type(_), SemanticArgument::Type(_)])
                 } else {
                     arguments.len() == enumeration.generics.len()
                         && arguments.iter().all(|argument| matches!(argument, SemanticArgument::Type(_)))
@@ -14181,8 +14187,8 @@ fn analyze_closed_enum_constructor(
                 (
                     "semantic-runtime-result-constructor-context",
                     "core Result constructor context is not the exact supported specialization",
-                    "the constructor must target authenticated Result[T, T] with one supported scalar T",
-                    "construct the Result variant in an explicit matching Result[T, T] context",
+                    "the constructor must target authenticated Result[T, E] with supported stored copy scalars",
+                    "construct the Result variant in an explicit matching Result[T, E] context",
                 )
             } else {
                 (
@@ -17758,23 +17764,13 @@ fn ensure_core_result_type(
             "semantic-runtime-result-argument-count",
             "core Result requires exactly two runtime type arguments",
             "R2 specializes Result[T, E] only after both type arguments are resolved",
-            "supply Result[T, E] with two identical supported copy-scalar types",
+            "supply Result[T, E] with two supported copy-scalar types",
         ));
     };
     let ok =
         core_result_scalar_argument(request, partial, ok_argument, aggregate_work, is_cancelled)?;
     let err =
         core_result_scalar_argument(request, partial, err_argument, aggregate_work, is_cancelled)?;
-    if ok != err {
-        return Err(runtime_type_diagnostic(
-            request,
-            err_argument.source,
-            "semantic-runtime-result-payload-mismatch",
-            "core Result runtime arguments must resolve to the identical scalar type",
-            "the current canonical tagged representation has one shared payload slot",
-            "use the same supported copy-scalar type for T and E",
-        ));
-    }
     let semantic_arguments = [SemanticArgument::Type(ok), SemanticArgument::Type(err)];
     for existing in &partial.types {
         charge_runtime_aggregate_lookup(request, &mut *aggregate_work, is_cancelled)?;
@@ -17787,16 +17783,25 @@ fn ensure_core_result_type(
             return Ok(existing.id);
         }
     }
-    let payload = partial
+    let ok_payload = partial
         .types
         .get(ok.0 as usize)
         .ok_or(AnalysisFailure::RequestMismatch)?;
-    let alignment = payload.alignment_lower_bound.max(1);
+    let err_payload = partial
+        .types
+        .get(err.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let alignment = ok_payload
+        .alignment_lower_bound
+        .max(err_payload.alignment_lower_bound)
+        .max(1);
     let offset = (1_u64 + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
     let size = offset
         .checked_add(
-            payload
+            ok_payload
                 .size_upper_bound
+                .zip(err_payload.size_upper_bound)
+                .map(|(ok, err)| ok.max(err))
                 .ok_or(AnalysisFailure::RequestMismatch)?,
         )
         .and_then(|size| size.checked_add(u64::from(alignment) - 1))
@@ -17817,13 +17822,13 @@ fn ensure_core_result_type(
         kind: SemanticTypeKind::Enumeration {
             declaration: record.id,
             arguments: semantic_arguments.to_vec(),
-            variants: ["Ok", "Err"]
+            variants: [("Ok", ok), ("Err", err)]
                 .into_iter()
-                .map(|name| SemanticVariant {
+                .map(|(name, ty)| SemanticVariant {
                     name: name.to_owned(),
                     fields: vec![SemanticField {
                         name: String::new(),
-                        ty: ok,
+                        ty,
                         public: true,
                     }],
                 })
@@ -17922,7 +17927,11 @@ fn is_exact_core_result_declaration(
             .as_program()
             .generic_parameter(id)
             .is_some_and(|generic| {
-                matches!(generic.kind, wrela_hir::GenericParameterKind::Type { .. })
+                generic.owner == record.id
+                    && matches!(
+                        generic.kind,
+                        wrela_hir::GenericParameterKind::Type { bound: None }
+                    )
             })
     };
     if !generic_is_type(*ok_generic) || !generic_is_type(*err_generic) {
@@ -17941,7 +17950,10 @@ fn is_exact_core_result_declaration(
                         arguments,
                     } if *candidate == generic && arguments.is_empty()))
         };
-    exact_variant(ok, "Ok", *ok_generic) && exact_variant(err, "Err", *err_generic)
+    enumeration.members.is_empty()
+        && enumeration.deriving.is_empty()
+        && exact_variant(ok, "Ok", *ok_generic)
+        && exact_variant(err, "Err", *err_generic)
 }
 
 fn is_exact_core_option_declaration(
@@ -38592,6 +38604,201 @@ fn projection_fixture():
                 .is_err(),
             "full sealing must authenticate specialized variant names against exact HIR"
         );
+    }
+
+    fn asymmetric_core_result_actor_source() -> String {
+        r#"module app
+
+from core.image import Image, Target
+from core.result import Result
+
+fn choose(flag: bool) -> Result[u8, u64]:
+    if flag:
+        return Result.Ok(7)
+    return Result.Err(9)
+
+fn propagate(flag: bool) -> Result[u8, u64]:
+    payload: u8 = choose(flag)?
+    return Result.Ok(payload)
+
+@service
+pub struct Worker:
+    @task
+    async fn inspect(mut self):
+        outcome: Result[u8, u64] = propagate(true)
+        accepted: bool = outcome is Result.Ok(_)
+        match outcome:
+            case Result.Ok(value):
+                pass
+            case Result.Err(error):
+                pass
+        await checkpoint()
+
+async fn checkpoint():
+    pass
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#
+        .to_owned()
+    }
+
+    #[test]
+    fn asymmetric_core_result_constructs_consumes_and_propagates_exact_payload_types() {
+        let fixture = parsed_actor_admission_fixture(&asymmetric_core_result_actor_source());
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("asymmetric core Result analysis is recoverable");
+        assert!(
+            output.diagnostics().is_empty(),
+            "authenticated Result[u8, u64] must analyze: {:?}",
+            output.diagnostics()
+        );
+        let successful = output.successful().expect("sealed asymmetric core Result");
+        let result = successful
+            .facts()
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(&ty.kind, SemanticTypeKind::Enumeration { arguments, variants, .. }
+                    if matches!(arguments.as_slice(),
+                        [SemanticArgument::Type(ok), SemanticArgument::Type(err)] if ok != err)
+                        && matches!(variants.as_slice(), [ok, err]
+                            if ok.name == "Ok" && err.name == "Err"))
+            })
+            .expect("asymmetric Result specialization");
+        let SemanticTypeKind::Enumeration {
+            arguments,
+            variants,
+            ..
+        } = &result.kind
+        else {
+            unreachable!("selected Result enumeration")
+        };
+        let [
+            SemanticArgument::Type(ok_ty),
+            SemanticArgument::Type(err_ty),
+        ] = arguments.as_slice()
+        else {
+            unreachable!("two Result type arguments")
+        };
+        assert_eq!(variants[0].fields[0].ty, *ok_ty);
+        assert_eq!(variants[1].fields[0].ty, *err_ty);
+        assert_ne!(ok_ty, err_ty);
+        assert_eq!(result.size_upper_bound, Some(16));
+        assert_eq!(result.alignment_lower_bound, 8);
+
+        let result_try = successful
+            .facts()
+            .expressions
+            .iter()
+            .find_map(|fact| match fact.resolution {
+                ExpressionResolution::ResultTry {
+                    result_type,
+                    ok_payload,
+                    err_payload,
+                    propagated,
+                    ..
+                } => Some((fact, result_type, ok_payload, err_payload, propagated)),
+                _ => None,
+            })
+            .expect("postfix question fact");
+        assert_eq!(result_try.0.ty, *ok_ty);
+        assert_eq!(result_try.1, result.id);
+        assert_eq!(
+            successful.facts().values[result_try.2.0 as usize].ty,
+            *ok_ty
+        );
+        assert_eq!(
+            successful.facts().values[result_try.3.0 as usize].ty,
+            *err_ty
+        );
+        assert_eq!(
+            successful.facts().values[result_try.4.0 as usize].ty,
+            result.id
+        );
+
+        let bindings = successful
+            .facts()
+            .values
+            .iter()
+            .filter_map(|value| {
+                value
+                    .source_name
+                    .as_deref()
+                    .filter(|name| matches!(*name, "value" | "error"))
+                    .map(|name| (name, value.ty))
+            })
+            .collect::<Vec<_>>();
+        assert!(bindings.contains(&("value", *ok_ty)));
+        assert!(bindings.contains(&("error", *err_ty)));
+
+        let mut forged = successful.facts().clone();
+        let forged_result = forged
+            .types
+            .iter_mut()
+            .find(|ty| ty.id == result.id)
+            .expect("mutable asymmetric Result type");
+        let SemanticTypeKind::Enumeration { variants, .. } = &mut forged_result.kind else {
+            unreachable!("selected Result enumeration")
+        };
+        variants[1].fields[0].ty = *ok_ty;
+        assert!(
+            forged
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err(),
+            "full sealing must reject substituting Err's declared E payload with T"
+        );
+
+        let exact_values = u32::try_from(successful.facts().values.len())
+            .expect("bounded asymmetric Result values");
+        let mut exact = AnalysisLimits::standard();
+        exact.values = exact_values;
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| false)
+            .expect("exact asymmetric Result value limit");
+        let mut one_under = exact;
+        one_under.values = exact_values - 1;
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new()
+                .analyze(parsed_actor_request(&fixture, &changes, one_under), &|| {
+                    false
+                },),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "semantic values",
+                ..
+            })
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            })
+            .expect("count asymmetric Result polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, exact),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
     }
 
     const CORE_OPTION_QUESTION_ACTOR_SOURCE: &str = r#"module app

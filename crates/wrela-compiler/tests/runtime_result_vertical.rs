@@ -2250,10 +2250,6 @@ pub fn boot() -> Image:
 "#;
     for (body, code) in [
         (
-            "@test\nfn reject_mismatch():\n    value: Result[u8, bool] = Result.Ok(1)\n    return\n",
-            "semantic-runtime-result-payload-mismatch",
-        ),
-        (
             "@test\nfn reject_nonscalar():\n    value: Result[unit, unit] = Result.Ok(unit)\n    return\n",
             "semantic-runtime-result-argument-type",
         ),

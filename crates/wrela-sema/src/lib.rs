@@ -4775,8 +4775,15 @@ fn exact_result_try_matches(
     else {
         return false;
     };
-    let Some(payload_type) = variants
+    let Some(ok_payload_type) = variants
         .first()
+        .and_then(|variant| variant.fields.first())
+        .map(|field| field.ty)
+    else {
+        return false;
+    };
+    let Some(err_payload_type) = variants
+        .get(1)
         .and_then(|variant| variant.fields.first())
         .map(|field| field.ty)
     else {
@@ -4795,9 +4802,9 @@ fn exact_result_try_matches(
         && err_variant == 1
         && exact_core_result_declaration_matches(program, *declaration)
         && runtime_enum_arguments_supported(arguments, variants)
-        && fact.ty == payload_type
-        && internal_value(ok_payload, payload_type)
-        && internal_value(err_payload, payload_type)
+        && fact.ty == ok_payload_type
+        && internal_value(ok_payload, ok_payload_type)
+        && internal_value(err_payload, err_payload_type)
         && internal_value(propagated, result_type)
 }
 
@@ -4916,7 +4923,11 @@ fn exact_core_result_declaration_matches(
     };
     let generic_is_type = |generic| {
         program.generic_parameter(generic).is_some_and(|record| {
-            matches!(record.kind, wrela_hir::GenericParameterKind::Type { .. })
+            record.owner == declaration
+                && matches!(
+                    record.kind,
+                    wrela_hir::GenericParameterKind::Type { bound: None }
+                )
         })
     };
     let [ok, err] = source.variants.as_slice() else {
@@ -4932,7 +4943,9 @@ fn exact_core_result_declaration_matches(
                             arguments,
                         } if *candidate == generic && arguments.is_empty()))
         };
-    generic_is_type(*ok_generic)
+    source.members.is_empty()
+        && source.deriving.is_empty()
+        && generic_is_type(*ok_generic)
         && generic_is_type(*err_generic)
         && exact_variant(ok, "Ok", *ok_generic)
         && exact_variant(err, "Err", *err_generic)
@@ -6367,13 +6380,6 @@ fn exact_generic_enum_type_matches(
             return false;
         }
     }
-    if exact_core_result_declaration_matches(program, *declaration)
-        && !matches!(arguments.as_slice(),
-            [SemanticArgument::Type(left), SemanticArgument::Type(right)] if left == right)
-    {
-        return false;
-    }
-
     let mut payload_slot: Option<(u64, u32)> = None;
     for (source_variant, semantic_variant) in enumeration.variants.iter().zip(variants) {
         if semantic_variant.name != source_variant.name.as_str() {
@@ -10741,8 +10747,15 @@ fn valid_result_try_resolution(
     {
         return false;
     }
-    let Some(payload_type) = variants
+    let Some(ok_payload_type) = variants
         .first()
+        .and_then(|variant| variant.fields.first())
+        .map(|field| field.ty)
+    else {
+        return false;
+    };
+    let Some(err_payload_type) = variants
+        .get(1)
         .and_then(|variant| variant.fields.first())
         .map(|field| field.ty)
     else {
@@ -10762,8 +10775,8 @@ fn valid_result_try_resolution(
                 .all(|candidate| candidate != value)
         });
     distinct
-        && value_matches(ok_payload, payload_type)
-        && value_matches(err_payload, payload_type)
+        && value_matches(ok_payload, ok_payload_type)
+        && value_matches(err_payload, err_payload_type)
         && value_matches(propagated, result_type)
 }
 
