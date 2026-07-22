@@ -1513,9 +1513,10 @@ fn encode_operation(writer: &mut Writer<'_>, value: &FlowOperation) -> Result<()
             writer.u8(50)?;
             writer.u32(value.0)
         }
-        FlowOperation::EnumPayload { value } => {
+        FlowOperation::EnumPayload { value, variant } => {
             writer.u8(51)?;
-            writer.u32(value.0)
+            writer.u32(value.0)?;
+            writer.option(variant, |writer, variant| writer.u8(*variant))
         }
         FlowOperation::ActorCapability { actor, proof } => {
             writer.u8(52)?;
@@ -2751,6 +2752,7 @@ impl Reader<'_> {
             },
             51 => FlowOperation::EnumPayload {
                 value: ValueId(self.u32()?),
+                variant: self.option(Self::u8)?,
             },
             52 => FlowOperation::ActorCapability {
                 actor: ActorId(self.u32()?),
@@ -3285,7 +3287,7 @@ mod tests {
         harness_name.clone_from(&name);
         model
             .validate()
-            .expect("valid long-prefix FlowWir v17 fixture")
+            .expect("valid long-prefix FlowWir v18 fixture")
     }
 
     struct SubstitutingCodec<'a> {
@@ -3716,7 +3718,10 @@ mod tests {
                 payload: None,
             },
             FlowOperation::EnumTag { value: v },
-            FlowOperation::EnumPayload { value: v },
+            FlowOperation::EnumPayload {
+                value: v,
+                variant: Some(4),
+            },
             FlowOperation::ExtractField {
                 aggregate: v,
                 field: 4,
@@ -4800,7 +4805,7 @@ mod tests {
                 &|| false,
             ),
             Err(CodecError::NonCanonical(
-                "codec output differs from the canonical FlowWir v17 encoding"
+                "codec output differs from the canonical FlowWir v18 encoding"
             ))
         ));
     }
@@ -5262,7 +5267,10 @@ mod tests {
                 payload: Some(ValueId(5)),
             },
             FlowOperation::EnumTag { value: ValueId(5) },
-            FlowOperation::EnumPayload { value: ValueId(5) },
+            FlowOperation::EnumPayload {
+                value: ValueId(5),
+                variant: None,
+            },
         ];
         for (operation, expected_tag) in operations.iter().zip([49_u8, 50, 51]) {
             let mut writer = Writer::new(CodecLimits::standard(), &not_cancelled);

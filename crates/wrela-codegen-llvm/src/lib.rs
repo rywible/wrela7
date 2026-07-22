@@ -5417,7 +5417,7 @@ mod contract_tests {
                     right: semantic::ValueId(1),
                     arithmetic,
                 });
-            assert_eq!(machine.as_wir().version, 18);
+            assert_eq!(machine.as_wir().version, 19);
             assert!(
                 machine
                     .as_wir()

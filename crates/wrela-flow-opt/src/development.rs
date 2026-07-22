@@ -2173,7 +2173,7 @@ fn map_operation_values(
         | FlowOperation::Cast { value, .. }
         | FlowOperation::Promote { value, .. }
         | FlowOperation::EnumTag { value }
-        | FlowOperation::EnumPayload { value }
+        | FlowOperation::EnumPayload { value, .. }
         | FlowOperation::ExtractField {
             aggregate: value, ..
         }
@@ -2707,7 +2707,7 @@ fn for_each_operation_value(
         | FlowOperation::Cast { value, .. }
         | FlowOperation::Promote { value, .. }
         | FlowOperation::EnumTag { value }
-        | FlowOperation::EnumPayload { value }
+        | FlowOperation::EnumPayload { value, .. }
         | FlowOperation::ExtractField {
             aggregate: value, ..
         }

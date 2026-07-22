@@ -18,16 +18,16 @@ pub use decode::decode_image_report_json;
 /// Version 14 introduced the machine-representation version binding. Version 15
 /// retains the authenticated FlowWir scheduler ownership partition. Version 16
 /// adds the exact all-or-empty actor placement input set and binds reports to
-/// the current MachineWir v18 contract. Version 17 adds exact
+/// the current MachineWir v19 contract. Version 17 adds exact
 /// source-authenticated iso-pool/brand/region contracts. The decoder gates on
 /// this exact value, so every older representation is rejected as
 /// [`ReportError::UnsupportedSchema`].
 pub const REPORT_SCHEMA_VERSION: u32 = 17;
 
 const CURRENT_SEMANTIC_WIR_VERSION: u32 = 13;
-const CURRENT_FLOW_WIR_VERSION: u32 = 17;
-const CURRENT_FLOW_WIR_WIRE_VERSION: u32 = 17;
-const CURRENT_MACHINE_WIR_VERSION: u32 = 18;
+const CURRENT_FLOW_WIR_VERSION: u32 = 18;
+const CURRENT_FLOW_WIR_WIRE_VERSION: u32 = 18;
+const CURRENT_MACHINE_WIR_VERSION: u32 = 19;
 const CURRENT_RUNTIME_ABI_VERSION: u32 = 2;
 
 /// One finite capacity or memory fact established by the build.
@@ -3946,9 +3946,9 @@ mod tests {
             symbols: Vec::new(),
             representations: super::RepresentationFacts {
                 semantic_wir_version: 13,
-                flow_wir_version: 17,
-                flow_wir_wire_version: 17,
-                machine_wir_version: 18,
+                flow_wir_version: 18,
+                flow_wir_wire_version: 18,
+                machine_wir_version: 19,
                 runtime_abi_version: 2,
                 optimization_pipeline_name: "fixture".to_owned(),
                 optimization_pipeline_revision: 1,
@@ -5495,12 +5495,12 @@ mod tests {
         let mutations: [fn(&mut super::RepresentationFacts); 10] = [
             |versions| versions.semantic_wir_version = 12,
             |versions| versions.semantic_wir_version = 14,
-            |versions| versions.flow_wir_version = 16,
-            |versions| versions.flow_wir_version = 18,
-            |versions| versions.flow_wir_wire_version = 16,
-            |versions| versions.flow_wir_wire_version = 18,
-            |versions| versions.machine_wir_version = 17,
-            |versions| versions.machine_wir_version = 19,
+            |versions| versions.flow_wir_version = 17,
+            |versions| versions.flow_wir_version = 19,
+            |versions| versions.flow_wir_wire_version = 17,
+            |versions| versions.flow_wir_wire_version = 19,
+            |versions| versions.machine_wir_version = 18,
+            |versions| versions.machine_wir_version = 20,
             |versions| versions.runtime_abi_version = 1,
             |versions| versions.runtime_abi_version = 3,
         ];

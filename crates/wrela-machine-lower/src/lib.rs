@@ -6645,7 +6645,7 @@ mod contract_tests {
         .expect("float not-equal FlowWir reaches MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 18);
+        assert_eq!(machine.version, 19);
         assert!(matches!(machine.types[8].kind, MachineTypeKind::Float32));
         assert!(matches!(machine.types[9].kind, MachineTypeKind::Float64));
         let float_function = &machine.functions[3];
@@ -6753,7 +6753,7 @@ mod contract_tests {
         .expect("unary and lossless casts reach MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 18);
+        assert_eq!(machine.version, 19);
         assert!(matches!(
             machine.types[10].kind,
             MachineTypeKind::Integer { bits: 16 }

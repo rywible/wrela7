@@ -5859,7 +5859,7 @@ fn for_each_flow_operation_value(
         | flow::FlowOperation::Cast { value, .. }
         | flow::FlowOperation::Promote { value, .. }
         | flow::FlowOperation::EnumTag { value }
-        | flow::FlowOperation::EnumPayload { value }
+        | flow::FlowOperation::EnumPayload { value, .. }
         | flow::FlowOperation::ExtractField {
             aggregate: value, ..
         }
@@ -6460,12 +6460,23 @@ fn validate_supported_operation(
             }
             Ok(())
         }
-        flow::FlowOperation::EnumPayload { value } => {
+        flow::FlowOperation::EnumPayload { value, variant } => {
             let result = require_single_result(instruction)?;
             let enum_ty = flow_value_type(function, *value)?;
-            if closed_scalar_enum_payload(&input.types, enum_ty)
-                != Some(flow_value_type(function, result)?)
-            {
+            let expected = match variant {
+                None => closed_scalar_enum_payload(&input.types, enum_ty),
+                Some(variant) if is_exact_heterogeneous_scalar_enum(&input.types, enum_ty) => input
+                    .types
+                    .get(enum_ty.0 as usize)
+                    .and_then(|record| match &record.kind {
+                        flow::FlowTypeKind::Enum { variants } => variants
+                            .get(usize::from(*variant))
+                            .and_then(|fields| fields.as_slice().first().copied()),
+                        _ => None,
+                    }),
+                Some(_) => None,
+            };
+            if expected != Some(flow_value_type(function, result)?) {
                 return Err(unsupported(
                     "an enum payload projection with mismatched types",
                 ));
@@ -8997,8 +9008,9 @@ fn lower_operation(
         flow::FlowOperation::EnumTag { value } => MachineOperation::EnumTag {
             value: map_value(*value, mapping)?,
         },
-        flow::FlowOperation::EnumPayload { value } => MachineOperation::EnumPayload {
+        flow::FlowOperation::EnumPayload { value, variant } => MachineOperation::EnumPayload {
             value: map_value(*value, mapping)?,
+            variant: *variant,
         },
         flow::FlowOperation::ExtractField { aggregate, field } => {
             let result = require_single_result(instruction)?;

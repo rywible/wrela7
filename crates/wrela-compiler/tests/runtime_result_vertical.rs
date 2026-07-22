@@ -25,7 +25,10 @@ use wrela_flow_lower::{
     CanonicalFlowLowerer, FlowLowerer, FlowOperation, FlowTypeKind,
     LowerRequest as FlowLowerRequest, LoweringLimits as FlowLoweringLimits, Terminator,
 };
-use wrela_flow_wir_codec::{CanonicalFlowWirCodec, CodecLimits, EncodeRequest, encode_and_verify};
+use wrela_flow_wir_codec::{
+    CanonicalFlowWirCodec, CodecLimits, DecodeRequest, EncodeRequest, decode_and_verify,
+    encode_and_verify,
+};
 use wrela_hir::DeclarationId;
 use wrela_hir_lower::{
     CanonicalHirLowerer, ChangeSet as HirChangeSet, HirLowerer, LowerRequest as HirLowerRequest,
@@ -676,7 +679,7 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
             .expect("runtime-result FlowWir");
         assert!(flow.diagnostics().is_empty());
         let flow_model = flow.wir().as_wir();
-        assert_eq!(flow_model.version, 17);
+        assert_eq!(flow_model.version, 18);
         assert!(
             flow_model.types.iter().any(
                 |ty| matches!(&ty.kind, FlowTypeKind::Enum { variants } if variants.len() == 2)
@@ -739,8 +742,8 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
             },
             &never_cancelled,
         )
-        .expect("runtime-result FlowWir v17 frame");
-        assert_eq!(encoded.header().wire_version, 17);
+        .expect("runtime-result FlowWir v18 frame");
+        assert_eq!(encoded.header().wire_version, 18);
         let prepared = prepare_canonical_frame_for_codegen(
             encoded.bytes(),
             &fixture.target,
@@ -749,7 +752,7 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
         )
         .expect("runtime-result MachineWir preparation");
         let machine = prepared.machine().wir().as_wir();
-        assert_eq!(machine.version, 18);
+        assert_eq!(machine.version, 19);
         assert!(
             machine
                 .types
@@ -895,7 +898,7 @@ fn match_value() -> u64:
         },
         &never_cancelled,
     )
-    .expect("mixed-arity generic enum FlowWir v17 frame");
+    .expect("mixed-arity generic enum FlowWir v18 frame");
     let prepared = prepare_canonical_frame_for_codegen(
         encoded.bytes(),
         &fixture.target,
@@ -1036,7 +1039,7 @@ fn fixed_flat_generic_enum_runtime():
         },
         &never_cancelled,
     )
-    .expect("fixed flat generic enum FlowWir v17 frame");
+    .expect("fixed flat generic enum FlowWir v18 frame");
     let prepared = prepare_canonical_frame_for_codegen(
         encoded.bytes(),
         &fixture.target,
@@ -1567,8 +1570,8 @@ fn match_second() -> u64:
         },
         &never_cancelled,
     )
-    .expect("all-unit generic enum FlowWir v17 frame");
-    assert_eq!(encoded.header().wire_version, 17);
+    .expect("all-unit generic enum FlowWir v18 frame");
+    assert_eq!(encoded.header().wire_version, 18);
     let prepared = prepare_canonical_frame_for_codegen(
         encoded.bytes(),
         &fixture.target,
@@ -1577,7 +1580,7 @@ fn match_second() -> u64:
     )
     .expect("all-unit generic enum MachineWir preparation");
     let machine = prepared.machine().wir().as_wir();
-    assert_eq!(machine.version, 18);
+    assert_eq!(machine.version, 19);
     assert!(machine.types.iter().any(|ty| {
         matches!(&ty.kind, MachineTypeKind::TaggedEnum {
             payload: None,
@@ -2166,7 +2169,7 @@ fn asymmetric_result_construction():
 }
 
 #[test]
-fn asymmetric_core_result_payload_projection_stays_named_fail_closed() {
+fn asymmetric_core_result_payload_projection_reaches_native_coff() {
     let source = r#"module runtime_result.image
 
 from core.image import Image, Target
@@ -2183,10 +2186,26 @@ fn project(value: Result[u8, u64]) -> u8:
         case Result.Err(error):
             return 0
 
+fn source_ok() -> Result[u8, u64]:
+    return Result.Ok(7)
+
+fn source_err() -> Result[u8, u64]:
+    return Result.Err(9)
+
+fn propagate_ok() -> Result[u8, u64]:
+    payload: u8 = source_ok()?
+    return Result.Ok(payload)
+
+fn propagate_err() -> Result[u8, u64]:
+    payload: u8 = source_err()?
+    return Result.Ok(payload)
+
 @test(runtime)
 fn asymmetric_result_projection():
     value: Result[u8, u64] = Result.Ok(7)
-    assert project(value) == 7, "projection must remain closed before execution"
+    assert project(value) == 7, "Ok payload must project at its exact logical width"
+    assert project(propagate_ok()) == 7, "conversion-free question must yield Ok"
+    propagated_error: Result[u8, u64] = propagate_err()
     return
 "#;
     let fixture = source_fixture_for(source);
@@ -2202,22 +2221,192 @@ fn asymmetric_result_projection():
         .expect("asymmetric Result projection SemanticWir")
         .into_parts()
         .0;
-    let rejected = CanonicalFlowLowerer::new().lower(
-        FlowLowerRequest {
-            input: semantic,
-            limits: FlowLoweringLimits::standard(),
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("asymmetric Result payload projection FlowWir");
+    let flow_payload_variants = flow
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.operation {
+            FlowOperation::EnumPayload { variant, .. } => variant,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(flow_payload_variants.contains(&0));
+    assert!(flow_payload_variants.contains(&1));
+
+    let mut forged_variant = flow.wir().as_wir().clone();
+    let projection = forged_variant
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find(|instruction| {
+            matches!(
+                instruction.operation,
+                FlowOperation::EnumPayload {
+                    variant: Some(0),
+                    ..
+                }
+            )
+        })
+        .expect("exact Ok projection");
+    let FlowOperation::EnumPayload { variant, .. } = &mut projection.operation else {
+        unreachable!()
+    };
+    *variant = Some(1);
+    assert!(forged_variant.validate().is_err());
+
+    let exact_flow_instructions = flow.report().instructions;
+    let mut exact_flow_limits = FlowLoweringLimits::standard();
+    exact_flow_limits.instructions = exact_flow_instructions;
+    CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: exact_flow_limits,
+            },
+            &never_cancelled,
+        )
+        .expect("exact heterogeneous projection FlowWir instruction ceiling");
+    let mut one_under_flow = exact_flow_limits;
+    one_under_flow.instructions = exact_flow_instructions - 1;
+    assert!(matches!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: one_under_flow,
+            },
+            &never_cancelled,
+        ),
+        Err(wrela_flow_lower::LowerError::ResourceLimit {
+            resource: "FlowWir instructions",
+            limit,
+        }) if limit == exact_flow_instructions - 1
+    ));
+    let flow_polls = Cell::new(0_u64);
+    CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: exact_flow_limits,
+            },
+            &|| {
+                flow_polls.set(flow_polls.get().saturating_add(1));
+                false
+            },
+        )
+        .expect("measure heterogeneous projection FlowWir cancellation polls");
+    let flow_cancel_at = flow_polls.get().saturating_sub(2);
+    assert!(flow_cancel_at > 2);
+    let cancelled_flow_polls = Cell::new(0_u64);
+    assert!(matches!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: exact_flow_limits,
+            },
+            &|| {
+                let next = cancelled_flow_polls.get().saturating_add(1);
+                cancelled_flow_polls.set(next);
+                next >= flow_cancel_at
+            },
+        ),
+        Err(wrela_flow_lower::LowerError::Cancelled)
+    ));
+
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
         },
         &never_cancelled,
-    );
+    )
+    .expect("heterogeneous projection canonical FlowWir frame");
+    let decoded = decode_and_verify(
+        &CanonicalFlowWirCodec,
+        DecodeRequest {
+            bytes: encoded.bytes(),
+            limits: CodecLimits::standard(),
+            expected_build: Some(&flow_wir.as_wir().build),
+        },
+        &never_cancelled,
+    )
+    .expect("heterogeneous projection FlowWir roundtrip");
+    assert_eq!(decoded.as_wir(), flow_wir.as_wir());
+
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("heterogeneous projection MachineWir preparation");
+    let machine = prepared.machine().wir().as_wir();
+    let machine_payload_variants = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.operation {
+            MachineOperation::EnumPayload { variant, .. } => variant,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(machine_payload_variants.contains(&0));
+    assert!(machine_payload_variants.contains(&1));
+
+    let mut forged_machine_variant = machine.clone();
+    let projection = forged_machine_variant
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find(|instruction| {
+            matches!(
+                instruction.operation,
+                MachineOperation::EnumPayload {
+                    variant: Some(0),
+                    ..
+                }
+            )
+        })
+        .expect("exact machine Ok projection");
+    let MachineOperation::EnumPayload { variant, .. } = &mut projection.operation else {
+        unreachable!()
+    };
+    *variant = Some(1);
     assert!(
-        matches!(
-            rejected,
-            Err(wrela_flow_lower::LowerError::UnsupportedInput {
-                feature: "flow-enum-heterogeneous-payload-projection-pending"
-            })
-        ),
-        "{rejected:?}"
+        forged_machine_variant
+            .validate_for_target(&fixture.target)
+            .is_err()
     );
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("heterogeneous projection native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat heterogeneous projection native emission");
+            assert_eq!(first.bytes(), second.bytes());
+            inspect_native_object(first.bytes(), HASHER.sha256(first.bytes()));
+        }
+    }
 }
 
 #[test]
@@ -2423,7 +2612,7 @@ fn checked_in_runtime_result_try_reaches_exact_early_return_switch() {
             )
             .expect("runtime-result Try FlowWir");
         assert!(flow.diagnostics().is_empty());
-        assert_eq!(flow.wir().as_wir().version, 17);
+        assert_eq!(flow.wir().as_wir().version, 18);
         let flow_propagation = flow
             .wir()
             .as_wir()
@@ -2481,8 +2670,8 @@ fn checked_in_runtime_result_try_reaches_exact_early_return_switch() {
             },
             &never_cancelled,
         )
-        .expect("runtime-result Try FlowWir v17 frame");
-        assert_eq!(encoded.header().wire_version, 17);
+        .expect("runtime-result Try FlowWir v18 frame");
+        assert_eq!(encoded.header().wire_version, 18);
         let prepared = prepare_canonical_frame_for_codegen(
             encoded.bytes(),
             &fixture.target,
@@ -2491,7 +2680,7 @@ fn checked_in_runtime_result_try_reaches_exact_early_return_switch() {
         )
         .expect("runtime-result Try MachineWir preparation");
         let machine = prepared.machine().wir().as_wir();
-        assert_eq!(machine.version, 18);
+        assert_eq!(machine.version, 19);
         let machine_propagation = machine
             .functions
             .iter()

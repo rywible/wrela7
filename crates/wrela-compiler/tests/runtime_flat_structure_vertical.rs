@@ -842,7 +842,7 @@ fn read_only_scalar_view_projection_reaches_semantic_wir() {
         .expect("scalar view projection lowers to FlowWir");
     assert!(flow.diagnostics().is_empty());
     let flow_model = flow.wir().as_wir();
-    assert_eq!(flow_model.version, 17);
+    assert_eq!(flow_model.version, 18);
     let flow_projects = flow_model
         .functions
         .iter()
@@ -866,7 +866,7 @@ fn read_only_scalar_view_projection_reaches_semantic_wir() {
         },
         &never_cancelled,
     )
-    .expect("scalar view FlowWir v17 canonical frame");
+    .expect("scalar view FlowWir v18 canonical frame");
     let decoded = CanonicalFlowWirCodec
         .decode(
             DecodeRequest {
@@ -876,7 +876,7 @@ fn read_only_scalar_view_projection_reaches_semantic_wir() {
             },
             &never_cancelled,
         )
-        .expect("scalar view FlowWir v17 decode");
+        .expect("scalar view FlowWir v18 decode");
     assert_eq!(decoded, flow_wir);
 
     let prepared = prepare_canonical_frame_for_codegen(
@@ -887,7 +887,7 @@ fn read_only_scalar_view_projection_reaches_semantic_wir() {
     )
     .expect("scalar view projection reaches MachineWir");
     let machine = prepared.machine().wir().as_wir();
-    assert_eq!(machine.version, 18);
+    assert_eq!(machine.version, 19);
     let machine_projects = machine
         .functions
         .iter()
@@ -1305,7 +1305,7 @@ fn real_imported_duration_shape_reaches_flow_and_v16_roundtrips_exactly() {
         },
         &never_cancelled,
     )
-    .expect("FlowWir v17 canonical roundtrip");
+    .expect("FlowWir v18 canonical roundtrip");
     let decoded = CanonicalFlowWirCodec
         .decode(
             DecodeRequest {
@@ -1315,7 +1315,7 @@ fn real_imported_duration_shape_reaches_flow_and_v16_roundtrips_exactly() {
             },
             &never_cancelled,
         )
-        .expect("FlowWir v17 decode");
+        .expect("FlowWir v18 decode");
     assert_eq!(decoded, flow_wir);
 
     let prepared = prepare_canonical_frame_for_codegen(
@@ -1432,7 +1432,7 @@ fn local_flat_field_update_reaches_deterministic_native_coff() {
     assert_eq!(
         flow.wir().as_wir(),
         repeated_flow.wir().as_wir(),
-        "identical SemanticWir must produce identical FlowWir v17"
+        "identical SemanticWir must produce identical FlowWir v18"
     );
     let flow_insertions = flow
         .wir()
@@ -1469,7 +1469,7 @@ fn local_flat_field_update_reaches_deterministic_native_coff() {
             },
             &never_cancelled,
         )
-        .expect("field-update FlowWir v17 decode");
+        .expect("field-update FlowWir v18 decode");
     assert_eq!(decoded, flow_wir);
 
     let prepared = prepare_canonical_frame_for_codegen(
@@ -1661,7 +1661,7 @@ fn two_field_flat_local_reaches_unpacked_machine_wir_and_deterministic_coff() {
         &fixture.build,
         &never_cancelled,
     )
-    .expect("two-field local reaches MachineWir v18");
+    .expect("two-field local reaches MachineWir v19");
     let machine = prepared.machine().wir().as_wir();
     let pair = machine
         .types
@@ -1869,7 +1869,7 @@ fn generic_flat_field_update_reaches_flow_machine_and_deterministic_coff() {
             },
             &never_cancelled,
         )
-        .expect("generic field-update FlowWir v17 decode");
+        .expect("generic field-update FlowWir v18 decode");
     assert_eq!(decoded, flow_wir);
 
     let prepared = prepare_canonical_frame_for_codegen(
@@ -2941,7 +2941,7 @@ fn local_result_constructor_and_exhaustive_match_reach_machine_switch() {
         },
         &never_cancelled,
     )
-    .expect("FlowWir v17 enum roundtrip");
+    .expect("FlowWir v18 enum roundtrip");
     let prepared = prepare_canonical_frame_for_codegen(
         encoded.bytes(),
         &fixture.target,

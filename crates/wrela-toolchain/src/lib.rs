@@ -338,9 +338,9 @@ impl ToolchainCompatibility {
             backend_protocol: 5,
             target_package: 1,
             semantic_wir: 13,
-            flow_wir: 17,
-            flow_wir_wire: 17,
-            machine_wir: 18,
+            flow_wir: 18,
+            flow_wir_wire: 18,
+            machine_wir: 19,
             runtime_abi: 2,
             image_report: 17,
             test_plan: 2,
@@ -1231,14 +1231,14 @@ mod tests {
             ..compatibility.clone()
         };
         assert!(manifest.validate(&incompatible).is_err());
-        for machine_wir in [17, 19] {
+        for machine_wir in [18, 20] {
             let incompatible = ToolchainCompatibility {
                 machine_wir,
                 ..compatibility.clone()
             };
             assert!(
                 manifest.validate(&incompatible).is_err(),
-                "MachineWir {machine_wir} must not cross the exact v18 distribution boundary"
+                "MachineWir {machine_wir} must not cross the exact v19 distribution boundary"
             );
         }
     }

@@ -19,7 +19,7 @@ use wrela_target::{InterruptDomain, TargetError, TargetPackage};
 use wrela_test_model::{GuestTestOutcome, TestEvent, TestEventKind, TestId};
 use wrela_test_protocol::{CanonicalTestEventCodec, ProtocolLimits, TestEventCodec};
 
-pub const MACHINE_WIR_VERSION: u32 = 18;
+pub const MACHINE_WIR_VERSION: u32 = 19;
 pub const REGION_STORAGE_SECTION_PREFIX: &str = ".data$wrela$region$";
 pub const REGION_STORAGE_SYMBOL_PREFIX: &str = "__wrela_region_storage_";
 
@@ -540,6 +540,9 @@ pub enum MachineOperation {
     },
     EnumPayload {
         value: ValueId,
+        /// Exact tag for heterogeneous logical payloads; absent only for the
+        /// canonical uniform-payload representation.
+        variant: Option<u8>,
     },
     AddressOffset {
         base: ValueId,
@@ -786,7 +789,7 @@ pub struct MachineFunction {
     pub source: Option<Span>,
 }
 
-/// The only scheduler ownership admitted by MachineWir v18. An actor turn is
+/// The only scheduler ownership admitted by MachineWir v19. An actor turn is
 /// compiled but remains dormant until a real mailbox admission operation
 /// exists; a single-slot static task is invoked exactly once during startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -820,7 +823,7 @@ pub enum MachineActivationCancellation {
     DropCalleeThenPropagate,
 }
 
-/// Exact machine-consumer join for one FlowWir v17 immediate activation.
+/// Exact machine-consumer join for one FlowWir v18 immediate activation.
 ///
 /// The current closed subset lowers an ordinary async helper that is proven
 /// to return without another suspension into a private direct call followed
@@ -870,7 +873,7 @@ pub enum MachineRegionStorageKind {
         actor: u32,
         mailbox_capacity: u32,
     },
-    /// Canonical, actor-owned persistent state cell. MachineWir v18 admits
+    /// Canonical, actor-owned persistent state cell. MachineWir v19 admits
     /// exactly one zero-initialized `u64` cell for a stateful actor; richer
     /// state layouts remain outside this closed representation.
     ActorState {
@@ -6245,7 +6248,7 @@ fn for_each_operation_value(
             condition: value, ..
         } => visit(*value),
         MachineOperation::MakeEnum { payload, .. } => payload.is_none_or(&mut visit),
-        MachineOperation::EnumTag { value } | MachineOperation::EnumPayload { value } => {
+        MachineOperation::EnumTag { value } | MachineOperation::EnumPayload { value, .. } => {
             visit(*value)
         }
         MachineOperation::MakeStruct { fields, .. } => fields.iter().copied().all(&mut visit),
@@ -6505,7 +6508,7 @@ fn validate_operation(
                 value!(*payload);
             }
         }
-        MachineOperation::EnumTag { value } | MachineOperation::EnumPayload { value } => {
+        MachineOperation::EnumTag { value } | MachineOperation::EnumPayload { value, .. } => {
             value!(*value)
         }
         MachineOperation::AddressOffset {
@@ -7074,15 +7077,39 @@ fn validate_operation_types(
                     })
                     .is_some_and(|expected| result_ty(0) == Some(expected))
         }
-        MachineOperation::EnumPayload { value } => {
+        MachineOperation::EnumPayload { value, variant } => {
             result_count == 1
                 && value_ty(*value)
                     .and_then(|ty| module.types.get(ty.0 as usize))
                     .and_then(|record| match &record.kind {
                         MachineTypeKind::TaggedEnum {
                             variant_payloads,
+                            storage,
                             ..
-                        } => {
+                        } => match variant {
+                            Some(variant)
+                                if storage.is_some()
+                                    && variant_payloads.len() == 2
+                                    && matches!(variant_payloads.as_slice(), [Some(left), Some(right)] if left != right)
+                                    && variant_payloads.iter().flatten().all(|payload| {
+                                        module.types.get(payload.0 as usize).is_some_and(|ty| {
+                                            matches!(
+                                                ty.kind,
+                                                MachineTypeKind::Integer {
+                                                    bits: 1 | 8 | 16 | 32 | 64 | 128,
+                                                } | MachineTypeKind::Float32
+                                                    | MachineTypeKind::Float64
+                                            )
+                                        })
+                                    }) =>
+                            {
+                                variant_payloads
+                                    .get(usize::from(*variant))
+                                    .copied()
+                                    .flatten()
+                            }
+                            Some(_) => None,
+                            None if storage.is_none() => {
                             let mut payload = None;
                             for candidate in variant_payloads.iter().flatten() {
                                 if payload.is_some_and(|payload| payload != *candidate) {
@@ -7091,7 +7118,9 @@ fn validate_operation_types(
                                 payload = Some(*candidate);
                             }
                             payload
-                        }
+                            }
+                            None => None,
+                        },
                         _ => None,
                     })
                     .is_some_and(|expected| result_ty(0) == Some(expected))
@@ -8741,7 +8770,10 @@ mod tests {
                     MachineInstruction {
                         id: InstructionId(2),
                         results: vec![ValueId(3)],
-                        operation: MachineOperation::EnumPayload { value: ValueId(1) },
+                        operation: MachineOperation::EnumPayload {
+                            value: ValueId(1),
+                            variant: None,
+                        },
                         source: None,
                     },
                 ],
@@ -9360,7 +9392,10 @@ mod tests {
             .push(MachineInstruction {
                 id: InstructionId(2),
                 results: vec![ValueId(3)],
-                operation: MachineOperation::EnumPayload { value: ValueId(1) },
+                operation: MachineOperation::EnumPayload {
+                    value: ValueId(1),
+                    variant: None,
+                },
                 source: None,
             });
         assert!(forged_projection.validate_for_target(&target).is_err());
@@ -9392,6 +9427,20 @@ mod tests {
             variants: 2,
             variant_payloads: vec![Some(MachineTypeId(5)), Some(MachineTypeId(3))],
         };
+        let mut forged_nominal_projection = module.clone();
+        forged_nominal_projection.functions[1].values[3].ty = MachineTypeId(5);
+        let MachineOperation::EnumPayload { variant, .. } =
+            &mut forged_nominal_projection.functions[1].blocks[0].instructions[2].operation
+        else {
+            unreachable!();
+        };
+        *variant = Some(0);
+        assert!(
+            forged_nominal_projection
+                .validate_for_target(&target)
+                .is_err(),
+            "nominal heterogeneous projection remains fail closed"
+        );
         module.functions[1].blocks[0].instructions.remove(2);
         module.functions[1].values.remove(3);
         module.functions[1].blocks[0].terminator = MachineTerminator::Return(vec![ValueId(2)]);
@@ -9488,14 +9537,18 @@ mod tests {
             alignment: 8,
             source_name: Some("Result".to_owned()),
         };
-        module.functions[1].blocks[0].instructions.remove(2);
-        module.functions[1].values.remove(3);
         let MachineOperation::MakeEnum { variant, .. } =
             &mut module.functions[1].blocks[0].instructions[0].operation
         else {
             unreachable!();
         };
         *variant = 0;
+        let MachineOperation::EnumPayload { variant, .. } =
+            &mut module.functions[1].blocks[0].instructions[2].operation
+        else {
+            unreachable!();
+        };
+        *variant = Some(0);
         module.functions[1].blocks[0].terminator = MachineTerminator::Return(vec![ValueId(2)]);
         module
             .clone()
@@ -9549,6 +9602,23 @@ mod tests {
         };
         variant_payloads[1] = variant_payloads[0];
         assert!(forged_payload_map.validate_for_target(&target).is_err());
+
+        let mut forged_projection_variant = module.clone();
+        let MachineOperation::EnumPayload { variant, .. } =
+            &mut forged_projection_variant.functions[1].blocks[0].instructions[2].operation
+        else {
+            unreachable!();
+        };
+        *variant = Some(1);
+        assert!(
+            forged_projection_variant
+                .validate_for_target(&target)
+                .is_err()
+        );
+
+        let mut forged_projection_type = module.clone();
+        forged_projection_type.functions[1].values[3].ty = MachineTypeId(5);
+        assert!(forged_projection_type.validate_for_target(&target).is_err());
 
         let mut forged_storage = module;
         let MachineTypeKind::TaggedEnum { storage, .. } = &mut forged_storage.types[4].kind else {
@@ -9858,8 +9928,8 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_accepts_only_exact_machine_wir_v18() {
-        assert_eq!(MACHINE_WIR_VERSION, 18);
+    fn current_schema_accepts_only_exact_machine_wir_v19() {
+        assert_eq!(MACHINE_WIR_VERSION, 19);
         assert_eq!(
             CheckedIntegerOp::ShiftLeft.invalid_shift_count_fatal_code(),
             Some(RuntimeFatalCode::InvalidShiftCount)
@@ -9882,12 +9952,12 @@ mod tests {
         );
         assert_eq!(CheckedIntegerOp::Add.invalid_shift_count_fatal_code(), None);
         let (module, target) = fixture();
-        for rejected in [17, 19] {
+        for rejected in [18, 20] {
             let mut changed = module.clone();
             changed.version = rejected;
             let errors = changed
                 .validate_for_target(&target)
-                .expect_err("only exact-current MachineWir v18 is accepted");
+                .expect_err("only exact-current MachineWir v19 is accepted");
             assert!(
                 errors
                     .0

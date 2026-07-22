@@ -2403,22 +2403,46 @@ fn validate_operation(
                 return Err(unsupported());
             }
         }
-        MachineOperation::EnumPayload { value } => {
+        MachineOperation::EnumPayload { value, variant } => {
             let valid = value_type(machine, function, *value).is_some_and(|enum_ty| {
                 machine.types.get(enum_ty.0 as usize).is_some_and(|record| {
                     let MachineTypeKind::TaggedEnum {
-                        variant_payloads, ..
+                        variant_payloads,
+                        storage,
+                        ..
                     } = &record.kind
                     else {
                         return false;
                     };
-                    let mut expected = None;
-                    for payload in variant_payloads.iter().flatten() {
-                        if expected.is_some_and(|expected| expected != *payload) {
-                            return false;
+                    let expected = match variant {
+                        Some(variant)
+                            if storage.is_some()
+                                && variant_payloads.len() == 2
+                                && matches!(variant_payloads.as_slice(), [Some(left), Some(right)] if left != right)
+                                && variant_payloads.iter().flatten().all(|payload| {
+                                    machine.types.get(payload.0 as usize).is_some_and(|ty| {
+                                        supported_scalar_type(&ty.kind, ty.size, ty.alignment)
+                                    })
+                                }) =>
+                        {
+                            variant_payloads
+                                .get(usize::from(*variant))
+                                .copied()
+                                .flatten()
                         }
-                        expected = Some(*payload);
-                    }
+                        Some(_) => None,
+                        None if storage.is_none() => {
+                            let mut expected = None;
+                            for payload in variant_payloads.iter().flatten() {
+                                if expected.is_some_and(|expected| expected != *payload) {
+                                    return false;
+                                }
+                                expected = Some(*payload);
+                            }
+                            expected
+                        }
+                        None => None,
+                    };
                     supported_enum_type(machine, enum_ty)
                         && matches!((expected, instruction.results.as_slice()),
                             (Some(expected), [result])

@@ -899,13 +899,60 @@ fn render_instruction(
             ir.number(u128::from(value.0))?;
             ir.push(", 0\n")?;
         }
-        MachineOperation::EnumPayload { value } => {
-            render_result(ir, result)?;
-            ir.push("extractvalue ")?;
-            render_value_type(ir, machine, function, *value)?;
-            ir.push(" %v")?;
-            ir.number(u128::from(value.0))?;
-            ir.push(", 1\n")?;
+        MachineOperation::EnumPayload { value, .. } => {
+            let result = required_result(result)?;
+            let enum_ty = value_type(function, *value)?;
+            let storage = match type_kind(machine, enum_ty)? {
+                MachineTypeKind::TaggedEnum { storage, .. } => *storage,
+                _ => None,
+            };
+            if let Some(storage) = storage {
+                let payload_ty = value_type(function, result)?;
+                let payload_alignment = machine
+                    .types
+                    .get(payload_ty.0 as usize)
+                    .ok_or(CodegenError::UnsupportedMachineContract(
+                        "an enum projection result has no machine type",
+                    ))?
+                    .alignment;
+                ir.push("  %t")?;
+                ir.number(u128::from(instruction.id.0))?;
+                ir.push("_enum_bits = extractvalue ")?;
+                render_value_type(ir, machine, function, *value)?;
+                ir.push(" %v")?;
+                ir.number(u128::from(value.0))?;
+                ir.push(", 1\n  %t")?;
+                ir.number(u128::from(instruction.id.0))?;
+                ir.push("_enum_slot = alloca ")?;
+                render_enum_storage(ir, storage)?;
+                ir.push(", align ")?;
+                ir.number(u128::from(storage.alignment))?;
+                ir.push("\n  store ")?;
+                render_enum_storage(ir, storage)?;
+                ir.push(" %t")?;
+                ir.number(u128::from(instruction.id.0))?;
+                ir.push("_enum_bits, ptr %t")?;
+                ir.number(u128::from(instruction.id.0))?;
+                ir.push("_enum_slot, align ")?;
+                ir.number(u128::from(storage.alignment))?;
+                ir.push("\n  %v")?;
+                ir.number(u128::from(result.0))?;
+                ir.push(" = load ")?;
+                render_type(ir, machine, payload_ty)?;
+                ir.push(", ptr %t")?;
+                ir.number(u128::from(instruction.id.0))?;
+                ir.push("_enum_slot, align ")?;
+                ir.number(u128::from(payload_alignment))?;
+                ir.push("\n")?;
+            } else {
+                ir.push("  %v")?;
+                ir.number(u128::from(result.0))?;
+                ir.push(" = extractvalue ")?;
+                render_value_type(ir, machine, function, *value)?;
+                ir.push(" %v")?;
+                ir.number(u128::from(value.0))?;
+                ir.push(", 1\n")?;
+            }
         }
         MachineOperation::AddressOffset {
             base,

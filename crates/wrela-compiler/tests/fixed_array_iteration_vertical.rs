@@ -330,7 +330,7 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
         )
         .expect("fixed array reaches FlowWir");
     assert_eq!(first_flow.wir().as_wir(), flow.wir().as_wir());
-    assert_eq!(flow.wir().as_wir().version, 17);
+    assert_eq!(flow.wir().as_wir().version, 18);
     assert_eq!(
         flow.wir()
             .as_wir()
@@ -353,12 +353,12 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
         &never_cancelled,
     )
     .expect("fixed-array canonical FlowWir frame");
-    assert_eq!(encoded.header().wire_version, 17);
+    assert_eq!(encoded.header().wire_version, 18);
     let prepared =
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
             .expect("fixed-array MachineWir preparation");
     let machine = prepared.machine().wir().as_wir();
-    assert_eq!(machine.version, 18);
+    assert_eq!(machine.version, 19);
     assert_eq!(
         machine
             .functions

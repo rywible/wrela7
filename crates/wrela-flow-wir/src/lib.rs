@@ -13,7 +13,7 @@ use wrela_source::Span;
 
 pub use wrela_test_model::TestPlanLimits;
 
-pub const FLOW_WIR_VERSION: u32 = 17;
+pub const FLOW_WIR_VERSION: u32 = 18;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 13;
 
@@ -255,9 +255,14 @@ pub enum FlowOperation {
     EnumTag {
         value: ValueId,
     },
-    /// Read the shared scalar payload of an enum value.
+    /// Read one authenticated scalar payload from an enum value.
+    ///
+    /// `variant` is required when the enum's variants have distinct payload
+    /// types. It stays absent for the canonical uniform-payload representation,
+    /// where a projection may be shared by several switch cases.
     EnumPayload {
         value: ValueId,
+        variant: Option<u8>,
     },
     ExtractField {
         aggregate: ValueId,
@@ -4741,7 +4746,7 @@ fn for_each_flow_operation_value(operation: &FlowOperation, mut visit: impl FnMu
         | FlowOperation::Cast { value, .. }
         | FlowOperation::Promote { value, .. }
         | FlowOperation::EnumTag { value }
-        | FlowOperation::EnumPayload { value }
+        | FlowOperation::EnumPayload { value, .. }
         | FlowOperation::ExtractField {
             aggregate: value, ..
         }
@@ -5589,14 +5594,24 @@ fn validate_operation(
                 });
             }
         }
-        FlowOperation::EnumPayload { value } => {
+        FlowOperation::EnumPayload { value, variant } => {
             value!(*value);
             let payload_ty = function.values.get(value.0 as usize).and_then(|value| {
                 module
                     .types
                     .get(value.ty.0 as usize)
                     .and_then(|record| match &record.kind {
-                        FlowTypeKind::Enum { variants } => canonical_enum_payload(module, variants),
+                        FlowTypeKind::Enum { variants } => match variant {
+                            None => canonical_enum_payload(module, variants),
+                            Some(variant)
+                                if exact_heterogeneous_scalar_enum_profile(module, variants) =>
+                            {
+                                variants
+                                    .get(usize::from(*variant))
+                                    .and_then(|fields| fields.as_slice().first().copied())
+                            }
+                            Some(_) => None,
+                        },
                         _ => None,
                     })
             });
@@ -6712,7 +6727,10 @@ mod tests {
                     Instruction {
                         id: InstructionId(2),
                         results: vec![ValueId(3)],
-                        operation: FlowOperation::EnumPayload { value: ValueId(1) },
+                        operation: FlowOperation::EnumPayload {
+                            value: ValueId(1),
+                            variant: None,
+                        },
                         source: Some(source),
                     },
                 ],
@@ -6999,10 +7017,58 @@ mod tests {
             .push(Instruction {
                 id: InstructionId(2),
                 results: vec![ValueId(3)],
-                operation: FlowOperation::EnumPayload { value: ValueId(1) },
+                operation: FlowOperation::EnumPayload {
+                    value: ValueId(1),
+                    variant: None,
+                },
                 source: None,
             });
         assert!(forged_projection.validate().is_err());
+
+        let mut heterogeneous = closed_enum_fixture(2);
+        heterogeneous.types.push(FlowType {
+            id: TypeId(3),
+            kind: FlowTypeKind::Scalar(ScalarType::Integer {
+                signed: false,
+                bits: 64,
+            }),
+            name: Some("u64".to_owned()),
+            copyable: true,
+            strict_linear: false,
+        });
+        let FlowTypeKind::Enum { variants } = &mut heterogeneous.types[2].kind else {
+            unreachable!();
+        };
+        variants[1][0] = TypeId(3);
+        let FlowOperation::MakeEnum { variant, .. } =
+            &mut heterogeneous.functions[1].blocks[0].instructions[0].operation
+        else {
+            unreachable!();
+        };
+        *variant = 0;
+        let FlowOperation::EnumPayload { variant, .. } =
+            &mut heterogeneous.functions[1].blocks[0].instructions[2].operation
+        else {
+            unreachable!();
+        };
+        *variant = Some(0);
+        heterogeneous
+            .clone()
+            .validate()
+            .expect("heterogeneous scalar projection carries exact tag authority");
+
+        let mut forged_variant = heterogeneous.clone();
+        let FlowOperation::EnumPayload { variant, .. } =
+            &mut forged_variant.functions[1].blocks[0].instructions[2].operation
+        else {
+            unreachable!();
+        };
+        *variant = Some(1);
+        assert!(forged_variant.validate().is_err());
+
+        let mut forged_result_type = heterogeneous;
+        forged_result_type.functions[1].values[3].ty = TypeId(3);
+        assert!(forged_result_type.validate().is_err());
     }
 
     #[test]

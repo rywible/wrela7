@@ -3651,8 +3651,8 @@ fn exact_result_try_match_protocol(
         || !err_field.name.is_empty()
         || !ok_field.public
         || !err_field.public
-        || ok_field.ty != err_field.ty
         || scalar_primitive(input, ok_field.ty).is_none()
+        || scalar_primitive(input, err_field.ty).is_none()
         || function.result != enum_type.id
         || scalar_value_type(function, *result) != Some(ok_field.ty)
         || ok_arm.variant != Some(0)
@@ -6524,13 +6524,6 @@ fn lower_generated_function(
                     if !canonical_semantic_enum_shape(input, enum_type, variants) {
                         return Err(unsupported("enum match scrutinee type"));
                     }
-                    if exact_heterogeneous_scalar_enum_profile(input, enum_type, variants)
-                        && arms.iter().any(|arm| !arm.bindings.is_empty())
-                    {
-                        return Err(unsupported(
-                            "flow-enum-heterogeneous-payload-projection-pending",
-                        ));
-                    }
                     let variants = variants.as_slice();
                     let exact_type_test = exact_enum_type_test_match_protocol(
                         input, function, enum_type, arms, results,
@@ -6563,13 +6556,16 @@ fn lower_generated_function(
                         "FlowWir values",
                         limits.model_edges,
                     )?;
-                    let shared_payload = if arms.iter().any(|arm| !arm.bindings.is_empty())
+                    let shared_payload_ty = if arms.iter().any(|arm| !arm.bindings.is_empty())
                         && variants
                             .iter()
                             .all(|variant| matches!(variant.fields.as_slice(), [_]))
                     {
-                        let payload_ty = canonical_semantic_enum_payload(input, variants)
-                            .ok_or_else(|| unsupported("enum match canonical payload type"))?;
+                        canonical_semantic_enum_payload(input, variants)
+                    } else {
+                        None
+                    };
+                    let shared_payload = if let Some(payload_ty) = shared_payload_ty {
                         let payload = flow::ValueId(u32::try_from(values.len()).map_err(|_| {
                             LowerError::ResourceLimit {
                                 resource: "FlowWir values",
@@ -6612,6 +6608,7 @@ fn lower_generated_function(
                                     results: vec![payload],
                                     operation: flow::FlowOperation::EnumPayload {
                                         value: flow::ValueId(scrutinee.0),
+                                        variant: None,
                                     },
                                     source: *source,
                                 },
@@ -6696,6 +6693,21 @@ fn lower_generated_function(
                                                     results: vec![flow::ValueId(binding.0)],
                                                     operation: flow::FlowOperation::EnumPayload {
                                                         value: flow::ValueId(scrutinee.0),
+                                                        variant: if canonical_semantic_enum_payload(
+                                                            input, variants,
+                                                        )
+                                                        .is_some()
+                                                        {
+                                                            None
+                                                        } else {
+                                                            Some(u8::try_from(variant).map_err(
+                                                                |_| {
+                                                                    unsupported(
+                                                                        "enum match variant range",
+                                                                    )
+                                                                },
+                                                            )?)
+                                                        },
                                                     },
                                                     source: *source,
                                                 },
@@ -6752,6 +6764,7 @@ fn lower_generated_function(
                                                 results: vec![flow::ValueId(binding.0)],
                                                 operation: flow::FlowOperation::EnumPayload {
                                                     value: flow::ValueId(scrutinee.0),
+                                                    variant: None,
                                                 },
                                                 source: *source,
                                             },

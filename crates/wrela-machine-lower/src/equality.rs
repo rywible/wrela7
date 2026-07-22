@@ -365,11 +365,19 @@ fn operation_equal(
                 payload: right_payload,
             },
         ) => left_ty == right_ty && left_variant == right_variant && left_payload == right_payload,
-        (MachineOperation::EnumTag { value: left }, MachineOperation::EnumTag { value: right })
-        | (
-            MachineOperation::EnumPayload { value: left },
-            MachineOperation::EnumPayload { value: right },
-        ) => left == right,
+        (MachineOperation::EnumTag { value: left }, MachineOperation::EnumTag { value: right }) => {
+            left == right
+        }
+        (
+            MachineOperation::EnumPayload {
+                value: left,
+                variant: left_variant,
+            },
+            MachineOperation::EnumPayload {
+                value: right,
+                variant: right_variant,
+            },
+        ) => left == right && left_variant == right_variant,
         (
             MachineOperation::MakeStruct {
                 ty: left_ty,
