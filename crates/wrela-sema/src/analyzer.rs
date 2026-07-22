@@ -14753,7 +14753,6 @@ pub(super) struct StructuredViewLiveness {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum StructuredViewLivenessError {
     UnsupportedControlFlow(Span),
-    UnevenPaths(Span),
     InvalidUse(Span),
     Question(Span),
     Escape(Span),
@@ -14962,13 +14961,7 @@ pub(super) fn derive_structured_view_liveness(
                     branches,
                     else_body,
                 } => {
-                    let mut path_states = Vec::new();
-                    path_states
-                        .try_reserve_exact(branches.len().saturating_add(1))
-                        .map_err(|_| AnalysisFailure::ResourceLimit {
-                            resource: "structured lexical-view branches",
-                            limit: u64::from(u32::MAX),
-                        })?;
+                    let mut any_path_live = false;
                     for (_, branch) in branches {
                         let state = match analyze_body(
                             program,
@@ -14983,7 +14976,7 @@ pub(super) fn derive_structured_view_liveness(
                             Ok(state) => state,
                             Err(error) => return Ok(Err(error)),
                         };
-                        path_states.push(state);
+                        any_path_live |= state;
                     }
                     if let Some(otherwise) = else_body {
                         let state = match analyze_body(
@@ -14999,20 +14992,14 @@ pub(super) fn derive_structured_view_liveness(
                             Ok(state) => state,
                             Err(error) => return Ok(Err(error)),
                         };
-                        path_states.push(state);
+                        any_path_live |= state;
                     } else {
-                        path_states.push(live_after);
+                        any_path_live |= live_after;
                     }
-                    let first = path_states.first().copied().unwrap_or(live_after);
-                    if path_states.iter().any(|state| *state != first) {
-                        return Ok(Err(StructuredViewLivenessError::UnevenPaths(
-                            statement.source,
-                        )));
-                    }
-                    first
+                    any_path_live
                 }
                 StatementKind::Match { arms, .. } => {
-                    let mut first = None;
+                    let mut any_path_live = arms.is_empty() && live_after;
                     for arm in arms {
                         let state = match analyze_body(
                             program,
@@ -15027,14 +15014,9 @@ pub(super) fn derive_structured_view_liveness(
                             Ok(state) => state,
                             Err(error) => return Ok(Err(error)),
                         };
-                        if first.is_some_and(|expected| expected != state) {
-                            return Ok(Err(StructuredViewLivenessError::UnevenPaths(
-                                statement.source,
-                            )));
-                        }
-                        first = Some(state);
+                        any_path_live |= state;
                     }
-                    first.unwrap_or(live_after)
+                    any_path_live
                 }
                 StatementKind::For { .. }
                 | StatementKind::While { .. }
@@ -15245,16 +15227,6 @@ fn record_lexical_view_initialization(
                 "loop or with control flow occurs while a lexical view remains live",
                 "this increment authenticates acyclic if/match liveness without inventing a fixed-point witness",
                 "consume the view before this statement or recreate it afterward",
-            ));
-        }
-        Err(StructuredViewLivenessError::UnevenPaths(source)) => {
-            return Err(runtime_type_diagnostic(
-                request,
-                source,
-                "semantic-view-control-flow-pending",
-                "lexical view has no exact terminal use on every control-flow path",
-                "branch and match joins require the activation to be live on every incoming path or released on every path",
-                "consume the view in every arm or after the structured statement",
             ));
         }
         Err(StructuredViewLivenessError::MissingUse(source)) => {
@@ -36469,6 +36441,261 @@ fn match_view_liveness_is_structured():
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn asymmetric_if_view_liveness_releases_the_nonretaining_branch() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn touch(mut packet: Packet):
+    pass
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn asymmetric_branch_release():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    pass
+    if true:
+        consume(hdr)
+    else:
+        touch(mut packet)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "a branch that never retains the view may mutate its former source: {:?}",
+            output.diagnostics()
+        );
+        let analyzed = output.successful().expect("sealed asymmetric if view");
+        let facts = analyzed.facts();
+        let view = &facts.lexical_views[0];
+        let program = analyzed.hir().as_program();
+        let initialization = program
+            .statement(view.initialization)
+            .expect("view initialization");
+        let body = program.body(initialization.body).expect("runtime body");
+        let if_index = body
+            .statements
+            .iter()
+            .position(|statement| {
+                program
+                    .statement(*statement)
+                    .is_some_and(|statement| matches!(statement.kind, StatementKind::If { .. }))
+            })
+            .expect("asymmetric if");
+        let before_if = body.statements[if_index - 1];
+        let if_statement = program
+            .statement(body.statements[if_index])
+            .expect("asymmetric if");
+        let StatementKind::If {
+            branches,
+            else_body: Some(otherwise),
+        } = &if_statement.kind
+        else {
+            panic!("if/else shape");
+        };
+        let consuming = program
+            .body(branches[0].1)
+            .and_then(|body| body.statements.first())
+            .copied()
+            .expect("consuming branch statement");
+        let nonretaining = program
+            .body(*otherwise)
+            .and_then(|body| body.statements.first())
+            .copied()
+            .expect("nonretaining mutation statement");
+        assert_eq!(view.terminal_uses.len(), 1);
+        assert_eq!(
+            containing_statement_for_expression(
+                program,
+                program
+                    .expression(view.terminal_uses[0])
+                    .expect("terminal reference"),
+            ),
+            Some(consuming)
+        );
+        assert_eq!(view.live_after_statements.as_slice(), &[before_if]);
+        assert!(
+            !view.live_after_statements.contains(&nonretaining),
+            "the mutating branch never retains the view"
+        );
+
+        let mut forged = facts.clone();
+        forged.lexical_views[0]
+            .live_after_statements
+            .push(nonretaining);
+        forged.lexical_views[0]
+            .live_after_statements
+            .sort_unstable();
+        let statement = forged
+            .statements
+            .iter_mut()
+            .find(|fact| fact.function == view.function && fact.statement == nonretaining)
+            .expect("nonretaining statement fact");
+        statement.live_lexical_views_after.push(view.id);
+        statement.live_lexical_views_after.sort_unstable();
+        assert!(
+            forged.validate_partial_structure().is_ok(),
+            "the paired forged witnesses remain structurally well formed"
+        );
+        assert!(
+            forged.validate_for_seal(analyzed.hir(), &|| false).is_err(),
+            "full sealing must recompute liveness and reject a falsely retained branch"
+        );
+    }
+
+    #[test]
+    fn asymmetric_if_view_liveness_allows_nonretaining_await() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+async fn checkpoint():
+    pass
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+async fn asymmetric_branch_await():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    pass
+    if true:
+        consume(hdr)
+    else:
+        await checkpoint()
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "an await on a path that never retains the view must analyze: {:?}",
+            output.diagnostics()
+        );
+        let analyzed = output.successful().expect("sealed asymmetric await view");
+        let facts = analyzed.facts();
+        let view = &facts.lexical_views[0];
+        let program = analyzed.hir().as_program();
+        let await_statement = program
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(
+                    expression.kind,
+                    ExpressionKind::Unary {
+                        operator: wrela_hir::UnaryOperator::Await,
+                        ..
+                    }
+                )
+            })
+            .and_then(|expression| containing_statement_for_expression(program, expression))
+            .expect("await statement");
+        assert_eq!(view.terminal_uses.len(), 1);
+        assert_eq!(view.live_after_statements.len(), 1);
+        assert!(
+            !view.live_after_statements.contains(&await_statement),
+            "the await branch must be outside this view's live interval"
+        );
+    }
+
+    #[test]
+    fn asymmetric_match_view_liveness_uses_an_or_join() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+pub enum Choice:
+    left
+    right
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn asymmetric_match_release():
+    packet: Packet = Packet(header=7)
+    choice: Choice = .left
+    hdr: view u64 = header(packet)
+    pass
+    match choice:
+        case Choice.left:
+            consume(hdr)
+        case Choice.right:
+            pass
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "an exhaustive match may retain the view in only one arm: {:?}",
+            output.diagnostics()
+        );
+        let analyzed = output.successful().expect("sealed asymmetric match view");
+        let facts = analyzed.facts();
+        let view = &facts.lexical_views[0];
+        let program = analyzed.hir().as_program();
+        let initialization = program
+            .statement(view.initialization)
+            .expect("view initialization");
+        let body = program.body(initialization.body).expect("runtime body");
+        let match_index = body
+            .statements
+            .iter()
+            .position(|statement| {
+                program
+                    .statement(*statement)
+                    .is_some_and(|statement| matches!(statement.kind, StatementKind::Match { .. }))
+            })
+            .expect("asymmetric match");
+        let before_match = body.statements[match_index - 1];
+        let match_statement = program
+            .statement(body.statements[match_index])
+            .expect("asymmetric match");
+        let StatementKind::Match { arms, .. } = &match_statement.kind else {
+            panic!("match shape");
+        };
+        let nonretaining = program
+            .body(arms[1].body)
+            .and_then(|body| body.statements.first())
+            .copied()
+            .expect("nonretaining match arm");
+        assert_eq!(view.terminal_uses.len(), 1);
+        assert_eq!(view.live_after_statements.as_slice(), &[before_match]);
+        assert!(!view.live_after_statements.contains(&nonretaining));
     }
 
     #[test]
