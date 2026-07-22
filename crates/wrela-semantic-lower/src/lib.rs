@@ -8973,9 +8973,16 @@ impl SourceFunctionLowerer<'_> {
                             matches!(record.kind, sema::SemanticTypeKind::Array { .. })
                         })
                     {
-                        return Err(unsupported(
-                            "semantic-fixed-array-match-lowering-pending (positional branch lowering)",
-                        ));
+                        returned = self.lower_closed_fixed_array_match(
+                            scrutinee,
+                            &arms,
+                            statement_source,
+                            depth,
+                            &statement_definitions,
+                            local_state,
+                            &mut statements,
+                        )?;
+                        continue;
                     }
                     let (declaration, semantic_variants) = self
                         .input
@@ -9621,6 +9628,475 @@ impl SourceFunctionLowerer<'_> {
             parameters: Vec::new(),
             statements,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_closed_fixed_array_match(
+        &mut self,
+        scrutinee: wrela_hir::ExpressionId,
+        arms: &[wrela_hir::MatchArm],
+        statement_source: Span,
+        depth: u32,
+        definitions: &[sema::LocalDefinition],
+        local_state: &SourceLocalState,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<bool, LowerError> {
+        struct LoweredArrayArm {
+            condition: Option<wir::ValueId>,
+            prelude: Vec<wir::SemanticStatement>,
+            body: wir::SemanticRegion,
+            source: Span,
+        }
+
+        check_cancelled(self.is_cancelled)?;
+        self.push_seen_expression(scrutinee)?;
+        let (source_elements, array_source) = {
+            let expression = self
+                .input
+                .hir()
+                .as_program()
+                .expression(scrutinee)
+                .ok_or_else(|| self.fact_mismatch("fixed-array match HIR expression"))?;
+            let wrela_hir::ExpressionKind::Array(elements) = &expression.kind else {
+                return Err(self.fact_mismatch("fixed-array match HIR shape"));
+            };
+            let mut copied = try_vec(
+                elements.len(),
+                "SemanticWir fixed-array match source elements",
+                self.limits.model_edges,
+            )?;
+            copied.extend_from_slice(elements);
+            (copied, expression.source)
+        };
+        let (array_ty, fact_effects, semantic_elements, length, bounds) = {
+            let fact = self.expression_fact(scrutinee)?;
+            let (elements, maximum_iterations, bounds) = match &fact.resolution {
+                sema::ExpressionResolution::ClosedArray {
+                    elements,
+                    maximum_iterations,
+                    bounds,
+                } => (elements, *maximum_iterations, *bounds),
+                _ => return Err(self.fact_mismatch("fixed-array match semantic resolution")),
+            };
+            if fact.function != self.function.id
+                || fact.result.is_some()
+                || fact.category != sema::ValueCategory::Value
+                || fact.region.is_some()
+                || fact.proofs != self.function.proofs
+            {
+                return Err(self.fact_mismatch("fixed-array match semantic fact"));
+            }
+            let mut copied = try_vec(
+                elements.len(),
+                "SemanticWir fixed-array match element identities",
+                self.limits.model_edges,
+            )?;
+            copied.extend_from_slice(elements);
+            (fact.ty, fact.effects, copied, maximum_iterations, bounds)
+        };
+        if source_elements.len() != semantic_elements.len()
+            || u64::try_from(source_elements.len()) != Ok(length)
+            || length == 0
+        {
+            return Err(self.fact_mismatch("fixed-array match semantic extent"));
+        }
+        let element_ty = self
+            .input
+            .facts()
+            .types
+            .get(array_ty.0 as usize)
+            .and_then(|record| match record.kind {
+                sema::SemanticTypeKind::Array {
+                    element,
+                    length: exact,
+                } if exact == length => Some(element),
+                _ => None,
+            })
+            .filter(|element| {
+                self.input
+                    .facts()
+                    .types
+                    .get(element.0 as usize)
+                    .is_some_and(|record| {
+                        record.linearity == sema::Linearity::ScalarCopy
+                            && matches!(
+                                record.kind,
+                                sema::SemanticTypeKind::Bool
+                                    | sema::SemanticTypeKind::Integer {
+                                        signed: true,
+                                        bits: 64,
+                                        pointer_sized: false,
+                                    }
+                            )
+                    })
+            })
+            .ok_or_else(|| self.fact_mismatch("fixed-array match semantic type"))?;
+        let proof = self
+            .input
+            .facts()
+            .proofs
+            .get(bounds.0 as usize)
+            .filter(|proof| proof.id == bounds)
+            .ok_or_else(|| self.fact_mismatch("fixed-array match bounds proof"))?;
+        if proof.kind != sema::ProofKind::CapacityBound
+            || proof.subject != "inline fixed-array pattern match"
+            || proof.sources.as_slice() != [array_source]
+            || !proof.depends_on.is_empty()
+            || proof.bound != Some(length)
+            || proof.explanation.as_slice()
+                != [
+                    "every array-pattern position is authenticated against the exact inline array length",
+                ]
+        {
+            return Err(self.fact_mismatch("fixed-array match bounds proof"));
+        }
+        let required = wir::ProofId(bounds.0);
+        if self.function.proofs.binary_search(&bounds).is_err()
+            && !self.required_proofs.contains(&required)
+        {
+            push_bounded_proof(&mut self.required_proofs, required, self.limits.model_edges)?;
+        }
+
+        let mut fields = try_vec(
+            source_elements.len(),
+            "SemanticWir fixed-array match fields",
+            self.limits.model_edges,
+        )?;
+        let mut effects = 0_u64;
+        for (source_element, semantic_element) in source_elements.iter().zip(&semantic_elements) {
+            check_cancelled(self.is_cancelled)?;
+            let child = self.expression_fact(*source_element)?;
+            if child.ty != element_ty || child.result != Some(*semantic_element) {
+                return Err(self.fact_mismatch("fixed-array match element identity"));
+            }
+            effects |= child.effects.0;
+            let LoweredExpression::Value(value) =
+                self.lower_expression(*source_element, sema::AccessMode::Value, statements)?
+            else {
+                return Err(self.fact_mismatch("fixed-array match element value"));
+            };
+            if value != self.value_map.get(*semantic_element)? {
+                return Err(self.fact_mismatch("fixed-array match lowered element identity"));
+            }
+            fields.push(value);
+        }
+        if fact_effects.0 != effects {
+            return Err(self.fact_mismatch("fixed-array match effects"));
+        }
+        let array_value = self.allocate_synthetic_value(array_ty, array_source)?;
+        self.push_let(
+            statements,
+            array_value,
+            wir::SemanticOperation::Aggregate {
+                ty: wir::TypeId(array_ty.0),
+                fields,
+            },
+            Some(array_source),
+        )?;
+        let index_ty = self
+            .input
+            .facts()
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(
+                    ty.kind,
+                    sema::SemanticTypeKind::Integer {
+                        signed: false,
+                        bits: 64,
+                        pointer_sized: false,
+                    }
+                )
+            })
+            .map(|ty| ty.id)
+            .ok_or_else(|| self.fact_mismatch("fixed-array match index type"))?;
+        let bool_ty = self
+            .input
+            .facts()
+            .types
+            .iter()
+            .find(|ty| matches!(ty.kind, sema::SemanticTypeKind::Bool))
+            .map(|ty| ty.id)
+            .ok_or_else(|| self.fact_mismatch("fixed-array match condition type"))?;
+        let arity = usize::try_from(length)
+            .map_err(|_| self.fact_mismatch("fixed-array match representable arity"))?;
+        let mut definition_index = 0usize;
+        let mut all_return = true;
+        let mut lowered_arms = try_vec(
+            arms.len(),
+            "SemanticWir fixed-array match arms",
+            self.limits.model_edges,
+        )?;
+        for arm in arms {
+            check_cancelled(self.is_cancelled)?;
+            if arm.guard.is_some() {
+                return Err(self.fact_mismatch("fixed-array match guard"));
+            }
+            let pattern = self
+                .input
+                .hir()
+                .as_program()
+                .patterns
+                .get(arm.pattern.0 as usize)
+                .filter(|pattern| {
+                    pattern.id == arm.pattern
+                        && pattern
+                            .binding_scope
+                            .and_then(|scope| {
+                                self.input.hir().as_program().scopes.get(scope.0 as usize)
+                            })
+                            .is_some_and(|scope| scope.body == arm.body)
+                })
+                .ok_or_else(|| self.fact_mismatch("fixed-array match pattern scope"))?;
+            let [alternative] = pattern.alternatives.as_slice() else {
+                return Err(self.fact_mismatch("fixed-array match pattern alternatives"));
+            };
+            let mut condition_prelude = try_vec(
+                arity.saturating_mul(5),
+                "SemanticWir fixed-array match condition prelude",
+                self.limits.model_edges,
+            )?;
+            let mut binding_prelude = try_vec(
+                arity.saturating_mul(2),
+                "SemanticWir fixed-array match binding prelude",
+                self.limits.model_edges,
+            )?;
+            let mut condition = None;
+            let mut arm_state = local_state.copy(self.limits)?;
+            let irrefutable = match &alternative.kind {
+                wrela_hir::PrimaryPattern::Wildcard => true,
+                wrela_hir::PrimaryPattern::Array(arguments) if arguments.len() == arity => {
+                    let mut all_irrefutable = true;
+                    for (position, argument) in arguments.iter().enumerate() {
+                        check_cancelled(self.is_cancelled)?;
+                        if argument.take {
+                            return Err(self.fact_mismatch("fixed-array match taking element"));
+                        }
+                        let child = self
+                            .input
+                            .hir()
+                            .as_program()
+                            .patterns
+                            .get(argument.pattern.0 as usize)
+                            .filter(|pattern| pattern.id == argument.pattern)
+                            .ok_or_else(|| {
+                                self.fact_mismatch("fixed-array match element pattern")
+                            })?;
+                        let [child] = child.alternatives.as_slice() else {
+                            return Err(
+                                self.fact_mismatch("fixed-array match element alternatives")
+                            );
+                        };
+                        match &child.kind {
+                            wrela_hir::PrimaryPattern::Wildcard => {}
+                            wrela_hir::PrimaryPattern::Bind(local) => {
+                                let definition = definitions
+                                    .get(definition_index)
+                                    .filter(|definition| definition.local == *local)
+                                    .ok_or_else(|| {
+                                        self.fact_mismatch(
+                                            "fixed-array match binding definition order",
+                                        )
+                                    })?;
+                                definition_index += 1;
+                                let local_record = self
+                                    .input
+                                    .hir()
+                                    .as_program()
+                                    .locals
+                                    .get(local.0 as usize)
+                                    .filter(|record| record.id == *local && record.body == arm.body)
+                                    .ok_or_else(|| {
+                                        self.fact_mismatch(
+                                            "fixed-array match binding local ownership",
+                                        )
+                                    })?;
+                                self.input
+                                    .facts()
+                                    .values
+                                    .get(definition.value.0 as usize)
+                                    .filter(|record| {
+                                        record.function == self.function.id
+                                            && record.ty == element_ty
+                                            && record.origin
+                                                == sema::SemanticValueOrigin::Local(*local)
+                                            && record.source == Some(local_record.source)
+                                            && record.source_name.as_deref()
+                                                == Some(local_record.name.as_str())
+                                    })
+                                    .ok_or_else(|| {
+                                        self.fact_mismatch(
+                                            "fixed-array match binding value provenance",
+                                        )
+                                    })?;
+                                if arm_state.get(*local).is_some() {
+                                    return Err(self.fact_mismatch(
+                                        "fixed-array match binding shadows live local",
+                                    ));
+                                }
+                                arm_state.set(*local, definition.value)?;
+                                let index =
+                                    self.allocate_synthetic_value(index_ty, child.source)?;
+                                self.push_let(
+                                    &mut binding_prelude,
+                                    index,
+                                    wir::SemanticOperation::Constant(wir::Constant::Unsigned {
+                                        bits: 64,
+                                        value: position as u128,
+                                    }),
+                                    Some(child.source),
+                                )?;
+                                self.push_let(
+                                    &mut binding_prelude,
+                                    self.value_map.get(definition.value)?,
+                                    wir::SemanticOperation::Index {
+                                        base: array_value,
+                                        index,
+                                        proof: required,
+                                    },
+                                    Some(child.source),
+                                )?;
+                            }
+                            wrela_hir::PrimaryPattern::Literal { negative, literal }
+                                if !negative =>
+                            {
+                                all_irrefutable = false;
+                                let index =
+                                    self.allocate_synthetic_value(index_ty, child.source)?;
+                                let actual =
+                                    self.allocate_synthetic_value(element_ty, child.source)?;
+                                let expected =
+                                    self.allocate_synthetic_value(element_ty, child.source)?;
+                                let equal = self.allocate_synthetic_value(bool_ty, child.source)?;
+                                self.push_let(
+                                    &mut condition_prelude,
+                                    index,
+                                    wir::SemanticOperation::Constant(wir::Constant::Unsigned {
+                                        bits: 64,
+                                        value: position as u128,
+                                    }),
+                                    Some(child.source),
+                                )?;
+                                self.push_let(
+                                    &mut condition_prelude,
+                                    actual,
+                                    wir::SemanticOperation::Index {
+                                        base: array_value,
+                                        index,
+                                        proof: required,
+                                    },
+                                    Some(child.source),
+                                )?;
+                                let literal =
+                                    lower_scope_literal(self.input.facts(), element_ty, literal)
+                                        .map_err(|_| {
+                                            self.fact_mismatch("fixed-array match scalar literal")
+                                        })?;
+                                self.push_let(
+                                    &mut condition_prelude,
+                                    expected,
+                                    wir::SemanticOperation::Constant(literal),
+                                    Some(child.source),
+                                )?;
+                                self.push_let(
+                                    &mut condition_prelude,
+                                    equal,
+                                    wir::SemanticOperation::Binary {
+                                        operator: wir::BinaryOperator::Equal,
+                                        left: actual,
+                                        right: expected,
+                                        arithmetic: wir::ArithmeticMode::Checked,
+                                    },
+                                    Some(child.source),
+                                )?;
+                                condition = Some(match condition {
+                                    None => equal,
+                                    Some(previous) => {
+                                        let combined =
+                                            self.allocate_synthetic_value(bool_ty, child.source)?;
+                                        self.push_let(
+                                            &mut condition_prelude,
+                                            combined,
+                                            wir::SemanticOperation::Binary {
+                                                operator: wir::BinaryOperator::BitAnd,
+                                                left: previous,
+                                                right: equal,
+                                                arithmetic: wir::ArithmeticMode::Checked,
+                                            },
+                                            Some(child.source),
+                                        )?;
+                                        combined
+                                    }
+                                });
+                            }
+                            _ => {
+                                return Err(self.fact_mismatch("fixed-array match element shape"));
+                            }
+                        }
+                    }
+                    all_irrefutable
+                }
+                _ => return Err(self.fact_mismatch("fixed-array match arm shape")),
+            };
+            if irrefutable != condition.is_none() {
+                return Err(self.fact_mismatch("fixed-array match exact coverage"));
+            }
+            let mut body = self.lower_body(arm.body, depth + 1, &mut arm_state)?;
+            binding_prelude.append(&mut body.statements);
+            body.statements = binding_prelude;
+            if !self.body_definitely_returns(arm.body)? {
+                all_return = false;
+            }
+            lowered_arms.push(LoweredArrayArm {
+                condition,
+                prelude: condition_prelude,
+                body,
+                source: arm.source,
+            });
+        }
+        if definition_index != definitions.len() {
+            return Err(self.fact_mismatch("fixed-array match extra definitions"));
+        }
+        let mut folded: Option<wir::SemanticRegion> = None;
+        for arm in lowered_arms.into_iter().rev() {
+            check_cancelled(self.is_cancelled)?;
+            match arm.condition {
+                None => {
+                    if folded.is_some() || !arm.prelude.is_empty() {
+                        return Err(self.fact_mismatch("fixed-array match irrefutable arm order"));
+                    }
+                    folded = Some(arm.body);
+                }
+                Some(condition) => {
+                    let else_region = folded
+                        .take()
+                        .ok_or_else(|| self.fact_mismatch("fixed-array match exhaustiveness"))?;
+                    let mut prelude = arm.prelude;
+                    self.push_statement(
+                        &mut prelude,
+                        wir::SemanticStatement::If {
+                            condition,
+                            then_region: arm.body,
+                            else_region,
+                            results: Vec::new(),
+                            source: Some(arm.source),
+                        },
+                    )?;
+                    folded = Some(wir::SemanticRegion {
+                        parameters: Vec::new(),
+                        statements: prelude,
+                    });
+                }
+            }
+        }
+        let mut folded =
+            folded.ok_or_else(|| self.fact_mismatch("fixed-array match has no exhaustive arms"))?;
+        if !folded.parameters.is_empty() {
+            return Err(self.fact_mismatch("fixed-array match root parameters"));
+        }
+        statements.append(&mut folded.statements);
+        let _ = statement_source;
+        Ok(all_return)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -27988,9 +28464,74 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn closed_fixed_array_match_stops_at_named_semantic_lowering_boundary() {
-        let image = analyze_parsed_actor_source(
-            r#"module app
+    fn closed_fixed_array_match_lowers_ordered_positional_branches() {
+        fn visit_statements<'a>(
+            region: &'a wir::SemanticRegion,
+            statements: &mut Vec<&'a wir::SemanticStatement>,
+        ) {
+            for statement in &region.statements {
+                statements.push(statement);
+                match statement {
+                    wir::SemanticStatement::If {
+                        then_region,
+                        else_region,
+                        ..
+                    } => {
+                        visit_statements(then_region, statements);
+                        visit_statements(else_region, statements);
+                    }
+                    wir::SemanticStatement::Match { arms, .. } => {
+                        for arm in arms {
+                            visit_statements(&arm.body, statements);
+                        }
+                    }
+                    wir::SemanticStatement::Loop { body, .. } => {
+                        visit_statements(body, statements);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        fn replace_index_for_result(
+            region: &mut wir::SemanticRegion,
+            result: wir::ValueId,
+            replacement: wir::ValueId,
+        ) -> bool {
+            for statement in &mut region.statements {
+                let replaced = match statement {
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        results,
+                        operation: wir::SemanticOperation::Index { index, .. },
+                        ..
+                    }) if results.as_slice() == [result] => {
+                        *index = replacement;
+                        return true;
+                    }
+                    wir::SemanticStatement::If {
+                        then_region,
+                        else_region,
+                        ..
+                    } => {
+                        replace_index_for_result(then_region, result, replacement)
+                            || replace_index_for_result(else_region, result, replacement)
+                    }
+                    wir::SemanticStatement::Match { arms, .. } => arms
+                        .iter_mut()
+                        .any(|arm| replace_index_for_result(&mut arm.body, result, replacement)),
+                    wir::SemanticStatement::Loop { body, .. } => {
+                        replace_index_for_result(body, result, replacement)
+                    }
+                    _ => false,
+                };
+                if replaced {
+                    return true;
+                }
+            }
+            false
+        }
+
+        let source = r#"module app
 
 from core.image import Image, Target
 
@@ -28012,20 +28553,316 @@ pub fn boot() -> Image:
     img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
     installed = img.service(Worker, mailbox=2)
     return img
-"#,
+"#;
+        let image = analyze_parsed_actor_source(source);
+        let (input_edges, input_payload) =
+            preflight_input(image.facts(), LoweringLimits::standard(), &|| false)
+                .expect("measure fixed-array match input");
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("fixed-array match reaches SemanticWir");
+        assert_eq!(lowered.wir().as_wir().version, wir::SEMANTIC_WIR_VERSION);
+        let turn = lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .expect("actor turn");
+        let binding = turn
+            .values
+            .iter()
+            .find(|value| value.name.as_deref() == Some("second"))
+            .expect("second-position binding")
+            .id;
+        let mut nested = Vec::new();
+        visit_statements(&turn.body, &mut nested);
+        let binding_index = nested
+            .iter()
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    results,
+                    operation: wir::SemanticOperation::Index { index, proof, .. },
+                    ..
+                }) if results.as_slice() == [binding] => Some((*index, *proof)),
+                _ => None,
+            })
+            .expect("binding is one exact positional extraction");
+        let index_constant =
+            nested
+                .iter()
+                .find_map(|statement| match statement {
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        results,
+                        operation:
+                            wir::SemanticOperation::Constant(wir::Constant::Unsigned {
+                                bits: 64,
+                                value,
+                            }),
+                        ..
+                    }) if results.as_slice() == [binding_index.0] => Some(*value),
+                    _ => None,
+                })
+                .expect("binding index constant");
+        assert_eq!(index_constant, 1);
+        let condition_index = nested
+            .iter()
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    results,
+                    operation: wir::SemanticOperation::Index { index, .. },
+                    ..
+                }) if results.as_slice() != [binding] => Some(*index),
+                _ => None,
+            })
+            .expect("first-arm literal extraction index");
+        assert_ne!(condition_index, binding_index.0);
+        assert!(nested.iter().any(|statement| matches!(
+            statement,
+            wir::SemanticStatement::Let(wir::LetStatement {
+                operation: wir::SemanticOperation::Binary {
+                    operator: wir::BinaryOperator::Equal,
+                    ..
+                },
+                ..
+            })
+        )));
+        assert_eq!(
+            lowered.wir().as_wir().proofs[binding_index.1.0 as usize].subject,
+            "inline fixed-array pattern match"
         );
+
+        let mut forged_position = lowered.wir().as_wir().clone();
+        let forged_turn = forged_position
+            .functions
+            .iter_mut()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .expect("mutable actor turn");
+        assert!(replace_index_for_result(
+            &mut forged_turn.body,
+            binding,
+            condition_index,
+        ));
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                forged_position,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
+        ));
+
+        let mut forged_proof = lowered.wir().as_wir().clone();
+        forged_proof.proofs[binding_index.1.0 as usize].subject =
+            "inline fixed-array forged authority".to_owned();
+        assert!(forged_proof.clone().validate().is_err());
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                forged_proof,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidOutput(_))
+        ));
+
+        let exact_operations = lowered.report().operations;
+        let meter = measure_model_resources(
+            lowered.wir().as_wir().into(),
+            LoweringLimits::standard(),
+            &|| false,
+        )
+        .expect("measure fixed-array match SemanticWir");
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        exact.model_edges = meter.edges.max(input_edges);
+        exact.payload_bytes = meter.payload_bytes.max(input_payload);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact fixed-array match operation/model limits");
+        let mut one_operation_under = exact;
+        one_operation_under.operations -= 1;
         assert!(matches!(
             CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_operation_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == exact_operations - 1
+        ));
+        let mut one_edge_under = exact;
+        one_edge_under.model_edges -= 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_edge_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit { limit, .. })
+                if limit == exact.model_edges - 1
+        ));
+        let polls = Cell::new(0_u64);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            )
+            .expect("count fixed-array match lowering polls");
+        let final_poll = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next == final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn closed_fixed_array_match_lowers_each_boolean_binding_once_in_position_order() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        match [true, false]:
+            case [first, second]:
+                pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
                 LowerRequest {
                     input: image,
                     limits: LoweringLimits::standard(),
                 },
                 &|| false,
-            ),
-            Err(LowerError::UnsupportedInput {
-                feature: "semantic-fixed-array-match-lowering-pending (positional branch lowering)"
+            )
+            .expect("fixed-array match reaches SemanticWir");
+        let turn = lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .expect("actor turn");
+        let debug = format!("{:?}", turn.body);
+        assert_eq!(debug.matches("operation: Index").count(), 2);
+        assert!(!debug.contains("operator: Equal"));
+        let named: Vec<_> = turn
+            .values
+            .iter()
+            .filter_map(|value| match value.name.as_deref() {
+                Some(name @ ("first" | "second")) => Some((value.id, name)),
+                _ => None,
             })
-        ));
+            .collect();
+        assert_eq!(named.len(), 2);
+        assert_eq!(named[0].1, "first");
+        assert_eq!(named[1].1, "second");
+    }
+
+    #[test]
+    fn closed_fixed_array_match_folds_multiple_literals_before_whole_wildcard() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        match [1, 2]:
+            case [1, 2]:
+                pass
+            case _:
+                pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("multi-literal array pattern reaches SemanticWir");
+        let turn = lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .expect("actor turn");
+        let debug = format!("{:?}", turn.body);
+        assert_eq!(debug.matches("operator: Equal").count(), 2);
+        assert_eq!(debug.matches("operator: BitAnd").count(), 1);
+        assert_eq!(debug.matches("If {").count(), 1);
     }
 
     #[test]

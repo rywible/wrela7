@@ -16,7 +16,7 @@ pub use wrela_test_model::{
     TestDescriptor, TestId as ModelTestId, TestKind as ModelTestKind,
 };
 
-pub const SEMANTIC_WIR_VERSION: u32 = 14;
+pub const SEMANTIC_WIR_VERSION: u32 = 15;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 
 macro_rules! id_type {
@@ -3974,6 +3974,42 @@ fn validate_operation(
             value!(*base);
             value!(*index);
             require_id("index proof", proof.0, module.proofs.len(), errors);
+            let valid = matches!(results, [result]
+            if function.values.get(base.0 as usize).and_then(|base| {
+                module.types.get(base.ty.0 as usize).and_then(|ty| match ty.kind {
+                    TypeKind::Array { element, length } if length > 0 => {
+                        Some((element, length))
+                    }
+                    _ => None,
+                })
+            }).is_some_and(|(element, length)| {
+                function.values.get(result.0 as usize).is_some_and(|result| result.ty == element)
+                    && function.values.get(index.0 as usize).is_some_and(|index| {
+                        module.types.get(index.ty.0 as usize).is_some_and(|ty| {
+                            ty.kind == TypeKind::Primitive(PrimitiveType::U64)
+                                && ty.linearity == Linearity::CopyScalar
+                        })
+                    })
+                    && module.proofs.get(proof.0 as usize).is_some_and(|record| {
+                        record.id == *proof
+                            && record.kind == ProofKind::CapacityBound
+                            && matches!(
+                                record.subject.as_str(),
+                                "inline fixed-array iteration"
+                                    | "inline fixed-array pattern match"
+                            )
+                            && record.bound == Some(length)
+                            && record.depends_on.is_empty()
+                            && record.sources.len() == 1
+                    })
+                    && function.proofs.binary_search(proof).is_ok()
+            }));
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "fixed-array index",
+                    id: results.first().map_or(u32::MAX, |result| result.0),
+                });
+            }
         }
         SemanticOperation::BeginAccess { place, region, .. } => {
             value!(*place);
@@ -5949,7 +5985,7 @@ mod tests {
         closed_enum_fixture(256)
             .validate()
             .expect("256-variant enum");
-        for rejected in [13, 15] {
+        for rejected in [14, 16] {
             let mut wrong_version = closed_enum_fixture(2);
             wrong_version.version = rejected;
             assert!(wrong_version.validate().is_err());

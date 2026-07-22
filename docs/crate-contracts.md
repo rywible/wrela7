@@ -462,11 +462,11 @@ it. It injects phase implementations and bounded host capabilities, while
   preserves the analyzer's exact proof-kind vocabulary and every proof source,
   as well as function instance keys, attached proof IDs, recursive-depth
   bounds, and the HIR declaration/file bounds used to validate provenance.
-- SemanticWir v14 retains exact SSA aggregate field replacement as `InsertField`.
+- SemanticWir v15 retains exact SSA aggregate field replacement as `InsertField`.
   Validation joins the prior aggregate's struct type, selected field, inserted
   value type, and single result of the unchanged aggregate type; FlowWir v19
   preserves the same operation and independently repeats that join.
-- SemanticWir v14 retains compiler-minted plain byte literals as
+- SemanticWir v15 retains compiler-minted plain byte literals as
   `StaticBytes { bytes }` plus an exact decoded `Constant::Bytes`. Validation
   authenticates the canonical `Static[Bytes[N]]` identity, explicit-copy
   linearity, decoded extent, byte-constant result type, and resource bounds.
@@ -476,13 +476,22 @@ it. It injects phase implementations and bounded host capabilities, while
   optimizer preserve the model. Machine lowering rejects the type by name at
   `machine-static-bytes-lowering-pending` until runtime storage and a consumer
   ABI are specified.
-- SemanticWir v14 retains the exact privileged fallible-await profile as
+- SemanticWir v15 retains the exact privileged fallible-await profile as
   distinct `AsyncExit` and ephemeral `AsyncOutcome` types plus
   `AwaitAsyncOutcome` and `AsyncOutcomeAuthenticated` proof authority. The
   validator joins the direct callee's declared `Result[u64,u64]`, the effective
   `Result[u64,AsyncExit[u64]]`, all three sealed zero-size cause identities, the
   await source, and the base type/effect proofs. Flow lowering fails closed at
   `flow-async-outcome-lowering-pending`; no runtime delivery ABI is claimed.
+- SemanticWir v15 retains the bounded inline fixed-array statement-pattern
+  profile as an exact `Aggregate`, proof-bearing positional `Index`
+  operations, scalar equality/boolean conjunctions, and source-ordered nested
+  `If` regions. Validation joins every extraction result to the array element
+  type, a canonical `u64` index, and the exact-length `CapacityBound`; lowering
+  independently replays each literal, binding position, arm order, and
+  exhaustive cover. Flow rejects the pattern proof authority by name at
+  `flow-fixed-array-match-lowering-pending`; no Flow or native execution is
+  claimed.
 - MachineWir v19 retains same-block nongeneric flat values with two or more
   primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
   `InsertField`, and `ExtractField` carry exact SSA joins through independent

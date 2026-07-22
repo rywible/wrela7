@@ -291,6 +291,23 @@ fn unsupported(feature: &'static str) -> LowerError {
     LowerError::UnsupportedInput { feature }
 }
 
+fn reject_fixed_array_pattern_index(
+    input: &semantic::SemanticWir,
+    proof: semantic::ProofId,
+) -> Result<(), LowerError> {
+    if input.proofs.get(proof.0 as usize).is_some_and(|record| {
+        record.id == proof
+            && record.kind == semantic::ProofKind::CapacityBound
+            && record.subject == "inline fixed-array pattern match"
+    }) {
+        Err(unsupported(
+            "flow-fixed-array-match-lowering-pending (positional branch lowering)",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn supported_input<'a>(
     input: &'a semantic::SemanticWir,
     limits: LoweringLimits,
@@ -3344,6 +3361,7 @@ fn validate_scalar_source_function(
                         }
                     }
                     semantic::SemanticOperation::Index { base, index, proof } => {
+                        reject_fixed_array_pattern_index(input, *proof)?;
                         let [result] = statement.results.as_slice() else {
                             return Err(unsupported("fixed-array index result arity"));
                         };
@@ -16066,5 +16084,20 @@ mod contract_tests {
                 proof: flow::ProofId(0),
             }
         );
+    }
+
+    #[test]
+    fn fixed_array_pattern_index_stops_at_named_flow_boundary() {
+        let mut input = fixture().into_wir();
+        let proof = input.proofs.first_mut().expect("fixture proof");
+        proof.kind = semantic::ProofKind::CapacityBound;
+        proof.subject = "inline fixed-array pattern match".to_owned();
+        let proof = proof.id;
+        assert!(matches!(
+            super::reject_fixed_array_pattern_index(&input, proof),
+            Err(LowerError::UnsupportedInput {
+                feature: "flow-fixed-array-match-lowering-pending (positional branch lowering)",
+            })
+        ));
     }
 }

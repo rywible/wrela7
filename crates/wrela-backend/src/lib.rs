@@ -3356,7 +3356,7 @@ mod tests {
             name: "actor-report-image".to_owned(),
             build,
             source_summary: SourceSummary {
-                semantic_wir_version: 14,
+                semantic_wir_version: 15,
                 // The generated image entry is the one retained base semantic
                 // function; actor/task bodies below are generated async states
                 // rooted in that dense semantic provenance ID.
@@ -3655,7 +3655,7 @@ mod tests {
             name: "actor-activation-report-image".to_owned(),
             build,
             source_summary: SourceSummary {
-                semantic_wir_version: 14,
+                semantic_wir_version: 15,
                 semantic_functions: 3,
                 hir_files: 1,
                 hir_declarations: 3,

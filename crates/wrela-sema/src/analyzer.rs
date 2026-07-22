@@ -7131,6 +7131,27 @@ fn analyze_closed_fixed_array_match(
             "match a nonempty homogeneous boolean or default-i64 array literal",
         ));
     };
+    // Positional SemanticWir lowering uses an exact u64 index for each
+    // authenticated pattern position and a boolean result for literal tests.
+    // Retain both canonical identities even when neither is the element type.
+    let _index_ty = ensure_primitive_type(
+        request,
+        partial,
+        PrimitiveSemanticType::Integer {
+            signed: false,
+            bits: 64,
+            pointer_sized: false,
+        },
+        aggregate_work,
+        is_cancelled,
+    )?;
+    let _condition_ty = ensure_primitive_type(
+        request,
+        partial,
+        PrimitiveSemanticType::Bool,
+        aggregate_work,
+        is_cancelled,
+    )?;
     if u64::try_from(source_elements.len())
         .map_or(true, |length| length > request.limits.fact_edges)
     {

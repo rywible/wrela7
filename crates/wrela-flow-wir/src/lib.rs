@@ -15,7 +15,7 @@ pub use wrela_test_model::TestPlanLimits;
 
 pub const FLOW_WIR_VERSION: u32 = 19;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
-pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 14;
+pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 15;
 
 macro_rules! id_type {
     ($name:ident) => {

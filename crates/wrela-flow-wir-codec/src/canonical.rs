@@ -2870,7 +2870,7 @@ mod tests {
             name: "canonical-image".to_owned(),
             build: build_identity(7),
             source_summary: SourceSummary {
-                semantic_wir_version: 14,
+                semantic_wir_version: 15,
                 semantic_functions: 2,
                 hir_files: 1,
                 hir_declarations: 2,
