@@ -1067,6 +1067,14 @@ it. It injects phase implementations and bounded host capabilities, while
   type records may name a supported flat-struct return so the source scope
   protocol survives the type table, but first-class function values and
   unauthenticated aggregate function boundaries remain rejected.
+- One additional sealed aggregate ABI is exact and deliberately non-general:
+  a single private ordinary source callee accepts one unpacked two-field
+  primitive flat value and returns that same parameter without instructions,
+  with exactly one direct call in the image. Machine lowering and LLVM each
+  reauthenticate the unique callee/call census, complete body, nominal machine
+  type, arity, and argument/result identity. Generic source authority and its
+  nominal specialization key are sealed before FlowWir; downstream consumers
+  authenticate only this erased identity ABI and do not reconstruct generics.
 - For the sealed immediate typed-async profile, codegen independently checks
   the no-argument internal call's one exact `u64` result, the constant-return
   callee, parameterless resume, and empty jump before using the ordinary call

@@ -928,6 +928,23 @@ fn validate_generic_function_lowering_boundary_parts(
                 "semantic-generic-function-parameter-lowering-pending (const, region, bounded, or unauthenticated specialization)",
             ));
         }
+        let flat_arguments = function
+            .generic_arguments
+            .iter()
+            .filter(|argument| {
+                matches!(argument, sema::SemanticArgument::Type(ty)
+                    if exact_generic_function_flat_argument(facts, *ty))
+            })
+            .count();
+        let exact_flat_identity = flat_arguments == 1
+            && function.generic_arguments.len() == 1
+            && !method_owner
+            && exact_generic_flat_identity_source(program, declaration, source, body);
+        if flat_arguments != 0 && !exact_flat_identity {
+            return Err(unsupported(
+                "semantic-generic-function-signature-lowering-pending (unsupported or unauthenticated substitution)",
+            ));
+        }
         for (generic, argument) in source.generics.iter().zip(&function.generic_arguments) {
             let Some(record) = program.generic_parameter(*generic) else {
                 return Err(unsupported(
@@ -949,7 +966,9 @@ fn validate_generic_function_lowering_boundary_parts(
                     "semantic-generic-function-argument-lowering-pending (non-type or non-scalar specialization)",
                 ));
             };
-            if !is_stored_copy_scalar(facts, *argument) {
+            if !(is_stored_copy_scalar(facts, *argument)
+                || exact_flat_identity && exact_generic_function_flat_argument(facts, *argument))
+            {
                 return Err(unsupported(
                     "semantic-generic-function-argument-lowering-pending (non-type or non-scalar specialization)",
                 ));
@@ -1009,6 +1028,62 @@ fn validate_generic_function_lowering_boundary_parts(
         }
     }
     Ok(())
+}
+
+fn exact_generic_flat_identity_source(
+    program: &wrela_hir::Program,
+    declaration: wrela_hir::DeclarationId,
+    source: &wrela_hir::FunctionDeclaration,
+    body: wrela_hir::BodyId,
+) -> bool {
+    let ([generic], [parameter], Some(result)) = (
+        source.generics.as_slice(),
+        source.parameters.as_slice(),
+        source.result.as_ref(),
+    ) else {
+        return false;
+    };
+    let bare_generic = |ty: &wrela_hir::TypeExpression| {
+        matches!(&ty.kind,
+            wrela_hir::TypeExpressionKind::Named {
+                definition: wrela_hir::Definition::Generic(candidate),
+                arguments,
+            } if candidate == generic && arguments.is_empty())
+    };
+    let Some(parameter_record) = program.parameter(*parameter) else {
+        return false;
+    };
+    if parameter_record.owner != wrela_hir::CallableOwner::Declaration(declaration)
+        || parameter_record.receiver
+        || parameter_record.access != wrela_hir::AccessMode::Value
+        || parameter_record
+            .ty
+            .as_ref()
+            .is_none_or(|ty| !bare_generic(ty))
+        || !bare_generic(result)
+    {
+        return false;
+    }
+    let Some(body_record) = program
+        .body(body)
+        .filter(|record| record.owner == wrela_hir::BodyOwner::Declaration(declaration))
+    else {
+        return false;
+    };
+    let [statement] = body_record.statements.as_slice() else {
+        return false;
+    };
+    program.statement(*statement).is_some_and(|statement| {
+        statement.body == body
+            && statement.attributes.is_empty()
+            && matches!(statement.kind, wrela_hir::StatementKind::Return(Some(expression))
+            if program.expression(expression).is_some_and(|expression| {
+                matches!(expression.kind,
+                    wrela_hir::ExpressionKind::Reference(
+                        wrela_hir::Definition::Parameter(candidate)
+                    ) if candidate == *parameter)
+            }))
+    })
 }
 
 fn supported_minimum(facts: &sema::PartialAnalysis) -> Result<MinimumFacts<'_>, LowerError> {
@@ -6293,6 +6368,28 @@ fn is_stored_copy_scalar(facts: &sema::PartialAnalysis, ty: sema::SemanticTypeId
                     | sema::SemanticTypeKind::Float { bits: 32 | 64 }
             )
     })
+}
+
+fn exact_generic_function_flat_argument(
+    facts: &sema::PartialAnalysis,
+    ty: sema::SemanticTypeId,
+) -> bool {
+    let Some(record) = facts.types.get(ty.0 as usize) else {
+        return false;
+    };
+    let sema::SemanticTypeKind::Structure {
+        arguments, fields, ..
+    } = &record.kind
+    else {
+        return false;
+    };
+    arguments.is_empty()
+        && fields.len() == 2
+        && record.linearity == sema::Linearity::ExplicitCopy
+        && canonical_flat_structure_layout(facts, fields)
+            == record
+                .size_upper_bound
+                .map(|size| (size, record.alignment_lower_bound))
 }
 
 fn canonical_flat_structure_layout(
@@ -25838,6 +25935,49 @@ pub fn boot() -> Image:
         wrong_result.functions[identity].result = sema::SemanticTypeId(0);
         assert!(matches!(
             validate_generic_function_lowering_boundary_parts(&wrong_result, hir.as_program()),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-generic-function-signature-lowering-pending (unsupported or unauthenticated substitution)"
+            })
+        ));
+
+        let non_identity = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub struct Pair:
+    pub count: u32
+    pub total: u64
+
+pub fn select[T](left: T, right: T) -> T:
+    return left
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        left: Pair = Pair(count=1, total=2)
+        right: Pair = Pair(count=3, total=4)
+        observed: Pair = select(left=left, right=right)
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: non_identity,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
             Err(LowerError::UnsupportedInput {
                 feature: "semantic-generic-function-signature-lowering-pending (unsupported or unauthenticated substitution)"
             })

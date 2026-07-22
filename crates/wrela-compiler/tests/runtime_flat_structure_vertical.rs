@@ -350,6 +350,31 @@ fn generic_native_pair_field_update_runs():
     return
 "#;
 
+const GENERIC_FUNCTION_SOURCE: &str = r#"module app.duration
+
+pub struct Pair:
+    pub count: u32
+    pub total: u64
+
+pub fn identity[T](value: T) -> T:
+    return value
+
+pub fn call_identity() -> u64:
+    source: Pair = Pair(count=1, total=42)
+    observed: Pair = identity(source)
+    return observed.total
+"#;
+
+const GENERIC_FUNCTION_TEST_SOURCE: &str = r#"module app.duration_test
+
+from app.duration import call_identity
+
+@test(runtime)
+fn generic_flat_function_reaches_native():
+    observed: u64 = call_identity()
+    return
+"#;
+
 const NATIVE_PAIR_ARGUMENT_SOURCE: &str = r#"module app.duration
 
 pub struct Pair:
@@ -2558,6 +2583,402 @@ fn generic_interface_reader_reaches_flow_machine_and_deterministic_coff() {
             let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
                 .expect("repeat generic-interface reader native emission");
             assert_eq!(first.bytes(), second.bytes());
+        }
+    }
+}
+
+#[test]
+fn generic_flat_function_reaches_flow_machine_and_deterministic_coff() {
+    let fixture = fixture(GENERIC_FUNCTION_SOURCE, GENERIC_FUNCTION_TEST_SOURCE);
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed(&fixture),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("generic flat function lowers to SemanticWir");
+    let semantic_wir = semantic.into_parts().0;
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("generic flat function lowers to FlowWir");
+    let flow_model = flow.wir().as_wir();
+    let pair = flow_model
+        .types
+        .iter()
+        .find(|ty| ty.name.as_deref() == Some("Pair"))
+        .expect("generic flat argument type");
+    assert!(matches!(&pair.kind, FlowTypeKind::Struct { fields } if fields.len() == 2));
+    let pair_id = pair.id;
+    let identity = flow_model
+        .functions
+        .iter()
+        .find(|function| {
+            matches!(function.parameters.as_slice(), [parameter]
+                if function.values[parameter.0 as usize].ty == pair_id)
+                && function.result_types.as_slice() == [pair_id]
+                && matches!(function.blocks.as_slice(), [block]
+                    if block.instructions.is_empty()
+                        && matches!(&block.terminator, Terminator::Return(values)
+                            if values.as_slice() == function.parameters.as_slice()))
+        })
+        .expect("exact generic flat identity FlowWir body");
+    let identity_id = identity.id;
+    assert_eq!(
+        flow_model
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(&instruction.operation,
+                FlowOperation::Call { function, arguments }
+                    if *function == identity_id && arguments.len() == 1))
+            .count(),
+        1,
+        "the exact specialization has one direct call"
+    );
+
+    let flow_instruction_count = flow.report().instructions;
+    let mut exact_flow_limits = FlowLoweringLimits::standard();
+    exact_flow_limits.instructions = flow_instruction_count;
+    CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: exact_flow_limits,
+            },
+            &never_cancelled,
+        )
+        .expect("generic flat function accepts its exact FlowWir instruction ceiling");
+    let mut one_under_flow = exact_flow_limits;
+    one_under_flow.instructions = flow_instruction_count - 1;
+    assert!(matches!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: one_under_flow,
+            },
+            &never_cancelled,
+        ),
+        Err(FlowLowerError::ResourceLimit {
+            resource: "FlowWir instructions",
+            limit,
+        }) if limit == flow_instruction_count - 1
+    ));
+    let flow_polls = Cell::new(0_u64);
+    CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: exact_flow_limits,
+            },
+            &|| {
+                flow_polls.set(flow_polls.get().saturating_add(1));
+                false
+            },
+        )
+        .expect("count generic flat FlowWir cancellation polls");
+    let flow_final_poll = flow_polls.get();
+    assert!(flow_final_poll > 3);
+    flow_polls.set(0);
+    assert!(matches!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic_wir,
+                limits: exact_flow_limits,
+            },
+            &|| {
+                let next = flow_polls.get().saturating_add(1);
+                flow_polls.set(next);
+                next >= flow_final_poll
+            },
+        ),
+        Err(FlowLowerError::Cancelled)
+    ));
+    assert_eq!(flow_polls.get(), flow_final_poll);
+
+    let flow_wir = flow.into_parts().0;
+    let mut forged_flow = flow_wir.as_wir().clone();
+    let forged_identity = &mut forged_flow.functions[identity_id.0 as usize];
+    let parameter = forged_identity.parameters[0];
+    let copied = flow::ValueId(forged_identity.values.len() as u32);
+    forged_identity.values.push(flow::Value {
+        id: copied,
+        ty: pair_id,
+        source_name: Some("forged_copy".to_owned()),
+        source: forged_identity.source,
+    });
+    forged_identity.blocks[0]
+        .instructions
+        .push(flow::Instruction {
+            id: flow::InstructionId(0),
+            results: vec![copied],
+            operation: flow::FlowOperation::Copy { value: parameter },
+            source: forged_identity.source,
+        });
+    forged_identity.blocks[0].terminator = flow::Terminator::Return(vec![copied]);
+    let forged_flow = forged_flow
+        .validate()
+        .expect("extra generic identity computation remains structurally valid FlowWir");
+    let forged_encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &forged_flow,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("forged generic identity FlowWir canonical frame");
+    let forged_error = prepare_canonical_frame_for_codegen(
+        forged_encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect_err("Machine lowering must reauthenticate the instruction-free identity body");
+    assert_eq!(
+        forged_error.machine_lower_error(),
+        Some(&MachineLowerError::UnsupportedInput {
+            feature: "machine-flat-structure-operation-lowering-pending",
+        })
+    );
+
+    let mut forged_census = flow_wir.as_wir().clone();
+    let (caller_index, block_index, instruction_index) = forged_census
+        .functions
+        .iter()
+        .enumerate()
+        .find_map(|(function_index, function)| {
+            function
+                .blocks
+                .iter()
+                .enumerate()
+                .find_map(|(block_index, block)| {
+                    block.instructions.iter().enumerate().find_map(
+                        |(instruction_index, instruction)| {
+                            matches!(instruction.operation,
+                                FlowOperation::Call { function, .. }
+                                    if function == identity_id)
+                            .then_some((function_index, block_index, instruction_index))
+                        },
+                    )
+                })
+        })
+        .expect("generic identity call location");
+    let original_call = forged_census.functions[caller_index].blocks[block_index].instructions
+        [instruction_index]
+        .clone();
+    let caller = &mut forged_census.functions[caller_index];
+    let second_result = flow::ValueId(caller.values.len() as u32);
+    caller.values.push(flow::Value {
+        id: second_result,
+        ty: pair_id,
+        source_name: Some("forged_second_call".to_owned()),
+        source: original_call.source,
+    });
+    let next_instruction = caller
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .map(|instruction| instruction.id.0)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut second_call = original_call;
+    second_call.id = flow::InstructionId(next_instruction);
+    second_call.results = vec![second_result];
+    caller.blocks[block_index].instructions.push(second_call);
+    let forged_census = forged_census
+        .validate()
+        .expect("a second identity call remains structurally valid FlowWir");
+    let forged_census_encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &forged_census,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("second-call FlowWir canonical frame");
+    let forged_census_error = prepare_canonical_frame_for_codegen(
+        forged_census_encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect_err("Machine lowering must reject a second aggregate identity call");
+    assert_eq!(
+        forged_census_error.machine_lower_error(),
+        Some(&MachineLowerError::UnsupportedInput {
+            feature: "machine-flat-structure-operation-lowering-pending",
+        })
+    );
+
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("generic flat function FlowWir canonical frame");
+    let decoded = CanonicalFlowWirCodec
+        .decode(
+            DecodeRequest {
+                bytes: encoded.bytes(),
+                limits: CodecLimits::standard(),
+                expected_build: Some(fixture.build.identity()),
+            },
+            &never_cancelled,
+        )
+        .expect("generic flat function FlowWir v19 decode");
+    assert_eq!(decoded, flow_wir);
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("generic flat function reaches MachineWir");
+    let machine = prepared.machine().wir().as_wir();
+    let machine_pair = machine
+        .types
+        .iter()
+        .find(|ty| ty.source_name.as_deref() == Some("Pair"))
+        .expect("generic flat argument MachineWir type");
+    assert!(matches!(&machine_pair.kind,
+        MachineTypeKind::Struct { fields, packed: false } if fields.len() == 2));
+    assert!(machine.functions.iter().any(|function| {
+        matches!(function.parameters.as_slice(), [parameter]
+            if function.values[parameter.0 as usize].ty == machine_pair.id)
+            && function.result == machine_pair.id
+            && matches!(function.blocks.as_slice(), [block]
+                if block.instructions.is_empty()
+                    && matches!(&block.terminator,
+                        wrela_backend::machine_wir::MachineTerminator::Return(values)
+                            if values.as_slice() == function.parameters.as_slice()))
+    }));
+
+    let codec = CanonicalFlowWirCodec;
+    let hasher = CanonicalBackendContentHasher::new();
+    let optimizer = CanonicalFlowOptimizer::new();
+    let machine_lowerer = CanonicalMachineLowerer::new();
+    let expected_digest = hasher
+        .sha256(encoded.bytes(), &never_cancelled)
+        .expect("generic flat function frame digest");
+    let optimization = OptimizationProfile::from_build_policy(
+        &fixture.build.profile.optimization,
+        fixture.build.identity.compiler,
+    )
+    .expect("generic flat function optimization profile");
+    let prepare_with = |machine_limits: MachineLoweringLimits, is_cancelled: &dyn Fn() -> bool| {
+        prepare_for_codegen(
+            BackendPreparationServices {
+                codec: &codec,
+                hasher: &hasher,
+                optimizer: &optimizer,
+                machine_lowerer: &machine_lowerer,
+            },
+            encoded.bytes(),
+            expected_digest,
+            &fixture.target,
+            &fixture.build,
+            BackendPreparationOptions {
+                codec_limits: CodecLimits::standard(),
+                optimization: optimization.clone(),
+                optimization_limits: OptimizationLimits::standard(),
+                machine_limits,
+            },
+            is_cancelled,
+        )
+    };
+    let instruction_count = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .map(|block| block.instructions.len() as u64)
+        .sum::<u64>();
+    let mut exact_machine_limits = MachineLoweringLimits::standard();
+    exact_machine_limits.types = machine.types.len() as u64;
+    exact_machine_limits.functions = machine.functions.len() as u64;
+    exact_machine_limits.sections = machine.sections.len() as u32;
+    exact_machine_limits.symbols = machine.symbols.len() as u32;
+    exact_machine_limits.globals = machine.globals.len() as u32;
+    exact_machine_limits.instructions = instruction_count;
+    exact_machine_limits.stack_slots = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_slots.len() as u64)
+        .sum::<u64>()
+        .max(1);
+    exact_machine_limits.proofs = machine.proofs.len() as u32;
+    exact_machine_limits.static_bytes = machine
+        .sections
+        .iter()
+        .map(|section| section.reserved_bytes)
+        .sum();
+    exact_machine_limits.stack_bytes_per_function = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_bytes)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    exact_machine_limits = exact_machine_limits.with_aligned_validation();
+    let exact_machine = prepare_with(exact_machine_limits, &never_cancelled)
+        .expect("generic flat function accepts exact MachineWir instruction ceiling");
+    assert_eq!(exact_machine.machine().wir().as_wir(), machine);
+    let mut one_under_machine = exact_machine_limits;
+    one_under_machine.instructions = instruction_count - 1;
+    one_under_machine = one_under_machine.with_aligned_validation();
+    let one_under_error = prepare_with(one_under_machine, &never_cancelled)
+        .expect_err("one fewer generic flat MachineWir instruction must fail");
+    assert_eq!(
+        one_under_error.machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir instructions",
+            limit: instruction_count - 1,
+        })
+    );
+    let machine_polls = Cell::new(0_u64);
+    prepare_with(MachineLoweringLimits::standard(), &|| {
+        machine_polls.set(machine_polls.get().saturating_add(1));
+        false
+    })
+    .expect("count generic flat MachineWir cancellation polls");
+    let machine_cancel_at = machine_polls.get().saturating_sub(2);
+    assert!(machine_cancel_at > 2);
+    let cancelled_machine_polls = Cell::new(0_u64);
+    let cancellation = prepare_with(MachineLoweringLimits::standard(), &|| {
+        let next = cancelled_machine_polls.get().saturating_add(1);
+        cancelled_machine_polls.set(next);
+        next >= machine_cancel_at
+    })
+    .expect_err("late generic flat MachineWir cancellation must propagate");
+    assert!(cancellation.is_cancelled());
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("generic flat function native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat generic flat function native emission");
+            assert_eq!(
+                first.bytes(),
+                second.bytes(),
+                "identical generic flat MachineWir emits byte-identical ARM64 COFF"
+            );
         }
     }
 }

@@ -1503,6 +1503,39 @@ mod contract_tests {
         (validated, target)
     }
 
+    fn generic_flat_identity_machine_fixture() -> (ValidatedMachineWir, TargetPackage) {
+        let (validated, target) = ordinary_aggregate_reader_machine_fixture();
+        let mut machine = validated.into_wir();
+        machine.name = "generic-flat-identity".to_owned();
+        let identity = &mut machine.functions[1];
+        identity.result = MachineTypeId(4);
+        identity.values.truncate(1);
+        identity.blocks[0].instructions.clear();
+        identity.blocks[0].terminator = MachineTerminator::Return(vec![ValueId(0)]);
+
+        let caller = &mut machine.functions[2];
+        caller.values[3].ty = MachineTypeId(4);
+        caller.values.push(MachineValue {
+            id: ValueId(4),
+            ty: MachineTypeId(3),
+            source_name: Some("total".to_owned()),
+        });
+        caller.blocks[0].instructions.push(MachineInstruction {
+            id: InstructionId(4),
+            results: vec![ValueId(4)],
+            operation: MachineOperation::ExtractField {
+                aggregate: ValueId(3),
+                field: 1,
+            },
+            source: caller.source,
+        });
+        caller.blocks[0].terminator = MachineTerminator::Return(vec![ValueId(4)]);
+        let validated = machine
+            .validate_for_target(&target)
+            .expect("valid generic flat identity MachineWir fixture");
+        (validated, target)
+    }
+
     fn ordinary_aggregate_checked_combine_machine_fixture() -> (ValidatedMachineWir, TargetPackage)
     {
         let (validated, target) = ordinary_aggregate_passthrough_machine_fixture();
@@ -4846,6 +4879,88 @@ mod contract_tests {
             super::preflight(
                 &CodegenRequest {
                     module: &forged,
+                    target: target.backend(),
+                    options: CodegenOptions::standard(),
+                },
+                &|| false,
+            ),
+            Err(CodegenError::UnsupportedMachineContract(
+                "void or non-scalar function parameter",
+            ))
+        );
+    }
+
+    #[test]
+    fn generic_flat_identity_is_reauthenticated_and_census_forgery_fails_closed() {
+        let (machine, target) = generic_flat_identity_machine_fixture();
+        let request = CodegenRequest {
+            module: &machine,
+            target: target.backend(),
+            options: CodegenOptions::standard(),
+        };
+        super::preflight(&request, &|| false)
+            .expect("exact generic flat identity passes codegen preflight");
+        let first = super::ir::render_module(&request, &|| false)
+            .expect("generic flat identity renders to bounded LLVM IR");
+        let second = super::ir::render_module(&request, &|| false)
+            .expect("generic flat identity rerenders deterministically");
+        assert_eq!(first, second);
+
+        let mut forged_body = machine.clone().into_wir();
+        let identity = &mut forged_body.functions[1];
+        identity.values.push(MachineValue {
+            id: ValueId(1),
+            ty: MachineTypeId(4),
+            source_name: Some("forged".to_owned()),
+        });
+        identity.blocks[0].instructions.push(MachineInstruction {
+            id: InstructionId(0),
+            results: vec![ValueId(1)],
+            operation: MachineOperation::Copy { value: ValueId(0) },
+            source: identity.source,
+        });
+        identity.blocks[0].terminator = MachineTerminator::Return(vec![ValueId(1)]);
+        let forged_body = forged_body
+            .validate_for_target(&target)
+            .expect("extra identity computation remains structurally valid MachineWir");
+        assert_eq!(
+            super::preflight(
+                &CodegenRequest {
+                    module: &forged_body,
+                    target: target.backend(),
+                    options: CodegenOptions::standard(),
+                },
+                &|| false,
+            ),
+            Err(CodegenError::UnsupportedMachineContract(
+                "void or non-scalar function parameter",
+            ))
+        );
+
+        let mut forged_census = machine.into_wir();
+        let caller = &mut forged_census.functions[2];
+        caller.values.push(MachineValue {
+            id: ValueId(5),
+            ty: MachineTypeId(4),
+            source_name: Some("forged_second_call".to_owned()),
+        });
+        caller.blocks[0].instructions.push(MachineInstruction {
+            id: InstructionId(5),
+            results: vec![ValueId(5)],
+            operation: MachineOperation::Call {
+                function: FunctionId(1),
+                arguments: vec![ValueId(2)],
+                convention: CallingConvention::Internal,
+            },
+            source: caller.source,
+        });
+        let forged_census = forged_census
+            .validate_for_target(&target)
+            .expect("second identity call remains structurally valid MachineWir");
+        assert_eq!(
+            super::preflight(
+                &CodegenRequest {
+                    module: &forged_census,
                     target: target.backend(),
                     options: CodegenOptions::standard(),
                 },

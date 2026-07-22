@@ -3434,7 +3434,10 @@ fn exact_source_function_specialization_matches(
                 wrela_hir::GenericParameterKind::Type { bound: None }
             )
             || !matches!(argument, SemanticArgument::Type(ty)
-                if exact_stored_copy_scalar_layout(analysis, *ty).is_some())
+                if exact_stored_copy_scalar_layout(analysis, *ty).is_some()
+                    || (is_free_function
+                        && source.generics.len() == 1
+                        && exact_generic_function_flat_argument(analysis, *ty).is_some()))
         {
             return false;
         }
@@ -7052,12 +7055,53 @@ fn source_function_specialization_key(
         let SemanticArgument::Type(ty) = argument else {
             return None;
         };
-        bytes[HEADER_BYTES + index] ^= stored_copy_scalar_specialization_code(analysis, *ty)?;
+        if let Some(code) = stored_copy_scalar_specialization_code(analysis, *ty) {
+            bytes[HEADER_BYTES + index] ^= code;
+        } else if arguments.len() == 1 {
+            let declaration = exact_generic_function_flat_argument(analysis, *ty)?;
+            bytes[HEADER_BYTES] ^= 0x80;
+            for (destination, source) in bytes[HEADER_BYTES + 1..HEADER_BYTES + 5]
+                .iter_mut()
+                .zip(declaration.0.to_be_bytes())
+            {
+                *destination ^= source;
+            }
+        } else {
+            return None;
+        }
     }
     if bytes.iter().all(|byte| *byte == 0) {
         bytes[0] = 0x47;
     }
     Some(FunctionKey(Sha256Digest::from_bytes(bytes)))
+}
+
+pub(crate) fn exact_generic_function_flat_argument(
+    analysis: &PartialAnalysis,
+    ty: SemanticTypeId,
+) -> Option<DeclarationId> {
+    let record = analysis.types.get(ty.0 as usize)?;
+    let SemanticTypeKind::Structure {
+        declaration,
+        arguments,
+        fields,
+    } = &record.kind
+    else {
+        return None;
+    };
+    if !arguments.is_empty()
+        || fields.len() != 2
+        || record.linearity != Linearity::ExplicitCopy
+        || record.size_upper_bound.is_none()
+        || record.alignment_lower_bound == 0
+        || !record.alignment_lower_bound.is_power_of_two()
+        || fields
+            .iter()
+            .any(|field| exact_stored_copy_scalar_layout(analysis, field.ty).is_none())
+    {
+        return None;
+    }
+    Some(*declaration)
 }
 
 fn exact_integer_kind(

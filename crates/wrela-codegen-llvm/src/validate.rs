@@ -2143,18 +2143,26 @@ fn validate_function(
     let cleanup_state = authenticated_cleanup_boundary_state(machine, function, is_cancelled)?;
     let reader_state = authenticated_flat_structure_reader_state(machine, function);
     let builder_state = authenticated_flat_structure_builder_state(machine, function);
+    let passthrough_state =
+        authenticated_flat_structure_passthrough_state(machine, function, is_cancelled)?;
     poll_values(&function.parameters, is_cancelled)?;
     for (parameter_index, parameter) in function.parameters.iter().enumerate() {
         check_periodically(parameter_index, is_cancelled)?;
         if value_type(machine, function, *parameter).is_none_or(|ty| {
-            !is_basic_scalar(machine, ty) && cleanup_state != Some(ty) && reader_state != Some(ty)
+            !is_basic_scalar(machine, ty)
+                && cleanup_state != Some(ty)
+                && reader_state != Some(ty)
+                && passthrough_state != Some(ty)
         }) {
             return Err(CodegenError::UnsupportedMachineContract(
                 "void or non-scalar function parameter",
             ));
         }
     }
-    if !is_return_type(machine, function.result) && builder_state != Some(function.result) {
+    if !is_return_type(machine, function.result)
+        && builder_state != Some(function.result)
+        && passthrough_state != Some(function.result)
+    {
         return Err(CodegenError::UnsupportedMachineContract(
             "non-scalar function result",
         ));
@@ -2163,7 +2171,7 @@ fn validate_function(
         check_periodically(block_index, is_cancelled)?;
         for (instruction_index, instruction) in block.instructions.iter().enumerate() {
             check_periodically(instruction_index, is_cancelled)?;
-            validate_operation(request, function, instruction, valid_proofs)?;
+            validate_operation(request, function, instruction, valid_proofs, is_cancelled)?;
         }
         validate_terminator(request, function, block.id, &block.terminator, is_cancelled)?;
     }
@@ -2279,6 +2287,7 @@ fn validate_operation(
     function: &MachineFunction,
     instruction: &wrela_machine_wir::MachineInstruction,
     valid_proofs: &[u8],
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), CodegenError> {
     let machine = request.module.as_wir();
     let unsupported = || CodegenError::UnsupportedMachineOperation {
@@ -2511,6 +2520,14 @@ fn validate_operation(
                     *callee,
                     arguments,
                 )
+                && !authenticated_flat_structure_passthrough_call(
+                    machine,
+                    function,
+                    instruction,
+                    *callee,
+                    arguments,
+                    is_cancelled,
+                )?
             {
                 let boundary = if machine
                     .functions
@@ -2536,6 +2553,14 @@ fn validate_operation(
                     *callee,
                     arguments,
                 )
+                && !authenticated_flat_structure_passthrough_call(
+                    machine,
+                    function,
+                    instruction,
+                    *callee,
+                    arguments,
+                    is_cancelled,
+                )?
             {
                 return Err(CodegenError::UnsupportedMachineContract(
                     "unauthenticated ordinary aggregate builder call",
@@ -3700,6 +3725,105 @@ fn authenticated_flat_structure_reader_call(
                 value_type(machine, caller, *argument) == value_type(machine, callee, *parameter)
             })
         && value_type(machine, caller, *result) == Some(callee.result)
+}
+
+fn authenticated_flat_structure_passthrough_call(
+    machine: &wrela_machine_wir::MachineWir,
+    caller: &MachineFunction,
+    instruction: &MachineInstruction,
+    callee_id: wrela_machine_wir::FunctionId,
+    arguments: &[ValueId],
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, CodegenError> {
+    let Some(callee) = machine.functions.get(callee_id.0 as usize) else {
+        return Ok(false);
+    };
+    let ([result], [argument]) = (instruction.results.as_slice(), arguments) else {
+        return Ok(false);
+    };
+    let Some(ty) = authenticated_flat_structure_passthrough_state(machine, callee, is_cancelled)?
+    else {
+        return Ok(false);
+    };
+    Ok(matches!(caller.origin,
+        MachineFunctionOrigin::SourceSemantic { semantic_function }
+            if semantic_function == caller.flow_function
+                && semantic_function == caller.id.0)
+        && caller.role == MachineFunctionRole::Ordinary
+        && caller.convention == CallingConvention::Internal
+        && instruction.source.is_some()
+        && value_type(machine, caller, *argument) == Some(ty)
+        && value_type(machine, caller, *result) == Some(ty))
+}
+
+fn authenticated_flat_structure_passthrough_state(
+    machine: &wrela_machine_wir::MachineWir,
+    callee: &MachineFunction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<MachineTypeId>, CodegenError> {
+    check_cancelled(is_cancelled)?;
+    let Some(state) = flat_structure_passthrough_state(machine, callee) else {
+        return Ok(None);
+    };
+    let mut candidates = 0_u8;
+    let mut calls = 0_u8;
+    for candidate in &machine.functions {
+        check_cancelled(is_cancelled)?;
+        if flat_structure_passthrough_state(machine, candidate).is_some() {
+            candidates = candidates.saturating_add(1);
+        }
+        for block in &candidate.blocks {
+            check_cancelled(is_cancelled)?;
+            for instruction in &block.instructions {
+                check_cancelled(is_cancelled)?;
+                if matches!(instruction.operation,
+                    MachineOperation::Call { function, .. } if function == callee.id)
+                {
+                    calls = calls.saturating_add(1);
+                }
+            }
+        }
+    }
+    Ok((candidates == 1 && calls == 1).then_some(state))
+}
+
+fn flat_structure_passthrough_state(
+    machine: &wrela_machine_wir::MachineWir,
+    callee: &MachineFunction,
+) -> Option<MachineTypeId> {
+    let ([parameter], [block]) = (callee.parameters.as_slice(), callee.blocks.as_slice()) else {
+        return None;
+    };
+    let parameter_ty = value_type(machine, callee, *parameter)?;
+    let aggregate = machine.types.get(parameter_ty.0 as usize)?;
+    let MachineTypeKind::Struct {
+        fields,
+        packed: false,
+    } = &aggregate.kind
+    else {
+        return None;
+    };
+    (matches!(callee.origin,
+        MachineFunctionOrigin::SourceSemantic { semantic_function }
+            if semantic_function == callee.flow_function
+                && semantic_function == callee.id.0)
+        && callee.role == MachineFunctionRole::Ordinary
+        && callee.linkage == Linkage::Private
+        && callee.convention == CallingConvention::Internal
+        && callee.entry == block.id
+        && block.id == BlockId(0)
+        && block.parameters.is_empty()
+        && block.instructions.is_empty()
+        && matches!(&block.terminator, MachineTerminator::Return(values)
+            if values.as_slice() == [*parameter])
+        && callee.values.len() == 1
+        && callee.stack_bytes == 0
+        && callee.stack_slots.is_empty()
+        && callee.source.is_some()
+        && callee.result == parameter_ty
+        && fields.len() == 2
+        && supported_struct_type(machine, parameter_ty))
+    .then_some(parameter_ty)
 }
 
 fn authenticated_flat_structure_reader_state(

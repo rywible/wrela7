@@ -13639,7 +13639,7 @@ fn infer_generic_call_arguments(
                 "semantic-generic-method-parameter-count",
             ),
             "generic callable declares more type parameters than the bounded specialization key supports",
-            "this analysis slice authenticates at most 26 ordered primitive type arguments",
+            "this analysis slice authenticates at most 26 ordered primitive arguments or one exact two-field flat argument",
             "split the function into smaller generic helpers",
         ));
     }
@@ -13665,7 +13665,7 @@ fn infer_generic_call_arguments(
                 ),
                 "generic runtime callable parameter is outside the unbounded type-only subset",
                 "constant, region, and bounded type parameters require later inference and specialization contracts",
-                "use an unbounded type parameter specialized by a primitive stored copy scalar",
+                "use an unbounded type parameter specialized by a primitive stored copy scalar or the exact free-function flat profile",
             ));
         }
     }
@@ -13702,7 +13702,11 @@ fn infer_generic_call_arguments(
             .types
             .get(ty.0 as usize)
             .ok_or(AnalysisFailure::RequestMismatch)?;
-        if !is_stored_copy_scalar_type(record) {
+        if !(is_stored_copy_scalar_type(record)
+            || matches!(form, GenericCallForm::Function)
+                && source.generics.len() == 1
+                && crate::exact_generic_function_flat_argument(partial, ty).is_some())
+        {
             return Err(runtime_type_diagnostic(
                 request,
                 source_span,
@@ -13710,9 +13714,9 @@ fn infer_generic_call_arguments(
                     "semantic-generic-function-argument-type",
                     "semantic-generic-method-argument-type",
                 ),
-                "generic callable inference produced a non-scalar type argument",
-                "this specialization slice admits only bool, integer, and f32/f64 stored copy scalars",
-                "pass a supported copy-scalar value",
+                "generic callable inference produced an unsupported type argument",
+                "this specialization slice admits stored copy scalars or one exact nongeneric two-field primitive flat structure",
+                "pass a supported copy scalar or exact two-field flat value",
             ));
         }
         let slot = inferred
@@ -17443,15 +17447,19 @@ fn ensure_ordinary_source_function_inner(
                 wrela_hir::GenericParameterKind::Type { bound: None }
             )
             || !matches!(argument, SemanticArgument::Type(ty)
-                if partial.types.get(ty.0 as usize).is_some_and(is_stored_copy_scalar_type))
+                if partial.types.get(ty.0 as usize).is_some_and(is_stored_copy_scalar_type)
+                    || (source_function.generics.len() == 1
+                        && matches!(declaration_record.owner,
+                            wrela_hir::DeclarationOwner::Module(_))
+                        && crate::exact_generic_function_flat_argument(partial, *ty).is_some()))
         {
             return Err(runtime_type_diagnostic(
                 request,
                 generic.source,
                 "semantic-generic-function-parameter-kind",
-                "generic function specialization is outside the unbounded copy-scalar type subset",
-                "constant, region, bounded, and non-scalar arguments require later monomorphization semantics",
-                "use unbounded type parameters inferred as primitive stored copy scalars",
+                "generic function specialization is outside the bounded type subset",
+                "constant, region, bounded, broader aggregate, and multiple aggregate arguments require later monomorphization semantics",
+                "use unbounded type parameters inferred as primitive stored copy scalars or one exact two-field flat structure",
             ));
         }
     }
@@ -17790,8 +17798,8 @@ fn ensure_ordinary_source_function_inner(
                 declaration_record.source,
                 "semantic-generic-function-specialization-key",
                 "generic function specialization cannot be represented by the bounded canonical key",
-                "the key admits at most 26 ordered primitive stored copy-scalar arguments",
-                "reduce the number of generic parameters or use supported primitive arguments",
+                "the key admits at most 26 ordered primitive stored copy-scalar arguments or one exact two-field flat structure",
+                "reduce the number of generic parameters or use a supported bounded argument",
             )
         })?
     };
@@ -43277,6 +43285,192 @@ pub fn boot() -> Image:
             output.diagnostics()
         );
         assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn generic_function_infers_one_exact_flat_argument_and_seals_it() {
+        let source = dot_variant_actor_source(
+            "pub struct Pair:\n    pub count: u32\n    pub total: u64\n\npub struct OtherPair:\n    pub count: u32\n    pub total: u64\n\npub fn identity[T](value: T) -> T:\n    return value\n\nasync fn checkpoint():\n    source: Pair = Pair(count=1, total=2)\n    observed: Pair = identity(source)\n    spare: OtherPair = OtherPair(count=3, total=4)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("exact flat generic function specialization analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "{:?}",
+            output.diagnostics()
+        );
+        let successful = output.successful().expect("sealed flat specialization");
+        let facts = successful.facts();
+        let identity = facts
+            .functions
+            .iter()
+            .find(|function| {
+                function.name.ends_with("identity") && !function.generic_arguments.is_empty()
+            })
+            .expect("flat identity specialization");
+        let [SemanticArgument::Type(pair)] = identity.generic_arguments.as_slice() else {
+            panic!("identity must retain one concrete flat type")
+        };
+        assert_eq!(identity.parameters.len(), 1);
+        assert_eq!(identity.parameters[0].ty, *pair);
+        assert_eq!(identity.result, *pair);
+        assert!(matches!(&facts.types[pair.0 as usize].kind,
+            SemanticTypeKind::Structure { arguments, fields, .. }
+                if arguments.is_empty() && fields.len() == 2));
+
+        let other = facts
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(&ty.kind, SemanticTypeKind::Structure { declaration, arguments, fields }
+                    if arguments.is_empty()
+                        && fields.len() == 2
+                        && matches!(fixture.fixture.hir.as_program().declaration(*declaration)
+                            .and_then(|record| record.name.as_ref()).map(Name::as_str), Some("OtherPair")))
+            })
+            .expect("adjacent same-layout nominal")
+            .id;
+        let mut forged = facts.clone();
+        forged.functions[identity.id.0 as usize].generic_arguments[0] =
+            SemanticArgument::Type(other);
+        forged
+            .validate_partial_structure()
+            .expect("same-layout nominal substitution remains prefix-valid");
+        assert!(
+            forged
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err()
+        );
+
+        const EXACT_TYPES: u32 = 8;
+        assert_eq!(
+            facts.types.len(),
+            EXACT_TYPES as usize,
+            "recalibrate exact type pin"
+        );
+        let mut exact = AnalysisLimits::standard();
+        exact.types = EXACT_TYPES;
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| false)
+            .expect("exact flat generic-function type limit");
+        let mut one_under = exact;
+        one_under.types = EXACT_TYPES - 1;
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, one_under),
+                &|| false,
+            ),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "semantic types",
+                limit,
+            }) if limit == AnalysisLimits::standard().fact_edges
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            })
+            .expect("count flat generic-function analysis polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, exact),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn generic_function_flat_argument_tails_fail_closed_by_name() {
+        for (declaration, expected) in [
+            (
+                "pub struct Box:\n    pub value: u64\n",
+                "semantic-generic-function-argument-type",
+            ),
+            (
+                "pub struct Box:\n    pub first: u64\n    pub second: u64\n    pub third: u64\n",
+                "semantic-generic-function-argument-type",
+            ),
+            (
+                "pub struct Cell[T]:\n    pub left: T\n    pub right: T\n",
+                "semantic-runtime-function-body-not-supported",
+            ),
+        ] {
+            let box_type = if declaration.contains("Cell") {
+                "Cell[u64]"
+            } else {
+                "Box"
+            };
+            let constructor = if declaration.contains("third") {
+                format!("{box_type}(first=1, second=2, third=3)")
+            } else if declaration.contains("Cell") {
+                format!("{box_type}(left=1, right=2)")
+            } else {
+                format!("{box_type}(1)")
+            };
+            let source = dot_variant_actor_source(&format!(
+                "{declaration}\npub fn identity[T](value: T) -> T:\n    return value\n\nasync fn checkpoint():\n    source: {box_type} = {constructor}\n    observed: {box_type} = identity(source)\n    pass\n\n"
+            ));
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("unsupported flat specialization must be a diagnostic");
+            assert_eq!(
+                output.diagnostics().len(),
+                1,
+                "{declaration}: {:?}",
+                output.diagnostics()
+            );
+            assert_eq!(
+                output.diagnostics()[0].code.as_deref(),
+                Some(expected),
+                "{declaration}"
+            );
+            assert!(output.has_errors());
+        }
+
+        for (source, expected) in [
+            (
+                "pub struct Pair:\n    pub count: u32\n    pub total: u64\n\n    pub fn identity[T](read self, value: T) -> T:\n        return value\n\nasync fn checkpoint():\n    receiver: Pair = Pair(count=1, total=2)\n    source: Pair = Pair(count=3, total=4)\n    observed: Pair = receiver.identity(source)\n    pass\n\n",
+                "semantic-generic-method-argument-type",
+            ),
+            (
+                "pub struct Pair:\n    pub count: u32\n    pub total: u64\n\npub fn first[T, U](left: T, right: U) -> T:\n    return left\n\nasync fn checkpoint():\n    source: Pair = Pair(count=1, total=2)\n    scalar: u64 = 3\n    observed: Pair = first(left=source, right=scalar)\n    pass\n\n",
+                "semantic-generic-function-argument-type",
+            ),
+        ] {
+            let fixture = parsed_actor_fixture(&dot_variant_actor_source(source));
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("unsupported generic aggregate callable must be a diagnostic");
+            assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+            assert_eq!(output.diagnostics()[0].code.as_deref(), Some(expected));
+            assert!(output.has_errors());
+        }
     }
 
     #[test]

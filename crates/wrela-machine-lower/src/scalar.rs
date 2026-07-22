@@ -5728,6 +5728,14 @@ fn validate_native_struct_locality_contract(
     } else {
         None
     };
+    let passthrough_state = if has_native_parameter {
+        input
+            .map(|input| authenticated_flat_structure_passthrough(input, function, is_cancelled))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
     let builder_state = input
         .map(|input| authenticated_flat_structure_builder(input, function, is_cancelled))
         .transpose()?
@@ -5736,10 +5744,12 @@ fn validate_native_struct_locality_contract(
         native(parameter)
             && cleanup_state != flow_value_type(function, parameter).ok()
             && reader_state != flow_value_type(function, parameter).ok()
+            && passthrough_state != flow_value_type(function, parameter).ok()
     }) || function.result_types.iter().copied().any(|ty| {
         flat_u64_struct_field(types, ty).is_none()
             && flat_native_struct_fields(types, ty).is_some()
             && builder_state != Some(ty)
+            && passthrough_state != Some(ty)
     }) {
         return Err(unsupported(
             "machine-flat-structure-function-boundary-lowering-pending",
@@ -5761,6 +5771,17 @@ fn validate_native_struct_locality_contract(
                 && !input
                     .map(|input| {
                         authenticated_flat_structure_builder_call(
+                            input,
+                            function,
+                            instruction,
+                            is_cancelled,
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(false)
+                && !input
+                    .map(|input| {
+                        authenticated_flat_structure_passthrough_call(
                             input,
                             function,
                             instruction,
@@ -5820,6 +5841,17 @@ fn validate_native_struct_locality_contract(
                         .unwrap_or(false)
                     && !input
                         .map(|input| {
+                            authenticated_flat_structure_passthrough_call(
+                                input,
+                                function,
+                                candidate,
+                                is_cancelled,
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or(false)
+                    && !input
+                        .map(|input| {
                             authenticated_flat_structure_reader_call(
                                 input,
                                 function,
@@ -5839,11 +5871,116 @@ fn validate_native_struct_locality_contract(
             validate_native_struct_terminator_use(
                 &block.terminator,
                 value,
-                builder_state == flow_value_type(function, value).ok(),
+                builder_state == flow_value_type(function, value).ok()
+                    || passthrough_state == flow_value_type(function, value).ok(),
             )?;
         }
     }
     check_cancelled(is_cancelled)
+}
+
+/// Authenticate one exact owned aggregate identity boundary. Generic source
+/// authority is sealed before FlowWir; this consumer independently admits only
+/// the erased ABI shape: one two-field primitive flat parameter returned
+/// unchanged from one instruction-free source function.
+fn authenticated_flat_structure_passthrough(
+    input: &flow::FlowWir,
+    function: &flow::FlowFunction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<flow::TypeId>, MachineLowerError> {
+    check_cancelled(is_cancelled)?;
+    let Some(state) = flat_structure_passthrough_state(&input.types, function) else {
+        return Ok(None);
+    };
+    let mut candidates = 0_u8;
+    let mut calls = 0_u8;
+    for candidate in &input.functions {
+        check_cancelled(is_cancelled)?;
+        if flat_structure_passthrough_state(&input.types, candidate).is_some() {
+            candidates = candidates.saturating_add(1);
+        }
+        for block in &candidate.blocks {
+            check_cancelled(is_cancelled)?;
+            for instruction in &block.instructions {
+                check_cancelled(is_cancelled)?;
+                if matches!(instruction.operation,
+                    flow::FlowOperation::Call { function: callee, .. }
+                        if callee == function.id)
+                {
+                    calls = calls.saturating_add(1);
+                }
+            }
+        }
+    }
+    Ok((candidates == 1 && calls == 1).then_some(state))
+}
+
+fn flat_structure_passthrough_state(
+    types: &[flow::FlowType],
+    function: &flow::FlowFunction,
+) -> Option<flow::TypeId> {
+    let flow::FunctionOrigin::SourceSemantic { semantic_function } = function.origin else {
+        return None;
+    };
+    let ([parameter], [result_ty], [block]) = (
+        function.parameters.as_slice(),
+        function.result_types.as_slice(),
+        function.blocks.as_slice(),
+    ) else {
+        return None;
+    };
+    let parameter_ty = function
+        .values
+        .get(parameter.0 as usize)
+        .map(|value| value.ty)?;
+    let exact = semantic_function == function.id.0
+        && function.role == flow::FunctionRole::Ordinary
+        && function.color == flow::FunctionColor::Sync
+        && function.entry == block.id
+        && block.id == flow::BlockId(0)
+        && block.parameters.is_empty()
+        && block.instructions.is_empty()
+        && matches!(&block.terminator, flow::Terminator::Return(values)
+            if values.as_slice() == [*parameter])
+        && function.values.len() == 1
+        && function.stack_bound == 0
+        && function.frame_bound == 0
+        && function.source.is_some()
+        && *result_ty == parameter_ty
+        && flat_native_struct_fields(types, parameter_ty).is_some_and(|fields| fields.len() == 2);
+    exact.then_some(parameter_ty)
+}
+
+fn authenticated_flat_structure_passthrough_call(
+    input: &flow::FlowWir,
+    caller: &flow::FlowFunction,
+    instruction: &flow::Instruction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, MachineLowerError> {
+    let flow::FlowOperation::Call {
+        function: callee,
+        arguments,
+    } = &instruction.operation
+    else {
+        return Ok(false);
+    };
+    let Some(callee) = input.functions.get(callee.0 as usize) else {
+        return Ok(false);
+    };
+    let Some(ty) = authenticated_flat_structure_passthrough(input, callee, is_cancelled)? else {
+        return Ok(false);
+    };
+    let ([result], [argument]) = (instruction.results.as_slice(), arguments.as_slice()) else {
+        return Ok(false);
+    };
+    Ok(matches!(caller.origin,
+            flow::FunctionOrigin::SourceSemantic { semantic_function }
+                if semantic_function == caller.id.0)
+        && caller.role == flow::FunctionRole::Ordinary
+        && caller.color == flow::FunctionColor::Sync
+        && instruction.source.is_some()
+        && flow_value_type(caller, *argument).ok() == Some(ty)
+        && flow_value_type(caller, *result).ok() == Some(ty))
 }
 
 /// Authenticate the first owned-aggregate result boundary without widening
