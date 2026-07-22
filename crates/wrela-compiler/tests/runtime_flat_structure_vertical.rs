@@ -194,6 +194,27 @@ fn derived_from_is_available():
     return
 "#;
 
+const DERIVED_FROM_NATIVE_SOURCE: &str = r#"module app.duration
+pub enum Milliseconds deriving(From):
+    value(u64,)
+
+pub fn convert(value: u64) -> Milliseconds:
+    return Milliseconds.from(value)
+
+pub fn construct(value: u64) -> Milliseconds:
+    return Milliseconds.value(value)
+"#;
+
+const DERIVED_FROM_NATIVE_TEST_SOURCE: &str = r#"module app.duration_test
+from app.duration import Milliseconds, construct, convert
+
+@test(runtime)
+fn generated_and_direct_construction_reach_native():
+    converted: Milliseconds = convert(42)
+    constructed: Milliseconds = construct(43)
+    return
+"#;
+
 const INITIALIZER_SOURCE: &str = r#"module app.duration
 
 pub struct Box:
@@ -3681,6 +3702,401 @@ fn single_variant_scalar_derived_from_analyzes_and_lowers_exactly() {
             )
         })
     }));
+}
+
+#[test]
+fn generated_scalar_from_reaches_flow_machine_and_deterministic_native_coff() {
+    let fixture = fixture(DERIVED_FROM_NATIVE_SOURCE, DERIVED_FROM_NATIVE_TEST_SOURCE);
+    let analyzed = analyzed(&fixture);
+    assert_eq!(
+        analyzed
+            .facts()
+            .expressions
+            .iter()
+            .filter(|fact| matches!(
+                fact.resolution,
+                wrela_sema::ExpressionResolution::DerivedFrom { .. }
+            ))
+            .count(),
+        1,
+        "only the generated conversion carries derived-From source authority"
+    );
+    assert_eq!(
+        analyzed
+            .facts()
+            .expressions
+            .iter()
+            .filter(|fact| matches!(
+                fact.resolution,
+                wrela_sema::ExpressionResolution::Constructor {
+                    variant: Some(0),
+                    ..
+                }
+            ))
+            .count(),
+        2,
+        "the adjacent direct constructor retains its callee and value witnesses"
+    );
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("generated From lowers to SemanticWir");
+    let semantic_model = semantic.wir().as_wir();
+    let semantic_constructors = semantic_model
+        .functions
+        .iter()
+        .filter(|function| {
+            function.name.ends_with("convert") || function.name.ends_with("construct")
+        })
+        .map(|function| {
+            function
+                .body
+                .statements
+                .iter()
+                .find_map(|statement| match statement {
+                    LoweredSemanticStatement::Let(statement) => match statement.operation {
+                        SemanticOperation::ConstructEnum {
+                            ty,
+                            variant: 0,
+                            payload: Some(_),
+                        } => Some(ty),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("conversion helper has one canonical enum construction")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(semantic_constructors.len(), 2);
+    assert_eq!(semantic_constructors[0], semantic_constructors[1]);
+
+    // From this boundary onward both expressions intentionally share the same
+    // canonical constructor representation. The source/sema authority above,
+    // not an invented downstream provenance bit, distinguishes their origin.
+    let semantic_wir = semantic.into_parts().0;
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("generated From reaches FlowWir");
+    assert_eq!(
+        flow.wir()
+            .as_wir()
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(instruction.operation, FlowOperation::MakeEnum { .. }))
+            .count(),
+        2,
+        "generated conversion and direct construction must each reach FlowWir"
+    );
+    let milliseconds = flow
+        .wir()
+        .as_wir()
+        .types
+        .iter()
+        .find(|ty| ty.name.as_deref() == Some("Milliseconds"))
+        .expect("Milliseconds FlowWir type");
+    assert!(matches!(
+        &milliseconds.kind,
+        FlowTypeKind::Enum { variants }
+            if matches!(variants.as_slice(), [variant] if variant.len() == 1)
+    ));
+    assert!(
+        flow.wir()
+            .as_wir()
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match instruction.operation {
+                FlowOperation::MakeEnum {
+                    ty,
+                    variant: 0,
+                    payload: Some(_),
+                } => Some(ty),
+                _ => None,
+            })
+            .all(|ty| ty == milliseconds.id)
+    );
+
+    let flow_instruction_count = flow.report().instructions;
+    let mut exact_flow_limits = FlowLoweringLimits::standard();
+    exact_flow_limits.instructions = flow_instruction_count;
+    CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: exact_flow_limits,
+            },
+            &never_cancelled,
+        )
+        .expect("generated From accepts its exact FlowWir instruction ceiling");
+    let mut one_under_flow = exact_flow_limits;
+    one_under_flow.instructions = flow_instruction_count - 1;
+    assert!(matches!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: one_under_flow,
+            },
+            &never_cancelled,
+        ),
+        Err(FlowLowerError::ResourceLimit {
+            resource: "FlowWir instructions",
+            limit,
+        }) if limit == flow_instruction_count - 1
+    ));
+    let flow_polls = Cell::new(0_u64);
+    CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: exact_flow_limits,
+            },
+            &|| {
+                flow_polls.set(flow_polls.get().saturating_add(1));
+                false
+            },
+        )
+        .expect("count generated From FlowWir cancellation polls");
+    let flow_cancel_at = flow_polls.get().saturating_sub(2);
+    assert!(flow_cancel_at > 2);
+    let cancelled_flow_polls = Cell::new(0_u64);
+    assert!(matches!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic_wir,
+                limits: exact_flow_limits,
+            },
+            &|| {
+                let next = cancelled_flow_polls.get().saturating_add(1);
+                cancelled_flow_polls.set(next);
+                next >= flow_cancel_at
+            },
+        ),
+        Err(FlowLowerError::Cancelled)
+    ));
+
+    let flow_wir = flow.into_parts().0;
+    let mut forged_flow = flow_wir.as_wir().clone();
+    let forged_variant = forged_flow
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.operation {
+            FlowOperation::MakeEnum { variant, .. } => Some(variant),
+            _ => None,
+        })
+        .expect("mutable generated From FlowWir constructor");
+    *forged_variant = 1;
+    assert!(
+        forged_flow.validate().is_err(),
+        "FlowWir must reject a forged generated-conversion variant"
+    );
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("generated From canonical FlowWir frame");
+    let decoded = CanonicalFlowWirCodec
+        .decode(
+            DecodeRequest {
+                bytes: encoded.bytes(),
+                limits: CodecLimits::standard(),
+                expected_build: Some(fixture.build.identity()),
+            },
+            &never_cancelled,
+        )
+        .expect("generated From canonical FlowWir decode");
+    assert_eq!(decoded, flow_wir);
+
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("generated From reaches MachineWir");
+    let machine = prepared.machine().wir().as_wir();
+    let milliseconds = machine
+        .types
+        .iter()
+        .find(|ty| ty.source_name.as_deref() == Some("Milliseconds"))
+        .expect("Milliseconds MachineWir type");
+    assert!(matches!(
+        &milliseconds.kind,
+        MachineTypeKind::TaggedEnum {
+            variants: 1,
+            payload: Some(_),
+            storage: None,
+            variant_payloads,
+            ..
+        } if variant_payloads.len() == 1
+    ));
+    let machine_constructors = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                MachineOperation::MakeEnum {
+                    ty,
+                    variant: 0,
+                    payload: Some(_),
+                } if ty == milliseconds.id
+            )
+        })
+        .count();
+    assert_eq!(machine_constructors, 2);
+    let mut forged_machine = machine.clone();
+    let forged_variant = forged_machine
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.operation {
+            MachineOperation::MakeEnum { variant, .. } => Some(variant),
+            _ => None,
+        })
+        .expect("mutable generated From MachineWir constructor");
+    *forged_variant = 1;
+    assert!(
+        forged_machine.validate_for_target(&fixture.target).is_err(),
+        "MachineWir must reject a forged generated-conversion variant"
+    );
+
+    let codec = CanonicalFlowWirCodec;
+    let hasher = CanonicalBackendContentHasher::new();
+    let optimizer = CanonicalFlowOptimizer::new();
+    let machine_lowerer = CanonicalMachineLowerer::new();
+    let expected_digest = hasher
+        .sha256(encoded.bytes(), &never_cancelled)
+        .expect("generated From frame digest");
+    let optimization = OptimizationProfile::from_build_policy(
+        &fixture.build.profile.optimization,
+        fixture.build.identity.compiler,
+    )
+    .expect("generated From optimization profile");
+    let prepare_with = |machine_limits: MachineLoweringLimits, is_cancelled: &dyn Fn() -> bool| {
+        prepare_for_codegen(
+            BackendPreparationServices {
+                codec: &codec,
+                hasher: &hasher,
+                optimizer: &optimizer,
+                machine_lowerer: &machine_lowerer,
+            },
+            encoded.bytes(),
+            expected_digest,
+            &fixture.target,
+            &fixture.build,
+            BackendPreparationOptions {
+                codec_limits: CodecLimits::standard(),
+                optimization: optimization.clone(),
+                optimization_limits: OptimizationLimits::standard(),
+                machine_limits,
+            },
+            is_cancelled,
+        )
+    };
+    let instruction_count = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .map(|block| block.instructions.len() as u64)
+        .sum::<u64>();
+    let mut exact_machine_limits = MachineLoweringLimits::standard();
+    exact_machine_limits.types = machine.types.len() as u64;
+    exact_machine_limits.functions = machine.functions.len() as u64;
+    exact_machine_limits.sections = machine.sections.len() as u32;
+    exact_machine_limits.symbols = machine.symbols.len() as u32;
+    exact_machine_limits.globals = machine.globals.len() as u32;
+    exact_machine_limits.instructions = instruction_count;
+    exact_machine_limits.stack_slots = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_slots.len() as u64)
+        .sum::<u64>()
+        .max(1);
+    exact_machine_limits.proofs = machine.proofs.len() as u32;
+    exact_machine_limits.static_bytes = machine
+        .sections
+        .iter()
+        .map(|section| section.reserved_bytes)
+        .sum();
+    exact_machine_limits.stack_bytes_per_function = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_bytes)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    exact_machine_limits = exact_machine_limits.with_aligned_validation();
+    let exact = prepare_with(exact_machine_limits, &never_cancelled)
+        .expect("generated From accepts its exact MachineWir ceiling");
+    assert_eq!(exact.machine().wir().as_wir(), machine);
+    let mut one_under_machine = exact_machine_limits;
+    one_under_machine.instructions -= 1;
+    one_under_machine = one_under_machine.with_aligned_validation();
+    let one_under_error = prepare_with(one_under_machine, &never_cancelled)
+        .expect_err("one fewer generated From MachineWir instruction must fail");
+    assert_eq!(
+        one_under_error.machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir instructions",
+            limit: instruction_count - 1,
+        })
+    );
+    let machine_polls = Cell::new(0_u64);
+    prepare_with(MachineLoweringLimits::standard(), &|| {
+        machine_polls.set(machine_polls.get().saturating_add(1));
+        false
+    })
+    .expect("count generated From MachineWir cancellation polls");
+    let machine_cancel_at = machine_polls.get().saturating_sub(2);
+    assert!(machine_cancel_at > 2);
+    let cancelled_machine_polls = Cell::new(0_u64);
+    let cancellation = prepare_with(MachineLoweringLimits::standard(), &|| {
+        let next = cancelled_machine_polls.get().saturating_add(1);
+        cancelled_machine_polls.set(next);
+        next >= machine_cancel_at
+    })
+    .expect_err("late generated From MachineWir cancellation must propagate");
+    assert!(cancellation.is_cancelled());
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("generated From native object emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat generated From native object emission");
+            assert_eq!(
+                first.bytes(),
+                second.bytes(),
+                "identical generated From MachineWir emits byte-identical ARM64 COFF"
+            );
+        }
+    }
 }
 
 #[test]
