@@ -15648,7 +15648,7 @@ pub(super) fn derive_structured_view_liveness(
             let statement = program
                 .statement(*statement_id)
                 .ok_or(AnalysisFailure::RequestMismatch)?;
-            if live_after {
+            if live_after && !matches!(statement.kind, StatementKind::Return(_)) {
                 live_after_statements.try_reserve(1).map_err(|_| {
                     AnalysisFailure::ResourceLimit {
                         resource: "structured lexical-view liveness",
@@ -15742,7 +15742,11 @@ pub(super) fn derive_structured_view_liveness(
                         statement.source,
                     )));
                 }
-                StatementKind::Return(_) | StatementKind::Break | StatementKind::Continue
+                // A return has no successor in this body, so continuation
+                // liveness does not flow into its path. A return expression
+                // that names the view was already rejected above as escape.
+                StatementKind::Return(_) => false,
+                StatementKind::Break | StatementKind::Continue
                     if live_after || !references.is_empty() =>
                 {
                     return Ok(Err(StructuredViewLivenessError::Escape(statement.source)));
@@ -39454,6 +39458,63 @@ fn unused_projection_releases_immediately():
         assert!(
             forged.validate_for_seal(analyzed.hir(), &|| false).is_err(),
             "full sealing must reject a falsely retained unused view"
+        );
+    }
+
+    #[test]
+    fn branch_local_return_releases_a_view_needed_only_by_the_continuation() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn returning_path_does_not_retain_continuation():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    if true:
+        return
+    consume(hdr)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "a terminating path must not inherit continuation liveness: {:?}",
+            output.diagnostics()
+        );
+        let analyzed = output
+            .successful()
+            .expect("sealed early-return view analysis");
+        let facts = analyzed.facts();
+        let view = facts.lexical_views.first().expect("one lexical view");
+        assert_eq!(view.terminal_uses.len(), 1);
+        let branch_return = facts
+            .statements
+            .iter()
+            .find(|fact| {
+                fact.function == view.function
+                    && analyzed
+                        .hir()
+                        .as_program()
+                        .statement(fact.statement)
+                        .is_some_and(|statement| matches!(statement.kind, StatementKind::Return(_)))
+            })
+            .expect("branch-local return statement fact");
+        assert!(
+            !branch_return.live_lexical_views_after.contains(&view.id),
+            "the view releases on the terminating branch"
         );
     }
 }
