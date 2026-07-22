@@ -1983,6 +1983,11 @@ impl PartialAnalysis {
                 "image graph contains invalid references, bounds, or order",
             ));
         }
+        if !valid_static_supervision_contract(self, hir.as_program(), graph, is_cancelled)? {
+            return Err(invalid(
+                "static supervision topology or proof closure differs from the exact actor image",
+            ));
+        }
         if !valid_actor_state_contracts(self, hir.as_program(), graph) {
             return Err(invalid(
                 "actor state storage differs from its exact HIR declaration",
@@ -10698,6 +10703,138 @@ fn valid_image_graph(graph: &ImageGraph, analysis: &PartialAnalysis) -> bool {
         && graph.shutdown_order.len() == shutdown.len()
         && startup == required
         && shutdown == required
+}
+
+fn valid_static_supervision_contract(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    graph: &ImageGraph,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, AnalysisFailure> {
+    let mut supervision = analysis
+        .proofs
+        .iter()
+        .filter(|proof| proof.kind == ProofKind::SupervisionComplete);
+    if graph.actors.is_empty() {
+        return Ok(supervision.next().is_none());
+    }
+    let Some(proof) = supervision.next() else {
+        return Ok(false);
+    };
+    if supervision.next().is_some() {
+        return Ok(false);
+    }
+    let Some(node_count) = graph.actors.len().checked_add(graph.tasks.len()) else {
+        return Ok(false);
+    };
+    if proof.sources.len() != node_count
+        || proof.subject != "complete static actor/task parent topology"
+        || proof.bound != u64::try_from(node_count).ok()
+        || proof.depends_on.as_slice() != [ProofId(0)]
+        || proof.explanation.as_slice()
+            != [
+                "the static actor parent graph is acyclic and every static @task is owned by exactly its declaring actor; restart policy and failure delivery are not claimed",
+            ]
+        || analysis
+            .proofs
+            .first()
+            .is_none_or(|type_checked| type_checked.kind != ProofKind::TypeChecked)
+    {
+        return Ok(false);
+    }
+
+    let mut source_index = 0usize;
+    for actor in &graph.actors {
+        check_analysis_cancelled(is_cancelled)?;
+        if proof.sources.get(source_index) != Some(&actor.source) {
+            return Ok(false);
+        }
+        source_index += 1;
+        let mut cursor = actor.supervisor;
+        for _ in 0..graph.actors.len() {
+            let Some(parent) = cursor else {
+                break;
+            };
+            if parent == actor.id {
+                return Ok(false);
+            }
+            let Some(parent_record) = graph
+                .actors
+                .get(parent.0 as usize)
+                .filter(|candidate| candidate.id == parent)
+            else {
+                return Ok(false);
+            };
+            cursor = parent_record.supervisor;
+        }
+        if cursor.is_some() {
+            return Ok(false);
+        }
+    }
+    for task in &graph.tasks {
+        check_analysis_cancelled(is_cancelled)?;
+        if proof.sources.get(source_index) != Some(&task.source) {
+            return Ok(false);
+        }
+        source_index += 1;
+        let parent_matches = task.supervisor.is_some_and(|parent| {
+            graph
+                .actors
+                .get(parent.0 as usize)
+                .is_some_and(|candidate| candidate.id == parent)
+        });
+        let entry = analysis
+            .functions
+            .get(task.entry.0 as usize)
+            .filter(|function| {
+                function.role == FunctionRole::TaskEntry(task.id)
+                    && function.source == Some(task.source)
+            });
+        let declared_owner = entry
+            .and_then(|function| match function.origin {
+                FunctionOrigin::Source { declaration, .. } => program.declaration(declaration),
+                _ => None,
+            })
+            .and_then(|declaration| match declaration.owner {
+                wrela_hir::DeclarationOwner::Declaration(owner) => Some(owner),
+                wrela_hir::DeclarationOwner::Module(_) => None,
+            });
+        let declared_supervisor = declared_owner.and_then(|owner| {
+            graph.actors.iter().find_map(|actor| {
+                analysis
+                    .types
+                    .get(actor.class.0 as usize)
+                    .and_then(|ty| match ty.kind {
+                        SemanticTypeKind::Class { declaration, .. } if declaration == owner => {
+                            Some(actor.id)
+                        }
+                        _ => None,
+                    })
+            })
+        });
+        if !parent_matches || entry.is_none() || task.supervisor != declared_supervisor {
+            return Ok(false);
+        }
+    }
+
+    let entry_has_proof = analysis
+        .functions
+        .get(graph.entry.0 as usize)
+        .is_some_and(|entry| entry.proofs.binary_search(&proof.id).is_ok());
+    let mut image_closed = analysis
+        .proofs
+        .iter()
+        .filter(|candidate| candidate.kind == ProofKind::ImageClosed);
+    let closure_reaches = image_closed.next().is_some_and(|closed| {
+        closed.depends_on.binary_search(&proof.id).is_ok()
+            || closed.depends_on.iter().any(|dependency| {
+                analysis
+                    .proofs
+                    .get(dependency.0 as usize)
+                    .is_some_and(|parent| parent.depends_on.binary_search(&proof.id).is_ok())
+            })
+    });
+    Ok(entry_has_proof && closure_reaches && image_closed.next().is_none())
 }
 
 fn valid_actor_state_contracts(

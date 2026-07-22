@@ -30274,6 +30274,126 @@ pub fn boot() -> Image:
     }
 
     #[test]
+    fn static_supervision_full_seal_rejects_topology_and_closure_substitution() {
+        let fixture = parsed_actor_fixture(BOUNDED_ACTOR_SOURCE);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("baseline static supervision analysis");
+        let image = output.successful().expect("sealed actor image");
+        let facts = image.facts();
+
+        let mut detached_task = facts.clone();
+        detached_task.graph.as_mut().expect("actor graph").tasks[0].supervisor = None;
+        detached_task
+            .validate_partial_structure()
+            .expect("a detached task remains prefix-safe");
+        assert!(
+            detached_task
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err(),
+            "the full sealer must authenticate every static task parent"
+        );
+
+        let supervision = facts
+            .proofs
+            .iter()
+            .find(|proof| proof.kind == ProofKind::SupervisionComplete)
+            .expect("static supervision proof");
+        let mut substituted_source = facts.clone();
+        substituted_source.proofs[supervision.id.0 as usize]
+            .sources
+            .swap(0, 1);
+        substituted_source
+            .validate_partial_structure()
+            .expect("source substitution remains prefix-safe");
+        assert!(
+            substituted_source
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err(),
+            "the full sealer must authenticate ordered topology sources"
+        );
+
+        let mut detached_closure = facts.clone();
+        let closed = detached_closure
+            .proofs
+            .iter_mut()
+            .find(|proof| proof.kind == ProofKind::ImageClosed)
+            .expect("closed-image proof");
+        closed.depends_on.retain(|proof| *proof != supervision.id);
+        detached_closure
+            .validate_partial_structure()
+            .expect("detached supervision closure remains prefix-safe");
+        assert!(
+            detached_closure
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err(),
+            "the full sealer must keep supervision in the closed-image proof closure"
+        );
+
+        let two_actor_source = ACTOR_REPLY_SOURCE
+            .replace(
+                "pub async fn ping(mut self) -> u64:\n        return 7",
+                "pub async fn ping(mut self):\n        pass",
+            )
+            .replace(
+                "        answer: u64 = await self.worker.ping()",
+                "        pass",
+            );
+        let two_actor_fixture = parsed_actor_fixture(&two_actor_source);
+        let two_actor_output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&two_actor_fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("two-actor supervision analysis");
+        let two_actor_image = two_actor_output.successful().unwrap_or_else(|| {
+            panic!(
+                "sealed two-actor image: {:?}",
+                two_actor_output.diagnostics()
+            )
+        });
+        let mut substituted_parent = two_actor_image.facts().clone();
+        let task = &mut substituted_parent
+            .graph
+            .as_mut()
+            .expect("two-actor graph")
+            .tasks[0];
+        assert_eq!(task.supervisor, Some(ActorId(1)));
+        task.supervisor = Some(ActorId(0));
+        substituted_parent
+            .validate_partial_structure()
+            .expect("in-range task-parent substitution remains prefix-safe");
+        assert!(
+            substituted_parent
+                .validate_for_seal(two_actor_image.hir(), &|| false)
+                .is_err(),
+            "the full sealer must bind a static task to its declaring actor"
+        );
+
+        let mut cyclic_actors = two_actor_image.facts().clone();
+        let actors = &mut cyclic_actors
+            .graph
+            .as_mut()
+            .expect("two-actor graph")
+            .actors;
+        actors[0].supervisor = Some(ActorId(1));
+        actors[1].supervisor = Some(ActorId(0));
+        cyclic_actors
+            .validate_partial_structure()
+            .expect("an in-range actor-parent cycle remains prefix-safe");
+        assert!(
+            cyclic_actors
+                .validate_for_seal(two_actor_image.hir(), &|| false)
+                .is_err(),
+            "the full sealer must reject a static actor-parent cycle"
+        );
+    }
+
+    #[test]
     fn static_supervision_proof_budget_is_exact() {
         let fixture = parsed_actor_fixture(BOUNDED_ACTOR_SOURCE);
         let changes = no_changes();
