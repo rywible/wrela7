@@ -23683,6 +23683,185 @@ pub fn boot() -> Image:
     }
 
     #[test]
+    fn concrete_generic_interface_dispatch_lowers_to_exact_semantic_call() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub interface Convert[T]:
+    fn convert(read self, value: T) -> T
+
+pub struct Cell:
+    pub value: u32
+
+    pub fn other(read self, value: u64) -> u64:
+        return value
+
+impl Convert[u64] for Cell:
+    fn convert(read self, value: u64) -> u64:
+        return value
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        cell: Cell = Cell(7)
+        selected: u64 = cell.convert(9)
+        othered: u64 = cell.other(10)
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let convert = image
+            .facts()
+            .functions
+            .iter()
+            .find(|function| function.name.ends_with("convert"))
+            .expect("concrete interface implementation")
+            .id;
+        let other = image
+            .facts()
+            .functions
+            .iter()
+            .find(|function| function.name.ends_with("other"))
+            .expect("same-signature direct method")
+            .id;
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("concrete generic-interface dispatch should lower");
+        let wir = lowered.wir().as_wir();
+        let calls: Vec<_> = wir
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation:
+                        wir::SemanticOperation::Call {
+                            function,
+                            arguments,
+                            activation: None,
+                        },
+                    ..
+                }) if *function == wir::FunctionId(convert.0) => Some(arguments),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].len(),
+            2,
+            "receiver precedes the interface argument"
+        );
+        assert_eq!(calls[0][0].access, wir::AccessMode::Read);
+
+        let mut forged = wir.clone();
+        let call = forged
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation:
+                        wir::SemanticOperation::Call {
+                            function,
+                            activation: None,
+                            ..
+                        },
+                    ..
+                }) if *function == wir::FunctionId(convert.0) => Some(function),
+                _ => None,
+            })
+            .expect("lowered generic-interface call");
+        *call = wir::FunctionId(other.0);
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                forged,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
+        ));
+
+        let exact_operations = lowered.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact generic-interface operation limit");
+        let mut below = exact;
+        below.operations = exact_operations - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: below,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                ..
+            })
+        ));
+
+        let polls = Cell::new(0u32);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("count generic-interface lowering polls");
+        let final_poll = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
     fn admission_result_stops_at_named_try_send_lowering_boundary() {
         let mut facts = analyze_parsed_actor().into_facts();
         let template = facts
