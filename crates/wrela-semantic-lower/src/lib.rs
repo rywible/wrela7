@@ -6391,11 +6391,10 @@ struct DerivedEqualityInput {
     left_expression: wrela_hir::ExpressionId,
     right_expression: wrela_hir::ExpressionId,
     aggregate: sema::SemanticTypeId,
-    field: u32,
     left: sema::ValueId,
     right: sema::ValueId,
-    left_field: sema::ValueId,
-    right_field: sema::ValueId,
+    fields: Vec<sema::DerivedEqualityField>,
+    conjunctions: Vec<sema::ValueId>,
     result_type: sema::SemanticTypeId,
     result: sema::ValueId,
     effects: sema::EffectSet,
@@ -9809,11 +9808,10 @@ impl SourceFunctionLowerer<'_> {
                         },
                         sema::ExpressionResolution::DerivedEquality {
                             aggregate,
-                            field,
                             left: left_value,
                             right: right_value,
-                            left_field,
-                            right_field,
+                            fields,
+                            conjunctions,
                         },
                     ) => SourceExpressionPlan::DerivedEquality(DerivedEqualityInput {
                         expression: expression_id,
@@ -9822,11 +9820,10 @@ impl SourceFunctionLowerer<'_> {
                         left_expression: *left,
                         right_expression: *right,
                         aggregate: *aggregate,
-                        field: *field,
                         left: *left_value,
                         right: *right_value,
-                        left_field: *left_field,
-                        right_field: *right_field,
+                        fields: fields.clone(),
+                        conjunctions: conjunctions.clone(),
                         result_type: fact.ty,
                         result: fact
                             .result
@@ -12073,7 +12070,7 @@ impl SourceFunctionLowerer<'_> {
         statements: &mut Vec<wir::SemanticStatement>,
     ) -> Result<LoweredExpression, LowerError> {
         let facts = self.input.facts();
-        let (declaration, field_ty) = match facts
+        let (declaration, semantic_fields) = match facts
             .types
             .get(equality.aggregate.0 as usize)
             .map(|record| &record.kind)
@@ -12082,11 +12079,21 @@ impl SourceFunctionLowerer<'_> {
                 declaration,
                 arguments,
                 fields,
-            }) if arguments.is_empty() && fields.len() == 1 && equality.field == 0 => {
-                (*declaration, fields[0].ty)
+            }) if arguments.is_empty()
+                && !fields.is_empty()
+                && equality.fields.len() == fields.len()
+                && equality.conjunctions.len() == fields.len().saturating_sub(1) =>
+            {
+                (*declaration, fields.as_slice())
             }
             _ => return Err(self.fact_mismatch("derived equality aggregate type")),
         };
+        let mut field_types = try_vec(
+            semantic_fields.len(),
+            "derived equality field types",
+            self.limits.model_edges,
+        )?;
+        field_types.extend(semantic_fields.iter().map(|field| field.ty));
         let source_structure = self
             .input
             .hir()
@@ -12098,13 +12105,19 @@ impl SourceFunctionLowerer<'_> {
             })
             .ok_or_else(|| self.fact_mismatch("derived equality source structure"))?;
         if !source_structure.generics.is_empty()
-            || source_structure.fields.len() != 1
+            || source_structure.fields.len() != field_types.len()
             || !source_structure
                 .deriving
                 .iter()
                 .any(|name| name.as_str() == "Eq")
-            || !source_type_matches_semantic(facts, &source_structure.fields[0].ty, field_ty)
-            || source_scalar_kind(facts, field_ty).is_none()
+            || !source_structure
+                .fields
+                .iter()
+                .zip(&field_types)
+                .all(|(source_field, field_ty)| {
+                    source_type_matches_semantic(facts, &source_field.ty, *field_ty)
+                        && source_scalar_kind(facts, *field_ty).is_some()
+                })
             || source_scalar_kind(facts, equality.result_type) != Some(SourceScalarKind::Bool)
         {
             return Err(self.fact_mismatch("derived equality declared shape"));
@@ -12123,9 +12136,9 @@ impl SourceFunctionLowerer<'_> {
         {
             return Err(self.fact_mismatch("derived equality operand facts"));
         }
-        let operator = match equality.operator {
-            wrela_hir::ComparisonOperator::Equal => wir::BinaryOperator::Equal,
-            wrela_hir::ComparisonOperator::NotEqual => wir::BinaryOperator::NotEqual,
+        let negate = match equality.operator {
+            wrela_hir::ComparisonOperator::Equal => false,
+            wrela_hir::ComparisonOperator::NotEqual => true,
             _ => return Err(self.fact_mismatch("derived equality operator")),
         };
         let LoweredExpression::Value(left) =
@@ -12146,55 +12159,123 @@ impl SourceFunctionLowerer<'_> {
         {
             return Err(self.fact_mismatch("derived equality operand values"));
         }
-        let left_field = self.lowered_expression_result(
-            equality.expression,
-            equality.left_field,
-            field_ty,
-            equality.source,
+        let mut comparisons = try_vec(
+            equality.fields.len(),
+            "derived equality field comparisons",
+            self.limits.model_edges,
         )?;
-        let right_field = self.lowered_expression_result(
-            equality.expression,
-            equality.right_field,
-            field_ty,
-            equality.source,
-        )?;
-        self.push_let(
-            statements,
-            left_field,
-            wir::SemanticOperation::Project {
-                base: left,
-                field: equality.field,
-                access: wir::AccessMode::Read,
-            },
-            Some(equality.source),
-        )?;
-        self.push_let(
-            statements,
-            right_field,
-            wir::SemanticOperation::Project {
-                base: right,
-                field: equality.field,
-                access: wir::AccessMode::Read,
-            },
-            Some(equality.source),
-        )?;
-        let result = self.lowered_expression_result(
-            equality.expression,
-            equality.result,
-            equality.result_type,
-            equality.source,
-        )?;
-        self.push_let(
-            statements,
-            result,
-            wir::SemanticOperation::Binary {
-                operator,
-                left: left_field,
-                right: right_field,
-                arithmetic: wir::ArithmeticMode::Checked,
-            },
-            Some(equality.source),
-        )?;
+        for (index, (derived, field_ty)) in equality
+            .fields
+            .iter()
+            .zip(field_types.iter().copied())
+            .enumerate()
+        {
+            check_cancelled(self.is_cancelled)?;
+            if u32::try_from(index) != Ok(derived.field) {
+                return Err(self.fact_mismatch("derived equality field order"));
+            }
+            let left_field = self.lowered_expression_result(
+                equality.expression,
+                derived.left,
+                field_ty,
+                equality.source,
+            )?;
+            let right_field = self.lowered_expression_result(
+                equality.expression,
+                derived.right,
+                field_ty,
+                equality.source,
+            )?;
+            self.push_let(
+                statements,
+                left_field,
+                wir::SemanticOperation::Project {
+                    base: left,
+                    field: derived.field,
+                    access: wir::AccessMode::Read,
+                },
+                Some(equality.source),
+            )?;
+            self.push_let(
+                statements,
+                right_field,
+                wir::SemanticOperation::Project {
+                    base: right,
+                    field: derived.field,
+                    access: wir::AccessMode::Read,
+                },
+                Some(equality.source),
+            )?;
+            let comparison = self.lowered_expression_result(
+                equality.expression,
+                derived.comparison,
+                equality.result_type,
+                equality.source,
+            )?;
+            self.push_let(
+                statements,
+                comparison,
+                wir::SemanticOperation::Binary {
+                    operator: wir::BinaryOperator::Equal,
+                    left: left_field,
+                    right: right_field,
+                    arithmetic: wir::ArithmeticMode::Checked,
+                },
+                Some(equality.source),
+            )?;
+            comparisons.push(comparison);
+        }
+        let mut raw = comparisons[0];
+        for (conjunction, comparison) in equality
+            .conjunctions
+            .iter()
+            .copied()
+            .zip(comparisons.iter().copied().skip(1))
+        {
+            check_cancelled(self.is_cancelled)?;
+            let result = self.lowered_expression_result(
+                equality.expression,
+                conjunction,
+                equality.result_type,
+                equality.source,
+            )?;
+            self.push_let(
+                statements,
+                result,
+                wir::SemanticOperation::Binary {
+                    operator: wir::BinaryOperator::BitAnd,
+                    left: raw,
+                    right: comparison,
+                    arithmetic: wir::ArithmeticMode::Checked,
+                },
+                Some(equality.source),
+            )?;
+            raw = result;
+        }
+        let result = if negate {
+            let result = self.lowered_expression_result(
+                equality.expression,
+                equality.result,
+                equality.result_type,
+                equality.source,
+            )?;
+            self.push_let(
+                statements,
+                result,
+                wir::SemanticOperation::Unary {
+                    operator: wir::UnaryOperator::BoolNot,
+                    operand: raw,
+                    arithmetic: wir::ArithmeticMode::Checked,
+                },
+                Some(equality.source),
+            )?;
+            result
+        } else {
+            if self.value_map.get(equality.result)? != raw {
+                return Err(self.fact_mismatch("derived equality final result"));
+            }
+            raw
+        };
         Ok(LoweredExpression::Value(result))
     }
 

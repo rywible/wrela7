@@ -148,6 +148,32 @@ fn derived_equality_reaches_native():
     return
 "#;
 
+const MULTIFIELD_DERIVED_EQ_SOURCE: &str = r#"module app.duration
+
+pub struct Pair deriving(Eq):
+    pub first: u64
+    pub second: bool
+
+pub fn compare() -> bool:
+    left: Pair = Pair(first=1, second=true)
+    right: Pair = Pair(first=1, second=true)
+    result: bool = left == right
+    left_after: u64 = left.first
+    right_after: bool = right.second
+    different: bool = left != right
+    return result
+"#;
+
+const MULTIFIELD_DERIVED_EQ_TEST_SOURCE: &str = r#"module app.duration_test
+
+from app.duration import compare
+
+@test(runtime)
+fn multifield_derived_equality_reaches_native():
+    equal: bool = compare()
+    return
+"#;
+
 const INITIALIZER_SOURCE: &str = r#"module app.duration
 
 pub struct Box:
@@ -2157,8 +2183,27 @@ fn deriving_eq_is_accepted() {
 }
 
 #[test]
-fn one_field_derived_eq_reaches_deterministic_native_coff() {
-    let fixture = fixture(DERIVED_EQ_SOURCE, DERIVED_EQ_TEST_SOURCE);
+fn multifield_derived_eq_is_accepted() {
+    let fixture = fixture(
+        MULTIFIELD_DERIVED_EQ_SOURCE,
+        MULTIFIELD_DERIVED_EQ_TEST_SOURCE,
+    );
+    let output = compile(&fixture, AnalysisLimits::standard(), &never_cancelled)
+        .expect("multi-field deriving Eq analysis remains bounded");
+    assert!(
+        output.diagnostics().is_empty(),
+        "{:?}",
+        output.diagnostics()
+    );
+    assert!(output.successful().is_some());
+}
+
+#[test]
+fn multifield_derived_eq_reaches_deterministic_native_coff() {
+    let fixture = fixture(
+        MULTIFIELD_DERIVED_EQ_SOURCE,
+        MULTIFIELD_DERIVED_EQ_TEST_SOURCE,
+    );
     let analyzed = analyzed(&fixture);
     let semantic = CanonicalSemanticLowerer::new()
         .lower(
@@ -2182,7 +2227,8 @@ fn one_field_derived_eq_reaches_deterministic_native_coff() {
 
     let mut semantic_projects = 0;
     let mut semantic_equal = 0;
-    let mut semantic_not_equal = 0;
+    let mut semantic_conjunctions = 0;
+    let mut semantic_negations = 0;
     for statement in semantic
         .wir()
         .as_wir()
@@ -2195,7 +2241,6 @@ fn one_field_derived_eq_reaches_deterministic_native_coff() {
         };
         match statement.operation {
             SemanticOperation::Project {
-                field: 0,
                 access: wrela_semantic_lower::SemanticAccessMode::Read,
                 ..
             } => semantic_projects += 1,
@@ -2205,18 +2250,26 @@ fn one_field_derived_eq_reaches_deterministic_native_coff() {
                 ..
             } => semantic_equal += 1,
             SemanticOperation::Binary {
-                operator: wrela_semantic_lower::semantic_wir::BinaryOperator::NotEqual,
+                operator: wrela_semantic_lower::semantic_wir::BinaryOperator::BitAnd,
                 arithmetic: SemanticArithmeticMode::Checked,
                 ..
-            } => semantic_not_equal += 1,
+            } => semantic_conjunctions += 1,
+            SemanticOperation::Unary {
+                operator: wrela_semantic_lower::semantic_wir::UnaryOperator::BoolNot,
+                arithmetic: SemanticArithmeticMode::Checked,
+                ..
+            } => semantic_negations += 1,
             _ => {}
         }
     }
     assert_eq!(
-        semantic_projects, 6,
-        "two derived comparisons project both operands and the equality function performs two post-comparison reads"
+        semantic_projects, 10,
+        "two derived comparisons project both fields of both operands and equality preserves both operands for post-comparison reads"
     );
-    assert_eq!((semantic_equal, semantic_not_equal), (1, 1));
+    assert_eq!(
+        (semantic_equal, semantic_conjunctions, semantic_negations),
+        (4, 2, 1)
+    );
 
     let (semantic_wir, _) = semantic.into_parts();
     let flow = CanonicalFlowLowerer::new()
@@ -2235,12 +2288,7 @@ fn one_field_derived_eq_reaches_deterministic_native_coff() {
         .iter()
         .flat_map(|function| &function.blocks)
         .flat_map(|block| &block.instructions)
-        .filter(|instruction| {
-            matches!(
-                instruction.operation,
-                FlowOperation::ExtractField { field: 0, .. }
-            )
-        })
+        .filter(|instruction| matches!(instruction.operation, FlowOperation::ExtractField { .. }))
         .count();
     let flow_equal = flow_model
         .functions
@@ -2257,7 +2305,7 @@ fn one_field_derived_eq_reaches_deterministic_native_coff() {
             )
         })
         .count();
-    let flow_not_equal = flow_model
+    let flow_conjunctions = flow_model
         .functions
         .iter()
         .flat_map(|function| &function.blocks)
@@ -2266,14 +2314,14 @@ fn one_field_derived_eq_reaches_deterministic_native_coff() {
             matches!(
                 instruction.operation,
                 FlowOperation::Binary {
-                    op: FlowBinaryOp::NotEqual,
+                    op: FlowBinaryOp::BitAnd,
                     ..
                 }
             )
         })
         .count();
-    assert_eq!(flow_projects, 6);
-    assert_eq!((flow_equal, flow_not_equal), (1, 1));
+    assert_eq!(flow_projects, 10);
+    assert_eq!((flow_equal, flow_conjunctions), (4, 2));
 
     let (flow_wir, _, _) = flow.into_parts();
     let encoded = encode_and_verify(
@@ -2305,21 +2353,6 @@ fn one_field_derived_eq_reaches_deterministic_native_coff() {
     )
     .expect("derived equality reaches MachineWir");
     let machine = prepared.machine().wir().as_wir();
-    let bitcasts = machine
-        .functions
-        .iter()
-        .flat_map(|function| &function.blocks)
-        .flat_map(|block| &block.instructions)
-        .filter(|instruction| {
-            matches!(
-                instruction.operation,
-                MachineOperation::Convert {
-                    op: ConversionOp::Bitcast,
-                    ..
-                }
-            )
-        })
-        .count();
     let comparisons = machine
         .functions
         .iter()
@@ -2332,11 +2365,7 @@ fn one_field_derived_eq_reaches_deterministic_native_coff() {
             )
         })
         .count();
-    assert!(
-        bitcasts >= 6,
-        "all six one-field projections must be materialized"
-    );
-    assert_eq!(comparisons, 2);
+    assert_eq!(comparisons, 4, "every field pair reaches machine equality");
 
     match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
         Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
@@ -2358,9 +2387,8 @@ fn one_field_derived_eq_reaches_deterministic_native_coff() {
 
 #[test]
 fn derived_eq_rejects_unmarked_and_unsupported_shapes_by_name() {
-    let cases = [
-        (
-            r#"module app.duration
+    let cases = [(
+        r#"module app.duration
 pub struct Point:
     pub value: u64
 pub fn make(value: u64) -> Point:
@@ -2368,7 +2396,7 @@ pub fn make(value: u64) -> Point:
 pub fn same(read left: Point, read right: Point) -> bool:
     return left == right
 "#,
-            r#"module app.duration_test
+        r#"module app.duration_test
 from app.duration import Point, make, same
 @test(runtime)
 fn unmarked_equality():
@@ -2377,30 +2405,8 @@ fn unmarked_equality():
     equal: bool = same(left=first, right=second)
     return
 "#,
-            "semantic-derived-eq-required",
-        ),
-        (
-            r#"module app.duration
-pub struct Pair deriving(Eq):
-    pub left: u64
-    pub right: u64
-pub fn make(value: u64) -> Pair:
-    return Pair(left=value, right=value)
-pub fn same(read left: Pair, read right: Pair) -> bool:
-    return left == right
-"#,
-            r#"module app.duration_test
-from app.duration import Pair, make, same
-@test(runtime)
-fn wide_derived_equality():
-    first: Pair = make(1)
-    second: Pair = make(1)
-    equal: bool = same(left=first, right=second)
-    return
-"#,
-            "semantic-deriving-eq-shape-pending",
-        ),
-    ];
+        "semantic-derived-eq-required",
+    )];
     for (production, tests, expected_code) in cases {
         let fixture = fixture(production, tests);
         if fixture
@@ -2454,7 +2460,9 @@ fn derived_eq_full_seal_rejects_field_and_intermediate_forgeries() {
         .expressions
         .iter_mut()
         .find_map(|fact| match &mut fact.resolution {
-            wrela_sema::ExpressionResolution::DerivedEquality { field, .. } => Some(field),
+            wrela_sema::ExpressionResolution::DerivedEquality { fields, .. } => {
+                fields.first_mut().map(|field| &mut field.field)
+            }
             _ => None,
         })
         .expect("derived equality fact");
@@ -2470,17 +2478,85 @@ fn derived_eq_full_seal_rejects_field_and_intermediate_forgeries() {
         .expressions
         .iter_mut()
         .find_map(|fact| match &mut fact.resolution {
-            wrela_sema::ExpressionResolution::DerivedEquality {
-                left_field,
-                right_field,
-                ..
-            } => Some((*left_field, right_field)),
+            wrela_sema::ExpressionResolution::DerivedEquality { fields, .. } => fields
+                .first_mut()
+                .map(|field| (field.left, &mut field.right)),
             _ => None,
         })
         .expect("derived equality intermediates");
     *right_field = left_field;
     assert!(
         aliased_intermediate
+            .validate_for_seal(analyzed.hir(), &never_cancelled)
+            .is_err()
+    );
+}
+
+#[test]
+fn multifield_derived_eq_full_seal_rejects_order_and_fold_forgeries() {
+    let analyzed = analyzed(&fixture(
+        MULTIFIELD_DERIVED_EQ_SOURCE,
+        MULTIFIELD_DERIVED_EQ_TEST_SOURCE,
+    ));
+
+    let mut reordered = analyzed.facts().clone();
+    reordered
+        .expressions
+        .iter_mut()
+        .find_map(|fact| match &mut fact.resolution {
+            wrela_sema::ExpressionResolution::DerivedEquality { fields, .. }
+                if fields.len() == 2 =>
+            {
+                fields.swap(0, 1);
+                Some(())
+            }
+            _ => None,
+        })
+        .expect("multi-field derived equality fact");
+    assert!(
+        reordered
+            .validate_for_seal(analyzed.hir(), &never_cancelled)
+            .is_err()
+    );
+
+    let mut aliased_comparison = analyzed.facts().clone();
+    aliased_comparison
+        .expressions
+        .iter_mut()
+        .find_map(|fact| match &mut fact.resolution {
+            wrela_sema::ExpressionResolution::DerivedEquality { fields, .. }
+                if fields.len() == 2 =>
+            {
+                fields[1].comparison = fields[0].comparison;
+                Some(())
+            }
+            _ => None,
+        })
+        .expect("multi-field comparison chain");
+    assert!(
+        aliased_comparison
+            .validate_for_seal(analyzed.hir(), &never_cancelled)
+            .is_err()
+    );
+
+    let mut aliased_conjunction = analyzed.facts().clone();
+    aliased_conjunction
+        .expressions
+        .iter_mut()
+        .find_map(|fact| match &mut fact.resolution {
+            wrela_sema::ExpressionResolution::DerivedEquality {
+                fields,
+                conjunctions,
+                ..
+            } if fields.len() == 2 && conjunctions.len() == 1 => {
+                conjunctions[0] = fields[0].comparison;
+                Some(())
+            }
+            _ => None,
+        })
+        .expect("multi-field conjunction chain");
+    assert!(
+        aliased_conjunction
             .validate_for_seal(analyzed.hir(), &never_cancelled)
             .is_err()
     );

@@ -8478,7 +8478,6 @@ fn lower_binary(
         flow::BinaryOp::AddWrapping
         | flow::BinaryOp::SubWrapping
         | flow::BinaryOp::MulWrapping
-        | flow::BinaryOp::BitAnd
         | flow::BinaryOp::BitOr
         | flow::BinaryOp::BitXor => {
             if !matches!(
@@ -8492,13 +8491,28 @@ fn lower_binary(
                 flow::BinaryOp::AddWrapping => ArithmeticOp::IntegerAdd,
                 flow::BinaryOp::SubWrapping => ArithmeticOp::IntegerSubtract,
                 flow::BinaryOp::MulWrapping => ArithmeticOp::IntegerMultiply,
-                flow::BinaryOp::BitAnd => ArithmeticOp::BitAnd,
                 flow::BinaryOp::BitOr => ArithmeticOp::BitOr,
                 flow::BinaryOp::BitXor => ArithmeticOp::BitXor,
                 _ => return Err(unsupported("a non-wrapping arithmetic operation")),
             };
             Ok(MachineOperation::Arithmetic {
                 op: operation,
+                left,
+                right,
+            })
+        }
+        flow::BinaryOp::BitAnd => {
+            if !matches!(
+                kind,
+                flow::FlowTypeKind::Scalar(
+                    flow::ScalarType::Bool | flow::ScalarType::Integer { .. }
+                )
+            ) || value_type(function, result)? != MachineTypeId(left_type.0)
+            {
+                return Err(unsupported("a bit-and operation on an unsupported type"));
+            }
+            Ok(MachineOperation::Arithmetic {
+                op: ArithmeticOp::BitAnd,
                 left,
                 right,
             })

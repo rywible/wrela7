@@ -2546,7 +2546,6 @@ fn validate_scalar_binary(
         | flow::BinaryOp::MulChecked
         | flow::BinaryOp::DivChecked
         | flow::BinaryOp::RemChecked
-        | flow::BinaryOp::BitAnd
         | flow::BinaryOp::BitOr
         | flow::BinaryOp::BitXor
         | flow::BinaryOp::ShiftLeftChecked
@@ -2554,6 +2553,14 @@ fn validate_scalar_binary(
         | flow::BinaryOp::ShiftRightChecked => {
             if integer_primitive(primitive).is_none() || result_ty != operand_ty {
                 return Err(unsupported("integer scalar binary type contract"));
+            }
+        }
+        flow::BinaryOp::BitAnd => {
+            if (integer_primitive(primitive).is_none()
+                && primitive != semantic::PrimitiveType::Bool)
+                || result_ty != operand_ty
+            {
+                return Err(unsupported("bit-and scalar binary type contract"));
             }
         }
         flow::BinaryOp::Equal

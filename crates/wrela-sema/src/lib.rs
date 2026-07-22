@@ -786,16 +786,15 @@ pub enum ExpressionResolution {
         raw_result: ValueId,
         negate: bool,
     },
-    /// Compiler-derived structural equality for the exact one-field scalar
-    /// structure subset. The two field values are explicit authenticated
-    /// intermediates defined by this comparison expression.
+    /// Compiler-derived structural equality for a nonempty flat stored-copy-
+    /// scalar structure. Fields and fold results are canonical in declaration
+    /// order and every generated value is authenticated by the full seal.
     DerivedEquality {
         aggregate: SemanticTypeId,
-        field: u32,
         left: ValueId,
         right: ValueId,
-        left_field: ValueId,
-        right_field: ValueId,
+        fields: Vec<DerivedEqualityField>,
+        conjunctions: Vec<ValueId>,
     },
     /// One exact closed-enum tag test. The scrutinee remains a borrowed value;
     /// the expression result is the separately recorded boolean value.
@@ -825,6 +824,14 @@ pub enum ExpressionResolution {
         bounds: ProofId,
     },
     Builtin(IntrinsicOperation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedEqualityField {
+    pub field: u32,
+    pub left: ValueId,
+    pub right: ValueId,
+    pub comparison: ValueId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4214,13 +4221,12 @@ fn validate_exact_expression_fact(
             },
             ExpressionResolution::DerivedEquality {
                 aggregate,
-                field,
                 left: left_value,
                 right: right_value,
-                left_field,
-                right_field,
+                fields,
+                conjunctions,
             },
-            Some(_),
+            Some(result),
         ) if exact_derived_equality_matches(
             analysis,
             program,
@@ -4230,15 +4236,24 @@ fn validate_exact_expression_fact(
             *right,
             fact,
             *aggregate,
-            *field,
             *left_value,
             *right_value,
-            *left_field,
-            *right_field,
+            fields,
+            conjunctions,
         ) =>
         {
-            increment_definition(definitions, *left_field)?;
-            increment_definition(definitions, *right_field)?;
+            for field in fields {
+                increment_definition(definitions, field.left)?;
+                increment_definition(definitions, field.right)?;
+                if field.comparison != result {
+                    increment_definition(definitions, field.comparison)?;
+                }
+            }
+            for conjunction in conjunctions {
+                if *conjunction != result {
+                    increment_definition(definitions, *conjunction)?;
+                }
+            }
         }
         (
             wrela_hir::ExpressionKind::Compare {
@@ -5761,17 +5776,15 @@ fn exact_derived_equality_matches(
     right_expression: ExpressionId,
     fact: &ExpressionFact,
     aggregate: SemanticTypeId,
-    field: u32,
     left: ValueId,
     right: ValueId,
-    left_field: ValueId,
-    right_field: ValueId,
+    derived_fields: &[DerivedEqualityField],
+    conjunctions: &[ValueId],
 ) -> bool {
     if !matches!(
         operator,
         wrela_hir::ComparisonOperator::Equal | wrela_hir::ComparisonOperator::NotEqual
-    ) || field != 0
-        || aggregate.0 as usize >= analysis.types.len()
+    ) || aggregate.0 as usize >= analysis.types.len()
     {
         return false;
     }
@@ -5813,9 +5826,12 @@ fn exact_derived_equality_matches(
     else {
         return false;
     };
-    let [semantic_field] = fields.as_slice() else {
+    if fields.is_empty()
+        || derived_fields.len() != fields.len()
+        || conjunctions.len() != fields.len().saturating_sub(1)
+    {
         return false;
-    };
+    }
     let source_matches = program
         .declaration(*declaration)
         .and_then(|record| match &record.kind {
@@ -5824,16 +5840,20 @@ fn exact_derived_equality_matches(
         })
         .is_some_and(|source| {
             source.generics.is_empty()
-                && source.fields.len() == 1
+                && source.fields.len() == fields.len()
                 && source.deriving.iter().any(|name| name.as_str() == "Eq")
+                && source.fields.iter().zip(fields).all(|(source, semantic)| {
+                    source.name.as_str() == semantic.name
+                        && exact_runtime_source_type(analysis, &source.ty) == Some(semantic.ty)
+                })
         });
     let fact_source = program
         .expression(fact.expression)
         .map(|record| record.source);
-    let value_matches = |value: ValueId| {
+    let value_matches = |value: ValueId, ty: SemanticTypeId| {
         analysis.values.get(value.0 as usize).is_some_and(|record| {
             record.function == function
-                && record.ty == semantic_field.ty
+                && record.ty == ty
                 && record.category == ValueCategory::Value
                 && record.class == SemanticValueClass::FirstClass
                 && record.origin == SemanticValueOrigin::Expression(fact.expression)
@@ -5841,12 +5861,72 @@ fn exact_derived_equality_matches(
                 && record.source_name.is_none()
         })
     };
+    let result = match fact.result {
+        Some(result) => result,
+        None => return false,
+    };
+    let mut generated = Vec::new();
+    if generated
+        .try_reserve(
+            derived_fields
+                .len()
+                .saturating_mul(3)
+                .saturating_add(conjunctions.len()),
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let fields_match =
+        derived_fields
+            .iter()
+            .zip(fields)
+            .enumerate()
+            .all(|(index, (derived, semantic))| {
+                let Ok(expected_index) = u32::try_from(index) else {
+                    return false;
+                };
+                let comparison_is_result = fields.len() == 1
+                    && operator == wrela_hir::ComparisonOperator::Equal
+                    && derived.comparison == result;
+                let matches = derived.field == expected_index
+                    && value_matches(derived.left, semantic.ty)
+                    && value_matches(derived.right, semantic.ty)
+                    && (comparison_is_result || value_matches(derived.comparison, fact.ty));
+                generated.extend([derived.left, derived.right, derived.comparison]);
+                matches
+            });
+    let conjunctions_match = conjunctions.iter().enumerate().all(|(index, value)| {
+        let final_equal_result = operator == wrela_hir::ComparisonOperator::Equal
+            && index + 1 == conjunctions.len()
+            && *value == result;
+        generated.push(*value);
+        final_equal_result || value_matches(*value, fact.ty)
+    });
+    let generated_are_distinct = generated.iter().enumerate().all(|(index, value)| {
+        generated[index + 1..]
+            .iter()
+            .all(|candidate| candidate != value)
+    });
     arguments.is_empty()
         && source_matches
-        && exact_scalar_type(analysis, semantic_field.ty).is_some()
-        && left_field != right_field
-        && value_matches(left_field)
-        && value_matches(right_field)
+        && fields
+            .iter()
+            .all(|field| exact_scalar_type(analysis, field.ty).is_some())
+        && fields_match
+        && conjunctions_match
+        && generated_are_distinct
+        && match operator {
+            wrela_hir::ComparisonOperator::Equal => {
+                conjunctions
+                    .last()
+                    .copied()
+                    .unwrap_or(derived_fields[0].comparison)
+                    == result
+            }
+            wrela_hir::ComparisonOperator::NotEqual => !generated.contains(&result),
+            _ => false,
+        }
 }
 
 fn exact_scalar_cast_matches(
@@ -9517,29 +9597,45 @@ fn valid_expression_resolution(
         }
         ExpressionResolution::DerivedEquality {
             aggregate,
-            field,
             left,
             right,
-            left_field,
-            right_field,
+            fields: derived_fields,
+            conjunctions,
         } => analysis
             .types
             .get(aggregate.0 as usize)
             .and_then(|record| match &record.kind {
-                SemanticTypeKind::Structure { fields, .. } => fields.get(*field as usize),
+                SemanticTypeKind::Structure { fields, .. } if !fields.is_empty() => Some(fields),
                 _ => None,
             })
-            .is_some_and(|field| {
+            .is_some_and(|fields| {
                 let value_has_type = |value: ValueId, ty: SemanticTypeId| {
                     analysis
                         .values
                         .get(value.0 as usize)
                         .is_some_and(|record| record.function == function && record.ty == ty)
                 };
+                let value_is_bool = |value: ValueId| {
+                    analysis
+                        .values
+                        .get(value.0 as usize)
+                        .filter(|record| record.function == function)
+                        .and_then(|record| analysis.types.get(record.ty.0 as usize))
+                        .is_some_and(|record| matches!(record.kind, SemanticTypeKind::Bool))
+                };
                 value_has_type(*left, *aggregate)
                     && value_has_type(*right, *aggregate)
-                    && value_has_type(*left_field, field.ty)
-                    && value_has_type(*right_field, field.ty)
+                    && derived_fields.len() == fields.len()
+                    && conjunctions.len() == fields.len().saturating_sub(1)
+                    && derived_fields.iter().zip(fields).enumerate().all(
+                        |(index, (derived, field))| {
+                            u32::try_from(index) == Ok(derived.field)
+                                && value_has_type(derived.left, field.ty)
+                                && value_has_type(derived.right, field.ty)
+                                && value_is_bool(derived.comparison)
+                        },
+                    )
+                    && conjunctions.iter().all(|value| value_is_bool(*value))
             }),
         ExpressionResolution::EnumTypeTest {
             enumeration,
@@ -12552,6 +12648,14 @@ fn validate_fact_resources(
             | ExpressionResolution::ProjectionCall { arguments, .. }
             | ExpressionResolution::OperatorCall { arguments, .. } => meter.edges(arguments),
             ExpressionResolution::Closure { captures, .. } => meter.edges(captures),
+            ExpressionResolution::DerivedEquality {
+                fields,
+                conjunctions,
+                ..
+            } => {
+                meter.edges(fields);
+                meter.edges(conjunctions);
+            }
             ExpressionResolution::Error
             | ExpressionResolution::Value(_)
             | ExpressionResolution::Function(_)
@@ -12562,7 +12666,6 @@ fn validate_fact_resources(
             | ExpressionResolution::ResultTry { .. }
             | ExpressionResolution::OptionTry { .. }
             | ExpressionResolution::ClosedRange { .. }
-            | ExpressionResolution::DerivedEquality { .. }
             | ExpressionResolution::EnumTypeTest { .. }
             | ExpressionResolution::ActorRequest { .. }
             | ExpressionResolution::Field { .. }

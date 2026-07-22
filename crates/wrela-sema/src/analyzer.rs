@@ -9649,7 +9649,7 @@ fn analyze_derived_equality(
             "add `deriving(Eq)` to the structure declaration or compare a field explicitly",
         ));
     }
-    let (field_ty, exact_shape) = partial
+    let (semantic_fields, exact_shape) = partial
         .types
         .get(left.ty.0 as usize)
         .and_then(|record| match &record.kind {
@@ -9658,27 +9658,35 @@ fn analyze_derived_equality(
                 arguments,
                 fields,
             } => Some((
-                fields.first().map(|field| field.ty),
+                fields.as_slice(),
                 *record_declaration == declaration
                     && arguments.is_empty()
-                    && fields.len() == 1
+                    && !fields.is_empty()
                     && source.generics.is_empty()
-                    && source.fields.len() == 1,
+                    && source.fields.len() == fields.len(),
             )),
             _ => None,
         })
         .ok_or(AnalysisFailure::RequestMismatch)?;
-    let Some(field_ty) = field_ty.filter(|_| exact_shape) else {
+    let mut field_types = Vec::new();
+    field_types
+        .try_reserve(semantic_fields.len())
+        .map_err(|_| fact_resource(request, "derived equality fields"))?;
+    field_types.extend(semantic_fields.iter().map(|field| field.ty));
+    if !exact_shape {
         return Err(runtime_type_diagnostic(
             request,
             binary.source,
             "semantic-deriving-eq-shape-pending",
             "derived equality is not implemented for this structure shape",
-            "the executable subset is one nongeneric field with a stored copy-scalar type",
-            "compare fields explicitly or use a one-field scalar structure",
+            "the executable subset is a nonempty nongeneric flat structure with stored copy-scalar fields",
+            "compare fields explicitly or use a supported flat structure",
         ));
-    };
-    if runtime_scalar_type(partial, field_ty).is_none() {
+    }
+    if field_types
+        .iter()
+        .any(|field_ty| runtime_scalar_type(partial, *field_ty).is_none())
+    {
         return Err(runtime_type_diagnostic(
             request,
             binary.source,
@@ -9716,39 +9724,120 @@ fn analyze_derived_equality(
         .referenced
         .or(right.result)
         .ok_or(AnalysisFailure::RequestMismatch)?;
-    let left_field = append_semantic_value(
-        request,
-        partial,
-        function,
-        field_ty,
-        (
-            SemanticValueOrigin::Expression(binary.expression),
-            Some(binary.source),
-            None,
-        ),
-        is_cancelled,
-    )?;
-    let right_field = append_semantic_value(
-        request,
-        partial,
-        function,
-        field_ty,
-        (
-            SemanticValueOrigin::Expression(binary.expression),
-            Some(binary.source),
-            None,
-        ),
-        is_cancelled,
-    )?;
-    let result = expression_result(
-        request,
-        partial,
-        function,
-        (binary.expression, binary.source),
-        bool_ty,
-        expression_request.desired_result,
-        is_cancelled,
-    )?;
+    let is_equal = matches!(
+        binary.operator,
+        RuntimeBinaryOperator::Compare(wrela_hir::ComparisonOperator::Equal)
+    );
+    let mut derived_fields = Vec::new();
+    derived_fields
+        .try_reserve(field_types.len())
+        .map_err(|_| fact_resource(request, "derived equality fields"))?;
+    for (field_index, field_ty) in field_types.iter().copied().enumerate() {
+        check_cancelled(is_cancelled)?;
+        let left_field = append_semantic_value(
+            request,
+            partial,
+            function,
+            field_ty,
+            (
+                SemanticValueOrigin::Expression(binary.expression),
+                Some(binary.source),
+                None,
+            ),
+            is_cancelled,
+        )?;
+        let right_field = append_semantic_value(
+            request,
+            partial,
+            function,
+            field_ty,
+            (
+                SemanticValueOrigin::Expression(binary.expression),
+                Some(binary.source),
+                None,
+            ),
+            is_cancelled,
+        )?;
+        let comparison = if field_types.len() == 1 && is_equal {
+            expression_result(
+                request,
+                partial,
+                function,
+                (binary.expression, binary.source),
+                bool_ty,
+                expression_request.desired_result,
+                is_cancelled,
+            )?
+        } else {
+            append_semantic_value(
+                request,
+                partial,
+                function,
+                bool_ty,
+                (
+                    SemanticValueOrigin::Expression(binary.expression),
+                    Some(binary.source),
+                    None,
+                ),
+                is_cancelled,
+            )?
+        };
+        derived_fields.push(DerivedEqualityField {
+            field: u32::try_from(field_index)
+                .map_err(|_| fact_resource(request, "derived equality fields"))?,
+            left: left_field,
+            right: right_field,
+            comparison,
+        });
+    }
+    let mut conjunctions = Vec::new();
+    conjunctions
+        .try_reserve(field_types.len().saturating_sub(1))
+        .map_err(|_| fact_resource(request, "derived equality conjunctions"))?;
+    for fold_index in 1..field_types.len() {
+        check_cancelled(is_cancelled)?;
+        let conjunction = if fold_index + 1 == field_types.len() && is_equal {
+            expression_result(
+                request,
+                partial,
+                function,
+                (binary.expression, binary.source),
+                bool_ty,
+                expression_request.desired_result,
+                is_cancelled,
+            )?
+        } else {
+            append_semantic_value(
+                request,
+                partial,
+                function,
+                bool_ty,
+                (
+                    SemanticValueOrigin::Expression(binary.expression),
+                    Some(binary.source),
+                    None,
+                ),
+                is_cancelled,
+            )?
+        };
+        conjunctions.push(conjunction);
+    }
+    let result = if is_equal {
+        conjunctions
+            .last()
+            .copied()
+            .unwrap_or(derived_fields[0].comparison)
+    } else {
+        expression_result(
+            request,
+            partial,
+            function,
+            (binary.expression, binary.source),
+            bool_ty,
+            expression_request.desired_result,
+            is_cancelled,
+        )?
+    };
     let effects = EffectSet(left.effects.0 | right.effects.0);
     append_expression_fact(
         request,
@@ -9760,11 +9849,10 @@ fn analyze_derived_equality(
             result: Some(result),
             resolution: ExpressionResolution::DerivedEquality {
                 aggregate: left.ty,
-                field: 0,
                 left: left_value,
                 right: right_value,
-                left_field,
-                right_field,
+                fields: derived_fields,
+                conjunctions,
             },
             effects,
             ownership_before: OwnershipState::Owned,
