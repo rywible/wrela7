@@ -3833,7 +3833,8 @@ fn require_supported_type(
         flow::FlowTypeKind::Enum { .. }
             if is_all_unit_closed_enum(types, ty.id)
                 || closed_scalar_enum_payload(types, ty.id).is_some()
-                || is_exact_fixed_flat_enum(types, ty.id) =>
+                || is_exact_fixed_flat_enum(types, ty.id)
+                || is_exact_heterogeneous_scalar_enum(types, ty.id) =>
         {
             Ok(())
         }
@@ -3980,6 +3981,41 @@ fn is_exact_fixed_flat_enum(types: &[flow::FlowType], ty: flow::TypeId) -> bool 
     };
     (flat_native_struct_fields(types, *left).is_some() && scalar(*right))
         || (scalar(*left) && flat_native_struct_fields(types, *right).is_some())
+}
+
+fn is_exact_heterogeneous_scalar_enum(types: &[flow::FlowType], ty: flow::TypeId) -> bool {
+    let Some(flow::FlowType {
+        kind: flow::FlowTypeKind::Enum { variants },
+        copyable: true,
+        strict_linear: false,
+        ..
+    }) = types.get(ty.0 as usize)
+    else {
+        return false;
+    };
+    let [left, right] = variants.as_slice() else {
+        return false;
+    };
+    let ([left], [right]) = (left.as_slice(), right.as_slice()) else {
+        return false;
+    };
+    let scalar = |id: flow::TypeId| {
+        types.get(id.0 as usize).is_some_and(|record| {
+            matches!(
+                record.kind,
+                flow::FlowTypeKind::Scalar(
+                    flow::ScalarType::Bool
+                        | flow::ScalarType::Integer {
+                            bits: 8 | 16 | 32 | 64 | 128,
+                            ..
+                        }
+                        | flow::ScalarType::Float32
+                        | flow::ScalarType::Float64
+                )
+            )
+        })
+    };
+    left != right && scalar(*left) && scalar(*right)
 }
 
 fn is_all_unit_closed_enum(types: &[flow::FlowType], ty: flow::TypeId) -> bool {
@@ -6208,6 +6244,7 @@ fn validate_supported_operation(
             if closed_scalar_enum_payload(&input.types, *ty).is_none()
                 && !is_all_unit_closed_enum(&input.types, *ty)
                 && !is_exact_fixed_flat_enum(&input.types, *ty)
+                && !is_exact_heterogeneous_scalar_enum(&input.types, *ty)
             {
                 return Err(unsupported("a noncanonical enum construction"));
             }
@@ -6240,7 +6277,8 @@ fn validate_supported_operation(
             let enum_ty = flow_value_type(function, *value)?;
             if (!is_all_unit_closed_enum(&input.types, enum_ty)
                 && closed_scalar_enum_payload(&input.types, enum_ty).is_none()
-                && !is_exact_fixed_flat_enum(&input.types, enum_ty))
+                && !is_exact_fixed_flat_enum(&input.types, enum_ty)
+                && !is_exact_heterogeneous_scalar_enum(&input.types, enum_ty))
                 || Some(flow_value_type(function, result)?) != canonical_u8_type(&input.types)
             {
                 return Err(unsupported("an enum tag projection with mismatched types"));
@@ -6613,7 +6651,9 @@ fn lower_types(
                             payload_size,
                             payload_alignment,
                         )
-                    } else if is_exact_fixed_flat_enum(&input.types, ty.id) {
+                    } else if is_exact_fixed_flat_enum(&input.types, ty.id)
+                        || is_exact_heterogeneous_scalar_enum(&input.types, ty.id)
+                    {
                         let mut maximum_size = 0_u64;
                         let mut maximum_alignment = 1_u32;
                         for payload in variant_payloads.iter().flatten() {

@@ -2055,6 +2055,172 @@ fn result_u64_match_returns_payload():
 }
 
 #[test]
+fn asymmetric_core_result_construction_reaches_native_coff() {
+    let source = r#"module runtime_result.image
+
+from core.image import Image, Target
+from core.result import Result
+
+@image
+pub fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn asymmetric_result_construction():
+    ok: Result[u8, u64] = Result.Ok(7)
+    err: Result[u8, u64] = Result.Err(9)
+    return
+"#;
+    let fixture = source_fixture_for(source);
+    let analyzed = analyze_selected(&fixture, "asymmetric_result_construction");
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("asymmetric Result SemanticWir")
+        .into_parts()
+        .0;
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("asymmetric Result FlowWir");
+    let mut forged_flow = flow.wir().as_wir().clone();
+    let result = forged_flow
+        .types
+        .iter_mut()
+        .find(|ty| ty.name.as_deref() == Some("Result"))
+        .expect("forged asymmetric Result Flow type");
+    let FlowTypeKind::Enum { variants } = &mut result.kind else {
+        unreachable!();
+    };
+    let duplicate = variants[1][0];
+    variants[1].push(duplicate);
+    assert!(
+        forged_flow.validate().is_err(),
+        "FlowWir must independently reject a non-unary heterogeneous variant"
+    );
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("asymmetric Result canonical FlowWir frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("asymmetric Result MachineWir preparation");
+    let result = prepared
+        .machine()
+        .wir()
+        .as_wir()
+        .types
+        .iter()
+        .find(|ty| ty.source_name.as_deref() == Some("Result"))
+        .expect("asymmetric Result machine type");
+    let MachineTypeKind::TaggedEnum {
+        payload,
+        storage,
+        variant_payloads,
+        ..
+    } = &result.kind
+    else {
+        panic!("Result must retain tagged-enum storage")
+    };
+    assert!(payload.is_none());
+    assert_eq!(variant_payloads.len(), 2);
+    assert_ne!(variant_payloads[0], variant_payloads[1]);
+    assert_eq!(
+        (storage.expect("heterogeneous storage").size, result.size),
+        (8, 16)
+    );
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("asymmetric Result native object emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat asymmetric Result native object emission");
+            assert_eq!(first.bytes(), second.bytes());
+            inspect_native_object(first.bytes(), HASHER.sha256(first.bytes()));
+        }
+    }
+}
+
+#[test]
+fn asymmetric_core_result_payload_projection_stays_named_fail_closed() {
+    let source = r#"module runtime_result.image
+
+from core.image import Image, Target
+from core.result import Result
+
+@image
+pub fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+fn project(value: Result[u8, u64]) -> u8:
+    match value:
+        case Result.Ok(payload):
+            return payload
+        case Result.Err(error):
+            return 0
+
+@test(runtime)
+fn asymmetric_result_projection():
+    value: Result[u8, u64] = Result.Ok(7)
+    assert project(value) == 7, "projection must remain closed before execution"
+    return
+"#;
+    let fixture = source_fixture_for(source);
+    let analyzed = analyze_selected(&fixture, "asymmetric_result_projection");
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("asymmetric Result projection SemanticWir")
+        .into_parts()
+        .0;
+    let rejected = CanonicalFlowLowerer::new().lower(
+        FlowLowerRequest {
+            input: semantic,
+            limits: FlowLoweringLimits::standard(),
+        },
+        &never_cancelled,
+    );
+    assert!(
+        matches!(
+            rejected,
+            Err(wrela_flow_lower::LowerError::UnsupportedInput {
+                feature: "flow-enum-heterogeneous-payload-projection-pending"
+            })
+        ),
+        "{rejected:?}"
+    );
+}
+
+#[test]
 fn guarded_payload_and_trailing_wildcard_match_reaches_native_coff() {
     let mut source = APPLICATION_SOURCE.to_owned();
     source.push_str(

@@ -2916,9 +2916,9 @@ fn supported_enum_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeI
                 return false;
             };
             if payload.is_some()
-                || nominal_count != 1
-                || scalar_count != 1
                 || variant_payloads.len() != 2
+                || !((nominal_count == 1 && scalar_count == 1)
+                    || (nominal_count == 0 && scalar_count == 2))
                 || storage.alignment != maximum_alignment.max(1)
                 || !storage.alignment.is_power_of_two()
                 || storage.alignment > machine.layout.maximum_object_alignment

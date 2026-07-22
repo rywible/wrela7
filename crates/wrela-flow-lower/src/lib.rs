@@ -2175,7 +2175,7 @@ fn supported_generated_tests<'a>(
                         limits.model_edges,
                     )?;
                 }
-                if !canonical_semantic_enum_shape(input, variants) {
+                if !canonical_semantic_enum_shape(input, ty, variants) {
                     return Err(unsupported("generated test enum payload type"));
                 }
             }
@@ -2412,7 +2412,7 @@ fn supported_source_value_type(input: &semantic::SemanticWir, ty: semantic::Type
                 && record.source.is_some()
                 && !variants.is_empty()
                 && variants.len() <= 256
-                && canonical_semantic_enum_shape(input, variants)
+                && canonical_semantic_enum_shape(input, record, variants)
         }
         _ => false,
     }
@@ -2442,12 +2442,39 @@ fn canonical_semantic_enum_payload(
 
 fn canonical_semantic_enum_shape(
     input: &semantic::SemanticWir,
+    record: &semantic::TypeRecord,
     variants: &[semantic::VariantType],
 ) -> bool {
     !variants.is_empty()
         && (variants.iter().all(|variant| variant.fields.is_empty())
             || canonical_semantic_enum_payload(input, variants).is_some()
-            || exact_fixed_flat_generic_enum_profile(input, variants))
+            || exact_fixed_flat_generic_enum_profile(input, variants)
+            || exact_heterogeneous_scalar_enum_profile(input, record, variants))
+}
+
+/// Exact construction-only boundary for heterogeneous scalar enums. Package
+/// provenance is intentionally not inferred from a bare source name: the
+/// independently verifiable contract is two unary variants with distinct
+/// primitive stored-copy payloads.
+fn exact_heterogeneous_scalar_enum_profile(
+    input: &semantic::SemanticWir,
+    record: &semantic::TypeRecord,
+    variants: &[semantic::VariantType],
+) -> bool {
+    let [left, right] = variants else {
+        return false;
+    };
+    let ([left_field], [right_field]) = (left.fields.as_slice(), right.fields.as_slice()) else {
+        return false;
+    };
+    record.source.is_some()
+        && left_field.name.is_empty()
+        && right_field.name.is_empty()
+        && left_field.public
+        && right_field.public
+        && left_field.ty != right_field.ty
+        && scalar_primitive(input, left_field.ty).is_some()
+        && scalar_primitive(input, right_field.ty).is_some()
 }
 
 fn flat_nominal_enum_payload(input: &semantic::SemanticWir, ty: semantic::TypeId) -> bool {
@@ -6277,8 +6304,15 @@ fn lower_generated_function(
                     let semantic::TypeKind::Enum { variants } = &enum_type.kind else {
                         return Err(unsupported("enum match scrutinee type"));
                     };
-                    if !canonical_semantic_enum_shape(input, variants) {
+                    if !canonical_semantic_enum_shape(input, enum_type, variants) {
                         return Err(unsupported("enum match scrutinee type"));
+                    }
+                    if exact_heterogeneous_scalar_enum_profile(input, enum_type, variants)
+                        && arms.iter().any(|arm| !arm.bindings.is_empty())
+                    {
+                        return Err(unsupported(
+                            "flow-enum-heterogeneous-payload-projection-pending",
+                        ));
                     }
                     let variants = variants.as_slice();
                     let exact_type_test = exact_enum_type_test_match_protocol(

@@ -2647,7 +2647,9 @@ fn validate_type(module: &MachineWir, ty: &MachineType, errors: &mut ValidationC
                                 } if !fields.is_empty() && fields.iter().all(|field| scalar(field.ty)))
                         })
                     };
-                    (flat(*left) && scalar(*right)) || (scalar(*left) && flat(*right))
+                    (flat(*left) && scalar(*right))
+                        || (scalar(*left) && flat(*right))
+                        || (scalar(*left) && scalar(*right))
                 }
                 _ => false,
             };
@@ -9326,6 +9328,105 @@ mod tests {
         };
         *variant = 0;
         assert!(forged_tag_payload.validate_for_target(&target).is_err());
+    }
+
+    #[test]
+    fn heterogeneous_scalar_enum_authenticates_union_storage_and_exact_limits() {
+        let (mut module, target) = closed_enum_fixture(2);
+        module.types.push(MachineType {
+            id: MachineTypeId(5),
+            kind: MachineTypeKind::Integer { bits: 64 },
+            size: 8,
+            alignment: 8,
+            source_name: Some("u64".to_owned()),
+        });
+        module.types[4] = MachineType {
+            id: MachineTypeId(4),
+            kind: MachineTypeKind::TaggedEnum {
+                tag: MachineTypeId(3),
+                payload: None,
+                storage: Some(MachineEnumStorage {
+                    size: 8,
+                    alignment: 8,
+                }),
+                variants: 2,
+                variant_payloads: vec![Some(MachineTypeId(3)), Some(MachineTypeId(5))],
+            },
+            size: 16,
+            alignment: 8,
+            source_name: Some("Result".to_owned()),
+        };
+        module.functions[1].blocks[0].instructions.remove(2);
+        module.functions[1].values.remove(3);
+        let MachineOperation::MakeEnum { variant, .. } =
+            &mut module.functions[1].blocks[0].instructions[0].operation
+        else {
+            unreachable!();
+        };
+        *variant = 0;
+        module.functions[1].blocks[0].terminator = MachineTerminator::Return(vec![ValueId(2)]);
+        module
+            .clone()
+            .validate_for_target(&target)
+            .expect("exact asymmetric Result constructor");
+
+        let (exact, usage) = exact_validation_policy(&module);
+        module
+            .clone()
+            .validate_with_limits(&target, exact, &|| false)
+            .expect("exact asymmetric Result validation bound");
+        assert_eq!(
+            module.clone().validate_with_limits(
+                &target,
+                ValidationLimits {
+                    model_edges: usage.model_edges - 1,
+                    ..exact
+                },
+                &|| false,
+            ),
+            Err(ValidationFailure::ResourceLimit {
+                resource: "model edges",
+                limit: usage.model_edges - 1,
+            })
+        );
+        let polls = Cell::new(0_u64);
+        module
+            .clone()
+            .validate_with_limits(&target, exact, &|| {
+                polls.set(polls.get() + 1);
+                false
+            })
+            .expect("measure asymmetric Result cancellation polls");
+        let cancellation_at = polls.get() - 1;
+        let polls = Cell::new(0_u64);
+        assert_eq!(
+            module.clone().validate_with_limits(&target, exact, &|| {
+                let next = polls.get() + 1;
+                polls.set(next);
+                next >= cancellation_at
+            }),
+            Err(ValidationFailure::Cancelled)
+        );
+
+        let mut forged_payload_map = module.clone();
+        let MachineTypeKind::TaggedEnum {
+            variant_payloads, ..
+        } = &mut forged_payload_map.types[4].kind
+        else {
+            unreachable!();
+        };
+        variant_payloads[1] = variant_payloads[0];
+        assert!(forged_payload_map.validate_for_target(&target).is_err());
+
+        let mut forged_storage = module;
+        let MachineTypeKind::TaggedEnum { storage, .. } = &mut forged_storage.types[4].kind else {
+            unreachable!();
+        };
+        *storage = Some(MachineEnumStorage {
+            size: 16,
+            alignment: 8,
+        });
+        assert!(forged_storage.validate_for_target(&target).is_err());
     }
 
     #[test]

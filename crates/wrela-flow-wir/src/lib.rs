@@ -5006,7 +5006,37 @@ fn canonical_enum_shape(module: &FlowWir, variants: &[Vec<TypeId>]) -> bool {
         && variants.len() <= 256
         && (variants.iter().all(Vec::is_empty)
             || canonical_enum_payload(module, variants).is_some()
-            || exact_fixed_flat_enum_profile(module, variants))
+            || exact_fixed_flat_enum_profile(module, variants)
+            || exact_heterogeneous_scalar_enum_profile(module, variants))
+}
+
+fn exact_heterogeneous_scalar_enum_profile(module: &FlowWir, variants: &[Vec<TypeId>]) -> bool {
+    let [left, right] = variants else {
+        return false;
+    };
+    let ([left], [right]) = (left.as_slice(), right.as_slice()) else {
+        return false;
+    };
+    let scalar = |ty: TypeId| {
+        module.types.get(ty.0 as usize).is_some_and(|record| {
+            record.id == ty
+                && record.copyable
+                && !record.strict_linear
+                && matches!(
+                    record.kind,
+                    FlowTypeKind::Scalar(
+                        ScalarType::Bool
+                            | ScalarType::Integer {
+                                bits: 8 | 16 | 32 | 64 | 128,
+                                ..
+                            }
+                            | ScalarType::Float32
+                            | ScalarType::Float64
+                    )
+                )
+        })
+    };
+    left != right && scalar(*left) && scalar(*right)
 }
 
 fn flat_nominal_enum_payload(module: &FlowWir, ty: TypeId) -> bool {
