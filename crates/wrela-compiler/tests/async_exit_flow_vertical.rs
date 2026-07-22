@@ -99,6 +99,26 @@ pub fn boot() -> Image:
     return img
 "#;
 
+const COMPLETED_FRAME_RESET_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint() -> u64:
+    return 7
+
+@service
+pub struct Worker:
+    @task
+    async fn consume(mut self):
+        value: u64 = await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#;
+
 fn never_cancelled() -> bool {
     false
 }
@@ -884,6 +904,217 @@ fn async_exit_flow_tails_fail_closed_by_name() {
             feature: "flow-async-outcome-producer-pending (only direct Ok[u64])",
         })
     ));
+}
+
+#[test]
+fn completed_activation_frame_reset_reaches_machine_and_native_coff() {
+    let fixture = compile_semantic(COMPLETED_FRAME_RESET_SOURCE);
+    let semantic = fixture.semantic.clone();
+    assert_eq!(
+        semantic
+            .as_wir()
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .filter(|statement| matches!(
+                statement,
+                semantic::SemanticStatement::Let(semantic::LetStatement {
+                    operation: semantic::SemanticOperation::ResetRegion { .. },
+                    ..
+                })
+            ))
+            .count(),
+        1
+    );
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("completed activation reset reaches FlowWir");
+    let reset_count = flow
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                flow::FlowOperation::RegionReset { .. }
+            )
+        })
+        .count();
+    assert_eq!(reset_count, 1);
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: flow.wir(),
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("completed activation reset FlowWir encodes canonically");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("authenticated completed-frame reset reaches MachineWir");
+    let machine = prepared.machine().wir().as_wir();
+    assert_eq!(machine.activations.len(), 1);
+    assert_eq!(machine.region_storage.len(), 3);
+    let caller = machine
+        .functions
+        .iter()
+        .find(|function| matches!(function.role, machine::MachineFunctionRole::TaskEntry(0)))
+        .expect("completed-frame caller");
+    assert!(caller.blocks.get(1).is_some_and(|resume| {
+        resume.instructions.is_empty()
+            && matches!(&resume.terminator, machine::MachineTerminator::Return(values) if values.is_empty())
+    }));
+
+    let reject = |forged: flow::FlowWir| {
+        let validated = forged
+            .validate()
+            .expect("reset forgery remains structurally valid FlowWir");
+        let encoded = encode_and_verify(
+            &CanonicalFlowWirCodec,
+            EncodeRequest {
+                wir: &validated,
+                limits: CodecLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("reset forgery encodes canonically");
+        let error = prepare_canonical_frame_for_codegen(
+            encoded.bytes(),
+            &fixture.target,
+            &fixture.build,
+            &never_cancelled,
+        )
+        .expect_err("forged reset authority must fail closed");
+        assert_eq!(
+            error.machine_lower_error(),
+            Some(&MachineLowerError::UnsupportedInput {
+                feature: "machine-region-reset-lowering-pending (only exact completed immediate activation frames are admitted)",
+            })
+        );
+    };
+    let source_flow = flow.wir().as_wir();
+    let mut wrong_source = source_flow.clone();
+    wrong_source.functions[1].blocks[1].instructions[0].source = None;
+    reject(wrong_source);
+    let mut wrong_region = source_flow.clone();
+    wrong_region.functions[1].blocks[1].instructions[0].operation =
+        flow::FlowOperation::RegionReset {
+            region: flow::RegionId(1),
+        };
+    reject(wrong_region);
+    let mut duplicate = source_flow.clone();
+    let mut second = duplicate.functions[1].blocks[1].instructions[0].clone();
+    second.id = flow::InstructionId(2);
+    duplicate.functions[1].blocks[1].instructions.push(second);
+    reject(duplicate);
+
+    let codec = CanonicalFlowWirCodec;
+    let hasher = CanonicalBackendContentHasher::new();
+    let optimizer = CanonicalFlowOptimizer::new();
+    let machine_lowerer = CanonicalMachineLowerer::new();
+    let expected_digest = hasher
+        .sha256(encoded.bytes(), &never_cancelled)
+        .expect("completed-frame digest");
+    let optimization = OptimizationProfile::from_build_policy(
+        &fixture.build.profile.optimization,
+        fixture.build.identity.compiler,
+    )
+    .expect("completed-frame optimization profile");
+    let prepare_with = |machine_limits: MachineLoweringLimits, is_cancelled: &dyn Fn() -> bool| {
+        prepare_for_codegen(
+            BackendPreparationServices {
+                codec: &codec,
+                hasher: &hasher,
+                optimizer: &optimizer,
+                machine_lowerer: &machine_lowerer,
+            },
+            encoded.bytes(),
+            expected_digest,
+            &fixture.target,
+            &fixture.build,
+            BackendPreparationOptions {
+                codec_limits: CodecLimits::standard(),
+                optimization: optimization.clone(),
+                optimization_limits: OptimizationLimits::standard(),
+                machine_limits,
+            },
+            is_cancelled,
+        )
+    };
+    let repeated = prepare_with(MachineLoweringLimits::standard(), &never_cancelled)
+        .expect("repeat completed-frame MachineWir preparation");
+    assert_eq!(repeated.machine().wir().as_wir(), machine);
+    let instruction_count = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .map(|block| block.instructions.len() as u64)
+        .sum::<u64>();
+    let mut exact = MachineLoweringLimits::standard();
+    exact.instructions = instruction_count;
+    exact = exact.with_aligned_validation();
+    assert_eq!(
+        prepare_with(exact, &never_cancelled)
+            .expect("exact completed-frame MachineWir instruction ceiling")
+            .machine()
+            .wir()
+            .as_wir(),
+        machine
+    );
+    let mut one_under = exact;
+    one_under.instructions = instruction_count - 1;
+    one_under = one_under.with_aligned_validation();
+    assert_eq!(
+        prepare_with(one_under, &never_cancelled)
+            .expect_err("one fewer completed-frame MachineWir instruction must fail")
+            .machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir instructions",
+            limit: instruction_count - 1,
+        })
+    );
+    let polls = Cell::new(0_u64);
+    prepare_with(MachineLoweringLimits::standard(), &|| {
+        polls.set(polls.get().saturating_add(1));
+        false
+    })
+    .expect("count completed-frame MachineWir cancellation polls");
+    let final_poll = polls.get();
+    let cancelled_polls = Cell::new(0_u64);
+    let cancellation = prepare_with(MachineLoweringLimits::standard(), &|| {
+        let next = cancelled_polls.get().saturating_add(1);
+        cancelled_polls.set(next);
+        next >= final_poll
+    })
+    .expect_err("final completed-frame MachineWir cancellation poll must propagate");
+    assert!(cancellation.is_cancelled());
+    assert_eq!(cancelled_polls.get(), final_poll);
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("completed-frame native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat completed-frame native emission");
+            assert_eq!(first.bytes(), second.bytes());
+        }
+    }
 }
 
 #[test]

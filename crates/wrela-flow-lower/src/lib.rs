@@ -2923,6 +2923,81 @@ fn validate_actor_source_function(
                             return Err(unsupported("async await result delivery"));
                         }
                     }
+                    semantic::SemanticOperation::ResetRegion {
+                        region: reset_region,
+                    } => {
+                        let exact_plan = matches!(input.activations.as_slice(), [activation]
+                            if activation.caller == function.id
+                                && activation.region == *reset_region
+                                && statement.source == Some(activation.source));
+                        let exact_region = input
+                            .activations
+                            .first()
+                            .and_then(|activation| {
+                                input
+                                    .regions
+                                    .get(activation.region.0 as usize)
+                                    .map(|region| (activation, region))
+                            })
+                            .is_some_and(|(activation, region)| {
+                                region.id == activation.region
+                                    && region.class == semantic::RegionClass::TaskFrame
+                                    && region.capacity_bytes == activation.frame_bytes
+                                    && region.alignment == 8
+                                    && region.proof == activation.capacity_proof
+                                    && region.source == activation.source
+                                    && activation.maximum_live == 1
+                                    && activation.cancellation
+                                        == semantic::ActivationCancellation::DropCalleeThenPropagate
+                            });
+                        let prior_matches = index.checked_sub(2).is_some_and(|call_index| {
+                            matches!(
+                                &region.statements[call_index..index],
+                                [
+                                    semantic::SemanticStatement::Let(semantic::LetStatement {
+                                        results: call_results,
+                                        operation: semantic::SemanticOperation::Call {
+                                            function: callee,
+                                            arguments,
+                                            activation: Some(plan),
+                                        },
+                                        source: Some(call_source),
+                                    }),
+                                    semantic::SemanticStatement::Let(semantic::LetStatement {
+                                        results: await_results,
+                                        operation: semantic::SemanticOperation::Await { awaitable },
+                                        ..
+                                    }),
+                                ] if matches!(input.activations.as_slice(), [activation]
+                                    if *plan == activation.id
+                                        && *callee == activation.callee
+                                        && *call_source == activation.source)
+                                    && arguments.is_empty()
+                                    && call_results.as_slice() == [*awaitable]
+                                    && await_results.len() == 1
+                                    && input.functions.get(callee.0 as usize).is_some_and(|callee| {
+                                        callee.role == semantic::FunctionRole::Ordinary
+                                            && callee.color == semantic::FunctionColor::Async
+                                            && callee.parameters.is_empty()
+                                            && input.types.get(callee.result.0 as usize).is_some_and(|ty| {
+                                                ty.kind == semantic::TypeKind::Primitive(
+                                                    semantic::PrimitiveType::U64,
+                                                )
+                                            })
+                                    })
+                            )
+                        });
+                        if !statement.results.is_empty()
+                            || !is_root
+                            || !exact_plan
+                            || !exact_region
+                            || !prior_matches
+                        {
+                            return Err(unsupported(
+                                "semantic-region-reset-lowering-pending (only exact completed immediate activation frames are admitted)",
+                            ));
+                        }
+                    }
                     semantic::SemanticOperation::Promote {
                         value,
                         destination,
@@ -7196,6 +7271,7 @@ fn measure_actor_flow_output_resources(
                             | semantic::SemanticOperation::ActorStateLoad { .. }
                             | semantic::SemanticOperation::ActorStateStore { .. }
                             | semantic::SemanticOperation::Promote { .. }
+                            | semantic::SemanticOperation::ResetRegion { .. }
                             | semantic::SemanticOperation::EnterScope { .. }
                             | semantic::SemanticOperation::CommitScope { .. } => {}
                             _ => {
@@ -8223,6 +8299,30 @@ fn lower_generated_function(
                                     value: flow::ValueId(value.0),
                                     destination: flow::RegionId(destination.0),
                                     proof: flow::ProofId(proof.0),
+                                },
+                                source: statement.source,
+                            },
+                            "FlowWir instructions",
+                            limits.instructions,
+                        )?;
+                        item.next_statement += 1;
+                        continue;
+                    }
+                    if let semantic::SemanticOperation::ResetRegion { region } =
+                        &statement.operation
+                    {
+                        if !statement.results.is_empty() {
+                            return Err(unsupported(
+                                "semantic-region-reset-lowering-pending (only exact completed immediate activation frames are admitted)",
+                            ));
+                        }
+                        let block = pending_block_mut(&mut pending_blocks, item.block)?;
+                        push_bounded(
+                            &mut block.instructions,
+                            PendingInstruction {
+                                results: Vec::new(),
+                                operation: flow::FlowOperation::RegionReset {
+                                    region: flow::RegionId(region.0),
                                 },
                                 source: statement.source,
                             },
@@ -10710,6 +10810,10 @@ fn actor_flow_operation_matches(
                 && expected_proof == output_proof
         }
         (
+            flow::FlowOperation::RegionReset { region: expected },
+            flow::FlowOperation::RegionReset { region: output },
+        ) => expected == output,
+        (
             flow::FlowOperation::Unary {
                 op: expected_op,
                 value: expected_value,
@@ -12980,6 +13084,36 @@ mod contract_tests {
         module
             .validate()
             .expect("valid real-producer-shaped value async activation")
+    }
+
+    fn actor_async_u64_reset_fixture() -> semantic::ValidatedSemanticWir {
+        let mut module = actor_async_value_fixture().into_wir();
+        module.types[1].source_name = "u64".to_owned();
+        module.types[1].kind = semantic::TypeKind::Primitive(semantic::PrimitiveType::U64);
+        let helper = &mut module.functions[0];
+        let semantic::SemanticStatement::Let(semantic::LetStatement {
+            operation:
+                semantic::SemanticOperation::Constant(semantic::Constant::Unsigned { bits, .. }),
+            ..
+        }) = &mut helper.body.statements[0]
+        else {
+            panic!("async value helper begins with its constant")
+        };
+        *bits = 64;
+        let activation_source = module.activations[0].source;
+        module.functions[1].body.statements.insert(
+            2,
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                results: Vec::new(),
+                operation: semantic::SemanticOperation::ResetRegion {
+                    region: semantic::RegionId(3),
+                },
+                source: Some(activation_source),
+            }),
+        );
+        module
+            .validate()
+            .expect("valid completed u64 activation reset fixture")
     }
 
     fn actor_two_await_fixture() -> semantic::ValidatedSemanticWir {
@@ -15494,6 +15628,149 @@ mod contract_tests {
                 && resume.parameters.as_slice() == [flow::ValueId(2)]
                 && matches!(resume.terminator, flow::Terminator::Return(ref values) if values.is_empty())
         ));
+    }
+
+    #[test]
+    fn completed_activation_reset_is_first_in_the_resume_block() {
+        let input = actor_async_u64_reset_fixture();
+        let output = CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("completed activation reset reaches FlowWir");
+        let model = output.wir().as_wir();
+        let [activation] = model.activations.as_slice() else {
+            panic!("single Flow activation")
+        };
+        let caller = &model.functions[activation.caller.0 as usize];
+        let resume = caller
+            .blocks
+            .iter()
+            .find(|block| {
+                caller.blocks.iter().any(|candidate| {
+                    matches!(candidate.terminator,
+                        flow::Terminator::Suspend { resume, .. } if resume == block.id)
+                })
+            })
+            .expect("activation resume block");
+        assert!(matches!(resume.instructions.as_slice(),
+            [flow::Instruction {
+                results,
+                operation: flow::FlowOperation::RegionReset { region },
+                source: Some(source),
+                ..
+            }] if results.is_empty()
+                && *region == activation.region
+                && *source == activation.source));
+
+        let reject = |forged: semantic::SemanticWir| {
+            let forged = forged
+                .validate()
+                .expect("reset forgery remains structurally valid SemanticWir");
+            assert!(matches!(
+                CanonicalFlowLowerer::new().lower(
+                    LowerRequest {
+                        input: forged,
+                        limits: LoweringLimits::standard(),
+                    },
+                    &|| false,
+                ),
+                Err(LowerError::UnsupportedInput {
+                    feature: "semantic-region-reset-lowering-pending (only exact completed immediate activation frames are admitted)",
+                })
+            ));
+        };
+        let mut wrong_source = input.as_wir().clone();
+        let caller = wrong_source.activations[0].caller.0 as usize;
+        let semantic::SemanticStatement::Let(reset) =
+            &mut wrong_source.functions[caller].body.statements[2]
+        else {
+            panic!("completed reset statement")
+        };
+        reset.source = None;
+        reject(wrong_source);
+        let mut wrong_region = input.as_wir().clone();
+        let caller = wrong_region.activations[0].caller.0 as usize;
+        let semantic::SemanticStatement::Let(semantic::LetStatement {
+            operation: semantic::SemanticOperation::ResetRegion { region },
+            ..
+        }) = &mut wrong_region.functions[caller].body.statements[2]
+        else {
+            panic!("completed reset operation")
+        };
+        *region = semantic::RegionId(2);
+        reject(wrong_region);
+        let mut duplicate = input.as_wir().clone();
+        let caller = duplicate.activations[0].caller.0 as usize;
+        let second = duplicate.functions[caller].body.statements[2].clone();
+        duplicate.functions[caller]
+            .body
+            .statements
+            .insert(3, second);
+        reject(duplicate);
+
+        let exact_instructions = output.report().instructions;
+        let mut exact = LoweringLimits::standard();
+        exact.instructions = exact_instructions;
+        CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact completed-frame FlowWir instruction limit");
+        let mut one_under = exact;
+        one_under.instructions = exact_instructions - 1;
+        assert!(matches!(
+            CanonicalFlowLowerer::new().lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "FlowWir instructions",
+                limit,
+            }) if limit == exact_instructions - 1
+        ));
+
+        let polls = Cell::new(0_u64);
+        CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("count completed-frame FlowWir cancellation polls");
+        let final_poll = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalFlowLowerer::new().lower(
+                LowerRequest {
+                    input,
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
     }
 
     #[test]

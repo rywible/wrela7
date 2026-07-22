@@ -753,7 +753,14 @@ it. It injects phase implementations and bounded host capabilities, while
   must be immediately followed by the same-source, same-value, same-region
   actor-state store; a compound marker must name the checked result rather than
   its RHS. The sealer compares operator, marker, and adjacency exactly; general
-  allocation/reset and other promotion shapes stay fail closed.
+  allocation and other promotion shapes stay fail closed. A separate exact
+  completed-frame subset emits one no-result `ResetRegion` immediately after
+  the sole `Await` of a nullary async `u64` helper owned by one single-slot
+  task. Flow lowering reauthenticates the activation, task-frame region,
+  capacity/cleanup proofs, source, and call/await/reset adjacency before
+  retaining `RegionReset` as the first resume-block instruction. Other reset
+  positions, owners, counts, and activation shapes reject as
+  `semantic-region-reset-lowering-pending`.
 - Does not optimize, fix ABI/layout, choose runtime intrinsics, or serialize.
 
 ### `wrela-flow-opt`
@@ -1008,6 +1015,16 @@ it. It injects phase implementations and bounded host capabilities, while
   result-for-parameter substitution before allocation. Argumented, computed,
   non-`u64`, structured typed, multistate, parking/wake, and cancellation-
   execution tails reject as `machine-async-result-delivery-pending`.
+- For the exact completed-frame reset profile, Machine lowering independently
+  authenticates the sole actor, single-slot task, nullary async `u64` callee,
+  activation region/layout/capacity and cleanup proofs, call/suspend/resume
+  links, and the one same-source `RegionReset`. It then erases only that marker:
+  the direct internal call has completed, so its fixed activation-frame storage
+  is physically reusable. MachineWir validation admits the resulting exact
+  task-only three-region layout, while the producer-derived seal retains reset
+  authority. Substituted, moved, or duplicate resets reject as
+  `machine-region-reset-lowering-pending`; general runtime reset execution is
+  not claimed.
 - The operation-only structured-outcome exception is distinct from that scalar
   result profile. It admits exactly one nullary async helper that directly
   constructs outer `Result.Ok(u64)`, one root suspension, and one immediate

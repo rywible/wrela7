@@ -4698,22 +4698,35 @@ fn lower_actor_image(
     let actors = lower_actor_instances(actor.graph, limits, is_cancelled)?;
     let tasks = lower_task_instances(actor.graph, limits, is_cancelled)?;
     let mut regions = lower_actor_regions(actor.graph, limits, is_cancelled)?;
-    let (activations, activation_bytes, image_closed_proof) = lower_actor_activations(
-        ActorActivationOutput {
-            types: &types,
-            functions: &mut functions,
-            actors: &actors,
-            tasks: &tasks,
-            regions: &mut regions,
-            proofs: &mut proofs,
-            image_name: &actor.graph.name,
-            startup_order: actor.graph.startup_order.len(),
-            shutdown_order: actor.graph.shutdown_order.len(),
-        },
-        actor.graph.static_bytes,
-        limits,
-        is_cancelled,
-    )?;
+    let (activations, activation_bytes, image_closed_proof, reset_operations) =
+        lower_actor_activations(
+            ActorActivationOutput {
+                types: &types,
+                functions: &mut functions,
+                actors: &actors,
+                tasks: &tasks,
+                regions: &mut regions,
+                proofs: &mut proofs,
+                image_name: &actor.graph.name,
+                startup_order: actor.graph.startup_order.len(),
+                shutdown_order: actor.graph.shutdown_order.len(),
+            },
+            actor.graph.static_bytes,
+            limits,
+            is_cancelled,
+        )?;
+    operations = operations
+        .checked_add(reset_operations)
+        .ok_or(LowerError::ResourceLimit {
+            resource: "SemanticWir operations",
+            limit: limits.operations,
+        })?;
+    if operations > limits.operations {
+        return Err(LowerError::ResourceLimit {
+            resource: "SemanticWir operations",
+            limit: limits.operations,
+        });
+    }
     let static_bytes = actor
         .graph
         .static_bytes
@@ -5366,7 +5379,7 @@ fn lower_actor_activations(
     base_static_bytes: u64,
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
-) -> Result<(Vec<wir::ActivationPlan>, u64, Option<wir::ProofId>), LowerError> {
+) -> Result<(Vec<wir::ActivationPlan>, u64, Option<wir::ProofId>, u64), LowerError> {
     let ActorActivationOutput {
         types,
         functions,
@@ -5495,8 +5508,12 @@ fn lower_actor_activations(
         }
     }
     if pending.is_empty() {
-        return Ok((Vec::new(), 0, None));
+        return Ok((Vec::new(), 0, None, 0));
     }
+
+    let emit_completed_frame_reset =
+        exact_single_completed_activation_reset_profile(types, functions, actors, tasks, &pending);
+    let reset_operations = u64::from(emit_completed_frame_reset);
 
     let activation_count = pending.len();
     let activation_proof_count =
@@ -5578,6 +5595,7 @@ fn lower_actor_activations(
             shutdown_order,
         },
         &pending,
+        usize::from(emit_completed_frame_reset),
         base_closed,
         limits,
         is_cancelled,
@@ -5675,6 +5693,31 @@ fn lower_actor_activations(
             })
             .ok_or(unsupported("actor activation call-site substitution"))?;
         *call = Some(id);
+        if emit_completed_frame_reset {
+            let reset_index = site
+                .statement
+                .checked_add(2)
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "SemanticWir actor activation expansion",
+                    limit: limits.model_edges,
+                })?;
+            caller
+                .body
+                .statements
+                .try_reserve(1)
+                .map_err(|_| LowerError::ResourceLimit {
+                    resource: "SemanticWir actor activation expansion",
+                    limit: limits.model_edges,
+                })?;
+            caller.body.statements.insert(
+                reset_index,
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    results: Vec::new(),
+                    operation: wir::SemanticOperation::ResetRegion { region },
+                    source: Some(site.source),
+                }),
+            );
+        }
         push_bounded_proof(&mut caller.proofs, proof, limits.model_edges)?;
 
         let mut proof_sources = try_vec(
@@ -5771,12 +5814,102 @@ fn lower_actor_activations(
         depends_on: final_dependencies,
         explanation: bounded_singleton_text(ACTIVATION_IMAGE_EXPLANATION, limits)?,
     });
-    Ok((activations, activation_bytes, Some(image_closed)))
+    Ok((
+        activations,
+        activation_bytes,
+        Some(image_closed),
+        reset_operations,
+    ))
+}
+
+fn exact_single_completed_activation_reset_profile(
+    types: &[wir::TypeRecord],
+    functions: &[wir::SemanticFunction],
+    actors: &[wir::ActorInstance],
+    tasks: &[wir::TaskInstance],
+    pending: &[PendingActivation],
+) -> bool {
+    let ([site], [actor], [task]) = (pending, actors, tasks) else {
+        return false;
+    };
+    if actor.id != wir::ActorId(0)
+        || actor.mailbox_capacity != 1
+        || !actor.turn_functions.is_empty()
+        || actor.supervisor.is_some()
+        || task.id != wir::TaskId(0)
+        || task.slots != 1
+        || task.supervisor != Some(actor.id)
+        || site.owner != wir::ImageOwner::Task(task.id)
+        || site.caller != task.entry
+    {
+        return false;
+    }
+    let Some(caller) = functions.get(site.caller.0 as usize) else {
+        return false;
+    };
+    let Some(callee) = functions.get(site.callee.0 as usize) else {
+        return false;
+    };
+    let [
+        call,
+        await_statement,
+        wir::SemanticStatement::Return(returned),
+    ] = caller.body.statements.as_slice()
+    else {
+        return false;
+    };
+    let (
+        wir::SemanticStatement::Let(wir::LetStatement {
+            results: call_results,
+            operation:
+                wir::SemanticOperation::Call {
+                    function,
+                    arguments,
+                    activation: None,
+                },
+            source: Some(call_source),
+        }),
+        wir::SemanticStatement::Let(wir::LetStatement {
+            results: await_results,
+            operation: wir::SemanticOperation::Await { awaitable },
+            source: Some(_),
+        }),
+    ) = (call, await_statement)
+    else {
+        return false;
+    };
+    let ([activation_value], [delivered]) = (call_results.as_slice(), await_results.as_slice())
+    else {
+        return false;
+    };
+    caller.role == wir::FunctionRole::TaskEntry(task.id)
+        && caller.color == wir::FunctionColor::Async
+        && caller.parameters.len() == 1
+        && returned.is_empty()
+        && *function == callee.id
+        && arguments.is_empty()
+        && *call_source == site.source
+        && *awaitable == *activation_value
+        && caller
+            .values
+            .get(activation_value.0 as usize)
+            .is_some_and(|value| value.ty == callee.result)
+        && caller
+            .values
+            .get(delivered.0 as usize)
+            .is_some_and(|value| value.ty == callee.result)
+        && callee.role == wir::FunctionRole::Ordinary
+        && callee.color == wir::FunctionColor::Async
+        && callee.parameters.is_empty()
+        && types
+            .get(callee.result.0 as usize)
+            .is_some_and(|ty| ty.kind == wir::TypeKind::Primitive(wir::PrimitiveType::U64))
 }
 
 fn validate_actor_activation_expansion_resources(
     base: SemanticResourceView<'_>,
     pending: &[PendingActivation],
+    reset_statements: usize,
     base_closed: &wir::ProofRecord,
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
@@ -5844,6 +5977,7 @@ fn validate_actor_activation_expansion_resources(
         activation_count, // final-closure sources
         final_dependencies,
         1, // final-closure explanation
+        reset_statements,
     ] {
         meter.add_edges(count);
     }
@@ -19335,6 +19469,10 @@ fn actor_operations_match(
             },
         ) => lv == rv && ld == rd && lp == rp,
         (
+            wir::SemanticOperation::ResetRegion { region: left },
+            wir::SemanticOperation::ResetRegion { region: right },
+        ) => left == right,
+        (
             wir::SemanticOperation::EnterScope {
                 scope: left_scope,
                 state: left_state,
@@ -19801,6 +19939,25 @@ pub struct Worker:
 pub fn boot() -> Image:
     img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
     installed = img.service(Worker, mailbox=2)
+    return img
+"#;
+    const SINGLE_ACTIVATION_RESET_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint() -> u64:
+    return 7
+
+@service
+pub struct Worker:
+    @task
+    async fn pulse(mut self):
+        value: u64 = await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
     return img
 "#;
     const ZERO_STATE_ACTOR_SOURCE: &str = r#"module app
@@ -22085,6 +22242,133 @@ pub fn boot() -> Image:
                     .iter()
                     .any(|line| line.contains("reverse source order"))
         }));
+        assert_eq!(
+            lowered
+                .functions
+                .iter()
+                .flat_map(|function| &function.body.statements)
+                .filter(|statement| matches!(
+                    statement,
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::ResetRegion { .. },
+                        ..
+                    })
+                ))
+                .count(),
+            0,
+            "the broader two-activation actor profile remains outside exact reset production"
+        );
+    }
+
+    #[test]
+    fn completed_single_activation_emits_exact_frame_reset_after_await() {
+        let image = analyze_parsed_actor_source(SINGLE_ACTIVATION_RESET_SOURCE);
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("single activation SemanticWir lowering");
+        let model = output.wir().as_wir();
+        let [activation] = model.activations.as_slice() else {
+            panic!("single activation profile")
+        };
+        let caller = &model.functions[activation.caller.0 as usize];
+        assert!(
+            caller
+                .body
+                .statements
+                .windows(3)
+                .any(|window| matches!(window,
+                    [
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            results: call_results,
+                            operation: wir::SemanticOperation::Call {
+                                activation: Some(call_activation),
+                                ..
+                            },
+                            ..
+                        }),
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            results: await_results,
+                            operation: wir::SemanticOperation::Await { awaitable },
+                            ..
+                        }),
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            results: reset_results,
+                            operation: wir::SemanticOperation::ResetRegion { region },
+                            source: Some(source),
+                        }),
+                    ] if call_results.as_slice() == [*awaitable]
+                        && await_results.len() == 1
+                        && reset_results.is_empty()
+                        && *call_activation == activation.id
+                        && *region == activation.region
+                        && *source == activation.source
+                ))
+        );
+
+        let exact_operations = output.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact completed-frame SemanticWir operation limit");
+        let mut one_under = exact;
+        one_under.operations = exact_operations - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == exact_operations - 1
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("count completed-frame SemanticWir cancellation polls");
+        let final_poll = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
     }
 
     #[test]

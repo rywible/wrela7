@@ -4602,6 +4602,18 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
             module, caller, callee, activation, errors,
         )
     }));
+    let task_only_activation = operation_only_async
+        || matches!(module.activations.as_slice(), [activation]
+        if activation.schedule == MachineActivationSchedule::StartupOnce
+            && matches!(activation.owner,
+                MachineActivationOwner::Task {
+                    task: 0,
+                    slots: 1,
+                    supervisor: Some(0),
+                })
+            && !module.functions.iter().any(|function| {
+                matches!(function.role, MachineFunctionRole::ActorTurn(_))
+            }));
     let actor_state_count = module
         .region_storage
         .iter()
@@ -4611,7 +4623,7 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
     let expected = module
         .activations
         .len()
-        .checked_add(if operation_only_async {
+        .checked_add(if task_only_activation {
             2
         } else if cross_actor {
             4
@@ -4812,7 +4824,7 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                                 mailbox_capacity,
                             })
                     }) || (cross_actor && actor == 1 && mailbox_capacity == 1)
-                        || (operation_only_async && actor == 0 && mailbox_capacity == 1)
+                        || (task_only_activation && actor == 0 && mailbox_capacity == 1)
                         || (reply_profile && matches!(actor, 0 | 1) && mailbox_capacity == 1))
             }
             MachineRegionStorageKind::ActorState { actor } => {
@@ -4878,7 +4890,7 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
             } => {
                 task_frame_count = task_frame_count.saturating_add(1);
                 storage.id.0
-                    == (if operation_only_async {
+                    == (if task_only_activation {
                         1
                     } else if cross_actor {
                         3
@@ -4950,7 +4962,7 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
     if mailbox_count != if cross_actor { 2 } else { 1 }
         || state_count != u8::from(has_actor_state)
         || actor_state_count > 1
-        || actor_frame_count != u8::from(!operation_only_async)
+        || actor_frame_count != u8::from(!task_only_activation)
         || task_frame_count != 1
     {
         errors.push(ValidationError::InvalidRecord {

@@ -115,6 +115,7 @@ struct ScalarPlan {
     mailbox_turn: Option<FunctionId>,
     actor_dispatch: Option<ActorDispatchPlan>,
     async_outcome: Option<AsyncOutcomeDirectIsProfile>,
+    completed_reset: Option<CompletedActivationResetProfile>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -124,6 +125,158 @@ struct AsyncOutcomeDirectIsProfile {
     caller: flow::FunctionId,
     callee: flow::FunctionId,
     activation: flow::ActivationId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompletedActivationResetProfile {
+    caller: flow::FunctionId,
+    callee: flow::FunctionId,
+    activation: flow::ActivationId,
+    instruction: flow::InstructionId,
+}
+
+const COMPLETED_ACTIVATION_RESET_BOUNDARY: &str = "machine-region-reset-lowering-pending (only exact completed immediate activation frames are admitted)";
+
+fn authenticate_completed_activation_reset(
+    input: &flow::FlowWir,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<CompletedActivationResetProfile>, MachineLowerError> {
+    let mut reset = None;
+    for function in &input.functions {
+        check_cancelled(is_cancelled)?;
+        for block in &function.blocks {
+            check_cancelled(is_cancelled)?;
+            for instruction in &block.instructions {
+                check_cancelled(is_cancelled)?;
+                if matches!(
+                    instruction.operation,
+                    flow::FlowOperation::RegionReset { .. }
+                ) && reset.replace((function, block, instruction)).is_some()
+                {
+                    return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+                }
+            }
+        }
+    }
+    let Some((caller, resume, reset)) = reset else {
+        return Ok(None);
+    };
+    let [activation] = input.activations.as_slice() else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let [actor] = input.actors.as_slice() else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let [task] = input.tasks.as_slice() else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let [entry, expected_resume] = caller.blocks.as_slice() else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let [call] = entry.instructions.as_slice() else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let [activation_value] = call.results.as_slice() else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let [delivered] = resume.parameters.as_slice() else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let [reset_instruction] = resume.instructions.as_slice() else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let Some(callee) = input.functions.get(activation.callee.0 as usize) else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let Some(region) = input.regions.get(activation.region.0 as usize) else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let Some(capacity) = input.proofs.get(activation.capacity_proof.0 as usize) else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let [cleanup] = capacity.depends_on.as_slice() else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let exact = actor.id == flow::ActorId(0)
+        && actor.mailbox_capacity == 1
+        && actor.message_types.is_empty()
+        && actor.turn_functions.is_empty()
+        && actor.supervisor.is_none()
+        && task.id == flow::TaskId(0)
+        && task.entry == caller.id
+        && task.slots == 1
+        && task.supervisor == Some(actor.id)
+        && caller.role == flow::FunctionRole::TaskEntry(task.id)
+        && caller.color == flow::FunctionColor::Async
+        && caller.entry == entry.id
+        && caller.parameters.len() == 1
+        && caller.result_types.is_empty()
+        && activation.id == flow::ActivationId(0)
+        && activation.caller == caller.id
+        && activation.callee == callee.id
+        && activation.maximum_live == 1
+        && activation.cancellation == flow::ActivationCancellation::DropCalleeThenPropagate
+        && region.id == activation.region
+        && region.class == flow::RegionClass::TaskFrame
+        && region.owner == flow::PlanOwner::Task(task.id)
+        && region.capacity_bytes == activation.frame_bytes
+        && region.alignment == 8
+        && region.capacity_proof == activation.capacity_proof
+        && region.source == activation.source
+        && capacity.kind == flow::ProofKind::CapacityBound
+        && capacity.bound == Some(1)
+        && capacity.sources.as_slice() == [activation.source]
+        && caller.proofs.contains(&activation.capacity_proof)
+        && callee.proofs.contains(cleanup)
+        && callee.role == flow::FunctionRole::Ordinary
+        && callee.color == flow::FunctionColor::Async
+        && callee.parameters.is_empty()
+        && callee.result_types.len() == 1
+        && flow_type_is_exact_u64(input, callee.result_types[0])
+        && exact_bounded_u64_activation_callee(input, callee, callee.result_types[0])
+        && matches!(&call.operation,
+            flow::FlowOperation::AsyncCall { function, arguments, plan }
+                if *function == callee.id
+                    && arguments.is_empty()
+                    && *plan == activation.id)
+        && caller
+            .values
+            .get(activation_value.0 as usize)
+            .and_then(|value| input.types.get(value.ty.0 as usize))
+            .is_some_and(|ty| {
+                matches!(ty.kind,
+                flow::FlowTypeKind::Activation { result }
+                    if result == callee.result_types[0])
+            })
+        && matches!(entry.terminator,
+            flow::Terminator::Suspend {
+                state: 0,
+                activation: value,
+                resume: target,
+            } if value == *activation_value && target == resume.id)
+        && resume.id == expected_resume.id
+        && caller
+            .values
+            .get(delivered.0 as usize)
+            .is_some_and(|value| value.ty == callee.result_types[0])
+        && reset_instruction.id == reset.id
+        && reset_instruction.results.is_empty()
+        && reset_instruction.source == Some(activation.source)
+        && matches!(reset_instruction.operation,
+            flow::FlowOperation::RegionReset { region }
+                if region == activation.region)
+        && matches!(&resume.terminator,
+            flow::Terminator::Return(values) if values.is_empty());
+    if !exact {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    }
+    check_cancelled(is_cancelled)?;
+    Ok(Some(CompletedActivationResetProfile {
+        caller: caller.id,
+        callee: callee.id,
+        activation: activation.id,
+        instruction: reset.id,
+    }))
 }
 
 pub(super) fn require_operation_only_async_outcome(
@@ -616,6 +769,13 @@ struct OutputModelPreflight<'a> {
     fatal_calls: u64,
     test_assert_calls: u64,
     async_outcome: Option<&'a AsyncOutcomeDirectIsProfile>,
+    completed_reset: Option<&'a CompletedActivationResetProfile>,
+}
+
+#[derive(Clone, Copy)]
+struct OperationProfiles<'a> {
+    async_outcome: Option<&'a AsyncOutcomeDirectIsProfile>,
+    completed_reset: Option<&'a CompletedActivationResetProfile>,
 }
 
 #[derive(Clone, Copy)]
@@ -1417,11 +1577,13 @@ fn preflight(
     let async_outcome = has_async_outcome
         .then(|| authenticate_operation_only_async_outcome(input, is_cancelled))
         .transpose()?;
+    let completed_reset = authenticate_completed_activation_reset(input, is_cancelled)?;
     let flow_actor_dispatch = discover_actor_dispatch(input, is_cancelled)?;
     let activations = lower_activation_subset(
         input,
         flow_actor_dispatch.as_ref(),
         async_outcome.as_ref(),
+        completed_reset.as_ref(),
         request.limits,
         is_cancelled,
     )?;
@@ -1754,7 +1916,12 @@ fn preflight(
             check_cancelled(is_cancelled)?;
             for instruction in &block.instructions {
                 check_cancelled(is_cancelled)?;
-                if !erases_machine_instruction(input, function, instruction)? {
+                if !erases_machine_instruction(
+                    input,
+                    function,
+                    instruction,
+                    completed_reset.as_ref(),
+                )? {
                     retained = retained
                         .checked_add(1)
                         .ok_or(MachineLowerError::ResourceLimit {
@@ -1883,7 +2050,10 @@ fn preflight(
                     instruction,
                     &test_payload_index,
                     &activations,
-                    async_outcome.as_ref(),
+                    OperationProfiles {
+                        async_outcome: async_outcome.as_ref(),
+                        completed_reset: completed_reset.as_ref(),
+                    },
                     is_cancelled,
                 )?;
             }
@@ -1901,6 +2071,7 @@ fn preflight(
             fatal_calls,
             test_assert_calls,
             async_outcome: async_outcome.as_ref(),
+            completed_reset: completed_reset.as_ref(),
         },
         is_cancelled,
     )?;
@@ -1982,6 +2153,7 @@ fn preflight(
         }),
         actor_dispatch,
         async_outcome,
+        completed_reset,
         activations,
     })
 }
@@ -2056,6 +2228,7 @@ fn lower_operation_only_async_outcome_activation(
             input,
             caller,
             call.id,
+            None,
             limits.instructions,
             is_cancelled,
         )?,
@@ -2080,11 +2253,15 @@ fn lower_activation_subset(
     input: &flow::FlowWir,
     dispatch: Option<&FlowActorDispatch>,
     async_outcome: Option<&AsyncOutcomeDirectIsProfile>,
+    completed_reset: Option<&CompletedActivationResetProfile>,
     limits: MachineLoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<MachineActivationPlan>, MachineLowerError> {
     if let Some(profile) = async_outcome {
         return lower_operation_only_async_outcome_activation(input, profile, limits, is_cancelled);
+    }
+    if let Some(profile) = completed_reset {
+        return lower_completed_activation_reset(input, profile, limits, is_cancelled);
     }
     let has_surface = !input.actors.is_empty()
         || !input.tasks.is_empty()
@@ -2475,7 +2652,14 @@ fn lower_activation_subset(
                     )
                 })
             } else {
-                resume.instructions.is_empty()
+                (resume.instructions.is_empty()
+                    || completed_reset.is_some_and(|profile| {
+                        profile.caller == caller.id
+                            && profile.callee == callee.id
+                            && profile.activation == plan.id
+                            && matches!(resume.instructions.as_slice(), [instruction]
+                                if instruction.id == profile.instruction)
+                    }))
                     && matches!(&resume.terminator, flow::Terminator::Return(values) if values.is_empty())
             };
         let unit_callee_matches = result_is_unit
@@ -2545,8 +2729,14 @@ fn lower_activation_subset(
             return Err(unsupported("machine-async-result-delivery-pending"));
         }
         shared_callee = Some(plan.callee);
-        let call_instruction =
-            lowered_instruction_id(input, caller, call.id, limits.instructions, is_cancelled)?;
+        let call_instruction = lowered_instruction_id(
+            input,
+            caller,
+            call.id,
+            completed_reset,
+            limits.instructions,
+            is_cancelled,
+        )?;
         output.push(MachineActivationPlan {
             id: MachineActivationId(plan.id.0),
             owner,
@@ -2628,10 +2818,88 @@ fn lower_activation_subset(
     Ok(output)
 }
 
+fn lower_completed_activation_reset(
+    input: &flow::FlowWir,
+    profile: &CompletedActivationResetProfile,
+    limits: MachineLoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<MachineActivationPlan>, MachineLowerError> {
+    check_cancelled(is_cancelled)?;
+    let activation = input
+        .activations
+        .get(profile.activation.0 as usize)
+        .ok_or(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY))?;
+    let caller = input
+        .functions
+        .get(profile.caller.0 as usize)
+        .ok_or(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY))?;
+    let entry = caller
+        .blocks
+        .get(caller.entry.0 as usize)
+        .ok_or(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY))?;
+    let [call] = entry.instructions.as_slice() else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let flow::Terminator::Suspend { state, resume, .. } = entry.terminator else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let region = input
+        .regions
+        .get(activation.region.0 as usize)
+        .ok_or(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY))?;
+    let capacity = input
+        .proofs
+        .get(activation.capacity_proof.0 as usize)
+        .ok_or(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY))?;
+    let [cleanup] = capacity.depends_on.as_slice() else {
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
+    };
+    let mut output = try_vec(
+        1,
+        "MachineWir activations",
+        limits.model_edges,
+        is_cancelled,
+    )?;
+    output.push(MachineActivationPlan {
+        id: MachineActivationId(activation.id.0),
+        owner: MachineActivationOwner::Task {
+            task: 0,
+            slots: 1,
+            supervisor: Some(0),
+        },
+        schedule: MachineActivationSchedule::StartupOnce,
+        caller: FunctionId(profile.caller.0),
+        callee: FunctionId(profile.callee.0),
+        call_instruction: lowered_instruction_id(
+            input,
+            caller,
+            call.id,
+            Some(profile),
+            limits.instructions,
+            is_cancelled,
+        )?,
+        state,
+        resume_block: BlockId(resume.0),
+        region: activation.region.0,
+        region_capacity_bytes: region.capacity_bytes,
+        region_alignment: u32::try_from(region.alignment)
+            .map_err(|_| unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY))?,
+        frame_bytes: activation.frame_bytes,
+        maximum_live: activation.maximum_live,
+        cancellation: MachineActivationCancellation::DropCalleeThenPropagate,
+        capacity_proof: ProofId(activation.capacity_proof.0),
+        capacity_bound: capacity.bound.unwrap_or(0),
+        cleanup_proof: ProofId(cleanup.0),
+        source: activation.source,
+    });
+    Ok(output)
+}
+
 #[cfg(test)]
 pub(super) fn test_lower_activation_subset(input: &flow::FlowWir) -> Result<(), MachineLowerError> {
     lower_activation_subset(
         input,
+        None,
         None,
         None,
         MachineLoweringLimits::standard(),
@@ -3074,6 +3342,7 @@ fn lowered_instruction_id(
     input: &flow::FlowWir,
     function: &flow::FlowFunction,
     target: flow::InstructionId,
+    completed_reset: Option<&CompletedActivationResetProfile>,
     limit: u64,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<InstructionId, MachineLowerError> {
@@ -3093,7 +3362,7 @@ fn lowered_instruction_id(
             let retained = if matches!(instruction.operation, flow::FlowOperation::TestEmit { .. })
             {
                 2
-            } else if erases_machine_instruction(input, function, instruction)? {
+            } else if erases_machine_instruction(input, function, instruction, completed_reset)? {
                 0
             } else {
                 1
@@ -3900,6 +4169,7 @@ fn preflight_output_model_resources(
         fatal_calls,
         test_assert_calls,
         async_outcome,
+        completed_reset,
     } = preflight;
     let edge_limit = request.limits.model_edges;
     let payload_limit = request.limits.payload_bytes;
@@ -4223,7 +4493,7 @@ fn preflight_output_model_resources(
                     edges = add_edges(edges, 6, edge_limit)?;
                     continue;
                 }
-                if erases_machine_instruction(input, function, instruction)? {
+                if erases_machine_instruction(input, function, instruction, completed_reset)? {
                     continue;
                 }
                 machine_instructions = machine_instructions.checked_add(1).ok_or(
@@ -7455,11 +7725,17 @@ fn erases_machine_instruction(
     input: &flow::FlowWir,
     function: &flow::FlowFunction,
     instruction: &flow::Instruction,
+    completed_reset: Option<&CompletedActivationResetProfile>,
 ) -> Result<bool, MachineLowerError> {
     Ok(matches!(
         instruction.operation,
         flow::FlowOperation::Drop { .. } | flow::FlowOperation::Promote { .. }
-    ) || erases_unit_definition(input, function, instruction)?)
+    ) || matches!(
+        instruction.operation,
+        flow::FlowOperation::RegionReset { .. }
+    ) && completed_reset.is_some_and(|profile| {
+        profile.caller == function.id && profile.instruction == instruction.id
+    }) || erases_unit_definition(input, function, instruction)?)
 }
 
 fn validate_supported_operation(
@@ -7468,9 +7744,13 @@ fn validate_supported_operation(
     instruction: &flow::Instruction,
     test_payload_index: &TestPayloadIndex,
     activations: &[MachineActivationPlan],
-    async_outcome: Option<&AsyncOutcomeDirectIsProfile>,
+    profiles: OperationProfiles<'_>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), MachineLowerError> {
+    let OperationProfiles {
+        async_outcome,
+        completed_reset,
+    } = profiles;
     if erases_unit_definition(input, function, instruction)? {
         return Ok(());
     }
@@ -7512,6 +7792,16 @@ fn validate_supported_operation(
                 if exact_actor_state_promotion(input, function, actor, instruction)) =>
         {
             require_no_results(instruction)
+        }
+        flow::FlowOperation::RegionReset { .. }
+            if completed_reset.is_some_and(|profile| {
+                profile.caller == function.id && profile.instruction == instruction.id
+            }) =>
+        {
+            require_no_results(instruction)
+        }
+        flow::FlowOperation::RegionReset { .. } => {
+            Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY))
         }
         flow::FlowOperation::ActorCapability { .. }
         | flow::FlowOperation::ActorStateAddress { .. }
@@ -7962,7 +8252,6 @@ fn validate_supported_operation(
         | flow::FlowOperation::EndAccess { .. }
         | flow::FlowOperation::Promote { .. }
         | flow::FlowOperation::Allocate { .. }
-        | flow::FlowOperation::RegionReset { .. }
         | flow::FlowOperation::ActorReject { .. }
         | flow::FlowOperation::ReplyResolve { .. }
         | flow::FlowOperation::ReceiptCommit { .. }
@@ -9629,6 +9918,7 @@ fn lowered_segment_capacity(
     function: &flow::FlowFunction,
     instructions: &[flow::Instruction],
     generated_return: bool,
+    completed_reset: Option<&CompletedActivationResetProfile>,
     limit: u64,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<usize, MachineLowerError> {
@@ -9637,7 +9927,7 @@ fn lowered_segment_capacity(
         check_cancelled(is_cancelled)?;
         let retained = if matches!(instruction.operation, flow::FlowOperation::TestEmit { .. }) {
             2
-        } else if erases_machine_instruction(input, function, instruction)? {
+        } else if erases_machine_instruction(input, function, instruction, completed_reset)? {
             0
         } else {
             1
@@ -9715,6 +10005,7 @@ fn lower_block(
         function,
         &block.instructions,
         generated_return,
+        plan.completed_reset.as_ref(),
         limits.instructions,
         is_cancelled,
     )?
@@ -9898,6 +10189,7 @@ fn lower_block(
                 function,
                 &block.instructions[index + 1..],
                 generated_return,
+                plan.completed_reset.as_ref(),
                 limits.instructions,
                 is_cancelled,
             )?;
@@ -10069,6 +10361,19 @@ fn lower_operation(
             return Err(unsupported("an unauthenticated actor-state promotion"));
         }
         return Ok(None);
+    }
+    if matches!(
+        instruction.operation,
+        flow::FlowOperation::RegionReset { .. }
+    ) {
+        if plan.completed_reset.is_some_and(|profile| {
+            profile.caller == function.id
+                && profile.instruction == instruction.id
+                && instruction.results.is_empty()
+        }) {
+            return Ok(None);
+        }
+        return Err(unsupported(COMPLETED_ACTIVATION_RESET_BOUNDARY));
     }
     let operation = match &instruction.operation {
         flow::FlowOperation::ActorStateAddress {
