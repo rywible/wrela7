@@ -8054,6 +8054,11 @@ impl SourceFunctionLowerer<'_> {
                             .patterns
                             .get(arm.pattern.0 as usize)
                             .ok_or_else(|| self.fact_mismatch("match constructor pattern"))?;
+                        if pattern.alternatives.len() > 1 {
+                            return Err(unsupported(
+                                "semantic-match-alternatives-lowering-pending",
+                            ));
+                        }
                         let [alternative] = pattern.alternatives.as_slice() else {
                             return Err(self.fact_mismatch("match pattern alternatives"));
                         };
@@ -21469,6 +21474,57 @@ pub fn boot() -> Image:
                 feature: "semantic-match-wildcard-guard-fallback-lowering-pending (guarded variant requires an explicit unguarded cover before the catch-all)"
             })
         ));
+    }
+
+    #[test]
+    fn unit_pattern_alternatives_stop_at_named_semantic_lowering_boundary() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub enum Mode[T]:
+    cold
+    warm
+    hot
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        mode: Mode[u64] = Mode.warm
+        match mode:
+            case Mode.cold | Mode.warm:
+                pass
+            case Mode.hot:
+                pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let result = CanonicalSemanticLowerer::new().lower(
+            LowerRequest {
+                input: image,
+                limits: LoweringLimits::standard(),
+            },
+            &|| false,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(LowerError::UnsupportedInput {
+                    feature: "semantic-match-alternatives-lowering-pending"
+                })
+            ),
+            "unexpected alternative lowering result: {result:?}"
+        );
     }
 
     #[test]

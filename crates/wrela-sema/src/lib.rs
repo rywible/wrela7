@@ -6905,6 +6905,64 @@ fn validate_exact_statement_fact(
                                 .is_some_and(|scope| scope.body == arm.body)
                     })
                     .ok_or_else(|| invalid("enum match arm pattern scope differs from HIR"))?;
+                if pattern.alternatives.len() > 1 {
+                    if arm.guard.is_some() {
+                        return Err(invalid("guarded enum match alternatives are not canonical"));
+                    }
+                    for alternative in &pattern.alternatives {
+                        check_analysis_cancelled(is_cancelled)?;
+                        let wrela_hir::PrimaryPattern::Constructor {
+                            candidates,
+                            arguments,
+                            ..
+                        } = &alternative.kind
+                        else {
+                            return Err(invalid(
+                                "enum match alternative is not a unit constructor",
+                            ));
+                        };
+                        let [candidate] = candidates.as_slice() else {
+                            return Err(invalid("enum match alternative constructor is not exact"));
+                        };
+                        let variant = usize::try_from(candidate.variant)
+                            .map_err(|_| invalid("enum match alternative variant is invalid"))?;
+                        let exact_constructor = program
+                            .declaration(candidate.enumeration.declaration)
+                            .filter(|record| {
+                                record.id == enumeration
+                                    && record.module == candidate.enumeration.module
+                                    && program
+                                        .modules
+                                        .get(candidate.enumeration.module.0 as usize)
+                                        .is_some_and(|module| {
+                                            module.package == candidate.enumeration.package
+                                        })
+                            })
+                            .is_some();
+                        let unit_variant = analysis
+                            .types
+                            .get(scrutinee_fact.ty.0 as usize)
+                            .and_then(|record| match &record.kind {
+                                SemanticTypeKind::Enumeration { variants, .. } => {
+                                    variants.get(variant)
+                                }
+                                _ => None,
+                            })
+                            .is_some_and(|variant| variant.fields.is_empty());
+                        if !exact_constructor
+                            || variant >= variant_count
+                            || !unit_variant
+                            || !arguments.is_empty()
+                            || covered[variant]
+                        {
+                            return Err(invalid(
+                                "enum match unit alternative coverage differs from HIR",
+                            ));
+                        }
+                        covered[variant] = true;
+                    }
+                    continue;
+                }
                 let [alternative] = pattern.alternatives.as_slice() else {
                     return Err(invalid("enum match arm is not one constructor pattern"));
                 };

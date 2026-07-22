@@ -6873,6 +6873,132 @@ fn analyze_closed_enum_match(
             .patterns
             .get(arm.pattern.0 as usize)
             .ok_or(AnalysisFailure::RequestMismatch)?;
+        if pattern.alternatives.len() > 1 {
+            if arm.guard.is_some() {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    arm.source,
+                    "semantic-runtime-match-alternative-guard-pending",
+                    "runtime enum pattern alternatives cannot carry a guard yet",
+                    "guarded alternative coverage needs one shared fallthrough proof",
+                    "split the guarded alternatives into separate constructor arms",
+                ));
+            }
+            let mut alternative_variants = Vec::new();
+            alternative_variants
+                .try_reserve_exact(pattern.alternatives.len())
+                .map_err(|_| fact_resource(request, "runtime match alternatives"))?;
+            for alternative in &pattern.alternatives {
+                check_cancelled(is_cancelled)?;
+                let wrela_hir::PrimaryPattern::Constructor {
+                    candidates,
+                    arguments,
+                    ..
+                } = &alternative.kind
+                else {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        alternative.source,
+                        "semantic-runtime-match-alternative-shape",
+                        "runtime enum alternative must name one unit constructor",
+                        "wildcards, literals, bindings, and nested patterns do not identify one disjoint tag",
+                        "use distinct payload-free enum constructors in this alternative arm",
+                    ));
+                };
+                let [candidate] = candidates.as_slice() else {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        alternative.source,
+                        "semantic-runtime-match-alternative-shape",
+                        "runtime enum alternative constructor is ambiguous or unresolved",
+                        "closed alternative coverage requires one exact variant identity",
+                        "import or qualify one declared unit variant",
+                    ));
+                };
+                let variant_index = candidate.variant as usize;
+                let unit_variant = partial
+                    .types
+                    .get(scrutinee.ty.0 as usize)
+                    .and_then(|record| match &record.kind {
+                        SemanticTypeKind::Enumeration { variants, .. } => {
+                            variants.get(variant_index)
+                        }
+                        _ => None,
+                    })
+                    .is_some_and(|variant| variant.fields.is_empty());
+                if candidate.enumeration.declaration != enumeration
+                    || variant_index >= variants
+                    || !unit_variant
+                    || !arguments.is_empty()
+                {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        alternative.source,
+                        "semantic-runtime-match-alternative-binding-pending",
+                        "runtime enum alternatives currently require payload-free variants",
+                        "payload binding across alternatives needs one shared binding and type witness",
+                        "use unit variants here or split payload variants into separate arms",
+                    ));
+                }
+                if covered[variant_index] || alternative_variants.contains(&variant_index) {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        alternative.source,
+                        "semantic-runtime-match-unreachable-arm",
+                        "runtime enum alternative is unreachable after an earlier cover",
+                        "each unguarded alternative must contribute one previously uncovered variant",
+                        "remove the duplicate alternative",
+                    ));
+                }
+                alternative_variants.push(variant_index);
+            }
+            for variant in alternative_variants {
+                covered[variant] = true;
+            }
+            let mut arm_locals = copy_binding_map(locals, request.limits.values)?;
+            let mut arm_parameters = copy_binding_map(parameters, request.limits.values)?;
+            let fact_start = partial.statements.len();
+            analyze_runtime_body(
+                request,
+                partial,
+                function,
+                arm.body,
+                &mut arm_locals,
+                &mut arm_parameters,
+                allow_assertions,
+                &mut *aggregate_work,
+                is_cancelled,
+            )?;
+            let mut state_changed =
+                arm_parameters.len() != parameters.len() || arm_locals.len() != locals.len();
+            for (left, right) in arm_parameters.iter().zip(parameters.iter()) {
+                check_cancelled(is_cancelled)?;
+                state_changed |= left != right;
+            }
+            for (left, right) in arm_locals.iter().zip(locals.iter()) {
+                check_cancelled(is_cancelled)?;
+                state_changed |= left != right;
+            }
+            if state_changed {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    arm.source,
+                    "semantic-runtime-match-state-change-not-supported",
+                    "runtime enum alternative arm changes outer local state",
+                    "alternative arms share one body but this slice does not join outer SSA assignments",
+                    "return from the arm or move the assignment after the match",
+                ));
+            }
+            for statement in partial
+                .statements
+                .get(fact_start..)
+                .ok_or(AnalysisFailure::RequestMismatch)?
+            {
+                check_cancelled(is_cancelled)?;
+                effects.0 |= statement.effects.0;
+            }
+            continue;
+        }
         let [alternative] = pattern.alternatives.as_slice() else {
             return Err(runtime_type_diagnostic(
                 request,
@@ -35153,6 +35279,75 @@ fn projection_fixture():
             .expect("struct payload binding");
         assert_eq!(detail_binding.ty, detail_ty);
         assert!(output.successful().is_some());
+    }
+
+    #[test]
+    fn runtime_adt_match_unit_alternatives_contribute_exact_exhaustive_coverage() {
+        let source = dot_variant_actor_source(
+            "pub enum Mode:\n    cold\n    warm\n    hot\n\nasync fn checkpoint():\n    state: Mode = .warm\n    match state:\n        case Mode.cold | Mode.warm:\n            pass\n        case Mode.hot:\n            pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("unit alternative match analysis is recoverable");
+        assert!(
+            output.diagnostics().is_empty(),
+            "disjoint unit alternatives must contribute exhaustive coverage: {:?}",
+            output.diagnostics()
+        );
+        let successful = output.successful().expect("sealed unit alternative match");
+        let alternative_count = successful
+            .hir()
+            .as_program()
+            .patterns
+            .iter()
+            .map(|pattern| pattern.alternatives.len())
+            .max()
+            .expect("retained match patterns");
+        assert_eq!(alternative_count, 2);
+    }
+
+    #[test]
+    fn runtime_adt_match_alternative_tails_fail_closed_by_name() {
+        let cases = [
+            (
+                "pub enum Mode:\n    cold\n    warm\n\nasync fn checkpoint():\n    state: Mode = .cold\n    match state:\n        case Mode.cold | Mode.cold:\n            pass\n        case Mode.warm:\n            pass\n\n",
+                "semantic-runtime-match-unreachable-arm",
+            ),
+            (
+                "pub enum Status:\n    idle\n    active(u8)\n\nasync fn checkpoint():\n    state: Status = .active(1)\n    match state:\n        case Status.idle | Status.active(_):\n            pass\n\n",
+                "semantic-runtime-match-alternative-binding-pending",
+            ),
+            (
+                "pub enum Mode:\n    cold\n    warm\n\nasync fn checkpoint():\n    state: Mode = .cold\n    match state:\n        case Mode.cold | Mode.warm if true:\n            pass\n\n",
+                "semantic-runtime-match-alternative-guard-pending",
+            ),
+        ];
+        for (body, expected) in cases {
+            let source = dot_variant_actor_source(body);
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("alternative tail diagnostic is recoverable");
+            assert_eq!(
+                output
+                    .diagnostics()
+                    .first()
+                    .and_then(|diagnostic| diagnostic.code.as_deref()),
+                Some(expected),
+                "{body}: {:?}",
+                output.diagnostics()
+            );
+            assert!(output.successful().is_none());
+        }
     }
 
     #[test]

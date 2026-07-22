@@ -95,6 +95,18 @@ and versioned boundary fixtures are described in
 | 3.10 | `SlotMap[T, ..N]` graph model with fresh non-wrapping instance IDs, `Key` as a `copy struct` over `(map_id, index, generation)`, generation retirement, checked lexical access. | Not implemented end to end. | gap — req-06 |
 | 3.11 | Universal `with`, abort/exit, deterministic cleanup dependency graph and all normal/abnormal teardown paths. | B4a analysis supports module-level free-call scopes used directly by `with`: exact `Scope`/`ScopeCall` resolution, lexical binding lifetime, pass-only non-suspending abort/exit validation, canonical nested cleanup dependencies, reverse-source ordering, and `CleanupAcyclic` facts (`free_scope_call_builds_protocol_activation_and_lexical_binding`, `nested_scope_activations_form_reverse_source_cleanup_dag`, `scope_abort_await_is_a_named_rejection`, `scope_exit_await_is_a_named_rejection`). The parameterless/pass-only actor-turn normal path crosses SemanticWir→FlowWir→MachineWir as an authenticated `GeneratedCleanup` call and native aggregate boundary. Direct unit returns from a scope body or directly nested scope chain clean before returning. A single-arm, no-`else` conditional return lowers exact cleanup calls on the taken return and fallthrough-to-suspend CFG paths (`structured_scope_return_cleans_return_and_fallthrough_paths`, `structured_scope_return_lowers_cleanup_on_both_cfg_paths`); `nested_structured_scope_return_has_exact_depth_boundary` pins the structured depth edge. `structured_scope_return_reaches_machine_and_deterministic_native_coff` now carries the exact five-block shape through MachineWir and native COFF with independent cleanup/proof/state authentication, forgery rejection, Machine N/N−1 bounds, late cancellation, and repeat-byte identity. This does not admit general branched async activation callers. `if`/`else` (`if_else_structured_return_keeps_named_cleanup_boundary`), loops/matches, parameterized acquisition, abort phases, break/continue, `?`/failure, scope-held await, receiver scopes, non-pass cleanup, and event-stream teardown observation remain named fail-closed. | partial — req-05,10 |
 
+A3 evidence for rows 2.3.3 and 2.7 now includes one analysis-tier pattern-
+alternative subset: an unguarded arm may join two or more distinct payload-free
+constructors of the exact scrutinee enum. Every constructor contributes exact
+exhaustiveness coverage and the full sealer replays the alternatives from HIR
+(`runtime_adt_match_unit_alternatives_contribute_exact_exhaustive_coverage`).
+Duplicate alternatives, guarded alternatives, and payload-bearing alternatives
+remain named fail-closed (`runtime_adt_match_alternative_tails_fail_closed_by_name`).
+Semantic lowering stops explicitly at
+`semantic-match-alternatives-lowering-pending`
+(`unit_pattern_alternatives_stop_at_named_semantic_lowering_boundary`); no
+executable or payload-binding alternative support is claimed.
+
 B1a.2 retention-boundary evidence additionally includes
 `lexical_projection_loop_liveness_remains_named_and_fail_closed`,
 `live_projection_source_and_view_carrier_cannot_be_rebound`, and
