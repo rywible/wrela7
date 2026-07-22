@@ -5410,21 +5410,17 @@ fn analyze_runtime_body(
                                     "semantic-projected-assignment-base",
                                     "projected assignment requires a flat runtime structure local",
                                     "scalar and unsupported aggregate locals do not expose replaceable named fields",
-                                    "use a nongeneric structure with scalar-backed fields",
+                                    "use a flat structure with stored copy-scalar fields and generic arguments",
                                 ));
                             };
-                            if !arguments.is_empty()
-                                || !runtime_structure_arguments_supported(
-                                    partial, arguments, fields,
-                                )
-                            {
+                            if !runtime_structure_arguments_supported(partial, arguments, fields) {
                                 return Err(runtime_type_diagnostic(
                                     request,
                                     target.source,
                                     "semantic-projected-assignment-base",
-                                    "projected assignment requires a nongeneric flat runtime structure",
-                                    "generic and non-flat aggregate replacement remains outside this lowering slice",
-                                    "use a nongeneric structure with scalar-backed fields",
+                                    "projected assignment requires a supported flat runtime structure",
+                                    "non-scalar generic arguments and non-flat aggregate replacement remain outside this lowering slice",
+                                    "use a flat structure specialized only with stored copy-scalar types",
                                 ));
                             }
                             let mut selected = None;
@@ -38018,6 +38014,122 @@ fn projection_fixture():
                 .is_err(),
             "full sealing must derive primitive and specialized layouts independently"
         );
+    }
+
+    #[test]
+    fn generic_flat_structure_field_update_is_exactly_sealed() {
+        let source = dot_variant_actor_source(
+            "pub struct Cell[T]:\n    pub value: T\n    pub stamp: u8\n\nasync fn checkpoint():\n    cell: Cell[u64] = Cell(value=1, stamp=2)\n    cell.value = 9\n    observed: u64 = cell.value\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("generic flat-structure field update should analyze");
+        assert!(
+            output.diagnostics().is_empty(),
+            "a specialized copy-scalar field must be replaceable: {:?}",
+            output.diagnostics()
+        );
+        let successful = output.successful().expect("sealed generic field update");
+        let program = successful.hir().as_program();
+        let (statement, rhs) = program
+            .statements
+            .iter()
+            .find_map(|statement| match &statement.kind {
+                StatementKind::Assign { targets, value, .. }
+                    if matches!(
+                        targets.as_slice(),
+                        [target] if !target.projections.is_empty()
+                    ) =>
+                {
+                    Some((statement.id, *value))
+                }
+                _ => None,
+            })
+            .expect("generic projected assignment");
+        let rhs = successful
+            .facts()
+            .expressions
+            .iter()
+            .find(|fact| fact.expression == rhs)
+            .and_then(|fact| fact.result)
+            .expect("generic projected assignment RHS value");
+        let replacement = successful
+            .facts()
+            .statements
+            .iter()
+            .find(|fact| fact.statement == statement)
+            .and_then(|fact| fact.definitions.first())
+            .expect("generic projected assignment replacement");
+        assert_ne!(replacement.value, rhs);
+        assert!(matches!(
+            successful.facts().types
+                [successful.facts().values[replacement.value.0 as usize].ty.0 as usize]
+                .kind,
+            SemanticTypeKind::Structure { ref arguments, .. } if !arguments.is_empty()
+        ));
+
+        let mut forged = successful.facts().clone();
+        forged
+            .statements
+            .iter_mut()
+            .find(|fact| fact.statement == statement)
+            .and_then(|fact| fact.definitions.first_mut())
+            .expect("mutable generic replacement definition")
+            .value = rhs;
+        assert!(
+            forged
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err(),
+            "full sealing must reject the scalar RHS as the replacement aggregate"
+        );
+
+        let exact_values = u32::try_from(successful.facts().values.len())
+            .expect("bounded generic field-update values");
+        let mut exact = AnalysisLimits::standard();
+        exact.values = exact_values;
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| false)
+            .expect("exact generic field-update value limit");
+        let mut one_under = exact;
+        one_under.values = exact_values - 1;
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new()
+                .analyze(parsed_actor_request(&fixture, &changes, one_under), &|| {
+                    false
+                },),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "semantic values",
+                ..
+            })
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            })
+            .expect("count generic field-update polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, exact),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
     }
 
     #[test]

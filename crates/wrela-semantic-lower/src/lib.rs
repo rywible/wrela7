@@ -21813,6 +21813,163 @@ pub fn boot() -> Image:
     }
 
     #[test]
+    fn generic_flat_structure_field_update_lowers_to_exact_insert() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub struct Cell[T]:
+    pub left: T
+    pub right: T
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        cell: Cell[u64] = Cell(left=1, right=2)
+        cell.right = 9
+        observed: u64 = cell.right
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("generic flat-structure field update should lower");
+        let wir = lowered.wir().as_wir();
+        let cell = wir
+            .types
+            .iter()
+            .find(|ty| ty.source_name == "Cell")
+            .expect("lowered Cell[u64]");
+        assert!(matches!(
+            &cell.kind,
+            wir::TypeKind::Struct { fields }
+                if matches!(fields.as_slice(), [left, right]
+                    if left.name == "left" && right.name == "right" && left.ty == right.ty)
+        ));
+        let insert = wir
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation:
+                        wir::SemanticOperation::InsertField {
+                            aggregate,
+                            field,
+                            value,
+                        },
+                    ..
+                }) => Some((*aggregate, *field, *value)),
+                _ => None,
+            })
+            .expect("exact generic InsertField");
+        assert_eq!(insert.1, 1, "source replaces Cell.right");
+
+        let mut forged = wir.clone();
+        let forged_field = forged
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::InsertField { field, .. },
+                    ..
+                }) => Some(field),
+                _ => None,
+            })
+            .expect("mutable generic InsertField");
+        *forged_field = 0;
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                forged,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
+        ));
+
+        let exact_operations = lowered.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact generic field-update operation limit");
+        let mut one_under = exact;
+        one_under.operations = exact_operations - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == exact_operations - 1
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("count generic field-update lowering polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
     fn non_type_generic_structure_specialization_fails_closed_by_name() {
         let (image, _target) = analyze_minimum();
         let facts = image.into_facts();

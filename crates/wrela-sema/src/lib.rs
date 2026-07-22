@@ -2896,8 +2896,7 @@ fn validate_exact_body_local_value_flow(
                         }
                         let field = selected
                             .ok_or_else(|| invalid("projected assignment field is not exact"))?;
-                        if !arguments.is_empty()
-                            || !runtime_structure_arguments_supported(analysis, arguments, fields)
+                        if !runtime_structure_arguments_supported(analysis, arguments, fields)
                             || replacement.ty != previous_record.ty
                             || rhs.ty != field.ty
                         {
@@ -7199,11 +7198,9 @@ fn validate_exact_statement_fact(
                             "projected assignment value is not a flat structure",
                         ));
                     };
-                    if !arguments.is_empty()
-                        || !runtime_structure_arguments_supported(analysis, arguments, fields)
-                    {
+                    if !runtime_structure_arguments_supported(analysis, arguments, fields) {
                         return Err(invalid(
-                            "projected assignment structure is not the supported nongeneric shape",
+                            "projected assignment structure is not the supported flat scalar shape",
                         ));
                     }
                     let mut selected = None;
