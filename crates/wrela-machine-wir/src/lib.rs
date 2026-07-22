@@ -3743,7 +3743,7 @@ fn validate_activations(module: &MachineWir, errors: &mut ValidationContext<'_>)
             && activation.capacity_bound == u64::from(activation.maximum_live)
             && activation.source.range.start <= activation.source.range.end;
 
-        let call_shape_matches = activation_call_shape_matches(caller, activation, errors);
+        let call_shape_matches = activation_call_shape_matches(module, caller, activation, errors);
         let callee_shape_matches = immediate_activation_callee_matches(module, callee);
         let schedule_matches = activation_schedule_matches(module, activation, errors);
         if !owner_matches
@@ -4329,6 +4329,7 @@ fn text_ends_with(actual: &str, suffix: &str, errors: &mut ValidationContext<'_>
 }
 
 fn activation_call_shape_matches(
+    module: &MachineWir,
     caller: &MachineFunction,
     activation: &MachineActivationPlan,
     errors: &mut ValidationContext<'_>,
@@ -4347,8 +4348,7 @@ fn activation_call_shape_matches(
                 continue;
             }
             matched = matched.saturating_add(1);
-            valid &= block.id == caller.entry
-                && instruction.results.is_empty()
+            valid &= instruction.results.is_empty()
                 && instruction.source == Some(activation.source)
                 && matches!(
                     &instruction.operation,
@@ -4362,7 +4362,11 @@ fn activation_call_shape_matches(
                     &block.terminator,
                     MachineTerminator::Jump { block, arguments }
                         if *block == activation.resume_block && arguments.is_empty()
-                );
+                )
+                && (block.id == caller.entry
+                    || structured_scope_activation_shape_matches(
+                        module, caller, block.id, activation, errors,
+                    ));
         }
     }
     let resume_matches = caller
@@ -4374,6 +4378,135 @@ fn activation_call_shape_matches(
                 && matches!(&resume.terminator, MachineTerminator::Return(values) if values.is_empty())
         });
     matched == 1 && valid && resume_matches
+}
+
+fn structured_scope_activation_shape_matches(
+    module: &MachineWir,
+    caller: &MachineFunction,
+    call_block: BlockId,
+    activation: &MachineActivationPlan,
+    errors: &mut ValidationContext<'_>,
+) -> bool {
+    let [entry, taken, untaken, fallthrough, resume] = caller.blocks.as_slice() else {
+        return false;
+    };
+    if caller.entry != entry.id
+        || entry.id != BlockId(0)
+        || taken.id != BlockId(1)
+        || untaken.id != BlockId(2)
+        || fallthrough.id != BlockId(3)
+        || resume.id != BlockId(4)
+        || call_block != fallthrough.id
+        || activation.resume_block != resume.id
+        || !entry.parameters.is_empty()
+        || !taken.parameters.is_empty()
+        || !untaken.parameters.is_empty()
+        || !fallthrough.parameters.is_empty()
+        || !resume.parameters.is_empty()
+    {
+        return false;
+    }
+    let [state_field, state_constructor, predicate] = entry.instructions.as_slice() else {
+        return false;
+    };
+    let [taken_cleanup] = taken.instructions.as_slice() else {
+        return false;
+    };
+    let [fallthrough_cleanup, activation_call] = fallthrough.instructions.as_slice() else {
+        return false;
+    };
+    let [state_field_value] = state_field.results.as_slice() else {
+        return false;
+    };
+    let [state] = state_constructor.results.as_slice() else {
+        return false;
+    };
+    let [condition] = predicate.results.as_slice() else {
+        return false;
+    };
+    let predicate_callee = match &predicate.operation {
+        MachineOperation::Call {
+            function,
+            arguments,
+            convention: CallingConvention::Internal,
+        } if arguments.is_empty() => module.functions.get(function.0 as usize),
+        _ => None,
+    };
+    let cleanup_function = match (&taken_cleanup.operation, &fallthrough_cleanup.operation) {
+        (
+            MachineOperation::Call {
+                function: left,
+                arguments: left_arguments,
+                convention: CallingConvention::Internal,
+            },
+            MachineOperation::Call {
+                function: right,
+                arguments: right_arguments,
+                convention: CallingConvention::Internal,
+            },
+        ) if left == right
+            && left_arguments.as_slice() == [*state]
+            && right_arguments == left_arguments
+            && taken_cleanup.results.is_empty()
+            && fallthrough_cleanup.results.is_empty()
+            && taken_cleanup.source == fallthrough_cleanup.source =>
+        {
+            module.functions.get(left.0 as usize)
+        }
+        _ => None,
+    };
+    let branch_matches = matches!(
+        &entry.terminator,
+        MachineTerminator::Branch {
+            condition: branch_condition,
+            then_block,
+            then_arguments,
+            else_block,
+            else_arguments,
+        } if branch_condition == condition
+            && *then_block == taken.id
+            && then_arguments.is_empty()
+            && *else_block == untaken.id
+            && else_arguments.is_empty()
+    );
+    let state_matches = matches!(
+        state_field.operation,
+        MachineOperation::Immediate(MachineImmediate::Integer { .. })
+    ) && matches!(
+        &state_constructor.operation,
+        MachineOperation::MakeStruct { fields, .. }
+            if fields.as_slice() == [*state_field_value]
+    );
+    let predicate_matches = predicate_callee.is_some_and(|callee| {
+        callee.role == MachineFunctionRole::Ordinary
+            && callee.convention == CallingConvention::Internal
+            && callee.parameters.is_empty()
+            && module
+                .types
+                .get(callee.result.0 as usize)
+                .is_some_and(|ty| ty.kind == MachineTypeKind::Integer { bits: 8 })
+    });
+    let cleanup_matches = cleanup_function.is_some_and(|cleanup| {
+        matches!(
+            cleanup.origin,
+            MachineFunctionOrigin::GeneratedCleanup { .. }
+        ) && cleanup.role == MachineFunctionRole::Cleanup
+            && cleanup.convention == CallingConvention::Internal
+    });
+    let tails_match = matches!(&taken.terminator, MachineTerminator::Return(values) if values.is_empty())
+        && untaken.instructions.is_empty()
+        && matches!(&untaken.terminator,
+            MachineTerminator::Jump { block, arguments }
+                if *block == fallthrough.id && arguments.is_empty())
+        && activation_call.id == activation.call_instruction
+        && resume.instructions.is_empty()
+        && matches!(&resume.terminator, MachineTerminator::Return(values) if values.is_empty());
+    branch_matches
+        && state_matches
+        && predicate_matches
+        && cleanup_matches
+        && tails_match
+        && errors.poll()
 }
 
 fn immediate_activation_callee_matches(module: &MachineWir, callee: &MachineFunction) -> bool {

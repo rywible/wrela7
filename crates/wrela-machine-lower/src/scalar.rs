@@ -1597,14 +1597,10 @@ fn lower_activation_subset(
                 ));
             }
         };
-        let [entry, resume] = caller.blocks.as_slice() else {
-            return Err(unsupported(
-                "an activation caller without one entry and resume block",
-            ));
-        };
-        let Some(call) = entry.instructions.last() else {
-            return Err(unsupported("an activation caller without an async call"));
-        };
+        let call_site = authenticated_activation_call_site(input, caller, plan, is_cancelled)?;
+        let entry = call_site.entry;
+        let call = call_site.call;
+        let resume = call_site.resume;
         let message_shape = match (owner, schedule, dispatch) {
             (
                 MachineActivationOwner::Actor { actor, .. },
@@ -1667,12 +1663,15 @@ fn lower_activation_subset(
                 MachineActivationOwner::Actor { .. },
                 MachineActivationSchedule::DormantMailbox,
                 None,
-            ) => exact_actor_state_prefix(
-                input,
-                caller,
-                actor.id,
-                &entry.instructions[..entry.instructions.len().saturating_sub(1)],
-            ),
+            ) => {
+                call_site.structured_scope
+                    || exact_actor_state_prefix(
+                        input,
+                        caller,
+                        actor.id,
+                        &entry.instructions[..entry.instructions.len().saturating_sub(1)],
+                    )
+            }
             (
                 MachineActivationOwner::Task { .. },
                 MachineActivationSchedule::StartupOnce,
@@ -1772,14 +1771,10 @@ fn lower_activation_subset(
             .types
             .get(result.0 as usize)
             .is_some_and(|ty| ty.kind == flow::FlowTypeKind::Unit);
-        let (state, resume_id) = match entry.terminator {
-            flow::Terminator::Suspend {
-                state,
-                activation,
-                resume,
-            } if activation == *activation_value => (state, resume),
-            _ => return Err(unsupported("an async call without its exact suspend edge")),
-        };
+        let (state, resume_id) = (call_site.state, call_site.resume_id);
+        if call_site.activation != *activation_value {
+            return Err(unsupported("an async call without its exact suspend edge"));
+        }
         let call_matches = matches!(
             &call.operation,
             flow::FlowOperation::AsyncCall {
@@ -1906,6 +1901,186 @@ fn lower_activation_subset(
     }
     check_cancelled(is_cancelled)?;
     Ok(output)
+}
+
+struct AuthenticatedActivationCallSite<'a> {
+    entry: &'a flow::Block,
+    call: &'a flow::Instruction,
+    resume: &'a flow::Block,
+    state: u32,
+    activation: flow::ValueId,
+    resume_id: flow::BlockId,
+    structured_scope: bool,
+}
+
+fn authenticated_activation_call_site<'a>(
+    input: &'a flow::FlowWir,
+    caller: &'a flow::FlowFunction,
+    plan: &flow::ActivationPlan,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<AuthenticatedActivationCallSite<'a>, MachineLowerError> {
+    check_cancelled(is_cancelled)?;
+    if let [entry, resume] = caller.blocks.as_slice() {
+        let call = entry
+            .instructions
+            .last()
+            .ok_or(unsupported("an activation caller without an async call"))?;
+        let flow::Terminator::Suspend {
+            state,
+            activation,
+            resume: resume_id,
+        } = entry.terminator
+        else {
+            return Err(unsupported("an async call without its exact suspend edge"));
+        };
+        return Ok(AuthenticatedActivationCallSite {
+            entry,
+            call,
+            resume,
+            state,
+            activation,
+            resume_id,
+            structured_scope: false,
+        });
+    }
+
+    let [entry, taken, untaken, fallthrough, resume] = caller.blocks.as_slice() else {
+        return Err(unsupported(
+            "an activation caller without one entry and resume block",
+        ));
+    };
+    let boundary = || unsupported("machine-structured-scope-activation-boundary-authentication");
+    let [state_field, state_constructor, predicate] = entry.instructions.as_slice() else {
+        return Err(boundary());
+    };
+    let [taken_cleanup] = taken.instructions.as_slice() else {
+        return Err(boundary());
+    };
+    let [fallthrough_cleanup, call] = fallthrough.instructions.as_slice() else {
+        return Err(boundary());
+    };
+    let flow::Terminator::Branch {
+        condition,
+        then_block,
+        then_arguments,
+        else_block,
+        else_arguments,
+    } = &entry.terminator
+    else {
+        return Err(boundary());
+    };
+    let flow::Terminator::Jump {
+        target: fallthrough_target,
+        arguments: fallthrough_arguments,
+    } = &untaken.terminator
+    else {
+        return Err(boundary());
+    };
+    let flow::Terminator::Suspend {
+        state: suspend_state,
+        activation,
+        resume: resume_target,
+    } = fallthrough.terminator
+    else {
+        return Err(boundary());
+    };
+    let [state_field_value] = state_field.results.as_slice() else {
+        return Err(boundary());
+    };
+    let [state] = state_constructor.results.as_slice() else {
+        return Err(boundary());
+    };
+    let [condition_result] = predicate.results.as_slice() else {
+        return Err(boundary());
+    };
+    let flow::FlowOperation::MakeAggregate { fields, .. } = &state_constructor.operation else {
+        return Err(boundary());
+    };
+    let flow::FlowOperation::Call {
+        function: predicate_function,
+        arguments: predicate_arguments,
+    } = &predicate.operation
+    else {
+        return Err(boundary());
+    };
+    let predicate_callee = input
+        .functions
+        .get(predicate_function.0 as usize)
+        .ok_or_else(boundary)?;
+    let condition_is_bool = input
+        .types
+        .get(flow_value_type(caller, *condition_result)?.0 as usize)
+        .is_some_and(|ty| ty.kind == flow::FlowTypeKind::Scalar(flow::ScalarType::Bool));
+    let cleanup_calls_match = taken_cleanup.operation == fallthrough_cleanup.operation
+        && taken_cleanup.source == fallthrough_cleanup.source
+        && authenticated_generated_cleanup_call(
+            input,
+            caller,
+            taken_cleanup,
+            *state,
+            is_cancelled,
+        )?
+        && authenticated_generated_cleanup_call(
+            input,
+            caller,
+            fallthrough_cleanup,
+            *state,
+            is_cancelled,
+        )?;
+    let exact_shape = caller.entry == entry.id
+        && entry.id == flow::BlockId(0)
+        && taken.id == flow::BlockId(1)
+        && untaken.id == flow::BlockId(2)
+        && fallthrough.id == flow::BlockId(3)
+        && resume.id == flow::BlockId(4)
+        && entry.parameters.is_empty()
+        && taken.parameters.is_empty()
+        && untaken.parameters.is_empty()
+        && fallthrough.parameters.is_empty()
+        && then_block == &taken.id
+        && else_block == &untaken.id
+        && then_arguments.is_empty()
+        && else_arguments.is_empty()
+        && condition == condition_result
+        && matches!(
+            state_field.operation,
+            flow::FlowOperation::Immediate(flow::Immediate::Integer { .. })
+        )
+        && fields.as_slice() == [*state_field_value]
+        && predicate_arguments.is_empty()
+        && predicate_callee.color == flow::FunctionColor::Sync
+        && predicate_callee.role == flow::FunctionRole::Ordinary
+        && predicate_callee.parameters.is_empty()
+        && predicate_callee.result_types.as_slice()
+            == [flow_value_type(caller, *condition_result)?]
+        && condition_is_bool
+        && cleanup_calls_match
+        && matches!(&taken.terminator, flow::Terminator::Return(values) if values.is_empty())
+        && untaken.instructions.is_empty()
+        && fallthrough_target == &fallthrough.id
+        && fallthrough_arguments.is_empty()
+        && suspend_state == 0
+        && resume_target == resume.id
+        && matches!(&call.operation,
+            flow::FlowOperation::AsyncCall {
+                function,
+                arguments,
+                plan: call_plan,
+            } if *function == plan.callee && arguments.is_empty() && *call_plan == plan.id)
+        && matches!(call.results.as_slice(), [result] if *result == activation)
+        && resume.instructions.is_empty();
+    if !exact_shape {
+        return Err(boundary());
+    }
+    Ok(AuthenticatedActivationCallSite {
+        entry,
+        call,
+        resume,
+        state: suspend_state,
+        activation,
+        resume_id: resume_target,
+        structured_scope: true,
+    })
 }
 
 fn lowered_instruction_id(
@@ -4609,9 +4784,9 @@ fn authenticated_generated_cleanup_state(
     if matches!(function.proofs.as_slice(), [generated_helper, cleanup]
         if generated_helper == helper_proof
             && input.proofs.get(helper_proof.0 as usize).is_some_and(|proof| {
-                proof.id == *helper_proof
+                    proof.id == *helper_proof
                     && proof.kind == flow::ProofKind::CleanupAcyclic
-                    && proof.bound == Some(1)
+                    && proof.bound == Some(0)
             })
             && input.proofs.get(cleanup.0 as usize).is_some_and(|proof| {
                 proof.id == *cleanup

@@ -793,6 +793,13 @@ it. It injects phase implementations and bounded host capabilities, while
   state-mismatch and duplicate-resolve fatal provenances, and the target must
   have no parameters and return exact `u64`. Reserve/commit/dispatch and
   activation records are forbidden in this profile.
+- MachineWir v15 also admits one exact structured scope-return activation
+  shape: a five-block actor caller branches to an authenticated generated
+  cleanup plus return, or to the same cleanup followed by its already-proved
+  immediate unit activation and resume. Validation rejoins the flat state,
+  generated-cleanup origin, both calls, branch/jump targets, activation call,
+  and empty resume. Deleting or substituting either cleanup invalidates the
+  activation plan; arbitrary branched activation callers remain invalid.
 - Codegen may translate facts; it may not strengthen them.
 
 ### `wrela-machine-lower`
@@ -830,6 +837,13 @@ it. It injects phase implementations and bounded host capabilities, while
   startup task once after successful image entry, and retains the installed
   mailbox storage. It does not synthesize a scheduler activation or a parked
   continuation; those remain outside this direct same-core profile.
+- For the structured scope-return profile, lowering accepts only the canonical
+  five-block Flow shape and reauthenticates its literal flat state, unary
+  synchronous Boolean predicate, identical generated-cleanup calls, taken
+  return, fallthrough jump, exact async call/suspend, and empty resume. The
+  existing two-block activation contract is unchanged, and the structured
+  path uses the named
+  `machine-structured-scope-activation-boundary-authentication` rejection.
 - Generated test harnesses receive a measured read-only global for every
   canonical protocol frame. MachineWir uses explicit global-address values and
   exact `TestEmit(address, length)` / nonreturning `TestFinish(outcome)` runtime
@@ -888,6 +902,12 @@ it. It injects phase implementations and bounded host capabilities, while
   to fatal codes 7 and 8. `ActorReplyResolve` is a validated authority marker
   fused into that direct call; codegen may not accept it outside the one
   request/receive/resolve contract.
+- For the sealed structured scope-return profile, codegen independently
+  rechecks the same five blocks and both authenticated flat-state cleanup calls
+  before rendering the branch and fallthrough activation. Passive function
+  type records may name a supported flat-struct return so the source scope
+  protocol survives the type table, but first-class function values and
+  unauthenticated aggregate function boundaries remain rejected.
 - The implemented writable-storage subset is deliberately narrow. Private,
   dense, exactly covering byte-array globals may use `WritableData` with a
   typed zero initializer in exact `.data` or in the canonical

@@ -3238,7 +3238,7 @@ mod contract_tests {
                 subject: "scope protocol cleanup: irqs_masked".to_owned(),
                 sources: vec![source],
                 depends_on: Vec::new(),
-                bound: Some(1),
+                bound: Some(0),
                 explanation: vec!["one pass-only exit helper".to_owned()],
             },
             FlowProof {

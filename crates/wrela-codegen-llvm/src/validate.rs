@@ -1,5 +1,5 @@
 use wrela_machine_wir::{
-    AtomicOrdering, BackendFacts, BackendProofKind, CallingConvention, CheckedIntegerOp,
+    AtomicOrdering, BackendFacts, BackendProofKind, BlockId, CallingConvention, CheckedIntegerOp,
     ConversionOp, Endianness, IntegerSignedness, Linkage, MACHINE_WIR_VERSION,
     MachineActivationOwner, MachineActivationSchedule, MachineFunction, MachineFunctionOrigin,
     MachineFunctionRole, MachineImmediate, MachineInstruction, MachineOperation,
@@ -1310,7 +1310,7 @@ fn validate_activation_table(
                 && matches!(&entry.terminator,
                     MachineTerminator::Jump { block, arguments }
                         if *block == activation.resume_block && arguments.is_empty())
-        });
+        }) || structured_scope_activation_codegen_matches(machine, caller, activation);
         let resume_matches = caller
             .blocks
             .get(activation.resume_block.0 as usize)
@@ -1380,6 +1380,121 @@ fn validate_activation_table(
         }
     }
     Ok(())
+}
+
+fn structured_scope_activation_codegen_matches(
+    machine: &wrela_machine_wir::MachineWir,
+    caller: &MachineFunction,
+    activation: &wrela_machine_wir::MachineActivationPlan,
+) -> bool {
+    let [entry, taken, untaken, fallthrough, resume] = caller.blocks.as_slice() else {
+        return false;
+    };
+    let [state_field, state_constructor, predicate] = entry.instructions.as_slice() else {
+        return false;
+    };
+    let [taken_cleanup] = taken.instructions.as_slice() else {
+        return false;
+    };
+    let [fallthrough_cleanup, activation_call] = fallthrough.instructions.as_slice() else {
+        return false;
+    };
+    let [state_field_value] = state_field.results.as_slice() else {
+        return false;
+    };
+    let [state] = state_constructor.results.as_slice() else {
+        return false;
+    };
+    let [condition] = predicate.results.as_slice() else {
+        return false;
+    };
+    let cleanup_matches = |instruction: &wrela_machine_wir::MachineInstruction| {
+        matches!(&instruction.operation,
+        MachineOperation::Call {
+            function,
+            arguments,
+            convention: CallingConvention::Internal,
+        } if authenticated_generated_cleanup_call(
+            machine,
+            caller,
+            instruction,
+            *function,
+            arguments,
+        ))
+    };
+    caller.entry == entry.id
+        && entry.id == BlockId(0)
+        && taken.id == BlockId(1)
+        && untaken.id == BlockId(2)
+        && fallthrough.id == BlockId(3)
+        && resume.id == BlockId(4)
+        && activation.resume_block == resume.id
+        && entry.parameters.is_empty()
+        && taken.parameters.is_empty()
+        && untaken.parameters.is_empty()
+        && fallthrough.parameters.is_empty()
+        && resume.parameters.is_empty()
+        && matches!(
+            &entry.terminator,
+            MachineTerminator::Branch {
+                condition: branch_condition,
+                then_block,
+                then_arguments,
+                else_block,
+                else_arguments,
+            } if branch_condition == condition
+                && *then_block == taken.id
+                && then_arguments.is_empty()
+                && *else_block == untaken.id
+                && else_arguments.is_empty()
+        )
+        && matches!(
+            state_field.operation,
+            MachineOperation::Immediate(MachineImmediate::Integer { .. })
+        )
+        && matches!(&state_constructor.operation,
+            MachineOperation::MakeStruct { fields, .. }
+                if fields.as_slice() == [*state_field_value])
+        && matches!(&predicate.operation,
+            MachineOperation::Call {
+                arguments,
+                convention: CallingConvention::Internal,
+                ..
+            } if arguments.is_empty())
+        && cleanup_matches(taken_cleanup)
+        && cleanup_matches(fallthrough_cleanup)
+        && taken_cleanup.operation == fallthrough_cleanup.operation
+        && taken_cleanup.source == fallthrough_cleanup.source
+        && matches!(&taken.terminator,
+            MachineTerminator::Return(values) if values.is_empty())
+        && untaken.instructions.is_empty()
+        && matches!(&untaken.terminator,
+            MachineTerminator::Jump { block, arguments }
+                if *block == fallthrough.id && arguments.is_empty())
+        && activation_call.id == activation.call_instruction
+        && activation_call.results.is_empty()
+        && activation_call.source == Some(activation.source)
+        && matches!(&activation_call.operation,
+            MachineOperation::Call {
+                function,
+                arguments,
+                convention: CallingConvention::Internal,
+            } if *function == activation.callee && arguments.is_empty())
+        && matches!(&fallthrough.terminator,
+            MachineTerminator::Jump { block, arguments }
+                if *block == resume.id && arguments.is_empty())
+        && resume.instructions.is_empty()
+        && matches!(&resume.terminator,
+            MachineTerminator::Return(values) if values.is_empty())
+        && machine
+            .functions
+            .get(activation.callee.0 as usize)
+            .is_some()
+        && caller
+            .values
+            .get(state.0 as usize)
+            .and_then(|value| machine.types.get(value.ty.0 as usize))
+            .is_some_and(|ty| matches!(ty.kind, MachineTypeKind::Struct { .. }))
 }
 
 fn exact_actor_state_machine_prefix(
@@ -2491,7 +2606,7 @@ fn authenticated_generated_cleanup_state(
             && machine.proofs.get(helper_proof.0 as usize).is_some_and(|proof| {
                 proof.id == *helper_proof
                     && proof.kind == wrela_machine_wir::BackendProofKind::CleanupAcyclic
-                    && proof.bound == Some(1)
+                    && proof.bound == Some(0)
             })
             && machine.proofs.get(cleanup.0 as usize).is_some_and(|proof| {
                 proof.id == *cleanup
@@ -2575,7 +2690,10 @@ fn supported_passive_function_type(
     let MachineTypeKind::Function { parameters, result } = &ty.kind else {
         return Ok(false);
     };
-    if ty.size != 0 || ty.alignment != 1 || !is_return_type(machine, *result) {
+    if ty.size != 0
+        || ty.alignment != 1
+        || (!is_return_type(machine, *result) && !supported_struct_type(machine, *result))
+    {
         return Ok(false);
     }
     for (index, parameter) in parameters.iter().enumerate() {

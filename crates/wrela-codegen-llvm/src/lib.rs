@@ -1228,7 +1228,7 @@ mod contract_tests {
                 source_proofs: vec![1],
                 kind: BackendProofKind::CleanupAcyclic,
                 depends_on: Vec::new(),
-                bound: Some(1),
+                bound: Some(0),
                 sources: vec![cleanup_source],
                 statement: "one pass-only scope exit helper".to_owned(),
                 source: Some(cleanup_source),
