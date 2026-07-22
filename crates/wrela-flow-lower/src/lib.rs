@@ -296,7 +296,7 @@ fn supported_input<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedSemantic<'a>, LowerError> {
-    reject_pending_nominal_enum_payload(input, is_cancelled)?;
+    reject_unadmitted_nominal_enum_payload(input, is_cancelled)?;
     if input.tests.is_empty() {
         if input.actors.is_empty()
             && input.tasks.is_empty()
@@ -313,7 +313,7 @@ fn supported_input<'a>(
     }
 }
 
-fn reject_pending_nominal_enum_payload(
+fn reject_unadmitted_nominal_enum_payload(
     input: &semantic::SemanticWir,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), LowerError> {
@@ -322,14 +322,12 @@ fn reject_pending_nominal_enum_payload(
         let semantic::TypeKind::Enum { variants } = &ty.kind else {
             continue;
         };
+        if exact_fixed_flat_generic_enum_profile(input, variants) {
+            continue;
+        }
         for field in variants.iter().flat_map(|variant| &variant.fields) {
             check_cancelled(is_cancelled)?;
-            if input.types.get(field.ty.0 as usize).is_some_and(|payload| {
-                payload.id == field.ty
-                    && payload.linearity == semantic::Linearity::ExplicitCopy
-                    && matches!(&payload.kind, semantic::TypeKind::Struct { fields }
-                        if fields.iter().all(|field| scalar_primitive(input, field.ty).is_some()))
-            }) {
+            if flat_nominal_enum_payload(input, field.ty) {
                 return Err(unsupported(
                     "flow-enum-nominal-payload-lowering-pending (flat-structure enum payload)",
                 ));
@@ -2422,7 +2420,47 @@ fn canonical_semantic_enum_shape(
 ) -> bool {
     !variants.is_empty()
         && (variants.iter().all(|variant| variant.fields.is_empty())
-            || canonical_semantic_enum_payload(input, variants).is_some())
+            || canonical_semantic_enum_payload(input, variants).is_some()
+            || exact_fixed_flat_generic_enum_profile(input, variants))
+}
+
+fn flat_nominal_enum_payload(input: &semantic::SemanticWir, ty: semantic::TypeId) -> bool {
+    input.types.get(ty.0 as usize).is_some_and(|record| {
+        record.id == ty
+            && record.source.is_some()
+            && record.linearity == semantic::Linearity::ExplicitCopy
+            && matches!(&record.kind, semantic::TypeKind::Struct { fields }
+                if !fields.is_empty()
+                    && fields.iter().all(|field| !field.name.is_empty()
+                        && scalar_primitive(input, field.ty).is_some()))
+    })
+}
+
+/// Exact Flow boundary for the first nominal enum payload producer: one fixed
+/// nongeneric flat structure beside one substituted primitive scalar. FlowWir
+/// can retain both nominal type identities without choosing a machine union
+/// representation; every broader heterogeneous or nested shape stays closed.
+fn exact_fixed_flat_generic_enum_profile(
+    input: &semantic::SemanticWir,
+    variants: &[semantic::VariantType],
+) -> bool {
+    let [left, right] = variants else {
+        return false;
+    };
+    let ([left], [right]) = (left.fields.as_slice(), right.fields.as_slice()) else {
+        return false;
+    };
+    if !left.name.is_empty()
+        || !right.name.is_empty()
+        || !left.public
+        || !right.public
+        || left.ty == right.ty
+    {
+        return false;
+    }
+    (flat_nominal_enum_payload(input, left.ty) && scalar_primitive(input, right.ty).is_some())
+        || (scalar_primitive(input, left.ty).is_some()
+            && flat_nominal_enum_payload(input, right.ty))
 }
 
 fn integer_primitive(primitive: semantic::PrimitiveType) -> Option<(bool, u8)> {
@@ -2905,7 +2943,8 @@ fn validate_scalar_source_function(
                             ([], None) => true,
                             ([field], Some(payload)) => {
                                 scalar_value_type(function, *payload) == Some(field.ty)
-                                    && scalar_primitive(input, field.ty).is_some()
+                                    && (scalar_primitive(input, field.ty).is_some()
+                                        || flat_nominal_enum_payload(input, field.ty))
                             }
                             _ => false,
                         };

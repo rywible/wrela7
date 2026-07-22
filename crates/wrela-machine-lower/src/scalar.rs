@@ -1108,6 +1108,14 @@ fn preflight(
     }
     for ty in &input.types {
         check_cancelled(is_cancelled)?;
+        if matches!(&ty.kind, flow::FlowTypeKind::Enum { variants }
+        if variants.iter().flat_map(|variant| variant.iter()).any(|payload| {
+            flat_native_struct_fields(&input.types, *payload).is_some()
+        })) {
+            return Err(unsupported(
+                "machine-enum-nominal-payload-lowering-pending (flat-structure enum payload)",
+            ));
+        }
         require_supported_type(
             &input.types,
             ty,

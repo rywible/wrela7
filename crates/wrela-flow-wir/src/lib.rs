@@ -5005,7 +5005,66 @@ fn canonical_enum_shape(module: &FlowWir, variants: &[Vec<TypeId>]) -> bool {
     !variants.is_empty()
         && variants.len() <= 256
         && (variants.iter().all(Vec::is_empty)
-            || canonical_enum_payload(module, variants).is_some())
+            || canonical_enum_payload(module, variants).is_some()
+            || exact_fixed_flat_enum_profile(module, variants))
+}
+
+fn flat_nominal_enum_payload(module: &FlowWir, ty: TypeId) -> bool {
+    module.types.get(ty.0 as usize).is_some_and(|record| {
+        record.id == ty
+            && record.name.is_some()
+            && record.copyable
+            && !record.strict_linear
+            && matches!(&record.kind, FlowTypeKind::Struct { fields }
+            if !fields.is_empty() && fields.iter().all(|field| {
+                module.types.get(field.0 as usize).is_some_and(|field| {
+                    field.copyable
+                        && !field.strict_linear
+                        && matches!(field.kind, FlowTypeKind::Scalar(
+                            ScalarType::Bool
+                                | ScalarType::Integer {
+                                    bits: 8 | 16 | 32 | 64 | 128,
+                                    ..
+                                }
+                                | ScalarType::Float32
+                                | ScalarType::Float64
+                        ))
+                })
+            }))
+    })
+}
+
+fn exact_fixed_flat_enum_profile(module: &FlowWir, variants: &[Vec<TypeId>]) -> bool {
+    let [left, right] = variants else {
+        return false;
+    };
+    let ([left], [right]) = (left.as_slice(), right.as_slice()) else {
+        return false;
+    };
+    if left == right {
+        return false;
+    }
+    let scalar = |ty: TypeId| {
+        module.types.get(ty.0 as usize).is_some_and(|record| {
+            record.id == ty
+                && record.copyable
+                && !record.strict_linear
+                && matches!(
+                    record.kind,
+                    FlowTypeKind::Scalar(
+                        ScalarType::Bool
+                            | ScalarType::Integer {
+                                bits: 8 | 16 | 32 | 64 | 128,
+                                ..
+                            }
+                            | ScalarType::Float32
+                            | ScalarType::Float64
+                    )
+                )
+        })
+    };
+    (flat_nominal_enum_payload(module, *left) && scalar(*right))
+        || (scalar(*left) && flat_nominal_enum_payload(module, *right))
 }
 
 fn validate_type(module: &FlowWir, ty: &FlowType, errors: &mut ValidationContext<'_>) {
@@ -6433,6 +6492,136 @@ mod tests {
                 source: None,
             });
         assert!(forged_projection.validate().is_err());
+    }
+
+    #[test]
+    fn fixed_flat_enum_payload_accepts_exact_nominal_operations_and_rejects_substitution() {
+        let mut module = fixture();
+        module.types.extend([
+            FlowType {
+                id: TypeId(1),
+                kind: FlowTypeKind::Scalar(ScalarType::Integer {
+                    signed: false,
+                    bits: 8,
+                }),
+                name: Some("u8".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+            FlowType {
+                id: TypeId(2),
+                kind: FlowTypeKind::Struct {
+                    fields: vec![TypeId(1)],
+                },
+                name: Some("Detail".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+            FlowType {
+                id: TypeId(3),
+                kind: FlowTypeKind::Enum {
+                    variants: vec![vec![TypeId(2)], vec![TypeId(1)]],
+                },
+                name: Some("Envelope".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+        ]);
+        let source = Span {
+            file: FileId(0),
+            range: TextRange { start: 0, end: 0 },
+        };
+        module.functions.push(FlowFunction {
+            id: FunctionId(1),
+            name: "construct-fixed-payload".to_owned(),
+            origin: FunctionOrigin::SourceSemantic {
+                semantic_function: 1,
+            },
+            role: FunctionRole::Ordinary,
+            color: FunctionColor::Sync,
+            parameters: vec![ValueId(0)],
+            result_types: vec![TypeId(3)],
+            values: vec![
+                Value {
+                    id: ValueId(0),
+                    ty: TypeId(1),
+                    source_name: Some("word".to_owned()),
+                    source: Some(source),
+                },
+                Value {
+                    id: ValueId(1),
+                    ty: TypeId(2),
+                    source_name: Some("detail".to_owned()),
+                    source: Some(source),
+                },
+                Value {
+                    id: ValueId(2),
+                    ty: TypeId(3),
+                    source_name: Some("envelope".to_owned()),
+                    source: Some(source),
+                },
+            ],
+            blocks: vec![Block {
+                id: BlockId(0),
+                parameters: Vec::new(),
+                instructions: vec![
+                    Instruction {
+                        id: InstructionId(0),
+                        results: vec![ValueId(1)],
+                        operation: FlowOperation::MakeAggregate {
+                            ty: TypeId(2),
+                            fields: vec![ValueId(0)],
+                        },
+                        source: Some(source),
+                    },
+                    Instruction {
+                        id: InstructionId(1),
+                        results: vec![ValueId(2)],
+                        operation: FlowOperation::MakeEnum {
+                            ty: TypeId(3),
+                            variant: 0,
+                            payload: Some(ValueId(1)),
+                        },
+                        source: Some(source),
+                    },
+                ],
+                terminator: Terminator::Return(vec![ValueId(2)]),
+                source: Some(source),
+            }],
+            entry: BlockId(0),
+            stack_bound: 0,
+            frame_bound: 0,
+            proofs: Vec::new(),
+            source: Some(source),
+        });
+        module.source_summary.semantic_functions = 2;
+        module.source_summary.hir_declarations = 2;
+        module.source_summary.reachable_declarations = 2;
+        module.source_summary.monomorphized_instantiations = 2;
+        module
+            .clone()
+            .validate()
+            .expect("exact fixed flat payload and construction are canonical");
+
+        let mut wrong_variant_payload = module.clone();
+        let FlowOperation::MakeEnum {
+            variant, payload, ..
+        } = &mut wrong_variant_payload.functions[1].blocks[0].instructions[1].operation
+        else {
+            unreachable!();
+        };
+        *variant = 1;
+        *payload = Some(ValueId(1));
+        assert!(wrong_variant_payload.validate().is_err());
+
+        let mut wrong_nominal_value = module;
+        let FlowOperation::MakeEnum { payload, .. } =
+            &mut wrong_nominal_value.functions[1].blocks[0].instructions[1].operation
+        else {
+            unreachable!();
+        };
+        *payload = Some(ValueId(0));
+        assert!(wrong_nominal_value.validate().is_err());
     }
 
     #[test]

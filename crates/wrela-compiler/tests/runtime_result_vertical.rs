@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use wrela_backend::{
-    CodegenError, emit_prepared_object, llvm_backend_available,
+    CodegenError, MachineLowerError, emit_prepared_object, llvm_backend_available,
     machine_wir::{
         MachineFunctionOrigin, MachineOperation, MachineTerminator, MachineTypeKind,
         ValidationError,
@@ -936,6 +936,116 @@ fn match_value() -> u64:
             inspect_native_object(first.bytes(), digest);
         }
     }
+}
+
+#[test]
+fn fixed_flat_generic_enum_payload_reaches_exact_flow_and_named_machine_boundary() {
+    let fixture = source_fixture_for(
+        r#"module runtime_result.image
+
+from core.image import Image, Target
+
+pub struct Detail:
+    pub word: u8
+
+pub enum Envelope[T]:
+    detail(Detail)
+    value(T)
+
+@image
+pub fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn fixed_flat_generic_enum_runtime():
+    detail: Envelope[u8] = Envelope.detail(Detail(7))
+    value: Envelope[u8] = Envelope.value(9)
+    return
+"#,
+    );
+    let image = analyze_selected(&fixture, "fixed_flat_generic_enum_runtime");
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: image,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("fixed flat generic enum SemanticWir")
+        .into_parts()
+        .0;
+
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("fixed flat generic enum FlowWir");
+    let flow_model = flow.wir().as_wir();
+    let detail = flow_model
+        .types
+        .iter()
+        .find(|ty| ty.name.as_deref() == Some("Detail"))
+        .expect("exact Detail FlowWir type");
+    let envelope = flow_model
+        .types
+        .iter()
+        .find(|ty| ty.name.as_deref() == Some("Envelope"))
+        .expect("exact Envelope FlowWir type");
+    assert!(matches!(&detail.kind, FlowTypeKind::Struct { fields }
+        if fields.len() == 1));
+    assert!(matches!(&envelope.kind, FlowTypeKind::Enum { variants }
+        if matches!(variants.as_slice(), [fixed, substituted]
+            if fixed.as_slice() == [detail.id] && substituted.len() == 1)));
+    let operations = flow_model
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.operation {
+            FlowOperation::MakeAggregate { ty, .. } if *ty == detail.id => {
+                Some(("aggregate", 0, true))
+            }
+            FlowOperation::MakeEnum {
+                ty,
+                variant,
+                payload,
+            } if *ty == envelope.id => Some(("enum", *variant, payload.is_some())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operations,
+        [("aggregate", 0, true), ("enum", 0, true), ("enum", 1, true)]
+    );
+
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("fixed flat generic enum FlowWir v15 frame");
+    let error = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect_err("nominal enum payload must retain the Machine lowering boundary");
+    assert!(matches!(
+        error.machine_lower_error(),
+        Some(MachineLowerError::UnsupportedInput {
+            feature: "machine-enum-nominal-payload-lowering-pending (flat-structure enum payload)"
+        })
+    ));
 }
 
 #[test]
