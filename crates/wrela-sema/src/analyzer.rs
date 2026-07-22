@@ -6986,6 +6986,20 @@ fn analyze_runtime_with(
             .get_mut(local.0 as usize)
             .ok_or(AnalysisFailure::RequestMismatch)? = None;
     }
+    for (index, slot) in locals.iter_mut().enumerate() {
+        check_cancelled(is_cancelled)?;
+        if slot.is_none() {
+            continue;
+        }
+        let declaring_body = program
+            .locals
+            .get(index)
+            .ok_or(AnalysisFailure::RequestMismatch)?
+            .body;
+        if crate::body_is_ancestor(program, body, declaring_body) {
+            *slot = None;
+        }
+    }
     if partial.scope_activations.len() >= request.limits.scope_activations as usize {
         return Err(fact_resource(request, "scope activations").into());
     }
@@ -44820,6 +44834,69 @@ fn rejected():
         assert!(with_fact.initialized_after.iter().all(|value| {
             facts.values[value.0 as usize].origin != SemanticValueOrigin::Local(mask)
         }));
+    }
+
+    #[test]
+    fn scope_body_local_is_released_at_the_activation_boundary() {
+        let source = SCOPE_SEMANTICS_SOURCE.replace(
+            "    with irqs_masked() as mask:\n        pass\n    return",
+            "    with irqs_masked() as mask:\n        token: u64 = 3\n    return",
+        );
+        let output = compile_scope_fixture(&source);
+        assert!(
+            output.diagnostics().is_empty(),
+            "a scope body local must analyze cleanly: {:?}",
+            output.diagnostics()
+        );
+        let analyzed = output.successful().expect("sealed scope analysis");
+        let facts = analyzed.facts();
+        let program = analyzed.shared_hir().as_program();
+        let activation = facts
+            .scope_activations
+            .first()
+            .expect("one scope activation");
+        let with_statement = activation.statement;
+        let StatementKind::With { body, .. } = program
+            .statement(with_statement)
+            .expect("with statement")
+            .kind
+        else {
+            panic!("scope activation must name a with statement")
+        };
+        let body_statement = program
+            .body(body)
+            .and_then(|body| body.statements.first())
+            .copied()
+            .expect("with body statement");
+        let StatementKind::Initialize { local, .. } = program
+            .statement(body_statement)
+            .expect("with body statement record")
+            .kind
+        else {
+            panic!("the scope body must initialize a local")
+        };
+        let body_fact = facts
+            .statements
+            .iter()
+            .find(|fact| fact.statement == body_statement)
+            .expect("with body fact");
+        assert!(
+            body_fact.initialized_after.iter().any(|value| {
+                facts.values[value.0 as usize].origin == SemanticValueOrigin::Local(local)
+            }),
+            "the body local is live inside the activation"
+        );
+        let with_fact = facts
+            .statements
+            .iter()
+            .find(|fact| fact.statement == with_statement)
+            .expect("with statement fact");
+        assert!(
+            with_fact.initialized_after.iter().all(|value| {
+                facts.values[value.0 as usize].origin != SemanticValueOrigin::Local(local)
+            }),
+            "the body local must not escape the activation"
+        );
     }
 
     #[test]
