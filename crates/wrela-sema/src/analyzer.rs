@@ -1303,28 +1303,270 @@ fn diagnose_deriving_clauses(
     Ok(())
 }
 
+fn initializer_diagnostic(source: Span, code: &str, message: &str) -> Diagnostic {
+    let mut diagnostic = Diagnostic::error(Category::TYPE, source, message);
+    diagnostic.code = Some(code.to_owned());
+    diagnostic.notes.push(
+        "the admitted init slice is an exact infallible call-site desugar, not a partially initialized runtime place"
+            .to_owned(),
+    );
+    diagnostic.help.push(
+        "use `init(mut self, field: Scalar, ...)` with one direct `self.field = field` assignment per public field"
+            .to_owned(),
+    );
+    diagnostic
+}
+
+fn exact_initializer_builtin_type(
+    left: &wrela_hir::TypeExpression,
+    right: &wrela_hir::TypeExpression,
+) -> bool {
+    matches!(
+        (&left.kind, &right.kind),
+        (
+            wrela_hir::TypeExpressionKind::Named {
+                definition: Definition::Builtin(left),
+                arguments: left_arguments,
+            },
+            wrela_hir::TypeExpressionKind::Named {
+                definition: Definition::Builtin(right),
+                arguments: right_arguments,
+            },
+        ) if left == right
+            && left_arguments.is_empty()
+            && right_arguments.is_empty()
+            && matches!(
+                left,
+                wrela_hir::Builtin::Bool
+                    | wrela_hir::Builtin::U8
+                    | wrela_hir::Builtin::U16
+                    | wrela_hir::Builtin::U32
+                    | wrela_hir::Builtin::U64
+                    | wrela_hir::Builtin::U128
+                    | wrela_hir::Builtin::Usize
+                    | wrela_hir::Builtin::I8
+                    | wrela_hir::Builtin::I16
+                    | wrela_hir::Builtin::I32
+                    | wrela_hir::Builtin::I64
+                    | wrela_hir::Builtin::I128
+                    | wrela_hir::Builtin::Isize
+                    | wrela_hir::Builtin::F32
+                    | wrela_hir::Builtin::F64
+            )
+    )
+}
+
+fn structural_initializer_diagnostic(
+    program: &wrela_hir::Program,
+    record: &wrela_hir::Declaration,
+    initializer: &wrela_hir::InitializerDeclaration,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<Diagnostic>, AnalysisFailure> {
+    let wrela_hir::DeclarationOwner::Declaration(owner) = record.owner else {
+        return Ok(Some(initializer_diagnostic(
+            record.source,
+            "semantic-init-owner",
+            "initializer is not owned by one structure declaration",
+        )));
+    };
+    let Some(owner_record) = program.declaration(owner) else {
+        return Err(AnalysisFailure::RequestMismatch);
+    };
+    let DeclarationKind::Structure(structure) = &owner_record.kind else {
+        return Ok(Some(initializer_diagnostic(
+            record.source,
+            "semantic-init-owner",
+            "initializer is not owned by one structure declaration",
+        )));
+    };
+    if initializer.result.is_some() {
+        return Ok(Some(initializer_diagnostic(
+            record.source,
+            "semantic-init-fallible-rollback-pending",
+            "fallible initializer rollback is not yet executable",
+        )));
+    }
+    if !structure.generics.is_empty() {
+        return Ok(Some(initializer_diagnostic(
+            record.source,
+            "semantic-init-generic-pending",
+            "generic structure initializers are not in the admitted constructor slice",
+        )));
+    }
+    if structure.linear || structure.copy {
+        return Ok(Some(initializer_diagnostic(
+            record.source,
+            "semantic-init-linearity-pending",
+            "linear and copy-annotated initializer protocols are not yet executable",
+        )));
+    }
+    if structure.fields.is_empty() {
+        return Ok(Some(initializer_diagnostic(
+            record.source,
+            "semantic-init-zero-sized-pending",
+            "zero-sized initializer protocols are not yet executable",
+        )));
+    }
+    if structure.fields.iter().any(|field| {
+        field.visibility != wrela_hir::Visibility::Public
+            || !field.attributes.is_empty()
+            || field.default.is_some()
+    }) {
+        return Ok(Some(initializer_diagnostic(
+            record.source,
+            "semantic-init-field-contract-pending",
+            "initializer fields must be public, attribute-free, and have no defaults in this slice",
+        )));
+    }
+    if initializer.parameters.len() != structure.fields.len().saturating_add(1) {
+        return Ok(Some(initializer_diagnostic(
+            record.source,
+            "semantic-init-parameter-shape",
+            "initializer must declare one value parameter for every structure field",
+        )));
+    }
+    let Some(receiver) = initializer
+        .parameters
+        .first()
+        .and_then(|parameter| program.parameters.get(parameter.0 as usize))
+    else {
+        return Err(AnalysisFailure::RequestMismatch);
+    };
+    if !receiver.receiver
+        || receiver.access != wrela_hir::AccessMode::Mutate
+        || receiver.name.is_some()
+        || receiver.ty.is_some()
+    {
+        return Ok(Some(initializer_diagnostic(
+            receiver.source,
+            "semantic-init-receiver-shape",
+            "initializer must begin with the exact `mut self` receiver",
+        )));
+    }
+    for (field, parameter_id) in structure
+        .fields
+        .iter()
+        .zip(initializer.parameters.iter().skip(1))
+    {
+        check_cancelled(is_cancelled)?;
+        let Some(parameter) = program
+            .parameters
+            .get(parameter_id.0 as usize)
+            .filter(|parameter| parameter.id == *parameter_id)
+        else {
+            return Err(AnalysisFailure::RequestMismatch);
+        };
+        if parameter.receiver
+            || parameter.access != wrela_hir::AccessMode::Value
+            || parameter.positional_only
+            || parameter.name.as_ref() != Some(&field.name)
+            || parameter
+                .ty
+                .as_ref()
+                .is_none_or(|parameter_ty| !exact_initializer_builtin_type(parameter_ty, &field.ty))
+        {
+            return Ok(Some(initializer_diagnostic(
+                parameter.source,
+                "semantic-init-parameter-shape",
+                "initializer parameters must exactly mirror primitive-scalar structure fields",
+            )));
+        }
+    }
+    let Some(body) = program.body(initializer.body) else {
+        return Err(AnalysisFailure::RequestMismatch);
+    };
+    let mut initialized = Vec::new();
+    initialized
+        .try_reserve_exact(structure.fields.len())
+        .map_err(|_| AnalysisFailure::ResourceLimit {
+            resource: "initializer census fields",
+            limit: structure.fields.len() as u64,
+        })?;
+    initialized.resize(structure.fields.len(), false);
+    for statement_id in &body.statements {
+        check_cancelled(is_cancelled)?;
+        let Some(statement) = program.statement(*statement_id) else {
+            return Err(AnalysisFailure::RequestMismatch);
+        };
+        let StatementKind::Assign {
+            targets,
+            operator: wrela_hir::AssignmentOperator::Assign,
+            value,
+        } = &statement.kind
+        else {
+            return Ok(Some(initializer_diagnostic(
+                statement.source,
+                "semantic-init-control-flow-pending",
+                "initializer body contains control flow or an operation beyond direct field initialization",
+            )));
+        };
+        let [target] = targets.as_slice() else {
+            return Ok(Some(initializer_diagnostic(
+                statement.source,
+                "semantic-init-assignment-shape",
+                "initializer assignment must target exactly one direct self field",
+            )));
+        };
+        let [wrela_hir::PlaceProjection::Field(name)] = target.projections.as_slice() else {
+            return Ok(Some(initializer_diagnostic(
+                target.source,
+                "semantic-init-assignment-shape",
+                "initializer assignment must target exactly one direct self field",
+            )));
+        };
+        let Some(field_index) = structure
+            .fields
+            .iter()
+            .position(|field| field.name == *name)
+        else {
+            return Ok(Some(initializer_diagnostic(
+                target.source,
+                "semantic-init-assignment-shape",
+                "initializer assignment names no declared field",
+            )));
+        };
+        let rhs_matches = program.expression(*value).is_some_and(|expression| {
+            matches!(expression.kind,
+                ExpressionKind::Reference(Definition::Parameter(parameter))
+                    if initializer.parameters.get(field_index.saturating_add(1)) == Some(&parameter))
+        });
+        if !matches!(target.root, Definition::Parameter(parameter) if parameter == receiver.id)
+            || !rhs_matches
+            || std::mem::replace(&mut initialized[field_index], true)
+        {
+            return Ok(Some(initializer_diagnostic(
+                statement.source,
+                "semantic-init-assignment-shape",
+                "initializer must assign each self field exactly once from its matching parameter",
+            )));
+        }
+    }
+    if initialized.iter().any(|field| !field) {
+        return Ok(Some(initializer_diagnostic(
+            body.source,
+            "semantic-init-partial",
+            "initializer success path leaves a field uninitialized",
+        )));
+    }
+    Ok(None)
+}
+
 fn diagnose_unsupported_initializers(
     request: &AnalysisRequest<'_>,
     diagnostics: &mut Vec<Diagnostic>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), AnalysisFailure> {
-    for declaration in &request.hir.as_program().declarations {
+    for record in &request.hir.as_program().declarations {
         check_cancelled(is_cancelled)?;
-        if matches!(&declaration.kind, DeclarationKind::Initializer(_)) {
-            let mut diagnostic = Diagnostic::error(
-                Category::TYPE,
-                declaration.source,
-                "struct initializers (`init`) are not yet executable by semantic analysis",
-            );
-            diagnostic.code = Some("semantic-initializer-not-supported".to_owned());
-            diagnostic.notes.push(
-                "the dedicated initializer HIR is rejected before function, actor-message, and WIR production"
-                    .to_owned(),
-            );
-            diagnostic.help.push(
-                "remove the `init` declaration until struct construction semantics are implemented"
-                    .to_owned(),
-            );
+        let DeclarationKind::Initializer(initializer) = &record.kind else {
+            continue;
+        };
+        if let Some(diagnostic) = structural_initializer_diagnostic(
+            request.hir.as_program(),
+            record,
+            initializer,
+            is_cancelled,
+        )? {
             push_diagnostic(diagnostics, diagnostic, request.limits)?;
         }
     }
@@ -9155,6 +9397,277 @@ fn aggregate_has_initializer(program: &wrela_hir::Program, declaration: Declarat
     })
 }
 
+fn structure_initializer(
+    program: &wrela_hir::Program,
+    declaration: DeclarationId,
+) -> Option<(DeclarationId, &wrela_hir::InitializerDeclaration)> {
+    let record = program.declaration(declaration)?;
+    let DeclarationKind::Structure(aggregate) = &record.kind else {
+        return None;
+    };
+    aggregate.members.iter().find_map(|member| {
+        program.declaration(*member).and_then(|record| {
+            if let DeclarationKind::Initializer(initializer) = &record.kind {
+                Some((*member, initializer))
+            } else {
+                None
+            }
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_infallible_initializer(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    declaration: DeclarationId,
+    initializer_id: DeclarationId,
+    initializer: &wrela_hir::InitializerDeclaration,
+    ty: SemanticTypeId,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<()> {
+    check_cancelled(is_cancelled)?;
+    let program = request.hir.as_program();
+    let declaration_record = program
+        .declaration(declaration)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let initializer_record = program
+        .declaration(initializer_id)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let DeclarationKind::Structure(aggregate) = &declaration_record.kind else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    if !aggregate.generics.is_empty() {
+        return Err(runtime_type_diagnostic(
+            request,
+            initializer_record.source,
+            "semantic-init-generic-pending",
+            "generic structure initializers are not in the admitted constructor slice",
+            "this increment authenticates one closed nominal structure and its exact scalar fields",
+            "use a nongeneric structure until generic initializer monomorphization is implemented",
+        ));
+    }
+    if initializer.result.is_some() {
+        return Err(runtime_type_diagnostic(
+            request,
+            initializer_record.source,
+            "semantic-init-fallible-rollback-pending",
+            "fallible initializer rollback is not yet executable",
+            "Result-returning init requires partial-value teardown on every error edge",
+            "use an infallible initializer or construct the Result in an ordinary function",
+        ));
+    }
+    if aggregate.linear || aggregate.copy {
+        return Err(runtime_type_diagnostic(
+            request,
+            initializer_record.source,
+            "semantic-init-linearity-pending",
+            "linear and copy-annotated initializer protocols are not yet executable",
+            "the first initializer slice is limited to ordinary owned flat structures",
+            "use an ordinary struct until initializer ownership obligations are implemented",
+        ));
+    }
+    if aggregate.fields.is_empty() {
+        return Err(runtime_type_diagnostic(
+            request,
+            initializer_record.source,
+            "semantic-init-zero-sized-pending",
+            "zero-sized initializer protocols are not yet executable",
+            "this increment authenticates at least one primitive field assignment",
+            "omit init on the zero-sized structure until its construction contract is implemented",
+        ));
+    }
+    if aggregate.fields.iter().any(|field| {
+        field.visibility != wrela_hir::Visibility::Public
+            || !field.attributes.is_empty()
+            || field.default.is_some()
+    }) {
+        return Err(runtime_type_diagnostic(
+            request,
+            initializer_record.source,
+            "semantic-init-field-contract-pending",
+            "initializer fields must be public, attribute-free, and have no defaults in this slice",
+            "private/defaulted/attributed fields need a dedicated initializer-only lowering boundary",
+            "use plain public fields for this initializer increment",
+        ));
+    }
+    let semantic_fields = partial
+        .types
+        .get(ty.0 as usize)
+        .and_then(|record| match &record.kind {
+            SemanticTypeKind::Structure {
+                declaration: candidate,
+                fields,
+                ..
+            } if *candidate == declaration => Some(fields.clone()),
+            _ => None,
+        })
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if initializer.parameters.len() != aggregate.fields.len().saturating_add(1) {
+        return Err(runtime_type_diagnostic(
+            request,
+            initializer_record.source,
+            "semantic-init-parameter-shape",
+            "initializer must declare one value parameter for every structure field",
+            "the admitted call-site desugar has an exact one-to-one field parameter map",
+            "declare `mut self` followed by one same-named parameter per field",
+        ));
+    }
+    let receiver = initializer
+        .parameters
+        .first()
+        .and_then(|parameter| program.parameters.get(parameter.0 as usize))
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if !receiver.receiver
+        || receiver.access != wrela_hir::AccessMode::Mutate
+        || receiver.name.is_some()
+        || receiver.ty.is_some()
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            receiver.source,
+            "semantic-init-receiver-shape",
+            "initializer must begin with the exact `mut self` receiver",
+            "init owns one partially initialized receiver and cannot read, take, or relabel it",
+            "write `init(mut self, ...)`",
+        ));
+    }
+    for (index, ((field, semantic_field), parameter_id)) in aggregate
+        .fields
+        .iter()
+        .zip(&semantic_fields)
+        .zip(initializer.parameters.iter().skip(1))
+        .enumerate()
+    {
+        check_cancelled(is_cancelled)?;
+        let parameter = program
+            .parameters
+            .get(parameter_id.0 as usize)
+            .filter(|parameter| parameter.id == *parameter_id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let parameter_source_ty = parameter
+            .ty
+            .as_ref()
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let parameter_ty = semantic_type_from_source(
+            request,
+            partial,
+            parameter_source_ty,
+            aggregate_work,
+            is_cancelled,
+        )?;
+        if parameter.receiver
+            || parameter.access != wrela_hir::AccessMode::Value
+            || parameter.positional_only
+            || parameter.name.as_ref() != Some(&field.name)
+            || parameter_ty != semantic_field.ty
+            || runtime_scalar_type(partial, semantic_field.ty).is_none()
+        {
+            return Err(runtime_type_diagnostic(
+                request,
+                parameter.source,
+                "semantic-init-parameter-shape",
+                "initializer parameters must exactly mirror structure fields",
+                "field order, spelling, scalar type, and value access are authenticated before call-site desugaring",
+                "declare one same-named value parameter per field in declaration order",
+            ));
+        }
+        let _ = index;
+    }
+    let body = program
+        .body(initializer.body)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let mut initialized = Vec::new();
+    initialized
+        .try_reserve_exact(aggregate.fields.len())
+        .map_err(|_| fact_resource(request, "initializer fields"))?;
+    initialized.resize(aggregate.fields.len(), false);
+    for statement_id in &body.statements {
+        check_cancelled(is_cancelled)?;
+        let statement = program
+            .statement(*statement_id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let StatementKind::Assign {
+            targets,
+            operator: wrela_hir::AssignmentOperator::Assign,
+            value,
+        } = &statement.kind
+        else {
+            return Err(runtime_type_diagnostic(
+                request,
+                statement.source,
+                "semantic-init-control-flow-pending",
+                "initializer body contains control flow or an operation beyond direct field initialization",
+                "the admitted body is exactly one `self.field = field` assignment per field",
+                "move computation into ordinary functions and keep init as direct assignments",
+            ));
+        };
+        let [target] = targets.as_slice() else {
+            return Err(runtime_type_diagnostic(
+                request,
+                statement.source,
+                "semantic-init-assignment-shape",
+                "initializer assignment must target exactly one direct self field",
+                "parallel and projected stores do not have partial-initialization lowering",
+                "write one `self.field = field` assignment",
+            ));
+        };
+        let [wrela_hir::PlaceProjection::Field(field_name)] = target.projections.as_slice() else {
+            return Err(runtime_type_diagnostic(
+                request,
+                target.source,
+                "semantic-init-assignment-shape",
+                "initializer assignment must target one direct self field",
+                "nested and indexed partial places are not represented in this slice",
+                "write `self.field = field`",
+            ));
+        };
+        let receiver_matches =
+            matches!(target.root, Definition::Parameter(parameter) if parameter == receiver.id);
+        let Some(field_index) = aggregate
+            .fields
+            .iter()
+            .position(|field| field.name == *field_name)
+        else {
+            return Err(runtime_type_diagnostic(
+                request,
+                target.source,
+                "semantic-init-assignment-shape",
+                "initializer assignment names no declared field",
+                "field identities are nominal and matched exactly",
+                "assign one of the structure's declared fields",
+            ));
+        };
+        let rhs_matches = program.expression(*value).is_some_and(|expression| {
+            matches!(expression.kind, ExpressionKind::Reference(Definition::Parameter(parameter))
+                if initializer.parameters.get(field_index.saturating_add(1)) == Some(&parameter))
+        });
+        if !receiver_matches || !rhs_matches || initialized[field_index] {
+            return Err(runtime_type_diagnostic(
+                request,
+                statement.source,
+                "semantic-init-assignment-shape",
+                "initializer must assign each self field exactly once from its matching parameter",
+                "the call-site desugar preserves only the authenticated one-to-one field map",
+                "write one `self.field = field` assignment for every field",
+            ));
+        }
+        initialized[field_index] = true;
+    }
+    if initialized.iter().any(|field| !field) {
+        return Err(runtime_type_diagnostic(
+            request,
+            body.source,
+            "semantic-init-partial",
+            "initializer success path leaves a field uninitialized",
+            "every field must be assigned exactly once before normal completion",
+            "assign the missing field directly from its matching initializer parameter",
+        ));
+    }
+    Ok(())
+}
+
 fn parameter_is_effectively_positional(
     parameter: &wrela_hir::Parameter,
     non_receiver_count: usize,
@@ -10983,14 +11496,66 @@ fn analyze_direct_call(
         );
     }
     if has_initializer {
-        return Err(runtime_type_diagnostic(
+        let (initializer_id, initializer) =
+            structure_initializer(request.hir.as_program(), resolved.declaration)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+        let ty = ensure_flat_structure_type(
             request,
-            call.source,
-            "semantic-struct-construction-not-supported",
-            "initializer-based construction is not yet supported by semantic analysis",
-            "structs with an `init` member require the dedicated initializer protocol; they cannot use structure field construction",
-            "remove the initializer-based construction call until initializer execution is implemented",
-        ));
+            partial,
+            resolved.declaration,
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )?;
+        validate_infallible_initializer(
+            request,
+            partial,
+            resolved.declaration,
+            initializer_id,
+            initializer,
+            ty,
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )?;
+        if call.arguments.len() != initializer.parameters.len().saturating_sub(1) {
+            return Err(runtime_type_diagnostic(
+                request,
+                call.source,
+                "semantic-init-argument",
+                "initializer construction must supply every initializer parameter exactly once",
+                "the admitted init protocol has an exact, closed parameter list",
+                "supply one argument for every non-receiver initializer parameter",
+            ));
+        }
+        let outcome = analyze_flat_structure_constructor(
+            request,
+            partial,
+            function,
+            call,
+            resolved.declaration,
+            expression_request,
+            state,
+            is_cancelled,
+        )?;
+        let fact = partial
+            .expressions
+            .iter_mut()
+            .rev()
+            .find(|fact| fact.function == function && fact.expression == call.expression)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if !matches!(
+            fact.resolution,
+            ExpressionResolution::Constructor {
+                ty: candidate,
+                variant: None,
+            } if candidate == ty
+        ) {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        }
+        fact.resolution = ExpressionResolution::InitializerConstruction {
+            ty,
+            initializer: initializer_id,
+        };
+        return Ok(outcome);
     }
     let generic_arguments = match request
         .hir
@@ -25767,7 +26332,7 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn parsed_initializer_stops_before_callable_or_wir_facts() {
+    fn unsupported_unused_initializer_still_fails_closed_before_wir() {
         const SOURCE: &str = r#"module app
 
 from core.image import Image, Target
@@ -25788,27 +26353,22 @@ pub fn boot() -> Image:
                 &|| false,
             )
             .expect("unsupported initializer is a structured source diagnostic");
-        assert_eq!(output.diagnostics().len(), 1);
         assert_eq!(
-            output.diagnostics()[0].code.as_deref(),
-            Some("semantic-initializer-not-supported")
+            output
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.as_deref()),
+            Some("semantic-init-zero-sized-pending")
         );
-        assert!(output.has_errors());
+        assert!(output.successful().is_none());
         let partial = output.partial();
         assert!(partial.functions.is_empty());
-        assert!(partial.expressions.is_empty());
-        assert!(partial.statements.is_empty());
         assert!(partial.graph.is_none());
     }
 
     #[test]
-    fn parsed_initializer_struct_flat_call_is_rejected_by_the_initializer_diagnostic() {
-        // A struct with an `init` member is caught by the blanket
-        // not-yet-supported initializer diagnostic before any call
-        // expression (including a would-be flat construction call) is
-        // ever reached, so no separate construction-specific diagnostic
-        // fires here.
-        const TYPES: &str = "module app.math\n\npub struct Cache:\n    value: u32\n\n    init(mut self, value: u32):\n        self.value = value\n";
+    fn initializer_construction_wrong_arity_has_a_call_site_diagnostic() {
+        const TYPES: &str = "module app.math\n\npub struct Cache:\n    pub value: u32\n\n    init(mut self, value: u32):\n        self.value = value\n";
         const TEST: &str = concat!(
             "module app.math_test\n\n",
             "from app.math import Cache\n\n",
@@ -25833,16 +26393,194 @@ pub fn boot() -> Image:
         assert!(output.successful().is_none());
         assert_eq!(output.diagnostics().len(), 1);
         let diagnostic = &output.diagnostics()[0];
-        assert_eq!(
-            diagnostic.code.as_deref(),
-            Some("semantic-initializer-not-supported")
-        );
+        assert_eq!(diagnostic.code.as_deref(), Some("semantic-init-argument"));
         assert_eq!(diagnostic.category, Category::TYPE);
         assert!(
             output.partial().expressions.iter().all(|fact| {
                 !matches!(fact.resolution, ExpressionResolution::Constructor { .. })
             })
         );
+    }
+
+    #[test]
+    fn canonical_infallible_initializer_constructs_a_flat_scalar_value() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Box:
+    pub value: u64
+
+    init(mut self, value: u64):
+        self.value = value
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn initializer_constructs():
+    built: Box = Box(42)
+    observed: u64 = built.value
+    return
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert!(
+            output.diagnostics().is_empty(),
+            "canonical infallible initializer must analyze cleanly: {:?}",
+            output.diagnostics()
+        );
+        let analyzed = output
+            .successful()
+            .expect("sealed initializer construction");
+        let facts = analyzed.facts();
+        let mut forged = facts.clone();
+        let initializer = forged
+            .expressions
+            .iter_mut()
+            .find_map(|fact| match &mut fact.resolution {
+                ExpressionResolution::InitializerConstruction { initializer, .. } => {
+                    Some(initializer)
+                }
+                _ => None,
+            })
+            .expect("initializer construction fact");
+        let structure = analyzed
+            .hir()
+            .as_program()
+            .declarations
+            .iter()
+            .find(|declaration| {
+                matches!(declaration.kind, DeclarationKind::Structure(_))
+                    && declaration
+                        .name
+                        .as_ref()
+                        .is_some_and(|name| name.as_str() == "Box")
+            })
+            .expect("Box declaration")
+            .id;
+        *initializer = structure;
+        forged
+            .validate_partial_structure()
+            .expect("in-range initializer identity forgery remains prefix-valid");
+        assert!(
+            forged.validate_for_seal(analyzed.hir(), &|| false).is_err(),
+            "exact sealing must reject replacing the selected init declaration with its owner"
+        );
+
+        let exact_count = u32::try_from(facts.expressions.len()).expect("bounded fact count");
+        let mut exact_limits = AnalysisLimits::standard();
+        exact_limits.expression_facts = exact_count;
+        assert!(
+            compile_scope_fixture_result(SOURCE, exact_limits, &|| false)
+                .expect("exact initializer expression-fact limit")
+                .successful()
+                .is_some()
+        );
+        let mut below_limits = AnalysisLimits::standard();
+        below_limits.expression_facts = exact_count - 1;
+        assert!(matches!(
+            compile_scope_fixture_result(SOURCE, below_limits, &|| false),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "expression facts",
+                ..
+            })
+        ));
+
+        let polls = Cell::new(0u32);
+        assert!(
+            compile_scope_fixture_result(SOURCE, AnalysisLimits::standard(), &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            })
+            .expect("counted initializer analysis")
+            .successful()
+            .is_some()
+        );
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            compile_scope_fixture_result(SOURCE, AnalysisLimits::standard(), &|| {
+                let next = polls.get().saturating_add(1);
+                polls.set(next);
+                next >= final_poll
+            }),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn partial_initializer_fails_closed_with_named_diagnostic() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Pair:
+    pub left: u64
+    pub right: u64
+
+    init(mut self, left: u64, right: u64):
+        self.left = left
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn partial_initializer_is_rejected():
+    built: Pair = Pair(left=1, right=2)
+    return
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        assert_eq!(
+            output
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.as_deref()),
+            Some("semantic-init-partial"),
+            "partial initialization must not fall back to direct field construction: {:?}",
+            output.diagnostics()
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn initializer_tails_fail_closed_with_stable_named_diagnostics() {
+        for (initializer, code) in [
+            (
+                "    init(mut self, value: u64) -> u64:\n        self.value = value\n        return 0\n",
+                "semantic-init-fallible-rollback-pending",
+            ),
+            (
+                "    init(mut self, value: u64):\n        pass\n",
+                "semantic-init-control-flow-pending",
+            ),
+            (
+                "    init(mut self, input: u64):\n        self.value = input\n",
+                "semantic-init-parameter-shape",
+            ),
+            (
+                "    init(mut self, value: u64):\n        self.value = value\n        self.value = value\n",
+                "semantic-init-assignment-shape",
+            ),
+        ] {
+            let source = format!(
+                "module app\n\nfrom core.image import Image, Target\n\npub struct Box:\n    pub value: u64\n\n{initializer}\n@image\npub fn boot() -> Image:\n    return Image(name=\"scope-image\", target=Target.aarch64_qemu_virt_uefi)\n"
+            );
+            let output = compile_scope_fixture(&source);
+            assert_eq!(
+                output
+                    .diagnostics()
+                    .first()
+                    .and_then(|diagnostic| diagnostic.code.as_deref()),
+                Some(code),
+                "{initializer}: {:?}",
+                output.diagnostics()
+            );
+            assert!(output.successful().is_none());
+        }
     }
 
     #[test]
@@ -33036,7 +33774,11 @@ fn scope_binding_is_lexical():
     return
 "#;
 
-    fn compile_scope_fixture(source: &str) -> AnalysisOutput {
+    fn compile_scope_fixture_result(
+        source: &str,
+        limits: AnalysisLimits,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<AnalysisOutput, AnalysisFailure> {
         let fixture = parsed_actor_fixture(source);
         let changes = no_changes();
         let analyzer = CanonicalSemanticAnalyzer::new();
@@ -33058,30 +33800,33 @@ fn scope_binding_is_lexical():
             .analyze(discovery_request, &|| false)
             .expect("scope fixture discovery");
         if discovery.has_errors() {
-            return discovery;
+            return Ok(discovery);
         }
         let plan = discovery
             .successful()
             .and_then(|image| image.facts().test_plan.as_ref())
             .expect("scope fixture runtime test plan")
             .clone();
-        analyzer
-            .analyze(
-                AnalysisRequest {
-                    hir: Arc::clone(&fixture.fixture.hir),
-                    standard_library_package: PackageId(1),
-                    target: fixture.fixture.target.semantic(),
-                    build: &fixture.fixture.build,
-                    mode: AnalysisMode::CompileTestGroup {
-                        plan: &plan,
-                        group: plan.image_groups()[0].id,
-                        declared_entry: None,
-                    },
-                    changes: &changes,
-                    limits: AnalysisLimits::standard(),
+        analyzer.analyze(
+            AnalysisRequest {
+                hir: Arc::clone(&fixture.fixture.hir),
+                standard_library_package: PackageId(1),
+                target: fixture.fixture.target.semantic(),
+                build: &fixture.fixture.build,
+                mode: AnalysisMode::CompileTestGroup {
+                    plan: &plan,
+                    group: plan.image_groups()[0].id,
+                    declared_entry: None,
                 },
-                &|| false,
-            )
+                changes: &changes,
+                limits,
+            },
+            is_cancelled,
+        )
+    }
+
+    fn compile_scope_fixture(source: &str) -> AnalysisOutput {
+        compile_scope_fixture_result(source, AnalysisLimits::standard(), &|| false)
             .expect("scope fixture compilation")
     }
 

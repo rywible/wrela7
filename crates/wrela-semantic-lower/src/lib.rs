@@ -5478,6 +5478,11 @@ struct AggregateInput {
     effects: sema::EffectSet,
 }
 
+struct InitializerAggregateInput {
+    aggregate: AggregateInput,
+    initializer: wrela_hir::DeclarationId,
+}
+
 struct EnumAggregateInput {
     expression: wrela_hir::ExpressionId,
     source: Span,
@@ -5654,6 +5659,7 @@ enum SourceExpressionPlan {
         result: Option<sema::ValueId>,
     },
     Aggregate(AggregateInput),
+    InitializerAggregate(InitializerAggregateInput),
     EnumAggregate(EnumAggregateInput),
     Project(ProjectInput),
     ActorStateLoad(sema::ActorStateAccess),
@@ -7909,6 +7915,21 @@ impl SourceFunctionLowerer<'_> {
                     }),
                     (
                         wrela_hir::ExpressionKind::Call { callee, arguments },
+                        sema::ExpressionResolution::InitializerConstruction { ty, initializer },
+                    ) => SourceExpressionPlan::InitializerAggregate(InitializerAggregateInput {
+                        aggregate: AggregateInput {
+                            expression: expression_id,
+                            source: expression.source,
+                            callee: *callee,
+                            source_argument_count: arguments.len(),
+                            ty: *ty,
+                            result: fact.result,
+                            effects: fact.effects,
+                        },
+                        initializer: *initializer,
+                    }),
+                    (
+                        wrela_hir::ExpressionKind::Call { callee, arguments },
                         sema::ExpressionResolution::Constructor {
                             ty,
                             variant: Some(variant),
@@ -8388,6 +8409,9 @@ impl SourceFunctionLowerer<'_> {
             }
             SourceExpressionPlan::Aggregate(aggregate) => {
                 self.lower_flat_aggregate(aggregate, statements)
+            }
+            SourceExpressionPlan::InitializerAggregate(initializer) => {
+                self.lower_initializer_aggregate(initializer, statements)
             }
             SourceExpressionPlan::EnumAggregate(aggregate) => {
                 self.lower_enum_aggregate(aggregate, statements)
@@ -9412,6 +9436,170 @@ impl SourceFunctionLowerer<'_> {
             Some(aggregate.source),
         )?;
         Ok(LoweredExpression::Value(result))
+    }
+
+    fn lower_initializer_aggregate(
+        &mut self,
+        initializer: InitializerAggregateInput,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<LoweredExpression, LowerError> {
+        self.validate_initializer_aggregate(&initializer)?;
+        self.lower_flat_aggregate(initializer.aggregate, statements)
+    }
+
+    fn validate_initializer_aggregate(
+        &self,
+        input: &InitializerAggregateInput,
+    ) -> Result<(), LowerError> {
+        check_cancelled(self.is_cancelled)?;
+        let program = self.input.hir().as_program();
+        let (declaration, semantic_fields) = self
+            .input
+            .facts()
+            .types
+            .get(input.aggregate.ty.0 as usize)
+            .and_then(|ty| match &ty.kind {
+                sema::SemanticTypeKind::Structure {
+                    declaration,
+                    arguments,
+                    fields,
+                } if arguments.is_empty() => Some((*declaration, fields)),
+                _ => None,
+            })
+            .ok_or_else(|| self.fact_mismatch("initializer structure type"))?;
+        let declaration_record = program
+            .declaration(declaration)
+            .ok_or_else(|| self.fact_mismatch("initializer structure declaration"))?;
+        let wrela_hir::DeclarationKind::Structure(structure) = &declaration_record.kind else {
+            return Err(self.fact_mismatch("initializer structure declaration kind"));
+        };
+        if !structure.generics.is_empty()
+            || structure.linear
+            || structure.copy
+            || structure.fields.len() != semantic_fields.len()
+            || !structure.members.contains(&input.initializer)
+        {
+            return Err(self.fact_mismatch("initializer structure contract"));
+        }
+        let initializer_record = program
+            .declaration(input.initializer)
+            .ok_or_else(|| self.fact_mismatch("initializer declaration"))?;
+        let wrela_hir::DeclarationKind::Initializer(initializer) = &initializer_record.kind else {
+            return Err(self.fact_mismatch("initializer declaration kind"));
+        };
+        if initializer.result.is_some()
+            || initializer.parameters.len() != semantic_fields.len().saturating_add(1)
+            || input.aggregate.source_argument_count != semantic_fields.len()
+        {
+            return Err(self.fact_mismatch("initializer arity or result contract"));
+        }
+        let receiver = initializer
+            .parameters
+            .first()
+            .and_then(|parameter| program.parameters.get(parameter.0 as usize))
+            .ok_or_else(|| self.fact_mismatch("initializer receiver"))?;
+        if !receiver.receiver
+            || receiver.access != wrela_hir::AccessMode::Mutate
+            || receiver.name.is_some()
+            || receiver.ty.is_some()
+        {
+            return Err(self.fact_mismatch("initializer receiver contract"));
+        }
+        for ((source_field, semantic_field), parameter_id) in structure
+            .fields
+            .iter()
+            .zip(semantic_fields)
+            .zip(initializer.parameters.iter().skip(1))
+        {
+            check_cancelled(self.is_cancelled)?;
+            let parameter = program
+                .parameters
+                .get(parameter_id.0 as usize)
+                .filter(|parameter| parameter.id == *parameter_id)
+                .ok_or_else(|| self.fact_mismatch("initializer field parameter"))?;
+            let primitive = self
+                .input
+                .facts()
+                .types
+                .get(semantic_field.ty.0 as usize)
+                .is_some_and(|ty| {
+                    matches!(
+                        ty.kind,
+                        sema::SemanticTypeKind::Bool
+                            | sema::SemanticTypeKind::Integer { .. }
+                            | sema::SemanticTypeKind::Float { .. }
+                    )
+                });
+            if source_field.visibility != wrela_hir::Visibility::Public
+                || !source_field.attributes.is_empty()
+                || source_field.default.is_some()
+                || !primitive
+                || parameter.receiver
+                || parameter.access != wrela_hir::AccessMode::Value
+                || parameter.positional_only
+                || parameter.name.as_ref() != Some(&source_field.name)
+                || parameter.ty.as_ref().is_none_or(|source| {
+                    !source_type_matches_semantic(self.input.facts(), source, semantic_field.ty)
+                })
+            {
+                return Err(self.fact_mismatch("initializer field parameter contract"));
+            }
+        }
+        let body = program
+            .body(initializer.body)
+            .ok_or_else(|| self.fact_mismatch("initializer body"))?;
+        let mut initialized = try_vec(
+            semantic_fields.len(),
+            "SemanticWir initializer fields",
+            self.limits.model_edges,
+        )?;
+        initialized.resize(semantic_fields.len(), false);
+        for statement_id in &body.statements {
+            check_cancelled(self.is_cancelled)?;
+            let statement = program
+                .statement(*statement_id)
+                .ok_or_else(|| self.fact_mismatch("initializer statement"))?;
+            let wrela_hir::StatementKind::Assign {
+                targets,
+                operator: wrela_hir::AssignmentOperator::Assign,
+                value,
+            } = &statement.kind
+            else {
+                return Err(self.fact_mismatch("initializer direct assignment body"));
+            };
+            let [target] = targets.as_slice() else {
+                return Err(self.fact_mismatch("initializer assignment target"));
+            };
+            let [wrela_hir::PlaceProjection::Field(field)] = target.projections.as_slice() else {
+                return Err(self.fact_mismatch("initializer direct field target"));
+            };
+            if !matches!(target.root, wrela_hir::Definition::Parameter(parameter) if parameter == receiver.id)
+            {
+                return Err(self.fact_mismatch("initializer receiver target"));
+            }
+            let field_index = structure
+                .fields
+                .iter()
+                .position(|candidate| candidate.name == *field)
+                .ok_or_else(|| self.fact_mismatch("initializer field identity"))?;
+            let matching_parameter = initializer
+                .parameters
+                .get(field_index.saturating_add(1))
+                .copied()
+                .ok_or_else(|| self.fact_mismatch("initializer parameter identity"))?;
+            if !program.expression(*value).is_some_and(|expression| {
+                matches!(expression.kind,
+                    wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Parameter(parameter))
+                        if parameter == matching_parameter)
+            }) || std::mem::replace(&mut initialized[field_index], true)
+            {
+                return Err(self.fact_mismatch("initializer field assignment map"));
+            }
+        }
+        if initialized.iter().any(|field| !field) {
+            return Err(self.fact_mismatch("initializer complete field map"));
+        }
+        Ok(())
     }
 
     fn lower_enum_aggregate(
@@ -16103,6 +16291,124 @@ pub fn boot() -> Image:
             seal(&request, wrong_owner, report, &|| false),
             Err(LowerError::InvalidOutput(_))
         ));
+    }
+
+    #[test]
+    fn canonical_infallible_initializer_lowers_to_exact_aggregate() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Box:
+    pub value: u64
+
+    init(mut self, value: u64):
+        self.value = value
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        built: Box = Box(42)
+        observed: u64 = built.value
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#;
+        let image = analyze_parsed_actor_source(SOURCE);
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("canonical initializer lowers");
+        let wir = output.wir().as_wir();
+        let aggregate_count = wir
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .filter(|statement| {
+                matches!(
+                    statement,
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::Aggregate { fields, .. },
+                        ..
+                    }) if fields.len() == 1
+                )
+            })
+            .count();
+        assert_eq!(
+            aggregate_count, 1,
+            "init must desugar to one flat aggregate"
+        );
+
+        let exact_operations = output.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact initializer operation limit");
+        let mut below = exact;
+        below.operations = exact_operations - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: below,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                ..
+            })
+        ));
+
+        let polls = Cell::new(0u32);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("counted initializer lowering");
+        let final_poll = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
     }
 
     #[test]

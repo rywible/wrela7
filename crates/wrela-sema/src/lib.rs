@@ -703,6 +703,14 @@ pub enum ExpressionResolution {
         ty: SemanticTypeId,
         variant: Option<u32>,
     },
+    /// A structure value produced by one exact, infallible `init` protocol.
+    /// The initializer declaration identity is retained so validation and
+    /// lowering can replay the source protocol instead of trusting layout
+    /// compatibility or treating the call as direct field construction.
+    InitializerConstruction {
+        ty: SemanticTypeId,
+        initializer: DeclarationId,
+    },
     ResultTry {
         result_type: SemanticTypeId,
         ok_variant: u32,
@@ -3841,6 +3849,21 @@ fn validate_exact_expression_fact(
             )? => {}
         (
             wrela_hir::ExpressionKind::Call { callee, arguments },
+            ExpressionResolution::InitializerConstruction { ty, initializer },
+            Some(_),
+        ) if *ty == fact.ty
+            && exact_initializer_constructor_matches(
+                analysis,
+                program,
+                function.id,
+                *callee,
+                arguments,
+                *ty,
+                *initializer,
+                is_cancelled,
+            )? => {}
+        (
+            wrela_hir::ExpressionKind::Call { callee, arguments },
             ExpressionResolution::Constructor {
                 ty,
                 variant: Some(variant),
@@ -4720,6 +4743,169 @@ fn exact_flat_constructor_matches(
         }
     }
     Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_initializer_constructor_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    function: FunctionInstanceId,
+    callee: ExpressionId,
+    arguments: &[wrela_hir::CallArgument],
+    ty: SemanticTypeId,
+    initializer_id: DeclarationId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, AnalysisFailure> {
+    if !exact_flat_constructor_matches(
+        analysis,
+        program,
+        function,
+        callee,
+        arguments,
+        ty,
+        is_cancelled,
+    )? {
+        return Ok(false);
+    }
+    let Some(SemanticTypeKind::Structure {
+        declaration,
+        arguments: type_arguments,
+        fields,
+    }) = analysis.types.get(ty.0 as usize).map(|record| &record.kind)
+    else {
+        return Ok(false);
+    };
+    if !type_arguments.is_empty() || fields.is_empty() {
+        return Ok(false);
+    }
+    let Some(wrela_hir::Declaration {
+        kind: wrela_hir::DeclarationKind::Structure(source_structure),
+        ..
+    }) = program.declaration(*declaration)
+    else {
+        return Ok(false);
+    };
+    if !source_structure.generics.is_empty()
+        || source_structure.linear
+        || source_structure.copy
+        || source_structure.fields.len() != fields.len()
+        || !source_structure.members.contains(&initializer_id)
+        || source_structure.fields.iter().any(|field| {
+            field.visibility != wrela_hir::Visibility::Public
+                || !field.attributes.is_empty()
+                || field.default.is_some()
+        })
+    {
+        return Ok(false);
+    }
+    let Some(wrela_hir::Declaration {
+        kind: wrela_hir::DeclarationKind::Initializer(initializer),
+        ..
+    }) = program.declaration(initializer_id)
+    else {
+        return Ok(false);
+    };
+    if initializer.result.is_some()
+        || initializer.parameters.len() != fields.len().saturating_add(1)
+    {
+        return Ok(false);
+    }
+    let Some(receiver) = initializer
+        .parameters
+        .first()
+        .and_then(|parameter| program.parameters.get(parameter.0 as usize))
+    else {
+        return Ok(false);
+    };
+    if !receiver.receiver
+        || receiver.access != wrela_hir::AccessMode::Mutate
+        || receiver.name.is_some()
+        || receiver.ty.is_some()
+    {
+        return Ok(false);
+    }
+    for ((source_field, field), parameter_id) in source_structure
+        .fields
+        .iter()
+        .zip(fields)
+        .zip(initializer.parameters.iter().skip(1))
+    {
+        check_analysis_cancelled(is_cancelled)?;
+        let Some(parameter) = program
+            .parameters
+            .get(parameter_id.0 as usize)
+            .filter(|parameter| parameter.id == *parameter_id)
+        else {
+            return Ok(false);
+        };
+        if parameter.receiver
+            || parameter.access != wrela_hir::AccessMode::Value
+            || parameter.positional_only
+            || parameter.name.as_ref() != Some(&source_field.name)
+            || parameter
+                .ty
+                .as_ref()
+                .and_then(|source| exact_scalar_source_type(analysis, source))
+                != Some(field.ty)
+        {
+            return Ok(false);
+        }
+    }
+    let Some(body) = program.body(initializer.body) else {
+        return Ok(false);
+    };
+    let mut initialized = Vec::new();
+    initialized
+        .try_reserve_exact(fields.len())
+        .map_err(|_| AnalysisFailure::ResourceLimit {
+            resource: "initializer validation fields",
+            limit: fields.len() as u64,
+        })?;
+    initialized.resize(fields.len(), false);
+    for statement_id in &body.statements {
+        check_analysis_cancelled(is_cancelled)?;
+        let Some(wrela_hir::Statement {
+            kind:
+                wrela_hir::StatementKind::Assign {
+                    targets,
+                    operator: wrela_hir::AssignmentOperator::Assign,
+                    value,
+                },
+            ..
+        }) = program.statement(*statement_id)
+        else {
+            return Ok(false);
+        };
+        let [target] = targets.as_slice() else {
+            return Ok(false);
+        };
+        let [wrela_hir::PlaceProjection::Field(name)] = target.projections.as_slice() else {
+            return Ok(false);
+        };
+        if !matches!(target.root, wrela_hir::Definition::Parameter(parameter) if parameter == receiver.id)
+        {
+            return Ok(false);
+        }
+        let Some(field_index) = source_structure
+            .fields
+            .iter()
+            .position(|field| field.name == *name)
+        else {
+            return Ok(false);
+        };
+        let rhs_matches = program.expression(*value).is_some_and(|expression| {
+            matches!(expression.kind,
+                wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Parameter(parameter))
+                    if initializer.parameters.get(field_index.saturating_add(1)) == Some(&parameter))
+        });
+        let Some(slot) = initialized.get_mut(field_index) else {
+            return Ok(false);
+        };
+        if !rhs_matches || std::mem::replace(slot, true) {
+            return Ok(false);
+        }
+    }
+    Ok(initialized.into_iter().all(|field| field))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7994,6 +8180,13 @@ fn valid_expression_resolution(
                 }
                 _ => false,
             }),
+        ExpressionResolution::InitializerConstruction { ty, initializer } => {
+            analysis
+                .types
+                .get(ty.0 as usize)
+                .is_some_and(|record| matches!(record.kind, SemanticTypeKind::Structure { .. }))
+                && (initializer.0 as usize) < analysis.hir.declarations as usize
+        }
         ExpressionResolution::ResultTry {
             result_type,
             ok_variant,
@@ -8847,6 +9040,7 @@ fn valid_expression_region(
             | ExpressionResolution::Scope(_)
             | ExpressionResolution::Projection(_)
             | ExpressionResolution::Constructor { .. }
+            | ExpressionResolution::InitializerConstruction { .. }
             | ExpressionResolution::ResultTry { .. }
             | ExpressionResolution::ClosedRange { .. }
             | ExpressionResolution::DirectCall { .. }
@@ -10814,6 +11008,7 @@ fn validate_fact_resources(
             | ExpressionResolution::Scope(_)
             | ExpressionResolution::Projection(_)
             | ExpressionResolution::Constructor { .. }
+            | ExpressionResolution::InitializerConstruction { .. }
             | ExpressionResolution::ResultTry { .. }
             | ExpressionResolution::ClosedRange { .. }
             | ExpressionResolution::ActorRequest { .. }

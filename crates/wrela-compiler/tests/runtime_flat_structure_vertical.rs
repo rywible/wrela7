@@ -116,6 +116,32 @@ fn local_field_update_reaches_native():
     return
 "#;
 
+const INITIALIZER_SOURCE: &str = r#"module app.duration
+
+pub struct Box:
+    pub value: u64
+
+    init(mut self, value: u64):
+        self.value = value
+
+pub fn make_box(value: u64) -> Box:
+    return Box(value)
+
+pub fn read_box(value: Box) -> u64:
+    return value.value
+"#;
+
+const INITIALIZER_TEST_SOURCE: &str = r#"module app.duration_test
+
+from app.duration import Box, make_box, read_box
+
+@test(runtime)
+fn initializer_reaches_native():
+    built: Box = make_box(42)
+    observed: u64 = read_box(built)
+    return
+"#;
+
 const LOCAL_RESULT_SOURCE: &str = r#"module app.duration
 
 pub enum LocalResult:
@@ -839,6 +865,111 @@ fn local_flat_field_update_reaches_deterministic_native_coff() {
                 first.bytes(),
                 second.bytes(),
                 "identical field-update MachineWir must emit byte-identical ARM64 COFF"
+            );
+        }
+    }
+}
+
+#[test]
+fn infallible_initializer_reaches_deterministic_native_coff() {
+    let fixture = fixture(INITIALIZER_SOURCE, INITIALIZER_TEST_SOURCE);
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed(&fixture),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("infallible initializer lowers to SemanticWir");
+    let repeated_semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed(&fixture),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("repeat infallible initializer lowering");
+    assert_eq!(semantic.wir().as_wir(), repeated_semantic.wir().as_wir());
+    assert_eq!(
+        semantic
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .filter(|statement| matches!(
+                statement,
+                LoweredSemanticStatement::Let(statement)
+                    if matches!(&statement.operation, SemanticOperation::Aggregate { fields, .. } if fields.len() == 1)
+            ))
+            .count(),
+        1,
+        "the authenticated init body desugars to one aggregate construction"
+    );
+
+    let (semantic_wir, _) = semantic.into_parts();
+    let (repeated_semantic_wir, _) = repeated_semantic.into_parts();
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("initializer lowers to FlowWir");
+    let repeated_flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: repeated_semantic_wir,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("repeat initializer FlowWir lowering");
+    assert_eq!(flow.wir().as_wir(), repeated_flow.wir().as_wir());
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("initializer FlowWir canonical frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("initializer reaches MachineWir");
+    assert!(
+        prepared
+            .machine()
+            .wir()
+            .as_wir()
+            .types
+            .iter()
+            .any(|ty| ty.source_name.as_deref() == Some("Box")
+                && ty.kind == MachineTypeKind::Integer { bits: 64 })
+    );
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("initializer native object emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat initializer native object emission");
+            assert_eq!(
+                first.bytes(),
+                second.bytes(),
+                "identical initializer MachineWir must emit byte-identical ARM64 COFF"
             );
         }
     }
