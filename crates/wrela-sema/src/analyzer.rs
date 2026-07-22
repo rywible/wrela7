@@ -1259,16 +1259,10 @@ fn diagnose_deriving_clauses(
         }
         let valid_from_shape = match &declaration.kind {
             DeclarationKind::Structure(aggregate) => aggregate.fields.len() == 1,
-            DeclarationKind::Enumeration(enumeration) => {
-                let mut payloads = enumeration
-                    .variants
-                    .iter()
-                    .filter(|variant| !variant.fields.is_empty());
-                payloads
-                    .next()
-                    .is_some_and(|variant| variant.fields.len() == 1)
-                    && payloads.next().is_none()
-            }
+            DeclarationKind::Enumeration(enumeration) => matches!(
+                enumeration.variants.as_slice(),
+                [variant] if variant.fields.len() == 1
+            ),
             _ => false,
         };
         for name in deriving {
@@ -1279,11 +1273,11 @@ fn diagnose_deriving_clauses(
                         let mut diagnostic = Diagnostic::error(
                             Category::TYPE,
                             declaration.source,
-                            "`deriving(From)` requires exactly one payload-carrying field or variant",
+                            "`deriving(From)` requires exactly one payload-carrying field or a single-variant, single-field enum",
                         );
                         diagnostic.code = Some("semantic-deriving-from-shape".to_owned());
                         diagnostic.help.push(
-                            "use `deriving(From)` only on a single-field struct or a single-payload enum"
+                            "use `deriving(From)` only on a single-field struct or a single-variant enum with one field"
                                 .to_owned(),
                         );
                         push_diagnostic(diagnostics, diagnostic, request.limits)?;
@@ -13604,6 +13598,31 @@ fn analyze_direct_call(
         );
     }
     if let ExpressionKind::Field { base, name } = &callee_expression.kind {
+        if name.as_str() == "from" {
+            if let Some(ExpressionKind::Reference(Definition::Declaration(destination))) = request
+                .hir
+                .as_program()
+                .expression(*base)
+                .map(|expression| &expression.kind)
+            {
+                if request
+                    .hir
+                    .resolved_declaration(destination)
+                    .is_some_and(|record| matches!(record.kind, DeclarationKind::Enumeration(_)))
+                {
+                    return analyze_derived_from_call(
+                        request,
+                        partial,
+                        function,
+                        call,
+                        destination,
+                        expression_request,
+                        state,
+                        is_cancelled,
+                    );
+                }
+            }
+        }
         return analyze_concrete_method_call(
             request,
             partial,
@@ -14055,6 +14074,231 @@ fn analyze_direct_call(
         result: Some(result),
         referenced: None,
         effects: target_effects,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_derived_from_call(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    call: RuntimeDirectCall<'_>,
+    destination: &wrela_hir::ResolvedDeclaration,
+    expression_request: RuntimeExpressionRequest,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<RuntimeExpression> {
+    check_cancelled(is_cancelled)?;
+    let declaration = request
+        .hir
+        .resolved_declaration(destination)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let DeclarationKind::Enumeration(enumeration) = &declaration.kind else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    if !enumeration
+        .deriving
+        .iter()
+        .any(|name| name.as_str() == "From")
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-derived-from-required",
+            "associated `from` conversion requires `deriving(From)`",
+            "nominal enum identity does not synthesize conversion behavior by itself",
+            "add `deriving(From)` to an eligible destination enum",
+        ));
+    }
+    let [variant] = enumeration.variants.as_slice() else {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-deriving-from-shape",
+            "derived From destination is not a single-variant enum",
+            "the generated conversion has exactly one unambiguous payload-carrying constructor",
+            "use one variant with one positional field",
+        ));
+    };
+    let [source_field] = variant.fields.as_slice() else {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-deriving-from-shape",
+            "derived From destination variant does not have exactly one field",
+            "the generated conversion wraps one source value without field selection",
+            "give the sole variant one positional field",
+        ));
+    };
+    if !enumeration.generics.is_empty() || source_field.name.is_some() {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-deriving-from-profile-pending",
+            "derived From destination is outside the bounded executable profile",
+            "this increment admits a nongeneric enum with one positional stored copy-scalar field",
+            "use the exact nongeneric positional scalar profile",
+        ));
+    }
+    let ty = ensure_closed_scalar_enum_type(
+        request,
+        partial,
+        destination.declaration,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    if expression_request
+        .expected
+        .is_some_and(|expected| expected != ty)
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-derived-from-result-type",
+            "derived From conversion does not produce the required nominal type",
+            "conversion preserves the exact destination enum identity",
+            "use the result where the derived destination type is required",
+        ));
+    }
+    let payload_ty = partial
+        .types
+        .get(ty.0 as usize)
+        .and_then(|record| match &record.kind {
+            SemanticTypeKind::Enumeration { variants, .. } => variants
+                .first()
+                .and_then(|variant| variant.fields.first())
+                .map(|field| field.ty),
+            _ => None,
+        })
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if runtime_scalar_type(partial, payload_ty).is_none() {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-deriving-from-profile-pending",
+            "derived From payload is outside the stored copy-scalar profile",
+            "nominal, view, and linear payload conversion requires cleanup-aware generated semantics",
+            "use bool, an integer type, or f32/f64 as the sole payload",
+        ));
+    }
+    let callee = request
+        .hir
+        .as_program()
+        .expression(call.callee)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let ExpressionKind::Field { base, .. } = callee.kind else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: base,
+            ty,
+            result: None,
+            resolution: ExpressionResolution::DerivedFromType { enumeration: ty },
+            effects: EffectSet(0),
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: call.callee,
+            ty,
+            result: None,
+            resolution: ExpressionResolution::DerivedFromFunction {
+                enumeration: ty,
+                variant: 0,
+            },
+            effects: EffectSet(0),
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    let [argument] = call.arguments else {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-derived-from-argument",
+            "derived From conversion requires exactly one positional argument",
+            "unary generated conversion follows the language argument-label rule",
+            "supply one unlabeled source value",
+        ));
+    };
+    if argument.name.is_some() {
+        return Err(runtime_type_diagnostic(
+            request,
+            argument.source,
+            "semantic-argument-label-forbidden",
+            "unary derived From conversion forbids an argument label",
+            "calls with one non-receiver parameter are positional",
+            "remove the argument label",
+        ));
+    }
+    let wrela_hir::CallArgumentValue::Value(payload_expression) = argument.value else {
+        return Err(runtime_type_diagnostic(
+            request,
+            argument.source,
+            "semantic-derived-from-argument",
+            "derived From conversion consumes a plain source value",
+            "borrow, mutate, and take markers are not generated conversion arguments",
+            "pass the source value without an access marker",
+        ));
+    };
+    let payload = analyze_runtime_expression(
+        request,
+        partial,
+        function,
+        payload_expression,
+        RuntimeExpressionRequest {
+            expected: Some(payload_ty),
+            desired_result: None,
+            access: AccessMode::Value,
+        },
+        state,
+        is_cancelled,
+    )?;
+    let payload_value = payload
+        .referenced
+        .or(payload.result)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let result = expression_result(
+        request,
+        partial,
+        function,
+        (call.expression, call.source),
+        ty,
+        expression_request.desired_result,
+        is_cancelled,
+    )?;
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: call.expression,
+            ty,
+            result: Some(result),
+            resolution: ExpressionResolution::DerivedFrom {
+                enumeration: ty,
+                variant: 0,
+                payload: payload_value,
+            },
+            effects: payload.effects,
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    Ok(RuntimeExpression {
+        ty,
+        result: Some(result),
+        referenced: None,
+        effects: payload.effects,
     })
 }
 

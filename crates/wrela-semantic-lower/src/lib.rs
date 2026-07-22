@@ -6497,6 +6497,18 @@ struct EnumAggregateInput {
     effects: sema::EffectSet,
 }
 
+struct DerivedFromInput {
+    expression: wrela_hir::ExpressionId,
+    source: Span,
+    callee: wrela_hir::ExpressionId,
+    payload_expression: wrela_hir::ExpressionId,
+    enumeration: sema::SemanticTypeId,
+    variant: u32,
+    payload: sema::ValueId,
+    result: Option<sema::ValueId>,
+    effects: sema::EffectSet,
+}
+
 struct ProjectInput {
     expression: wrela_hir::ExpressionId,
     source: Span,
@@ -6725,6 +6737,7 @@ enum SourceExpressionPlan {
     Aggregate(AggregateInput),
     InitializerAggregate(InitializerAggregateInput),
     EnumAggregate(EnumAggregateInput),
+    DerivedFrom(DerivedFromInput),
     Project(ProjectInput),
     DerivedEquality(DerivedEqualityInput),
     ProjectionCall(ProjectionCallInput),
@@ -9786,6 +9799,36 @@ impl SourceFunctionLowerer<'_> {
                         })
                     }
                     (
+                        wrela_hir::ExpressionKind::Call { callee, arguments },
+                        sema::ExpressionResolution::DerivedFrom {
+                            enumeration,
+                            variant,
+                            payload,
+                        },
+                    ) if matches!(arguments.as_slice(), [argument]
+                        if matches!(argument.value, wrela_hir::CallArgumentValue::Value(_))) =>
+                    {
+                        let [argument] = arguments.as_slice() else {
+                            return Err(self.fact_mismatch("derived From argument count"));
+                        };
+                        let wrela_hir::CallArgumentValue::Value(payload_expression) =
+                            argument.value
+                        else {
+                            return Err(self.fact_mismatch("derived From payload access"));
+                        };
+                        SourceExpressionPlan::DerivedFrom(DerivedFromInput {
+                            expression: expression_id,
+                            source: expression.source,
+                            callee: *callee,
+                            payload_expression,
+                            enumeration: *enumeration,
+                            variant: *variant,
+                            payload: *payload,
+                            result: fact.result,
+                            effects: fact.effects,
+                        })
+                    }
+                    (
                         wrela_hir::ExpressionKind::Field { base, .. },
                         sema::ExpressionResolution::Field { index },
                     ) => SourceExpressionPlan::Project(ProjectInput {
@@ -10439,6 +10482,9 @@ impl SourceFunctionLowerer<'_> {
             }
             SourceExpressionPlan::EnumAggregate(aggregate) => {
                 self.lower_enum_aggregate(aggregate, statements)
+            }
+            SourceExpressionPlan::DerivedFrom(conversion) => {
+                self.lower_derived_from(conversion, statements)
             }
             SourceExpressionPlan::Project(project) => {
                 self.lower_flat_projection(project, statements)
@@ -12493,6 +12539,148 @@ impl SourceFunctionLowerer<'_> {
                 payload: Some(payload),
             },
             Some(aggregate.source),
+        )?;
+        Ok(LoweredExpression::Value(result))
+    }
+
+    fn lower_derived_from(
+        &mut self,
+        conversion: DerivedFromInput,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<LoweredExpression, LowerError> {
+        check_cancelled(self.is_cancelled)?;
+        if conversion.variant != 0 {
+            return Err(self.fact_mismatch("derived From variant"));
+        }
+        let program = self.input.hir().as_program();
+        let Some(wrela_hir::ExpressionKind::Field { base, name }) = program
+            .expression(conversion.callee)
+            .map(|expression| &expression.kind)
+        else {
+            return Err(self.fact_mismatch("derived From associated callee"));
+        };
+        let Some(wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(
+            destination,
+        ))) = program.expression(*base).map(|expression| &expression.kind)
+        else {
+            return Err(self.fact_mismatch("derived From destination reference"));
+        };
+        let declaration = program
+            .declaration(destination.declaration)
+            .filter(|declaration| {
+                declaration.module == destination.module
+                    && program
+                        .modules
+                        .get(destination.module.0 as usize)
+                        .is_some_and(|module| module.package == destination.package)
+            })
+            .ok_or_else(|| self.fact_mismatch("derived From destination identity"))?;
+        let wrela_hir::DeclarationKind::Enumeration(source) = &declaration.kind else {
+            return Err(self.fact_mismatch("derived From destination declaration"));
+        };
+        if name.as_str() != "from"
+            || !source.generics.is_empty()
+            || !source.deriving.iter().any(|name| name.as_str() == "From")
+            || !matches!(source.variants.as_slice(), [variant]
+                if matches!(variant.fields.as_slice(), [field] if field.name.is_none()))
+        {
+            return Err(self.fact_mismatch("derived From source contract"));
+        }
+        let base_fact = self.expression_fact(*base)?;
+        let callee_fact = self.expression_fact(conversion.callee)?;
+        if base_fact.ty != conversion.enumeration
+            || base_fact.result.is_some()
+            || base_fact.effects.0 != 0
+            || base_fact.resolution
+                != (sema::ExpressionResolution::DerivedFromType {
+                    enumeration: conversion.enumeration,
+                })
+            || callee_fact.ty != conversion.enumeration
+            || callee_fact.result.is_some()
+            || callee_fact.effects.0 != 0
+            || callee_fact.resolution
+                != (sema::ExpressionResolution::DerivedFromFunction {
+                    enumeration: conversion.enumeration,
+                    variant: 0,
+                })
+        {
+            return Err(self.fact_mismatch("derived From associated witnesses"));
+        }
+        self.push_seen_expression(*base)?;
+        self.push_seen_expression(conversion.callee)?;
+        let payload_ty = self
+            .input
+            .facts()
+            .types
+            .get(conversion.enumeration.0 as usize)
+            .and_then(|record| match &record.kind {
+                sema::SemanticTypeKind::Enumeration {
+                    declaration,
+                    arguments,
+                    variants,
+                } if *declaration == destination.declaration && arguments.is_empty() => {
+                    match variants.as_slice() {
+                        [variant] => match variant.fields.as_slice() {
+                            [field] => Some(field.ty),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .filter(|ty| {
+                self.input
+                    .facts()
+                    .types
+                    .get(ty.0 as usize)
+                    .is_some_and(|record| {
+                        matches!(
+                            record.kind,
+                            sema::SemanticTypeKind::Bool
+                                | sema::SemanticTypeKind::Integer { .. }
+                                | sema::SemanticTypeKind::Float { .. }
+                        )
+                    })
+            })
+            .ok_or_else(|| self.fact_mismatch("derived From semantic profile"))?;
+        let payload_fact = self.expression_fact(conversion.payload_expression)?;
+        let produced = match payload_fact.resolution {
+            sema::ExpressionResolution::Value(value) => Some(value),
+            _ => payload_fact.result,
+        };
+        if payload_fact.ty != payload_ty
+            || payload_fact.effects != conversion.effects
+            || produced != Some(conversion.payload)
+        {
+            return Err(self.fact_mismatch("derived From payload authority"));
+        }
+        let LoweredExpression::Value(payload) = self.lower_expression(
+            conversion.payload_expression,
+            sema::AccessMode::Value,
+            statements,
+        )?
+        else {
+            return Err(self.fact_mismatch("derived From payload value"));
+        };
+        let result = conversion
+            .result
+            .ok_or_else(|| self.fact_mismatch("derived From result"))?;
+        let result = self.lowered_expression_result(
+            conversion.expression,
+            result,
+            conversion.enumeration,
+            conversion.source,
+        )?;
+        self.push_let(
+            statements,
+            result,
+            wir::SemanticOperation::ConstructEnum {
+                ty: wir::TypeId(conversion.enumeration.0),
+                variant: 0,
+                payload: Some(payload),
+            },
+            Some(conversion.source),
         )?;
         Ok(LoweredExpression::Value(result))
     }

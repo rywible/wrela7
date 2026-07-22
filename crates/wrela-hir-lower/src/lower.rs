@@ -738,6 +738,15 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
         })
     }
 
+    fn member_name(&self, identifier: &syntax::Identifier) -> Result<hir::Name, LowerFailure> {
+        let spelling = clone_text(&identifier.spelling, self.request.limits.payload_bytes)?;
+        hir::Name::new_member(spelling).map_err(|_| {
+            LowerFailure::InternalInvariant(
+                "validated syntax contained a non-member identifier".to_owned(),
+            )
+        })
+    }
+
     fn collect_modules(&mut self) -> Result<(), LowerFailure> {
         reserve(
             &mut self.program.modules,
@@ -5836,7 +5845,7 @@ impl<'a, 'request> LoweringSession<'a, 'request> {
                         depth + 1,
                         ExpectedName::Any,
                     )?,
-                    name: self.name(field)?,
+                    name: self.member_name(field)?,
                 },
                 syntax::ExpressionKind::Call { callee, arguments } => {
                     if !self.valid_call_argument_order(arguments)? {

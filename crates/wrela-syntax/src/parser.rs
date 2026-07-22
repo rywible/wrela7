@@ -5846,7 +5846,16 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         let mut expression = self.parse_primary(depth + 1)?;
         loop {
             if self.eat_punctuation(Punctuation::Dot)? {
-                let Some(field) = self.parse_identifier(depth + 1)? else {
+                // `from` is a declaration-level keyword, but chapter 10's
+                // generated conversion spelling is the associated member
+                // `Destination.from(value)`. Admit that one keyword in member
+                // position; all other keywords remain closed here.
+                let field = if self.at_keyword(Keyword::From) {
+                    self.identifier_from_current(depth + 1)?
+                } else {
+                    self.parse_identifier(depth + 1)?
+                };
+                let Some(field) = field else {
                     self.error_here("syntax-expected-field", "expected an identifier after `.`")?;
                     break;
                 };

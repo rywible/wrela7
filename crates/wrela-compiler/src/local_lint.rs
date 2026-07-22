@@ -350,6 +350,12 @@ impl CanonicalSemanticLinter {
                         }
                     }
                 }
+                ExpressionResolution::DerivedFrom { payload, .. } => mark_value(
+                    &mut value_state,
+                    *payload,
+                    VALUE_STATE_USED,
+                    &self.unused_local,
+                )?,
                 ExpressionResolution::Error
                 | ExpressionResolution::Constant(_)
                 | ExpressionResolution::Function(_)
@@ -357,6 +363,8 @@ impl CanonicalSemanticLinter {
                 | ExpressionResolution::Projection(_)
                 | ExpressionResolution::Constructor { .. }
                 | ExpressionResolution::InitializerConstruction { .. }
+                | ExpressionResolution::DerivedFromType { .. }
+                | ExpressionResolution::DerivedFromFunction { .. }
                 | ExpressionResolution::ResultTry { .. }
                 | ExpressionResolution::OptionTry { .. }
                 | ExpressionResolution::DirectCall { .. }

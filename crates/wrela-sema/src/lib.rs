@@ -802,6 +802,25 @@ pub enum ExpressionResolution {
         fields: Vec<DerivedEqualityField>,
         conjunctions: Vec<ValueId>,
     },
+    /// Compiler-derived `Destination.from(value)` for the exact
+    /// single-variant, single-positional-field enum profile. The destination
+    /// type, variant tag, and evaluated payload identity are retained so the
+    /// full seal can re-derive the clause and nominal source declaration.
+    DerivedFrom {
+        enumeration: SemanticTypeId,
+        variant: u32,
+        payload: ValueId,
+    },
+    /// Exact destination-type witness in the associated derived conversion
+    /// spelling. This is not a first-class runtime type value.
+    DerivedFromType {
+        enumeration: SemanticTypeId,
+    },
+    /// Exact generated associated conversion member witness.
+    DerivedFromFunction {
+        enumeration: SemanticTypeId,
+        variant: u32,
+    },
     /// Exact source-order witness for an analysis-only bounded interpolation.
     BoundedInterpolation {
         capacity: u64,
@@ -4156,6 +4175,25 @@ fn validate_exact_expression_fact(
             )? => {}
         (
             wrela_hir::ExpressionKind::Call { callee, arguments },
+            ExpressionResolution::DerivedFrom {
+                enumeration,
+                variant,
+                payload,
+            },
+            Some(_),
+        ) if exact_derived_from_matches(
+            analysis,
+            program,
+            function.id,
+            fact,
+            *callee,
+            arguments,
+            *enumeration,
+            *variant,
+            *payload,
+        ) => {}
+        (
+            wrela_hir::ExpressionKind::Call { callee, arguments },
             ExpressionResolution::Constructor {
                 ty,
                 variant: Some(variant),
@@ -4193,6 +4231,36 @@ fn validate_exact_expression_fact(
             fact.result,
             fact.region,
         ) => {}
+        (
+            wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(destination)),
+            ExpressionResolution::DerivedFromType { enumeration },
+            None,
+        ) if fact.ty == *enumeration
+            && exact_derived_from_destination_matches(
+                analysis,
+                program,
+                destination,
+                *enumeration,
+            ) => {}
+        (
+            wrela_hir::ExpressionKind::Field { base, name },
+            ExpressionResolution::DerivedFromFunction {
+                enumeration,
+                variant,
+            },
+            None,
+        ) if fact.ty == *enumeration
+            && *variant == 0
+            && name.as_str() == "from"
+            && exact_child_expression(analysis, function.id, *base).is_some_and(|base| {
+                base.ty == *enumeration
+                    && base.result.is_none()
+                    && base.effects == EffectSet(0)
+                    && base.resolution
+                        == ExpressionResolution::DerivedFromType {
+                            enumeration: *enumeration,
+                        }
+            }) => {}
         (
             wrela_hir::ExpressionKind::Field { base, name },
             ExpressionResolution::Function(target),
@@ -5181,6 +5249,139 @@ fn exact_enum_constructor_matches(
                 && value.effects == fact.effects
         });
     Ok(callee_matches && payload_matches)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_derived_from_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    function: FunctionInstanceId,
+    fact: &ExpressionFact,
+    callee: ExpressionId,
+    arguments: &[wrela_hir::CallArgument],
+    enumeration: SemanticTypeId,
+    variant: u32,
+    payload: ValueId,
+) -> bool {
+    if fact.ty != enumeration || variant != 0 {
+        return false;
+    }
+    let Some(wrela_hir::ExpressionKind::Field { base, name }) = program
+        .expression(callee)
+        .map(|expression| &expression.kind)
+    else {
+        return false;
+    };
+    let Some(wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Declaration(destination))) =
+        program.expression(*base).map(|expression| &expression.kind)
+    else {
+        return false;
+    };
+    let Some(declaration) = program.declaration(destination.declaration) else {
+        return false;
+    };
+    let source_identity = name.as_str() == "from"
+        && declaration.module == destination.module
+        && program
+            .modules
+            .get(destination.module.0 as usize)
+            .is_some_and(|module| module.package == destination.package);
+    let wrela_hir::DeclarationKind::Enumeration(source) = &declaration.kind else {
+        return false;
+    };
+    let source_shape = source.generics.is_empty()
+        && source.deriving.iter().any(|name| name.as_str() == "From")
+        && matches!(source.variants.as_slice(), [variant]
+            if matches!(variant.fields.as_slice(), [field] if field.name.is_none()));
+    let Some(payload_ty) = analysis
+        .types
+        .get(enumeration.0 as usize)
+        .and_then(|record| match &record.kind {
+            SemanticTypeKind::Enumeration {
+                declaration,
+                arguments,
+                variants,
+            } if *declaration == destination.declaration && arguments.is_empty() => {
+                match variants.as_slice() {
+                    [variant] => match variant.fields.as_slice() {
+                        [field] => Some(field.ty),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    let [argument] = arguments else {
+        return false;
+    };
+    let wrela_hir::CallArgumentValue::Value(payload_expression) = argument.value else {
+        return false;
+    };
+    let Some(payload_fact) = exact_child_expression(analysis, function, payload_expression) else {
+        return false;
+    };
+    let produced = match payload_fact.resolution {
+        ExpressionResolution::Value(value) => Some(value),
+        _ => payload_fact.result,
+    };
+    source_identity
+        && source_shape
+        && argument.name.is_none()
+        && exact_stored_copy_scalar_layout(analysis, payload_ty).is_some()
+        && payload_fact.ty == payload_ty
+        && produced == Some(payload)
+        && payload_fact.effects == fact.effects
+        && analysis
+            .values
+            .get(payload.0 as usize)
+            .is_some_and(|value| {
+                value.function == function
+                    && value.ty == payload_ty
+                    && value.category == ValueCategory::Value
+            })
+}
+
+fn exact_derived_from_destination_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    destination: &wrela_hir::ResolvedDeclaration,
+    enumeration: SemanticTypeId,
+) -> bool {
+    let Some(declaration) = program.declaration(destination.declaration) else {
+        return false;
+    };
+    let exact_identity = declaration.module == destination.module
+        && program
+            .modules
+            .get(destination.module.0 as usize)
+            .is_some_and(|module| module.package == destination.package);
+    let wrela_hir::DeclarationKind::Enumeration(source) = &declaration.kind else {
+        return false;
+    };
+    exact_identity
+        && source.generics.is_empty()
+        && source.deriving.iter().any(|name| name.as_str() == "From")
+        && matches!(source.variants.as_slice(), [variant]
+            if matches!(variant.fields.as_slice(), [field] if field.name.is_none()))
+        && analysis
+            .types
+            .get(enumeration.0 as usize)
+            .is_some_and(|record| {
+                matches!(&record.kind,
+                SemanticTypeKind::Enumeration {
+                    declaration,
+                    arguments,
+                    variants,
+                } if *declaration == destination.declaration
+                    && arguments.is_empty()
+                    && matches!(variants.as_slice(), [variant]
+                        if matches!(variant.fields.as_slice(), [field]
+                            if exact_stored_copy_scalar_layout(analysis, field.ty).is_some())))
+            })
 }
 
 fn exact_flat_constructor_matches(
@@ -10029,6 +10230,37 @@ fn valid_expression_resolution(
                     )
                     && conjunctions.iter().all(|value| value_is_bool(*value))
             }),
+        ExpressionResolution::DerivedFrom {
+            enumeration,
+            variant,
+            payload,
+        } => analysis
+            .types
+            .get(enumeration.0 as usize)
+            .and_then(|record| match &record.kind {
+                SemanticTypeKind::Enumeration { variants, .. } => variants.get(*variant as usize),
+                _ => None,
+            })
+            .and_then(|variant| match variant.fields.as_slice() {
+                [field] => Some(field.ty),
+                _ => None,
+            })
+            .is_some_and(|payload_ty| {
+                exact_stored_copy_scalar_layout(analysis, payload_ty).is_some()
+                    && analysis
+                        .values
+                        .get(payload.0 as usize)
+                        .is_some_and(|value| {
+                            value.function == function
+                                && value.ty == payload_ty
+                                && value.category == ValueCategory::Value
+                        })
+            }),
+        ExpressionResolution::DerivedFromType { enumeration }
+        | ExpressionResolution::DerivedFromFunction { enumeration, .. } => analysis
+            .types
+            .get(enumeration.0 as usize)
+            .is_some_and(|record| matches!(record.kind, SemanticTypeKind::Enumeration { .. })),
         ExpressionResolution::BoundedInterpolation { capacity, parts } => {
             *capacity > 0
                 && !parts.is_empty()
@@ -10884,6 +11116,9 @@ fn valid_expression_region(
             | ExpressionResolution::ProjectionCall { .. }
             | ExpressionResolution::OperatorCall { .. }
             | ExpressionResolution::DerivedEquality { .. }
+            | ExpressionResolution::DerivedFrom { .. }
+            | ExpressionResolution::DerivedFromType { .. }
+            | ExpressionResolution::DerivedFromFunction { .. }
             | ExpressionResolution::BoundedInterpolation { .. }
             | ExpressionResolution::EnumTypeTest { .. }
             | ExpressionResolution::ActorRequest { .. }
@@ -13399,6 +13634,9 @@ fn validate_fact_resources(
             | ExpressionResolution::Projection(_)
             | ExpressionResolution::Constructor { .. }
             | ExpressionResolution::InitializerConstruction { .. }
+            | ExpressionResolution::DerivedFrom { .. }
+            | ExpressionResolution::DerivedFromType { .. }
+            | ExpressionResolution::DerivedFromFunction { .. }
             | ExpressionResolution::ResultTry { .. }
             | ExpressionResolution::OptionTry { .. }
             | ExpressionResolution::ClosedRange { .. }

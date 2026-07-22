@@ -56,6 +56,17 @@ impl Name {
         }
     }
 
+    /// Construct an expression member name. `from` is the sole revision 0.1
+    /// keyword admitted in member position because the generated conversion
+    /// contract spells calls as `Destination.from(value)`.
+    pub fn new_member(value: String) -> Result<Self, InvalidName> {
+        if is_valid_source_identifier(&value) || value == "from" {
+            Ok(Self(value))
+        } else {
+            Err(InvalidName)
+        }
+    }
+
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -69,6 +80,11 @@ impl Name {
     #[must_use]
     pub fn is_valid_argument_label(&self) -> bool {
         self.is_valid() || self.as_str() == "brand"
+    }
+
+    #[must_use]
+    pub fn is_valid_member(&self) -> bool {
+        self.is_valid() || self.as_str() == "from"
     }
 }
 
@@ -2904,6 +2920,15 @@ fn validate_argument_name(name: &Name, errors: &mut ValidationErrorSink) {
     }
 }
 
+fn validate_member_name(name: &Name, kind: &'static str, errors: &mut ValidationErrorSink) {
+    if errors.poll() {
+        return;
+    }
+    if !name.is_valid_member() {
+        errors.push(ValidationError::InvalidName { kind });
+    }
+}
+
 fn declaration_generics(declaration: &Declaration) -> &[GenericParameterId] {
     match &declaration.kind {
         DeclarationKind::Function(value) => &value.generics,
@@ -5089,7 +5114,7 @@ fn validate_expression(
         }
         ExpressionKind::Field { base, name } => {
             child(*base, "field base", errors);
-            validate_name(name, "field", errors);
+            validate_member_name(name, "field", errors);
         }
         ExpressionKind::Call { callee, arguments } => {
             child(*callee, "callee", errors);
@@ -6600,6 +6625,15 @@ mod tests {
             );
         }
         assert!(Name::new("a".repeat(256)).is_err());
+
+        assert_eq!(
+            Name::new_member("from".to_owned())
+                .expect("generated conversion member")
+                .as_str(),
+            "from"
+        );
+        assert!(Name::new("from".to_owned()).is_err());
+        assert!(Name::new_member("if".to_owned()).is_err());
     }
 
     #[test]

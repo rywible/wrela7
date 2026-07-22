@@ -177,6 +177,23 @@ fn multifield_derived_equality_reaches_native():
     return
 "#;
 
+const DERIVED_FROM_SOURCE: &str = r#"module app.duration
+pub enum Milliseconds deriving(From):
+    value(u64,)
+
+pub fn convert(value: u64) -> Milliseconds:
+    return Milliseconds.from(value)
+"#;
+
+const DERIVED_FROM_TEST_SOURCE: &str = r#"module app.duration_test
+from app.duration import Milliseconds, convert
+
+@test(runtime)
+fn derived_from_is_available():
+    converted: Milliseconds = convert(42)
+    return
+"#;
+
 const INITIALIZER_SOURCE: &str = r#"module app.duration
 
 pub struct Box:
@@ -3616,6 +3633,259 @@ fn unused():
         "{:?}",
         fixture.discovery_diagnostics
     );
+}
+
+#[test]
+fn single_variant_scalar_derived_from_analyzes_and_lowers_exactly() {
+    let fixture = fixture(DERIVED_FROM_SOURCE, DERIVED_FROM_TEST_SOURCE);
+    let analyzed = analyzed(&fixture);
+    let conversion = analyzed
+        .facts()
+        .expressions
+        .iter()
+        .find(|fact| {
+            matches!(
+                fact.resolution,
+                wrela_sema::ExpressionResolution::DerivedFrom { .. }
+            )
+        })
+        .expect("derived From conversion fact");
+    assert!(matches!(
+        analyzed
+            .facts()
+            .types
+            .get(conversion.ty.0 as usize)
+            .map(|ty| &ty.kind),
+        Some(SemanticTypeKind::Enumeration { variants, .. })
+            if matches!(variants.as_slice(), [variant] if variant.fields.len() == 1)
+    ));
+    let lowered = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("derived From lowers to SemanticWir");
+    assert!(lowered.wir().as_wir().functions.iter().any(|function| {
+        function.body.statements.iter().any(|statement| {
+            matches!(
+                statement,
+                LoweredSemanticStatement::Let(statement)
+                    if matches!(statement.operation, SemanticOperation::ConstructEnum {
+                        variant: 0,
+                        payload: Some(_),
+                        ..
+                    })
+            )
+        })
+    }));
+}
+
+#[test]
+fn derived_from_full_seal_rejects_nominal_variant_payload_and_witness_forgeries() {
+    let analyzed = analyzed(&fixture(DERIVED_FROM_SOURCE, DERIVED_FROM_TEST_SOURCE));
+
+    let mut wrong_variant = analyzed.facts().clone();
+    let variant = wrong_variant
+        .expressions
+        .iter_mut()
+        .find_map(|fact| match &mut fact.resolution {
+            wrela_sema::ExpressionResolution::DerivedFrom { variant, .. } => Some(variant),
+            _ => None,
+        })
+        .expect("derived From fact");
+    *variant = 1;
+    assert!(
+        wrong_variant
+            .validate_for_seal(analyzed.hir(), &never_cancelled)
+            .is_err()
+    );
+
+    let mut wrong_payload = analyzed.facts().clone();
+    let result = wrong_payload
+        .expressions
+        .iter()
+        .find_map(|fact| match fact.resolution {
+            wrela_sema::ExpressionResolution::DerivedFrom { .. } => fact.result,
+            _ => None,
+        })
+        .expect("derived From result");
+    let payload = wrong_payload
+        .expressions
+        .iter_mut()
+        .find_map(|fact| match &mut fact.resolution {
+            wrela_sema::ExpressionResolution::DerivedFrom { payload, .. } => Some(payload),
+            _ => None,
+        })
+        .expect("derived From payload");
+    *payload = result;
+    assert!(
+        wrong_payload
+            .validate_for_seal(analyzed.hir(), &never_cancelled)
+            .is_err()
+    );
+
+    let mut wrong_witness = analyzed.facts().clone();
+    let witness_variant = wrong_witness
+        .expressions
+        .iter_mut()
+        .find_map(|fact| match &mut fact.resolution {
+            wrela_sema::ExpressionResolution::DerivedFromFunction { variant, .. } => Some(variant),
+            _ => None,
+        })
+        .expect("derived From associated witness");
+    *witness_variant = 1;
+    assert!(
+        wrong_witness
+            .validate_for_seal(analyzed.hir(), &never_cancelled)
+            .is_err()
+    );
+}
+
+#[test]
+fn derived_from_lowering_has_exact_operation_bound_and_late_cancellation() {
+    let analyzed = analyzed(&fixture(DERIVED_FROM_SOURCE, DERIVED_FROM_TEST_SOURCE));
+    let baseline = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("baseline derived From lowering");
+    let exact = baseline.report().operations;
+    assert!(exact > 0);
+    let mut exact_limits = SemanticLoweringLimits::standard();
+    exact_limits.operations = exact;
+    CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: exact_limits,
+            },
+            &never_cancelled,
+        )
+        .expect("exact derived From operation bound is admitted");
+    exact_limits.operations = exact - 1;
+    assert!(matches!(
+        CanonicalSemanticLowerer::new().lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: exact_limits,
+            },
+            &never_cancelled,
+        ),
+        Err(SemanticLowerError::ResourceLimit {
+            resource: "SemanticWir operations",
+            limit,
+        }) if limit == exact - 1
+    ));
+
+    let polls = Cell::new(0_u32);
+    CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            },
+        )
+        .expect("count derived From cancellation polls");
+    let cancel_at = polls.get().saturating_sub(2);
+    let cancelled = Cell::new(0_u32);
+    assert!(matches!(
+        CanonicalSemanticLowerer::new().lower(
+            SemanticLowerRequest {
+                input: analyzed,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &|| {
+                let next = cancelled.get().saturating_add(1);
+                cancelled.set(next);
+                next >= cancel_at
+            },
+        ),
+        Err(SemanticLowerError::Cancelled)
+    ));
+    assert!(cancelled.get() >= cancel_at);
+}
+
+#[test]
+fn derived_from_adjacent_shapes_and_labels_fail_closed_by_name() {
+    let cases = [
+        (
+            r#"module app.duration
+pub enum Ambiguous deriving(From):
+    first(u64,)
+    second(u64,)
+"#,
+            r#"module app.duration_test
+@test(runtime)
+fn unused():
+    return
+"#,
+            "semantic-deriving-from-shape",
+        ),
+        (
+            r#"module app.duration
+pub enum Plain:
+    value(u64,)
+pub fn convert(value: u64) -> Plain:
+    return Plain.from(value)
+"#,
+            r#"module app.duration_test
+from app.duration import Plain, convert
+@test(runtime)
+fn rejected():
+    converted: Plain = convert(1)
+    return
+"#,
+            "semantic-derived-from-required",
+        ),
+        (
+            r#"module app.duration
+pub enum Wrapped deriving(From):
+    value(u64,)
+pub fn convert(value: u64) -> Wrapped:
+    return Wrapped.from(value=value)
+"#,
+            r#"module app.duration_test
+from app.duration import Wrapped, convert
+@test(runtime)
+fn rejected():
+    converted: Wrapped = convert(1)
+    return
+"#,
+            "semantic-argument-label-forbidden",
+        ),
+    ];
+    for (production, tests, expected_code) in cases {
+        let fixture = fixture(production, tests);
+        if fixture
+            .discovery_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some(expected_code))
+        {
+            continue;
+        }
+        let output = compile(&fixture, AnalysisLimits::standard(), &never_cancelled)
+            .expect("derived From rejection remains bounded");
+        assert!(output.successful().is_none());
+        assert!(
+            output
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_deref() == Some(expected_code)),
+            "missing {expected_code}: {:?}",
+            output.diagnostics()
+        );
+    }
 }
 
 #[test]
