@@ -8964,6 +8964,19 @@ impl SourceFunctionLowerer<'_> {
                 }
                 SourceStatementPlan::Match { scrutinee, arms } => {
                     let scrutinee_fact = self.expression_fact(scrutinee)?;
+                    if self
+                        .input
+                        .facts()
+                        .types
+                        .get(scrutinee_fact.ty.0 as usize)
+                        .is_some_and(|record| {
+                            matches!(record.kind, sema::SemanticTypeKind::Array { .. })
+                        })
+                    {
+                        return Err(unsupported(
+                            "semantic-fixed-array-match-lowering-pending (positional branch lowering)",
+                        ));
+                    }
                     let (declaration, semantic_variants) = self
                         .input
                         .facts()
@@ -27972,6 +27985,47 @@ pub fn boot() -> Image:
             Err(LowerError::Cancelled)
         ));
         assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn closed_fixed_array_match_stops_at_named_semantic_lowering_boundary() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        match [1, 2]:
+            case [1, second]:
+                pass
+            case [_, _]:
+                pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-fixed-array-match-lowering-pending (positional branch lowering)"
+            })
+        ));
     }
 
     #[test]

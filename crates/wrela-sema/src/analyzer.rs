@@ -6125,19 +6125,40 @@ fn analyze_runtime_body(
             }
             StatementKind::Break | StatementKind::Continue => {}
             StatementKind::Match { scrutinee, arms } => {
-                statement_effects = analyze_closed_enum_match(
-                    request,
-                    partial,
-                    function,
-                    *scrutinee,
-                    arms,
-                    locals,
-                    parameters,
-                    allow_assertions,
-                    &mut *aggregate_work,
-                    &mut definitions,
-                    is_cancelled,
-                )?;
+                statement_effects = if request
+                    .hir
+                    .as_program()
+                    .expression(*scrutinee)
+                    .is_some_and(|expression| matches!(expression.kind, ExpressionKind::Array(_)))
+                {
+                    analyze_closed_fixed_array_match(
+                        request,
+                        partial,
+                        function,
+                        *scrutinee,
+                        arms,
+                        locals,
+                        parameters,
+                        allow_assertions,
+                        &mut *aggregate_work,
+                        &mut definitions,
+                        is_cancelled,
+                    )?
+                } else {
+                    analyze_closed_enum_match(
+                        request,
+                        partial,
+                        function,
+                        *scrutinee,
+                        arms,
+                        locals,
+                        parameters,
+                        allow_assertions,
+                        &mut *aggregate_work,
+                        &mut definitions,
+                        is_cancelled,
+                    )?
+                };
             }
             StatementKind::With {
                 value,
@@ -7077,6 +7098,432 @@ fn finalize_scope_activations(
         )
     });
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_closed_fixed_array_match(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    scrutinee_id: ExpressionId,
+    arms: &[wrela_hir::MatchArm],
+    locals: &mut [Option<RuntimeBinding>],
+    parameters: &mut [Option<RuntimeBinding>],
+    allow_assertions: bool,
+    aggregate_work: &mut RuntimeAggregateWork,
+    definitions: &mut Vec<LocalDefinition>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<EffectSet> {
+    let program = request.hir.as_program();
+    let scrutinee = program
+        .expression(scrutinee_id)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let ExpressionKind::Array(source_elements) = &scrutinee.kind else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    let Some(first) = source_elements.first().copied() else {
+        return Err(runtime_type_diagnostic(
+            request,
+            scrutinee.source,
+            "semantic-runtime-array-match-empty-type-pending",
+            "empty fixed-array match has no inferred element type",
+            "this bounded slice infers one primitive scalar type from a nonempty inline literal",
+            "match a nonempty homogeneous boolean or default-i64 array literal",
+        ));
+    };
+    if u64::try_from(source_elements.len())
+        .map_or(true, |length| length > request.limits.fact_edges)
+    {
+        return Err(fact_resource(request, "fixed-array match elements").into());
+    }
+    for source_element in source_elements {
+        check_cancelled(is_cancelled)?;
+        if !program.expression(*source_element).is_some_and(|element| {
+            matches!(
+                element.kind,
+                ExpressionKind::Literal(Literal::Boolean(_))
+                    | ExpressionKind::Literal(Literal::Integer(_))
+            )
+        }) {
+            return Err(runtime_type_diagnostic(
+                request,
+                program
+                    .expression(*source_element)
+                    .map_or(scrutinee.source, |element| element.source),
+                "semantic-runtime-array-match-element-shape",
+                "fixed-array match scrutinee element is not an admitted scalar literal",
+                "this slice authenticates only inline boolean or default-i64 literal elements",
+                "use boolean literals or nonnegative integer literals of one inferred type",
+            ));
+        }
+    }
+    let first_is_bool = program.expression(first).is_some_and(|element| {
+        matches!(element.kind, ExpressionKind::Literal(Literal::Boolean(_)))
+    });
+    if source_elements.iter().any(|source_element| {
+        program.expression(*source_element).is_none_or(|element| {
+            matches!(element.kind, ExpressionKind::Literal(Literal::Boolean(_))) != first_is_bool
+        })
+    }) {
+        return Err(runtime_type_diagnostic(
+            request,
+            scrutinee.source,
+            "semantic-runtime-array-match-element-type",
+            "fixed-array match scrutinee elements do not have one inferred scalar type",
+            "boolean and default-i64 literals cannot share one homogeneous fixed-array type",
+            "use only booleans or only nonnegative integer literals in the inline array",
+        ));
+    }
+    let mut state = RuntimeState {
+        locals: &mut *locals,
+        parameters: &mut *parameters,
+        aggregate_work: &mut *aggregate_work,
+        allow_assertions,
+        allow_scope_call: false,
+    };
+    let first_outcome = analyze_runtime_expression(
+        request,
+        partial,
+        function,
+        first,
+        RuntimeExpressionRequest {
+            expected: None,
+            desired_result: None,
+            access: AccessMode::Value,
+        },
+        &mut state,
+        is_cancelled,
+    )?;
+    let element_ty = first_outcome.ty;
+    if partial.types.get(element_ty.0 as usize).is_none_or(|ty| {
+        ty.linearity != Linearity::ScalarCopy
+            || !matches!(
+                ty.kind,
+                SemanticTypeKind::Bool | SemanticTypeKind::Integer { .. }
+            )
+    }) {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    let mut elements = Vec::new();
+    elements
+        .try_reserve_exact(source_elements.len())
+        .map_err(|_| fact_resource(request, "fixed-array match elements"))?;
+    elements.push(
+        first_outcome
+            .result
+            .ok_or(AnalysisFailure::RequestMismatch)?,
+    );
+    let mut effects = first_outcome.effects;
+    for source_element in &source_elements[1..] {
+        check_cancelled(is_cancelled)?;
+        let outcome = analyze_runtime_expression(
+            request,
+            partial,
+            function,
+            *source_element,
+            RuntimeExpressionRequest {
+                expected: Some(element_ty),
+                desired_result: None,
+                access: AccessMode::Value,
+            },
+            &mut state,
+            is_cancelled,
+        )?;
+        elements.push(outcome.result.ok_or(AnalysisFailure::RequestMismatch)?);
+        effects.0 |= outcome.effects.0;
+    }
+    let length = u64::try_from(elements.len())
+        .map_err(|_| fact_resource(request, "fixed-array match elements"))?;
+    let array_ty = ensure_closed_fixed_array_type(
+        request,
+        partial,
+        element_ty,
+        length,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    let bounds = append_capacity_proof(
+        request,
+        partial,
+        "inline fixed-array pattern match".to_owned(),
+        vec![scrutinee.source],
+        length,
+        "every array-pattern position is authenticated against the exact inline array length",
+    )?;
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: scrutinee_id,
+            ty: array_ty,
+            result: None,
+            resolution: ExpressionResolution::ClosedArray {
+                elements,
+                maximum_iterations: length,
+                bounds,
+            },
+            effects,
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+
+    let mut exhaustive = false;
+    for arm in arms {
+        check_cancelled(is_cancelled)?;
+        if exhaustive {
+            return Err(runtime_type_diagnostic(
+                request,
+                arm.source,
+                "semantic-runtime-match-unreachable-arm",
+                "fixed-array match arm follows an irrefutable cover",
+                "an earlier whole wildcard or all-binding array pattern covers every value of this exact array type",
+                "remove the unreachable arm",
+            ));
+        }
+        if arm.guard.is_some() {
+            return Err(runtime_type_diagnostic(
+                request,
+                arm.source,
+                "semantic-runtime-array-match-guard-pending",
+                "fixed-array match patterns cannot carry a guard yet",
+                "guard fallthrough needs a value-space coverage proof beyond exact array shape",
+                "move the condition into the arm body or remove the guard",
+            ));
+        }
+        let pattern = program
+            .patterns
+            .get(arm.pattern.0 as usize)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let [alternative] = pattern.alternatives.as_slice() else {
+            return Err(runtime_type_diagnostic(
+                request,
+                pattern.source,
+                "semantic-runtime-array-match-alternatives-pending",
+                "fixed-array match requires one pattern per arm",
+                "array-pattern alternatives need union coverage and shared-binding authentication",
+                "split the alternatives into separate arms",
+            ));
+        };
+        let mut arm_locals = copy_binding_map(locals, request.limits.values)?;
+        let mut arm_parameters = copy_binding_map(parameters, request.limits.values)?;
+        let mut binding_locals = Vec::new();
+        let irrefutable = match &alternative.kind {
+            wrela_hir::PrimaryPattern::Wildcard => true,
+            wrela_hir::PrimaryPattern::Array(arguments) => {
+                if arguments.len() != source_elements.len() {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        alternative.source,
+                        "semantic-runtime-array-match-arity",
+                        "fixed-array pattern length differs from the scrutinee length",
+                        "fixed arrays have exact extent and do not admit rest patterns in this slice",
+                        "write exactly one pattern for each array element",
+                    ));
+                }
+                binding_locals
+                    .try_reserve_exact(arguments.len())
+                    .map_err(|_| fact_resource(request, "fixed-array match bindings"))?;
+                let mut all_irrefutable = true;
+                for argument in arguments {
+                    check_cancelled(is_cancelled)?;
+                    if argument.take {
+                        return Err(runtime_type_diagnostic(
+                            request,
+                            argument.source,
+                            "semantic-runtime-array-match-take-pending",
+                            "fixed-array element patterns cannot use `take`",
+                            "this slice copies primitive scalar elements into arm-local bindings",
+                            "remove `take` from the element pattern",
+                        ));
+                    }
+                    let element_pattern = program
+                        .patterns
+                        .get(argument.pattern.0 as usize)
+                        .ok_or(AnalysisFailure::RequestMismatch)?;
+                    let [element_alternative] = element_pattern.alternatives.as_slice() else {
+                        return Err(runtime_type_diagnostic(
+                            request,
+                            element_pattern.source,
+                            "semantic-runtime-array-match-element-alternatives-pending",
+                            "fixed-array element requires one direct pattern",
+                            "nested alternatives need per-position union coverage",
+                            "use one literal, binding, or `_` element pattern",
+                        ));
+                    };
+                    match &element_alternative.kind {
+                        wrela_hir::PrimaryPattern::Wildcard => {}
+                        wrela_hir::PrimaryPattern::Bind(local) => {
+                            if binding_locals.contains(local) {
+                                return Err(AnalysisFailure::RequestMismatch.into());
+                            }
+                            let local_record = program
+                                .locals
+                                .get(local.0 as usize)
+                                .filter(|record| record.id == *local && record.body == arm.body)
+                                .ok_or(AnalysisFailure::RequestMismatch)?;
+                            let value = append_semantic_value(
+                                request,
+                                partial,
+                                function,
+                                element_ty,
+                                (
+                                    SemanticValueOrigin::Local(*local),
+                                    Some(local_record.source),
+                                    Some(local_record.name.as_str()),
+                                ),
+                                is_cancelled,
+                            )?;
+                            definitions.try_reserve(1).map_err(|_| {
+                                fact_resource(request, "fixed-array match bindings")
+                            })?;
+                            definitions.push(LocalDefinition {
+                                local: *local,
+                                value,
+                            });
+                            let slot = arm_locals
+                                .get_mut(local.0 as usize)
+                                .ok_or(AnalysisFailure::RequestMismatch)?;
+                            if slot
+                                .replace(RuntimeBinding {
+                                    value,
+                                    state: OwnershipState::Owned,
+                                    authority: RuntimeAuthority::Own,
+                                    origin: RuntimeBindingOrigin::Local(*local),
+                                    source: local_record.source,
+                                })
+                                .is_some()
+                            {
+                                return Err(AnalysisFailure::RequestMismatch.into());
+                            }
+                            binding_locals.push(*local);
+                        }
+                        wrela_hir::PrimaryPattern::Literal { negative, literal } => {
+                            all_irrefutable = false;
+                            if *negative {
+                                return Err(runtime_type_diagnostic(
+                                    request,
+                                    element_alternative.source,
+                                    "semantic-runtime-array-match-negative-literal-pending",
+                                    "fixed-array pattern does not yet admit a negative literal",
+                                    "the bounded literal validator currently authenticates source literals without a unary sign",
+                                    "use a nonnegative integer literal, a binding, or `_`",
+                                ));
+                            }
+                            if !matches!(
+                                (first_is_bool, literal),
+                                (true, Literal::Boolean(_)) | (false, Literal::Integer(_))
+                            ) {
+                                return Err(runtime_type_diagnostic(
+                                    request,
+                                    element_alternative.source,
+                                    "semantic-runtime-array-match-literal-type",
+                                    "fixed-array pattern literal differs from the element type",
+                                    "every literal position must be an exactly representable bool or default-i64 value of the scrutinee element type",
+                                    "use a same-type literal, a binding, or `_`",
+                                ));
+                            }
+                            if let Err(error) = lower_scalar_literal(
+                                request,
+                                partial,
+                                element_ty,
+                                literal,
+                                is_cancelled,
+                            ) {
+                                if error != AnalysisFailure::RequestMismatch {
+                                    return Err(error.into());
+                                }
+                                return Err(runtime_type_diagnostic(
+                                    request,
+                                    element_alternative.source,
+                                    "semantic-runtime-array-match-literal-type",
+                                    "fixed-array pattern literal differs from the element type",
+                                    "every literal position must be an exactly representable bool or default-i64 value of the scrutinee element type",
+                                    "use a same-type literal, a binding, or `_`",
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                element_alternative.source,
+                                "semantic-runtime-array-match-element-shape",
+                                "fixed-array element pattern is outside the admitted scalar subset",
+                                "nested constructor, tuple, and array destructuring is not authenticated here",
+                                "use a direct literal, binding, or `_` element pattern",
+                            ));
+                        }
+                    }
+                }
+                all_irrefutable
+            }
+            _ => {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    alternative.source,
+                    "semantic-runtime-array-match-pattern-shape",
+                    "fixed-array match arm requires an exact array pattern or `_`",
+                    "whole-value bindings, constructors, tuples, and literals do not establish fixed-array positional coverage",
+                    "use `[element, ...]` with exact arity or a trailing `_`",
+                ));
+            }
+        };
+        exhaustive = irrefutable;
+        let fact_start = partial.statements.len();
+        analyze_runtime_body(
+            request,
+            partial,
+            function,
+            arm.body,
+            &mut arm_locals,
+            &mut arm_parameters,
+            allow_assertions,
+            &mut *aggregate_work,
+            is_cancelled,
+        )?;
+        let mut state_changed =
+            arm_parameters.len() != parameters.len() || arm_locals.len() != locals.len();
+        for (left, right) in arm_parameters.iter().zip(parameters.iter()) {
+            check_cancelled(is_cancelled)?;
+            state_changed |= left != right;
+        }
+        for (index, (left, right)) in arm_locals.iter().zip(locals.iter()).enumerate() {
+            check_cancelled(is_cancelled)?;
+            if !binding_locals.iter().any(|local| index == local.0 as usize) {
+                state_changed |= left != right;
+            }
+        }
+        if state_changed {
+            return Err(runtime_type_diagnostic(
+                request,
+                arm.source,
+                "semantic-runtime-match-state-change-not-supported",
+                "fixed-array match arm changes outer local state",
+                "this slice does not join outer SSA assignments across positional array patterns",
+                "return from each arm or move the assignment after the match",
+            ));
+        }
+        for statement in partial
+            .statements
+            .get(fact_start..)
+            .ok_or(AnalysisFailure::RequestMismatch)?
+        {
+            check_cancelled(is_cancelled)?;
+            effects.0 |= statement.effects.0;
+        }
+    }
+    if !exhaustive {
+        return Err(runtime_type_diagnostic(
+            request,
+            scrutinee.source,
+            "semantic-runtime-array-match-nonexhaustive",
+            "fixed-array match has no irrefutable arm",
+            "literal element patterns cover only part of the exact-length array value space",
+            "add a final same-arity pattern containing only bindings and `_`, or add a trailing `_` arm",
+        ));
+    }
+    Ok(effects)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -39044,6 +39491,259 @@ fn projection_fixture():
             Err(AnalysisFailure::Cancelled)
         ));
         assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn closed_fixed_array_match_analyzes_exact_arity_literals_and_bindings() {
+        let source = dot_variant_actor_source(
+            "async fn checkpoint():\n    match [1, 2]:\n        case [1, second]:\n            pass\n        case [_, _]:\n            pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("closed fixed-array match analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "the exact fixed-array match must analyze cleanly: {:?}",
+            output.diagnostics()
+        );
+        let image = output.successful().expect("sealed fixed-array match image");
+        let second = image
+            .facts()
+            .values
+            .iter()
+            .find(|value| value.source_name.as_deref() == Some("second"))
+            .expect("fixed-array element binding");
+        assert!(matches!(
+            image.facts().types[second.ty.0 as usize].kind,
+            SemanticTypeKind::Integer {
+                signed: true,
+                bits: 64,
+                pointer_sized: false,
+            }
+        ));
+        let array = image
+            .facts()
+            .expressions
+            .iter()
+            .find(|fact| matches!(fact.resolution, ExpressionResolution::ClosedArray { .. }))
+            .expect("fixed-array match scrutinee fact");
+        let ExpressionResolution::ClosedArray {
+            ref elements,
+            maximum_iterations,
+            bounds,
+        } = array.resolution
+        else {
+            unreachable!()
+        };
+        assert_eq!(elements.len(), 2);
+        assert_eq!(maximum_iterations, 2);
+        let proof = &image.facts().proofs[bounds.0 as usize];
+        assert_eq!(proof.subject, "inline fixed-array pattern match");
+        assert_eq!(proof.bound, Some(2));
+
+        let mut forged_proof = image.facts().clone();
+        forged_proof.proofs[bounds.0 as usize].subject = "inline fixed-array iteration".to_owned();
+        assert!(
+            forged_proof
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let match_statement = image
+            .facts()
+            .statements
+            .iter()
+            .find(|fact| {
+                image
+                    .hir()
+                    .as_program()
+                    .statement(fact.statement)
+                    .is_some_and(|statement| matches!(statement.kind, StatementKind::Match { .. }))
+            })
+            .expect("fixed-array match statement");
+        assert_eq!(match_statement.definitions.len(), 1);
+        let mut forged_binding = image.facts().clone();
+        forged_binding
+            .statements
+            .iter_mut()
+            .find(|fact| fact.statement == match_statement.statement)
+            .expect("mutable fixed-array match statement")
+            .definitions[0]
+            .value = elements[0];
+        assert!(
+            forged_binding
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let exact_count =
+            u32::try_from(image.facts().expressions.len()).expect("fixed-array match facts");
+        let mut exact_limits = AnalysisLimits::standard();
+        exact_limits.expression_facts = exact_count;
+        assert!(
+            CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, exact_limits),
+                    &|| false,
+                )
+                .expect("exact fixed-array match expression-fact limit")
+                .successful()
+                .is_some()
+        );
+        let mut one_under = exact_limits;
+        one_under.expression_facts = exact_count - 1;
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new()
+                .analyze(parsed_actor_request(&fixture, &changes, one_under), &|| {
+                    false
+                },),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "expression facts",
+                ..
+            })
+        ));
+
+        let polls = Cell::new(0_u32);
+        let counted = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, exact_limits),
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("count fixed-array match polls");
+        assert!(counted.successful().is_some());
+        let final_poll = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, exact_limits),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next == final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn closed_fixed_array_match_admits_boolean_multi_binding_irrefutable_pattern() {
+        let source = dot_variant_actor_source(
+            "async fn checkpoint():\n    match [true, false]:\n        case [first, second]:\n            pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("boolean fixed-array match analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "{:?}",
+            output.diagnostics()
+        );
+        let image = output.successful().expect("sealed boolean array match");
+        let definitions = image
+            .facts()
+            .statements
+            .iter()
+            .find(|fact| {
+                image
+                    .hir()
+                    .as_program()
+                    .statement(fact.statement)
+                    .is_some_and(|statement| matches!(statement.kind, StatementKind::Match { .. }))
+            })
+            .expect("boolean array match statement")
+            .definitions
+            .as_slice();
+        assert_eq!(definitions.len(), 2);
+        assert!(definitions.iter().all(|definition| matches!(
+            image.facts().types[image.facts().values[definition.value.0 as usize].ty.0 as usize]
+                .kind,
+            SemanticTypeKind::Bool
+        )));
+    }
+
+    #[test]
+    fn closed_fixed_array_match_tails_fail_closed_by_name() {
+        for (body, code) in [
+            (
+                "    match []:\n        case _:\n            pass\n",
+                "semantic-runtime-array-match-empty-type-pending",
+            ),
+            (
+                "    match [1, true]:\n        case _:\n            pass\n",
+                "semantic-runtime-array-match-element-type",
+            ),
+            (
+                "    match [1, 2]:\n        case [first]:\n            pass\n",
+                "semantic-runtime-array-match-arity",
+            ),
+            (
+                "    match [1, 2]:\n        case [true, _]:\n            pass\n        case _:\n            pass\n",
+                "semantic-runtime-array-match-literal-type",
+            ),
+            (
+                "    match [1, 2]:\n        case [-1, _]:\n            pass\n        case _:\n            pass\n",
+                "semantic-runtime-array-match-negative-literal-pending",
+            ),
+            (
+                "    match [1, 2]:\n        case [1, _]:\n            pass\n",
+                "semantic-runtime-array-match-nonexhaustive",
+            ),
+            (
+                "    match [1, 2]:\n        case [_, _] if true:\n            pass\n",
+                "semantic-runtime-array-match-guard-pending",
+            ),
+            (
+                "    match [1, 2]:\n        case [take first, _]:\n            pass\n",
+                "semantic-runtime-array-match-take-pending",
+            ),
+            (
+                "    match [1, 2]:\n        case [1, _] | [2, _]:\n            pass\n        case _:\n            pass\n",
+                "semantic-runtime-array-match-alternatives-pending",
+            ),
+            (
+                "    match [1, 2]:\n        case [[nested], _]:\n            pass\n",
+                "semantic-runtime-array-match-element-shape",
+            ),
+            (
+                "    match [1, 2]:\n        case [_, _]:\n            pass\n        case _:\n            pass\n",
+                "semantic-runtime-match-unreachable-arm",
+            ),
+        ] {
+            let source = dot_variant_actor_source(&format!("async fn checkpoint():\n{body}\n"));
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("fixed-array match tail is a diagnostic");
+            assert_eq!(
+                output
+                    .diagnostics()
+                    .first()
+                    .and_then(|diagnostic| diagnostic.code.as_deref()),
+                Some(code),
+                "{body}: {:?}",
+                output.diagnostics()
+            );
+            assert!(output.successful().is_none());
+        }
     }
 
     #[test]

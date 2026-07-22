@@ -746,9 +746,9 @@ pub enum ExpressionResolution {
         inclusive: bool,
         maximum_iterations: u64,
     },
-    /// Analysis-only fixed-array iterator. The HIR array literal is retained
-    /// as an exact source-ordered element-value witness and is consumable only
-    /// by its enclosing `for` statement in this slice.
+    /// Analysis-only fixed-array witness. The HIR array literal is retained as
+    /// an exact source-ordered element-value sequence and is consumable only by
+    /// its enclosing `for` or bounded fixed-array `match` statement.
     ClosedArray {
         elements: Vec<ValueId>,
         maximum_iterations: u64,
@@ -3202,23 +3202,21 @@ fn validate_exact_body_local_value_flow(
                 for arm in arms {
                     check_analysis_cancelled(is_cancelled)?;
                     let mut arm_locals = copy_exact_local_values(locals)?;
-                    let local = exact_match_payload_local(program, arm);
-                    if let Some(local) = local {
+                    let binding_locals = exact_match_binding_locals(program, arm)?;
+                    for local in &binding_locals {
                         let definition = fact
                             .definitions
                             .get(definition_index)
-                            .ok_or_else(|| invalid("enum match payload binding is missing"))?;
+                            .ok_or_else(|| invalid("match pattern binding is missing"))?;
                         definition_index += 1;
-                        if definition.local != local {
-                            return Err(invalid(
-                                "enum match payload definition order is not exact",
-                            ));
+                        if definition.local != *local {
+                            return Err(invalid("match binding definition order is not exact"));
                         }
                         let slot = arm_locals
                             .get_mut(local.0 as usize)
-                            .ok_or_else(|| invalid("enum match payload local is invalid"))?;
+                            .ok_or_else(|| invalid("match pattern local is invalid"))?;
                         if slot.replace(definition.value).is_some() {
-                            return Err(invalid("enum match payload shadows reaching local state"));
+                            return Err(invalid("match pattern shadows reaching local state"));
                         }
                     }
                     if let Some(guard) = arm.guard {
@@ -3246,8 +3244,10 @@ fn validate_exact_body_local_value_flow(
                     )?;
                     for (index, (before, after)) in locals.iter().zip(&arm_locals).enumerate() {
                         check_analysis_cancelled(is_cancelled)?;
-                        if local.is_none_or(|local| index != local.0 as usize) && before != after {
-                            return Err(invalid("enum match arm mutates outer local state"));
+                        if !binding_locals.iter().any(|local| index == local.0 as usize)
+                            && before != after
+                        {
+                            return Err(invalid("match arm mutates outer local state"));
                         }
                     }
                     effects.0 |= arm_effects.0;
@@ -3877,38 +3877,73 @@ fn collect_source_body_closure(
     })
 }
 
-fn exact_match_payload_local(
+fn exact_match_binding_locals(
     program: &wrela_hir::Program,
     arm: &wrela_hir::MatchArm,
-) -> Option<wrela_hir::LocalId> {
-    let pattern = program.patterns.get(arm.pattern.0 as usize)?;
+) -> Result<Vec<wrela_hir::LocalId>, AnalysisFailure> {
+    let invalid = |message: &str| AnalysisFailure::InternalInvariant(message.to_owned());
+    let pattern = program
+        .patterns
+        .get(arm.pattern.0 as usize)
+        .ok_or_else(|| invalid("match pattern is missing"))?;
+    if let [alternative] = pattern.alternatives.as_slice() {
+        if let wrela_hir::PrimaryPattern::Array(arguments) = &alternative.kind {
+            let mut bindings = fallible_scratch(arguments.len(), 256)?;
+            for argument in arguments {
+                let child = program
+                    .patterns
+                    .get(argument.pattern.0 as usize)
+                    .ok_or_else(|| invalid("array element pattern is missing"))?;
+                let [child] = child.alternatives.as_slice() else {
+                    return Err(invalid("array element pattern is not exact"));
+                };
+                if let wrela_hir::PrimaryPattern::Bind(local) = child.kind {
+                    bindings.push(local);
+                }
+            }
+            return Ok(bindings);
+        }
+    }
     let mut shared = None;
     for alternative in &pattern.alternatives {
         let wrela_hir::PrimaryPattern::Constructor { arguments, .. } = &alternative.kind else {
-            return None;
+            return Ok(Vec::new());
         };
         if arguments.is_empty() {
             continue;
         }
         let [argument] = arguments.as_slice() else {
-            return None;
+            return Ok(Vec::new());
         };
         if argument.take {
-            return None;
+            return Ok(Vec::new());
         }
-        let payload = program.patterns.get(argument.pattern.0 as usize)?;
+        let payload = program
+            .patterns
+            .get(argument.pattern.0 as usize)
+            .ok_or_else(|| invalid("constructor payload pattern is missing"))?;
         let [alternative] = payload.alternatives.as_slice() else {
-            return None;
+            return Ok(Vec::new());
         };
         let wrela_hir::PrimaryPattern::Bind(local) = alternative.kind else {
-            return None;
+            return Ok(Vec::new());
         };
         if shared.is_some_and(|existing| existing != local) {
-            return None;
+            return Ok(Vec::new());
         }
         shared = Some(local);
     }
-    shared
+    let mut bindings = Vec::new();
+    if let Some(local) = shared {
+        bindings
+            .try_reserve_exact(1)
+            .map_err(|_| AnalysisFailure::ResourceLimit {
+                resource: "match binding validation",
+                limit: 1,
+            })?;
+        bindings.push(local);
+    }
+    Ok(bindings)
 }
 
 fn validate_exact_expression_fact(
@@ -7330,6 +7365,172 @@ struct ExactStatementValidation<'a> {
     definitions: &'a mut [u8],
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_exact_fixed_array_match_statement(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    function: &FunctionInstance,
+    fact: &StatementFact,
+    arms: &[wrela_hir::MatchArm],
+    element_ty: SemanticTypeId,
+    length: u64,
+    definitions: &mut [u8],
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), AnalysisFailure> {
+    let invalid = |message: &str| AnalysisFailure::InternalInvariant(message.to_owned());
+    let element_kind = analysis
+        .types
+        .get(element_ty.0 as usize)
+        .filter(|record| record.linearity == Linearity::ScalarCopy)
+        .map(|record| &record.kind)
+        .ok_or_else(|| invalid("fixed-array match element type is missing"))?;
+    if !matches!(
+        element_kind,
+        SemanticTypeKind::Bool
+            | SemanticTypeKind::Integer {
+                signed: true,
+                bits: 64,
+                pointer_sized: false,
+            }
+    ) {
+        return Err(invalid("fixed-array match element type is not canonical"));
+    }
+    let arity = usize::try_from(length)
+        .map_err(|_| invalid("fixed-array match length is not representable"))?;
+    let mut definition_index = 0usize;
+    let mut exhaustive = false;
+    for arm in arms {
+        check_analysis_cancelled(is_cancelled)?;
+        if exhaustive || arm.guard.is_some() {
+            return Err(invalid("fixed-array match coverage differs from HIR"));
+        }
+        let pattern = program
+            .patterns
+            .get(arm.pattern.0 as usize)
+            .filter(|pattern| {
+                pattern.id == arm.pattern
+                    && pattern
+                        .binding_scope
+                        .and_then(|scope| program.scopes.get(scope.0 as usize))
+                        .is_some_and(|scope| scope.body == arm.body)
+            })
+            .ok_or_else(|| invalid("fixed-array match arm pattern scope differs from HIR"))?;
+        let [alternative] = pattern.alternatives.as_slice() else {
+            return Err(invalid("fixed-array match arm is not one exact pattern"));
+        };
+        match &alternative.kind {
+            wrela_hir::PrimaryPattern::Wildcard => exhaustive = true,
+            wrela_hir::PrimaryPattern::Array(arguments) => {
+                if arguments.len() != arity {
+                    return Err(invalid("fixed-array match pattern arity differs from type"));
+                }
+                let mut irrefutable = true;
+                let mut arm_bindings = fallible_scratch::<wrela_hir::LocalId>(arity, 256)?;
+                for argument in arguments {
+                    check_analysis_cancelled(is_cancelled)?;
+                    if argument.take {
+                        return Err(invalid("fixed-array match element unexpectedly takes"));
+                    }
+                    let child = program
+                        .patterns
+                        .get(argument.pattern.0 as usize)
+                        .filter(|pattern| pattern.id == argument.pattern)
+                        .ok_or_else(|| invalid("fixed-array element pattern is missing"))?;
+                    let [child] = child.alternatives.as_slice() else {
+                        return Err(invalid("fixed-array element pattern is not exact"));
+                    };
+                    match &child.kind {
+                        wrela_hir::PrimaryPattern::Wildcard => {}
+                        wrela_hir::PrimaryPattern::Bind(local) => {
+                            if arm_bindings.contains(local) {
+                                return Err(invalid("fixed-array element binding is duplicated"));
+                            }
+                            arm_bindings.push(*local);
+                            let definition =
+                                fact.definitions.get(definition_index).ok_or_else(|| {
+                                    invalid("fixed-array element binding definition is missing")
+                                })?;
+                            definition_index += 1;
+                            let local_record = program
+                                .locals
+                                .get(local.0 as usize)
+                                .filter(|record| record.id == *local && record.body == arm.body)
+                                .ok_or_else(|| {
+                                    invalid("fixed-array element binding differs from arm body")
+                                })?;
+                            let value_record = analysis
+                                .values
+                                .get(definition.value.0 as usize)
+                                .filter(|record| {
+                                    definition.local == *local
+                                        && record.function == function.id
+                                        && record.ty == element_ty
+                                        && record.category == ValueCategory::Value
+                                        && record.class == SemanticValueClass::FirstClass
+                                        && record.origin == SemanticValueOrigin::Local(*local)
+                                        && record.source == Some(local_record.source)
+                                        && record.source_name.as_deref()
+                                            == Some(local_record.name.as_str())
+                                })
+                                .ok_or_else(|| {
+                                    invalid("fixed-array element binding provenance is invalid")
+                                })?;
+                            if analysis.expressions.iter().any(|expression| {
+                                expression.function == function.id
+                                    && expression.result == Some(value_record.id)
+                            }) {
+                                return Err(invalid(
+                                    "fixed-array element binding is an expression result",
+                                ));
+                            }
+                            increment_definition(definitions, definition.value)?;
+                        }
+                        wrela_hir::PrimaryPattern::Literal { negative, literal } => {
+                            irrefutable = false;
+                            let exact = match (element_kind, literal) {
+                                (SemanticTypeKind::Bool, wrela_hir::Literal::Boolean(_)) => {
+                                    !*negative
+                                }
+                                (
+                                    SemanticTypeKind::Integer {
+                                        signed: true,
+                                        bits: 64,
+                                        pointer_sized: false,
+                                    },
+                                    wrela_hir::Literal::Integer(spelling),
+                                ) => {
+                                    !*negative
+                                        && parse_hir_integer(spelling)
+                                            .is_some_and(|value| value <= i64::MAX as u128)
+                                }
+                                _ => false,
+                            };
+                            if !exact {
+                                return Err(invalid(
+                                    "fixed-array pattern literal differs from element type",
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(invalid(
+                                "fixed-array element pattern is outside the exact scalar subset",
+                            ));
+                        }
+                    }
+                }
+                exhaustive = irrefutable;
+            }
+            _ => return Err(invalid("fixed-array match arm shape differs from HIR")),
+        }
+    }
+    if !exhaustive || definition_index != fact.definitions.len() {
+        return Err(invalid(
+            "fixed-array match coverage or binding definitions are incomplete",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_exact_statement_fact(
     analysis: &PartialAnalysis,
     program: &wrela_hir::Program,
@@ -7546,6 +7747,35 @@ fn validate_exact_statement_fact(
                 .ok()
                 .and_then(|index| analysis.expressions.get(index))
                 .ok_or_else(|| invalid("enum match scrutinee expression fact is missing"))?;
+            if let Some((element, length)) = analysis
+                .types
+                .get(scrutinee_fact.ty.0 as usize)
+                .and_then(|record| match record.kind {
+                    SemanticTypeKind::Array { element, length } => Some((element, length)),
+                    _ => None,
+                })
+            {
+                validate_exact_fixed_array_match_statement(
+                    analysis,
+                    program,
+                    function,
+                    fact,
+                    arms,
+                    element,
+                    length,
+                    definitions,
+                    is_cancelled,
+                )?;
+                return validate_exact_statement_post_state(
+                    analysis,
+                    program,
+                    function,
+                    fact,
+                    exactly_taken,
+                    statement.body,
+                    is_cancelled,
+                );
+            }
             let (enumeration, variant_count) = analysis
                 .types
                 .get(scrutinee_fact.ty.0 as usize)
@@ -8031,6 +8261,27 @@ fn validate_exact_statement_fact(
             ));
         }
     }
+    validate_exact_statement_post_state(
+        analysis,
+        program,
+        function,
+        fact,
+        exactly_taken,
+        statement.body,
+        is_cancelled,
+    )
+}
+
+fn validate_exact_statement_post_state(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    function: &FunctionInstance,
+    fact: &StatementFact,
+    exactly_taken: &[bool],
+    statement_body: wrela_hir::BodyId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), AnalysisFailure> {
+    let invalid = |message: &str| AnalysisFailure::InternalInvariant(message.to_owned());
     for value in &fact.initialized_after {
         let record = analysis
             .values
@@ -8043,7 +8294,7 @@ fn validate_exact_statement_fact(
                 .get(local.0 as usize)
                 .map(|local| local.body)
                 .ok_or_else(|| invalid("statement post-state local is missing"))?;
-            if !body_is_ancestor(program, local_body, statement.body) {
+            if !body_is_ancestor(program, local_body, statement_body) {
                 return Err(invalid(
                     "branch-local value escapes without an explicit merge",
                 ));
@@ -9526,13 +9777,45 @@ fn exact_closed_fixed_array_matches(
     else {
         return false;
     };
+    let iteration_uses = program
+        .statements
+        .iter()
+        .filter(|statement| {
+            matches!(
+                statement.kind,
+                wrela_hir::StatementKind::For { iterable, .. } if iterable == array.expression
+            )
+        })
+        .count();
+    let match_uses = program
+        .statements
+        .iter()
+        .filter(|statement| {
+            matches!(
+                statement.kind,
+                wrela_hir::StatementKind::Match { scrutinee, .. }
+                    if scrutinee == array.expression
+            )
+        })
+        .count();
+    let exact_use = match (iteration_uses, match_uses) {
+        (1, 0) => Some((
+            "inline fixed-array iteration",
+            "every generated index is strictly below the exact inline array length",
+        )),
+        (0, 1) => Some((
+            "inline fixed-array pattern match",
+            "every array-pattern position is authenticated against the exact inline array length",
+        )),
+        _ => None,
+    };
     if proof.kind != ProofKind::CapacityBound
-        || proof.subject != "inline fixed-array iteration"
+        || exact_use.is_none_or(|(subject, explanation)| {
+            proof.subject != subject || proof.explanation.as_slice() != [explanation]
+        })
         || proof.sources.as_slice() != [source]
         || !proof.depends_on.is_empty()
         || proof.bound != Some(length)
-        || proof.explanation.as_slice()
-            != ["every generated index is strictly below the exact inline array length"]
     {
         return false;
     }
