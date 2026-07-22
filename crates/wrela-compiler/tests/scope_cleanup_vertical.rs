@@ -63,6 +63,8 @@ pub struct Worker:
     pub async fn ping(mut self):
         with irqs_masked() as mask:
             if should_stop():
+                pass
+            else:
                 return
         await checkpoint()
 
@@ -288,20 +290,28 @@ fn structured_scope_return_reaches_machine_and_deterministic_native_coff() {
     .expect("structured scope FlowWir encodes canonically");
 
     let mut forged_flow = flow_output.wir().as_wir().clone();
-    let helper = match cleanup.origin {
-        flow::FunctionOrigin::GeneratedCleanup {
-            semantic_function, ..
-        } => flow::FunctionId(semantic_function),
-        _ => panic!("generated cleanup origin"),
-    };
     let forged_turn = forged_flow
         .functions
         .iter_mut()
         .find(|function| matches!(function.role, flow::FunctionRole::ActorTurn(_)))
         .expect("forged actor turn");
-    forged_turn.blocks[1].instructions[0].operation = flow::FlowOperation::Call {
-        function: helper,
-        arguments: vec![flow::ValueId(1)],
+    let forged_cleanup = forged_turn
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find(|instruction| {
+            matches!(
+                instruction.operation,
+                flow::FlowOperation::Call { function, .. } if function == cleanup.id
+            )
+        })
+        .expect("forged taken-path cleanup call");
+    let copied_state = match &forged_cleanup.operation {
+        flow::FlowOperation::Call { arguments, .. } => arguments[0],
+        _ => unreachable!("selected only a cleanup call"),
+    };
+    forged_cleanup.operation = flow::FlowOperation::Copy {
+        value: copied_state,
     };
     let forged_flow = forged_flow
         .validate()
@@ -352,7 +362,17 @@ fn structured_scope_return_reaches_machine_and_deterministic_native_coff() {
     assert_eq!(machine, repeated.machine().wir().as_wir());
 
     let mut missing_taken_cleanup = machine.clone();
-    missing_taken_cleanup.functions[machine_turn.id.0 as usize].blocks[1]
+    missing_taken_cleanup.functions[machine_turn.id.0 as usize]
+        .blocks
+        .iter_mut()
+        .find(|block| {
+            matches!(
+                block.terminator,
+                wrela_backend::machine_wir::MachineTerminator::Return(ref values)
+                    if values.is_empty() && !block.instructions.is_empty()
+            )
+        })
+        .expect("returning scope branch")
         .instructions
         .clear();
     let errors = missing_taken_cleanup

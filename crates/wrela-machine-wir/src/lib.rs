@@ -4556,11 +4556,28 @@ fn structured_scope_activation_shape_matches(
     let [state_field, state_constructor, predicate] = entry.instructions.as_slice() else {
         return false;
     };
-    let [taken_cleanup] = taken.instructions.as_slice() else {
-        return false;
-    };
     let [fallthrough_cleanup, activation_call] = fallthrough.instructions.as_slice() else {
         return false;
+    };
+    let returning_cleanup = match (
+        taken.instructions.as_slice(),
+        &taken.terminator,
+        untaken.instructions.as_slice(),
+        &untaken.terminator,
+    ) {
+        (
+            [cleanup],
+            MachineTerminator::Return(values),
+            [],
+            MachineTerminator::Jump { block, arguments },
+        ) if values.is_empty() && *block == fallthrough.id && arguments.is_empty() => cleanup,
+        (
+            [],
+            MachineTerminator::Jump { block, arguments },
+            [cleanup],
+            MachineTerminator::Return(values),
+        ) if values.is_empty() && *block == fallthrough.id && arguments.is_empty() => cleanup,
+        _ => return false,
     };
     let [state_field_value] = state_field.results.as_slice() else {
         return false;
@@ -4579,7 +4596,7 @@ fn structured_scope_activation_shape_matches(
         } if arguments.is_empty() => module.functions.get(function.0 as usize),
         _ => None,
     };
-    let cleanup_function = match (&taken_cleanup.operation, &fallthrough_cleanup.operation) {
+    let cleanup_function = match (&returning_cleanup.operation, &fallthrough_cleanup.operation) {
         (
             MachineOperation::Call {
                 function: left,
@@ -4594,9 +4611,9 @@ fn structured_scope_activation_shape_matches(
         ) if left == right
             && left_arguments.as_slice() == [*state]
             && right_arguments == left_arguments
-            && taken_cleanup.results.is_empty()
+            && returning_cleanup.results.is_empty()
             && fallthrough_cleanup.results.is_empty()
-            && taken_cleanup.source == fallthrough_cleanup.source =>
+            && returning_cleanup.source == fallthrough_cleanup.source =>
         {
             module.functions.get(left.0 as usize)
         }
@@ -4640,12 +4657,7 @@ fn structured_scope_activation_shape_matches(
         ) && cleanup.role == MachineFunctionRole::Cleanup
             && cleanup.convention == CallingConvention::Internal
     });
-    let tails_match = matches!(&taken.terminator, MachineTerminator::Return(values) if values.is_empty())
-        && untaken.instructions.is_empty()
-        && matches!(&untaken.terminator,
-            MachineTerminator::Jump { block, arguments }
-                if *block == fallthrough.id && arguments.is_empty())
-        && activation_call.id == activation.call_instruction
+    let tails_match = activation_call.id == activation.call_instruction
         && resume.instructions.is_empty()
         && matches!(&resume.terminator, MachineTerminator::Return(values) if values.is_empty());
     branch_matches

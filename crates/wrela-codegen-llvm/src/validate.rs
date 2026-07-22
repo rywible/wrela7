@@ -1427,11 +1427,28 @@ fn structured_scope_activation_codegen_matches(
     let [state_field, state_constructor, predicate] = entry.instructions.as_slice() else {
         return false;
     };
-    let [taken_cleanup] = taken.instructions.as_slice() else {
-        return false;
-    };
     let [fallthrough_cleanup, activation_call] = fallthrough.instructions.as_slice() else {
         return false;
+    };
+    let returning_cleanup = match (
+        taken.instructions.as_slice(),
+        &taken.terminator,
+        untaken.instructions.as_slice(),
+        &untaken.terminator,
+    ) {
+        (
+            [cleanup],
+            MachineTerminator::Return(values),
+            [],
+            MachineTerminator::Jump { block, arguments },
+        ) if values.is_empty() && *block == fallthrough.id && arguments.is_empty() => cleanup,
+        (
+            [],
+            MachineTerminator::Jump { block, arguments },
+            [cleanup],
+            MachineTerminator::Return(values),
+        ) if values.is_empty() && *block == fallthrough.id && arguments.is_empty() => cleanup,
+        _ => return false,
     };
     let [state_field_value] = state_field.results.as_slice() else {
         return false;
@@ -1495,16 +1512,10 @@ fn structured_scope_activation_codegen_matches(
                 convention: CallingConvention::Internal,
                 ..
             } if arguments.is_empty())
-        && cleanup_matches(taken_cleanup)
+        && cleanup_matches(returning_cleanup)
         && cleanup_matches(fallthrough_cleanup)
-        && taken_cleanup.operation == fallthrough_cleanup.operation
-        && taken_cleanup.source == fallthrough_cleanup.source
-        && matches!(&taken.terminator,
-            MachineTerminator::Return(values) if values.is_empty())
-        && untaken.instructions.is_empty()
-        && matches!(&untaken.terminator,
-            MachineTerminator::Jump { block, arguments }
-                if *block == fallthrough.id && arguments.is_empty())
+        && returning_cleanup.operation == fallthrough_cleanup.operation
+        && returning_cleanup.source == fallthrough_cleanup.source
         && activation_call.id == activation.call_instruction
         && activation_call.results.is_empty()
         && activation_call.source == Some(activation.source)

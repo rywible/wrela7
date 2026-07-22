@@ -991,10 +991,9 @@ fn validate_scope_normal_body(
                     branches,
                     else_body,
                 } => {
-                    let structured_return =
-                        direct_cleanup_path && branches.len() == 1 && else_body.is_none();
+                    let structured_return = direct_cleanup_path && branches.len() == 1;
                     pending.extend(branches.iter().map(|(_, body)| (*body, structured_return)));
-                    pending.extend(else_body.map(|body| (body, false)));
+                    pending.extend(else_body.map(|body| (body, structured_return)));
                 }
                 wrela_hir::StatementKind::Match { arms, .. } => {
                     pending.extend(arms.iter().map(|arm| (arm.body, false)));
@@ -9051,7 +9050,7 @@ impl SourceFunctionLowerer<'_> {
                         state,
                         source,
                         next,
-                        false,
+                        allow_returns,
                     )?;
                 }
                 wir::SemanticStatement::Match { arms, .. } => {
@@ -23720,22 +23719,143 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn if_else_structured_return_keeps_named_cleanup_boundary() {
+    fn if_else_structured_return_cleans_both_paths() {
         let source = PASS_ONLY_SCOPE_ACTOR_SOURCE.replace(
             "        with irqs_masked() as mask:\n            pass\n        await checkpoint()",
             "        with irqs_masked() as mask:\n            if true:\n                return\n            else:\n                return",
         );
-        assert!(matches!(
-            CanonicalSemanticLowerer::new().lower(
+        let image = analyze_parsed_actor_source(&source);
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
                 LowerRequest {
-                    input: analyze_parsed_actor_source(&source),
+                    input: image.clone(),
                     limits: LoweringLimits::standard(),
                 },
                 &|| false,
-            ),
-            Err(LowerError::UnsupportedInput {
-                feature: "semantic-with-structured-return-cleanup-lowering-pending"
+            )
+            .expect("both returning branches must clean the active scope");
+        let turn = lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .expect("actor turn");
+        let (then_region, else_region) = turn
+            .body
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::If {
+                    then_region,
+                    else_region,
+                    ..
+                } => Some((then_region, else_region)),
+                _ => None,
             })
+            .expect("if/else scope body");
+        let exact_cleanup_return = |region: &wir::SemanticRegion| {
+            matches!(region.statements.as_slice(), [
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::CommitScope { .. },
+                    ..
+                }),
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::ExitScope { .. },
+                    ..
+                }),
+                wir::SemanticStatement::Return(values),
+            ] if values.is_empty())
+        };
+        assert!(exact_cleanup_return(then_region));
+        assert!(exact_cleanup_return(else_region));
+
+        let exact_operations = lowered.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact if/else cleanup operation bound");
+        let mut one_under = exact;
+        one_under.operations -= 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == one_under.operations
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("measure if/else cleanup cancellation polls");
+        let final_poll = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+
+        let mut forged = lowered.wir().as_wir().clone();
+        let else_region = forged
+            .functions
+            .iter_mut()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .and_then(|turn| {
+                turn.body
+                    .statements
+                    .iter_mut()
+                    .find_map(|statement| match statement {
+                        wir::SemanticStatement::If { else_region, .. } => Some(else_region),
+                        _ => None,
+                    })
+            })
+            .expect("forged else branch");
+        else_region.statements.remove(1);
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                forged,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidOutput(_)) | Err(LowerError::InvalidReport(_))
         ));
     }
 

@@ -2014,9 +2014,6 @@ fn authenticated_activation_call_site<'a>(
     let [state_field, state_constructor, predicate] = entry.instructions.as_slice() else {
         return Err(boundary());
     };
-    let [taken_cleanup] = taken.instructions.as_slice() else {
-        return Err(boundary());
-    };
     let [fallthrough_cleanup, call] = fallthrough.instructions.as_slice() else {
         return Err(boundary());
     };
@@ -2030,12 +2027,25 @@ fn authenticated_activation_call_site<'a>(
     else {
         return Err(boundary());
     };
-    let flow::Terminator::Jump {
-        target: fallthrough_target,
-        arguments: fallthrough_arguments,
-    } = &untaken.terminator
-    else {
-        return Err(boundary());
+    let returning_cleanup = match (
+        taken.instructions.as_slice(),
+        &taken.terminator,
+        untaken.instructions.as_slice(),
+        &untaken.terminator,
+    ) {
+        (
+            [cleanup],
+            flow::Terminator::Return(values),
+            [],
+            flow::Terminator::Jump { target, arguments },
+        ) if values.is_empty() && *target == fallthrough.id && arguments.is_empty() => cleanup,
+        (
+            [],
+            flow::Terminator::Jump { target, arguments },
+            [cleanup],
+            flow::Terminator::Return(values),
+        ) if values.is_empty() && *target == fallthrough.id && arguments.is_empty() => cleanup,
+        _ => return Err(boundary()),
     };
     let flow::Terminator::Suspend {
         state: suspend_state,
@@ -2072,12 +2082,12 @@ fn authenticated_activation_call_site<'a>(
         .types
         .get(flow_value_type(caller, *condition_result)?.0 as usize)
         .is_some_and(|ty| ty.kind == flow::FlowTypeKind::Scalar(flow::ScalarType::Bool));
-    let cleanup_calls_match = taken_cleanup.operation == fallthrough_cleanup.operation
-        && taken_cleanup.source == fallthrough_cleanup.source
+    let cleanup_calls_match = returning_cleanup.operation == fallthrough_cleanup.operation
+        && returning_cleanup.source == fallthrough_cleanup.source
         && authenticated_generated_cleanup_call(
             input,
             caller,
-            taken_cleanup,
+            returning_cleanup,
             *state,
             is_cancelled,
         )?
@@ -2116,10 +2126,6 @@ fn authenticated_activation_call_site<'a>(
             == [flow_value_type(caller, *condition_result)?]
         && condition_is_bool
         && cleanup_calls_match
-        && matches!(&taken.terminator, flow::Terminator::Return(values) if values.is_empty())
-        && untaken.instructions.is_empty()
-        && fallthrough_target == &fallthrough.id
-        && fallthrough_arguments.is_empty()
         && suspend_state == 0
         && resume_target == resume.id
         && matches!(&call.operation,
