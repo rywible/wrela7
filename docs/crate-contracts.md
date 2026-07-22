@@ -611,9 +611,10 @@ it. It injects phase implementations and bounded host capabilities, while
   initialized owned nongeneric flat-structure local as SSA aggregate
   replacement. It never invents an address or memory proof. Compound/nested,
   nonlocal and view write-through remain explicit pending boundaries. One
-  canonical actor-state plain write additionally retains its exact
-  `RegionBound` proof as a no-result `Promote` immediately before the concrete
-  store, and attaches that proof to the actor-turn function authority set.
+  canonical actor-state plain write and checked-add/subtract result additionally
+  retain their exact `RegionBound` proofs as no-result `Promote` markers
+  immediately before the concrete stores, and attach those proofs to the
+  actor-turn function authority set. A compound RHS is never promoted.
 - Generated synchronous tests admit one projection-lowering profile only: a
   free nongeneric bare immutable projection with one read parameter backed by
   a nongeneric flat copy-scalar aggregate, one direct primitive field yield,
@@ -684,7 +685,7 @@ it. It injects phase implementations and bounded host capabilities, while
 - Every region records its closed class, owner, byte capacity, alignment,
   exact `CapacityBound` proof, and source span. Validation joins those fields
   rather than allowing report or Machine consumers to infer region provenance.
-- FlowWir v19 adds one exact actor-state `Promote` marker. Validation requires
+- FlowWir v19 carries exact actor-state `Promote` markers. Validation requires
   an unsigned 64-bit value, the owning actor's canonical eight-byte `.state`
   image region, a source-identical eight-byte `RegionBound` proof listed on the
   turn function, and no result. This is proof/lifetime authority; the following
@@ -725,11 +726,12 @@ it. It injects phase implementations and bounded host capabilities, while
   without fabricating function tests.
 - The seal independently bounds all blocks/instructions plus aggregate operand,
   edge, feature/proof, and UTF-8/immediate payload retained in FlowWir.
-- The first L2.3 subset lowers only the authenticated direct actor-state
-  promotion and requires it to be immediately followed by the same-source,
-  same-value, same-region actor-state store. Its sealer compares the marker and
-  adjacency exactly; general allocation/reset and other promotion shapes stay
-  fail closed.
+- The first L2.3 subset lowers the authenticated direct actor-state promotion
+  and the synthetic result of one checked addition or subtraction. Each marker
+  must be immediately followed by the same-source, same-value, same-region
+  actor-state store; a compound marker must name the checked result rather than
+  its RHS. The sealer compares operator, marker, and adjacency exactly; general
+  allocation/reset and other promotion shapes stay fail closed.
 - Does not optimize, fix ABI/layout, choose runtime intrinsics, or serialize.
 
 ### `wrela-flow-opt`
@@ -953,11 +955,14 @@ it. It injects phase implementations and bounded host capabilities, while
   selects, ordinary loads/stores, calls, fences, and control-flow edges. The
   image entry alone receives the exact AArch64 UEFI two-pointer/`EFI_STATUS`
   boundary and an implicit `EFI_SUCCESS` value for a unit return.
-- For the canonical actor-state direct write, lowering authenticates the
-  FlowWir v19 promotion proof, owning `.state` region, value, source, and exact
-  marker→address→store adjacency. The marker has no MachineWir operation and
-  is excluded consistently from output, reservation, and exact instruction
-  accounting; the address/store remains the concrete writable-global action.
+- For the canonical actor-state direct write and checked-add/subtract profiles,
+  lowering authenticates the FlowWir v19 promotion proof, owning `.state`
+  region, value, source, and exact load→operator→marker→address→store chain.
+  At most one checked addition and one checked subtraction are admitted in the
+  bounded turn prefix, preventing an operator relabel from satisfying the
+  profile. Markers have no MachineWir operation and are excluded consistently
+  from output, reservation, and exact instruction accounting; address/load/
+  store and checked arithmetic remain concrete machine actions.
   Activation call IDs are translated through this erasure so the sealed
   scheduler plan continues to name the exact dense MachineWir instruction.
 - For the typed-reply profile, lowering allocates exactly one caller-owned
@@ -1060,6 +1065,11 @@ it. It injects phase implementations and bounded host capabilities, while
   the no-argument internal call's one exact `u64` result, the constant-return
   callee, parameterless resume, and empty jump before using the ordinary call
   renderer. No scheduler, parked frame, or cancellation runtime is inferred.
+- For the sealed actor-state compound profile, codegen independently checks the
+  owning eight-byte writable cell, unsigned `u64` load/RHS/result identities,
+  same-source address/store chain, arithmetic failure provenance, and at most
+  one checked addition plus one checked subtraction. It rejects an operator
+  relabel before rendering the generic checked-integer underflow path.
 - The implemented writable-storage subset is deliberately narrow. Private,
   dense, exactly covering byte-array globals may use `WritableData` with a
   typed zero initializer in exact `.data` or in the canonical

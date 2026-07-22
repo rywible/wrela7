@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::{cell::Cell, sync::Arc};
 
 use wrela_backend::{
-    CodegenError, MachineLowerError, emit_prepared_object, flow_wir as flow,
-    llvm_backend_available,
+    BackendContentHasher, BackendPreparationOptions, BackendPreparationServices,
+    CanonicalBackendContentHasher, CanonicalFlowOptimizer, CanonicalMachineLowerer, CodegenError,
+    MachineLowerError, MachineLoweringLimits, OptimizationLimits, OptimizationProfile,
+    emit_prepared_object, flow_wir as flow, llvm_backend_available,
     machine_wir::{CheckedIntegerOp, MachineOperation, MachineRegionStorageKind, ValidationError},
-    prepare_canonical_frame_for_codegen,
+    prepare_canonical_frame_for_codegen, prepare_for_codegen,
 };
 use wrela_build_model::{
     BuildConfiguration, BuildIdentity, BuildProfile, LanguageRevision, Sha256Digest,
@@ -53,6 +55,7 @@ pub struct Worker:
     pub async fn ping(mut self):
         self.value = 5
         self.value += 7
+        self.value -= 3
         await checkpoint()
 
     @task
@@ -79,7 +82,7 @@ fn never_cancelled() -> bool {
 }
 
 #[test]
-fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
+fn canonical_checked_add_and_subtract_actor_state_reach_native_machine_storage() {
     let source_graph_digest = Sha256Digest::from_bytes([0xb1; 32]);
     let core_package_digest = Sha256Digest::from_bytes([0xb2; 32]);
     let target_digest = Sha256Digest::from_bytes([0xb3; 32]);
@@ -248,6 +251,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
         [
             "alloc:0:actor-state-store",
             "alloc:1:actor-state-compound-store",
+            "alloc:2:actor-state-compound-store",
         ]
     );
     assert_eq!(
@@ -259,6 +263,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
         [
             "alloc:0:actor-state-store",
             "alloc:1:actor-state-compound-store",
+            "alloc:2:actor-state-compound-store",
         ]
     );
     assert!(report.promotions.iter().all(|fact| {
@@ -377,6 +382,44 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
                 },
                 source: compound_store_source,
             },
+            semantic::LetStatement {
+                results: subtract_loaded,
+                operation: semantic::SemanticOperation::ActorStateLoad {
+                    actor: semantic::ActorId(0),
+                    region: subtract_region,
+                    proof: subtract_proof,
+                },
+                ..
+            },
+            semantic::LetStatement {
+                results: subtracted,
+                operation: semantic::SemanticOperation::Binary {
+                    operator: semantic::BinaryOperator::Subtract,
+                    left: subtract_left,
+                    arithmetic: semantic::ArithmeticMode::Checked,
+                    ..
+                },
+                ..
+            },
+            semantic::LetStatement {
+                results: subtract_promotion_results,
+                operation: semantic::SemanticOperation::Promote {
+                    value: subtract_promoted,
+                    destination: subtract_promotion_region,
+                    proof: subtract_promotion_proof,
+                },
+                source: subtract_promotion_source,
+            },
+            semantic::LetStatement {
+                results: subtract_store_results,
+                operation: semantic::SemanticOperation::ActorStateStore {
+                    actor: semantic::ActorId(0),
+                    region: subtract_store_region,
+                    value: subtract_stored,
+                    proof: subtract_store_proof,
+                },
+                source: subtract_store_source,
+            },
         ] if promotion_results.is_empty()
             && direct_store_results.is_empty()
             && *promoted == *directly_stored
@@ -397,6 +440,18 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             && semantic_actor_turn.proofs.contains(compound_promotion_proof)
             && *compound_promotion_source == *compound_store_source
             && stored_results.is_empty()
+            && *subtract_region == semantic_state.id
+            && *subtract_store_region == *subtract_region
+            && *subtract_proof == semantic_state.proof
+            && *subtract_store_proof == *subtract_proof
+            && matches!(subtract_loaded.as_slice(), [loaded] if loaded == subtract_left)
+            && matches!(subtracted.as_slice(), [result] if result == subtract_stored)
+            && subtract_promotion_results.is_empty()
+            && subtract_promoted == subtract_stored
+            && *subtract_promotion_region == semantic_state.id
+            && semantic_actor_turn.proofs.contains(subtract_promotion_proof)
+            && *subtract_promotion_source == *subtract_store_source
+            && subtract_store_results.is_empty()
     ));
 
     let (semantic_wir, _) = semantic_output.into_parts();
@@ -443,7 +498,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             )
         })
         .count();
-    assert_eq!(flow_promotions, 2);
+    assert_eq!(flow_promotions, 3);
     let flow_state_addresses = flow_actor_turn
         .blocks
         .iter()
@@ -459,7 +514,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             )
         })
         .count();
-    assert_eq!(flow_state_addresses, 3);
+    assert_eq!(flow_state_addresses, 5);
     assert_eq!(
         flow_actor_turn
             .blocks
@@ -467,7 +522,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             .flat_map(|block| &block.instructions)
             .filter(|instruction| matches!(instruction.operation, flow::FlowOperation::Load { .. }))
             .count(),
-        1
+        2
     );
     assert_eq!(
         flow_actor_turn
@@ -491,10 +546,25 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             .flat_map(|block| &block.instructions)
             .filter(|instruction| matches!(
                 instruction.operation,
+                flow::FlowOperation::Binary {
+                    op: flow::BinaryOp::SubChecked,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        flow_actor_turn
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(
+                instruction.operation,
                 flow::FlowOperation::Store { .. }
             ))
             .count(),
-        2
+        3
     );
     let mut forged_flow = flow_output.wir().as_wir().clone();
     let forged_turn = forged_flow
@@ -551,6 +621,47 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             feature: "machine-async-result-delivery-pending",
         })
     );
+    let mut forged_subtract_operator = flow_output.wir().as_wir().clone();
+    let forged_turn = forged_subtract_operator
+        .functions
+        .iter_mut()
+        .find(|function| function.role == flow::FunctionRole::ActorTurn(flow::ActorId(0)))
+        .expect("forged FlowWir actor turn");
+    let op = forged_turn
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.operation {
+            flow::FlowOperation::Binary { op, .. } if *op == flow::BinaryOp::SubChecked => Some(op),
+            _ => None,
+        })
+        .expect("checked actor-state subtraction");
+    *op = flow::BinaryOp::AddChecked;
+    let forged_subtract_operator = forged_subtract_operator
+        .validate()
+        .expect("operator substitution remains structurally valid FlowWir");
+    let forged_encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &forged_subtract_operator,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("operator substitution remains canonical FlowWir");
+    let error = prepare_canonical_frame_for_codegen(
+        forged_encoded.bytes(),
+        &target,
+        &build,
+        &never_cancelled,
+    )
+    .expect_err("Machine lowering must reject subtraction relabelled as a second addition");
+    assert_eq!(
+        error.machine_lower_error(),
+        Some(&MachineLowerError::UnsupportedInput {
+            feature: "machine-async-result-delivery-pending",
+        })
+    );
     let encoded = encode_and_verify(
         &CanonicalFlowWirCodec,
         EncodeRequest {
@@ -571,7 +682,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             .flat_map(|function| &function.blocks)
             .map(|block| block.instructions.len())
             .sum::<usize>(),
-        14,
+        20,
         "both lifetime markers are erased before exact MachineWir instruction accounting"
     );
     assert_eq!(machine.version, 21);
@@ -606,7 +717,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
                 instruction.operation == MachineOperation::GlobalAddress(machine_state.global)
             })
             .count(),
-        3
+        5
     );
     assert_eq!(
         machine_actor_turn
@@ -615,7 +726,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             .flat_map(|block| &block.instructions)
             .filter(|instruction| matches!(instruction.operation, MachineOperation::Load { .. }))
             .count(),
-        1
+        2
     );
     assert_eq!(
         machine_actor_turn
@@ -637,15 +748,127 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             .blocks
             .iter()
             .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(
+                instruction.operation,
+                MachineOperation::CheckedInteger {
+                    op: CheckedIntegerOp::Subtract,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        machine_actor_turn
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
             .filter(|instruction| matches!(instruction.operation, MachineOperation::Store { .. }))
             .count(),
-        2
+        3
     );
 
     let repeated =
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
             .expect("repeated canonical actor-state preparation");
     assert_eq!(machine, repeated.machine().wir().as_wir());
+
+    let prepare_with = |machine_limits: MachineLoweringLimits, is_cancelled: &dyn Fn() -> bool| {
+        let codec = CanonicalFlowWirCodec;
+        let hasher = CanonicalBackendContentHasher::new();
+        let optimizer = CanonicalFlowOptimizer::new();
+        let machine_lowerer = CanonicalMachineLowerer::new();
+        let expected_digest = hasher
+            .sha256(encoded.bytes(), &never_cancelled)
+            .expect("actor-state frame digest");
+        let optimization = OptimizationProfile::from_build_policy(
+            &build.profile.optimization,
+            build.identity.compiler,
+        )
+        .expect("actor-state optimization profile");
+        prepare_for_codegen(
+            BackendPreparationServices {
+                codec: &codec,
+                hasher: &hasher,
+                optimizer: &optimizer,
+                machine_lowerer: &machine_lowerer,
+            },
+            encoded.bytes(),
+            expected_digest,
+            &target,
+            &build,
+            BackendPreparationOptions {
+                codec_limits: CodecLimits::standard(),
+                optimization,
+                optimization_limits: OptimizationLimits::standard(),
+                machine_limits,
+            },
+            is_cancelled,
+        )
+    };
+    let exact_instructions = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .map(|block| block.instructions.len() as u64)
+        .sum::<u64>();
+    let exact_stack_slots = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_slots.len() as u64)
+        .sum::<u64>();
+    let exact_stack_bytes = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_bytes)
+        .max()
+        .unwrap_or(0);
+    let mut exact_machine_limits = MachineLoweringLimits::standard();
+    exact_machine_limits.types = machine.types.len() as u64;
+    exact_machine_limits.functions = machine.functions.len() as u64;
+    exact_machine_limits.sections = machine.sections.len() as u32;
+    exact_machine_limits.symbols = machine.symbols.len() as u32;
+    exact_machine_limits.globals = machine.globals.len() as u32;
+    exact_machine_limits.instructions = exact_instructions;
+    exact_machine_limits.stack_slots = exact_stack_slots.max(1);
+    exact_machine_limits.proofs = machine.proofs.len() as u32;
+    exact_machine_limits.static_bytes = machine
+        .sections
+        .iter()
+        .map(|section| section.reserved_bytes)
+        .sum();
+    exact_machine_limits.stack_bytes_per_function = exact_stack_bytes.max(1);
+    exact_machine_limits = exact_machine_limits.with_aligned_validation();
+    let exact = prepare_with(exact_machine_limits, &never_cancelled)
+        .expect("actor-state subtraction accepts its exact MachineWir ceilings");
+    assert_eq!(machine, exact.machine().wir().as_wir());
+    let mut one_under = exact_machine_limits;
+    one_under.instructions -= 1;
+    let error = prepare_with(one_under, &never_cancelled)
+        .expect_err("one fewer MachineWir instruction must fail closed");
+    assert_eq!(
+        error.machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir instructions",
+            limit: exact_instructions - 1,
+        })
+    );
+    let polls = Cell::new(0_u64);
+    prepare_with(exact_machine_limits, &|| {
+        polls.set(polls.get().saturating_add(1));
+        false
+    })
+    .expect("count actor-state backend preparation polls");
+    let final_poll = polls.get();
+    assert!(final_poll > 2);
+    polls.set(0);
+    let cancelled = prepare_with(exact_machine_limits, &|| {
+        let next = polls.get().saturating_add(1);
+        polls.set(next);
+        next >= final_poll
+    })
+    .expect_err("final actor-state backend preparation poll must cancel");
+    assert!(cancelled.is_cancelled());
 
     let state_id = machine_state.id;
     let state_section = machine.sections[machine_state.section.0 as usize].clone();

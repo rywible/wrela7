@@ -1845,6 +1845,8 @@ fn exact_actor_state_machine_prefix(
         })
     };
     let mut index = 0;
+    let mut checked_adds = 0_u8;
+    let mut checked_subtracts = 0_u8;
     while index < instructions.len() {
         if let (MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le }), [result]) = (
             &instructions[index].operation,
@@ -1966,7 +1968,9 @@ fn exact_actor_state_machine_prefix(
                         (&binary.operation, binary.results.as_slice()),
                         (
                             MachineOperation::CheckedInteger {
-                                op: CheckedIntegerOp::Add,
+                                op:
+                                    CheckedIntegerOp::Add
+                                    | CheckedIntegerOp::Subtract,
                                 signedness: IntegerSignedness::Unsigned,
                                 left,
                                 right: binary_right,
@@ -1976,6 +1980,7 @@ fn exact_actor_state_machine_prefix(
                         ) if left == loaded
                             && binary_right == right
                             && failure.kind == ScalarFailureKind::Arithmetic
+                            && failure.flow_function == function.id.0
                             && function.values.get(result.0 as usize)
                                 .is_some_and(|value| u64_type(value.ty))
                             && matches!(
@@ -2006,6 +2011,20 @@ fn exact_actor_state_machine_prefix(
                     && store.source == address_instruction.source
             );
             if compound_matches {
+                match binary.operation {
+                    MachineOperation::CheckedInteger {
+                        op: CheckedIntegerOp::Add,
+                        ..
+                    } => checked_adds = checked_adds.saturating_add(1),
+                    MachineOperation::CheckedInteger {
+                        op: CheckedIntegerOp::Subtract,
+                        ..
+                    } => checked_subtracts = checked_subtracts.saturating_add(1),
+                    _ => return false,
+                }
+                if checked_adds > 1 || checked_subtracts > 1 {
+                    return false;
+                }
                 index += 6;
                 continue;
             }

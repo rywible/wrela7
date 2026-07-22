@@ -2593,6 +2593,8 @@ fn exact_actor_state_prefix(
         return false;
     };
     let mut index = 0;
+    let mut checked_adds = 0_u8;
+    let mut checked_subtracts = 0_u8;
     while index < instructions.len() {
         if let (
             flow::FlowOperation::Immediate(flow::Immediate::Integer { bits: 64, bytes_le }),
@@ -2798,7 +2800,9 @@ fn exact_actor_state_prefix(
                         (&binary.operation, binary.results.as_slice()),
                         (
                             flow::FlowOperation::Binary {
-                                op: flow::BinaryOp::AddChecked,
+                                op:
+                                    flow::BinaryOp::AddChecked
+                                    | flow::BinaryOp::SubChecked,
                                 left,
                                 right: binary_right,
                             },
@@ -2861,6 +2865,20 @@ fn exact_actor_state_prefix(
                     && store.source == address_instruction.source
             );
             if compound_matches {
+                match binary.operation {
+                    flow::FlowOperation::Binary {
+                        op: flow::BinaryOp::AddChecked,
+                        ..
+                    } => checked_adds = checked_adds.saturating_add(1),
+                    flow::FlowOperation::Binary {
+                        op: flow::BinaryOp::SubChecked,
+                        ..
+                    } => checked_subtracts = checked_subtracts.saturating_add(1),
+                    _ => return false,
+                }
+                if checked_adds > 1 || checked_subtracts > 1 {
+                    return false;
+                }
                 index += 7;
                 continue;
             }
