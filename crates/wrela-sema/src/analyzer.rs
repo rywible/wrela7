@@ -15432,6 +15432,237 @@ fn analyze_closed_enum_constructor(
     })
 }
 
+fn runtime_constructor_field_index(
+    request: &AnalysisRequest<'_>,
+    aggregate: &wrela_hir::AggregateDeclaration,
+    argument: &wrela_hir::CallArgument,
+    source_index: usize,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<usize> {
+    if let Some(name) = &argument.name {
+        let mut selected = None;
+        for (index, field) in aggregate.fields.iter().enumerate() {
+            charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+            if field.name == *name && selected.replace(index).is_some() {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    argument.source,
+                    "semantic-runtime-constructor-argument",
+                    "runtime structure field name is ambiguous",
+                    "constructor field selection requires one exact declaration",
+                    "remove the duplicate field declaration",
+                ));
+            }
+        }
+        selected.ok_or_else(|| {
+            runtime_type_diagnostic(
+                request,
+                argument.source,
+                "semantic-runtime-constructor-argument",
+                "runtime constructor argument does not name a declared field",
+                "field names are matched exactly and nominally",
+                "use one of the structure's declared field names",
+            )
+        })
+    } else {
+        Ok(source_index)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn infer_generic_structure_constructor_arguments(
+    request: &AnalysisRequest<'_>,
+    partial: &PartialAnalysis,
+    call: RuntimeDirectCall<'_>,
+    declaration: DeclarationId,
+    aggregate: &wrela_hir::AggregateDeclaration,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<Vec<SemanticArgument>> {
+    if u64::try_from(aggregate.generics.len())
+        .map_or(true, |count| count > request.limits.fact_edges)
+    {
+        return Err(fact_resource(request, "generic structure parameters").into());
+    }
+    let mut inferred = Vec::new();
+    inferred
+        .try_reserve_exact(aggregate.generics.len())
+        .map_err(|_| fact_resource(request, "generic structure inference"))?;
+    inferred.resize(aggregate.generics.len(), None);
+    for generic_id in &aggregate.generics {
+        check_cancelled(is_cancelled)?;
+        let generic = request
+            .hir
+            .as_program()
+            .generic_parameter(*generic_id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if generic.owner != declaration
+            || !matches!(
+                generic.kind,
+                wrela_hir::GenericParameterKind::Type { bound: None }
+            )
+        {
+            return Err(runtime_type_diagnostic(
+                request,
+                generic.source,
+                "semantic-runtime-generic-structure-parameter",
+                "runtime generic structure parameter is outside the bounded type-only subset",
+                "constant, region, and bounded type parameters require later specialization semantics",
+                "use an unbounded type parameter specialized with a supported copy scalar",
+            ));
+        }
+    }
+
+    let mut resolved = optional_call_map(aggregate.fields.len(), request.limits.fact_edges)?;
+    for (source_index, argument) in call.arguments.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        if !matches!(argument.value, wrela_hir::CallArgumentValue::Value(_)) {
+            return Err(runtime_type_diagnostic(
+                request,
+                argument.source,
+                "semantic-runtime-constructor-access",
+                "runtime structure constructor fields use value access",
+                "borrow, mutate, and take markers do not constrain owned generic field types",
+                "remove the access marker from this constructor argument",
+            ));
+        }
+        if aggregate.fields.len() != 1 && argument.name.is_none() {
+            return Err(runtime_type_diagnostic(
+                request,
+                argument.source,
+                "semantic-runtime-constructor-argument",
+                "a runtime structure with multiple fields requires named constructor arguments",
+                "named fields make source-to-layout ordering explicit and deterministic",
+                "name every constructor argument",
+            ));
+        }
+        let field_index = runtime_constructor_field_index(
+            request,
+            aggregate,
+            argument,
+            source_index,
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )?;
+        let slot = resolved
+            .get_mut(field_index)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if slot.is_some() {
+            return Err(runtime_type_diagnostic(
+                request,
+                argument.source,
+                "semantic-runtime-constructor-argument",
+                "runtime constructor supplies one field more than once",
+                "each field has exactly one deterministic initializer",
+                "remove the duplicate field argument",
+            ));
+        }
+        *slot = Some(ResolvedCallArgument {
+            source_index: u32::try_from(source_index)
+                .map_err(|_| fact_resource(request, "generic structure inference arguments"))?,
+            parameter_index: u32::try_from(field_index)
+                .map_err(|_| fact_resource(request, "generic structure inference arguments"))?,
+            access: AccessMode::Value,
+            value: ValueId(0),
+        });
+
+        let field = aggregate
+            .fields
+            .get(field_index)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let position = match &field.ty.kind {
+            TypeExpressionKind::Named {
+                definition: Definition::Builtin(_),
+                arguments,
+            } if arguments.is_empty() => continue,
+            TypeExpressionKind::Named {
+                definition: Definition::Generic(generic),
+                arguments,
+            } if arguments.is_empty() => {
+                let mut position = None;
+                for (index, candidate) in aggregate.generics.iter().enumerate() {
+                    charge_runtime_aggregate_lookup(
+                        request,
+                        &mut *state.aggregate_work,
+                        is_cancelled,
+                    )?;
+                    if candidate == generic {
+                        position = Some(index);
+                        break;
+                    }
+                }
+                position.ok_or(AnalysisFailure::RequestMismatch)?
+            }
+            _ => {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    field.ty.source,
+                    "semantic-runtime-generic-structure-inference-shape",
+                    "generic structure inference encountered a non-direct field type",
+                    "this bounded inference slice substitutes only bare structure-owned type parameters in scalar fields",
+                    "add an exact expected specialization for nested nominal, generic, view, tuple, or array fields",
+                ));
+            }
+        };
+        let Some(ty) = known_call_argument_type(request, partial, argument, state) else {
+            continue;
+        };
+        let ty_record = partial
+            .types
+            .get(ty.0 as usize)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if !is_stored_copy_scalar_type(ty_record) {
+            return Err(runtime_type_diagnostic(
+                request,
+                argument.source,
+                "semantic-runtime-generic-structure-inference-argument-type",
+                "generic structure field inference produced a non-scalar type argument",
+                "this specialization slice admits only bool, integer, and f32/f64 stored copy scalars",
+                "initialize the field from a previously typed supported copy-scalar local or parameter",
+            ));
+        }
+        let inferred_slot = inferred
+            .get_mut(position)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if inferred_slot.is_some_and(|existing| existing != ty) {
+            return Err(runtime_type_diagnostic(
+                request,
+                argument.source,
+                "semantic-runtime-generic-structure-inference-conflict",
+                "generic structure fields infer different types for one parameter",
+                "every direct field using one type parameter must receive the same typed scalar value",
+                "make the conflicting field initializers use one primitive copy-scalar type",
+            ));
+        }
+        *inferred_slot = Some(ty);
+    }
+
+    let mut arguments = Vec::new();
+    arguments
+        .try_reserve_exact(inferred.len())
+        .map_err(|_| fact_resource(request, "generic structure arguments"))?;
+    for (position, inferred) in inferred.into_iter().enumerate() {
+        let Some(ty) = inferred else {
+            let source = aggregate
+                .generics
+                .get(position)
+                .and_then(|generic| request.hir.as_program().generic_parameter(*generic))
+                .map_or(call.source, |generic| generic.source);
+            return Err(runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-runtime-generic-structure-inference-required",
+                "generic structure type argument is unconstrained at this constructor",
+                "each type parameter must be fixed by a direct field initialized from a previously typed local or parameter",
+                "add an exact expected structure type or pass a previously typed copy-scalar value",
+            ));
+        };
+        arguments.push(SemanticArgument::Type(ty));
+    }
+    Ok(arguments)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn analyze_flat_structure_constructor(
     request: &AnalysisRequest<'_>,
@@ -15451,6 +15682,16 @@ fn analyze_flat_structure_constructor(
     let DeclarationKind::Structure(aggregate) = &record.kind else {
         return Err(AnalysisFailure::RequestMismatch.into());
     };
+    if call.arguments.len() != aggregate.fields.len() {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-runtime-constructor-argument",
+            "runtime structure construction must supply every field exactly once",
+            "defaults and partial aggregate initialization are outside the flat runtime structure subset",
+            "supply one value for every declared field",
+        ));
+    }
     let ty = if aggregate.generics.is_empty() {
         ensure_flat_structure_type(
             request,
@@ -15479,14 +15720,23 @@ fn analyze_flat_structure_constructor(
         }
         expected
     } else {
-        return Err(runtime_type_diagnostic(
+        let arguments = infer_generic_structure_constructor_arguments(
             request,
-            call.source,
-            "semantic-runtime-generic-structure-inference-required",
-            "generic structure constructor requires an expected specialized type",
-            "this first monomorphization slice does not infer type arguments from constructor values",
-            "add a local, parameter, or result type that names the complete structure specialization",
-        ));
+            partial,
+            call,
+            declaration,
+            aggregate,
+            state,
+            is_cancelled,
+        )?;
+        ensure_flat_structure_type_specialized(
+            request,
+            partial,
+            declaration,
+            &arguments,
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )?
     };
     if expression_request
         .expected
@@ -15499,16 +15749,6 @@ fn analyze_flat_structure_constructor(
             "structure constructor does not produce the required nominal type",
             "nominal structure identities are never substituted by layout",
             "construct the exact structure named by the surrounding type",
-        ));
-    }
-    if call.arguments.len() != aggregate.fields.len() {
-        return Err(runtime_type_diagnostic(
-            request,
-            call.source,
-            "semantic-runtime-constructor-argument",
-            "runtime structure construction must supply every field exactly once",
-            "defaults and partial aggregate initialization are outside the flat runtime structure subset",
-            "supply one value for every declared field",
         ));
     }
     let semantic_fields = partial
@@ -15571,34 +15811,14 @@ fn analyze_flat_structure_constructor(
                 "name every constructor argument",
             ));
         }
-        let field_index = if let Some(name) = &argument.name {
-            let mut selected = None;
-            for (index, field) in aggregate.fields.iter().enumerate() {
-                charge_runtime_aggregate_lookup(request, &mut *state.aggregate_work, is_cancelled)?;
-                if field.name == *name && selected.replace(index).is_some() {
-                    return Err(runtime_type_diagnostic(
-                        request,
-                        argument.source,
-                        "semantic-runtime-constructor-argument",
-                        "runtime structure field name is ambiguous",
-                        "constructor field selection requires one exact declaration",
-                        "remove the duplicate field declaration",
-                    ));
-                }
-            }
-            selected.ok_or_else(|| {
-                runtime_type_diagnostic(
-                    request,
-                    argument.source,
-                    "semantic-runtime-constructor-argument",
-                    "runtime constructor argument does not name a declared field",
-                    "field names are matched exactly and nominally",
-                    "use one of the structure's declared field names",
-                )
-            })?
-        } else {
-            source_index
-        };
+        let field_index = runtime_constructor_field_index(
+            request,
+            aggregate,
+            argument,
+            source_index,
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )?;
         let field = aggregate
             .fields
             .get(field_index)
@@ -42679,7 +42899,7 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn generic_flat_structure_constructor_requires_expected_specialization() {
+    fn generic_flat_structure_constructor_untyped_literal_stays_unconstrained() {
         let source = dot_variant_actor_source(
             "pub struct Cell[T]:\n    pub value: T\n\nasync fn checkpoint():\n    Cell(1)\n    pass\n\n",
         );
@@ -42697,6 +42917,247 @@ pub fn boot() -> Image:
             Some("semantic-runtime-generic-structure-inference-required")
         );
         assert!(output.has_errors());
+    }
+
+    #[test]
+    fn generic_flat_structure_constructor_infers_direct_fields_from_typed_values() {
+        let source = dot_variant_actor_source(
+            "pub struct Pair[Left, Right]:\n    pub left: Left\n    pub right: Right\n\nasync fn checkpoint():\n    small: u8 = 1\n    wide: u64 = 2\n    Pair(left=small, right=wide)\n    alternate: Pair[u64, u8] = Pair(left=wide, right=small)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("typed fields should constrain generic structure inference");
+        assert!(
+            output.diagnostics().is_empty(),
+            "direct typed field inference must analyze: {:?}",
+            output.diagnostics()
+        );
+        let successful = output.successful().expect("sealed inferred structure");
+        let pair = fixture
+            .fixture
+            .hir
+            .as_program()
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name.as_ref().map(Name::as_str) == Some("Pair"))
+            .expect("Pair declaration")
+            .id;
+        let inferred = successful
+            .facts()
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(
+                    &ty.kind,
+                    SemanticTypeKind::Structure { declaration, arguments, .. }
+                        if *declaration == pair && arguments.len() == 2
+                )
+            })
+            .expect("one inferred Pair specialization");
+        let SemanticTypeKind::Structure {
+            arguments, fields, ..
+        } = &inferred.kind
+        else {
+            unreachable!("selected inferred structure")
+        };
+        let [SemanticArgument::Type(left), SemanticArgument::Type(right)] = arguments.as_slice()
+        else {
+            panic!("Pair must retain two ordered inferred type arguments")
+        };
+        assert!(matches!(
+            successful.facts().types[left.0 as usize].kind,
+            SemanticTypeKind::Integer {
+                signed: false,
+                bits: 8,
+                pointer_sized: false,
+            }
+        ));
+        assert!(matches!(
+            successful.facts().types[right.0 as usize].kind,
+            SemanticTypeKind::Integer {
+                signed: false,
+                bits: 64,
+                pointer_sized: false,
+            }
+        ));
+        assert_eq!(fields[0].ty, *left);
+        assert_eq!(fields[1].ty, *right);
+
+        let alternate = successful
+            .facts()
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(
+                    &ty.kind,
+                    SemanticTypeKind::Structure { declaration, arguments, .. }
+                        if *declaration == pair && arguments.as_slice()
+                            == [SemanticArgument::Type(*right), SemanticArgument::Type(*left)]
+                )
+            })
+            .expect("opposite ordered Pair specialization")
+            .id;
+
+        let mut forged = successful.facts().clone();
+        let result = forged
+            .expressions
+            .iter_mut()
+            .find_map(|fact| {
+                let result = fact.result?;
+                match &mut fact.resolution {
+                    ExpressionResolution::Constructor { ty, variant: None }
+                        if *ty == inferred.id =>
+                    {
+                        *ty = alternate;
+                        fact.ty = alternate;
+                        Some(result)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("inferred structure constructor fact");
+        forged.values[result.0 as usize].ty = alternate;
+        forged
+            .validate_partial_structure()
+            .expect("same-image type substitution remains prefix-valid");
+        assert!(
+            forged
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err(),
+            "full sealing must independently rederive the inferred constructor type"
+        );
+
+        const EXACT_TYPES: u32 = 7;
+        assert_eq!(successful.facts().types.len(), EXACT_TYPES as usize);
+        let mut exact = AnalysisLimits::standard();
+        exact.types = EXACT_TYPES;
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| false)
+            .expect("exact inferred-structure type limit");
+        let mut one_under = exact;
+        one_under.types = EXACT_TYPES - 1;
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, one_under),
+                &|| false,
+            ),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "semantic types",
+                limit,
+            }) if limit == AnalysisLimits::standard().fact_edges
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            })
+            .expect("count inferred-structure analysis polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, exact),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn generic_flat_structure_constructor_inference_conflict_is_named() {
+        let source = dot_variant_actor_source(
+            "pub struct Pair[T]:\n    pub left: T\n    pub right: T\n\nasync fn checkpoint():\n    small: u8 = 1\n    wide: u64 = 2\n    Pair(left=small, right=wide)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("conflicting structure inference should be a source diagnostic");
+        assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-runtime-generic-structure-inference-conflict")
+        );
+        assert!(output.has_errors());
+    }
+
+    #[test]
+    fn generic_flat_structure_constructor_infers_from_a_typed_parameter() {
+        let source = dot_variant_actor_source(
+            "pub struct Cell[T]:\n    pub value: T\n\npub fn observe(seed: u16):\n    Cell(seed)\n\nasync fn checkpoint():\n    seed: u16 = 1\n    observe(seed)\n    pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("typed parameter should constrain generic structure inference");
+        assert!(
+            output.diagnostics().is_empty(),
+            "direct typed parameter inference must analyze: {:?}",
+            output.diagnostics()
+        );
+        let successful = output.successful().expect("sealed parameter inference");
+        assert!(successful.facts().types.iter().any(|ty| {
+            let SemanticTypeKind::Structure {
+                arguments: generic_arguments,
+                ..
+            } = &ty.kind
+            else {
+                return false;
+            };
+            matches!(generic_arguments.as_slice(), [SemanticArgument::Type(argument)]
+            if matches!(successful.facts().types[argument.0 as usize].kind,
+                SemanticTypeKind::Integer {
+                    signed: false,
+                    bits: 16,
+                    pointer_sized: false,
+                }))
+        }));
+    }
+
+    #[test]
+    fn generic_flat_structure_constructor_inference_tails_fail_closed_by_name() {
+        for (source, expected) in [
+            (
+                "pub struct Payload:\n    pub word: u8\n\npub struct Cell[T]:\n    pub value: T\n\nasync fn checkpoint():\n    payload: Payload = Payload(1)\n    Cell(payload)\n    pass\n\n",
+                "semantic-runtime-generic-structure-inference-argument-type",
+            ),
+            (
+                "pub struct Cell[T]:\n    pub value: T\n\npub struct Wrapper[T]:\n    pub value: Cell[T]\n\nasync fn checkpoint():\n    cell: Cell[u8] = Cell(1)\n    Wrapper(cell)\n    pass\n\n",
+                "semantic-runtime-generic-structure-inference-shape",
+            ),
+        ] {
+            let fixture = parsed_actor_fixture(&dot_variant_actor_source(source));
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("unsupported constructor inference should be a source diagnostic");
+            assert_eq!(output.diagnostics().len(), 1, "{:?}", output.diagnostics());
+            assert_eq!(output.diagnostics()[0].code.as_deref(), Some(expected));
+            assert!(output.has_errors());
+        }
     }
 
     #[test]
