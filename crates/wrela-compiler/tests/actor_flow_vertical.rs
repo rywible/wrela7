@@ -49,8 +49,13 @@ const ACTOR_SOURCE: &str = r#"module app
 
 from core.image import Image, Target
 
+fn seed() -> u64:
+    return 40
+
 async fn checkpoint() -> u64:
-    return 41
+    left: u64 = seed()
+    right: u64 = 1
+    return left + right
 
 @service
 pub struct Worker:
@@ -81,7 +86,7 @@ fn never_cancelled() -> bool {
 }
 
 #[test]
-fn parsed_actor_source_delivers_exact_u64_immediate_async_results_to_actor_and_task() {
+fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_task() {
     let source_graph_digest = Sha256Digest::from_bytes([0xa1; 32]);
     let core_package_digest = Sha256Digest::from_bytes([0xa2; 32]);
     let target_digest = Sha256Digest::from_bytes([0xa3; 32]);
@@ -381,6 +386,68 @@ fn parsed_actor_source_delivers_exact_u64_immediate_async_results_to_actor_and_t
     let [helper_result] = helper.result_types.as_slice() else {
         panic!("typed helper has one result");
     };
+    let [helper_block] = helper.blocks.as_slice() else {
+        panic!("computed helper has one Flow block");
+    };
+    let [helper_call, helper_constant, helper_binary] = helper_block.instructions.as_slice() else {
+        panic!("computed helper has one call, constant, and checked add");
+    };
+    let (seed_function, helper_left) =
+        match (&helper_call.operation, helper_call.results.as_slice()) {
+            (
+                flow::FlowOperation::Call {
+                    function,
+                    arguments,
+                },
+                [left],
+            ) if arguments.is_empty() => (*function, *left),
+            other => panic!("computed helper seed call: {other:?}"),
+        };
+    let helper_right = match (
+        &helper_constant.operation,
+        helper_constant.results.as_slice(),
+    ) {
+        (
+            flow::FlowOperation::Immediate(flow::Immediate::Integer { bits: 64, bytes_le }),
+            [right],
+        ) if bytes_le.as_slice() == 1_u64.to_le_bytes() => *right,
+        other => panic!("computed helper RHS: {other:?}"),
+    };
+    let helper_sum = match (&helper_binary.operation, helper_binary.results.as_slice()) {
+        (
+            flow::FlowOperation::Binary {
+                op: flow::BinaryOp::AddChecked,
+                left,
+                right,
+            },
+            [sum],
+        ) if *left == helper_left && *right == helper_right => *sum,
+        other => panic!("computed helper checked add: {other:?}"),
+    };
+    assert_eq!(
+        helper_block.terminator,
+        flow::Terminator::Return(vec![helper_sum])
+    );
+    let seed = &flow.functions[seed_function.0 as usize];
+    assert_eq!(seed.role, flow::FunctionRole::Ordinary);
+    assert_eq!(seed.color, flow::FunctionColor::Sync);
+    assert!(seed.parameters.is_empty());
+    let [seed_block] = seed.blocks.as_slice() else {
+        panic!("seed has one Flow block");
+    };
+    assert!(matches!(
+        seed_block.instructions.as_slice(),
+        [flow::Instruction {
+            results,
+            operation: flow::FlowOperation::Immediate(flow::Immediate::Integer {
+                bits: 64,
+                bytes_le,
+            }),
+            ..
+        }] if bytes_le.as_slice() == 40_u64.to_le_bytes()
+            && matches!(&seed_block.terminator, flow::Terminator::Return(values)
+                if values.as_slice() == results.as_slice())
+    ));
     let activation = flow
         .types
         .iter()
@@ -558,11 +625,11 @@ fn parsed_actor_source_delivers_exact_u64_immediate_async_results_to_actor_and_t
         );
     };
 
-    let mut nonconstant = flow.clone();
-    let nonconstant_helper = &mut nonconstant.functions[helper.id.0 as usize];
-    let helper_block = &mut nonconstant_helper.blocks[0];
-    let extra_value = flow::ValueId(nonconstant_helper.values.len() as u32);
-    nonconstant_helper.values.push(flow::Value {
+    let mut extra_tail = flow.clone();
+    let extra_tail_helper = &mut extra_tail.functions[helper.id.0 as usize];
+    let helper_block = &mut extra_tail_helper.blocks[0];
+    let extra_value = flow::ValueId(extra_tail_helper.values.len() as u32);
+    extra_tail_helper.values.push(flow::Value {
         id: extra_value,
         ty: *helper_result,
         source_name: None,
@@ -577,7 +644,20 @@ fn parsed_actor_source_delivers_exact_u64_immediate_async_results_to_actor_and_t
         source: helper_block.source,
     });
     helper_block.terminator = flow::Terminator::Return(vec![extra_value]);
-    prepare_forged_flow(nonconstant, "nonconstant async helper tail");
+    prepare_forged_flow(extra_tail, "extra computed async helper tail");
+
+    let mut swapped_computation = flow.clone();
+    let swapped_helper = &mut swapped_computation.functions[helper.id.0 as usize];
+    let flow::FlowOperation::Binary { left, right, .. } =
+        &mut swapped_helper.blocks[0].instructions[2].operation
+    else {
+        panic!("computed async helper checked add");
+    };
+    std::mem::swap(left, right);
+    prepare_forged_flow(
+        swapped_computation,
+        "swapped computed async helper operands",
+    );
 
     let mut argumented = flow.clone();
     let argument_helper = &mut argumented.functions[helper.id.0 as usize];
@@ -892,22 +972,68 @@ fn parsed_actor_source_delivers_exact_u64_immediate_async_results_to_actor_and_t
     assert_eq!(helper_result.kind, MachineTypeKind::Integer { bits: 64 });
     assert_eq!((helper_result.size, helper_result.alignment), (8, 8));
     let [helper_block] = machine_helper.blocks.as_slice() else {
-        panic!("immediate typed async helper has one machine block");
+        panic!("computed typed async helper has one machine block");
     };
-    let [helper_constant] = helper_block.instructions.as_slice() else {
-        panic!("immediate typed async helper has one machine instruction");
+    let [helper_call, helper_constant, helper_binary] = helper_block.instructions.as_slice() else {
+        panic!("computed typed async helper has call, constant, and checked add");
     };
-    let [helper_value] = helper_constant.results.as_slice() else {
-        panic!("immediate typed async helper defines one u64");
+    let [helper_left] = helper_call.results.as_slice() else {
+        panic!("computed helper call defines one u64");
+    };
+    let MachineOperation::Call {
+        function: seed_function,
+        arguments: seed_arguments,
+        convention: CallingConvention::Internal,
+    } = &helper_call.operation
+    else {
+        panic!("computed helper calls the exact synchronous seed");
+    };
+    assert!(seed_arguments.is_empty());
+    let seed = &machine.functions[seed_function.0 as usize];
+    let [seed_block] = seed.blocks.as_slice() else {
+        panic!("seed has one block");
+    };
+    let [seed_constant] = seed_block.instructions.as_slice() else {
+        panic!("seed has one constant");
+    };
+    let [seed_value] = seed_constant.results.as_slice() else {
+        panic!("seed defines one u64");
+    };
+    assert!(matches!(
+        &seed_constant.operation,
+        MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le })
+            if *ty == machine_helper.result && bytes_le.as_slice() == 40_u64.to_le_bytes()
+    ));
+    assert!(matches!(
+        &seed_block.terminator,
+        MachineTerminator::Return(values) if values.as_slice() == [*seed_value]
+    ));
+    let [helper_right] = helper_constant.results.as_slice() else {
+        panic!("computed helper constant defines one u64");
     };
     assert!(matches!(
         &helper_constant.operation,
         MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le })
-            if *ty == machine_helper.result && bytes_le.as_slice() == 41_u64.to_le_bytes()
+            if *ty == machine_helper.result && bytes_le.as_slice() == 1_u64.to_le_bytes()
+    ));
+    let [helper_sum] = helper_binary.results.as_slice() else {
+        panic!("computed helper checked add defines one u64");
+    };
+    assert!(matches!(
+        &helper_binary.operation,
+        MachineOperation::CheckedInteger {
+            op: wrela_backend::machine_wir::CheckedIntegerOp::Add,
+            signedness: wrela_backend::machine_wir::IntegerSignedness::Unsigned,
+            left,
+            right,
+            failure,
+        } if *left == *helper_left
+            && *right == *helper_right
+            && failure.kind == wrela_backend::machine_wir::ScalarFailureKind::Arithmetic
     ));
     assert!(matches!(
         &helper_block.terminator,
-        MachineTerminator::Return(values) if values.as_slice() == [*helper_value]
+        MachineTerminator::Return(values) if values.as_slice() == [*helper_sum]
     ));
     for activation in [actor_activation, task_activation] {
         let caller = &machine.functions[activation.caller.0 as usize];
@@ -1212,17 +1338,33 @@ fn parsed_actor_source_delivers_exact_u64_immediate_async_results_to_actor_and_t
     );
 
     let mut forged_callee_constant = machine.clone();
-    let helper_id = machine_helper.id.0 as usize;
+    let seed_id = seed.id.0 as usize;
     let MachineOperation::Immediate(MachineImmediate::Integer { bytes_le, .. }) =
-        &mut forged_callee_constant.functions[helper_id].blocks[0].instructions[0].operation
+        &mut forged_callee_constant.functions[seed_id].blocks[0].instructions[0].operation
     else {
-        panic!("typed helper machine constant");
+        panic!("typed helper seed constant");
     };
     bytes_le.pop();
     assert!(
         forged_callee_constant
             .validate_for_target(&target)
             .expect_err("typed activation helper constant must remain exact u64")
+            .0
+            .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
+    );
+
+    let mut forged_computation = machine.clone();
+    let helper_id = machine_helper.id.0 as usize;
+    let MachineOperation::CheckedInteger { left, right, .. } =
+        &mut forged_computation.functions[helper_id].blocks[0].instructions[2].operation
+    else {
+        panic!("typed helper machine checked add");
+    };
+    std::mem::swap(left, right);
+    assert!(
+        forged_computation
+            .validate_for_target(&target)
+            .expect_err("typed activation helper operands remain source-ordered")
             .0
             .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
     );

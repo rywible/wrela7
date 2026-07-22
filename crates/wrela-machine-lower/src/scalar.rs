@@ -1801,22 +1801,8 @@ fn lower_activation_subset(
                     && block.parameters.is_empty()
                     && block.instructions.is_empty()
                     && matches!(&block.terminator, flow::Terminator::Return(values) if values.is_empty()));
-        let u64_callee_matches = result_is_u64
-            && callee.result_types.as_slice() == [result]
-            && matches!(callee.blocks.as_slice(), [block]
-                if block.id == callee.entry
-                    && block.parameters.is_empty()
-                    && matches!(block.instructions.as_slice(), [constant]
-                        if matches!(constant.results.as_slice(), [value]
-                            if flow_value_type(callee, *value).ok() == Some(result))
-                            && matches!(&constant.operation,
-                                flow::FlowOperation::Immediate(flow::Immediate::Integer {
-                                    bits: 64,
-                                    bytes_le,
-                                }) if bytes_le.len() == 8)
-                            && matches!(&block.terminator,
-                                flow::Terminator::Return(values)
-                                    if values.as_slice() == constant.results.as_slice())));
+        let u64_callee_matches =
+            result_is_u64 && exact_bounded_u64_activation_callee(input, callee, result);
         let callee_matches = callee.role == flow::FunctionRole::Ordinary
             && callee.color == flow::FunctionColor::Async
             && callee.parameters.is_empty()
@@ -1939,6 +1925,92 @@ fn flow_type_is_exact_u64(input: &flow::FlowWir, ty: flow::TypeId) -> bool {
                 bits: 64,
             })
     })
+}
+
+fn exact_constant_u64_flow_function(
+    input: &flow::FlowWir,
+    function: &flow::FlowFunction,
+    result: flow::TypeId,
+) -> bool {
+    flow_type_is_exact_u64(input, result)
+        && function.result_types.as_slice() == [result]
+        && matches!(function.blocks.as_slice(), [block]
+            if block.id == function.entry
+                && block.parameters.is_empty()
+                && matches!(block.instructions.as_slice(), [constant]
+                    if constant.source.is_some()
+                        && matches!(constant.results.as_slice(), [value]
+                            if flow_value_type(function, *value).ok() == Some(result))
+                        && matches!(&constant.operation,
+                            flow::FlowOperation::Immediate(flow::Immediate::Integer {
+                                bits: 64,
+                                bytes_le,
+                            }) if bytes_le.len() == 8)
+                        && matches!(&block.terminator,
+                            flow::Terminator::Return(values)
+                                if values.as_slice() == constant.results.as_slice())))
+}
+
+fn exact_bounded_u64_activation_callee(
+    input: &flow::FlowWir,
+    callee: &flow::FlowFunction,
+    result: flow::TypeId,
+) -> bool {
+    if exact_constant_u64_flow_function(input, callee, result) {
+        return true;
+    }
+    callee.result_types.as_slice() == [result]
+        && matches!(callee.blocks.as_slice(), [block]
+            if block.id == callee.entry
+                && block.parameters.is_empty()
+                && matches!(block.instructions.as_slice(), [call, constant, binary]
+                    if matches!(
+                        (&call.operation, call.results.as_slice()),
+                        (
+                            flow::FlowOperation::Call {
+                                function,
+                                arguments,
+                            },
+                            [left],
+                        ) if arguments.is_empty()
+                            && flow_value_type(callee, *left).ok() == Some(result)
+                            && input.functions.get(function.0 as usize).is_some_and(|seed| {
+                                seed.id == *function
+                                    && seed.role == flow::FunctionRole::Ordinary
+                                    && seed.color == flow::FunctionColor::Sync
+                                    && seed.parameters.is_empty()
+                                    && exact_constant_u64_flow_function(input, seed, result)
+                            })
+                    )
+                    && matches!(
+                        (&constant.operation, constant.results.as_slice()),
+                        (
+                            flow::FlowOperation::Immediate(flow::Immediate::Integer {
+                                bits: 64,
+                                bytes_le,
+                            }),
+                            [right],
+                        ) if bytes_le.len() == 8
+                            && flow_value_type(callee, *right).ok() == Some(result)
+                    )
+                    && matches!(
+                        (&binary.operation, binary.results.as_slice()),
+                        (
+                            flow::FlowOperation::Binary {
+                                op: flow::BinaryOp::AddChecked,
+                                left: binary_left,
+                                right: binary_right,
+                            },
+                            [sum],
+                        ) if call.results.as_slice() == [*binary_left]
+                            && constant.results.as_slice() == [*binary_right]
+                            && flow_value_type(callee, *sum).ok() == Some(result)
+                            && matches!(&block.terminator,
+                                flow::Terminator::Return(values) if values.as_slice() == [*sum])
+                    )
+                    && call.source.is_some()
+                    && constant.source.is_some()
+                    && binary.source.is_some()))
 }
 
 fn typed_activation_resume_value(

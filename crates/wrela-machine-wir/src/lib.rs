@@ -4678,27 +4678,99 @@ fn immediate_activation_callee_matches(module: &MachineWir, callee: &MachineFunc
                 && block.parameters.is_empty()
                 && block.instructions.is_empty()
                 && matches!(&block.terminator, MachineTerminator::Return(values) if values.is_empty()));
-    let u64_result = exact_machine_u64_type(module, callee.result)
-        && matches!(callee.blocks.as_slice(), [block]
-            if block.id == callee.entry
-                && block.parameters.is_empty()
-                && matches!(block.instructions.as_slice(), [constant]
-                    if constant.source.is_some()
-                        && matches!(constant.results.as_slice(), [value]
-                            if callee.values.get(value.0 as usize)
-                                .is_some_and(|value| value.ty == callee.result))
-                        && matches!(&constant.operation,
-                            MachineOperation::Immediate(MachineImmediate::Integer {
-                                ty,
-                                bytes_le,
-                            }) if *ty == callee.result && bytes_le.len() == 8)
-                        && matches!(&block.terminator,
-                            MachineTerminator::Return(values)
-                                if values.as_slice() == constant.results.as_slice())));
+    let u64_result = exact_bounded_u64_activation_callee(module, callee);
     callee.role == MachineFunctionRole::Ordinary
         && callee.convention == CallingConvention::Internal
         && callee.parameters.is_empty()
         && (unit || u64_result)
+}
+
+fn exact_constant_u64_machine_function(module: &MachineWir, function: &MachineFunction) -> bool {
+    exact_machine_u64_type(module, function.result)
+        && function.parameters.is_empty()
+        && matches!(function.blocks.as_slice(), [block]
+            if block.id == function.entry
+                && block.parameters.is_empty()
+                && matches!(block.instructions.as_slice(), [constant]
+                    if constant.source.is_some()
+                        && matches!(constant.results.as_slice(), [value]
+                            if function.values.get(value.0 as usize)
+                                .is_some_and(|value| value.ty == function.result))
+                        && matches!(&constant.operation,
+                            MachineOperation::Immediate(MachineImmediate::Integer {
+                                ty,
+                                bytes_le,
+                            }) if *ty == function.result && bytes_le.len() == 8)
+                        && matches!(&block.terminator,
+                            MachineTerminator::Return(values)
+                                if values.as_slice() == constant.results.as_slice())))
+}
+
+fn exact_bounded_u64_activation_callee(module: &MachineWir, callee: &MachineFunction) -> bool {
+    if exact_constant_u64_machine_function(module, callee) {
+        return true;
+    }
+    exact_machine_u64_type(module, callee.result)
+        && callee.parameters.is_empty()
+        && matches!(callee.blocks.as_slice(), [block]
+            if block.id == callee.entry
+                && block.parameters.is_empty()
+                && matches!(block.instructions.as_slice(), [call, constant, binary]
+                    if matches!(
+                        (&call.operation, call.results.as_slice()),
+                        (
+                            MachineOperation::Call {
+                                function,
+                                arguments,
+                                convention: CallingConvention::Internal,
+                            },
+                            [left],
+                        ) if arguments.is_empty()
+                            && callee.values.get(left.0 as usize)
+                                .is_some_and(|value| value.ty == callee.result)
+                            && module.functions.get(function.0 as usize).is_some_and(|seed| {
+                                seed.id == *function
+                                    && seed.role == MachineFunctionRole::Ordinary
+                                    && seed.convention == CallingConvention::Internal
+                                    && seed.result == callee.result
+                                    && exact_constant_u64_machine_function(module, seed)
+                            })
+                    )
+                    && matches!(
+                        (&constant.operation, constant.results.as_slice()),
+                        (
+                            MachineOperation::Immediate(MachineImmediate::Integer {
+                                ty,
+                                bytes_le,
+                            }),
+                            [right],
+                        ) if *ty == callee.result
+                            && bytes_le.len() == 8
+                            && callee.values.get(right.0 as usize)
+                                .is_some_and(|value| value.ty == callee.result)
+                    )
+                    && matches!(
+                        (&binary.operation, binary.results.as_slice()),
+                        (
+                            MachineOperation::CheckedInteger {
+                                op: CheckedIntegerOp::Add,
+                                signedness: IntegerSignedness::Unsigned,
+                                left,
+                                right,
+                                failure,
+                            },
+                            [sum],
+                        ) if call.results.as_slice() == [*left]
+                            && constant.results.as_slice() == [*right]
+                            && failure.kind == ScalarFailureKind::Arithmetic
+                            && callee.values.get(sum.0 as usize)
+                                .is_some_and(|value| value.ty == callee.result)
+                            && matches!(&block.terminator,
+                                MachineTerminator::Return(values) if values.as_slice() == [*sum])
+                    )
+                    && call.source.is_some()
+                    && constant.source.is_some()
+                    && binary.source.is_some()))
 }
 
 fn exact_machine_u64_type(module: &MachineWir, ty: MachineTypeId) -> bool {
