@@ -788,7 +788,10 @@ fn read_only_scalar_view_projection_reaches_semantic_wir() {
         )
         .expect("authenticated read-only scalar view lowers to SemanticWir");
     let semantic_model = semantic.wir().as_wir();
-    assert_eq!(semantic_model.version, 12);
+    assert_eq!(
+        semantic_model.version,
+        wrela_semantic_lower::semantic_wir::SEMANTIC_WIR_VERSION
+    );
     assert_eq!(
         semantic_model.source_summary.reachable_declarations, 4,
         "test, unary consumer, Packet, and the projection declaration are reachable"

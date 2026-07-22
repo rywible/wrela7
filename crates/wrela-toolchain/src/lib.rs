@@ -337,7 +337,7 @@ impl ToolchainCompatibility {
             build_profile_encoding: 2,
             backend_protocol: 5,
             target_package: 1,
-            semantic_wir: 12,
+            semantic_wir: 13,
             flow_wir: 17,
             flow_wir_wire: 17,
             machine_wir: 18,

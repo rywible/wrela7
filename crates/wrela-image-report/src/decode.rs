@@ -1777,7 +1777,7 @@ mod tests {
                 bytes: 16,
             }],
             representations: RepresentationFacts {
-                semantic_wir_version: 12,
+                semantic_wir_version: 13,
                 flow_wir_version: 17,
                 flow_wir_wire_version: 17,
                 machine_wir_version: 18,
@@ -1987,7 +1987,7 @@ mod tests {
         );
 
         let oversized_u32 = json.replacen(
-            "\"semantic_wir_version\":12",
+            "\"semantic_wir_version\":13",
             "\"semantic_wir_version\":4294967296",
             1,
         );

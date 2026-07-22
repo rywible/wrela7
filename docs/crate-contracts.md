@@ -462,10 +462,16 @@ it. It injects phase implementations and bounded host capabilities, while
   preserves the analyzer's exact proof-kind vocabulary and every proof source,
   as well as function instance keys, attached proof IDs, recursive-depth
   bounds, and the HIR declaration/file bounds used to validate provenance.
-- SemanticWir v12 retains exact SSA aggregate field replacement as `InsertField`.
+- SemanticWir v13 retains exact SSA aggregate field replacement as `InsertField`.
   Validation joins the prior aggregate's struct type, selected field, inserted
   value type, and single result of the unchanged aggregate type; FlowWir v17
   preserves the same operation and independently repeats that join.
+- SemanticWir v13 retains compiler-minted plain byte literals as
+  `StaticBytes { bytes }` plus an exact decoded `Constant::Bytes`. Validation
+  authenticates the canonical `Static[Bytes[N]]` identity, explicit-copy
+  linearity, decoded extent, byte-constant result type, and resource bounds.
+  Flow lowering rejects the type by name at `flow-static-bytes-lowering-pending`
+  until a runtime storage and consumer ABI is specified.
 - MachineWir v18 retains same-block nongeneric flat values with two or more
   primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
   `InsertField`, and `ExtractField` carry exact SSA joins through independent
@@ -1124,7 +1130,7 @@ it. It injects phase implementations and bounded host capabilities, while
 - That schema is the only accepted report shape. Its tag rejects stale or
   mismatched artifacts at the trust boundary; there is no legacy reader,
   migration, adapter, or fallback contract. Its embedded interface facts must
-  be exactly SemanticWir 12, FlowWir 16, Flow wire 17, MachineWir 18, and runtime
+  be exactly SemanticWir 13, FlowWir 17, Flow wire 17, MachineWir 18, and runtime
   ABI 2; nonzero stale or future values are rejected rather than tolerated.
 - Schema v10 also projects sealed actor, task, reportable region, and async
   activation plans into

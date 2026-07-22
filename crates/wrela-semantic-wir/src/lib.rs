@@ -16,7 +16,7 @@ pub use wrela_test_model::{
     TestDescriptor, TestId as ModelTestId, TestKind as ModelTestKind,
 };
 
-pub const SEMANTIC_WIR_VERSION: u32 = 12;
+pub const SEMANTIC_WIR_VERSION: u32 = 13;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 
 macro_rules! id_type {
@@ -99,6 +99,11 @@ pub enum TypeKind {
     /// Compiler-minted immutable UTF-8 handle with an authenticated exact
     /// byte extent. This is a semantic identity, not a runtime ABI layout.
     StaticString {
+        bytes: u64,
+    },
+    /// Compiler-minted immutable byte-slice handle with an authenticated exact
+    /// decoded extent. This is a semantic identity, not a runtime ABI layout.
+    StaticBytes {
         bytes: u64,
     },
     /// Compiler-minted owned result of one bounded interpolation. Capacity is
@@ -1228,6 +1233,7 @@ fn validate_model_resources(
             TypeKind::OpaqueTarget { name } => meter.text(name)?,
             TypeKind::Primitive(_)
             | TypeKind::StaticString { .. }
+            | TypeKind::StaticBytes { .. }
             | TypeKind::BoundedString { .. }
             | TypeKind::Array { .. }
             | TypeKind::Iso { .. }
@@ -2297,6 +2303,22 @@ fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut ValidationE
             {
                 errors.push(ValidationError::InvalidRecord {
                     kind: "static string type",
+                    id: ty.id.0,
+                });
+            }
+        }
+        TypeKind::StaticBytes { bytes } => {
+            let extent = ty
+                .source_name
+                .strip_prefix("Static[Bytes[")
+                .and_then(|name| name.strip_suffix("]]"));
+            if extent.and_then(|extent| extent.parse::<u64>().ok()) != Some(*bytes)
+                || extent.is_none_or(|extent| extent.len() > 1 && extent.starts_with('0'))
+                || ty.linearity != Linearity::ExplicitCopy
+                || ty.source.is_some()
+            {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "static bytes type",
                     id: ty.id.0,
                 });
             }
@@ -3598,6 +3620,30 @@ fn validate_operation(
                     });
                 }
             }
+            if let Constant::Bytes(value) = constant {
+                let valid = matches!(results, [result]
+                if function.values.get(result.0 as usize).is_some_and(|result| {
+                    module.types.get(result.ty.0 as usize).is_some_and(|ty| match ty.kind {
+                        TypeKind::StaticBytes { bytes } => {
+                            u64::try_from(value.len()) == Ok(bytes)
+                        }
+                        TypeKind::Array { element, length } => {
+                            u64::try_from(value.len()) == Ok(length)
+                                && module.types.get(element.0 as usize).is_some_and(|element| {
+                                    element.kind == TypeKind::Primitive(PrimitiveType::U8)
+                                        && element.linearity == Linearity::CopyScalar
+                                })
+                        }
+                        _ => false,
+                    })
+                }));
+                if !valid {
+                    errors.push(ValidationError::InvalidRecord {
+                        kind: "byte constant",
+                        id: results.first().map_or(u32::MAX, |result| result.0),
+                    });
+                }
+            }
         }
         SemanticOperation::Unary { operand, .. } => value!(*operand),
         SemanticOperation::Binary { left, right, .. } => {
@@ -4830,6 +4876,39 @@ mod tests {
         module
     }
 
+    fn static_bytes_fixture() -> SemanticWir {
+        let mut module = fixture();
+        module.types.push(TypeRecord {
+            id: TypeId(1),
+            source_name: "Static[Bytes[3]]".to_owned(),
+            kind: TypeKind::StaticBytes { bytes: 3 },
+            linearity: Linearity::ExplicitCopy,
+            source: None,
+        });
+        let source = Span {
+            file: FileId(0),
+            range: TextRange { start: 1, end: 8 },
+        };
+        let mut function = source_function(1, 4);
+        function.values.push(SemanticValue {
+            id: ValueId(0),
+            ty: TypeId(1),
+            origin: Some(source),
+            name: Some("payload".to_owned()),
+        });
+        function.body.statements = vec![
+            SemanticStatement::Let(LetStatement {
+                results: vec![ValueId(0)],
+                operation: SemanticOperation::Constant(Constant::Bytes(vec![b'A', b'B', 0])),
+                source: Some(source),
+            }),
+            SemanticStatement::Return(Vec::new()),
+        ];
+        module.functions.push(function);
+        module.source_summary.monomorphized_instantiations = 2;
+        module
+    }
+
     fn insert_field_fixture() -> SemanticWir {
         let mut module = fixture();
         module.types.push(TypeRecord {
@@ -4983,6 +5062,41 @@ mod tests {
             *value = ValueId(0);
         });
         assert!(wrong_value_kind.validate().is_err());
+    }
+
+    #[test]
+    fn static_bytes_constant_authenticates_canonical_identity_and_exact_extent() {
+        static_bytes_fixture()
+            .validate()
+            .expect("canonical static bytes constant");
+
+        let mut forged_extent = static_bytes_fixture();
+        let SemanticStatement::Let(LetStatement {
+            operation: SemanticOperation::Constant(Constant::Bytes(bytes)),
+            ..
+        }) = &mut forged_extent.functions[1].body.statements[0]
+        else {
+            panic!("static bytes constant")
+        };
+        bytes.push(1);
+        assert!(forged_extent.validate().is_err());
+
+        let mut forged_name = static_bytes_fixture();
+        forged_name.types[1].source_name = "Static[Bytes[03]]".to_owned();
+        assert!(forged_name.validate().is_err());
+
+        let mut forged_kind = static_bytes_fixture();
+        let SemanticStatement::Let(LetStatement { operation, .. }) =
+            &mut forged_kind.functions[1].body.statements[0]
+        else {
+            panic!("static bytes constant")
+        };
+        *operation = SemanticOperation::Constant(Constant::String("AB\0".to_owned()));
+        assert!(forged_kind.validate().is_err());
+
+        let mut forged_linearity = static_bytes_fixture();
+        forged_linearity.types[1].linearity = Linearity::CopyScalar;
+        assert!(forged_linearity.validate().is_err());
     }
 
     #[test]
@@ -5648,7 +5762,7 @@ mod tests {
         closed_enum_fixture(256)
             .validate()
             .expect("256-variant enum");
-        for rejected in [11, 13] {
+        for rejected in [12, 14] {
             let mut wrong_version = closed_enum_fixture(2);
             wrong_version.version = rejected;
             assert!(wrong_version.validate().is_err());

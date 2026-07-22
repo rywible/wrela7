@@ -291,7 +291,6 @@ fn supported_input<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedInput<'a>, LowerError> {
-    validate_static_bytes_lowering_boundary(input.facts())?;
     validate_async_outcome_lowering_boundary(input.facts())?;
     validate_admission_result_lowering_boundary(input.facts())?;
     validate_generic_function_lowering_boundary(input)?;
@@ -313,22 +312,6 @@ fn supported_input<'a>(
             supported_generated_tests(input, limits, is_cancelled)
                 .map(SupportedInput::GeneratedTests)
         }
-    }
-}
-
-fn validate_static_bytes_lowering_boundary(
-    facts: &sema::PartialAnalysis,
-) -> Result<(), LowerError> {
-    if facts
-        .types
-        .iter()
-        .any(|ty| matches!(ty.kind, sema::SemanticTypeKind::StaticBytes { .. }))
-    {
-        Err(unsupported(
-            "semantic-static-data-lowering-pending (Static[Bytes[N]] has no SemanticWir representation or ABI)",
-        ))
-    } else {
-        Ok(())
     }
 }
 
@@ -1026,11 +1009,6 @@ fn validate_actor_source_type(
     input: &AnalyzedImage,
     ty: &sema::SemanticType,
 ) -> Result<(), LowerError> {
-    if matches!(ty.kind, sema::SemanticTypeKind::StaticBytes { .. }) {
-        return Err(unsupported(
-            "semantic-static-data-lowering-pending (Static[Bytes[N]] has no SemanticWir representation or ABI)",
-        ));
-    }
     let facts = input.facts();
     let scalar = match &ty.kind {
         sema::SemanticTypeKind::StaticString { .. } => {
@@ -1040,6 +1018,18 @@ fn validate_actor_source_type(
                 || ty.source.is_some()
             {
                 return Err(unsupported("noncanonical compiler-minted Static[Str] type"));
+            }
+            return Ok(());
+        }
+        sema::SemanticTypeKind::StaticBytes { .. } => {
+            if ty.linearity != sema::Linearity::ExplicitCopy
+                || ty.size_upper_bound.is_some()
+                || ty.alignment_lower_bound != 1
+                || ty.source.is_some()
+            {
+                return Err(unsupported(
+                    "noncanonical compiler-minted Static[Bytes[N]] type",
+                ));
             }
             return Ok(());
         }
@@ -3097,13 +3087,14 @@ fn validate_supported_source_type(
     ty: &sema::SemanticType,
     facts: &sema::PartialAnalysis,
 ) -> Result<(), LowerError> {
-    if matches!(ty.kind, sema::SemanticTypeKind::StaticBytes { .. }) {
-        return Err(unsupported(
-            "semantic-static-data-lowering-pending (Static[Bytes[N]] has no SemanticWir representation or ABI)",
-        ));
-    }
     let valid = match &ty.kind {
         sema::SemanticTypeKind::StaticString { .. } => {
+            ty.linearity == sema::Linearity::ExplicitCopy
+                && ty.size_upper_bound.is_none()
+                && ty.alignment_lower_bound == 1
+                && ty.source.is_none()
+        }
+        sema::SemanticTypeKind::StaticBytes { .. } => {
             ty.linearity == sema::Linearity::ExplicitCopy
                 && ty.size_upper_bound.is_none()
                 && ty.alignment_lower_bound == 1
@@ -4147,6 +4138,10 @@ fn lower_actor_types(
             sema::SemanticTypeKind::StaticString { bytes } => (
                 copy_text("Static[Str]", limits.payload_bytes)?,
                 wir::TypeKind::StaticString { bytes: *bytes },
+            ),
+            sema::SemanticTypeKind::StaticBytes { bytes } => (
+                copy_text(&format!("Static[Bytes[{bytes}]]"), limits.payload_bytes)?,
+                wir::TypeKind::StaticBytes { bytes: *bytes },
             ),
             sema::SemanticTypeKind::BoundedString { capacity } => (
                 copy_text("BoundedString", limits.payload_bytes)?,
@@ -5316,6 +5311,17 @@ fn lower_source_types(
             }
             sema::SemanticTypeKind::StaticString { bytes } => {
                 ("Static[Str]", wir::TypeKind::StaticString { bytes: *bytes })
+            }
+            sema::SemanticTypeKind::StaticBytes { bytes } => {
+                let name = format!("Static[Bytes[{bytes}]]");
+                output.push(wir::TypeRecord {
+                    id: wir::TypeId(ty.id.0),
+                    source_name: copy_text(&name, limits.payload_bytes)?,
+                    kind: wir::TypeKind::StaticBytes { bytes: *bytes },
+                    linearity: lower_linearity(ty.linearity),
+                    source: ty.source,
+                });
+                continue;
             }
             sema::SemanticTypeKind::BoundedString { capacity } => (
                 "BoundedString",
@@ -14620,6 +14626,7 @@ fn lower_constant(constant: &sema::ConstantValue) -> Result<wir::Constant, Lower
         sema::ConstantValue::Float32(bits) => Ok(wir::Constant::Float32(*bits)),
         sema::ConstantValue::Float64(bits) => Ok(wir::Constant::Float64(*bits)),
         sema::ConstantValue::Character(value) => Ok(wir::Constant::Char(*value)),
+        sema::ConstantValue::Bytes(value) => Ok(wir::Constant::Bytes(value.clone())),
         sema::ConstantValue::String(value) => Ok(wir::Constant::String(value.clone())),
         _ => Err(unsupported("non-scalar source constants")),
     }
@@ -14792,6 +14799,11 @@ fn constant_matches_literal(
             wrela_hir::Literal::String(source),
             sema::ConstantValue::String(value),
             sema::SemanticTypeKind::StaticString { bytes },
+        ) => source == value && u64::try_from(source.len()) == Ok(*bytes),
+        (
+            wrela_hir::Literal::Bytes(source),
+            sema::ConstantValue::Bytes(value),
+            sema::SemanticTypeKind::StaticBytes { bytes },
         ) => source == value && u64::try_from(source.len()) == Ok(*bytes),
         _ => false,
     }
@@ -16313,6 +16325,7 @@ fn measure_model_resources(
             TypeKind::OpaqueTarget { name } => meter.text(name),
             TypeKind::Primitive(_)
             | TypeKind::StaticString { .. }
+            | TypeKind::StaticBytes { .. }
             | TypeKind::BoundedString { .. }
             | TypeKind::Array { .. }
             | TypeKind::Iso { .. }
@@ -16970,6 +16983,10 @@ fn actor_type_kind_matches(
         (
             wir::TypeKind::StaticString { bytes: left },
             wir::TypeKind::StaticString { bytes: right },
+        ) => left == right,
+        (
+            wir::TypeKind::StaticBytes { bytes: left },
+            wir::TypeKind::StaticBytes { bytes: right },
         ) => left == right,
         (
             wir::TypeKind::BoundedString { capacity: left },
@@ -20069,7 +20086,7 @@ pub fn boot() -> Image:
         let output = CanonicalSemanticLowerer::new()
             .lower(
                 LowerRequest {
-                    input: image,
+                    input: image.clone(),
                     limits: LoweringLimits::standard(),
                 },
                 &|| false,
@@ -23306,7 +23323,7 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn inferred_static_literals_stop_at_named_semantic_lowering_boundary() {
+    fn inferred_static_text_and_bytes_literals_both_reach_semantic_wir() {
         let image = analyze_parsed_actor_source(
             r#"module app
 
@@ -23333,22 +23350,43 @@ pub fn boot() -> Image:
     return img
 "#,
         );
-        let result = CanonicalSemanticLowerer::new().lower(
-            LowerRequest {
-                input: image,
-                limits: LoweringLimits::standard(),
-            },
-            &|| false,
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("both exact static literal kinds reach SemanticWir");
+        let model = output.wir().as_wir();
+        assert!(
+            model
+                .types
+                .iter()
+                .any(|ty| matches!(ty.kind, wir::TypeKind::StaticString { bytes: 3 }))
         );
         assert!(
-            matches!(
-                result,
-                Err(LowerError::UnsupportedInput {
-                    feature: "semantic-static-data-lowering-pending (Static[Bytes[N]] has no SemanticWir representation or ABI)"
-                })
-            ),
-            "unexpected static lowering result: {result:?}"
+            model
+                .types
+                .iter()
+                .any(|ty| matches!(ty.kind, wir::TypeKind::StaticBytes { bytes: 3 }))
         );
+        assert!(model.functions.iter().any(|function| {
+            function.body.statements.iter().any(|statement| {
+                matches!(statement,
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::Constant(wir::Constant::String(text)),
+                        ..
+                    }) if text == "hé")
+            }) && function.body.statements.iter().any(|statement| {
+                matches!(statement,
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::Constant(wir::Constant::Bytes(bytes)),
+                        ..
+                    }) if bytes == &[b'A', b'B', 0])
+            })
+        }));
     }
 
     #[test]
@@ -23382,7 +23420,7 @@ pub fn boot() -> Image:
         let output = CanonicalSemanticLowerer::new()
             .lower(
                 LowerRequest {
-                    input: image,
+                    input: image.clone(),
                     limits: LoweringLimits::standard(),
                 },
                 &|| false,
@@ -23617,6 +23655,239 @@ pub fn boot() -> Image:
             ),
             Err(LowerError::InvalidReport(_))
         ));
+    }
+
+    #[test]
+    fn static_bytes_literal_lowers_to_exact_semantic_identity_and_limits() {
+        const EXACT_OPERATIONS: u64 = 4;
+        const EXACT_MODEL_EDGES: u64 = 179;
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+fn retain_bytes():
+    payload = b"A\x42\0"
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    @task
+    async fn pulse(mut self):
+        retain_bytes()
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#,
+        );
+        let byte_fact = image
+            .facts()
+            .expressions
+            .iter()
+            .find(|fact| {
+                matches!(&fact.resolution,
+                    sema::ExpressionResolution::Constant(sema::ConstantValue::Bytes(bytes))
+                        if bytes == &[b'A', b'B', 0])
+            })
+            .expect("decoded byte literal fact");
+        assert_eq!(byte_fact.effects, sema::EffectSet(0));
+        assert_eq!(byte_fact.category, sema::ValueCategory::Value);
+        assert_eq!(byte_fact.region, None);
+        assert_eq!(byte_fact.ownership_before, sema::OwnershipState::Owned);
+        assert_eq!(byte_fact.ownership_after, sema::OwnershipState::Owned);
+        assert!(matches!(
+            image.facts().types[byte_fact.ty.0 as usize].kind,
+            sema::SemanticTypeKind::StaticBytes { bytes: 3 }
+        ));
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("plain byte literal reaches SemanticWir");
+        let model = output.wir().as_wir();
+        let (input_edges, _) =
+            preflight_input(image.facts(), LoweringLimits::standard(), &|| false)
+                .expect("measure static bytes input");
+        let meter = measure_model_resources(model.into(), LoweringLimits::standard(), &|| false)
+            .expect("measure static bytes SemanticWir");
+        assert_eq!(output.report().operations, EXACT_OPERATIONS);
+        assert_eq!(input_edges.max(meter.edges), EXACT_MODEL_EDGES);
+        assert!(model.types.iter().any(|ty| {
+            ty.source_name == "Static[Bytes[3]]"
+                && ty.linearity == wir::Linearity::ExplicitCopy
+                && ty.source.is_none()
+                && matches!(ty.kind, wir::TypeKind::StaticBytes { bytes: 3 })
+        }));
+        assert!(model.functions.iter().any(|function| {
+            function.effects == wir::EffectSet(0)
+                && function.body.statements.iter().any(|statement| {
+                    matches!(statement,
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            results,
+                            operation: wir::SemanticOperation::Constant(wir::Constant::Bytes(bytes)),
+                            source: Some(_),
+                        }) if bytes == &[b'A', b'B', 0]
+                            && matches!(results.as_slice(), [result]
+                                if matches!(model.types[function.values[result.0 as usize].ty.0 as usize].kind,
+                                    wir::TypeKind::StaticBytes { bytes: 3 })))
+                })
+        }));
+
+        let mut exact = LoweringLimits::standard();
+        exact.operations = EXACT_OPERATIONS;
+        exact.model_edges = EXACT_MODEL_EDGES;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact static bytes limits");
+
+        let mut one_operation_under = exact;
+        one_operation_under.operations = EXACT_OPERATIONS - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_operation_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == EXACT_OPERATIONS - 1
+        ));
+
+        let mut one_edge_under = exact;
+        one_edge_under.model_edges = EXACT_MODEL_EDGES - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_edge_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit { limit, .. })
+                if limit == EXACT_MODEL_EDGES - 1
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("measure static bytes cancellation polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+
+        let static_bytes_type = model
+            .types
+            .iter()
+            .position(|ty| matches!(ty.kind, wir::TypeKind::StaticBytes { bytes: 3 }))
+            .expect("static bytes SemanticWir type");
+        let mutate_bytes = |candidate: &mut wir::SemanticWir, mutate: &dyn Fn(&mut Vec<u8>)| {
+            let bytes = candidate
+                .functions
+                .iter_mut()
+                .find_map(|function| {
+                    function
+                        .body
+                        .statements
+                        .iter_mut()
+                        .find_map(|statement| match statement {
+                            wir::SemanticStatement::Let(wir::LetStatement {
+                                operation:
+                                    wir::SemanticOperation::Constant(wir::Constant::Bytes(bytes)),
+                                source: Some(_),
+                                ..
+                            }) if bytes.as_slice() == [b'A', b'B', 0] => Some(bytes),
+                            _ => None,
+                        })
+                })
+                .expect("static bytes SemanticWir constant");
+            mutate(bytes);
+        };
+
+        let mut forged_extent = model.clone();
+        mutate_bytes(&mut forged_extent, &|bytes| bytes.push(1));
+        assert!(forged_extent.validate().is_err());
+
+        let mut forged_name = model.clone();
+        forged_name.types[static_bytes_type].source_name = "Static[Bytes[03]]".to_owned();
+        assert!(forged_name.validate().is_err());
+
+        let mut forged_content = model.clone();
+        mutate_bytes(&mut forged_content, &|bytes| bytes[1] = b'C');
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                forged_content,
+                output.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
+        ));
+
+        let mut forged_effect = model.clone();
+        forged_effect
+            .functions
+            .iter_mut()
+            .find(|function| function.name.ends_with("retain_bytes"))
+            .expect("retaining source function")
+            .effects = wir::EffectSet(wir::EffectSet::ACTOR_CALL);
+        assert!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                forged_effect,
+                output.report().clone(),
+                &|| false,
+            )
+            .is_err()
+        );
     }
 
     #[test]
