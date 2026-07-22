@@ -5742,6 +5742,15 @@ struct InlineIfInput {
     effects: sema::EffectSet,
 }
 
+struct PendingLoweredMatchArm {
+    variant: u32,
+    binding: wir::ValueId,
+    guard: Option<wir::ValueId>,
+    guard_prelude: Vec<wir::SemanticStatement>,
+    body: wir::SemanticRegion,
+    source: Span,
+}
+
 struct SourceFunctionLowerer<'a> {
     input: &'a AnalyzedImage,
     function: &'a sema::FunctionInstance,
@@ -7092,14 +7101,12 @@ impl SourceFunctionLowerer<'_> {
                     else {
                         return Err(self.fact_mismatch("match scrutinee value"));
                     };
-                    if arms.len() != variant_count {
-                        return Err(self.fact_mismatch("match exhaustiveness"));
-                    }
-                    let mut lowered_arms = try_vec(
+                    let mut pending_arms: Vec<Option<PendingLoweredMatchArm>> = try_vec(
                         arms.len(),
                         "SemanticWir match arms",
                         self.limits.model_edges,
                     )?;
+                    let mut wildcard_arm: Option<(wir::SemanticRegion, Span)> = None;
                     let mut used_definitions = 0usize;
                     let mut seen_variants = try_vec(
                         variant_count,
@@ -7115,9 +7122,6 @@ impl SourceFunctionLowerer<'_> {
                     let mut all_return = true;
                     for arm in arms {
                         check_cancelled(self.is_cancelled)?;
-                        if arm.guard.is_some() {
-                            return Err(self.fact_mismatch("guarded runtime match arm"));
-                        }
                         let pattern = self
                             .input
                             .hir()
@@ -7128,6 +7132,42 @@ impl SourceFunctionLowerer<'_> {
                         let [alternative] = pattern.alternatives.as_slice() else {
                             return Err(self.fact_mismatch("match pattern alternatives"));
                         };
+                        if matches!(alternative.kind, wrela_hir::PrimaryPattern::Wildcard) {
+                            if arm.guard.is_some() {
+                                return Err(self.fact_mismatch("guarded wildcard match arm"));
+                            }
+                            let mut arm_state = local_state.copy(self.limits)?;
+                            let mut body = self.lower_body(arm.body, depth + 1, &mut arm_state)?;
+                            let returns = self.body_definitely_returns(arm.body)?;
+                            if !returns {
+                                all_return = false;
+                                self.push_statement(
+                                    &mut body.statements,
+                                    wir::SemanticStatement::Yield(Vec::new()),
+                                )?;
+                            }
+                            body.parameters = Vec::new();
+                            for pending in pending_arms.iter().flatten() {
+                                check_cancelled(self.is_cancelled)?;
+                                if !seen_variants
+                                    .get(pending.variant as usize)
+                                    .copied()
+                                    .unwrap_or(false)
+                                {
+                                    return Err(unsupported(
+                                        "semantic-match-wildcard-guard-fallback-lowering-pending (guarded variant requires an explicit unguarded cover before the catch-all)",
+                                    ));
+                                }
+                            }
+                            if seen_variants.iter().all(|covered| *covered) {
+                                return Err(self.fact_mismatch("unreachable wildcard match arm"));
+                            }
+                            seen_variants.fill(true);
+                            if wildcard_arm.replace((body, statement_source)).is_some() {
+                                return Err(self.fact_mismatch("duplicate wildcard match arm"));
+                            }
+                            continue;
+                        }
                         let wrela_hir::PrimaryPattern::Constructor {
                             candidates,
                             arguments,
@@ -7144,16 +7184,14 @@ impl SourceFunctionLowerer<'_> {
                         if candidate.enumeration.declaration != declaration || argument.take {
                             return Err(self.fact_mismatch("match constructor payload access"));
                         }
-                        let payload_ty = semantic_variants
-                            .get(candidate.variant as usize)
-                            .and_then(|variant| variant.fields.first())
-                            .map(|field| field.ty)
-                            .ok_or_else(|| self.fact_mismatch("match variant payload type"))?;
                         let covered = seen_variants
                             .get_mut(candidate.variant as usize)
                             .ok_or_else(|| self.fact_mismatch("match variant range"))?;
-                        if std::mem::replace(covered, true) {
+                        if *covered {
                             return Err(self.fact_mismatch("duplicate match variant"));
+                        }
+                        if arm.guard.is_none() {
+                            *covered = true;
                         }
                         let payload_pattern = self
                             .input
@@ -7165,52 +7203,94 @@ impl SourceFunctionLowerer<'_> {
                         let [payload_alternative] = payload_pattern.alternatives.as_slice() else {
                             return Err(self.fact_mismatch("match payload alternatives"));
                         };
-                        let wrela_hir::PrimaryPattern::Bind(local) = &payload_alternative.kind
-                        else {
-                            return Err(self.fact_mismatch("match payload binding"));
-                        };
-                        let mut matching = statement_definitions
-                            .iter()
-                            .filter(|definition| definition.local == *local);
-                        let definition = matching
-                            .next()
-                            .ok_or_else(|| self.fact_mismatch("match binding definition"))?;
-                        if matching.next().is_some() || used_values.contains(&definition.value) {
-                            return Err(self.fact_mismatch("unique match binding definition"));
-                        }
-                        used_values.push(definition.value);
-                        let local_record = self
-                            .input
-                            .hir()
-                            .as_program()
-                            .locals
-                            .get(local.0 as usize)
-                            .filter(|record| record.id == *local && record.body == arm.body)
-                            .ok_or_else(|| self.fact_mismatch("match binding local ownership"))?;
-                        let binding_record = self
-                            .input
-                            .facts()
-                            .values
-                            .get(definition.value.0 as usize)
-                            .filter(|record| {
-                                record.function == self.function.id
-                                    && record.ty == payload_ty
-                                    && record.origin == sema::SemanticValueOrigin::Local(*local)
-                                    && record.source == Some(local_record.source)
-                                    && record.source_name.as_deref()
-                                        == Some(local_record.name.as_str())
-                            })
-                            .ok_or_else(|| self.fact_mismatch("match binding value provenance"))?;
-                        let _ = binding_record;
-                        used_definitions += 1;
                         let mut arm_state = local_state.copy(self.limits)?;
-                        if arm_state.get(*local).is_some() {
-                            return Err(self.fact_mismatch("match binding shadows live local"));
-                        }
-                        arm_state.set(*local, definition.value)?;
+                        let binding = match &payload_alternative.kind {
+                            wrela_hir::PrimaryPattern::Bind(local) => {
+                                let mut matching = statement_definitions
+                                    .iter()
+                                    .filter(|definition| definition.local == *local);
+                                let definition = matching.next().ok_or_else(|| {
+                                    self.fact_mismatch("match binding definition")
+                                })?;
+                                if matching.next().is_some()
+                                    || used_values.contains(&definition.value)
+                                {
+                                    return Err(
+                                        self.fact_mismatch("unique match binding definition")
+                                    );
+                                }
+                                used_values.push(definition.value);
+                                let local_record = self
+                                    .input
+                                    .hir()
+                                    .as_program()
+                                    .locals
+                                    .get(local.0 as usize)
+                                    .filter(|record| record.id == *local && record.body == arm.body)
+                                    .ok_or_else(|| {
+                                        self.fact_mismatch("match binding local ownership")
+                                    })?;
+                                let binding_record = self
+                                    .input
+                                    .facts()
+                                    .values
+                                    .get(definition.value.0 as usize)
+                                    .filter(|record| {
+                                        let payload_ty = semantic_variants
+                                            .get(candidate.variant as usize)
+                                            .and_then(|variant| variant.fields.first())
+                                            .map(|field| field.ty);
+                                        record.function == self.function.id
+                                            && Some(record.ty) == payload_ty
+                                            && record.origin
+                                                == sema::SemanticValueOrigin::Local(*local)
+                                            && record.source == Some(local_record.source)
+                                            && record.source_name.as_deref()
+                                                == Some(local_record.name.as_str())
+                                    })
+                                    .ok_or_else(|| {
+                                        self.fact_mismatch("match binding value provenance")
+                                    })?;
+                                let _ = binding_record;
+                                used_definitions += 1;
+                                if arm_state.get(*local).is_some() {
+                                    return Err(
+                                        self.fact_mismatch("match binding shadows live local")
+                                    );
+                                }
+                                arm_state.set(*local, definition.value)?;
+                                self.value_map.get(definition.value)?
+                            }
+                            wrela_hir::PrimaryPattern::Wildcard => {
+                                let payload_ty = semantic_variants
+                                    .get(candidate.variant as usize)
+                                    .and_then(|variant| variant.fields.first())
+                                    .map(|field| field.ty)
+                                    .ok_or_else(|| self.fact_mismatch("match payload type"))?;
+                                self.allocate_synthetic_value(payload_ty, statement_source)?
+                            }
+                            _ => return Err(self.fact_mismatch("match payload binding")),
+                        };
+                        let mut guard_prelude = try_vec(
+                            0,
+                            "SemanticWir match guard prelude",
+                            self.limits.model_edges,
+                        )?;
+                        let guard_value = if let Some(guard) = arm.guard {
+                            let LoweredExpression::Value(guard) = self.lower_expression(
+                                guard,
+                                sema::AccessMode::Value,
+                                &mut guard_prelude,
+                            )?
+                            else {
+                                return Err(self.fact_mismatch("match guard value"));
+                            };
+                            Some(guard)
+                        } else {
+                            None
+                        };
                         let mut body = self.lower_body(arm.body, depth + 1, &mut arm_state)?;
-                        let binding = self.value_map.get(definition.value)?;
-                        body.parameters = one_value_vec(binding, self.limits.model_edges)?;
+                        body.parameters = Vec::new();
                         let returns = self.body_definitely_returns(arm.body)?;
                         if !returns {
                             all_return = false;
@@ -7219,18 +7299,153 @@ impl SourceFunctionLowerer<'_> {
                                 wir::SemanticStatement::Yield(Vec::new()),
                             )?;
                         }
-                        lowered_arms.push(wir::SemanticMatchArm {
-                            variant: Some(candidate.variant),
-                            bindings: one_value_vec(binding, self.limits.model_edges)?,
-                            guard: None,
+                        pending_arms.push(Some(PendingLoweredMatchArm {
+                            variant: candidate.variant,
+                            binding,
+                            guard: guard_value,
+                            guard_prelude,
                             body,
-                        });
+                            source: statement_source,
+                        }));
                     }
                     if used_definitions != statement_definitions.len() {
                         return Err(self.fact_mismatch("extra match definitions"));
                     }
                     if seen_variants.iter().any(|seen| !seen) {
                         return Err(self.fact_mismatch("missing match variant"));
+                    }
+                    let mut lowered_arms = try_vec(
+                        variant_count,
+                        "SemanticWir folded match arms",
+                        self.limits.model_edges,
+                    )?;
+                    for variant_index in 0..variant_count {
+                        check_cancelled(self.is_cancelled)?;
+                        let mut group = try_vec(
+                            pending_arms.len(),
+                            "SemanticWir guarded match group",
+                            self.limits.model_edges,
+                        )?;
+                        for arm in &mut pending_arms {
+                            check_cancelled(self.is_cancelled)?;
+                            if arm
+                                .as_ref()
+                                .is_some_and(|arm| arm.variant as usize == variant_index)
+                            {
+                                group
+                                    .push(arm.take().ok_or_else(|| {
+                                        self.fact_mismatch("match arm ownership")
+                                    })?);
+                            }
+                        }
+                        if group.is_empty() {
+                            continue;
+                        }
+                        let root_binding = group[0].binding;
+                        let last = group
+                            .pop()
+                            .ok_or_else(|| self.fact_mismatch("missing folded match variant"))?;
+                        if last.guard.is_some() {
+                            return Err(self.fact_mismatch("variant group lacks unguarded cover"));
+                        }
+                        let mut folded = last.body;
+                        if root_binding != last.binding {
+                            let rebound_capacity = folded.statements.len().checked_add(1).ok_or(
+                                LowerError::ResourceLimit {
+                                    resource: "SemanticWir match binding copy",
+                                    limit: self.limits.model_edges,
+                                },
+                            )?;
+                            let mut rebound = try_vec(
+                                rebound_capacity,
+                                "SemanticWir match binding copy",
+                                self.limits.model_edges,
+                            )?;
+                            self.push_let(
+                                &mut rebound,
+                                last.binding,
+                                wir::SemanticOperation::Copy {
+                                    value: root_binding,
+                                },
+                                Some(last.source),
+                            )?;
+                            rebound.append(&mut folded.statements);
+                            folded.statements = rebound;
+                        }
+                        for arm in group.into_iter().rev() {
+                            let condition = arm
+                                .guard
+                                .ok_or_else(|| self.fact_mismatch("unguarded match fallthrough"))?;
+                            let binding = arm.binding;
+                            let source = arm.source;
+                            let mut prelude = arm.guard_prelude;
+                            let mut then_region = arm.body;
+                            then_region.parameters = Vec::new();
+                            let nested_capacity = prelude
+                                .len()
+                                .checked_add(usize::from(binding != root_binding))
+                                .ok_or(LowerError::ResourceLimit {
+                                    resource: "SemanticWir match guard prelude",
+                                    limit: self.limits.model_edges,
+                                })?;
+                            let mut nested = try_vec(
+                                nested_capacity,
+                                "SemanticWir match guard prelude",
+                                self.limits.model_edges,
+                            )?;
+                            if binding != root_binding {
+                                self.push_let(
+                                    &mut nested,
+                                    binding,
+                                    wir::SemanticOperation::Copy {
+                                        value: root_binding,
+                                    },
+                                    Some(source),
+                                )?;
+                            }
+                            nested.append(&mut prelude);
+                            let else_region = std::mem::replace(
+                                &mut folded,
+                                wir::SemanticRegion {
+                                    parameters: Vec::new(),
+                                    statements: Vec::new(),
+                                },
+                            );
+                            self.push_statement(
+                                &mut nested,
+                                wir::SemanticStatement::If {
+                                    condition,
+                                    then_region,
+                                    else_region,
+                                    results: Vec::new(),
+                                    source: Some(source),
+                                },
+                            )?;
+                            folded.statements = nested;
+                        }
+                        folded.parameters = one_value_vec(root_binding, self.limits.model_edges)?;
+                        lowered_arms.push(wir::SemanticMatchArm {
+                            variant: Some(
+                                u32::try_from(variant_index).map_err(|_| {
+                                    self.fact_mismatch("folded match variant index")
+                                })?,
+                            ),
+                            bindings: one_value_vec(root_binding, self.limits.model_edges)?,
+                            guard: None,
+                            body: folded,
+                        });
+                    }
+                    if pending_arms.iter().any(Option::is_some) {
+                        return Err(self.fact_mismatch("unfolded match arm"));
+                    }
+                    if let Some((mut body, _source)) = wildcard_arm {
+                        body.parameters = Vec::new();
+                        lowered_arms.push(wir::SemanticMatchArm {
+                            variant: None,
+                            bindings: Vec::new(),
+                            guard: None,
+                            body,
+                        });
                     }
                     self.push_statement(
                         &mut statements,
@@ -19047,6 +19262,168 @@ pub fn boot() -> Image:
                 &|| false,
             ),
             Err(LowerError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn guarded_wildcard_match_lowering_has_exact_limit_and_late_cancellation() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub enum Choice:
+    left(u64)
+    right(u64)
+    center(u64)
+
+fn consume(value: u64):
+    pass
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        choice: Choice = Choice.left(7)
+        match choice:
+            case Choice.left(value) if true:
+                pass
+            case Choice.left(_):
+                pass
+            case _:
+                consume(9)
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("guarded wildcard match lowering");
+        assert!(output.wir().as_wir().functions.iter().any(|function| {
+            function.body.statements.iter().any(|statement| {
+                matches!(statement, wir::SemanticStatement::Match { arms, .. }
+                    if arms.last().is_some_and(|arm| arm.variant.is_none())
+                        && arms.iter().filter(|arm| arm.variant.is_none()).count() == 1)
+            })
+        }));
+        let exact_operations = output.report().operations;
+        assert!(exact_operations > 1);
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact guarded-match operation limit");
+        let mut one_under = LoweringLimits::standard();
+        one_under.operations = exact_operations - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == exact_operations - 1
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("count guarded-match cancellation polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn guarded_variant_falling_through_to_wildcard_stays_named_fail_closed() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub enum Choice:
+    left(u64)
+    right(u64)
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        choice: Choice = Choice.left(7)
+        match choice:
+            case Choice.left(value) if true:
+                pass
+            case _:
+                pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-match-wildcard-guard-fallback-lowering-pending (guarded variant requires an explicit unguarded cover before the catch-all)"
+            })
         ));
     }
 

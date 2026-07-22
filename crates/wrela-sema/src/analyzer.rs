@@ -6700,32 +6700,23 @@ fn analyze_closed_enum_match(
                 "match a closed enum value with supported copy-scalar type arguments",
             )
         })?;
-    if arms.len() != variants {
-        return Err(runtime_type_diagnostic(
-            request,
-            fallback_span(request.hir.as_program()),
-            "semantic-runtime-match-nonexhaustive",
-            "runtime enum match is not exactly exhaustive",
-            "every declared variant must appear once in an unguarded constructor arm",
-            "add each missing variant and remove duplicates",
-        ));
-    }
     let mut covered = Vec::new();
     covered
         .try_reserve_exact(variants)
         .map_err(|_| fact_resource(request, "runtime match coverage"))?;
     covered.resize(variants, false);
     let mut effects = scrutinee.effects;
-    for arm in arms {
+    let mut seen_wildcard = false;
+    for (arm_index, arm) in arms.iter().enumerate() {
         check_cancelled(is_cancelled)?;
-        if arm.guard.is_some() {
+        if seen_wildcard {
             return Err(runtime_type_diagnostic(
                 request,
                 arm.source,
-                "semantic-runtime-match-guard-not-supported",
-                "runtime enum match arms must be unguarded",
-                "guarded arms do not contribute to closed exhaustiveness",
-                "move the condition into the arm body",
+                "semantic-runtime-match-unreachable-arm",
+                "runtime enum match arm follows a catch-all wildcard",
+                "a trailing `_` arm already covers every remaining variant",
+                "remove arms after the catch-all wildcard",
             ));
         }
         let pattern = request
@@ -6744,23 +6735,102 @@ fn analyze_closed_enum_match(
                 "write one arm per variant",
             ));
         };
+        if matches!(alternative.kind, wrela_hir::PrimaryPattern::Wildcard) {
+            if arm.guard.is_some() {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    arm.source,
+                    "semantic-runtime-match-guarded-wildcard",
+                    "runtime enum catch-all wildcard must be unguarded",
+                    "a guarded `_` arm cannot prove closed exhaustiveness",
+                    "drop the guard or name the remaining constructors explicitly",
+                ));
+            }
+            if arm_index + 1 != arms.len() {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    arm.source,
+                    "semantic-runtime-match-unreachable-arm",
+                    "runtime enum catch-all wildcard must be last",
+                    "a `_` arm covers every remaining variant",
+                    "move the `_` arm to the end",
+                ));
+            }
+            let mut remaining = false;
+            for slot in &mut covered {
+                check_cancelled(is_cancelled)?;
+                if !*slot {
+                    *slot = true;
+                    remaining = true;
+                }
+            }
+            if !remaining {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    alternative.source,
+                    "semantic-runtime-match-unreachable-arm",
+                    "runtime enum catch-all wildcard is unreachable",
+                    "every variant is already covered by an earlier unguarded constructor arm",
+                    "remove the redundant `_` arm",
+                ));
+            }
+            seen_wildcard = true;
+            let mut arm_locals = copy_binding_map(locals, request.limits.values)?;
+            let mut arm_parameters = copy_binding_map(parameters, request.limits.values)?;
+            let fact_start = partial.statements.len();
+            analyze_runtime_body(
+                request,
+                partial,
+                function,
+                arm.body,
+                &mut arm_locals,
+                &mut arm_parameters,
+                allow_assertions,
+                &mut *aggregate_work,
+                is_cancelled,
+            )?;
+            let mut state_changed =
+                arm_parameters.len() != parameters.len() || arm_locals.len() != locals.len();
+            for (left, right) in arm_parameters.iter().zip(parameters.iter()) {
+                check_cancelled(is_cancelled)?;
+                state_changed |= left != right;
+            }
+            for (left, right) in arm_locals.iter().zip(locals.iter()) {
+                check_cancelled(is_cancelled)?;
+                state_changed |= left != right;
+            }
+            if state_changed {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    arm.source,
+                    "semantic-runtime-match-state-change-not-supported",
+                    "runtime enum match arm changes outer local state",
+                    "match arms may return or perform effects, but this slice does not join outer SSA assignments",
+                    "return from each arm or move the assignment after the match",
+                ));
+            }
+            for statement in partial
+                .statements
+                .get(fact_start..)
+                .ok_or(AnalysisFailure::RequestMismatch)?
+            {
+                check_cancelled(is_cancelled)?;
+                effects.0 |= statement.effects.0;
+            }
+            continue;
+        }
         let wrela_hir::PrimaryPattern::Constructor {
             candidates,
             arguments,
             ..
         } = &alternative.kind
         else {
-            let code = if matches!(alternative.kind, wrela_hir::PrimaryPattern::Wildcard) {
-                "semantic-runtime-match-wildcard-not-supported"
-            } else {
-                "semantic-runtime-match-constructor-only"
-            };
             return Err(runtime_type_diagnostic(
                 request,
                 alternative.source,
-                code,
+                "semantic-runtime-match-constructor-only",
                 "runtime enum match arm must use an explicit constructor",
-                "wildcard, literal, binding-only, tuple, and array arms hide the closed variant set",
+                "literal, binding-only, tuple, and array arms hide the closed variant set",
                 "name one declared enum variant in each arm",
             ));
         };
@@ -6774,26 +6844,33 @@ fn analyze_closed_enum_match(
                 "import or qualify one declared variant",
             ));
         };
-        if candidate.enumeration.declaration != enumeration
-            || candidate.variant as usize >= variants
-            || covered[candidate.variant as usize]
-        {
+        let variant_index = candidate.variant as usize;
+        if candidate.enumeration.declaration != enumeration || variant_index >= variants {
             return Err(runtime_type_diagnostic(
                 request,
                 alternative.source,
                 "semantic-runtime-match-nonexhaustive",
-                "runtime enum match repeats or substitutes a variant",
-                "every variant of the scrutinee enum must appear exactly once",
-                "use each declared variant once",
+                "runtime enum match substitutes a variant from another enum",
+                "every arm must name a variant of the scrutinee's exact enum type",
+                "use a declared variant of the matched enum",
             ));
         }
-        covered[candidate.variant as usize] = true;
+        if covered[variant_index] {
+            return Err(runtime_type_diagnostic(
+                request,
+                alternative.source,
+                "semantic-runtime-match-unreachable-arm",
+                "runtime enum match arm is unreachable after an unguarded cover",
+                "an earlier unguarded arm already covers this variant",
+                "remove the duplicate arm or move guarded arms before the unguarded cover",
+            ));
+        }
         let payload_ty = partial
             .types
             .get(scrutinee.ty.0 as usize)
             .and_then(|record| match &record.kind {
                 SemanticTypeKind::Enumeration { variants, .. } => variants
-                    .get(candidate.variant as usize)
+                    .get(variant_index)
                     .map(|variant| variant.fields.first().map(|field| field.ty)),
                 _ => None,
             })
@@ -6851,60 +6928,99 @@ fn analyze_closed_enum_match(
                         "bind the payload directly",
                     ));
                 };
-                let wrela_hir::PrimaryPattern::Bind(local) = &payload_alternative.kind else {
-                    return Err(runtime_type_diagnostic(
-                        request,
-                        payload_alternative.source,
-                        "semantic-runtime-match-payload-shape",
-                        "runtime enum payload pattern must bind one name",
-                        "wildcard and nested destructuring remain outside the admitted ADT match subset",
-                        "bind the payload to a local name",
-                    ));
-                };
-                let local_record = request
-                    .hir
-                    .as_program()
-                    .locals
-                    .get(local.0 as usize)
-                    .filter(|record| record.id == *local && record.body == arm.body)
-                    .ok_or(AnalysisFailure::RequestMismatch)?;
-                let value = append_semantic_value(
-                    request,
-                    partial,
-                    function,
-                    payload_ty,
-                    (
-                        SemanticValueOrigin::Local(*local),
-                        Some(local_record.source),
-                        Some(local_record.name.as_str()),
-                    ),
-                    is_cancelled,
-                )?;
-                definitions
-                    .try_reserve(1)
-                    .map_err(|_| fact_resource(request, "runtime match bindings"))?;
-                definitions.push(LocalDefinition {
-                    local: *local,
-                    value,
-                });
-                let slot = arm_locals
-                    .get_mut(local.0 as usize)
-                    .ok_or(AnalysisFailure::RequestMismatch)?;
-                if slot
-                    .replace(RuntimeBinding {
-                        value,
-                        state: OwnershipState::Owned,
-                        authority: RuntimeAuthority::Own,
-                        origin: RuntimeBindingOrigin::Local(*local),
-                        source: local_record.source,
-                    })
-                    .is_some()
-                {
-                    return Err(AnalysisFailure::RequestMismatch.into());
+                match &payload_alternative.kind {
+                    wrela_hir::PrimaryPattern::Bind(local) => {
+                        let local_record = request
+                            .hir
+                            .as_program()
+                            .locals
+                            .get(local.0 as usize)
+                            .filter(|record| record.id == *local && record.body == arm.body)
+                            .ok_or(AnalysisFailure::RequestMismatch)?;
+                        let value = append_semantic_value(
+                            request,
+                            partial,
+                            function,
+                            payload_ty,
+                            (
+                                SemanticValueOrigin::Local(*local),
+                                Some(local_record.source),
+                                Some(local_record.name.as_str()),
+                            ),
+                            is_cancelled,
+                        )?;
+                        definitions
+                            .try_reserve(1)
+                            .map_err(|_| fact_resource(request, "runtime match bindings"))?;
+                        definitions.push(LocalDefinition {
+                            local: *local,
+                            value,
+                        });
+                        let slot = arm_locals
+                            .get_mut(local.0 as usize)
+                            .ok_or(AnalysisFailure::RequestMismatch)?;
+                        if slot
+                            .replace(RuntimeBinding {
+                                value,
+                                state: OwnershipState::Owned,
+                                authority: RuntimeAuthority::Own,
+                                origin: RuntimeBindingOrigin::Local(*local),
+                                source: local_record.source,
+                            })
+                            .is_some()
+                        {
+                            return Err(AnalysisFailure::RequestMismatch.into());
+                        }
+                        Some(*local)
+                    }
+                    wrela_hir::PrimaryPattern::Wildcard => None,
+                    _ => {
+                        return Err(runtime_type_diagnostic(
+                            request,
+                            payload_alternative.source,
+                            "semantic-runtime-match-payload-shape",
+                            "runtime enum payload pattern must bind one name or `_`",
+                            "nested payload destructuring remains outside the admitted ADT match subset",
+                            "bind the payload to a local name or discard it with `_`",
+                        ));
+                    }
                 }
-                Some(*local)
             }
         };
+        if let Some(guard) = arm.guard {
+            let bool_ty = ensure_primitive_type(
+                request,
+                partial,
+                PrimitiveSemanticType::Bool,
+                &mut *aggregate_work,
+                is_cancelled,
+            )?;
+            let guard_outcome = analyze_runtime_expression(
+                request,
+                partial,
+                function,
+                guard,
+                RuntimeExpressionRequest {
+                    expected: Some(bool_ty),
+                    desired_result: None,
+                    access: AccessMode::Value,
+                },
+                &mut RuntimeState {
+                    locals: &mut arm_locals,
+                    parameters: &mut arm_parameters,
+                    aggregate_work: &mut *aggregate_work,
+                    allow_assertions,
+                    allow_scope_call: false,
+                },
+                is_cancelled,
+            )?;
+            if guard_outcome.ty != bool_ty {
+                return Err(AnalysisFailure::RequestMismatch.into());
+            }
+            effects.0 |= guard_outcome.effects.0;
+        } else {
+            covered[variant_index] = true;
+        }
         let fact_start = partial.statements.len();
         analyze_runtime_body(
             request,
@@ -6959,8 +7075,8 @@ fn analyze_closed_enum_match(
             fallback_span(request.hir.as_program()),
             "semantic-runtime-match-nonexhaustive",
             "runtime enum match omits a variant",
-            "every variant must appear exactly once",
-            "add the missing constructor arm",
+            "every variant must be covered by an unguarded constructor arm or trailing `_`",
+            "add an unguarded arm for the missing variant",
         ));
     }
     Ok(effects)
@@ -32138,6 +32254,50 @@ fn projection_fixture():
             diagnostic.code.as_deref() == Some("semantic-runtime-match-nonexhaustive")
         }));
         assert!(output.has_errors());
+    }
+
+    #[test]
+    fn guarded_adt_match_full_seal_requires_the_exact_guard_fact() {
+        let source = dot_variant_actor_source(
+            "async fn checkpoint():\n    state: Lookup = .found(1)\n    match state:\n        case Lookup.found(value) if value == 1:\n            pass\n        case Lookup.found(_):\n            pass\n        case _:\n            pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("guarded ADT match analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "guarded match must analyze before its facts are forged: {:?}",
+            output.diagnostics()
+        );
+        let successful = output.successful().expect("sealed guarded match image");
+        let guard = successful
+            .hir()
+            .as_program()
+            .statements
+            .iter()
+            .find_map(|statement| match &statement.kind {
+                StatementKind::Match { arms, .. } => arms.iter().find_map(|arm| arm.guard),
+                _ => None,
+            })
+            .expect("guard expression in retained HIR");
+        let mut forged = successful.facts().clone();
+        let before = forged.expressions.len();
+        forged.expressions.retain(|fact| fact.expression != guard);
+        assert_eq!(before - forged.expressions.len(), 1, "one exact guard fact");
+        forged
+            .validate_partial_structure()
+            .expect("missing guard remains prefix-safe");
+        assert!(
+            forged
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err(),
+            "full sealing must reject a guarded match with its guard fact removed"
+        );
     }
 
     #[test]

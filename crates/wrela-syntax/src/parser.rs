@@ -4123,12 +4123,20 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         let kind = match self.kind() {
             TokenKind::Keyword(Keyword::Return) => {
                 self.bump()?;
-                let value = if self.is_statement_terminator() {
-                    None
+                if self.is_statement_terminator() {
+                    StatementKind::Return(None)
+                } else if self.at_keyword(Keyword::Match) {
+                    // The first executable tail-match slice is deliberately
+                    // represented as ordinary statement control flow. Every
+                    // arm's tail value becomes an exact return in the AST, so
+                    // HIR and every later sealer can authenticate the desugared
+                    // control flow without adding an unsealed expression kind.
+                    let mut kind = self.parse_match_statement(depth + 1)?;
+                    self.rewrite_match_tail_returns(&mut kind, depth + 1)?;
+                    kind
                 } else {
-                    Some(self.parse_expression(depth + 1)?)
-                };
-                StatementKind::Return(value)
+                    StatementKind::Return(Some(self.parse_expression(depth + 1)?))
+                }
             }
             TokenKind::Keyword(Keyword::Pass) => {
                 self.bump()?;
@@ -4343,6 +4351,74 @@ impl<'a, 'diag> Parser<'a, 'diag> {
         }
         self.leave_indented_declaration_suite("match")?;
         Ok(StatementKind::Match { scrutinee, arms })
+    }
+
+    fn rewrite_match_tail_returns(
+        &mut self,
+        kind: &mut StatementKind,
+        depth: u32,
+    ) -> Result<(), ParseFailure> {
+        self.check_depth(depth)?;
+        let StatementKind::Match { arms, .. } = kind else {
+            return Err(ParseFailure::InternalInvariant(
+                "tail return rewrite expected a match statement".to_owned(),
+            ));
+        };
+        for arm in arms {
+            if !self.rewrite_suite_tail_expression_to_return(&mut arm.body, depth + 1)? {
+                self.diagnostics.error(
+                    "syntax-tail-match-arm-value",
+                    arm.meta.span.range.start as usize,
+                    arm.meta.span.range.end as usize,
+                    "every `return match` arm must end in a value, value-return, or complete value-producing `if`"
+                        .to_owned(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn rewrite_suite_tail_expression_to_return(
+        &mut self,
+        suite: &mut Suite,
+        depth: u32,
+    ) -> Result<bool, ParseFailure> {
+        self.check_depth(depth)?;
+        let Some(last) = suite.statements.last_mut() else {
+            return Ok(false);
+        };
+        if matches!(last.kind, StatementKind::Expression(_)) {
+            let StatementKind::Expression(expression) =
+                std::mem::replace(&mut last.kind, StatementKind::Pass)
+            else {
+                return Err(ParseFailure::InternalInvariant(
+                    "tail expression changed during return rewrite".to_owned(),
+                ));
+            };
+            last.kind = StatementKind::Return(Some(expression));
+            return Ok(true);
+        }
+        let produces_value = match &mut last.kind {
+            StatementKind::If(if_statement) => {
+                let mut complete = self.rewrite_suite_tail_expression_to_return(
+                    &mut if_statement.then_suite,
+                    depth + 1,
+                )?;
+                for (_, suite) in &mut if_statement.elif {
+                    complete &= self.rewrite_suite_tail_expression_to_return(suite, depth + 1)?;
+                }
+                if let Some(else_suite) = &mut if_statement.else_suite {
+                    complete &=
+                        self.rewrite_suite_tail_expression_to_return(else_suite, depth + 1)?;
+                } else {
+                    complete = false;
+                }
+                complete
+            }
+            StatementKind::Return(Some(_)) => true,
+            _ => false,
+        };
+        Ok(produces_value)
     }
 
     fn parse_pattern(&mut self, depth: u32) -> Result<Pattern, ParseFailure> {
@@ -9049,6 +9125,32 @@ mod tests {
         assert_eq!(
             diagnostic.primary.range.end,
             (offset + '\u{202e}'.len_utf8()) as u32
+        );
+    }
+
+    #[test]
+    fn return_match_requires_one_value_on_every_tail_arm() {
+        let output = parse_with_limits(
+            "module tail\nfn choose(value: bool) -> u8:\n    return match value:\n        case true:\n            pass\n        case false:\n            0\n",
+            ParseLimits::standard(),
+        )
+        .expect("tail match shape error is recoverable");
+        assert!(output.diagnostics().iter().any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("syntax-tail-match-arm-value")
+        }));
+    }
+
+    #[test]
+    fn return_match_rewrites_complete_statement_if_tails() {
+        let output = parse_with_limits(
+            "module tail\nfn choose(value: bool) -> u8:\n    return match value:\n        case true:\n            if value:\n                1\n            else:\n                2\n        case false:\n            0\n",
+            ParseLimits::standard(),
+        )
+        .expect("complete statement-if tail parses");
+        assert!(
+            output.diagnostics().is_empty(),
+            "{:?}",
+            output.diagnostics()
         );
     }
 

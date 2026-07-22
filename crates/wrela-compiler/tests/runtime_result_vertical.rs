@@ -340,7 +340,11 @@ fn analyze_selected(fixture: &SourceFixture, selector: &str) -> wrela_sema::Anal
             &never_cancelled,
         )
         .expect("runtime-result discovery");
-    assert!(discovery.diagnostics().is_empty());
+    assert!(
+        discovery.diagnostics().is_empty(),
+        "runtime-result discovery diagnostics: {:?}",
+        discovery.diagnostics()
+    );
     let plan = discovery
         .successful()
         .and_then(|image| image.facts().test_plan.as_ref())
@@ -455,6 +459,61 @@ fn compile_selected(
         .expect("runtime-result SemanticWir")
         .into_parts()
         .0
+}
+
+fn compile_selected_through_native(
+    fixture: &SourceFixture,
+    selector: &str,
+    helper: &str,
+) -> (wrela_backend::machine_wir::MachineWir, u32) {
+    let semantic = compile_selected(fixture, selector);
+    let semantic_function = semantic
+        .as_wir()
+        .functions
+        .iter()
+        .find(|function| function.name.ends_with(helper))
+        .map(|function| function.id.0)
+        .expect("extended match helper reaches SemanticWir");
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("runtime-result extended match FlowWir");
+    assert!(flow.diagnostics().is_empty());
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("runtime-result extended match canonical FlowWir frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("runtime-result extended match MachineWir preparation");
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("runtime-result extended match native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat extended match native emission");
+            assert_eq!(first.bytes(), second.bytes());
+        }
+    }
+    (prepared.machine().wir().as_wir().clone(), semantic_function)
 }
 
 fn assert_discovery_diagnostic(application_source: &str, expected: &str) {
@@ -840,6 +899,154 @@ fn result_u64_match_returns_payload():
             inspect_native_object(first.bytes(), HASHER.sha256(first.bytes()));
         }
     }
+}
+
+#[test]
+fn guarded_payload_and_trailing_wildcard_match_reaches_native_coff() {
+    let mut source = APPLICATION_SOURCE.to_owned();
+    source.push_str(
+        r#"
+fn classify_guarded(value: Result[u8, u8]) -> u8:
+    match value:
+        case .Ok(payload) if payload == 41:
+            return 3
+        case .Ok(payload) if payload == 42:
+            return 1
+        case .Ok(_):
+            return 2
+        case _:
+            return 0
+
+@test
+fn result_guarded_wildcard_match():
+    value: Result[u8, u8] = Result.Ok(42)
+    assert classify_guarded(value) == 1, "guarded arm must win before wildcard fallbacks"
+    return
+"#,
+    );
+    let fixture = source_fixture_for(&source);
+    let (machine, semantic_function) = compile_selected_through_native(
+        &fixture,
+        "result_guarded_wildcard_match",
+        "classify_guarded",
+    );
+    let classify = machine
+        .functions
+        .iter()
+        .find(|function| {
+            function.origin == MachineFunctionOrigin::SourceSemantic { semantic_function }
+        })
+        .expect("guarded match helper reaches MachineWir");
+    assert_eq!(
+        classify
+            .blocks
+            .iter()
+            .filter(|block| matches!(block.terminator, MachineTerminator::Switch { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn tail_position_match_and_inline_if_reach_native_coff() {
+    let mut source = APPLICATION_SOURCE.to_owned();
+    source.push_str(
+        r#"
+fn classify_tail(value: Result[u8, u8]) -> u8:
+    return match value:
+        case .Ok(payload):
+            payload
+        case .Err(code):
+            (if code == 0: 1 else: code)
+
+@test
+fn result_tail_match_expression():
+    value: Result[u8, u8] = Result.Ok(5)
+    assert classify_tail(value) == 5, "tail match must return its selected arm value"
+    return
+"#,
+    );
+    let fixture = source_fixture_for(&source);
+    let (machine, semantic_function) =
+        compile_selected_through_native(&fixture, "result_tail_match_expression", "classify_tail");
+    let classify = machine
+        .functions
+        .iter()
+        .find(|function| {
+            function.origin == MachineFunctionOrigin::SourceSemantic { semantic_function }
+        })
+        .expect("tail match helper reaches MachineWir");
+    assert_eq!(
+        classify
+            .blocks
+            .iter()
+            .filter(|block| matches!(block.terminator, MachineTerminator::Switch { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn guarded_match_requires_an_unguarded_cover() {
+    let mut source = APPLICATION_SOURCE.to_owned();
+    source.push_str(
+        r#"
+fn reject_guard_only(value: Result[u8, u8]) -> u8:
+    match value:
+        case .Ok(payload) if payload == 42:
+            return 1
+        case .Err(code):
+            return code
+
+@test
+fn reject_guard_only_match():
+    value: Result[u8, u8] = Result.Ok(42)
+    assert reject_guard_only(value) == 1, "unreachable"
+    return
+"#,
+    );
+    assert_discovery_diagnostic(&source, "semantic-runtime-match-nonexhaustive");
+}
+
+#[test]
+fn catch_all_wildcard_order_and_guard_fail_closed_stably() {
+    let mut nonterminal = APPLICATION_SOURCE.to_owned();
+    nonterminal.push_str(
+        r#"
+fn reject_wildcard_order(value: Result[u8, u8]) -> u8:
+    match value:
+        case _:
+            return 0
+        case .Ok(payload):
+            return payload
+
+@test
+fn reject_wildcard_not_last():
+    value: Result[u8, u8] = Result.Ok(1)
+    assert reject_wildcard_order(value) == 1, "unreachable"
+    return
+"#,
+    );
+    assert_discovery_diagnostic(&nonterminal, "semantic-runtime-match-unreachable-arm");
+
+    let mut guarded = APPLICATION_SOURCE.to_owned();
+    guarded.push_str(
+        r#"
+fn reject_guarded_wildcard(value: Result[u8, u8]) -> u8:
+    match value:
+        case .Ok(payload):
+            return payload
+        case _ if true:
+            return 0
+
+@test
+fn reject_guarded_catch_all():
+    value: Result[u8, u8] = Result.Err(1)
+    assert reject_guarded_wildcard(value) == 0, "unreachable"
+    return
+"#,
+    );
+    assert_discovery_diagnostic(&guarded, "semantic-runtime-match-guarded-wildcard");
 }
 
 #[test]

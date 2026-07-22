@@ -2427,6 +2427,7 @@ fn validate_exact_scalar_conversion(
 #[derive(Clone, Copy)]
 enum ScalarRegionContract<'a> {
     Root,
+    Terminal,
     MatchArm(&'a [semantic::ValueId]),
     ResultMatchArm {
         bindings: &'a [semantic::ValueId],
@@ -2487,6 +2488,7 @@ fn validate_scalar_source_function(
         check_cancelled(is_cancelled)?;
         let parameters_match = match contract {
             ScalarRegionContract::Root => region.parameters == function.parameters,
+            ScalarRegionContract::Terminal => region.parameters.is_empty(),
             ScalarRegionContract::MatchArm(bindings) => region.parameters == bindings,
             ScalarRegionContract::ResultMatchArm { bindings, .. } => region.parameters == bindings,
             ScalarRegionContract::Fallthrough
@@ -2760,7 +2762,17 @@ fn validate_scalar_source_function(
                         resource: "source region depth",
                         limit: u64::from(limits.region_depth),
                     })?;
-                    let branch_contract = if results.is_empty() {
+                    let terminal_if = results.is_empty()
+                        && index + 1 == region.statements.len()
+                        && matches!(
+                            contract,
+                            ScalarRegionContract::Root
+                                | ScalarRegionContract::Terminal
+                                | ScalarRegionContract::MatchArm(_)
+                        );
+                    let branch_contract = if terminal_if {
+                        ScalarRegionContract::Terminal
+                    } else if results.is_empty() {
                         match contract {
                             ScalarRegionContract::LoopBody(arity)
                             | ScalarRegionContract::LoopBranch(arity) => {
@@ -2783,6 +2795,7 @@ fn validate_scalar_source_function(
                         "source region validation",
                         limits.model_edges,
                     )?;
+                    terminated |= terminal_if;
                 }
                 semantic::SemanticStatement::Match {
                     scrutinee,
@@ -2797,18 +2810,22 @@ fn validate_scalar_source_function(
                         _ => None,
                     });
                     let terminal = results.is_empty();
-                    if variant_count != Some(arms.len())
-                        || (terminal
-                            && (!matches!(contract, ScalarRegionContract::Root)
-                                || index + 1 != region.statements.len()))
+                    let Some(variant_count) = variant_count else {
+                        return Err(unsupported("terminal closed enum match contract"));
+                    };
+                    if (terminal
+                        && (arms.is_empty()
+                            || !matches!(contract, ScalarRegionContract::Root)
+                            || index + 1 != region.statements.len()))
                         || (!terminal
-                            && !exact_result_try_match_protocol(
-                                input,
-                                function,
-                                enum_ty.ok_or_else(|| unsupported("result match enum type"))?,
-                                arms,
-                                results,
-                            ))
+                            && (arms.len() != variant_count
+                                || !exact_result_try_match_protocol(
+                                    input,
+                                    function,
+                                    enum_ty.ok_or_else(|| unsupported("result match enum type"))?,
+                                    arms,
+                                    results,
+                                )))
                     {
                         return Err(unsupported("terminal closed enum match contract"));
                     }
@@ -2816,19 +2833,29 @@ fn validate_scalar_source_function(
                         resource: "source region depth",
                         limit: u64::from(limits.region_depth),
                     })?;
-                    let mut seen = vec![false; arms.len()];
-                    for arm in arms.iter().rev() {
+                    let mut seen = try_vec(
+                        variant_count,
+                        "source enum match coverage",
+                        limits.model_edges,
+                    )?;
+                    seen.resize(variant_count, false);
+                    let mut wildcard = false;
+                    for (arm_index, arm) in arms.iter().enumerate().rev() {
                         check_cancelled(is_cancelled)?;
-                        let Some(variant) = arm.variant else {
-                            return Err(unsupported("explicit enum match variant"));
+                        let canonical = match arm.variant {
+                            Some(variant) => {
+                                seen.get_mut(variant as usize)
+                                    .is_some_and(|slot| !std::mem::replace(slot, true))
+                                    && arm.bindings.len() == 1
+                            }
+                            None => {
+                                terminal
+                                    && arm_index + 1 == arms.len()
+                                    && !std::mem::replace(&mut wildcard, true)
+                                    && arm.bindings.is_empty()
+                            }
                         };
-                        let Some(slot) = seen.get_mut(variant as usize) else {
-                            return Err(unsupported("enum match variant range"));
-                        };
-                        if std::mem::replace(slot, true)
-                            || arm.guard.is_some()
-                            || arm.bindings.len() != 1
-                        {
+                        if !canonical || arm.guard.is_some() {
                             return Err(unsupported("canonical enum match arm"));
                         }
                         push_bounded(
@@ -2848,6 +2875,9 @@ fn validate_scalar_source_function(
                             "source region validation",
                             limits.model_edges,
                         )?;
+                    }
+                    if !wildcard && seen.iter().any(|covered| !covered) {
+                        return Err(unsupported("terminal closed enum match coverage"));
                     }
                     terminated = terminal;
                 }
@@ -2898,6 +2928,7 @@ fn validate_scalar_source_function(
                     if matches!(
                         contract,
                         ScalarRegionContract::Root
+                            | ScalarRegionContract::Terminal
                             | ScalarRegionContract::MatchArm(_)
                             | ScalarRegionContract::ResultMatchArm { .. }
                     ) =>
@@ -2957,7 +2988,11 @@ fn validate_scalar_source_function(
             }
         }
         match contract {
-            ScalarRegionContract::Root | ScalarRegionContract::MatchArm(_) if !terminated => {
+            ScalarRegionContract::Root
+            | ScalarRegionContract::Terminal
+            | ScalarRegionContract::MatchArm(_)
+                if !terminated =>
+            {
                 return Err(unsupported("scalar source root terminator"));
             }
             ScalarRegionContract::ResultMatchArm { .. } if !terminated => {
@@ -2970,6 +3005,7 @@ fn validate_scalar_source_function(
                 return Err(unsupported("scalar fallthrough region terminator"));
             }
             ScalarRegionContract::Root
+            | ScalarRegionContract::Terminal
             | ScalarRegionContract::MatchArm(_)
             | ScalarRegionContract::ResultMatchArm { .. }
             | ScalarRegionContract::Fallthrough
@@ -5074,6 +5110,64 @@ struct RegionWork<'a> {
     depth: u32,
 }
 
+fn semantic_region_definitely_terminates(
+    region: &semantic::SemanticRegion,
+    depth: u32,
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, LowerError> {
+    check_cancelled(is_cancelled)?;
+    if depth > limits.region_depth {
+        return Err(LowerError::ResourceLimit {
+            resource: "source region depth",
+            limit: u64::from(limits.region_depth),
+        });
+    }
+    let Some(last) = region.statements.last() else {
+        return Ok(false);
+    };
+    match last {
+        semantic::SemanticStatement::Return(_)
+        | semantic::SemanticStatement::Break(_)
+        | semantic::SemanticStatement::Continue(_)
+        | semantic::SemanticStatement::Unreachable => Ok(true),
+        semantic::SemanticStatement::If {
+            then_region,
+            else_region,
+            results,
+            ..
+        } if results.is_empty() => {
+            let next = depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                resource: "source region depth",
+                limit: u64::from(limits.region_depth),
+            })?;
+            Ok(
+                semantic_region_definitely_terminates(then_region, next, limits, is_cancelled)?
+                    && semantic_region_definitely_terminates(
+                        else_region,
+                        next,
+                        limits,
+                        is_cancelled,
+                    )?,
+            )
+        }
+        semantic::SemanticStatement::Match { arms, results, .. } if results.is_empty() => {
+            let next = depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                resource: "source region depth",
+                limit: u64::from(limits.region_depth),
+            })?;
+            for arm in arms {
+                check_cancelled(is_cancelled)?;
+                if !semantic_region_definitely_terminates(&arm.body, next, limits, is_cancelled)? {
+                    return Ok(false);
+                }
+            }
+            Ok(!arms.is_empty())
+        }
+        _ => Ok(false),
+    }
+}
+
 fn allocate_pending_block<S: Copy>(
     blocks: &mut Vec<PendingBlock<S>>,
     source: Option<S>,
@@ -5416,19 +5510,22 @@ fn lower_generated_function(
                 } => {
                     let then_block = allocate_pending_block(&mut pending_blocks, *source, limits)?;
                     let else_block = allocate_pending_block(&mut pending_blocks, *source, limits)?;
-                    let region_terminates = |region: &semantic::SemanticRegion| {
-                        matches!(
-                            region.statements.last(),
-                            Some(
-                                semantic::SemanticStatement::Return(_)
-                                    | semantic::SemanticStatement::Break(_)
-                                    | semantic::SemanticStatement::Continue(_)
-                                    | semantic::SemanticStatement::Unreachable
-                            )
-                        )
-                    };
-                    let terminal_branches =
-                        region_terminates(then_region) && region_terminates(else_region);
+                    let next_depth =
+                        item.depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                            resource: "source region depth",
+                            limit: u64::from(limits.region_depth),
+                        })?;
+                    let terminal_branches = semantic_region_definitely_terminates(
+                        then_region,
+                        next_depth,
+                        limits,
+                        is_cancelled,
+                    )? && semantic_region_definitely_terminates(
+                        else_region,
+                        next_depth,
+                        limits,
+                        is_cancelled,
+                    )?;
                     let merge_block = if terminal_branches {
                         then_block
                     } else {
@@ -5450,11 +5547,6 @@ fn lower_generated_function(
                             else_block,
                             else_arguments: Vec::new(),
                         });
-                    let next_depth =
-                        item.depth.checked_add(1).ok_or(LowerError::ResourceLimit {
-                            resource: "source region depth",
-                            limit: u64::from(limits.region_depth),
-                        })?;
                     if !terminal_branches {
                         push_bounded(
                             &mut work,
@@ -5536,7 +5628,7 @@ fn lower_generated_function(
                             _ => None,
                         })
                         .ok_or_else(|| unsupported("enum match scrutinee type"))?;
-                    if variant_count != arms.len() {
+                    if arms.is_empty() || arms.len() > variant_count {
                         return Err(unsupported("enum match exhaustiveness"));
                     }
                     let tag_ty = input
@@ -5608,9 +5700,7 @@ fn lower_generated_function(
                             limits.instructions,
                         )?;
                     }
-                    let default = allocate_pending_block(&mut pending_blocks, *source, limits)?;
-                    pending_block_mut(&mut pending_blocks, default)?.terminator =
-                        Some(flow::Terminator::Unreachable);
+                    let mut default = None;
                     let merge_block = if results.is_empty() {
                         None
                     } else {
@@ -5646,24 +5736,31 @@ fn lower_generated_function(
                             limit: u64::from(limits.region_depth),
                         })?;
                     for arm in arms {
-                        let [binding] = arm.bindings.as_slice() else {
-                            return Err(unsupported("enum match payload binding"));
-                        };
-                        let variant = arm
-                            .variant
-                            .ok_or_else(|| unsupported("enum match explicit variant"))?;
                         let block = allocate_pending_block(&mut pending_blocks, *source, limits)?;
-                        push_bounded(
-                            &mut pending_block_mut(&mut pending_blocks, block)?.parameters,
-                            flow::ValueId(binding.0),
-                            "FlowWir block parameters",
-                            limits.model_edges,
-                        )?;
-                        cases.push(flow::SwitchCase {
-                            value: u128::from(variant),
-                            target: block,
-                            arguments: vec![payload],
-                        });
+                        match arm.variant {
+                            Some(variant) => {
+                                let [binding] = arm.bindings.as_slice() else {
+                                    return Err(unsupported("enum match payload binding"));
+                                };
+                                push_bounded(
+                                    &mut pending_block_mut(&mut pending_blocks, block)?.parameters,
+                                    flow::ValueId(binding.0),
+                                    "FlowWir block parameters",
+                                    limits.model_edges,
+                                )?;
+                                cases.push(flow::SwitchCase {
+                                    value: u128::from(variant),
+                                    target: block,
+                                    arguments: vec![payload],
+                                });
+                            }
+                            None if arm.bindings.is_empty() && results.is_empty() => {
+                                if default.replace(block).is_some() {
+                                    return Err(unsupported("enum match wildcard uniqueness"));
+                                }
+                            }
+                            None => return Err(unsupported("enum match wildcard binding")),
+                        }
                         arm_work.push(RegionWork {
                             region: &arm.body,
                             next_statement: 0,
@@ -5672,6 +5769,14 @@ fn lower_generated_function(
                             depth: next_depth,
                         });
                     }
+                    let default = if let Some(default) = default {
+                        default
+                    } else {
+                        let default = allocate_pending_block(&mut pending_blocks, *source, limits)?;
+                        pending_block_mut(&mut pending_blocks, default)?.terminator =
+                            Some(flow::Terminator::Unreachable);
+                        default
+                    };
                     pending_block_mut(&mut pending_blocks, item.block)?.terminator =
                         Some(flow::Terminator::Switch {
                             value: tag,

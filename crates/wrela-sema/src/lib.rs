@@ -2955,6 +2955,20 @@ fn validate_exact_body_local_value_flow(
                             return Err(invalid("enum match payload shadows reaching local state"));
                         }
                     }
+                    if let Some(guard) = arm.guard {
+                        validate_exact_expression_local_values(
+                            analysis,
+                            program,
+                            function.id,
+                            guard,
+                            &arm_locals,
+                            is_cancelled,
+                        )?;
+                        effects.0 |= exact_child_expression(analysis, function.id, guard)
+                            .ok_or_else(|| invalid("enum match guard fact is missing"))?
+                            .effects
+                            .0;
+                    }
                     let arm_effects = validate_exact_body_local_value_flow(
                         analysis,
                         program,
@@ -3390,6 +3404,14 @@ fn collect_source_body_closure(
                         program.bodies.len() as u64,
                     )?;
                     for arm in arms {
+                        if let Some(guard) = arm.guard {
+                            reserve_validation_scratch(
+                                &mut pending_expressions,
+                                1,
+                                program.expressions.len() as u64,
+                            )?;
+                            pending_expressions.push(guard);
+                        }
                         pending_bodies.push(arm.body);
                     }
                 }
@@ -3566,9 +3588,6 @@ fn exact_match_payload_local(
     program: &wrela_hir::Program,
     arm: &wrela_hir::MatchArm,
 ) -> Option<wrela_hir::LocalId> {
-    if arm.guard.is_some() {
-        return None;
-    }
     let pattern = program.patterns.get(arm.pattern.0 as usize)?;
     let [alternative] = pattern.alternatives.as_slice() else {
         return None;
@@ -6166,16 +6185,14 @@ fn validate_exact_statement_fact(
                     _ => None,
                 })
                 .ok_or_else(|| invalid("enum match scrutinee type is not canonical"))?;
-            if arms.len() != variant_count {
-                return Err(invalid("enum match does not cover every variant arm"));
-            }
             let mut covered = fallible_scratch::<bool>(variant_count, 256)?;
             covered.resize(variant_count, false);
             let mut definition_index = 0usize;
-            for arm in arms {
+            let mut seen_wildcard = false;
+            for (arm_index, arm) in arms.iter().enumerate() {
                 check_analysis_cancelled(is_cancelled)?;
-                if arm.guard.is_some() {
-                    return Err(invalid("sealed enum match contains a guarded arm"));
+                if seen_wildcard {
+                    return Err(invalid("enum match arm follows a catch-all wildcard"));
                 }
                 let pattern = program
                     .patterns
@@ -6191,6 +6208,24 @@ fn validate_exact_statement_fact(
                 let [alternative] = pattern.alternatives.as_slice() else {
                     return Err(invalid("enum match arm is not one constructor pattern"));
                 };
+                if matches!(alternative.kind, wrela_hir::PrimaryPattern::Wildcard) {
+                    if arm.guard.is_some() || arm_index + 1 != arms.len() {
+                        return Err(invalid("enum match catch-all wildcard is not canonical"));
+                    }
+                    let mut remaining = false;
+                    for slot in &mut covered {
+                        check_analysis_cancelled(is_cancelled)?;
+                        if !*slot {
+                            *slot = true;
+                            remaining = true;
+                        }
+                    }
+                    if !remaining {
+                        return Err(invalid("enum match catch-all wildcard is unreachable"));
+                    }
+                    seen_wildcard = true;
+                    continue;
+                }
                 let wrela_hir::PrimaryPattern::Constructor {
                     candidates,
                     arguments,
@@ -6218,11 +6253,12 @@ fn validate_exact_statement_fact(
                     })
                     .is_none()
                     || variant >= variant_count
-                    || covered[variant]
                 {
                     return Err(invalid("enum match constructor coverage differs from HIR"));
                 }
-                covered[variant] = true;
+                if covered[variant] {
+                    return Err(invalid("enum match constructor arm is unreachable"));
+                }
                 let payload_ty = analysis
                     .types
                     .get(scrutinee_fact.ty.0 as usize)
@@ -6254,47 +6290,72 @@ fn validate_exact_statement_fact(
                         let [payload_alternative] = payload_pattern.alternatives.as_slice() else {
                             return Err(invalid("enum match payload is not one binding pattern"));
                         };
-                        let wrela_hir::PrimaryPattern::Bind(local) = payload_alternative.kind
-                        else {
-                            return Err(invalid("enum match payload is not a local binding"));
-                        };
-                        let definition = fact
-                            .definitions
-                            .get(definition_index)
-                            .ok_or_else(|| invalid("enum match payload definition is missing"))?;
-                        definition_index += 1;
-                        let local_record = program
-                            .locals
-                            .get(local.0 as usize)
-                            .filter(|record| record.id == local && record.body == arm.body)
-                            .ok_or_else(|| {
-                                invalid("enum match payload local differs from arm body")
-                            })?;
-                        let value_record = analysis
-                            .values
-                            .get(definition.value.0 as usize)
-                            .filter(|record| {
-                                definition.local == local
-                                    && record.function == function.id
-                                    && record.ty == payload_ty
-                                    && record.origin == SemanticValueOrigin::Local(local)
-                                    && record.source == Some(local_record.source)
-                                    && record.source_name.as_deref()
-                                        == Some(local_record.name.as_str())
-                            })
-                            .ok_or_else(|| {
-                                invalid("enum match payload value provenance is invalid")
-                            })?;
-                        if analysis.expressions.iter().any(|expression| {
-                            expression.function == function.id
-                                && expression.result == Some(value_record.id)
-                        }) {
-                            return Err(invalid(
-                                "enum match payload binding is an expression result",
-                            ));
+                        match payload_alternative.kind {
+                            wrela_hir::PrimaryPattern::Bind(local) => {
+                                let definition =
+                                    fact.definitions.get(definition_index).ok_or_else(|| {
+                                        invalid("enum match payload definition is missing")
+                                    })?;
+                                definition_index += 1;
+                                let local_record = program
+                                    .locals
+                                    .get(local.0 as usize)
+                                    .filter(|record| record.id == local && record.body == arm.body)
+                                    .ok_or_else(|| {
+                                        invalid("enum match payload local differs from arm body")
+                                    })?;
+                                let value_record = analysis
+                                    .values
+                                    .get(definition.value.0 as usize)
+                                    .filter(|record| {
+                                        definition.local == local
+                                            && record.function == function.id
+                                            && record.ty == payload_ty
+                                            && record.origin == SemanticValueOrigin::Local(local)
+                                            && record.source == Some(local_record.source)
+                                            && record.source_name.as_deref()
+                                                == Some(local_record.name.as_str())
+                                    })
+                                    .ok_or_else(|| {
+                                        invalid("enum match payload value provenance is invalid")
+                                    })?;
+                                if analysis.expressions.iter().any(|expression| {
+                                    expression.function == function.id
+                                        && expression.result == Some(value_record.id)
+                                }) {
+                                    return Err(invalid(
+                                        "enum match payload binding is an expression result",
+                                    ));
+                                }
+                                increment_definition(definitions, definition.value)?;
+                            }
+                            wrela_hir::PrimaryPattern::Wildcard => {}
+                            _ => {
+                                return Err(invalid(
+                                    "enum match payload is not a local binding or wildcard",
+                                ));
+                            }
                         }
-                        increment_definition(definitions, definition.value)?;
                     }
+                }
+                if let Some(guard) = arm.guard {
+                    let guard_fact = analysis
+                        .expressions
+                        .binary_search_by_key(&(function.id, guard), |fact| {
+                            (fact.function, fact.expression)
+                        })
+                        .ok()
+                        .and_then(|index| analysis.expressions.get(index))
+                        .ok_or_else(|| invalid("enum match guard expression fact is missing"))?;
+                    let bool_ty = analysis.types.iter().find_map(|record| match record.kind {
+                        SemanticTypeKind::Bool => Some(record.id),
+                        _ => None,
+                    });
+                    if Some(guard_fact.ty) != bool_ty {
+                        return Err(invalid("enum match guard is not bool"));
+                    }
+                } else {
+                    covered[variant] = true;
                 }
             }
             if definition_index != fact.definitions.len() {
