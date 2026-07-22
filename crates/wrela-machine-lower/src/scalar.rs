@@ -1959,58 +1959,83 @@ fn exact_bounded_u64_activation_callee(
     if exact_constant_u64_flow_function(input, callee, result) {
         return true;
     }
+    let [block] = callee.blocks.as_slice() else {
+        return false;
+    };
+    let [call, constant, first, tail @ ..] = block.instructions.as_slice() else {
+        return false;
+    };
+    let (left, right) = match (
+        &call.operation,
+        call.results.as_slice(),
+        &constant.operation,
+        constant.results.as_slice(),
+    ) {
+        (
+            flow::FlowOperation::Call {
+                function,
+                arguments,
+            },
+            [left],
+            flow::FlowOperation::Immediate(flow::Immediate::Integer { bits: 64, bytes_le }),
+            [right],
+        ) if arguments.is_empty()
+            && bytes_le.len() == 8
+            && flow_value_type(callee, *left).ok() == Some(result)
+            && flow_value_type(callee, *right).ok() == Some(result)
+            && input
+                .functions
+                .get(function.0 as usize)
+                .is_some_and(|seed| {
+                    seed.id == *function
+                        && seed.role == flow::FunctionRole::Ordinary
+                        && seed.color == flow::FunctionColor::Sync
+                        && seed.parameters.is_empty()
+                        && exact_constant_u64_flow_function(input, seed, result)
+                }) =>
+        {
+            (*left, *right)
+        }
+        _ => return false,
+    };
+    let checked_add =
+        |instruction: &flow::Instruction, expected_left: flow::ValueId| -> Option<flow::ValueId> {
+            match (&instruction.operation, instruction.results.as_slice()) {
+                (
+                    flow::FlowOperation::Binary {
+                        op: flow::BinaryOp::AddChecked,
+                        left,
+                        right: actual_right,
+                    },
+                    [sum],
+                ) if *left == expected_left
+                    && *actual_right == right
+                    && flow_value_type(callee, *sum).ok() == Some(result)
+                    && instruction.source.is_some() =>
+                {
+                    Some(*sum)
+                }
+                _ => None,
+            }
+        };
+    let Some(first_sum) = checked_add(first, left) else {
+        return false;
+    };
+    let final_sum = match tail {
+        [] => first_sum,
+        [second] => match checked_add(second, first_sum) {
+            Some(sum) => sum,
+            None => return false,
+        },
+        _ => return false,
+    };
     callee.result_types.as_slice() == [result]
-        && matches!(callee.blocks.as_slice(), [block]
-            if block.id == callee.entry
-                && block.parameters.is_empty()
-                && matches!(block.instructions.as_slice(), [call, constant, binary]
-                    if matches!(
-                        (&call.operation, call.results.as_slice()),
-                        (
-                            flow::FlowOperation::Call {
-                                function,
-                                arguments,
-                            },
-                            [left],
-                        ) if arguments.is_empty()
-                            && flow_value_type(callee, *left).ok() == Some(result)
-                            && input.functions.get(function.0 as usize).is_some_and(|seed| {
-                                seed.id == *function
-                                    && seed.role == flow::FunctionRole::Ordinary
-                                    && seed.color == flow::FunctionColor::Sync
-                                    && seed.parameters.is_empty()
-                                    && exact_constant_u64_flow_function(input, seed, result)
-                            })
-                    )
-                    && matches!(
-                        (&constant.operation, constant.results.as_slice()),
-                        (
-                            flow::FlowOperation::Immediate(flow::Immediate::Integer {
-                                bits: 64,
-                                bytes_le,
-                            }),
-                            [right],
-                        ) if bytes_le.len() == 8
-                            && flow_value_type(callee, *right).ok() == Some(result)
-                    )
-                    && matches!(
-                        (&binary.operation, binary.results.as_slice()),
-                        (
-                            flow::FlowOperation::Binary {
-                                op: flow::BinaryOp::AddChecked,
-                                left: binary_left,
-                                right: binary_right,
-                            },
-                            [sum],
-                        ) if call.results.as_slice() == [*binary_left]
-                            && constant.results.as_slice() == [*binary_right]
-                            && flow_value_type(callee, *sum).ok() == Some(result)
-                            && matches!(&block.terminator,
-                                flow::Terminator::Return(values) if values.as_slice() == [*sum])
-                    )
-                    && call.source.is_some()
-                    && constant.source.is_some()
-                    && binary.source.is_some()))
+        && block.id == callee.entry
+        && block.parameters.is_empty()
+        && call.source.is_some()
+        && constant.source.is_some()
+        && matches!(&block.terminator,
+            flow::Terminator::Return(values) if values.as_slice() == [final_sum])
 }
 
 fn typed_activation_resume_value(

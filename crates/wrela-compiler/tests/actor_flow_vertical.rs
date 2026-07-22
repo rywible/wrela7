@@ -55,7 +55,8 @@ fn seed() -> u64:
 async fn checkpoint() -> u64:
     left: u64 = seed()
     right: u64 = 1
-    return left + right
+    middle: u64 = left + right
+    return middle + right
 
 @service
 pub struct Worker:
@@ -389,8 +390,10 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
     let [helper_block] = helper.blocks.as_slice() else {
         panic!("computed helper has one Flow block");
     };
-    let [helper_call, helper_constant, helper_binary] = helper_block.instructions.as_slice() else {
-        panic!("computed helper has one call, constant, and checked add");
+    let [helper_call, helper_constant, helper_binary, helper_tail] =
+        helper_block.instructions.as_slice()
+    else {
+        panic!("computed helper has one call, constant, and two checked adds");
     };
     let (seed_function, helper_left) =
         match (&helper_call.operation, helper_call.results.as_slice()) {
@@ -424,9 +427,20 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         ) if *left == helper_left && *right == helper_right => *sum,
         other => panic!("computed helper checked add: {other:?}"),
     };
+    let helper_final = match (&helper_tail.operation, helper_tail.results.as_slice()) {
+        (
+            flow::FlowOperation::Binary {
+                op: flow::BinaryOp::AddChecked,
+                left,
+                right,
+            },
+            [result],
+        ) if *left == helper_sum && *right == helper_right => *result,
+        other => panic!("computed helper tail checked add: {other:?}"),
+    };
     assert_eq!(
         helper_block.terminator,
-        flow::Terminator::Return(vec![helper_sum])
+        flow::Terminator::Return(vec![helper_final])
     );
     let seed = &flow.functions[seed_function.0 as usize];
     assert_eq!(seed.role, flow::FunctionRole::Ordinary);
@@ -658,6 +672,16 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         swapped_computation,
         "swapped computed async helper operands",
     );
+
+    let mut swapped_tail = flow.clone();
+    let swapped_helper = &mut swapped_tail.functions[helper.id.0 as usize];
+    let flow::FlowOperation::Binary { left, right, .. } =
+        &mut swapped_helper.blocks[0].instructions[3].operation
+    else {
+        panic!("computed async helper tail checked add");
+    };
+    std::mem::swap(left, right);
+    prepare_forged_flow(swapped_tail, "swapped computed async helper tail operands");
 
     let mut argumented = flow.clone();
     let argument_helper = &mut argumented.functions[helper.id.0 as usize];
@@ -974,8 +998,10 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
     let [helper_block] = machine_helper.blocks.as_slice() else {
         panic!("computed typed async helper has one machine block");
     };
-    let [helper_call, helper_constant, helper_binary] = helper_block.instructions.as_slice() else {
-        panic!("computed typed async helper has call, constant, and checked add");
+    let [helper_call, helper_constant, helper_binary, helper_tail] =
+        helper_block.instructions.as_slice()
+    else {
+        panic!("computed typed async helper has call, constant, and two checked adds");
     };
     let [helper_left] = helper_call.results.as_slice() else {
         panic!("computed helper call defines one u64");
@@ -1031,9 +1057,24 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
             && *right == *helper_right
             && failure.kind == wrela_backend::machine_wir::ScalarFailureKind::Arithmetic
     ));
+    let [helper_final] = helper_tail.results.as_slice() else {
+        panic!("computed helper tail checked add defines one u64");
+    };
+    assert!(matches!(
+        &helper_tail.operation,
+        MachineOperation::CheckedInteger {
+            op: wrela_backend::machine_wir::CheckedIntegerOp::Add,
+            signedness: wrela_backend::machine_wir::IntegerSignedness::Unsigned,
+            left,
+            right,
+            failure,
+        } if *left == *helper_sum
+            && *right == *helper_right
+            && failure.kind == wrela_backend::machine_wir::ScalarFailureKind::Arithmetic
+    ));
     assert!(matches!(
         &helper_block.terminator,
-        MachineTerminator::Return(values) if values.as_slice() == [*helper_sum]
+        MachineTerminator::Return(values) if values.as_slice() == [*helper_final]
     ));
     for activation in [actor_activation, task_activation] {
         let caller = &machine.functions[activation.caller.0 as usize];
@@ -1365,6 +1406,21 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         forged_computation
             .validate_for_target(&target)
             .expect_err("typed activation helper operands remain source-ordered")
+            .0
+            .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
+    );
+
+    let mut forged_tail = machine.clone();
+    let MachineOperation::CheckedInteger { left, right, .. } =
+        &mut forged_tail.functions[helper_id].blocks[0].instructions[3].operation
+    else {
+        panic!("typed helper machine tail checked add");
+    };
+    std::mem::swap(left, right);
+    assert!(
+        forged_tail
+            .validate_for_target(&target)
+            .expect_err("typed activation helper tail remains source-ordered")
             .0
             .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
     );
