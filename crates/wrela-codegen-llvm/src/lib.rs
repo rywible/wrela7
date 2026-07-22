@@ -1480,6 +1480,28 @@ mod contract_tests {
         (validated, target)
     }
 
+    fn ordinary_aggregate_passthrough_machine_fixture() -> (ValidatedMachineWir, TargetPackage) {
+        let (validated, target) = ordinary_aggregate_reader_machine_fixture();
+        let mut machine = validated.into_wir();
+        machine.name = "ordinary-aggregate-passthrough".to_owned();
+        let reader = &mut machine.functions[1];
+        reader.parameters.push(ValueId(1));
+        reader.values[1].source_name = Some("passthrough".to_owned());
+        reader.blocks[0].instructions.clear();
+        reader.blocks[0].terminator = MachineTerminator::Return(vec![ValueId(1)]);
+        let caller = &mut machine.functions[2];
+        let MachineOperation::Call { arguments, .. } =
+            &mut caller.blocks[0].instructions[3].operation
+        else {
+            panic!("reader fixture call")
+        };
+        arguments.push(ValueId(1));
+        let validated = machine
+            .validate_for_target(&target)
+            .expect("valid ordinary aggregate passthrough MachineWir fixture");
+        (validated, target)
+    }
+
     fn ordinary_aggregate_builder_machine_fixture() -> (ValidatedMachineWir, TargetPackage) {
         let (validated, target) = ordinary_aggregate_reader_machine_fixture();
         let mut machine = validated.into_wir();
@@ -4614,6 +4636,54 @@ mod contract_tests {
         let forged = forged
             .validate_for_target(&target)
             .expect("extra reader computation remains structurally valid");
+        assert_eq!(
+            super::preflight(
+                &CodegenRequest {
+                    module: &forged,
+                    target: target.backend(),
+                    options: CodegenOptions::standard(),
+                },
+                &|| false,
+            ),
+            Err(CodegenError::UnsupportedMachineContract(
+                "void or non-scalar function parameter",
+            ))
+        );
+    }
+
+    #[test]
+    fn ordinary_two_field_passthrough_is_reauthenticated_and_forgery_fails_closed() {
+        let (machine, target) = ordinary_aggregate_passthrough_machine_fixture();
+        let request = CodegenRequest {
+            module: &machine,
+            target: target.backend(),
+            options: CodegenOptions::standard(),
+        };
+        super::preflight(&request, &|| false)
+            .expect("exact aggregate receiver passthrough passes codegen preflight");
+        let first = super::ir::render_module(&request, &|| false)
+            .expect("aggregate receiver passthrough renders to bounded LLVM IR");
+        let second = super::ir::render_module(&request, &|| false)
+            .expect("aggregate receiver passthrough rerenders deterministically");
+        assert_eq!(first, second);
+
+        let mut forged = machine.into_wir();
+        let reader = &mut forged.functions[1];
+        reader.values.push(MachineValue {
+            id: ValueId(2),
+            ty: MachineTypeId(3),
+            source_name: Some("forged".to_owned()),
+        });
+        reader.blocks[0].instructions.push(MachineInstruction {
+            id: InstructionId(0),
+            results: vec![ValueId(2)],
+            operation: MachineOperation::Copy { value: ValueId(1) },
+            source: reader.source,
+        });
+        reader.blocks[0].terminator = MachineTerminator::Return(vec![ValueId(2)]);
+        let forged = forged
+            .validate_for_target(&target)
+            .expect("extra passthrough computation remains structurally valid");
         assert_eq!(
             super::preflight(
                 &CodegenRequest {

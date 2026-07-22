@@ -5228,9 +5228,9 @@ fn authenticated_flat_structure_builder_call(
 
 /// Authenticate the first ordinary owned-aggregate function boundary without
 /// widening the general aggregate ABI. The callee is deliberately exact: one
-/// source function, one two-field flat-copy parameter, one scalar projection,
-/// and one scalar return. Every adjacent aggregate parameter/result shape
-/// remains behind the named function-boundary diagnostic.
+/// source function, one two-field flat-copy receiver, and either one scalar
+/// projection or one scalar passthrough argument. Every adjacent aggregate
+/// parameter/result shape remains behind the named function-boundary diagnostic.
 fn authenticated_flat_structure_reader(
     input: &flow::FlowWir,
     function: &flow::FlowFunction,
@@ -5240,11 +5240,11 @@ fn authenticated_flat_structure_reader(
     let flow::FunctionOrigin::SourceSemantic { semantic_function } = function.origin else {
         return Ok(None);
     };
-    let ([parameter], [result_ty], [block]) = (
-        function.parameters.as_slice(),
-        function.result_types.as_slice(),
-        function.blocks.as_slice(),
-    ) else {
+    let ([result_ty], [block]) = (function.result_types.as_slice(), function.blocks.as_slice())
+    else {
+        return Ok(None);
+    };
+    let Some(parameter) = function.parameters.first() else {
         return Ok(None);
     };
     let Some(parameter_ty) = function
@@ -5257,18 +5257,38 @@ fn authenticated_flat_structure_reader(
     let Some(fields) = flat_native_struct_fields(&input.types, parameter_ty) else {
         return Ok(None);
     };
-    let ([instruction], flow::Terminator::Return(returned)) =
-        (block.instructions.as_slice(), &block.terminator)
-    else {
-        return Ok(None);
+    let body_exact = match (
+        function.parameters.as_slice(),
+        block.instructions.as_slice(),
+        &block.terminator,
+    ) {
+        ([receiver], [instruction], flow::Terminator::Return(returned)) => {
+            matches!(
+                (instruction.results.as_slice(), &instruction.operation),
+                ([projected], flow::FlowOperation::ExtractField { aggregate, field })
+                    if *receiver == *parameter
+                        && *aggregate == *parameter
+                        && returned.as_slice() == [*projected]
+                        && fields.get(*field as usize).copied() == Some(*result_ty)
+                        && function.values.get(projected.0 as usize)
+                            .is_some_and(|value| value.ty == *result_ty)
+                        && instruction.source.is_some()
+            ) && function.values.len() == 2
+        }
+        ([receiver, passthrough], [], flow::Terminator::Return(returned)) => {
+            *receiver == *parameter
+                && returned.as_slice() == [*passthrough]
+                && function.values.len() == 2
+                && function
+                    .values
+                    .get(passthrough.0 as usize)
+                    .is_some_and(|value| value.ty == *result_ty)
+                && flow_scalar_type(input, *result_ty).is_ok()
+        }
+        _ => false,
     };
-    let ([projected], flow::FlowOperation::ExtractField { aggregate, field }) =
-        (instruction.results.as_slice(), &instruction.operation)
-    else {
-        return Ok(None);
-    };
-    let field_ty = fields.get(*field as usize).copied();
-    let exact = semantic_function == function.id.0
+    let exact = body_exact
+        && semantic_function == function.id.0
         && function.role == flow::FunctionRole::Ordinary
         && function.color == flow::FunctionColor::Sync
         && function.entry == block.id
@@ -5277,16 +5297,7 @@ fn authenticated_flat_structure_reader(
         && function.stack_bound == 0
         && function.frame_bound == 0
         && function.source.is_some()
-        && instruction.source.is_some()
-        && fields.len() == 2
-        && function.values.len() == 2
-        && *aggregate == *parameter
-        && returned.as_slice() == [*projected]
-        && field_ty == Some(*result_ty)
-        && function
-            .values
-            .get(projected.0 as usize)
-            .is_some_and(|value| value.ty == *result_ty);
+        && fields.len() == 2;
     Ok(exact.then_some(parameter_ty))
 }
 
@@ -5320,8 +5331,15 @@ fn authenticated_flat_structure_reader_call(
         && caller.role == flow::FunctionRole::Ordinary
         && caller.color == flow::FunctionColor::Sync
         && instruction.source.is_some()
-        && arguments.as_slice() == [aggregate]
+        && arguments.first() == Some(&aggregate)
+        && arguments.len() == callee.parameters.len()
         && flow_value_type(caller, aggregate).ok() == Some(aggregate_ty)
+        && arguments
+            .iter()
+            .zip(&callee.parameters)
+            .all(|(argument, parameter)| {
+                flow_value_type(caller, *argument).ok() == flow_value_type(callee, *parameter).ok()
+            })
         && callee
             .result_types
             .first()

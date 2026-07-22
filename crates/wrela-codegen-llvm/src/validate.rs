@@ -2890,8 +2890,8 @@ fn supported_struct_layout(types: &[wrela_machine_wir::MachineType], id: Machine
 
 /// Independently authenticate the narrow ordinary aggregate ABI admitted by
 /// machine lowering. Codegen does not trust source/Flow validation: it proves
-/// again that the callee is exactly a scalar-field reader over one owned,
-/// two-field flat structure and that the call passes that exact type once.
+/// again that the callee is exactly a scalar-field reader or scalar passthrough
+/// over one owned, two-field flat structure.
 fn authenticated_flat_structure_reader_call(
     machine: &wrela_machine_wir::MachineWir,
     caller: &MachineFunction,
@@ -2902,7 +2902,7 @@ fn authenticated_flat_structure_reader_call(
     let Some(callee) = machine.functions.get(callee_id.0 as usize) else {
         return false;
     };
-    let ([argument], [result]) = (arguments, instruction.results.as_slice()) else {
+    let ([result], Some(argument)) = (instruction.results.as_slice(), arguments.first()) else {
         return false;
     };
     let Some(parameter_ty) = authenticated_flat_structure_reader_state(machine, callee) else {
@@ -2915,7 +2915,14 @@ fn authenticated_flat_structure_reader_call(
         && caller.role == MachineFunctionRole::Ordinary
         && caller.convention == CallingConvention::Internal
         && instruction.source.is_some()
+        && arguments.len() == callee.parameters.len()
         && value_type(machine, caller, *argument) == Some(parameter_ty)
+        && arguments
+            .iter()
+            .zip(&callee.parameters)
+            .all(|(argument, parameter)| {
+                value_type(machine, caller, *argument) == value_type(machine, callee, *parameter)
+            })
         && value_type(machine, caller, *result) == Some(callee.result)
 }
 
@@ -2923,10 +2930,11 @@ fn authenticated_flat_structure_reader_state(
     machine: &wrela_machine_wir::MachineWir,
     callee: &MachineFunction,
 ) -> Option<MachineTypeId> {
-    let ([parameter], [block]) = (callee.parameters.as_slice(), callee.blocks.as_slice()) else {
+    let [block] = callee.blocks.as_slice() else {
         return None;
     };
-    let parameter_ty = value_type(machine, callee, *parameter)?;
+    let parameter = *callee.parameters.first()?;
+    let parameter_ty = value_type(machine, callee, parameter)?;
     let aggregate = machine.types.get(parameter_ty.0 as usize)?;
     let MachineTypeKind::Struct {
         fields,
@@ -2935,18 +2943,34 @@ fn authenticated_flat_structure_reader_state(
     else {
         return None;
     };
-    let ([projection], MachineTerminator::Return(returned)) =
-        (block.instructions.as_slice(), &block.terminator)
-    else {
-        return None;
+    let body_exact = match (
+        callee.parameters.as_slice(),
+        block.instructions.as_slice(),
+        &block.terminator,
+    ) {
+        ([receiver], [projection], MachineTerminator::Return(returned)) => {
+            matches!(
+                (projection.results.as_slice(), &projection.operation),
+                ([projected], MachineOperation::ExtractField { aggregate, field })
+                    if *receiver == parameter
+                        && *aggregate == parameter
+                        && returned.as_slice() == [*projected]
+                        && fields.get(*field as usize).map(|field| field.ty) == Some(callee.result)
+                        && value_type(machine, callee, *projected) == Some(callee.result)
+                        && projection.source.is_some()
+            ) && callee.values.len() == 2
+        }
+        ([receiver, passthrough], [], MachineTerminator::Return(returned)) => {
+            *receiver == parameter
+                && returned.as_slice() == [*passthrough]
+                && callee.values.len() == 2
+                && value_type(machine, callee, *passthrough) == Some(callee.result)
+                && is_basic_scalar(machine, callee.result)
+        }
+        _ => false,
     };
-    let ([projected], MachineOperation::ExtractField { aggregate, field }) =
-        (projection.results.as_slice(), &projection.operation)
-    else {
-        return None;
-    };
-    let field_ty = fields.get(*field as usize).map(|field| field.ty);
-    (matches!(callee.origin,
+    (body_exact
+        && matches!(callee.origin,
         MachineFunctionOrigin::SourceSemantic { semantic_function }
             if semantic_function == callee.flow_function
                 && semantic_function == callee.id.0)
@@ -2959,14 +2983,8 @@ fn authenticated_flat_structure_reader_state(
         && callee.stack_bytes == 0
         && callee.stack_slots.is_empty()
         && callee.source.is_some()
-        && projection.source.is_some()
         && fields.len() == 2
         && supported_struct_type(machine, parameter_ty)
-        && callee.values.len() == 2
-        && *aggregate == *parameter
-        && returned.as_slice() == [*projected]
-        && field_ty == Some(callee.result)
-        && value_type(machine, callee, *projected) == Some(callee.result)
         && is_basic_scalar(machine, callee.result))
     .then_some(parameter_ty)
 }

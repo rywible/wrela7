@@ -366,6 +366,34 @@ fn generic_interface_reader_reaches_native():
     return
 "#;
 
+const GENERIC_INTERFACE_ARGUMENT_SOURCE: &str = r#"module app.duration
+
+pub interface Convert[T]:
+    fn convert(read self, value: T) -> T
+
+pub struct Cell:
+    pub tag: u32
+    pub value: u64
+
+impl Convert[u64] for Cell:
+    fn convert(read self, value: u64) -> u64:
+        return value
+
+pub fn call_interface_argument() -> u64:
+    cell: Cell = Cell(tag=1, value=2)
+    return cell.convert(42)
+"#;
+
+const GENERIC_INTERFACE_ARGUMENT_TEST_SOURCE: &str = r#"module app.duration_test
+
+from app.duration import call_interface_argument
+
+@test(runtime)
+fn generic_interface_argument_reaches_native():
+    observed: u64 = call_interface_argument()
+    return
+"#;
+
 const SCALAR_VIEW_SOURCE: &str = r#"module app.duration
 
 pub struct Packet:
@@ -2131,6 +2159,61 @@ fn generic_interface_reader_reaches_flow_machine_and_deterministic_coff() {
         Ok(first) => {
             let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
                 .expect("repeat generic-interface reader native emission");
+            assert_eq!(first.bytes(), second.bytes());
+        }
+    }
+}
+
+#[test]
+fn generic_interface_argument_reaches_flow_machine_and_deterministic_coff() {
+    let fixture = fixture(
+        GENERIC_INTERFACE_ARGUMENT_SOURCE,
+        GENERIC_INTERFACE_ARGUMENT_TEST_SOURCE,
+    );
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed(&fixture),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("generic-interface argument lowers to SemanticWir");
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.into_parts().0,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("generic-interface argument lowers to FlowWir");
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow.into_parts().0,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("generic-interface argument FlowWir canonical frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("generic-interface argument reaches MachineWir");
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("generic-interface argument native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat generic-interface argument native emission");
             assert_eq!(first.bytes(), second.bytes());
         }
     }
