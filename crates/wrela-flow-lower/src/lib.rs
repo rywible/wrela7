@@ -180,7 +180,6 @@ impl FlowLowerer for CanonicalFlowLowerer {
     ) -> Result<LowerOutput, LowerError> {
         check_cancelled(is_cancelled)?;
         request.limits.validate()?;
-        validate_bounded_text_boundary(request.input.as_wir(), is_cancelled)?;
         preflight_input(request.input.as_wir(), request.limits, is_cancelled)?;
         let supported = supported_input(request.input.as_wir(), request.limits, is_cancelled)?;
         let wir = match supported {
@@ -198,29 +197,6 @@ impl FlowLowerer for CanonicalFlowLowerer {
         check_cancelled(is_cancelled)?;
         seal(&request, wir, report, Vec::new(), is_cancelled)
     }
-}
-
-fn validate_bounded_text_boundary(
-    input: &semantic::SemanticWir,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<(), LowerError> {
-    for ty in &input.types {
-        check_cancelled(is_cancelled)?;
-        if matches!(ty.kind, semantic::TypeKind::BoundedString { .. }) {
-            return Err(unsupported(
-                "flow-bounded-string-lowering-pending (runtime storage and formatting ABI)",
-            ));
-        }
-    }
-    for ty in &input.types {
-        check_cancelled(is_cancelled)?;
-        if matches!(ty.kind, semantic::TypeKind::StaticString { .. }) {
-            return Err(unsupported(
-                "flow-static-string-lowering-pending (runtime static-data handle ABI)",
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Failure to produce a sealed FlowWir value.
@@ -485,6 +461,14 @@ fn supported_actor_image<'a>(
             semantic::TypeKind::Primitive(primitive)
                 if supported_scalar_primitive(*primitive)
                     && ty.linearity == semantic::Linearity::CopyScalar => {}
+            semantic::TypeKind::Primitive(semantic::PrimitiveType::Char)
+                if ty.linearity == semantic::Linearity::CopyScalar => {}
+            semantic::TypeKind::StaticString { .. }
+                if ty.linearity == semantic::Linearity::ExplicitCopy && ty.source.is_none() => {}
+            semantic::TypeKind::BoundedString { capacity }
+                if *capacity > 0
+                    && ty.linearity == semantic::Linearity::Reclaimable
+                    && ty.source.is_none() => {}
             semantic::TypeKind::Array { .. }
                 if ty.linearity == semantic::Linearity::ExplicitCopy => {}
             semantic::TypeKind::Struct { fields }
@@ -1086,7 +1070,7 @@ fn validate_actor_source_function(
             .scopes
             .iter()
             .any(|scope| scope.state_type == value.ty);
-        if scalar_primitive(input, value.ty).is_none()
+        if !supported_local_value_type(input, value.ty)
             && !is_parameter
             && !is_reservation
             && !is_capability
@@ -1158,8 +1142,37 @@ fn validate_actor_source_function(
                         };
                         let ty = scalar_value_type(function, *result)
                             .ok_or(unsupported("actor scalar constant result type"))?;
-                        if !scalar_constant_matches(input, ty, constant) {
+                        if !scalar_constant_matches(input, ty, constant)
+                            && !input.types.get(ty.0 as usize).is_some_and(|record| {
+                                match (&record.kind, constant) {
+                                    (
+                                        semantic::TypeKind::Primitive(
+                                            semantic::PrimitiveType::Char,
+                                        ),
+                                        semantic::Constant::Char(_),
+                                    ) => true,
+                                    (
+                                        semantic::TypeKind::StaticString { bytes },
+                                        semantic::Constant::String(text),
+                                    ) => usize::try_from(*bytes).ok() == Some(text.len()),
+                                    _ => false,
+                                }
+                            })
+                        {
                             return Err(unsupported("actor scalar constant type"));
+                        }
+                    }
+                    semantic::SemanticOperation::FormatBoundedString { ty, parts } => {
+                        let [result] = statement.results.as_slice() else {
+                            return Err(unsupported("actor bounded string result arity"));
+                        };
+                        if parts.is_empty()
+                            || scalar_value_type(function, *result) != Some(*ty)
+                            || !input.types.get(ty.0 as usize).is_some_and(|record| {
+                                matches!(record.kind, semantic::TypeKind::BoundedString { capacity } if capacity > 0)
+                            })
+                        {
+                            return Err(unsupported("actor bounded string construction type"));
                         }
                     }
                     semantic::SemanticOperation::Copy { value } => {
@@ -2227,9 +2240,25 @@ fn supported_generated_tests<'a>(
                 }
                 previous_frame_length = Some(*length);
             }
-            semantic::TypeKind::StaticString { .. }
-            | semantic::TypeKind::BoundedString { .. }
-            | semantic::TypeKind::Tuple(_)
+            semantic::TypeKind::StaticString { bytes } => {
+                if saw_frame
+                    || ty.linearity != semantic::Linearity::ExplicitCopy
+                    || ty.source.is_some()
+                    || *bytes > limits.payload_bytes
+                {
+                    return Err(unsupported("generated test static string types"));
+                }
+            }
+            semantic::TypeKind::BoundedString { capacity } => {
+                if saw_frame
+                    || ty.linearity != semantic::Linearity::Reclaimable
+                    || ty.source.is_some()
+                    || *capacity == 0
+                {
+                    return Err(unsupported("generated test bounded string types"));
+                }
+            }
+            semantic::TypeKind::Tuple(_)
             | semantic::TypeKind::Iso { .. }
             | semantic::TypeKind::ActorHandle { .. }
             | semantic::TypeKind::Reservation
@@ -2454,6 +2483,18 @@ fn supported_source_value_type(input: &semantic::SemanticWir, ty: semantic::Type
         }
         _ => false,
     }
+}
+
+fn supported_local_value_type(input: &semantic::SemanticWir, ty: semantic::TypeId) -> bool {
+    input.types.get(ty.0 as usize).is_some_and(|record| {
+        supported_source_value_type(input, ty)
+            || matches!(
+                record.kind,
+                semantic::TypeKind::Primitive(semantic::PrimitiveType::Char)
+                    | semantic::TypeKind::StaticString { .. }
+                    | semantic::TypeKind::BoundedString { .. }
+            )
+    })
 }
 
 fn canonical_semantic_enum_payload(
@@ -2894,7 +2935,7 @@ fn validate_scalar_source_function(
     }
     for value in &function.values {
         check_cancelled(is_cancelled)?;
-        if !supported_source_value_type(input, value.ty) {
+        if !supported_local_value_type(input, value.ty) {
             return Err(unsupported(
                 "source function values outside scalar or flat structures",
             ));
@@ -2930,10 +2971,38 @@ fn validate_scalar_source_function(
                         let [result] = statement.results.as_slice() else {
                             return Err(unsupported("scalar constant result arity"));
                         };
-                        if !scalar_value_type(function, *result)
-                            .is_some_and(|ty| scalar_constant_matches(input, ty, constant))
-                        {
+                        if !scalar_value_type(function, *result).is_some_and(|ty| {
+                            scalar_constant_matches(input, ty, constant)
+                                || input.types.get(ty.0 as usize).is_some_and(|record| {
+                                    match (&record.kind, constant) {
+                                        (
+                                            semantic::TypeKind::Primitive(
+                                                semantic::PrimitiveType::Char,
+                                            ),
+                                            semantic::Constant::Char(_),
+                                        ) => true,
+                                        (
+                                            semantic::TypeKind::StaticString { bytes },
+                                            semantic::Constant::String(text),
+                                        ) => usize::try_from(*bytes).ok() == Some(text.len()),
+                                        _ => false,
+                                    }
+                                })
+                        }) {
                             return Err(unsupported("scalar constant result type"));
+                        }
+                    }
+                    semantic::SemanticOperation::FormatBoundedString { ty, parts } => {
+                        let [result] = statement.results.as_slice() else {
+                            return Err(unsupported("bounded string result arity"));
+                        };
+                        if parts.is_empty()
+                            || scalar_value_type(function, *result) != Some(*ty)
+                            || !input.types.get(ty.0 as usize).is_some_and(|record| {
+                                matches!(record.kind, semantic::TypeKind::BoundedString { capacity } if capacity > 0)
+                            })
+                        {
+                            return Err(unsupported("bounded string construction type"));
                         }
                     }
                     semantic::SemanticOperation::Copy { value } => {
@@ -4590,6 +4659,9 @@ fn lower_generated_type(
         semantic::TypeKind::Primitive(semantic::PrimitiveType::F64) => {
             flow::FlowTypeKind::Scalar(flow::ScalarType::Float64)
         }
+        semantic::TypeKind::Primitive(semantic::PrimitiveType::Char) => {
+            flow::FlowTypeKind::Scalar(flow::ScalarType::Character)
+        }
         semantic::TypeKind::Primitive(primitive) => {
             let Some((signed, bits)) = integer_primitive(*primitive) else {
                 return Err(unsupported("generated test primitive type"));
@@ -4647,9 +4719,13 @@ fn lower_generated_type(
                 result: flow::TypeId(function.result.0),
             }
         }
-        semantic::TypeKind::StaticString { .. }
-        | semantic::TypeKind::BoundedString { .. }
-        | semantic::TypeKind::Tuple(_)
+        semantic::TypeKind::StaticString { bytes } => {
+            flow::FlowTypeKind::StaticString { bytes: *bytes }
+        }
+        semantic::TypeKind::BoundedString { capacity } => flow::FlowTypeKind::BoundedString {
+            capacity: *capacity,
+        },
+        semantic::TypeKind::Tuple(_)
         | semantic::TypeKind::Iso { .. }
         | semantic::TypeKind::ActorHandle { .. }
         | semantic::TypeKind::Reservation
@@ -4691,6 +4767,9 @@ fn lower_actor_type(
         }
         semantic::TypeKind::Primitive(semantic::PrimitiveType::F64) => {
             flow::FlowTypeKind::Scalar(flow::ScalarType::Float64)
+        }
+        semantic::TypeKind::Primitive(semantic::PrimitiveType::Char) => {
+            flow::FlowTypeKind::Scalar(flow::ScalarType::Character)
         }
         semantic::TypeKind::Primitive(primitive) => {
             let Some((signed, bits)) = integer_primitive(*primitive) else {
@@ -4741,6 +4820,12 @@ fn lower_actor_type(
             flow::FlowTypeKind::ActorHandle(flow::ActorId(target.id.0))
         }
         semantic::TypeKind::Reservation => flow::FlowTypeKind::Reservation,
+        semantic::TypeKind::StaticString { bytes } => {
+            flow::FlowTypeKind::StaticString { bytes: *bytes }
+        }
+        semantic::TypeKind::BoundedString { capacity } => flow::FlowTypeKind::BoundedString {
+            capacity: *capacity,
+        },
         _ => return Err(unsupported("actor type changed after shape validation")),
     };
     Ok(flow::FlowType {
@@ -5070,6 +5155,8 @@ fn measure_actor_flow_output_resources(
             semantic::TypeKind::Function(function) => meter.edges(&function.parameters),
             semantic::TypeKind::Struct { fields } => meter.edges(fields),
             semantic::TypeKind::Primitive(_)
+            | semantic::TypeKind::StaticString { .. }
+            | semantic::TypeKind::BoundedString { .. }
             | semantic::TypeKind::Array { .. }
             | semantic::TypeKind::ActorHandle { .. }
             | semantic::TypeKind::Reservation => {}
@@ -5182,6 +5269,18 @@ fn measure_actor_flow_output_resources(
                                 semantic::Constant::Unsigned { bits, .. }
                                 | semantic::Constant::Signed { bits, .. },
                             ) => meter.add_payload(usize::from(*bits).div_ceil(8)),
+                            semantic::SemanticOperation::Constant(semantic::Constant::String(
+                                text,
+                            )) => meter.text(text),
+                            semantic::SemanticOperation::FormatBoundedString { parts, .. } => {
+                                meter.edges(parts);
+                                for part in parts {
+                                    check_cancelled(is_cancelled)?;
+                                    if let semantic::BoundedStringPart::Text { value, .. } = part {
+                                        meter.text(value);
+                                    }
+                                }
+                            }
                             semantic::SemanticOperation::Constant(_)
                             | semantic::SemanticOperation::Copy { .. }
                             | semantic::SemanticOperation::Binary { .. }
@@ -6965,6 +7064,14 @@ fn lower_generated_operation(
                 copy_bytes(bytes, limits.payload_bytes)?,
             )))
         }
+        semantic::SemanticOperation::Constant(semantic::Constant::String(text)) => {
+            Ok(flow::FlowOperation::Immediate(flow::Immediate::Bytes(
+                copy_bytes(text.as_bytes(), limits.payload_bytes)?,
+            )))
+        }
+        semantic::SemanticOperation::Constant(semantic::Constant::Char(value)) => Ok(
+            flow::FlowOperation::Immediate(flow::Immediate::Character(*value)),
+        ),
         semantic::SemanticOperation::Constant(semantic::Constant::Unsigned { bits, value }) => {
             let width = usize::from(*bits).div_ceil(8);
             Ok(flow::FlowOperation::Immediate(flow::Immediate::Integer {
@@ -7025,6 +7132,58 @@ fn lower_generated_operation(
             Ok(flow::FlowOperation::MakeAggregate {
                 ty: flow::TypeId(ty.0),
                 fields: lowered,
+            })
+        }
+        semantic::SemanticOperation::FormatBoundedString { ty, parts } => {
+            let mut lowered = try_vec(
+                parts.len(),
+                "FlowWir bounded string parts",
+                limits.model_edges,
+            )?;
+            for part in parts {
+                check_cancelled(is_cancelled)?;
+                lowered.push(match part {
+                    semantic::BoundedStringPart::Text { value, source } => {
+                        flow::BoundedStringPart::Text {
+                            value: copy_text(value, limits.payload_bytes)?,
+                            source: *source,
+                        }
+                    }
+                    semantic::BoundedStringPart::Bool { value, source } => {
+                        flow::BoundedStringPart::Bool {
+                            value: flow::ValueId(value.0),
+                            source: *source,
+                        }
+                    }
+                    semantic::BoundedStringPart::Character { value, source } => {
+                        flow::BoundedStringPart::Character {
+                            value: flow::ValueId(value.0),
+                            source: *source,
+                        }
+                    }
+                    semantic::BoundedStringPart::Integer {
+                        value,
+                        maximum_bytes,
+                        source,
+                    } => flow::BoundedStringPart::Integer {
+                        value: flow::ValueId(value.0),
+                        maximum_bytes: *maximum_bytes,
+                        source: *source,
+                    },
+                    semantic::BoundedStringPart::StaticString {
+                        value,
+                        bytes,
+                        source,
+                    } => flow::BoundedStringPart::StaticString {
+                        value: flow::ValueId(value.0),
+                        bytes: *bytes,
+                        source: *source,
+                    },
+                });
+            }
+            Ok(flow::FlowOperation::FormatBoundedString {
+                ty: flow::TypeId(ty.0),
+                parts: lowered,
             })
         }
         semantic::SemanticOperation::InsertField {
@@ -7177,13 +7336,10 @@ fn lower_generated_operation(
             "flow-fixed-array-index-lowering-pending (indexed aggregate extraction has no authenticated FlowWir operation)",
         )),
         semantic::SemanticOperation::Constant(
-            semantic::Constant::Char(_)
-            | semantic::Constant::String(_)
-            | semantic::Constant::Enum { .. }
+            semantic::Constant::Enum { .. }
             | semantic::Constant::Aggregate(_)
             | semantic::Constant::Zeroed(_),
         )
-        | semantic::SemanticOperation::FormatBoundedString { .. }
         | semantic::SemanticOperation::ActorStateLoad { .. }
         | semantic::SemanticOperation::ActorStateStore { .. }
         | semantic::SemanticOperation::Project { .. }
@@ -7591,6 +7747,7 @@ fn validate_model_resources(
         }
         Immediate::Unit
         | Immediate::Bool(_)
+        | Immediate::Character(_)
         | Immediate::Float32(_)
         | Immediate::Float64(_)
         | Immediate::Zero(_)
@@ -7617,6 +7774,8 @@ fn validate_model_resources(
             FlowTypeKind::OpaqueTarget { name } => meter.text(name),
             FlowTypeKind::Unit
             | FlowTypeKind::Scalar(_)
+            | FlowTypeKind::StaticString { .. }
+            | FlowTypeKind::BoundedString { .. }
             | FlowTypeKind::Array { .. }
             | FlowTypeKind::Activation { .. }
             | FlowTypeKind::RegionHandle(_)
@@ -7700,6 +7859,15 @@ fn validate_model_resources(
                     | FlowOperation::TaskStart {
                         arguments: fields, ..
                     } => meter.edges(fields),
+                    FlowOperation::FormatBoundedString { parts, .. } => {
+                        meter.edges(parts);
+                        for part in parts {
+                            check_cancelled(is_cancelled)?;
+                            if let flow::BoundedStringPart::Text { value, .. } = part {
+                                meter.text(value);
+                            }
+                        }
+                    }
                     FlowOperation::Unary { .. }
                     | FlowOperation::Binary { .. }
                     | FlowOperation::Cast { .. }
@@ -8271,6 +8439,14 @@ fn actor_flow_type_kind_matches(
             expected == output
         }
         (
+            flow::FlowTypeKind::StaticString { bytes: expected },
+            flow::FlowTypeKind::StaticString { bytes: output },
+        ) => expected == output,
+        (
+            flow::FlowTypeKind::BoundedString { capacity: expected },
+            flow::FlowTypeKind::BoundedString { capacity: output },
+        ) => expected == output,
+        (
             flow::FlowTypeKind::Array {
                 element: expected_element,
                 length: expected_length,
@@ -8428,6 +8604,19 @@ fn actor_flow_operation_matches(
                 && polled_slices_equal(expected_fields, output_fields, is_cancelled)?
         }
         (
+            flow::FlowOperation::FormatBoundedString {
+                ty: expected_ty,
+                parts: expected_parts,
+            },
+            flow::FlowOperation::FormatBoundedString {
+                ty: output_ty,
+                parts: output_parts,
+            },
+        ) => {
+            expected_ty == output_ty
+                && bounded_string_parts_match(expected_parts, output_parts, is_cancelled)?
+        }
+        (
             flow::FlowOperation::Call {
                 function: expected_function,
                 arguments: expected_arguments,
@@ -8546,6 +8735,9 @@ fn actor_flow_immediate_matches(
     Ok(match (expected, output) {
         (flow::Immediate::Unit, flow::Immediate::Unit) => true,
         (flow::Immediate::Bool(expected), flow::Immediate::Bool(output)) => expected == output,
+        (flow::Immediate::Character(expected), flow::Immediate::Character(output)) => {
+            expected == output
+        }
         (
             flow::Immediate::Integer {
                 bits: expected_bits,
@@ -8571,6 +8763,88 @@ fn actor_flow_immediate_matches(
         (flow::Immediate::Zero(expected), flow::Immediate::Zero(output)) => expected == output,
         _ => false,
     })
+}
+
+fn bounded_string_parts_match(
+    expected: &[flow::BoundedStringPart],
+    output: &[flow::BoundedStringPart],
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, LowerError> {
+    if expected.len() != output.len() {
+        return Ok(false);
+    }
+    for (expected, output) in expected.iter().zip(output) {
+        check_cancelled(is_cancelled)?;
+        let matches = match (expected, output) {
+            (
+                flow::BoundedStringPart::Text {
+                    value: expected_value,
+                    source: expected_source,
+                },
+                flow::BoundedStringPart::Text {
+                    value: output_value,
+                    source: output_source,
+                },
+            ) => {
+                expected_source == output_source
+                    && polled_text_matches(expected_value, output_value, is_cancelled)?
+            }
+            (
+                flow::BoundedStringPart::Bool {
+                    value: expected_value,
+                    source: expected_source,
+                },
+                flow::BoundedStringPart::Bool {
+                    value: output_value,
+                    source: output_source,
+                },
+            )
+            | (
+                flow::BoundedStringPart::Character {
+                    value: expected_value,
+                    source: expected_source,
+                },
+                flow::BoundedStringPart::Character {
+                    value: output_value,
+                    source: output_source,
+                },
+            ) => expected_value == output_value && expected_source == output_source,
+            (
+                flow::BoundedStringPart::Integer {
+                    value: expected_value,
+                    maximum_bytes: expected_bytes,
+                    source: expected_source,
+                },
+                flow::BoundedStringPart::Integer {
+                    value: output_value,
+                    maximum_bytes: output_bytes,
+                    source: output_source,
+                },
+            )
+            | (
+                flow::BoundedStringPart::StaticString {
+                    value: expected_value,
+                    bytes: expected_bytes,
+                    source: expected_source,
+                },
+                flow::BoundedStringPart::StaticString {
+                    value: output_value,
+                    bytes: output_bytes,
+                    source: output_source,
+                },
+            ) => {
+                expected_value == output_value
+                    && expected_bytes == output_bytes
+                    && expected_source == output_source
+            }
+            _ => false,
+        };
+        if !matches {
+            return Ok(false);
+        }
+    }
+    check_cancelled(is_cancelled)?;
+    Ok(true)
 }
 
 fn actor_flow_terminator_matches(
@@ -9236,28 +9510,100 @@ mod contract_tests {
     }
 
     #[test]
-    fn bounded_string_retains_named_runtime_storage_boundary() {
+    fn bounded_string_parts_retain_exact_flow_identity_and_limits() {
         let mut module = fixture().into_wir();
-        module.types.push(semantic::TypeRecord {
-            id: semantic::TypeId(1),
-            source_name: "BoundedString".to_owned(),
-            kind: semantic::TypeKind::BoundedString { capacity: 11 },
-            linearity: semantic::Linearity::Reclaimable,
-            source: None,
-        });
-        let validated = module.validate().expect("valid bounded semantic identity");
-        assert!(matches!(
-            CanonicalFlowLowerer::new().lower(
-                LowerRequest {
-                    input: validated,
-                    limits: LoweringLimits::standard(),
+        module.types.extend([
+            semantic::TypeRecord {
+                id: semantic::TypeId(1),
+                source_name: "bool".to_owned(),
+                kind: semantic::TypeKind::Primitive(semantic::PrimitiveType::Bool),
+                linearity: semantic::Linearity::CopyScalar,
+                source: None,
+            },
+            semantic::TypeRecord {
+                id: semantic::TypeId(2),
+                source_name: "Static[Str]".to_owned(),
+                kind: semantic::TypeKind::StaticString { bytes: 2 },
+                linearity: semantic::Linearity::ExplicitCopy,
+                source: None,
+            },
+            semantic::TypeRecord {
+                id: semantic::TypeId(3),
+                source_name: "BoundedString".to_owned(),
+                kind: semantic::TypeKind::BoundedString { capacity: 9 },
+                linearity: semantic::Linearity::Reclaimable,
+                source: None,
+            },
+        ]);
+        let limits = LoweringLimits::standard();
+        assert_eq!(
+            super::lower_generated_type(&module.types[2], limits, &|| false)
+                .expect("static string type")
+                .kind,
+            flow::FlowTypeKind::StaticString { bytes: 2 }
+        );
+        assert_eq!(
+            super::lower_generated_type(&module.types[3], limits, &|| false)
+                .expect("bounded string type")
+                .kind,
+            flow::FlowTypeKind::BoundedString { capacity: 9 }
+        );
+        let operation = semantic::SemanticOperation::FormatBoundedString {
+            ty: semantic::TypeId(3),
+            parts: vec![
+                semantic::BoundedStringPart::Text {
+                    value: "ok".to_owned(),
+                    source: span(0, 1, 3),
                 },
-                &|| false,
-            ),
-            Err(LowerError::UnsupportedInput {
-                feature: "flow-bounded-string-lowering-pending (runtime storage and formatting ABI)"
+                semantic::BoundedStringPart::Bool {
+                    value: semantic::ValueId(0),
+                    source: span(0, 4, 8),
+                },
+                semantic::BoundedStringPart::StaticString {
+                    value: semantic::ValueId(1),
+                    bytes: 2,
+                    source: span(0, 9, 11),
+                },
+            ],
+        };
+        let mut exact = limits;
+        exact.model_edges = 3;
+        let lowered = super::lower_generated_operation(&module, &operation, exact, &|| false)
+            .expect("exact part limit");
+        assert!(matches!(lowered,
+            flow::FlowOperation::FormatBoundedString { ty: flow::TypeId(3), parts }
+            if matches!(parts.as_slice(),
+                [flow::BoundedStringPart::Text { value, .. },
+                 flow::BoundedStringPart::Bool { value: flow::ValueId(0), .. },
+                 flow::BoundedStringPart::StaticString { value: flow::ValueId(1), bytes: 2, .. }]
+                if value == "ok")));
+
+        let mut one_under = exact;
+        one_under.model_edges = 2;
+        assert!(matches!(
+            super::lower_generated_operation(&module, &operation, one_under, &|| false),
+            Err(LowerError::ResourceLimit {
+                resource: "FlowWir bounded string parts",
+                limit: 2,
             })
         ));
+
+        let calls = Cell::new(0_u64);
+        super::lower_generated_operation(&module, &operation, exact, &|| {
+            calls.set(calls.get() + 1);
+            false
+        })
+        .expect("cancellation baseline");
+        let final_poll = calls.get();
+        calls.set(0);
+        assert_eq!(
+            super::lower_generated_operation(&module, &operation, exact, &|| {
+                let next = calls.get() + 1;
+                calls.set(next);
+                next >= final_poll
+            }),
+            Err(LowerError::Cancelled)
+        );
     }
 
     #[test]

@@ -818,7 +818,7 @@ fn read_only_scalar_view_projection_reaches_semantic_wir() {
         .expect("scalar view projection lowers to FlowWir");
     assert!(flow.diagnostics().is_empty());
     let flow_model = flow.wir().as_wir();
-    assert_eq!(flow_model.version, 15);
+    assert_eq!(flow_model.version, 16);
     let flow_projects = flow_model
         .functions
         .iter()
@@ -842,7 +842,7 @@ fn read_only_scalar_view_projection_reaches_semantic_wir() {
         },
         &never_cancelled,
     )
-    .expect("scalar view FlowWir v15 canonical frame");
+    .expect("scalar view FlowWir v16 canonical frame");
     let decoded = CanonicalFlowWirCodec
         .decode(
             DecodeRequest {
@@ -852,7 +852,7 @@ fn read_only_scalar_view_projection_reaches_semantic_wir() {
             },
             &never_cancelled,
         )
-        .expect("scalar view FlowWir v15 decode");
+        .expect("scalar view FlowWir v16 decode");
     assert_eq!(decoded, flow_wir);
 
     let prepared = prepare_canonical_frame_for_codegen(
@@ -1120,7 +1120,7 @@ fn multi_source_projection_lowering_tail_stays_named_and_fail_closed() {
 }
 
 #[test]
-fn real_imported_duration_shape_reaches_flow_and_v15_roundtrips_exactly() {
+fn real_imported_duration_shape_reaches_flow_and_v16_roundtrips_exactly() {
     let fixture = fixture(DURATION_SOURCE, TEST_SOURCE);
     let analyzed = analyzed(&fixture);
     let duration_ty = analyzed
@@ -1281,7 +1281,7 @@ fn real_imported_duration_shape_reaches_flow_and_v15_roundtrips_exactly() {
         },
         &never_cancelled,
     )
-    .expect("FlowWir v15 canonical roundtrip");
+    .expect("FlowWir v16 canonical roundtrip");
     let decoded = CanonicalFlowWirCodec
         .decode(
             DecodeRequest {
@@ -1291,7 +1291,7 @@ fn real_imported_duration_shape_reaches_flow_and_v15_roundtrips_exactly() {
             },
             &never_cancelled,
         )
-        .expect("FlowWir v15 decode");
+        .expect("FlowWir v16 decode");
     assert_eq!(decoded, flow_wir);
 
     let prepared = prepare_canonical_frame_for_codegen(
@@ -1408,7 +1408,7 @@ fn local_flat_field_update_reaches_deterministic_native_coff() {
     assert_eq!(
         flow.wir().as_wir(),
         repeated_flow.wir().as_wir(),
-        "identical SemanticWir must produce identical FlowWir v15"
+        "identical SemanticWir must produce identical FlowWir v16"
     );
     let flow_insertions = flow
         .wir()
@@ -1445,7 +1445,7 @@ fn local_flat_field_update_reaches_deterministic_native_coff() {
             },
             &never_cancelled,
         )
-        .expect("field-update FlowWir v15 decode");
+        .expect("field-update FlowWir v16 decode");
     assert_eq!(decoded, flow_wir);
 
     let prepared = prepare_canonical_frame_for_codegen(
@@ -1845,7 +1845,7 @@ fn generic_flat_field_update_reaches_flow_machine_and_deterministic_coff() {
             },
             &never_cancelled,
         )
-        .expect("generic field-update FlowWir v15 decode");
+        .expect("generic field-update FlowWir v16 decode");
     assert_eq!(decoded, flow_wir);
 
     let prepared = prepare_canonical_frame_for_codegen(
@@ -2917,7 +2917,7 @@ fn local_result_constructor_and_exhaustive_match_reach_machine_switch() {
         },
         &never_cancelled,
     )
-    .expect("FlowWir v15 enum roundtrip");
+    .expect("FlowWir v16 enum roundtrip");
     let prepared = prepare_canonical_frame_for_codegen(
         encoded.bytes(),
         &fixture.target,

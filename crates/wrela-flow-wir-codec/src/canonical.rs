@@ -703,6 +703,14 @@ impl<'a> Writer<'a> {
                 self.u8(15)?;
                 self.u32(result.0)
             }
+            FlowTypeKind::StaticString { bytes } => {
+                self.u8(16)?;
+                self.u64(*bytes)
+            }
+            FlowTypeKind::BoundedString { capacity } => {
+                self.u8(17)?;
+                self.u64(*capacity)
+            }
         }
     }
 
@@ -717,6 +725,51 @@ impl<'a> Writer<'a> {
             ScalarType::Float32 => self.u8(2),
             ScalarType::Float64 => self.u8(3),
             ScalarType::Address => self.u8(4),
+            ScalarType::Character => self.u8(5),
+        }
+    }
+
+    fn bounded_string_part(
+        &mut self,
+        value: &wrela_flow_wir::BoundedStringPart,
+    ) -> Result<(), CodecError> {
+        use wrela_flow_wir::BoundedStringPart;
+        match value {
+            BoundedStringPart::Text { value, source } => {
+                self.u8(0)?;
+                self.string(value)?;
+                self.span(source)
+            }
+            BoundedStringPart::Bool { value, source } => {
+                self.u8(1)?;
+                self.u32(value.0)?;
+                self.span(source)
+            }
+            BoundedStringPart::Character { value, source } => {
+                self.u8(2)?;
+                self.u32(value.0)?;
+                self.span(source)
+            }
+            BoundedStringPart::Integer {
+                value,
+                maximum_bytes,
+                source,
+            } => {
+                self.u8(3)?;
+                self.u32(value.0)?;
+                self.u64(*maximum_bytes)?;
+                self.span(source)
+            }
+            BoundedStringPart::StaticString {
+                value,
+                bytes,
+                source,
+            } => {
+                self.u8(4)?;
+                self.u32(value.0)?;
+                self.u64(*bytes)?;
+                self.span(source)
+            }
         }
     }
 
@@ -726,6 +779,10 @@ impl<'a> Writer<'a> {
             Immediate::Bool(value) => {
                 self.u8(1)?;
                 self.bool(*value)
+            }
+            Immediate::Character(value) => {
+                self.u8(9)?;
+                self.u32(u32::from(*value))
             }
             Immediate::Integer { bits, bytes_le } => {
                 self.u8(2)?;
@@ -1502,6 +1559,11 @@ fn encode_operation(writer: &mut Writer<'_>, value: &FlowOperation) -> Result<()
             writer.u32(outcome.0)?;
             writer.u32(reply.0)
         }
+        FlowOperation::FormatBoundedString { ty, parts } => {
+            writer.u8(57)?;
+            writer.u32(ty.0)?;
+            writer.vector(parts, VectorKind::General, Writer::bounded_string_part)
+        }
     }
 }
 
@@ -1937,6 +1999,10 @@ impl<'a> Reader<'a> {
             15 => Ok(FlowTypeKind::Activation {
                 result: TypeId(self.u32()?),
             }),
+            16 => Ok(FlowTypeKind::StaticString { bytes: self.u64()? }),
+            17 => Ok(FlowTypeKind::BoundedString {
+                capacity: self.u64()?,
+            }),
             tag => Err(invalid_tag("FlowTypeKind", tag)),
         }
     }
@@ -1951,8 +2017,38 @@ impl<'a> Reader<'a> {
             2 => Ok(ScalarType::Float32),
             3 => Ok(ScalarType::Float64),
             4 => Ok(ScalarType::Address),
+            5 => Ok(ScalarType::Character),
             tag => Err(invalid_tag("ScalarType", tag)),
         }
+    }
+
+    fn bounded_string_part(&mut self) -> Result<wrela_flow_wir::BoundedStringPart, CodecError> {
+        use wrela_flow_wir::BoundedStringPart;
+        Ok(match self.u8()? {
+            0 => BoundedStringPart::Text {
+                value: self.string()?,
+                source: self.span()?,
+            },
+            1 => BoundedStringPart::Bool {
+                value: ValueId(self.u32()?),
+                source: self.span()?,
+            },
+            2 => BoundedStringPart::Character {
+                value: ValueId(self.u32()?),
+                source: self.span()?,
+            },
+            3 => BoundedStringPart::Integer {
+                value: ValueId(self.u32()?),
+                maximum_bytes: self.u64()?,
+                source: self.span()?,
+            },
+            4 => BoundedStringPart::StaticString {
+                value: ValueId(self.u32()?),
+                bytes: self.u64()?,
+                source: self.span()?,
+            },
+            tag => return Err(invalid_tag("BoundedStringPart", tag)),
+        })
     }
 
     fn immediate(&mut self) -> Result<Immediate, CodecError> {
@@ -1969,6 +2065,12 @@ impl<'a> Reader<'a> {
             6 => Ok(Immediate::Zero(TypeId(self.u32()?))),
             7 => Ok(Immediate::GlobalAddress(GlobalId(self.u32()?))),
             8 => Ok(Immediate::FunctionAddress(FunctionId(self.u32()?))),
+            9 => {
+                let scalar = self.u32()?;
+                char::from_u32(scalar)
+                    .map(Immediate::Character)
+                    .ok_or_else(|| invalid_tag("Unicode scalar", 9))
+            }
             tag => Err(invalid_tag("Immediate", tag)),
         }
     }
@@ -2664,6 +2766,10 @@ impl Reader<'_> {
                 outcome: ValueId(self.u32()?),
                 reply: ProofId(self.u32()?),
             },
+            57 => FlowOperation::FormatBoundedString {
+                ty: TypeId(self.u32()?),
+                parts: self.vector(VectorKind::General, Self::bounded_string_part)?,
+            },
             tag => return Err(invalid_tag("FlowOperation", tag)),
         })
     }
@@ -3164,7 +3270,7 @@ mod tests {
         harness_name.clone_from(&name);
         model
             .validate()
-            .expect("valid long-prefix FlowWir v15 fixture")
+            .expect("valid long-prefix FlowWir v16 fixture")
     }
 
     struct SubstitutingCodec<'a> {
@@ -3319,6 +3425,94 @@ mod tests {
     }
 
     #[test]
+    fn bounded_string_identity_and_parts_roundtrip_canonically() {
+        let mut model = fixture().into_wir();
+        let source = Span {
+            file: wrela_source::FileId(0),
+            range: wrela_source::TextRange { start: 1, end: 2 },
+        };
+        model.types.extend([
+            FlowType {
+                id: TypeId(1),
+                kind: FlowTypeKind::StaticString { bytes: 2 },
+                name: Some("Static[Str]".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+            FlowType {
+                id: TypeId(2),
+                kind: FlowTypeKind::BoundedString { capacity: 4 },
+                name: Some("BoundedString".to_owned()),
+                copyable: false,
+                strict_linear: false,
+            },
+        ]);
+        model.functions[0].values = vec![
+            Value {
+                id: ValueId(0),
+                ty: TypeId(1),
+                source_name: Some("label".to_owned()),
+                source: Some(source),
+            },
+            Value {
+                id: ValueId(1),
+                ty: TypeId(2),
+                source_name: Some("rendered".to_owned()),
+                source: Some(source),
+            },
+        ];
+        model.functions[0].blocks[0].instructions = vec![
+            Instruction {
+                id: InstructionId(0),
+                results: vec![ValueId(0)],
+                operation: FlowOperation::Immediate(Immediate::Bytes(b"ok".to_vec())),
+                source: Some(source),
+            },
+            Instruction {
+                id: InstructionId(1),
+                results: vec![ValueId(1)],
+                operation: FlowOperation::FormatBoundedString {
+                    ty: TypeId(2),
+                    parts: vec![
+                        wrela_flow_wir::BoundedStringPart::Text {
+                            value: "v=".to_owned(),
+                            source,
+                        },
+                        wrela_flow_wir::BoundedStringPart::StaticString {
+                            value: ValueId(0),
+                            bytes: 2,
+                            source,
+                        },
+                    ],
+                },
+                source: Some(source),
+            },
+        ];
+        let model = model.validate().expect("valid bounded-string FlowWir");
+        let codec = CanonicalFlowWirCodec;
+        let encoded = encode_and_verify(
+            &codec,
+            EncodeRequest {
+                wir: &model,
+                limits: CodecLimits::standard(),
+            },
+            &|| false,
+        )
+        .expect("encode bounded-string FlowWir");
+        let decoded = decode_and_verify(
+            &codec,
+            DecodeRequest {
+                bytes: encoded.bytes(),
+                limits: CodecLimits::standard(),
+                expected_build: Some(&model.as_wir().build),
+            },
+            &|| false,
+        )
+        .expect("decode bounded-string FlowWir");
+        assert_eq!(decoded, model);
+    }
+
+    #[test]
     fn async_activation_delivery_roundtrips_canonically() {
         let model = async_fixture();
         let codec = CanonicalFlowWirCodec;
@@ -3395,6 +3589,7 @@ mod tests {
         let types = vec![
             FlowTypeKind::Unit,
             FlowTypeKind::Scalar(ScalarType::Bool),
+            FlowTypeKind::Scalar(ScalarType::Character),
             FlowTypeKind::Scalar(ScalarType::Integer {
                 signed: true,
                 bits: 128,
@@ -3434,6 +3629,8 @@ mod tests {
                 name: "target::opaque".to_owned(),
             },
             FlowTypeKind::Activation { result: TypeId(17) },
+            FlowTypeKind::StaticString { bytes: 18 },
+            FlowTypeKind::BoundedString { capacity: 19 },
         ];
         for value in types {
             roundtrip_type(&value);
@@ -3442,6 +3639,7 @@ mod tests {
         let immediates = vec![
             Immediate::Unit,
             Immediate::Bool(true),
+            Immediate::Character('é'),
             Immediate::Integer {
                 bits: 24,
                 bytes_le: vec![1, 2, 3],
@@ -3481,6 +3679,16 @@ mod tests {
             FlowOperation::MakeAggregate {
                 ty: TypeId(3),
                 fields: vec![v],
+            },
+            FlowOperation::FormatBoundedString {
+                ty: TypeId(3),
+                parts: vec![wrela_flow_wir::BoundedStringPart::Text {
+                    value: "text".to_owned(),
+                    source: Span {
+                        file: wrela_source::FileId(0),
+                        range: wrela_source::TextRange { start: 1, end: 2 },
+                    },
+                }],
             },
             FlowOperation::MakeEnum {
                 ty: TypeId(3),
@@ -3651,7 +3859,7 @@ mod tests {
                 },
             },
         ];
-        assert_eq!(operations.len(), 54);
+        assert_eq!(operations.len(), 55);
         for value in operations {
             roundtrip_operation(&value);
         }
@@ -4572,7 +4780,7 @@ mod tests {
                 &|| false,
             ),
             Err(CodecError::NonCanonical(
-                "codec output differs from the canonical FlowWir v15 encoding"
+                "codec output differs from the canonical FlowWir v16 encoding"
             ))
         ));
     }
@@ -5093,12 +5301,12 @@ mod tests {
                 .expect("actor reply operation consumes exactly");
         }
 
-        let mut reader = Reader::new(&[57], 0, CodecLimits::standard(), &not_cancelled);
+        let mut reader = Reader::new(&[58], 0, CodecLimits::standard(), &not_cancelled);
         assert_eq!(
             reader.operation(),
             Err(CodecError::InvalidEnumTag {
                 kind: "FlowOperation",
-                tag: 57,
+                tag: 58,
             })
         );
     }

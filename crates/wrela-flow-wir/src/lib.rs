@@ -13,7 +13,7 @@ use wrela_source::Span;
 
 pub use wrela_test_model::TestPlanLimits;
 
-pub const FLOW_WIR_VERSION: u32 = 15;
+pub const FLOW_WIR_VERSION: u32 = 16;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 12;
 
@@ -43,6 +43,7 @@ id_type!(TestId);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarType {
     Bool,
+    Character,
     Integer { signed: bool, bits: u16 },
     Float32,
     Float64,
@@ -53,6 +54,16 @@ pub enum ScalarType {
 pub enum FlowTypeKind {
     Unit,
     Scalar(ScalarType),
+    /// Compiler-minted immutable UTF-8 value with an authenticated exact byte
+    /// extent. This retains semantic identity without choosing a target ABI.
+    StaticString {
+        bytes: u64,
+    },
+    /// Compiler-minted owned UTF-8 value with runtime occupancy bounded by the
+    /// authenticated capacity. This retains no physical storage layout.
+    BoundedString {
+        capacity: u64,
+    },
     Tuple(Vec<TypeId>),
     Array {
         element: TypeId,
@@ -188,6 +199,7 @@ pub enum FailureKind {
 pub enum Immediate {
     Unit,
     Bool(bool),
+    Character(char),
     Integer { bits: u16, bytes_le: Vec<u8> },
     Float32(u32),
     Float64(u64),
@@ -225,6 +237,12 @@ pub enum FlowOperation {
     MakeAggregate {
         ty: TypeId,
         fields: Vec<ValueId>,
+    },
+    /// Preserve one source-ordered bounded formatting construction. Machine
+    /// lowering must select and authenticate storage plus a formatting ABI.
+    FormatBoundedString {
+        ty: TypeId,
+        parts: Vec<BoundedStringPart>,
     },
     /// Construct the canonical `{u8 tag, payload}` representation of an enum.
     MakeEnum {
@@ -440,6 +458,32 @@ pub enum FlowOperation {
     /// Terminate a generated test image with its protocol outcome code.
     TestFinish {
         outcome: ValueId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedStringPart {
+    Text {
+        value: String,
+        source: Span,
+    },
+    Bool {
+        value: ValueId,
+        source: Span,
+    },
+    Character {
+        value: ValueId,
+        source: Span,
+    },
+    Integer {
+        value: ValueId,
+        maximum_bytes: u64,
+        source: Span,
+    },
+    StaticString {
+        value: ValueId,
+        bytes: u64,
+        source: Span,
     },
 }
 
@@ -1133,6 +1177,8 @@ fn validate_model_resources(
             FlowTypeKind::OpaqueTarget { name } => meter.text(name)?,
             FlowTypeKind::Unit
             | FlowTypeKind::Scalar(_)
+            | FlowTypeKind::StaticString { .. }
+            | FlowTypeKind::BoundedString { .. }
             | FlowTypeKind::Array { .. }
             | FlowTypeKind::Activation { .. }
             | FlowTypeKind::RegionHandle(_)
@@ -1293,6 +1339,7 @@ fn meter_immediate(
         }
         Immediate::Unit
         | Immediate::Bool(_)
+        | Immediate::Character(_)
         | Immediate::Float32(_)
         | Immediate::Float64(_)
         | Immediate::Zero(_)
@@ -1311,6 +1358,15 @@ fn meter_operation(
             meter_immediate(meter, immediate)?;
         }
         FlowOperation::MakeAggregate { fields, .. } => meter.edge_slice(fields)?,
+        FlowOperation::FormatBoundedString { parts, .. } => {
+            meter.edge_slice(parts)?;
+            for part in parts {
+                meter.poll()?;
+                if let BoundedStringPart::Text { value, .. } = part {
+                    meter.text(value)?;
+                }
+            }
+        }
         FlowOperation::Call { arguments, .. }
         | FlowOperation::AsyncCall { arguments, .. }
         | FlowOperation::ActorCommit { arguments, .. } => meter.edge_slice(arguments)?,
@@ -4714,6 +4770,17 @@ fn for_each_flow_operation_value(operation: &FlowOperation, mut visit: impl FnMu
                 visit(*field);
             }
         }
+        FlowOperation::FormatBoundedString { parts, .. } => {
+            for part in parts {
+                match part {
+                    BoundedStringPart::Text { .. } => {}
+                    BoundedStringPart::Bool { value, .. }
+                    | BoundedStringPart::Character { value, .. }
+                    | BoundedStringPart::Integer { value, .. }
+                    | BoundedStringPart::StaticString { value, .. } => visit(*value),
+                }
+            }
+        }
         FlowOperation::MakeEnum { payload, .. } => {
             if let Some(payload) = payload {
                 visit(*payload);
@@ -5149,6 +5216,8 @@ fn validate_type(module: &FlowWir, ty: &FlowType, errors: &mut ValidationContext
         }
         FlowTypeKind::Unit
         | FlowTypeKind::Scalar(_)
+        | FlowTypeKind::StaticString { .. }
+        | FlowTypeKind::BoundedString { .. }
         | FlowTypeKind::Reservation
         | FlowTypeKind::OpaqueTarget { .. } => {}
     }
@@ -5161,6 +5230,20 @@ fn validate_type(module: &FlowWir, ty: &FlowType, errors: &mut ValidationContext
     if matches!(ty.kind, FlowTypeKind::Reservation) && (ty.copyable || !ty.strict_linear) {
         errors.push(ValidationError::InvalidRecord {
             kind: "actor reservation type",
+            id: ty.id.0,
+        });
+    }
+    let canonical_text = match ty.kind {
+        FlowTypeKind::Scalar(ScalarType::Character) => ty.copyable && !ty.strict_linear,
+        FlowTypeKind::StaticString { .. } => ty.copyable && !ty.strict_linear,
+        FlowTypeKind::BoundedString { capacity } => {
+            capacity > 0 && !ty.copyable && !ty.strict_linear
+        }
+        _ => true,
+    };
+    if !canonical_text {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "bounded text type",
             id: ty.id.0,
         });
     }
@@ -5177,11 +5260,138 @@ fn validate_immediate(module: &FlowWir, immediate: &Immediate, errors: &mut Vali
         }
         Immediate::Unit
         | Immediate::Bool(_)
+        | Immediate::Character(_)
         | Immediate::Integer { .. }
         | Immediate::Float32(_)
         | Immediate::Float64(_)
         | Immediate::Bytes(_) => {}
     }
+}
+
+fn decimal_digits(value: u128) -> u64 {
+    if value == 0 {
+        1
+    } else {
+        u64::from(value.ilog10()) + 1
+    }
+}
+
+fn integer_maximum_bytes(signed: bool, bits: u16) -> Option<u64> {
+    if !matches!(bits, 8 | 16 | 32 | 64 | 128) {
+        return None;
+    }
+    if signed {
+        let magnitude = 1_u128.checked_shl(u32::from(bits - 1))?;
+        decimal_digits(magnitude).checked_add(1)
+    } else {
+        let maximum = if bits == 128 {
+            u128::MAX
+        } else {
+            (1_u128 << u32::from(bits)) - 1
+        };
+        Some(decimal_digits(maximum))
+    }
+}
+
+fn validate_bounded_string_operation(
+    module: &FlowWir,
+    function: &FlowFunction,
+    instruction: &Instruction,
+    ty: TypeId,
+    parts: &[BoundedStringPart],
+) -> bool {
+    let Some(capacity) = module
+        .types
+        .get(ty.0 as usize)
+        .and_then(|record| match record.kind {
+            FlowTypeKind::BoundedString { capacity }
+                if !record.copyable && !record.strict_linear =>
+            {
+                Some(capacity)
+            }
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    if !matches!(instruction.results.as_slice(), [result]
+        if function.values.get(result.0 as usize).is_some_and(|value| value.ty == ty))
+    {
+        return false;
+    }
+    let mut total = 0_u64;
+    for part in parts {
+        let (bytes, valid) = match part {
+            BoundedStringPart::Text { value, source } => (
+                u64::try_from(value.len()).ok(),
+                source.range.start <= source.range.end,
+            ),
+            BoundedStringPart::Bool { value, source } => (
+                Some(5),
+                source.range.start <= source.range.end
+                    && function.values.get(value.0 as usize).is_some_and(|value| {
+                        module.types.get(value.ty.0 as usize).is_some_and(|record| {
+                            record.kind == FlowTypeKind::Scalar(ScalarType::Bool)
+                        })
+                    }),
+            ),
+            BoundedStringPart::Character { value, source } => (
+                Some(4),
+                source.range.start <= source.range.end
+                    && function.values.get(value.0 as usize).is_some_and(|value| {
+                        module.types.get(value.ty.0 as usize).is_some_and(|record| {
+                            record.kind == FlowTypeKind::Scalar(ScalarType::Character)
+                        })
+                    }),
+            ),
+            BoundedStringPart::Integer {
+                value,
+                maximum_bytes,
+                source,
+            } => {
+                let expected = function.values.get(value.0 as usize).and_then(|value| {
+                    module
+                        .types
+                        .get(value.ty.0 as usize)
+                        .and_then(|record| match record.kind {
+                            FlowTypeKind::Scalar(ScalarType::Integer { signed, bits }) => {
+                                integer_maximum_bytes(signed, bits)
+                            }
+                            _ => None,
+                        })
+                });
+                (
+                    Some(*maximum_bytes),
+                    source.range.start <= source.range.end && expected == Some(*maximum_bytes),
+                )
+            }
+            BoundedStringPart::StaticString {
+                value,
+                bytes,
+                source,
+            } => (
+                Some(*bytes),
+                source.range.start <= source.range.end
+                    && function.values.get(value.0 as usize).is_some_and(|value| {
+                        module.types.get(value.ty.0 as usize).is_some_and(|record| {
+                            matches!(record.kind, FlowTypeKind::StaticString { bytes: extent }
+                                if extent == *bytes && record.copyable && !record.strict_linear)
+                        })
+                    }),
+            ),
+        };
+        let Some(bytes) = bytes else {
+            return false;
+        };
+        if !valid {
+            return false;
+        }
+        let Some(next) = total.checked_add(bytes) else {
+            return false;
+        };
+        total = next;
+    }
+    !parts.is_empty() && total == capacity
 }
 
 fn validate_operation(
@@ -5201,7 +5411,37 @@ fn validate_operation(
         };
     }
     match &instruction.operation {
-        FlowOperation::Immediate(immediate) => validate_immediate(module, immediate, errors),
+        FlowOperation::Immediate(immediate) => {
+            validate_immediate(module, immediate, errors);
+            let exact_text_or_character = match immediate {
+                Immediate::Bytes(bytes) => match instruction.results.as_slice() {
+                    [result] => function
+                        .values
+                        .get(result.0 as usize)
+                        .and_then(|value| module.types.get(value.ty.0 as usize))
+                        .is_none_or(|record| match record.kind {
+                            FlowTypeKind::StaticString { bytes: extent } => {
+                                usize::try_from(extent).ok() == Some(bytes.len())
+                            }
+                            _ => true,
+                        }),
+                    _ => true,
+                },
+                Immediate::Character(_) => matches!(instruction.results.as_slice(), [result]
+                if function.values.get(result.0 as usize).is_some_and(|value| {
+                    module.types.get(value.ty.0 as usize).is_some_and(|record| {
+                        record.kind == FlowTypeKind::Scalar(ScalarType::Character)
+                    })
+                })),
+                _ => true,
+            };
+            if !exact_text_or_character {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "bounded text immediate",
+                    id: instruction.id.0,
+                });
+            }
+        }
         FlowOperation::ActorStateAddress {
             actor,
             region,
@@ -5262,6 +5502,24 @@ fn validate_operation(
             require_id("aggregate type", ty.0, module.types.len(), errors);
             for id in fields {
                 value!(*id);
+            }
+        }
+        FlowOperation::FormatBoundedString { ty, parts } => {
+            require_id("bounded string type", ty.0, module.types.len(), errors);
+            for part in parts {
+                match part {
+                    BoundedStringPart::Text { .. } => {}
+                    BoundedStringPart::Bool { value: operand, .. }
+                    | BoundedStringPart::Character { value: operand, .. }
+                    | BoundedStringPart::Integer { value: operand, .. }
+                    | BoundedStringPart::StaticString { value: operand, .. } => value!(*operand),
+                }
+            }
+            if !validate_bounded_string_operation(module, function, instruction, *ty, parts) {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "bounded string construction",
+                    id: instruction.id.0,
+                });
             }
         }
         FlowOperation::MakeEnum {
@@ -6144,6 +6402,165 @@ mod tests {
             static_bytes: 0,
             peak_bytes: 0,
         }
+    }
+
+    fn bounded_string_fixture() -> FlowWir {
+        let mut module = fixture();
+        let source = Span {
+            file: FileId(0),
+            range: TextRange { start: 10, end: 20 },
+        };
+        module.types.extend([
+            FlowType {
+                id: TypeId(1),
+                kind: FlowTypeKind::Scalar(ScalarType::Integer {
+                    signed: false,
+                    bits: 8,
+                }),
+                name: Some("u8".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+            FlowType {
+                id: TypeId(2),
+                kind: FlowTypeKind::StaticString { bytes: 5 },
+                name: Some("Static[Str]".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+            FlowType {
+                id: TypeId(3),
+                kind: FlowTypeKind::BoundedString { capacity: 10 },
+                name: Some("BoundedString".to_owned()),
+                copyable: false,
+                strict_linear: false,
+            },
+        ]);
+        let function = &mut module.functions[0];
+        function.values = vec![
+            Value {
+                id: ValueId(0),
+                ty: TypeId(1),
+                source_name: Some("count".to_owned()),
+                source: Some(source),
+            },
+            Value {
+                id: ValueId(1),
+                ty: TypeId(2),
+                source_name: Some("label".to_owned()),
+                source: Some(source),
+            },
+            Value {
+                id: ValueId(2),
+                ty: TypeId(3),
+                source_name: Some("rendered".to_owned()),
+                source: Some(source),
+            },
+        ];
+        function.blocks[0].instructions = vec![
+            Instruction {
+                id: InstructionId(0),
+                results: vec![ValueId(0)],
+                operation: FlowOperation::Immediate(Immediate::Integer {
+                    bits: 8,
+                    bytes_le: vec![7],
+                }),
+                source: Some(source),
+            },
+            Instruction {
+                id: InstructionId(1),
+                results: vec![ValueId(1)],
+                operation: FlowOperation::Immediate(Immediate::Bytes(b"ready".to_vec())),
+                source: Some(source),
+            },
+            Instruction {
+                id: InstructionId(2),
+                results: vec![ValueId(2)],
+                operation: FlowOperation::FormatBoundedString {
+                    ty: TypeId(3),
+                    parts: vec![
+                        BoundedStringPart::Text {
+                            value: "n=".to_owned(),
+                            source,
+                        },
+                        BoundedStringPart::Integer {
+                            value: ValueId(0),
+                            maximum_bytes: 3,
+                            source,
+                        },
+                        BoundedStringPart::StaticString {
+                            value: ValueId(1),
+                            bytes: 5,
+                            source,
+                        },
+                    ],
+                },
+                source: Some(source),
+            },
+        ];
+        module
+    }
+
+    #[test]
+    fn bounded_string_construction_authenticates_flow_parts_capacity_and_identity() {
+        bounded_string_fixture()
+            .validate()
+            .expect("exact bounded string FlowWir");
+
+        let mutate = |module: &mut FlowWir, mutation: u8| {
+            let FlowOperation::FormatBoundedString { ty, parts } =
+                &mut module.functions[0].blocks[0].instructions[2].operation
+            else {
+                panic!("bounded fixture operation")
+            };
+            match mutation {
+                0 => *ty = TypeId(2),
+                1 => {
+                    let BoundedStringPart::Integer { maximum_bytes, .. } = &mut parts[1] else {
+                        panic!("integer part")
+                    };
+                    *maximum_bytes = 4;
+                }
+                2 => {
+                    let BoundedStringPart::StaticString { bytes, .. } = &mut parts[2] else {
+                        panic!("static part")
+                    };
+                    *bytes = 4;
+                }
+                3 => module.types[3].kind = FlowTypeKind::BoundedString { capacity: 11 },
+                _ => unreachable!(),
+            }
+        };
+        for mutation in 0..4 {
+            let mut forged = bounded_string_fixture();
+            mutate(&mut forged, mutation);
+            let errors = forged.validate().expect_err("forged bounded string").0;
+            assert!(errors.iter().any(|error| matches!(
+                error,
+                ValidationError::InvalidRecord {
+                    kind: "bounded string construction",
+                    id: 2
+                }
+            )));
+        }
+
+        let calls = Cell::new(0_u64);
+        bounded_string_fixture()
+            .validate_with_limits(ValidationLimits::standard(), &|| {
+                calls.set(calls.get() + 1);
+                false
+            })
+            .expect("bounded string validation baseline");
+        let final_poll = calls.get();
+        calls.set(0);
+        assert_eq!(
+            bounded_string_fixture().validate_with_limits(ValidationLimits::standard(), &|| {
+                let next = calls.get() + 1;
+                calls.set(next);
+                next >= final_poll
+            }),
+            Err(ValidationFailure::Cancelled)
+        );
     }
 
     fn closed_enum_fixture(variants: usize) -> FlowWir {

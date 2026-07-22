@@ -836,6 +836,18 @@ fn discover_actor_dispatch(
             }
         }
     }
+    if input.types.iter().any(|ty| {
+        matches!(
+            ty.kind,
+            flow::FlowTypeKind::StaticString { .. }
+                | flow::FlowTypeKind::BoundedString { .. }
+                | flow::FlowTypeKind::Scalar(flow::ScalarType::Character)
+        )
+    }) {
+        return Err(unsupported(
+            "machine-bounded-string-lowering-pending (runtime storage and formatting ABI)",
+        ));
+    }
 
     match (
         dispatch,
@@ -3856,6 +3868,11 @@ fn require_supported_type(
         | flow::FlowTypeKind::OpaqueTarget { .. } => Err(unsupported(
             "aggregate, handle, or target-defined scalar types",
         )),
+        flow::FlowTypeKind::Scalar(flow::ScalarType::Character)
+        | flow::FlowTypeKind::StaticString { .. }
+        | flow::FlowTypeKind::BoundedString { .. } => Err(unsupported(
+            "machine-bounded-string-lowering-pending (runtime storage and formatting ABI)",
+        )),
     }
 }
 
@@ -5756,6 +5773,17 @@ fn for_each_flow_operation_value(
         flow::FlowOperation::MakeAggregate { fields, .. } => {
             fields.iter().copied().for_each(&mut visit)
         }
+        flow::FlowOperation::FormatBoundedString { parts, .. } => {
+            for part in parts {
+                match part {
+                    flow::BoundedStringPart::Text { .. } => {}
+                    flow::BoundedStringPart::Bool { value, .. }
+                    | flow::BoundedStringPart::Character { value, .. }
+                    | flow::BoundedStringPart::Integer { value, .. }
+                    | flow::BoundedStringPart::StaticString { value, .. } => visit(*value),
+                }
+            }
+        }
         flow::FlowOperation::MakeEnum { payload, .. } => {
             if let Some(payload) = payload {
                 visit(*payload);
@@ -5998,7 +6026,7 @@ fn checked_numeric_kind(scalar: flow::ScalarType) -> Option<CheckedNumericKind> 
         flow::ScalarType::Integer { signed: true, .. } => Some(CheckedNumericKind::SignedInteger),
         flow::ScalarType::Float32 => Some(CheckedNumericKind::Float32),
         flow::ScalarType::Float64 => Some(CheckedNumericKind::Float64),
-        flow::ScalarType::Bool | flow::ScalarType::Address => None,
+        flow::ScalarType::Bool | flow::ScalarType::Character | flow::ScalarType::Address => None,
     }
 }
 
@@ -6492,6 +6520,10 @@ fn validate_supported_operation(
         flow::FlowOperation::Immediate(flow::Immediate::GlobalAddress(_)) => {
             Err(unsupported("global-address immediates"))
         }
+        flow::FlowOperation::FormatBoundedString { .. }
+        | flow::FlowOperation::Immediate(flow::Immediate::Character(_)) => Err(unsupported(
+            "machine-bounded-string-lowering-pending (runtime storage and formatting ABI)",
+        )),
         flow::FlowOperation::BeginAccess { .. }
         | flow::FlowOperation::EndAccess { .. }
         | flow::FlowOperation::Promote { .. }
@@ -9072,6 +9104,9 @@ fn lower_immediate(
             limits.payload_bytes,
             is_cancelled,
         )?)),
+        flow::Immediate::Character(_) => Err(unsupported(
+            "machine-bounded-string-lowering-pending (runtime storage and formatting ABI)",
+        )),
         flow::Immediate::Zero(ty) if result_type == MachineTypeId(ty.0) => {
             Ok(MachineImmediate::Zero(result_type))
         }
@@ -10461,6 +10496,29 @@ mod tests {
                 .expect("suspend carries no ordinary SSA edge arguments"),
             0
         );
+    }
+
+    #[test]
+    fn bounded_string_identity_stops_at_named_machine_abi_boundary() {
+        for kind in [
+            flow::FlowTypeKind::StaticString { bytes: 5 },
+            flow::FlowTypeKind::BoundedString { capacity: 11 },
+            flow::FlowTypeKind::Scalar(flow::ScalarType::Character),
+        ] {
+            let ty = flow::FlowType {
+                id: flow::TypeId(0),
+                kind,
+                name: Some("bounded-text".to_owned()),
+                copyable: false,
+                strict_linear: false,
+            };
+            assert_eq!(
+                require_supported_type(&[], &ty, false, false),
+                Err(MachineLowerError::UnsupportedInput {
+                    feature: "machine-bounded-string-lowering-pending (runtime storage and formatting ABI)",
+                })
+            );
+        }
     }
 
     #[test]

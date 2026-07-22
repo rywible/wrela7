@@ -1447,6 +1447,8 @@ fn scan_model(
             FlowTypeKind::OpaqueTarget { name } => meter.payload(name.len())?,
             FlowTypeKind::Unit
             | FlowTypeKind::Scalar(_)
+            | FlowTypeKind::StaticString { .. }
+            | FlowTypeKind::BoundedString { .. }
             | FlowTypeKind::Array { .. }
             | FlowTypeKind::Activation { .. }
             | FlowTypeKind::RegionHandle(_)
@@ -1663,6 +1665,7 @@ fn scan_immediate(
         }
         Immediate::Unit
         | Immediate::Bool(_)
+        | Immediate::Character(_)
         | Immediate::Float32(_)
         | Immediate::Float64(_)
         | Immediate::Zero(_)
@@ -1690,6 +1693,16 @@ fn scan_operation(
         | FlowOperation::TaskStart {
             arguments: fields, ..
         } => meter.collection(fields.len()),
+        FlowOperation::FormatBoundedString { parts, .. } => {
+            meter.collection(parts.len())?;
+            for part in parts {
+                meter.visit()?;
+                if let wrela_flow_wir::BoundedStringPart::Text { value, .. } = part {
+                    meter.payload(value.len())?;
+                }
+            }
+            Ok(())
+        }
         FlowOperation::Unary { .. }
         | FlowOperation::ActorStateAddress { .. }
         | FlowOperation::Binary { .. }
@@ -3568,7 +3581,7 @@ mod contract_tests {
         model.name = "m".repeat(CANCELLABLE_COMPARISON_CHUNK_BYTES * 3 + 1);
         let model = model
             .validate()
-            .expect("valid long-prefix FlowWir v15 model");
+            .expect("valid long-prefix FlowWir v16 model");
         let equal = model.clone();
 
         let all_polls = Cell::new(0_u32);
@@ -3607,7 +3620,7 @@ mod contract_tests {
         substituted.name.push('n');
         let substituted = substituted
             .validate()
-            .expect("valid same-length substituted FlowWir v15 model");
+            .expect("valid same-length substituted FlowWir v16 model");
         let mut work = WorkMeter::new(OptimizationLimits::standard().work, &|| false);
         assert!(
             !flow_wir_equal(model.as_wir(), substituted.as_wir(), &mut work)
@@ -3625,7 +3638,7 @@ mod contract_tests {
         group.name = "g".repeat(CANCELLABLE_COMPARISON_CHUNK_BYTES * 2 + 1);
         let model = model
             .validate()
-            .expect("valid FlowWir v15 compiled-group fixture");
+            .expect("valid FlowWir v16 compiled-group fixture");
         let group = model
             .as_wir()
             .compiled_test_group

@@ -696,6 +696,7 @@ fn fold_operation(
         | FlowOperation::ActorStateAddress { .. }
         | FlowOperation::Cast { .. }
         | FlowOperation::MakeAggregate { .. }
+        | FlowOperation::FormatBoundedString { .. }
         | FlowOperation::MakeEnum { .. }
         | FlowOperation::EnumTag { .. }
         | FlowOperation::EnumPayload { .. }
@@ -2207,6 +2208,19 @@ fn map_operation_values(
         FlowOperation::MakeAggregate { fields, .. } => {
             map_value_slice(fields, value_map, "aggregate", work)?;
         }
+        FlowOperation::FormatBoundedString { parts, .. } => {
+            for part in parts {
+                match part {
+                    wrela_flow_wir::BoundedStringPart::Text { .. } => {}
+                    wrela_flow_wir::BoundedStringPart::Bool { value, .. }
+                    | wrela_flow_wir::BoundedStringPart::Character { value, .. }
+                    | wrela_flow_wir::BoundedStringPart::Integer { value, .. }
+                    | wrela_flow_wir::BoundedStringPart::StaticString { value, .. } => {
+                        map_value(value, value_map, work)?;
+                    }
+                }
+            }
+        }
         FlowOperation::MakeEnum { payload, .. } => {
             if let Some(payload) = payload {
                 map_value(payload, value_map, work)?;
@@ -2724,6 +2738,19 @@ fn for_each_operation_value(
                 visit_value(*value)?;
             }
         }
+        FlowOperation::FormatBoundedString { parts, .. } => {
+            for part in parts {
+                match part {
+                    wrela_flow_wir::BoundedStringPart::Text { .. } => {}
+                    wrela_flow_wir::BoundedStringPart::Bool { value, .. }
+                    | wrela_flow_wir::BoundedStringPart::Character { value, .. }
+                    | wrela_flow_wir::BoundedStringPart::Integer { value, .. }
+                    | wrela_flow_wir::BoundedStringPart::StaticString { value, .. } => {
+                        visit_value(*value)?;
+                    }
+                }
+            }
+        }
         FlowOperation::MakeEnum { payload, .. } => {
             if let Some(payload) = payload {
                 visit_value(*payload)?;
@@ -3236,6 +3263,52 @@ mod scalar_semantics_tests {
             right: ValueId(1),
         };
         assert!(removable_when_dead(&instruction, &function, &types));
+    }
+
+    #[test]
+    fn bounded_string_construction_is_not_dead_code_eliminated() {
+        let mut types = types();
+        types.push(FlowType {
+            id: TypeId(7),
+            kind: FlowTypeKind::BoundedString { capacity: 5 },
+            name: None,
+            copyable: false,
+            strict_linear: false,
+        });
+        let function = FlowFunction {
+            id: FunctionId(0),
+            name: "format".to_owned(),
+            origin: FunctionOrigin::SourceSemantic {
+                semantic_function: 0,
+            },
+            role: FunctionRole::Ordinary,
+            color: FunctionColor::Sync,
+            parameters: Vec::new(),
+            result_types: vec![TypeId(7)],
+            values: vec![Value {
+                id: ValueId(0),
+                ty: TypeId(7),
+                source_name: None,
+                source: None,
+            }],
+            blocks: Vec::new(),
+            entry: BlockId(0),
+            stack_bound: 0,
+            frame_bound: 0,
+            proofs: Vec::new(),
+            source: None,
+        };
+        let instruction = Instruction {
+            id: InstructionId(0),
+            results: vec![ValueId(0)],
+            operation: FlowOperation::FormatBoundedString {
+                ty: TypeId(7),
+                parts: Vec::new(),
+            },
+            source: None,
+        };
+
+        assert!(!removable_when_dead(&instruction, &function, &types));
     }
 
     #[test]

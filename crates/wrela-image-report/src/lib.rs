@@ -24,8 +24,8 @@ pub use decode::decode_image_report_json;
 pub const REPORT_SCHEMA_VERSION: u32 = 16;
 
 const CURRENT_SEMANTIC_WIR_VERSION: u32 = 12;
-const CURRENT_FLOW_WIR_VERSION: u32 = 15;
-const CURRENT_FLOW_WIR_WIRE_VERSION: u32 = 15;
+const CURRENT_FLOW_WIR_VERSION: u32 = 16;
+const CURRENT_FLOW_WIR_WIRE_VERSION: u32 = 16;
 const CURRENT_MACHINE_WIR_VERSION: u32 = 17;
 const CURRENT_RUNTIME_ABI_VERSION: u32 = 2;
 
@@ -3698,8 +3698,8 @@ mod tests {
             symbols: Vec::new(),
             representations: super::RepresentationFacts {
                 semantic_wir_version: 12,
-                flow_wir_version: 15,
-                flow_wir_wire_version: 15,
+                flow_wir_version: 16,
+                flow_wir_wire_version: 16,
                 machine_wir_version: 17,
                 runtime_abi_version: 2,
                 optimization_pipeline_name: "fixture".to_owned(),
@@ -5014,10 +5014,10 @@ mod tests {
         let mutations: [fn(&mut super::RepresentationFacts); 10] = [
             |versions| versions.semantic_wir_version = 11,
             |versions| versions.semantic_wir_version = 13,
-            |versions| versions.flow_wir_version = 14,
-            |versions| versions.flow_wir_version = 16,
-            |versions| versions.flow_wir_wire_version = 14,
-            |versions| versions.flow_wir_wire_version = 16,
+            |versions| versions.flow_wir_version = 15,
+            |versions| versions.flow_wir_version = 17,
+            |versions| versions.flow_wir_wire_version = 15,
+            |versions| versions.flow_wir_wire_version = 17,
             |versions| versions.machine_wir_version = 16,
             |versions| versions.machine_wir_version = 18,
             |versions| versions.runtime_abi_version = 1,
