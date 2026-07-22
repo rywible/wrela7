@@ -5300,6 +5300,7 @@ fn lower_source_function(
             limit: limits.values,
         })?,
         synthetic_values: Vec::new(),
+        required_proofs: try_vec(0, "SemanticWir function proofs", limits.model_edges)?,
     };
     let mut local_state = SourceLocalState::empty(input.hir().as_program().locals.len(), limits)?;
     let mut lowered_body = lowerer.lower_body(body, 1, &mut local_state)?;
@@ -5371,12 +5372,22 @@ fn lower_source_function(
     lowerer.validate_exact_closure()?;
     values.append(&mut lowerer.synthetic_values);
 
+    let function_proof_capacity = function
+        .proofs
+        .len()
+        .checked_add(lowerer.required_proofs.len())
+        .ok_or(LowerError::ResourceLimit {
+            resource: "SemanticWir function proofs",
+            limit: limits.model_edges,
+        })?;
     let mut function_proofs = try_vec(
-        function.proofs.len(),
+        function_proof_capacity,
         "SemanticWir function proofs",
         limits.model_edges,
     )?;
     function_proofs.extend(function.proofs.iter().map(|proof| wir::ProofId(proof.0)));
+    function_proofs.append(&mut lowerer.required_proofs);
+    function_proofs.sort_unstable();
     let lowered = wir::SemanticFunction {
         id: wir::FunctionId(function.id.0),
         instance_key: function.key.0,
@@ -5779,6 +5790,7 @@ struct SourceFunctionLowerer<'a> {
     aggregate_name_work: u64,
     next_value: u32,
     synthetic_values: Vec<wir::SemanticValue>,
+    required_proofs: Vec<wir::ProofId>,
 }
 
 struct SourceLocalState {
@@ -6606,6 +6618,20 @@ impl SourceFunctionLowerer<'_> {
                     {
                         return Err(self.fact_mismatch("actor state promotion provenance"));
                     }
+                    let promotion_proof = wir::ProofId(promotion.proof.0);
+                    if self
+                        .function
+                        .proofs
+                        .binary_search(&promotion.proof)
+                        .is_err()
+                        && !self.required_proofs.contains(&promotion_proof)
+                    {
+                        push_bounded_proof(
+                            &mut self.required_proofs,
+                            promotion_proof,
+                            self.limits.model_edges,
+                        )?;
+                    }
                     self.push_statement(
                         &mut statements,
                         wir::SemanticStatement::Let(wir::LetStatement {
@@ -6613,7 +6639,7 @@ impl SourceFunctionLowerer<'_> {
                             operation: wir::SemanticOperation::Promote {
                                 value,
                                 destination: wir::RegionId(promotion.destination.0),
-                                proof: wir::ProofId(promotion.proof.0),
+                                proof: promotion_proof,
                             },
                             source: Some(statement_source),
                         }),

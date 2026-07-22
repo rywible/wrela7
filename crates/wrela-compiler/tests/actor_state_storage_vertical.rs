@@ -49,6 +49,7 @@ pub struct Worker:
     value: u64 = 0
 
     pub async fn ping(mut self):
+        self.value = 5
         self.value += 7
         await checkpoint()
 
@@ -265,7 +266,8 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             semantic::SemanticStatement::Let(statement)
                 if matches!(
                     statement.operation,
-                    semantic::SemanticOperation::ActorStateLoad { .. }
+                    semantic::SemanticOperation::Promote { .. }
+                        | semantic::SemanticOperation::ActorStateLoad { .. }
                         | semantic::SemanticOperation::Binary { .. }
                         | semantic::SemanticOperation::ActorStateStore { .. }
                 ) =>
@@ -278,6 +280,25 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
     assert!(matches!(
         semantic_state_operations.as_slice(),
         [
+            semantic::LetStatement {
+                results: promotion_results,
+                operation: semantic::SemanticOperation::Promote {
+                    value: promoted,
+                    destination: promotion_region,
+                    proof: promotion_proof,
+                },
+                source: promotion_source,
+            },
+            semantic::LetStatement {
+                results: direct_store_results,
+                operation: semantic::SemanticOperation::ActorStateStore {
+                    actor: semantic::ActorId(0),
+                    region: direct_store_region,
+                    value: directly_stored,
+                    proof: direct_store_proof,
+                },
+                source: direct_store_source,
+            },
             semantic::LetStatement {
                 results: loaded,
                 operation: semantic::SemanticOperation::ActorStateLoad {
@@ -307,7 +328,15 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
                 },
                 ..
             },
-        ] if *region == semantic_state.id
+        ] if promotion_results.is_empty()
+            && direct_store_results.is_empty()
+            && *promoted == *directly_stored
+            && *promotion_region == semantic_state.id
+            && *direct_store_region == semantic_state.id
+            && *direct_store_proof == semantic_state.proof
+            && *promotion_source == *direct_store_source
+            && semantic_actor_turn.proofs.contains(promotion_proof)
+            && *region == semantic_state.id
             && store_region == region
             && *proof == semantic_state.proof
             && store_proof == proof
@@ -344,6 +373,23 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
         .iter()
         .find(|function| function.role == flow::FunctionRole::ActorTurn(flow::ActorId(0)))
         .expect("FlowWir actor turn");
+    let flow_promotions = flow_actor_turn
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                flow::FlowOperation::Promote {
+                    destination,
+                    proof,
+                    ..
+                } if destination == flow_state.id
+                    && flow_actor_turn.proofs.contains(&proof)
+            )
+        })
+        .count();
+    assert_eq!(flow_promotions, 1);
     let flow_state_addresses = flow_actor_turn
         .blocks
         .iter()
@@ -359,7 +405,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             )
         })
         .count();
-    assert_eq!(flow_state_addresses, 2);
+    assert_eq!(flow_state_addresses, 3);
     assert_eq!(
         flow_actor_turn
             .blocks
@@ -394,7 +440,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
                 flow::FlowOperation::Store { .. }
             ))
             .count(),
-        1
+        2
     );
     let encoded = encode_and_verify(
         &CanonicalFlowWirCodec,
@@ -409,6 +455,16 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
             .expect("canonical actor state reaches MachineWir");
     let machine = prepared.machine().wir().as_wir();
+    assert_eq!(
+        machine
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .map(|block| block.instructions.len())
+            .sum::<usize>(),
+        14,
+        "the lifetime marker is erased before exact MachineWir instruction accounting"
+    );
     assert_eq!(machine.version, 14);
     let machine_state = machine
         .region_storage
@@ -441,7 +497,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
                 instruction.operation == MachineOperation::GlobalAddress(machine_state.global)
             })
             .count(),
-        2
+        3
     );
     assert_eq!(
         machine_actor_turn
@@ -474,7 +530,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             .flat_map(|block| &block.instructions)
             .filter(|instruction| matches!(instruction.operation, MachineOperation::Store { .. }))
             .count(),
-        1
+        2
     );
 
     let repeated =

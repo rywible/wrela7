@@ -3029,8 +3029,8 @@ mod tests {
         TargetIdentity, ValidatedBuildConfiguration, seal_build_configuration,
     };
     use wrela_flow_lower::{
-        CanonicalFlowLowerer, FlowLowerer, LowerError as FlowLowerError,
-        LowerRequest as FlowLowerRequest, LoweringLimits as FlowLoweringLimits,
+        CanonicalFlowLowerer, FlowLowerer, FlowOperation, LowerRequest as FlowLowerRequest,
+        LoweringLimits as FlowLoweringLimits,
     };
     use wrela_hir::{
         AggregateDeclaration, AssignmentOperator, Attribute, AttributeIdentity, Body, BodyId,
@@ -4293,18 +4293,25 @@ pub fn boot() -> Image:
         assert!(facts.hardware.is_empty());
         assert!(facts.recovery.is_empty());
         let (semantic_wir, _) = lowered.into_parts();
-        assert!(matches!(
-            CanonicalFlowLowerer::new().lower(
+        let flow = CanonicalFlowLowerer::new()
+            .lower(
                 FlowLowerRequest {
                     input: semantic_wir,
                     limits: FlowLoweringLimits::standard(),
                 },
                 &|| false,
-            ),
-            Err(FlowLowerError::UnsupportedInput {
-                feature: "semantic-promotion-lowering-pending",
-            })
-        ));
+            )
+            .expect("authenticated promotion reaches FlowWir");
+        let promotions = flow
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(instruction.operation, FlowOperation::Promote { .. }))
+            .count();
+        assert_eq!(promotions, 1);
     }
 
     #[test]

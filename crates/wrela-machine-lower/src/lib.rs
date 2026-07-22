@@ -3699,7 +3699,7 @@ mod contract_tests {
         flow.peak_bytes = 40;
         let validated = flow
             .validate()
-            .expect("valid Flow v12 actor-state boundary fixture");
+            .expect("valid Flow v13 actor-state boundary fixture");
         (optimize(validated), target, build)
     }
 

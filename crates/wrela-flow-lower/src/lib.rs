@@ -1639,8 +1639,70 @@ fn validate_actor_source_function(
                             return Err(unsupported("async await result delivery"));
                         }
                     }
-                    semantic::SemanticOperation::Promote { .. } => {
-                        return Err(unsupported("semantic-promotion-lowering-pending"));
+                    semantic::SemanticOperation::Promote {
+                        value,
+                        destination,
+                        proof,
+                    } => {
+                        let Some(source) = statement.source else {
+                            return Err(unsupported("actor state promotion source"));
+                        };
+                        let owner = match function.role {
+                            semantic::FunctionRole::ActorTurn(actor) => actor,
+                            _ => return Err(unsupported("actor state promotion owner")),
+                        };
+                        let region_matches =
+                            input
+                                .regions
+                                .get(destination.0 as usize)
+                                .is_some_and(|region| {
+                                    region.id == *destination
+                                        && region.owner == semantic::ImageOwner::Actor(owner)
+                                        && region.class == semantic::RegionClass::Image
+                                        && region.capacity_bytes == 8
+                                        && region.alignment == 8
+                                });
+                        let proof_matches = input
+                            .proofs
+                            .get(proof.0 as usize)
+                            .is_some_and(|record| {
+                                record.id == *proof
+                                    && record.kind == semantic::ProofKind::RegionBound
+                                    && record.subject.starts_with("alloc:")
+                                    && record.bound == Some(8)
+                                    && record.sources.as_slice() == [source]
+                                    && record.depends_on.is_empty()
+                                    && record.explanation.as_slice()
+                                        == ["actor state store outlives its non-reentrant turn frame"]
+                            });
+                        let followed_by_store = matches!(
+                            region.statements.get(index + 1),
+                            Some(semantic::SemanticStatement::Let(semantic::LetStatement {
+                                results,
+                                operation: semantic::SemanticOperation::ActorStateStore {
+                                    actor,
+                                    region,
+                                    value: stored,
+                                    ..
+                                },
+                                source: store_source,
+                            })) if results.is_empty()
+                                && *actor == owner
+                                && region == destination
+                                && stored == value
+                                && *store_source == statement.source
+                        );
+                        if !statement.results.is_empty()
+                            || !region_matches
+                            || !proof_matches
+                            || !function.proofs.contains(proof)
+                            || scalar_value_type(function, *value).is_none_or(|ty| {
+                                !semantic_type_is(input, ty, semantic::PrimitiveType::U64)
+                            })
+                            || !followed_by_store
+                        {
+                            return Err(unsupported("actor state promotion authentication"));
+                        }
                     }
                     _ => {
                         return Err(unsupported(
@@ -3633,6 +3695,7 @@ fn preflight_input(
                             semantic::SemanticOperation::Constant(_)
                             | semantic::SemanticOperation::ActorStateLoad { .. }
                             | semantic::SemanticOperation::ActorStateStore { .. }
+                            | semantic::SemanticOperation::Promote { .. }
                             | semantic::SemanticOperation::Unary { .. }
                             | semantic::SemanticOperation::Binary { .. }
                             | semantic::SemanticOperation::Convert { .. }
@@ -3655,7 +3718,6 @@ fn preflight_input(
                             | semantic::SemanticOperation::Checkpoint { .. }
                             | semantic::SemanticOperation::Allocate { .. }
                             | semantic::SemanticOperation::ResetRegion { .. }
-                            | semantic::SemanticOperation::Promote { .. }
                             | semantic::SemanticOperation::EnterScope { .. }
                             | semantic::SemanticOperation::CommitScope { .. }
                             | semantic::SemanticOperation::AbortScope { .. }
@@ -4622,6 +4684,7 @@ fn measure_actor_flow_output_resources(
                             | semantic::SemanticOperation::MailboxReceive { .. }
                             | semantic::SemanticOperation::ActorStateLoad { .. }
                             | semantic::SemanticOperation::ActorStateStore { .. }
+                            | semantic::SemanticOperation::Promote { .. }
                             | semantic::SemanticOperation::EnterScope { .. }
                             | semantic::SemanticOperation::CommitScope { .. } => {}
                             _ => {
@@ -5515,6 +5578,33 @@ fn lower_generated_function(
                                 operation: flow::FlowOperation::Store {
                                     address,
                                     value: flow::ValueId(value.0),
+                                    proof: flow::ProofId(proof.0),
+                                },
+                                source: statement.source,
+                            },
+                            "FlowWir instructions",
+                            limits.instructions,
+                        )?;
+                        item.next_statement += 1;
+                        continue;
+                    }
+                    if let semantic::SemanticOperation::Promote {
+                        value,
+                        destination,
+                        proof,
+                    } = &statement.operation
+                    {
+                        if !statement.results.is_empty() {
+                            return Err(unsupported("actor state promotion result"));
+                        }
+                        let block = pending_block_mut(&mut pending_blocks, item.block)?;
+                        push_bounded(
+                            &mut block.instructions,
+                            PendingInstruction {
+                                results: Vec::new(),
+                                operation: flow::FlowOperation::Promote {
+                                    value: flow::ValueId(value.0),
+                                    destination: flow::RegionId(destination.0),
                                     proof: flow::ProofId(proof.0),
                                 },
                                 source: statement.source,
@@ -6999,6 +7089,7 @@ fn validate_model_resources(
                     | FlowOperation::Drop { .. }
                     | FlowOperation::Allocate { .. }
                     | FlowOperation::RegionReset { .. }
+                    | FlowOperation::Promote { .. }
                     | FlowOperation::ActorCapability { .. }
                     | FlowOperation::ActorReserve { .. }
                     | FlowOperation::ActorCommit { .. }
@@ -7618,6 +7709,22 @@ fn actor_flow_operation_matches(
                 proof: op,
             },
         ) => ea == oa && ev == ov && ep == op,
+        (
+            flow::FlowOperation::Promote {
+                value: expected_value,
+                destination: expected_destination,
+                proof: expected_proof,
+            },
+            flow::FlowOperation::Promote {
+                value: output_value,
+                destination: output_destination,
+                proof: output_proof,
+            },
+        ) => {
+            expected_value == output_value
+                && expected_destination == output_destination
+                && expected_proof == output_proof
+        }
         (
             flow::FlowOperation::Unary {
                 op: expected_op,
@@ -8834,6 +8941,74 @@ mod contract_tests {
         module
             .validate()
             .expect("valid producer-shaped actor state SemanticWir")
+    }
+
+    fn actor_state_promotion_fixture() -> semantic::ValidatedSemanticWir {
+        let mut module = actor_state_fixture().into_wir();
+        let promotion_source = span(0, 80, 94);
+        let ty = &mut module.types[1];
+        ty.source_name = "u64".to_owned();
+        ty.kind = semantic::TypeKind::Primitive(semantic::PrimitiveType::U64);
+
+        let mut closed = module.proofs.pop().expect("closed actor-state proof");
+        assert_eq!(closed.id, semantic::ProofId(10));
+        module.proofs.push(semantic::ProofRecord {
+            id: semantic::ProofId(10),
+            kind: semantic::ProofKind::RegionBound,
+            subject: "alloc:Worker.value:80".to_owned(),
+            bound: Some(8),
+            sources: vec![promotion_source],
+            depends_on: Vec::new(),
+            explanation: vec!["actor state store outlives its non-reentrant turn frame".to_owned()],
+        });
+        closed.id = semantic::ProofId(11);
+        module.proofs.push(closed);
+        for function in &mut module.functions {
+            for proof in &mut function.proofs {
+                if *proof == semantic::ProofId(10) {
+                    *proof = semantic::ProofId(11);
+                }
+            }
+        }
+
+        let turn = &mut module.functions[1];
+        turn.values.truncate(2);
+        turn.proofs.push(semantic::ProofId(10));
+        turn.proofs.sort_unstable();
+        turn.body.statements = vec![
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                results: vec![semantic::ValueId(1)],
+                operation: semantic::SemanticOperation::Constant(semantic::Constant::Unsigned {
+                    bits: 64,
+                    value: 7,
+                }),
+                source: Some(promotion_source),
+            }),
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                results: Vec::new(),
+                operation: semantic::SemanticOperation::Promote {
+                    value: semantic::ValueId(1),
+                    destination: semantic::RegionId(1),
+                    proof: semantic::ProofId(10),
+                },
+                source: Some(promotion_source),
+            }),
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                results: Vec::new(),
+                operation: semantic::SemanticOperation::ActorStateStore {
+                    actor: semantic::ActorId(0),
+                    region: semantic::RegionId(1),
+                    value: semantic::ValueId(1),
+                    proof: semantic::ProofId(9),
+                },
+                source: Some(promotion_source),
+            }),
+            semantic::SemanticStatement::Return(Vec::new()),
+        ];
+        turn.uninterrupted_bound = Some(4);
+        module
+            .validate()
+            .expect("valid actor-state promotion SemanticWir")
     }
 
     fn actor_scope_fixture() -> semantic::ValidatedSemanticWir {
@@ -10812,6 +10987,271 @@ mod contract_tests {
             seal(&request, wrong_owner, report, diagnostics, &|| false),
             Err(LowerError::InvalidOutput(_))
         ));
+    }
+
+    #[test]
+    fn actor_state_promotion_reaches_flow_with_exact_region_authority() {
+        let input = actor_state_promotion_fixture();
+        let output = CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("authenticated actor-state promotion reaches FlowWir");
+        assert_eq!(output.report().blocks, 4);
+        assert_eq!(output.report().instructions, 5);
+        let turn = output
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .find(|function| function.role == flow::FunctionRole::ActorTurn(flow::ActorId(0)))
+            .expect("actor turn");
+        let [block] = turn.blocks.as_slice() else {
+            panic!("promotion turn remains one block")
+        };
+        assert!(matches!(
+            block.instructions.as_slice(),
+            [
+                flow::Instruction {
+                    results: constant_results,
+                    operation: flow::FlowOperation::Immediate(_),
+                    source: constant_source,
+                    ..
+                },
+                flow::Instruction {
+                    results: promotion_results,
+                    operation: flow::FlowOperation::Promote {
+                        value,
+                        destination,
+                        proof,
+                    },
+                    source: promotion_source,
+                    ..
+                },
+                flow::Instruction {
+                    results: address_results,
+                    operation: flow::FlowOperation::ActorStateAddress {
+                        actor: flow::ActorId(0),
+                        region,
+                        ..
+                    },
+                    source: address_source,
+                    ..
+                },
+                flow::Instruction {
+                    results: store_results,
+                    operation: flow::FlowOperation::Store {
+                        address,
+                        value: stored,
+                        ..
+                    },
+                    source: store_source,
+                    ..
+                },
+            ] if matches!(constant_results.as_slice(), [constant] if constant == value)
+                && promotion_results.is_empty()
+                && destination == region
+                && turn.proofs.contains(proof)
+                && matches!(address_results.as_slice(), [defined] if defined == address)
+                && value == stored
+                && store_results.is_empty()
+                && *constant_source == *promotion_source
+                && *promotion_source == *address_source
+                && *address_source == *store_source
+        ));
+
+        let (validated, report, diagnostics) = output.into_parts();
+        let baseline = validated.into_wir();
+        let request = LowerRequest {
+            input,
+            limits: LoweringLimits::standard(),
+        };
+        let promotion_location = |candidate: &flow::FlowWir| {
+            let function = candidate
+                .functions
+                .iter()
+                .position(|function| {
+                    function.role == flow::FunctionRole::ActorTurn(flow::ActorId(0))
+                })
+                .expect("actor turn function");
+            let instruction = candidate.functions[function].blocks[0]
+                .instructions
+                .iter()
+                .position(|instruction| {
+                    matches!(instruction.operation, flow::FlowOperation::Promote { .. })
+                })
+                .expect("promotion instruction");
+            (function, instruction)
+        };
+
+        let mut wrong_value = baseline.clone();
+        let (function, instruction) = promotion_location(&wrong_value);
+        let flow::FlowOperation::Promote { value, .. } =
+            &mut wrong_value.functions[function].blocks[0].instructions[instruction].operation
+        else {
+            unreachable!()
+        };
+        *value = flow::ValueId(0);
+        assert!(matches!(
+            seal(
+                &request,
+                wrong_value,
+                report.clone(),
+                diagnostics.clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidOutput(_)) | Err(LowerError::InvalidReport(_))
+        ));
+
+        let mut wrong_destination = baseline.clone();
+        let (function, instruction) = promotion_location(&wrong_destination);
+        let flow::FlowOperation::Promote { destination, .. } =
+            &mut wrong_destination.functions[function].blocks[0].instructions[instruction]
+                .operation
+        else {
+            unreachable!()
+        };
+        *destination = flow::RegionId(0);
+        assert!(
+            seal(
+                &request,
+                wrong_destination,
+                report.clone(),
+                diagnostics.clone(),
+                &|| false,
+            )
+            .is_err()
+        );
+
+        let mut wrong_proof = baseline.clone();
+        let (function, instruction) = promotion_location(&wrong_proof);
+        let flow::FlowOperation::Promote { proof, .. } =
+            &mut wrong_proof.functions[function].blocks[0].instructions[instruction].operation
+        else {
+            unreachable!()
+        };
+        *proof = flow::ProofId(9);
+        assert!(
+            seal(
+                &request,
+                wrong_proof,
+                report.clone(),
+                diagnostics.clone(),
+                &|| false,
+            )
+            .is_err()
+        );
+
+        let mut wrong_source = baseline.clone();
+        let (function, instruction) = promotion_location(&wrong_source);
+        wrong_source.functions[function].blocks[0].instructions[instruction].source =
+            Some(span(0, 79, 94));
+        assert!(
+            seal(
+                &request,
+                wrong_source,
+                report.clone(),
+                diagnostics.clone(),
+                &|| false,
+            )
+            .is_err()
+        );
+
+        let mut removed = baseline.clone();
+        let (function, instruction) = promotion_location(&removed);
+        removed.functions[function].blocks[0]
+            .instructions
+            .remove(instruction);
+        assert!(
+            seal(
+                &request,
+                removed,
+                report.clone(),
+                diagnostics.clone(),
+                &|| false,
+            )
+            .is_err()
+        );
+
+        let mut reordered = baseline;
+        let (function, instruction) = promotion_location(&reordered);
+        reordered.functions[function].blocks[0]
+            .instructions
+            .swap(instruction, instruction + 1);
+        assert!(seal(&request, reordered, report, diagnostics, &|| false).is_err());
+
+        let mut exact = LoweringLimits::standard();
+        exact.blocks = 4;
+        exact.instructions = 5;
+        CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: actor_state_promotion_fixture(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact promotion FlowWir limits");
+        for (limits, resource, limit) in [
+            (LoweringLimits { blocks: 3, ..exact }, "FlowWir blocks", 3),
+            (
+                LoweringLimits {
+                    instructions: 4,
+                    ..exact
+                },
+                "FlowWir instructions",
+                4,
+            ),
+        ] {
+            assert!(matches!(
+                CanonicalFlowLowerer::new().lower(
+                    LowerRequest {
+                        input: actor_state_promotion_fixture(),
+                        limits,
+                    },
+                    &|| false,
+                ),
+                Err(LowerError::ResourceLimit {
+                    resource: actual,
+                    limit: actual_limit,
+                }) if actual == resource && actual_limit == limit
+            ));
+        }
+
+        let polls = Cell::new(0_u32);
+        CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: actor_state_promotion_fixture(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            )
+            .expect("count promotion cancellation polls");
+        let cancel_at = polls.get();
+        let polls = Cell::new(0_u32);
+        assert!(matches!(
+            CanonicalFlowLowerer::new().lower(
+                LowerRequest {
+                    input: actor_state_promotion_fixture(),
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next == cancel_at
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), cancel_at);
     }
 
     #[test]

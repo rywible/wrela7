@@ -712,6 +712,7 @@ fn fold_operation(
         | FlowOperation::AsyncCall { .. }
         | FlowOperation::Allocate { .. }
         | FlowOperation::RegionReset { .. }
+        | FlowOperation::Promote { .. }
         | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
         | FlowOperation::ActorCommit { .. }
@@ -1793,6 +1794,7 @@ fn operation_proofs(
         | FlowOperation::Load { proof, .. }
         | FlowOperation::Store { proof, .. }
         | FlowOperation::Allocate { proof, .. }
+        | FlowOperation::Promote { proof, .. }
         | FlowOperation::ActorReserve { proof, .. }
         | FlowOperation::TaskAcquireSlot { proof, .. }
         | FlowOperation::Checkpoint { proof, .. }
@@ -2164,6 +2166,7 @@ fn map_operation_values(
         | FlowOperation::Fence { .. } => {}
         FlowOperation::Unary { value, .. }
         | FlowOperation::Cast { value, .. }
+        | FlowOperation::Promote { value, .. }
         | FlowOperation::EnumTag { value }
         | FlowOperation::EnumPayload { value }
         | FlowOperation::ExtractField {
@@ -2676,6 +2679,7 @@ fn for_each_operation_value(
         | FlowOperation::Fence { .. } => {}
         FlowOperation::Unary { value, .. }
         | FlowOperation::Cast { value, .. }
+        | FlowOperation::Promote { value, .. }
         | FlowOperation::EnumTag { value }
         | FlowOperation::EnumPayload { value }
         | FlowOperation::ExtractField {
@@ -2848,13 +2852,30 @@ fn for_each_terminator_value(
 #[cfg(test)]
 mod scalar_semantics_tests {
     use super::{
-        ScalarConstant, constant_from_immediate, fold_binary, fold_unary, removable_when_dead,
+        ScalarConstant, constant_from_immediate, fold_binary, fold_unary, operation_proofs,
+        removable_when_dead,
     };
+    use crate::OptimizationLimits;
     use wrela_flow_wir::{
-        BinaryOp, BlockId, FlowFunction, FlowType, FlowTypeKind, FunctionColor, FunctionId,
-        FunctionOrigin, FunctionRole, Immediate, Instruction, InstructionId, ScalarType, TypeId,
-        UnaryOp, Value, ValueId,
+        BinaryOp, BlockId, FlowFunction, FlowOperation, FlowType, FlowTypeKind, FunctionColor,
+        FunctionId, FunctionOrigin, FunctionRole, Immediate, Instruction, InstructionId, ProofId,
+        RegionId, ScalarType, TypeId, UnaryOp, Value, ValueId,
     };
+
+    #[test]
+    fn promotion_marker_retains_its_exact_region_bound_proof_reliance() {
+        assert_eq!(
+            operation_proofs(
+                &FlowOperation::Promote {
+                    value: ValueId(3),
+                    destination: RegionId(4),
+                    proof: ProofId(5),
+                },
+                OptimizationLimits::standard(),
+            ),
+            Ok(vec![ProofId(5)])
+        );
+    }
 
     fn ty(id: u32, scalar: ScalarType) -> FlowType {
         FlowType {

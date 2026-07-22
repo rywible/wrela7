@@ -15,7 +15,7 @@ mod canonical;
 
 pub use canonical::CanonicalFlowWirCodec;
 
-pub const FLOW_WIR_WIRE_VERSION: u32 = 12;
+pub const FLOW_WIR_WIRE_VERSION: u32 = 13;
 pub const FLOW_WIR_MAGIC: &[u8; 8] = b"WRELFLO\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,13 +172,13 @@ pub fn encode_and_verify(
         ));
     }
 
-    // The production v12 encoder is the exact source-model identity. This
+    // The production v13 encoder is the exact source-model identity. This
     // avoids an uninterruptible derived equality walk over two project-sized
     // models and prevents an injected codec from silently omitting fields.
     let expected = CanonicalFlowWirCodec.encode(EncodeRequest { wir, limits }, is_cancelled)?;
     if !encoded_candidate_equal(&expected, &candidate, is_cancelled)? {
         return Err(CodecError::NonCanonical(
-            "codec output differs from the canonical FlowWir v12 encoding",
+            "codec output differs from the canonical FlowWir v13 encoding",
         ));
     }
     drop(expected);

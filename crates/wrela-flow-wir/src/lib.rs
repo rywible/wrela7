@@ -13,7 +13,7 @@ use wrela_source::Span;
 
 pub use wrela_test_model::TestPlanLimits;
 
-pub const FLOW_WIR_VERSION: u32 = 12;
+pub const FLOW_WIR_VERSION: u32 = 13;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 11;
 
@@ -301,6 +301,14 @@ pub enum FlowOperation {
     },
     RegionReset {
         region: RegionId,
+    },
+    /// Authenticate a value lifetime transition into one persistent image
+    /// region. The subsequent store performs the runtime write; this marker
+    /// preserves the exact escape proof for downstream validation.
+    Promote {
+        value: ValueId,
+        destination: RegionId,
+        proof: ProofId,
     },
     /// Immutable image-wired capability for one exact installed actor.
     ActorCapability {
@@ -1302,6 +1310,7 @@ fn meter_operation(
         | FlowOperation::Drop { .. }
         | FlowOperation::Allocate { .. }
         | FlowOperation::RegionReset { .. }
+        | FlowOperation::Promote { .. }
         | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
         | FlowOperation::ActorReject { .. }
@@ -4315,6 +4324,7 @@ fn for_each_flow_operation_value(operation: &FlowOperation, mut visit: impl FnMu
         | FlowOperation::Fence { .. } => {}
         FlowOperation::Unary { value, .. }
         | FlowOperation::Cast { value, .. }
+        | FlowOperation::Promote { value, .. }
         | FlowOperation::EnumTag { value }
         | FlowOperation::EnumPayload { value }
         | FlowOperation::ExtractField {
@@ -5052,6 +5062,63 @@ fn validate_operation(
         }
         FlowOperation::RegionReset { region } => {
             require_id("reset region", region.0, module.regions.len(), errors)
+        }
+        FlowOperation::Promote {
+            value: promoted,
+            destination,
+            proof: promotion_proof,
+        } => {
+            value!(*promoted);
+            require_id(
+                "promotion region",
+                destination.0,
+                module.regions.len(),
+                errors,
+            );
+            proof!(*promotion_proof);
+            let valid = matches!(function.role, FunctionRole::ActorTurn(actor)
+            if module.actors.get(actor.0 as usize).is_some_and(|actor_plan| {
+                module.regions.get(destination.0 as usize).is_some_and(|region| {
+                    region.owner == PlanOwner::Actor(actor)
+                        && region.class == RegionClass::Image
+                        && region.capacity_bytes == 8
+                        && region.alignment == 8
+                        && region.name.strip_suffix(".state") == Some(actor_plan.name.as_str())
+                })
+            })) && function
+                .values
+                .get(promoted.0 as usize)
+                .is_some_and(|value| {
+                    module.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                        ty.kind
+                            == FlowTypeKind::Scalar(ScalarType::Integer {
+                                signed: false,
+                                bits: 64,
+                            })
+                    })
+                })
+                && module
+                    .proofs
+                    .get(promotion_proof.0 as usize)
+                    .is_some_and(|proof| {
+                        proof.kind == ProofKind::RegionBound
+                            && proof.subject.starts_with("alloc:")
+                            && proof.bound == Some(8)
+                            && instruction
+                                .source
+                                .is_some_and(|source| proof.sources.as_slice() == [source])
+                            && proof.depends_on.is_empty()
+                            && proof.explanation.as_slice()
+                                == ["actor state store outlives its non-reentrant turn frame"]
+                    })
+                && function.proofs.binary_search(promotion_proof).is_ok()
+                && instruction.results.is_empty();
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "promotion",
+                    id: promotion_proof.0,
+                });
+            }
         }
         FlowOperation::ActorCapability { actor, proof: p } => {
             require_id("actor capability", actor.0, module.actors.len(), errors);
@@ -5837,7 +5904,7 @@ mod tests {
         closed_enum_fixture(256)
             .validate()
             .expect("256-variant enum");
-        for rejected in [11, 13] {
+        for rejected in [11, FLOW_WIR_VERSION - 1, FLOW_WIR_VERSION + 1] {
             let mut wrong_version = closed_enum_fixture(2);
             wrong_version.version = rejected;
             assert!(wrong_version.validate().is_err());

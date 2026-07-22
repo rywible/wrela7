@@ -464,7 +464,7 @@ it. It injects phase implementations and bounded host capabilities, while
   bounds, and the HIR declaration/file bounds used to validate provenance.
 - SemanticWir v11 retains exact SSA aggregate field replacement as `InsertField`.
   Validation joins the prior aggregate's struct type, selected field, inserted
-  value type, and single result of the unchanged aggregate type; FlowWir v12
+  value type, and single result of the unchanged aggregate type; FlowWir v13
   preserves the same operation and independently repeats that join.
 - MachineWir v14 retains same-block nongeneric flat values with two or more
   primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
@@ -525,8 +525,10 @@ it. It injects phase implementations and bounded host capabilities, while
 - The bounded source subset also lowers plain one-level field assignment on an
   initialized owned nongeneric flat-structure local as SSA aggregate
   replacement. It never invents an address or memory proof. Compound/nested,
-  nonlocal, view write-through, and actor-state stores remain explicit pending
-  boundaries.
+  nonlocal and view write-through remain explicit pending boundaries. One
+  canonical actor-state plain write additionally retains its exact
+  `RegionBound` proof as a no-result `Promote` immediately before the concrete
+  store, and attaches that proof to the actor-turn function authority set.
 
 ### `wrela-flow-wir`
 
@@ -570,6 +572,11 @@ it. It injects phase implementations and bounded host capabilities, while
 - Every region records its closed class, owner, byte capacity, alignment,
   exact `CapacityBound` proof, and source span. Validation joins those fields
   rather than allowing report or Machine consumers to infer region provenance.
+- FlowWir v13 adds one exact actor-state `Promote` marker. Validation requires
+  an unsigned 64-bit value, the owning actor's canonical eight-byte `.state`
+  image region, a source-identical eight-byte `RegionBound` proof listed on the
+  turn function, and no result. This is proof/lifetime authority; the following
+  store remains the concrete runtime action.
 
 ### `wrela-flow-lower`
 
@@ -592,6 +599,11 @@ it. It injects phase implementations and bounded host capabilities, while
   without fabricating function tests.
 - The seal independently bounds all blocks/instructions plus aggregate operand,
   edge, feature/proof, and UTF-8/immediate payload retained in FlowWir.
+- The first L2.3 subset lowers only the authenticated direct actor-state
+  promotion and requires it to be immediately followed by the same-source,
+  same-value, same-region actor-state store. Its sealer compares the marker and
+  adjacency exactly; general allocation/reset and other promotion shapes stay
+  fail closed.
 - Does not optimize, fix ABI/layout, choose runtime intrinsics, or serialize.
 
 ### `wrela-flow-opt`
@@ -617,6 +629,9 @@ it. It injects phase implementations and bounded host capabilities, while
 - Consumer needs met: Machine lowering cannot accidentally consume an
   unverified intermediate pass result; all actor-as-if, check-removal, storage,
   and control-flow decisions remain explainable.
+- Promotion markers are effectful proof-bearing operations. Every transforming
+  profile retains the marker and reports its exact `RegionBound` reliance; it
+  is never dead-code-eliminated merely because it has no SSA result.
 - Ordinary optimizations remain FlowWir. There is no new IR name for each pass.
 - Optimization may rewrite function bodies and global initializers, but cannot
   change types, proofs, checkpoints, provenance, signatures, roles, bounds, or
@@ -650,6 +665,8 @@ it. It injects phase implementations and bounded host capabilities, while
   second encode is byte-identical. Backend decoding canonically re-encodes the
   validated model and requires the complete received frame and inspected header
   to match, so ignored or alternate encodings cannot cross the wire boundary.
+- Wire version 13 appends `Promote` at operation tag 54. Model and wire version
+  12 are explicitly stale and rejected; there is no compatibility decoder.
 
 ### `wrela-runtime-abi`
 
@@ -781,6 +798,13 @@ it. It injects phase implementations and bounded host capabilities, while
   selects, ordinary loads/stores, calls, fences, and control-flow edges. The
   image entry alone receives the exact AArch64 UEFI two-pointer/`EFI_STATUS`
   boundary and an implicit `EFI_SUCCESS` value for a unit return.
+- For the canonical actor-state direct write, lowering authenticates the
+  FlowWir v13 promotion proof, owning `.state` region, value, source, and exact
+  marker→address→store adjacency. The marker has no MachineWir operation and
+  is excluded consistently from output, reservation, and exact instruction
+  accounting; the address/store remains the concrete writable-global action.
+  Activation call IDs are translated through this erasure so the sealed
+  scheduler plan continues to name the exact dense MachineWir instruction.
 - Generated test harnesses receive a measured read-only global for every
   canonical protocol frame. MachineWir uses explicit global-address values and
   exact `TestEmit(address, length)` / nonreturning `TestFinish(outcome)` runtime
@@ -967,7 +991,7 @@ it. It injects phase implementations and bounded host capabilities, while
 - That schema is the only accepted report shape. Its tag rejects stale or
   mismatched artifacts at the trust boundary; there is no legacy reader,
   migration, adapter, or fallback contract. Its embedded interface facts must
-  be exactly SemanticWir 11, FlowWir 12, Flow wire 12, MachineWir 13, and runtime
+  be exactly SemanticWir 11, FlowWir 13, Flow wire 13, MachineWir 14, and runtime
   ABI 2; nonzero stale or future values are rejected rather than tolerated.
 - Schema v10 also projects sealed actor, task, reportable region, and async
   activation plans into

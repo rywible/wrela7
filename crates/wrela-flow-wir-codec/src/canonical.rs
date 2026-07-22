@@ -1467,6 +1467,16 @@ fn encode_operation(writer: &mut Writer<'_>, value: &FlowOperation) -> Result<()
             writer.u32(region.0)?;
             writer.u32(proof.0)
         }
+        FlowOperation::Promote {
+            value,
+            destination,
+            proof,
+        } => {
+            writer.u8(54)?;
+            writer.u32(value.0)?;
+            writer.u32(destination.0)?;
+            writer.u32(proof.0)
+        }
     }
 }
 
@@ -2604,6 +2614,11 @@ impl Reader<'_> {
                 region: RegionId(self.u32()?),
                 proof: ProofId(self.u32()?),
             },
+            54 => FlowOperation::Promote {
+                value: ValueId(self.u32()?),
+                destination: RegionId(self.u32()?),
+                proof: ProofId(self.u32()?),
+            },
             tag => return Err(invalid_tag("FlowOperation", tag)),
         })
     }
@@ -3076,7 +3091,7 @@ mod tests {
         harness_name.clone_from(&name);
         model
             .validate()
-            .expect("valid long-prefix FlowWir v12 fixture")
+            .expect("valid long-prefix FlowWir v13 fixture")
     }
 
     struct SubstitutingCodec<'a> {
@@ -3448,6 +3463,11 @@ mod tests {
             FlowOperation::RegionReset {
                 region: RegionId(6),
             },
+            FlowOperation::Promote {
+                value: v,
+                destination: RegionId(6),
+                proof: p,
+            },
             FlowOperation::ActorReserve {
                 actor: ActorId(7),
                 method: FunctionId(8),
@@ -3550,7 +3570,7 @@ mod tests {
                 },
             },
         ];
-        assert_eq!(operations.len(), 53);
+        assert_eq!(operations.len(), 54);
         for value in operations {
             roundtrip_operation(&value);
         }
@@ -4139,19 +4159,21 @@ mod tests {
             Err(CodecError::UnsupportedWireVersion(u32::MAX))
         );
 
-        let mut stale_wire = encoded.bytes.clone();
-        stale_wire[8..12].copy_from_slice(&11_u32.to_le_bytes());
-        assert_eq!(
-            codec.inspect_header(&stale_wire, &|| false),
-            Err(CodecError::UnsupportedWireVersion(11))
-        );
+        for stale in [11_u32, 12] {
+            let mut stale_wire = encoded.bytes.clone();
+            stale_wire[8..12].copy_from_slice(&stale.to_le_bytes());
+            assert_eq!(
+                codec.inspect_header(&stale_wire, &|| false),
+                Err(CodecError::UnsupportedWireVersion(stale))
+            );
 
-        let mut stale_header_flow = encoded.bytes.clone();
-        stale_header_flow[12..16].copy_from_slice(&11_u32.to_le_bytes());
-        assert_eq!(
-            codec.inspect_header(&stale_header_flow, &|| false),
-            Err(CodecError::UnsupportedFlowWirVersion(11))
-        );
+            let mut stale_header_flow = encoded.bytes.clone();
+            stale_header_flow[12..16].copy_from_slice(&stale.to_le_bytes());
+            assert_eq!(
+                codec.inspect_header(&stale_header_flow, &|| false),
+                Err(CodecError::UnsupportedFlowWirVersion(stale))
+            );
+        }
 
         let mut trailing = encoded.bytes.clone();
         trailing.push(0);
@@ -4202,20 +4224,22 @@ mod tests {
         );
 
         let parsed = parse_header(&encoded.bytes, &|| false).expect("parsed header");
-        let mut stale_payload_flow = encoded.bytes.clone();
-        stale_payload_flow[parsed.payload_start..parsed.payload_start + 4]
-            .copy_from_slice(&11_u32.to_le_bytes());
-        assert_eq!(
-            codec.decode(
-                DecodeRequest {
-                    bytes: &stale_payload_flow,
-                    limits: CodecLimits::standard(),
-                    expected_build: None,
-                },
-                &|| false,
-            ),
-            Err(CodecError::UnsupportedFlowWirVersion(11))
-        );
+        for stale in [11_u32, 12] {
+            let mut stale_payload_flow = encoded.bytes.clone();
+            stale_payload_flow[parsed.payload_start..parsed.payload_start + 4]
+                .copy_from_slice(&stale.to_le_bytes());
+            assert_eq!(
+                codec.decode(
+                    DecodeRequest {
+                        bytes: &stale_payload_flow,
+                        limits: CodecLimits::standard(),
+                        expected_build: None,
+                    },
+                    &|| false,
+                ),
+                Err(CodecError::UnsupportedFlowWirVersion(stale))
+            );
+        }
         let semantic_version_offset = parsed.payload_start + 4 + 4 + "canonical-image".len();
         let mut stale_semantic_provenance = encoded.bytes.clone();
         stale_semantic_provenance[semantic_version_offset..semantic_version_offset + 4]
@@ -4467,7 +4491,7 @@ mod tests {
                 &|| false,
             ),
             Err(CodecError::NonCanonical(
-                "codec output differs from the canonical FlowWir v12 encoding"
+                "codec output differs from the canonical FlowWir v13 encoding"
             ))
         ));
     }
@@ -4945,12 +4969,29 @@ mod tests {
                 .expect("closed enum operation consumes exactly");
         }
 
-        let mut reader = Reader::new(&[54], 0, CodecLimits::standard(), &not_cancelled);
+        let operation = FlowOperation::Promote {
+            value: ValueId(5),
+            destination: RegionId(3),
+            proof: ProofId(7),
+        };
+        let mut writer = Writer::new(CodecLimits::standard(), &not_cancelled);
+        writer
+            .operation(&operation)
+            .expect("promotion operation encodes");
+        let bytes = writer.finish();
+        assert_eq!(bytes[0], 54);
+        let mut reader = Reader::new(&bytes, 0, CodecLimits::standard(), &not_cancelled);
+        assert_eq!(reader.operation(), Ok(operation));
+        reader
+            .finish()
+            .expect("promotion operation consumes exactly");
+
+        let mut reader = Reader::new(&[55], 0, CodecLimits::standard(), &not_cancelled);
         assert_eq!(
             reader.operation(),
             Err(CodecError::InvalidEnumTag {
                 kind: "FlowOperation",
-                tag: 54,
+                tag: 55,
             })
         );
     }

@@ -1025,9 +1025,7 @@ fn preflight(
             check_cancelled(is_cancelled)?;
             for instruction in &block.instructions {
                 check_cancelled(is_cancelled)?;
-                if !matches!(instruction.operation, flow::FlowOperation::Drop { .. })
-                    && !erases_unit_definition(input, function, instruction)?
-                {
+                if !erases_machine_instruction(input, function, instruction)? {
                     retained = retained
                         .checked_add(1)
                         .ok_or(MachineLowerError::ResourceLimit {
@@ -1670,13 +1668,15 @@ fn lower_activation_subset(
             ));
         }
         shared_callee = Some(plan.callee);
+        let call_instruction =
+            lowered_instruction_id(input, caller, call.id, limits.instructions, is_cancelled)?;
         output.push(MachineActivationPlan {
             id: MachineActivationId(plan.id.0),
             owner,
             schedule,
             caller: FunctionId(plan.caller.0),
             callee: FunctionId(plan.callee.0),
-            call_instruction: InstructionId(call.id.0),
+            call_instruction,
             state,
             resume_block: BlockId(resume_id.0),
             region: plan.region.0,
@@ -1716,6 +1716,103 @@ fn lower_activation_subset(
     Ok(output)
 }
 
+fn lowered_instruction_id(
+    input: &flow::FlowWir,
+    function: &flow::FlowFunction,
+    target: flow::InstructionId,
+    limit: u64,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<InstructionId, MachineLowerError> {
+    let mut lowered = 0_u64;
+    for block in &function.blocks {
+        check_cancelled(is_cancelled)?;
+        for instruction in &block.instructions {
+            check_cancelled(is_cancelled)?;
+            if instruction.id == target {
+                return u32::try_from(lowered).map(InstructionId).map_err(|_| {
+                    MachineLowerError::ResourceLimit {
+                        resource: "MachineWir instructions",
+                        limit,
+                    }
+                });
+            }
+            let retained = if matches!(instruction.operation, flow::FlowOperation::TestEmit { .. })
+            {
+                2
+            } else if erases_machine_instruction(input, function, instruction)? {
+                0
+            } else {
+                1
+            };
+            lowered = lowered
+                .checked_add(retained)
+                .ok_or(MachineLowerError::ResourceLimit {
+                    resource: "MachineWir instructions",
+                    limit,
+                })?;
+            check_resource("MachineWir instructions", lowered, limit)?;
+        }
+    }
+    Err(unsupported("an activation call absent from its caller"))
+}
+
+fn exact_actor_state_promotion(
+    input: &flow::FlowWir,
+    function: &flow::FlowFunction,
+    actor: flow::ActorId,
+    instruction: &flow::Instruction,
+) -> bool {
+    let flow::FlowOperation::Promote {
+        value,
+        destination,
+        proof,
+    } = instruction.operation
+    else {
+        return false;
+    };
+    instruction.results.is_empty()
+        && function
+            .values
+            .get(value.0 as usize)
+            .and_then(|value| input.types.get(value.ty.0 as usize))
+            .is_some_and(|ty| {
+                ty.kind
+                    == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                        signed: false,
+                        bits: 64,
+                    })
+            })
+        && input
+            .actors
+            .get(actor.0 as usize)
+            .is_some_and(|actor_plan| {
+                input
+                    .regions
+                    .get(destination.0 as usize)
+                    .is_some_and(|region| {
+                        region.id == destination
+                            && region.owner == flow::PlanOwner::Actor(actor)
+                            && region.class == flow::RegionClass::Image
+                            && region.capacity_bytes == 8
+                            && region.alignment == 8
+                            && region.name.strip_suffix(".state") == Some(actor_plan.name.as_str())
+                    })
+            })
+        && function.proofs.binary_search(&proof).is_ok()
+        && input.proofs.get(proof.0 as usize).is_some_and(|record| {
+            record.id == proof
+                && record.kind == flow::ProofKind::RegionBound
+                && record.subject.starts_with("alloc:")
+                && record.bound == Some(8)
+                && instruction
+                    .source
+                    .is_some_and(|source| record.sources.as_slice() == [source])
+                && record.depends_on.is_empty()
+                && record.explanation.as_slice()
+                    == ["actor state store outlives its non-reentrant turn frame"]
+        })
+}
+
 fn exact_actor_state_prefix(
     input: &flow::FlowWir,
     function: &flow::FlowFunction,
@@ -1746,6 +1843,56 @@ fn exact_actor_state_prefix(
                                 bits: 64,
                             })
                     })
+            {
+                return false;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(
+            instructions[index].operation,
+            flow::FlowOperation::Promote { .. }
+        ) {
+            let promotion = &instructions[index];
+            let flow::FlowOperation::Promote {
+                value, destination, ..
+            } = promotion.operation
+            else {
+                return false;
+            };
+            let follows_with_exact_store = matches!(
+                (instructions.get(index + 1), instructions.get(index + 2)),
+                (
+                    Some(flow::Instruction {
+                        results: address_results,
+                        operation: flow::FlowOperation::ActorStateAddress {
+                            actor: address_actor,
+                            region,
+                            ..
+                        },
+                        source: address_source,
+                        ..
+                    }),
+                    Some(flow::Instruction {
+                        results: store_results,
+                        operation: flow::FlowOperation::Store {
+                            address,
+                            value: stored,
+                            ..
+                        },
+                        source: store_source,
+                        ..
+                    }),
+                ) if address_results.as_slice() == [*address]
+                    && store_results.is_empty()
+                    && *address_actor == actor
+                    && *region == destination
+                    && *stored == value
+                    && *address_source == promotion.source
+                    && *store_source == promotion.source
+            );
+            if !exact_actor_state_promotion(input, function, actor, promotion)
+                || !follows_with_exact_store
             {
                 return false;
             }
@@ -2657,9 +2804,7 @@ fn preflight_output_model_resources(
                     edges = add_edges(edges, 6, edge_limit)?;
                     continue;
                 }
-                if matches!(instruction.operation, flow::FlowOperation::Drop { .. })
-                    || erases_unit_definition(input, function, instruction)?
-                {
+                if erases_machine_instruction(input, function, instruction)? {
                     continue;
                 }
                 machine_instructions = machine_instructions.checked_add(1).ok_or(
@@ -3768,6 +3913,7 @@ fn record_operation_payload_uses(
         }
         flow::FlowOperation::Unary { value, .. }
         | flow::FlowOperation::Cast { value, .. }
+        | flow::FlowOperation::Promote { value, .. }
         | flow::FlowOperation::Load { address: value, .. }
         | flow::FlowOperation::Move { value }
         | flow::FlowOperation::Copy { value }
@@ -4365,6 +4511,7 @@ fn for_each_flow_operation_value(
         | flow::FlowOperation::Fence { .. } => {}
         flow::FlowOperation::Unary { value, .. }
         | flow::FlowOperation::Cast { value, .. }
+        | flow::FlowOperation::Promote { value, .. }
         | flow::FlowOperation::EnumTag { value }
         | flow::FlowOperation::EnumPayload { value }
         | flow::FlowOperation::ExtractField {
@@ -4718,6 +4865,20 @@ fn erases_unit_definition(
     }
 }
 
+/// Whether a validated Flow instruction has no MachineWir representation.
+/// Promotion is an authenticated lifetime/proof marker: its immediately
+/// following address/store pair performs the concrete runtime write.
+fn erases_machine_instruction(
+    input: &flow::FlowWir,
+    function: &flow::FlowFunction,
+    instruction: &flow::Instruction,
+) -> Result<bool, MachineLowerError> {
+    Ok(matches!(
+        instruction.operation,
+        flow::FlowOperation::Drop { .. } | flow::FlowOperation::Promote { .. }
+    ) || erases_unit_definition(input, function, instruction)?)
+}
+
 fn validate_supported_operation(
     input: &flow::FlowWir,
     function: &flow::FlowFunction,
@@ -4762,6 +4923,12 @@ fn validate_supported_operation(
             ValueMapping::DenseShift(0),
         )
         .map(|_| ()),
+        flow::FlowOperation::Promote { .. }
+            if matches!(function.role, flow::FunctionRole::ActorTurn(actor)
+                if exact_actor_state_promotion(input, function, actor, instruction)) =>
+        {
+            require_no_results(instruction)
+        }
         flow::FlowOperation::ActorCapability { .. }
         | flow::FlowOperation::ActorStateAddress { .. }
         | flow::FlowOperation::Immediate(
@@ -5055,7 +5222,6 @@ fn validate_supported_operation(
                 activation.id.0 == plan.0
                     && activation.caller.0 == function.id.0
                     && activation.callee.0 == callee.0
-                    && activation.call_instruction.0 == instruction.id.0
                     && instruction.source == Some(activation.source)
             }) =>
         {
@@ -5072,6 +5238,7 @@ fn validate_supported_operation(
         }
         flow::FlowOperation::BeginAccess { .. }
         | flow::FlowOperation::EndAccess { .. }
+        | flow::FlowOperation::Promote { .. }
         | flow::FlowOperation::Allocate { .. }
         | flow::FlowOperation::RegionReset { .. }
         | flow::FlowOperation::ActorReject { .. }
@@ -6532,9 +6699,7 @@ fn lowered_segment_capacity(
         check_cancelled(is_cancelled)?;
         let retained = if matches!(instruction.operation, flow::FlowOperation::TestEmit { .. }) {
             2
-        } else if matches!(instruction.operation, flow::FlowOperation::Drop { .. })
-            || erases_unit_definition(input, function, instruction)?
-        {
+        } else if erases_machine_instruction(input, function, instruction)? {
             0
         } else {
             1
@@ -6904,6 +7069,15 @@ fn lower_operation(
 ) -> Result<Option<MachineOperation>, MachineLowerError> {
     check_cancelled(is_cancelled)?;
     if erases_unit_definition(input, function, instruction)? {
+        return Ok(None);
+    }
+    if matches!(instruction.operation, flow::FlowOperation::Promote { .. }) {
+        let flow::FunctionRole::ActorTurn(actor) = function.role else {
+            return Err(unsupported("an actor-state promotion outside its turn"));
+        };
+        if !exact_actor_state_promotion(input, function, actor, instruction) {
+            return Err(unsupported("an unauthenticated actor-state promotion"));
+        }
         return Ok(None);
     }
     let operation = match &instruction.operation {
@@ -7302,7 +7476,6 @@ fn lower_operation(
                 plan.id.0 == activation.0
                     && plan.caller.0 == function.id.0
                     && plan.callee.0 == callee.0
-                    && plan.call_instruction.0 == instruction.id.0
             });
             if !supported
                 || !instruction
