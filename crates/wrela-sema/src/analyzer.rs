@@ -16601,8 +16601,22 @@ fn lexical_view_blocking_terminal<'a>(
     view: &LexicalView,
     source: Span,
 ) -> Option<&'a wrela_hir::Expression> {
+    structured_view_blocking_terminal(
+        program,
+        &view.terminal_uses,
+        &view.live_after_statements,
+        source,
+    )
+}
+
+fn structured_view_blocking_terminal<'a>(
+    program: &'a wrela_hir::Program,
+    terminal_uses: &[ExpressionId],
+    live_after_statements: &[StatementId],
+    source: Span,
+) -> Option<&'a wrela_hir::Expression> {
     let statement = containing_statement_for_span(program, source)?;
-    let terminal_in_statement = view.terminal_uses.iter().find_map(|terminal| {
+    let terminal_in_statement = terminal_uses.iter().find_map(|terminal| {
         program.expression(*terminal).filter(|terminal| {
             statement.source.file == terminal.source.file
                 && statement.source.range.start <= terminal.source.range.start
@@ -16610,15 +16624,12 @@ fn lexical_view_blocking_terminal<'a>(
         })
     });
     if terminal_in_statement.is_none()
-        && view
-            .live_after_statements
-            .binary_search(&statement.id)
-            .is_err()
+        && live_after_statements.binary_search(&statement.id).is_err()
     {
         return None;
     }
     terminal_in_statement.or_else(|| {
-        view.terminal_uses
+        terminal_uses
             .iter()
             .filter_map(|terminal| program.expression(*terminal))
             .find(|terminal| {
@@ -16626,7 +16637,7 @@ fn lexical_view_blocking_terminal<'a>(
                     && source.range.end <= terminal.source.range.start
             })
             .or_else(|| {
-                view.terminal_uses
+                terminal_uses
                     .first()
                     .and_then(|terminal| program.expression(*terminal))
             })
@@ -17116,10 +17127,12 @@ fn record_lexical_view_initialization(
                 .get(retained.parameter.0 as usize)
                 .and_then(|parameter| parameter.name.as_ref())
                 .map_or("_", wrela_hir::Name::as_str);
-            let terminal = liveness
-                .terminal_uses
-                .first()
-                .and_then(|terminal| request.hir.as_program().expression(*terminal));
+            let terminal = structured_view_blocking_terminal(
+                request.hir.as_program(),
+                &liveness.terminal_uses,
+                &liveness.live_after_statements,
+                argument.source,
+            );
             let mut diagnostic = Diagnostic::error(
                 Category::OWNERSHIP,
                 argument.source,
@@ -17212,11 +17225,12 @@ fn record_lexical_view_initialization(
                 protocol.name
             ),
         });
-        if let Some(terminal) = liveness
-            .terminal_uses
-            .first()
-            .and_then(|terminal| request.hir.as_program().expression(*terminal))
-        {
+        if let Some(terminal) = structured_view_blocking_terminal(
+            request.hir.as_program(),
+            &liveness.terminal_uses,
+            &liveness.live_after_statements,
+            statement.source,
+        ) {
             diagnostic.labels.push(wrela_diagnostics::Label {
                 span: terminal.source,
                 message: "the blocking view's terminal use is here".to_owned(),
@@ -41506,6 +41520,107 @@ fn branch_mutation_is_blocked():
         );
         assert!(diagnostic.message.contains("packet"));
         assert!(diagnostic.message.contains("header"));
+    }
+
+    #[test]
+    fn branch_local_mutation_names_its_own_blocking_terminal_use() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn touch(mut packet: Packet):
+    pass
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn branch_mutation_has_path_local_terminal():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    if true:
+        consume(hdr)
+    else:
+        touch(mut packet)
+        consume(hdr)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        let diagnostic = output
+            .diagnostics()
+            .first()
+            .expect("branch-local source-mutation diagnostic");
+        assert_eq!(
+            diagnostic.code.as_deref(),
+            Some("semantic-view-source-mutated")
+        );
+        let terminal = diagnostic
+            .labels
+            .iter()
+            .find(|label| label.message.contains("terminal use"))
+            .expect("blocking terminal label");
+        assert!(
+            terminal.span.range.start > diagnostic.primary.range.end,
+            "the label must name the later terminal use on the mutating branch: {diagnostic:?}"
+        );
+    }
+
+    #[test]
+    fn branch_local_rebound_names_its_own_blocking_terminal_use() {
+        const SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Packet:
+    pub header: u64
+
+projection header(read packet: Packet) -> view u64:
+    yield packet.header
+
+fn consume(value: u64):
+    pass
+
+@image
+pub fn boot() -> Image:
+    return Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn branch_rebound_has_path_local_terminal():
+    packet: Packet = Packet(header=7)
+    hdr: view u64 = header(packet)
+    if true:
+        consume(hdr)
+    else:
+        packet = Packet(header=8)
+        consume(hdr)
+"#;
+        let output = compile_scope_fixture(SOURCE);
+        let diagnostic = output
+            .diagnostics()
+            .first()
+            .expect("branch-local carrier-rebound diagnostic");
+        assert_eq!(
+            diagnostic.code.as_deref(),
+            Some("semantic-projection-carrier-rebound")
+        );
+        let terminal = diagnostic
+            .labels
+            .iter()
+            .find(|label| label.message.contains("terminal use"))
+            .expect("blocking terminal label");
+        assert!(
+            terminal.span.range.start > diagnostic.primary.range.end,
+            "the label must name the later terminal use on the rebinding branch: {diagnostic:?}"
+        );
     }
 
     #[test]
