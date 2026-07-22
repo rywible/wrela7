@@ -1224,3 +1224,67 @@ fn async_exit_flow_rejects_metadata_and_nondiscriminating_is_forgeries() {
         })
     ));
 }
+
+#[test]
+fn completed_activation_frame_reset_carries_the_exact_reportable_region_contract() {
+    let fixture = compile_semantic(COMPLETED_FRAME_RESET_SOURCE);
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: fixture.semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("completed activation reset reaches FlowWir");
+    let flow = flow.wir().as_wir();
+
+    // These are exactly the FlowWir joins the public image report projects a
+    // completed-activation task-frame reset from. Pinning them against real
+    // compiled source keeps the report producer's admitted profile tied to the
+    // language surface rather than to a hand-built backend fixture alone.
+    let [plan] = flow.activations.as_slice() else {
+        panic!("one completed immediate activation")
+    };
+    let caller = &flow.functions[plan.caller.0 as usize];
+    let [entry, resume] = caller.blocks.as_slice() else {
+        panic!("completed-frame caller has exactly an entry and a resume block")
+    };
+    let [call] = entry.instructions.as_slice() else {
+        panic!("the entry block issues exactly the async call")
+    };
+    let [reset] = resume.instructions.as_slice() else {
+        panic!("the resume block runs exactly the frame reset")
+    };
+    let region = &flow.regions[plan.region.0 as usize];
+    let proof = &flow.proofs[plan.capacity_proof.0 as usize];
+    assert_eq!(caller.id, plan.caller);
+    assert_eq!(caller.role, flow::FunctionRole::TaskEntry(flow::TaskId(0)));
+    assert_eq!(caller.color, flow::FunctionColor::Async);
+    assert_eq!(caller.entry, entry.id);
+    assert!(matches!(&call.operation,
+        flow::FlowOperation::AsyncCall { function, arguments, plan: called }
+            if *function == plan.callee && arguments.is_empty() && *called == plan.id));
+    assert!(matches!(entry.terminator,
+        flow::Terminator::Suspend { state: 0, activation, resume: target }
+            if Some(&activation) == call.results.first() && target == resume.id));
+    assert!(reset.results.is_empty());
+    assert_eq!(reset.source, Some(plan.source));
+    assert!(matches!(reset.operation,
+        flow::FlowOperation::RegionReset { region } if region == plan.region));
+    assert!(matches!(&resume.terminator,
+        flow::Terminator::Return(values) if values.is_empty()));
+    assert_eq!(region.id, plan.region);
+    assert_eq!(region.class, flow::RegionClass::TaskFrame);
+    assert_eq!(region.owner, flow::PlanOwner::Task(flow::TaskId(0)));
+    assert_eq!(region.reset_function, None);
+    assert_eq!(region.source, plan.source);
+    assert_eq!(region.capacity_bytes, plan.frame_bytes);
+    assert_eq!(region.capacity_bytes, 16);
+    assert_eq!(region.alignment, 8);
+    assert_eq!(region.capacity_proof, plan.capacity_proof);
+    assert_eq!(proof.id, plan.capacity_proof);
+    assert_eq!(proof.kind, flow::ProofKind::CapacityBound);
+    assert_eq!(proof.bound, Some(1));
+    assert_eq!(proof.sources.as_slice(), [plan.source]);
+}

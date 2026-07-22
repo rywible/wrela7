@@ -32,12 +32,12 @@ use wrela_flow_wir_codec::{
     decode_and_verify as decode_flow_wir,
 };
 use wrela_image_report::{
-    ActivationCancellationFact, ActivationFrameEvidenceFact, ActorPlacementInputFact,
-    AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts,
-    BoundFact, HardwareFact, ImageEdgeFact, ImageNodeFact, ImageReport, OptimizationAction,
-    OptimizationDecisionFact, ProofFact, RegionCapacityEvidenceFact, ReportError,
-    RepresentationFacts, SchedulerOwnershipFact, SectionFact, SymbolFact, WorkFact,
-    seal_analysis_facts,
+    ActivationCancellationFact, ActivationFrameEvidenceFact, ActivationFrameResetFact,
+    ActorPlacementInputFact, AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts,
+    BackendFactLimits, BackendFacts, BoundFact, HardwareFact, ImageEdgeFact, ImageNodeFact,
+    ImageReport, OptimizationAction, OptimizationDecisionFact, ProofFact,
+    RegionCapacityEvidenceFact, ReportError, RepresentationFacts, SchedulerOwnershipFact,
+    SectionFact, SymbolFact, WorkFact, seal_analysis_facts,
 };
 use wrela_link_efi::{
     CanonicalCoffObjectInspector, CanonicalLinkedImageInspector, CoffObject, CoffObjectKind,
@@ -930,6 +930,7 @@ fn analysis_facts(
                 capacity_proof: plan.capacity_proof.0,
             });
     }
+    facts.activation_frame_resets = reportable_activation_frame_resets(flow, is_cancelled)?;
     for proof in &flow.proofs {
         check_report_cancelled(is_cancelled)?;
         let mut sources = Vec::new();
@@ -1166,6 +1167,127 @@ fn reportable_activation_regions(
         }
     }
     Ok(regions)
+}
+
+/// Project the one task-frame region reset that FlowWir authenticates for a
+/// completed immediate activation, or nothing at all.
+///
+/// The admitted profile is exactly the one the completed-activation frame reset
+/// is lowered from: a single activation plan whose task-entry caller suspends on
+/// it and, in the resume block that await returns to, resets that same
+/// activation's own task-frame region as the block's only instruction before
+/// returning. Every other shape — a second reset anywhere in the image, a reset
+/// of some other region, a reset without the await's source span, an actor-owned
+/// or non-task-frame region, or a capacity proof that is not an exact finite
+/// `CapacityBound` over the await — yields no row. Publishing a partial row
+/// would let a consumer mistake an unreset frame for a reset one.
+fn reportable_activation_frame_resets(
+    flow: &wrela_flow_wir::FlowWir,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<ActivationFrameResetFact>, BackendReportError> {
+    let mut reset = None;
+    for function in &flow.functions {
+        check_report_cancelled(is_cancelled)?;
+        for block in &function.blocks {
+            check_report_cancelled(is_cancelled)?;
+            for instruction in &block.instructions {
+                check_report_cancelled(is_cancelled)?;
+                if matches!(
+                    instruction.operation,
+                    wrela_flow_wir::FlowOperation::RegionReset { .. }
+                ) && reset.replace((function, block, instruction)).is_some()
+                {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+    }
+    let Some((caller, resume, reset)) = reset else {
+        return Ok(Vec::new());
+    };
+    let [plan] = flow.activations.as_slice() else {
+        return Ok(Vec::new());
+    };
+    let [entry, expected_resume] = caller.blocks.as_slice() else {
+        return Ok(Vec::new());
+    };
+    let [sole_reset] = resume.instructions.as_slice() else {
+        return Ok(Vec::new());
+    };
+    let [call] = entry.instructions.as_slice() else {
+        return Ok(Vec::new());
+    };
+    let [activation_value] = call.results.as_slice() else {
+        return Ok(Vec::new());
+    };
+    let (Some(region), Some(proof)) = (
+        flow.regions.get(plan.region.0 as usize),
+        flow.proofs.get(plan.capacity_proof.0 as usize),
+    ) else {
+        return Ok(Vec::new());
+    };
+    let expected_owner = match caller.role {
+        wrela_flow_wir::FunctionRole::TaskEntry(task) => PlanOwner::Task(task),
+        _ => return Ok(Vec::new()),
+    };
+    check_report_cancelled(is_cancelled)?;
+    let exact = caller.id == plan.caller
+        && caller.color == wrela_flow_wir::FunctionColor::Async
+        && caller.entry == entry.id
+        && resume.id == expected_resume.id
+        && resume.id != entry.id
+        && matches!(&call.operation,
+            wrela_flow_wir::FlowOperation::AsyncCall { function, plan: called, .. }
+                if *function == plan.callee && *called == plan.id)
+        && matches!(entry.terminator,
+            wrela_flow_wir::Terminator::Suspend { state: 0, activation: value, resume: target }
+                if value == *activation_value && target == resume.id)
+        && matches!(&resume.terminator, wrela_flow_wir::Terminator::Return(values) if values.is_empty())
+        && sole_reset.id == reset.id
+        && reset.results.is_empty()
+        && reset.source == Some(plan.source)
+        && matches!(reset.operation,
+            wrela_flow_wir::FlowOperation::RegionReset { region } if region == plan.region)
+        && region.id == plan.region
+        && region.class == wrela_flow_wir::RegionClass::TaskFrame
+        && region.owner == expected_owner
+        && region.reset_function.is_none()
+        && region.source == plan.source
+        && region.capacity_bytes == plan.frame_bytes
+        && region.capacity_bytes != 0
+        && region.alignment != 0
+        && region.alignment.is_power_of_two()
+        && region.capacity_proof == plan.capacity_proof
+        && proof.id == plan.capacity_proof
+        && proof.kind == wrela_flow_wir::ProofKind::CapacityBound
+        && proof.sources.as_slice() == [plan.source];
+    let Some(capacity_bound) = proof.bound.filter(|bound| *bound != 0) else {
+        return Ok(Vec::new());
+    };
+    if !exact {
+        return Ok(Vec::new());
+    }
+    check_report_cancelled(is_cancelled)?;
+    let mut resets = Vec::new();
+    resets
+        .try_reserve_exact(1)
+        .map_err(|_| BackendReportError::ResourceExhausted("activation frame resets"))?;
+    resets.push(ActivationFrameResetFact {
+        plan: plan.id.0,
+        region: named_identity_cancellable("region", region.id.0, &region.name, is_cancelled)?,
+        owner: owner_name_cancellable(flow, region.owner, is_cancelled)?,
+        source: source_identity(
+            plan.source.file.0,
+            plan.source.range.start,
+            plan.source.range.end,
+        )?,
+        region_class: wrela_image_report::RegionClass::TaskFrame,
+        capacity_bytes: region.capacity_bytes,
+        alignment: region.alignment,
+        capacity_proof: plan.capacity_proof.0,
+        capacity_bound,
+    });
+    Ok(resets)
 }
 
 fn exact_region_capacity_proof(
@@ -1801,6 +1923,7 @@ fn require_exact_analysis_binding(
         && expected.actor_lowerings == reported.actor_lowerings
         && expected.image_nodes == reported.image_nodes
         && expected.region_capacity_evidence == reported.region_capacity_evidence
+        && expected.activation_frame_resets == reported.activation_frame_resets
         && expected.image_edges == reported.image_edges
         && expected.work == reported.work
         && expected.hardware == reported.hardware
@@ -3230,8 +3353,8 @@ mod tests {
         ValueId,
     };
     use wrela_image_report::{
-        ActivationCancellationFact, ActivationFrameEvidenceFact, ActorPlacementInputFact,
-        AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts, ProofFact,
+        ActivationCancellationFact, ActivationFrameEvidenceFact, ActivationFrameResetFact,
+        ActorPlacementInputFact, AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts, ProofFact,
         RegionCapacityEvidenceFact, ReportError, seal_analysis_facts,
     };
     use wrela_source::{FileId, Span, TextRange};
@@ -3242,8 +3365,8 @@ mod tests {
         BackendJobPaths, BackendLimits, BackendReportError, CanonicalBackendContentHasher,
         MachineLowerError, actor_placement_inputs, analysis_facts,
         canonical_runtime_intrinsic_names, exact_region_capacity_proof,
-        report_artifact_measurements_match, report_region_kind, reportable_activation_regions,
-        require_exact_analysis_binding, source_identity,
+        report_artifact_measurements_match, report_region_kind, reportable_activation_frame_resets,
+        reportable_activation_regions, require_exact_analysis_binding, source_identity,
     };
 
     #[test]
@@ -4719,6 +4842,165 @@ mod tests {
             }),
             Err(BackendReportError::Cancelled)
         );
+    }
+
+    /// The exact completed-activation profile: the task-entry caller suspends
+    /// on its single immediate activation and resets that activation's own
+    /// task-frame region as the only instruction of the resume block.
+    fn completed_activation_reset_report_flow_fixture()
+    -> (wrela_flow_wir::ValidatedFlowWir, TargetPackage) {
+        let (flow, target) = task_activation_report_flow_fixture();
+        let mut flow = flow.as_wir().clone();
+        let source = flow.activations[0].source;
+        flow.name = "completed-activation-reset-report-image".to_owned();
+        flow.functions[1].blocks[1].instructions = vec![Instruction {
+            id: InstructionId(1),
+            results: Vec::new(),
+            operation: FlowOperation::RegionReset {
+                region: flow.activations[0].region,
+            },
+            source: Some(source),
+        }];
+        (
+            flow.validate()
+                .expect("validated completed-activation reset report FlowWir"),
+            target,
+        )
+    }
+
+    #[test]
+    fn completed_activation_reset_projects_exact_task_frame_region_contract() {
+        let (flow, target) = completed_activation_reset_report_flow_fixture();
+        let projected = analysis_facts(flow.as_wir(), &target, &|| false)
+            .expect("project completed-activation reset report facts");
+        assert_eq!(
+            projected.activation_frame_resets,
+            [ActivationFrameResetFact {
+                plan: 0,
+                region: "region:3:async-unit.async-activation-frame".to_owned(),
+                owner: "task:0:task".to_owned(),
+                source: "file:0:bytes:0..0".to_owned(),
+                region_class: wrela_image_report::RegionClass::TaskFrame,
+                capacity_bytes: 8,
+                alignment: 8,
+                capacity_proof: 9,
+                capacity_bound: 1,
+            }]
+        );
+        let [activation] = projected.activation_frame_evidence.as_slice() else {
+            panic!("one exact completed activation evidence record")
+        };
+        assert_eq!(activation.plan, projected.activation_frame_resets[0].plan);
+        assert_eq!(
+            activation.region,
+            projected.activation_frame_resets[0].region
+        );
+        assert_eq!(activation.owner, projected.activation_frame_resets[0].owner);
+        assert_eq!(
+            activation.frame_bytes,
+            projected.activation_frame_resets[0].capacity_bytes
+        );
+        seal_analysis_facts(
+            AnalysisFactRequest {
+                build: &flow.as_wir().build,
+                image_name: &flow.as_wir().name,
+                limits: AnalysisFactLimits::standard(),
+            },
+            projected.clone(),
+            &|| false,
+        )
+        .expect("seal exact completed-activation reset contract");
+
+        // A report that claims a different region contract than the FlowWir
+        // authenticated is rejected at the exact analysis binding.
+        for mutate in [
+            |facts: &mut AnalysisFacts| facts.activation_frame_resets[0].capacity_bytes = 16,
+            |facts: &mut AnalysisFacts| facts.activation_frame_resets[0].capacity_bound = 2,
+            |facts: &mut AnalysisFacts| facts.activation_frame_resets[0].capacity_proof = 5,
+            |facts: &mut AnalysisFacts| {
+                facts.activation_frame_resets[0].owner = "actor:0:actor".to_owned();
+            },
+            |facts: &mut AnalysisFacts| facts.activation_frame_resets.clear(),
+        ] {
+            let mut substituted = projected.clone();
+            mutate(&mut substituted);
+            assert_eq!(
+                require_exact_analysis_binding(&projected, &substituted, &|| false),
+                Err(BackendReportError::Mismatch(
+                    "report analysis graph, bounds, proofs, or origins differ from FlowWir"
+                ))
+            );
+        }
+        assert_eq!(
+            require_exact_analysis_binding(&projected, &projected, &|| false),
+            Ok(())
+        );
+
+        // Every near miss of the admitted profile projects no reset at all
+        // rather than a partial or approximate region account.
+        let source_flow = flow.as_wir();
+        for (mutate_index, mutate) in [
+            (|flow: &mut FlowWir| {
+                flow.functions[1].blocks[1].instructions[0].source = None;
+            }) as fn(&mut FlowWir),
+            |flow: &mut FlowWir| {
+                flow.functions[1].blocks[1].instructions[0].operation =
+                    FlowOperation::RegionReset {
+                        region: RegionId(2),
+                    };
+            },
+            |flow: &mut FlowWir| {
+                let mut second = flow.functions[1].blocks[1].instructions[0].clone();
+                second.id = InstructionId(2);
+                flow.functions[1].blocks[1].instructions.push(second);
+            },
+            |flow: &mut FlowWir| {
+                flow.functions[1].blocks[1].instructions.clear();
+            },
+            |flow: &mut FlowWir| {
+                let mut reset = flow.functions[1].blocks[1].instructions.remove(0);
+                reset.id = InstructionId(0);
+                flow.functions[3].blocks[0].instructions.push(reset);
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut near_miss = source_flow.clone();
+            mutate(&mut near_miss);
+            let near_miss = near_miss.validate().unwrap_or_else(|error| {
+                panic!("near-miss {mutate_index} stays structurally valid FlowWir: {error:?}")
+            });
+            let projected = analysis_facts(near_miss.as_wir(), &target, &|| false)
+                .expect("project near-miss reset profile");
+            assert!(projected.activation_frame_resets.is_empty());
+        }
+
+        let polls = Cell::new(0_u64);
+        reportable_activation_frame_resets(source_flow, &|| {
+            polls.set(
+                polls
+                    .get()
+                    .checked_add(1)
+                    .expect("bounded reset projection polls"),
+            );
+            false
+        })
+        .expect("measure reset projection polls");
+        let exact_stop = polls.get();
+        let polls = Cell::new(0_u64);
+        assert_eq!(
+            reportable_activation_frame_resets(source_flow, &|| {
+                let next = polls
+                    .get()
+                    .checked_add(1)
+                    .expect("bounded reset projection polls");
+                polls.set(next);
+                next == exact_stop
+            }),
+            Err(BackendReportError::Cancelled)
+        );
+        assert_eq!(polls.get(), exact_stop);
     }
 
     #[test]

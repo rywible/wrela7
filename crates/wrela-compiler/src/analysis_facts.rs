@@ -2410,6 +2410,9 @@ fn assemble_projection(
         // Source semantic facts precede activation lowering. The backend adds
         // exact FlowWir ActivationPlan evidence after that sealed boundary.
         activation_frame_evidence: Vec::new(),
+        // Likewise, the completed-activation task-frame reset is authenticated
+        // against FlowWir `ActivationPlan`s and the reset instruction itself.
+        activation_frame_resets: Vec::new(),
         region_assignments: actor_facts.region_assignments,
         promotions: actor_facts.promotions,
         image_edges: actor_facts.image_edges,

@@ -1307,6 +1307,21 @@ it. It injects phase implementations and bounded host capabilities, while
   producer leave both empty. Adding the arrays produced schema v12; exact
   identity/assignment/proof sealing bumps 12 to 13. The decoder accepts only
   the exact current version.
+- Schema v18 adds `ActivationFrameResetFact`: the exact task-frame region
+  contract re-established by one completed immediate activation's reset. Each
+  row carries the dense activation plan it belongs to, the region and owning
+  task identities, the await source span, the inferred `RegionClass`, the exact
+  capacity bytes and alignment, and the dense capacity proof plus that proof's
+  finite bound. Validation requires strictly increasing plans, a one-to-one join
+  to the same report's `ActivationFrameEvidenceFact`, agreement with the
+  published region node, its capacity-evidence row, and its `region-capacity`
+  and `region-alignment` bounds, a `capacity-bound`/`proved` proof carrying the
+  stated nonzero bound, a `task-frame` class, and a power-of-two alignment. The
+  vector is canonicalized, item/payload bounded, cancellation-aware, and round
+  trips through canonical JSON and the decoder. Only the FlowWir report producer
+  populates it, and only for the exact admitted completed-activation profile;
+  every other image — including every semantic-tier projection — leaves it
+  empty rather than publishing a partial region account.
 - Consumer needs met: the report exposes logical image topology and physical
   lowering, bounds, proof why-chains, actor paths, stack/frame/work/checkpoints,
   hardware/recovery, startup/shutdown, all IR/ABI versions, runtime intrinsics,

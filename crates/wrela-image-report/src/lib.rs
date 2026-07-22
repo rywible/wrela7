@@ -19,10 +19,12 @@ pub use decode::decode_image_report_json;
 /// retains the authenticated FlowWir scheduler ownership partition. Version 16
 /// adds the exact all-or-empty actor placement input set and binds reports to
 /// the current MachineWir v21 contract. Version 17 adds exact
-/// source-authenticated iso-pool/brand/region contracts. The decoder gates on
-/// this exact value, so every older representation is rejected as
+/// source-authenticated iso-pool/brand/region contracts. Version 18 adds the
+/// exact all-or-empty completed-activation task-frame reset contract
+/// (`ActivationFrameResetFact`). The decoder gates on this exact value, so
+/// every older representation is rejected as
 /// [`ReportError::UnsupportedSchema`].
-pub const REPORT_SCHEMA_VERSION: u32 = 17;
+pub const REPORT_SCHEMA_VERSION: u32 = 18;
 
 const CURRENT_SEMANTIC_WIR_VERSION: u32 = 15;
 const CURRENT_FLOW_WIR_VERSION: u32 = 19;
@@ -159,6 +161,32 @@ pub struct ActivationFrameEvidenceFact {
     pub maximum_live: u32,
     pub cancellation: ActivationCancellationFact,
     pub capacity_proof: u32,
+}
+
+/// Exact evidence that one completed immediate activation's task-frame region
+/// is reset at the await that completed it (ch03 §6.2).
+///
+/// `plan` joins this record to exactly the [`ActivationFrameEvidenceFact`] with
+/// the same dense `ActivationPlan` ID, so the caller/callee/cancellation of the
+/// await that this reset follows is read from that record rather than repeated
+/// here. Everything retained here is the region contract the reset re-establishes:
+/// the inferred [`RegionClass`], the owning task, the exact capacity and
+/// alignment, and the dense capacity proof plus the finite bound that proof
+/// establishes.
+///
+/// This is static image evidence that the reset is emitted and bounded. It does
+/// not claim that any wider region-reset, arena, or promotion runtime exists.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ActivationFrameResetFact {
+    pub plan: u32,
+    pub region: String,
+    pub owner: String,
+    pub source: String,
+    pub region_class: RegionClass,
+    pub capacity_bytes: u64,
+    pub alignment: u64,
+    pub capacity_proof: u32,
+    pub capacity_bound: u64,
 }
 
 /// Region class one allocation is assigned by whole-image region inference.
@@ -302,6 +330,10 @@ pub struct AnalysisFacts {
     /// source-authenticated iso-pool producer is present.
     pub iso_pools: Vec<IsoPoolFact>,
     pub activation_frame_evidence: Vec<ActivationFrameEvidenceFact>,
+    /// Exact task-frame region resets emitted at a completed await. Empty
+    /// unless the image matches the exact admitted completed-activation
+    /// profile; never a partial or approximate region account.
+    pub activation_frame_resets: Vec<ActivationFrameResetFact>,
     /// Inferred region class per reportable allocation (ch03 §7). Empty for
     /// images without a supported whole-image allocation producer.
     pub region_assignments: Vec<RegionAssignmentFact>,
@@ -1138,6 +1170,37 @@ impl ImageReport {
             );
             output.push('}');
         }
+        output.push_str("],\"activation_frame_resets\":[");
+        for (index, fact) in self.analysis.activation_frame_resets.iter().enumerate() {
+            if is_cancelled() {
+                return Err(ReportError::Cancelled);
+            }
+            if index != 0 {
+                output.push(',');
+            }
+            output.push('{');
+            json_number(&mut output, "plan", u64::from(fact.plan), false);
+            json_string(&mut output, "region", &fact.region, true, is_cancelled)?;
+            json_string(&mut output, "owner", &fact.owner, true, is_cancelled)?;
+            json_string(&mut output, "source", &fact.source, true, is_cancelled)?;
+            json_string(
+                &mut output,
+                "region_class",
+                fact.region_class.as_str(),
+                true,
+                is_cancelled,
+            )?;
+            json_number(&mut output, "capacity_bytes", fact.capacity_bytes, true);
+            json_number(&mut output, "alignment", fact.alignment, true);
+            json_number(
+                &mut output,
+                "capacity_proof",
+                u64::from(fact.capacity_proof),
+                true,
+            );
+            json_number(&mut output, "capacity_bound", fact.capacity_bound, true);
+            output.push('}');
+        }
         output.push_str("],\"image_edges\":[");
         for (index, fact) in self.analysis.image_edges.iter().enumerate() {
             if is_cancelled() {
@@ -1741,6 +1804,7 @@ fn canonicalize_analysis(
     cancellable_sort(&mut analysis.iso_pools, is_cancelled)?;
     cancellable_sort(&mut analysis.region_capacity_evidence, is_cancelled)?;
     cancellable_sort(&mut analysis.activation_frame_evidence, is_cancelled)?;
+    cancellable_sort(&mut analysis.activation_frame_resets, is_cancelled)?;
     cancellable_sort(&mut analysis.region_assignments, is_cancelled)?;
     cancellable_sort(&mut analysis.promotions, is_cancelled)?;
     cancellable_sort(&mut analysis.image_edges, is_cancelled)?;
@@ -1804,6 +1868,7 @@ fn measure_analysis(
         analysis.iso_pools.len(),
         analysis.region_capacity_evidence.len(),
         analysis.activation_frame_evidence.len(),
+        analysis.activation_frame_resets.len(),
         analysis.region_assignments.len(),
         analysis.promotions.len(),
         analysis.image_edges.len(),
@@ -1922,6 +1987,11 @@ fn measure_analysis(
             &fact.owner,
             &fact.source,
         ] {
+            add(value)?;
+        }
+    }
+    for fact in &analysis.activation_frame_resets {
+        for value in [&fact.region, &fact.owner, &fact.source] {
             add(value)?;
         }
     }
@@ -2099,6 +2169,11 @@ fn validate_analysis(
     require_canonical(
         "activation frame evidence",
         &analysis.activation_frame_evidence,
+        is_cancelled,
+    )?;
+    require_canonical(
+        "activation frame resets",
+        &analysis.activation_frame_resets,
         is_cancelled,
     )?;
     require_canonical(
@@ -2361,6 +2436,34 @@ fn validate_analysis(
             return Err(ReportError::InvalidFact);
         }
     }
+    let mut prior_reset_plan: Option<u32> = None;
+    for fact in &analysis.activation_frame_resets {
+        if is_cancelled() {
+            return Err(ReportError::Cancelled);
+        }
+        // A reset record is only meaningful when it names an activation plan
+        // this same report already publishes. A reset without its plan, or a
+        // second reset for one plan, is not evidence the report can carry.
+        let plan_index =
+            usize::try_from(fact.plan).map_err(|_| ReportError::MeasurementOverflow)?;
+        if prior_reset_plan.is_some_and(|prior| prior >= fact.plan)
+            || analysis
+                .activation_frame_evidence
+                .get(plan_index)
+                .is_none_or(|activation| activation.plan != fact.plan)
+            || !nonempty(&fact.region, is_cancelled)?
+            || !nonempty(&fact.owner, is_cancelled)?
+            || !canonical_source_identity(&fact.source, is_cancelled)?
+            || fact.region_class != RegionClass::TaskFrame
+            || fact.capacity_bytes == 0
+            || fact.alignment == 0
+            || !fact.alignment.is_power_of_two()
+            || fact.capacity_bound == 0
+        {
+            return Err(ReportError::InvalidFact);
+        }
+        prior_reset_plan = Some(fact.plan);
+    }
     for fact in &analysis.image_edges {
         if !nonempty(&fact.kind, is_cancelled)?
             || !nonempty(&fact.source, is_cancelled)?
@@ -2507,6 +2610,65 @@ fn validate_image_graph(
             return Err(ReportError::NonCanonical(
                 "region capacity evidence identities",
             ));
+        }
+    }
+
+    for fact in &analysis.activation_frame_resets {
+        if is_cancelled() {
+            return Err(ReportError::Cancelled);
+        }
+        // The reset must agree exactly with the activation record it names, the
+        // published region node, that node's capacity evidence, and the bounds
+        // and capacity proof that region already carries. Any disagreement is a
+        // forged or approximate region account rather than a reset.
+        let plan_index =
+            usize::try_from(fact.plan).map_err(|_| ReportError::MeasurementOverflow)?;
+        let activation = analysis
+            .activation_frame_evidence
+            .get(plan_index)
+            .filter(|activation| activation.plan == fact.plan)
+            .ok_or(ReportError::InvalidFact)?;
+        let region_id = canonical_named_identity_id(&fact.region, "region", is_cancelled)?
+            .ok_or(ReportError::InvalidFact)?;
+        let node = indexed_image_node(analysis, &nodes, &fact.region, is_cancelled)?
+            .filter(|node| is_reportable_region_kind(&node.kind))
+            .ok_or(ReportError::InvalidFact)?;
+        let evidence = region_evidence
+            .binary_search_by_key(&region_id, |(id, _)| *id)
+            .ok()
+            .and_then(|position| region_evidence.get(position))
+            .and_then(|(_, position)| analysis.region_capacity_evidence.get(*position))
+            .ok_or(ReportError::InvalidFact)?;
+        let proof = analysis
+            .proofs
+            .get(
+                usize::try_from(fact.capacity_proof)
+                    .map_err(|_| ReportError::MeasurementOverflow)?,
+            )
+            .filter(|proof| {
+                proof.id == fact.capacity_proof
+                    && proof.category == "capacity-bound"
+                    && proof.bound == Some(fact.capacity_bound)
+            })
+            .ok_or(ReportError::InvalidFact)?;
+        let capacity = unique_bound(analysis, "region-capacity", &fact.region, is_cancelled)?;
+        let alignment = unique_bound(analysis, "region-alignment", &fact.region, is_cancelled)?;
+        if !text_equal_cancellable(&activation.region, &fact.region, is_cancelled)?
+            || !text_equal_cancellable(&activation.owner, &fact.owner, is_cancelled)?
+            || !text_equal_cancellable(&activation.source, &fact.source, is_cancelled)?
+            || activation.frame_bytes != fact.capacity_bytes
+            || activation.capacity_proof != fact.capacity_proof
+            || !text_equal_cancellable(&node.owner, &fact.owner, is_cancelled)?
+            || !text_equal_cancellable(&node.source, &fact.source, is_cancelled)?
+            || node.static_bytes != fact.capacity_bytes
+            || evidence.capacity_proof != fact.capacity_proof
+            || proof.id != fact.capacity_proof
+            || capacity.unit != "bytes"
+            || capacity.amount != fact.capacity_bytes
+            || alignment.unit != "bytes"
+            || alignment.amount != fact.alignment
+        {
+            return Err(ReportError::InvalidFact);
         }
     }
 
@@ -3911,13 +4073,14 @@ mod tests {
     use wrela_build_model::{BuildIdentity, LanguageRevision, Sha256Digest, TargetIdentity};
 
     use super::{
-        ActivationCancellationFact, ActivationFrameEvidenceFact, ActorPlacementInputFact,
-        AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts,
-        BoundFact, ImageEdgeFact, ImageNodeFact, ImageReport, IsoPoolFact, OptimizationAction,
-        OptimizationDecisionFact, PromotionFact, ProofFact, RegionAssignmentFact,
-        RegionCapacityEvidenceFact, RegionClass, ReportError, SchedulerOwnershipFact, SectionFact,
-        SymbolFact, ValidatedAnalysisFacts, WorkFact, cancellable_sort, decode_image_report_json,
-        push_json_string_cancellable, seal_analysis_facts,
+        ActivationCancellationFact, ActivationFrameEvidenceFact, ActivationFrameResetFact,
+        ActorPlacementInputFact, AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts,
+        BackendFactLimits, BackendFacts, BoundFact, ImageEdgeFact, ImageNodeFact, ImageReport,
+        IsoPoolFact, OptimizationAction, OptimizationDecisionFact, PromotionFact, ProofFact,
+        RegionAssignmentFact, RegionCapacityEvidenceFact, RegionClass, ReportError,
+        SchedulerOwnershipFact, SectionFact, SymbolFact, ValidatedAnalysisFacts, WorkFact,
+        cancellable_sort, decode_image_report_json, push_json_string_cancellable,
+        seal_analysis_facts,
     };
 
     fn build(digest: Sha256Digest) -> BuildIdentity {
@@ -4440,7 +4603,7 @@ mod tests {
         };
         let sealed = seal_analysis_facts(request, facts.clone(), &|| false)
             .expect("exact actor/task/region graph limit");
-        assert_eq!(super::REPORT_SCHEMA_VERSION, 17);
+        assert_eq!(super::REPORT_SCHEMA_VERSION, 18);
         assert_eq!(sealed.as_facts().image_nodes.len(), 8);
         assert_eq!(sealed.as_facts().region_capacity_evidence.len(), 5);
         assert_eq!(sealed.as_facts().activation_frame_evidence.len(), 2);
@@ -4550,7 +4713,7 @@ mod tests {
             .find("\"activation_frame_evidence\":[")
             .expect("activation evidence field");
         let activation_end = omitted_activation[activation_start..]
-            .find("],\"image_edges\":[")
+            .find("],\"activation_frame_resets\":[")
             .and_then(|offset| activation_start.checked_add(offset + 1))
             .expect("activation evidence extent");
         omitted_activation.replace_range(
@@ -4616,6 +4779,200 @@ mod tests {
                     .get()
                     .checked_add(1)
                     .expect("bounded graph cancellation polls");
+                polls.set(next);
+                next == cancel_at
+            }),
+            Err(ReportError::Cancelled)
+        );
+    }
+
+    fn completed_activation_reset_facts() -> AnalysisFacts {
+        let mut facts = actor_region_facts();
+        facts.activation_frame_resets = vec![ActivationFrameResetFact {
+            plan: 1,
+            region: "region:4:flush_task.async-activation-frame".to_owned(),
+            owner: "task:0:flush".to_owned(),
+            source: "file:0:bytes:61..70".to_owned(),
+            region_class: RegionClass::TaskFrame,
+            capacity_bytes: 16,
+            alignment: 8,
+            capacity_proof: 4,
+            capacity_bound: 1,
+        }];
+        facts
+    }
+
+    #[test]
+    fn completed_activation_frame_reset_is_exact_sealed_bounded_and_round_trips() {
+        let digest = Sha256Digest::from_bytes([0x4b; 32]);
+        let build = build(digest);
+        let facts = completed_activation_reset_facts();
+        let measured = super::measure_analysis(
+            &facts,
+            "reset-image",
+            AnalysisFactLimits::standard(),
+            &|| false,
+        )
+        .expect("measure exact completed-activation reset facts");
+        let exact = AnalysisFactLimits {
+            items: measured.0,
+            proof_edges: measured.1,
+            payload_bytes: measured.2,
+        };
+        let request = AnalysisFactRequest {
+            build: &build,
+            image_name: "reset-image",
+            limits: exact,
+        };
+        let sealed = seal_analysis_facts(request, facts.clone(), &|| false)
+            .expect("exact completed-activation reset limit");
+        assert_eq!(
+            sealed.as_facts().activation_frame_resets,
+            [ActivationFrameResetFact {
+                plan: 1,
+                region: "region:4:flush_task.async-activation-frame".to_owned(),
+                owner: "task:0:flush".to_owned(),
+                source: "file:0:bytes:61..70".to_owned(),
+                region_class: RegionClass::TaskFrame,
+                capacity_bytes: 16,
+                alignment: 8,
+                capacity_proof: 4,
+                capacity_bound: 1,
+            }]
+        );
+        let report = ImageReport::new(
+            build.clone(),
+            "reset-image".to_owned(),
+            sealed,
+            backend(digest),
+            BackendFactLimits::standard(),
+            &|| false,
+        )
+        .expect("completed-activation reset report");
+        let json = report.to_json();
+        assert!(json.contains(
+            "\"activation_frame_resets\":[{\"plan\":1,\"region\":\"region:4:flush_task.async-activation-frame\",\"owner\":\"task:0:flush\",\"source\":\"file:0:bytes:61..70\",\"region_class\":\"task-frame\",\"capacity_bytes\":16,\"alignment\":8,\"capacity_proof\":4,\"capacity_bound\":1}]"
+        ));
+        assert_eq!(
+            decode_image_report_json(
+                json.as_bytes(),
+                &build,
+                exact,
+                BackendFactLimits::standard(),
+                u64::try_from(json.len()).expect("bounded reset report bytes"),
+                &|| false,
+            )
+            .expect("canonical completed-activation reset round trip"),
+            report
+        );
+
+        // Every substitution that would let the reset describe a different
+        // region contract than the one FlowWir authenticated must fail closed.
+        for (mutate_index, mutate) in [
+            |facts: &mut AnalysisFacts| facts.activation_frame_resets[0].plan = 0,
+            |facts: &mut AnalysisFacts| facts.activation_frame_resets[0].plan = 2,
+            |facts: &mut AnalysisFacts| {
+                facts.activation_frame_resets[0].region =
+                    "region:3:worker_turn.async-activation-frame".to_owned();
+            },
+            |facts: &mut AnalysisFacts| {
+                facts.activation_frame_resets[0].owner = "actor:1:worker".to_owned();
+            },
+            |facts: &mut AnalysisFacts| {
+                facts.activation_frame_resets[0].source = "file:0:bytes:61..71".to_owned();
+            },
+            |facts: &mut AnalysisFacts| {
+                facts.activation_frame_resets[0].region_class = RegionClass::Call;
+            },
+            |facts: &mut AnalysisFacts| facts.activation_frame_resets[0].capacity_bytes = 8,
+            |facts: &mut AnalysisFacts| facts.activation_frame_resets[0].alignment = 16,
+            |facts: &mut AnalysisFacts| facts.activation_frame_resets[0].capacity_proof = 2,
+            |facts: &mut AnalysisFacts| facts.activation_frame_resets[0].capacity_bound = 2,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut forged = facts.clone();
+            mutate(&mut forged);
+            assert!(
+                matches!(
+                    seal_analysis_facts(
+                        AnalysisFactRequest {
+                            limits: AnalysisFactLimits::standard(),
+                            ..request
+                        },
+                        forged,
+                        &|| false,
+                    ),
+                    Err(ReportError::InvalidFact)
+                ),
+                "reset forgery {mutate_index} must fail closed"
+            );
+        }
+
+        // Two reset records for one activation plan are rejected as
+        // noncanonical before any join runs, so a duplicated reset can never be
+        // read as two bounded resets.
+        let mut duplicated = facts.clone();
+        let duplicate = duplicated.activation_frame_resets[0].clone();
+        duplicated.activation_frame_resets.push(duplicate);
+        assert_eq!(
+            seal_analysis_facts(
+                AnalysisFactRequest {
+                    limits: AnalysisFactLimits::standard(),
+                    ..request
+                },
+                duplicated,
+                &|| false,
+            ),
+            Err(ReportError::NonCanonical("activation frame resets"))
+        );
+
+        for (resource, limits) in [
+            (
+                "analysis fact items",
+                AnalysisFactLimits {
+                    items: exact.items - 1,
+                    ..exact
+                },
+            ),
+            (
+                "analysis fact payload",
+                AnalysisFactLimits {
+                    payload_bytes: exact.payload_bytes - 1,
+                    ..exact
+                },
+            ),
+        ] {
+            assert!(matches!(
+                seal_analysis_facts(
+                    AnalysisFactRequest { limits, ..request },
+                    facts.clone(),
+                    &|| false,
+                ),
+                Err(ReportError::ResourceLimit { resource: actual, .. }) if actual == resource
+            ));
+        }
+
+        let polls = Cell::new(0_u64);
+        seal_analysis_facts(request, facts.clone(), &|| {
+            polls.set(
+                polls
+                    .get()
+                    .checked_add(1)
+                    .expect("bounded reset cancellation polls"),
+            );
+            false
+        })
+        .expect("measure reset cancellation polls");
+        let cancel_at = polls.get();
+        let polls = Cell::new(0_u64);
+        assert_eq!(
+            seal_analysis_facts(request, facts, &|| {
+                let next = polls
+                    .get()
+                    .checked_add(1)
+                    .expect("bounded reset cancellation polls");
                 polls.set(next);
                 next == cancel_at
             }),
@@ -5337,7 +5694,7 @@ mod tests {
         let digest = Sha256Digest::from_bytes([0x67; 32]);
         let minimum = assemble(digest, AnalysisFacts::default(), backend(digest))
             .expect("minimum one-block DIR64 relocation evidence");
-        assert_eq!(minimum.schema(), 17);
+        assert_eq!(minimum.schema(), 18);
         assert_eq!(minimum.backend().relocation_directory_bytes, 12);
         assert_eq!(minimum.backend().base_relocation_blocks, 1);
         assert_eq!(minimum.backend().base_relocation_dir64_count, 1);
@@ -5794,7 +6151,7 @@ mod tests {
         ];
         let digest_build = build(digest);
         let report = assemble(digest, facts, backend(digest)).expect("assemble region report");
-        assert_eq!(report.schema(), 17);
+        assert_eq!(report.schema(), 18);
         // Canonicalization sorted both vectors by their derived total order.
         assert_eq!(
             report

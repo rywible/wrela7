@@ -8,14 +8,14 @@ use wrela_test_model::{
 };
 
 use crate::{
-    ActivationCancellationFact, ActivationFrameEvidenceFact, ActorLoweringFact, ActorLoweringKind,
-    ActorPlacementInputFact, AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts,
-    BackendFactLimits, BackendFacts, BoundFact, HardwareFact, ImageEdgeFact, ImageNodeFact,
-    ImageReport, IsoPoolFact, OptimizationAction, OptimizationDecisionFact, PromotionFact,
-    ProofFact, REPORT_SCHEMA_VERSION, RecoveryFact, RegionAssignmentFact,
-    RegionCapacityEvidenceFact, RegionClass, ReportError, RepresentationFacts,
-    SchedulerOwnershipFact, SectionFact, SymbolFact, WorkFact, copy_build_identity,
-    seal_analysis_facts,
+    ActivationCancellationFact, ActivationFrameEvidenceFact, ActivationFrameResetFact,
+    ActorLoweringFact, ActorLoweringKind, ActorPlacementInputFact, AnalysisFactLimits,
+    AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts, BoundFact, HardwareFact,
+    ImageEdgeFact, ImageNodeFact, ImageReport, IsoPoolFact, OptimizationAction,
+    OptimizationDecisionFact, PromotionFact, ProofFact, REPORT_SCHEMA_VERSION, RecoveryFact,
+    RegionAssignmentFact, RegionCapacityEvidenceFact, RegionClass, ReportError,
+    RepresentationFacts, SchedulerOwnershipFact, SectionFact, SymbolFact, WorkFact,
+    copy_build_identity, seal_analysis_facts,
 };
 
 /// Decode and authenticate one canonical schema-v16 image report.
@@ -168,6 +168,13 @@ pub fn decode_image_report_json(
         ])?;
         Ok(fact)
     })?;
+    parser.field("activation_frame_resets", false)?;
+    let activation_frame_resets = parse_array(&mut parser, |parser| {
+        budget.analysis_item()?;
+        let fact = parse_activation_frame_reset(parser)?;
+        budget.analysis_payloads([&fact.region, &fact.owner, &fact.source])?;
+        Ok(fact)
+    })?;
     parser.field("image_edges", false)?;
     let image_edges = parse_array(&mut parser, |parser| {
         budget.analysis_item()?;
@@ -298,6 +305,7 @@ pub fn decode_image_report_json(
         iso_pools,
         region_capacity_evidence,
         activation_frame_evidence,
+        activation_frame_resets,
         region_assignments,
         promotions,
         image_edges,
@@ -633,6 +641,42 @@ fn parse_activation_frame_evidence(
         maximum_live,
         cancellation,
         capacity_proof,
+    })
+}
+
+fn parse_activation_frame_reset(
+    parser: &mut Parser<'_>,
+) -> Result<ActivationFrameResetFact, ReportError> {
+    parser.object_start()?;
+    parser.field("plan", true)?;
+    let plan = parser.u32("activation reset plan identifier")?;
+    parser.field("region", false)?;
+    let region = parser.string()?;
+    parser.field("owner", false)?;
+    let owner = parser.string()?;
+    parser.field("source", false)?;
+    let source = parser.string()?;
+    parser.field("region_class", false)?;
+    let region_class = parse_region_class(parser)?;
+    parser.field("capacity_bytes", false)?;
+    let capacity_bytes = parser.u64("activation reset capacity byte count")?;
+    parser.field("alignment", false)?;
+    let alignment = parser.u64("activation reset alignment")?;
+    parser.field("capacity_proof", false)?;
+    let capacity_proof = parser.u32("activation reset capacity proof identifier")?;
+    parser.field("capacity_bound", false)?;
+    let capacity_bound = parser.u64("activation reset capacity bound")?;
+    parser.object_end()?;
+    Ok(ActivationFrameResetFact {
+        plan,
+        region,
+        owner,
+        source,
+        region_class,
+        capacity_bytes,
+        alignment,
+        capacity_proof,
+        capacity_bound,
     })
 }
 
@@ -1655,6 +1699,7 @@ mod tests {
                 },
             ],
             activation_frame_evidence: Vec::new(),
+            activation_frame_resets: Vec::new(),
             region_assignments: vec![
                 RegionAssignmentFact {
                     allocation: "alloc:0:actor-state".to_owned(),
@@ -1975,15 +2020,15 @@ mod tests {
     #[test]
     fn schema_scalar_enum_and_json_structure_mutations_fail_closed() {
         let json = full_report(ActorLoweringKind::Queued, OptimizationAction::Retained).to_json();
-        let schema = json.replacen("\"schema\":17", "\"schema\":18", 1);
+        let schema = json.replacen("\"schema\":18", "\"schema\":19", 1);
         assert_eq!(
             decode(schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(18))
+            Err(ReportError::UnsupportedSchema(19))
         );
-        let stale_schema = json.replacen("\"schema\":17", "\"schema\":16", 1);
+        let stale_schema = json.replacen("\"schema\":18", "\"schema\":17", 1);
         assert_eq!(
             decode(stale_schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(16))
+            Err(ReportError::UnsupportedSchema(17))
         );
 
         let oversized_u32 = json.replacen(
