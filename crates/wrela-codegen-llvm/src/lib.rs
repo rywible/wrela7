@@ -1343,6 +1343,143 @@ mod contract_tests {
         (validated, target)
     }
 
+    fn ordinary_aggregate_reader_machine_fixture() -> (ValidatedMachineWir, TargetPackage) {
+        let (validated, target) = normal_cleanup_machine_fixture();
+        let mut machine = validated.into_wir();
+        let source = Span {
+            file: FileId(0),
+            range: TextRange {
+                start: 100,
+                end: 124,
+            },
+        };
+        machine.name = "ordinary-aggregate-reader".to_owned();
+        machine.types[4].kind = MachineTypeKind::Struct {
+            fields: vec![
+                wrela_machine_wir::MachineField {
+                    ty: MachineTypeId(3),
+                    offset: 0,
+                },
+                wrela_machine_wir::MachineField {
+                    ty: MachineTypeId(3),
+                    offset: 4,
+                },
+            ],
+            packed: false,
+        };
+        machine.types[4].size = 8;
+
+        let reader = &mut machine.functions[1];
+        reader.role = MachineFunctionRole::Ordinary;
+        reader.result = MachineTypeId(3);
+        reader.values.push(MachineValue {
+            id: ValueId(1),
+            ty: MachineTypeId(3),
+            source_name: Some("projected".to_owned()),
+        });
+        reader.blocks[0].instructions = vec![MachineInstruction {
+            id: InstructionId(0),
+            results: vec![ValueId(1)],
+            operation: MachineOperation::ExtractField {
+                aggregate: ValueId(0),
+                field: 1,
+            },
+            source: Some(source),
+        }];
+        reader.blocks[0].terminator = MachineTerminator::Return(vec![ValueId(1)]);
+        reader.proofs.clear();
+        reader.source = Some(source);
+
+        let caller = &mut machine.functions[2];
+        caller.origin = MachineFunctionOrigin::SourceSemantic {
+            semantic_function: 2,
+        };
+        caller.role = MachineFunctionRole::Ordinary;
+        caller.parameters.clear();
+        caller.result = MachineTypeId(3);
+        caller.proofs.clear();
+        caller.values = vec![
+            MachineValue {
+                id: ValueId(0),
+                ty: MachineTypeId(3),
+                source_name: None,
+            },
+            MachineValue {
+                id: ValueId(1),
+                ty: MachineTypeId(3),
+                source_name: None,
+            },
+            MachineValue {
+                id: ValueId(2),
+                ty: MachineTypeId(4),
+                source_name: Some("pair".to_owned()),
+            },
+            MachineValue {
+                id: ValueId(3),
+                ty: MachineTypeId(3),
+                source_name: Some("observed".to_owned()),
+            },
+        ];
+        caller.blocks[0].instructions = vec![
+            MachineInstruction {
+                id: InstructionId(0),
+                results: vec![ValueId(0)],
+                operation: MachineOperation::Immediate(MachineImmediate::Integer {
+                    ty: MachineTypeId(3),
+                    bytes_le: 1_u32.to_le_bytes().to_vec(),
+                }),
+                source: Some(source),
+            },
+            MachineInstruction {
+                id: InstructionId(1),
+                results: vec![ValueId(1)],
+                operation: MachineOperation::Immediate(MachineImmediate::Integer {
+                    ty: MachineTypeId(3),
+                    bytes_le: 42_u32.to_le_bytes().to_vec(),
+                }),
+                source: Some(source),
+            },
+            MachineInstruction {
+                id: InstructionId(2),
+                results: vec![ValueId(2)],
+                operation: MachineOperation::MakeStruct {
+                    ty: MachineTypeId(4),
+                    fields: vec![ValueId(0), ValueId(1)],
+                },
+                source: Some(source),
+            },
+            MachineInstruction {
+                id: InstructionId(3),
+                results: vec![ValueId(3)],
+                operation: MachineOperation::Call {
+                    function: FunctionId(1),
+                    arguments: vec![ValueId(2)],
+                    convention: CallingConvention::Internal,
+                },
+                source: Some(source),
+            },
+        ];
+        caller.blocks[0].terminator = MachineTerminator::Return(vec![ValueId(3)]);
+        caller.source = Some(source);
+
+        let entry = &mut machine.functions[0];
+        entry.values.truncate(4);
+        entry.blocks[0].instructions.truncate(1);
+        let mut next = 0_u32;
+        for block in &mut entry.blocks {
+            for instruction in &mut block.instructions {
+                instruction.id = InstructionId(next);
+                next = next.saturating_add(1);
+            }
+        }
+        machine.proofs.truncate(1);
+        machine.sections[0].reserved_bytes = 896;
+        let validated = machine
+            .validate_for_target(&target)
+            .expect("valid ordinary aggregate reader MachineWir fixture");
+        (validated, target)
+    }
+
     fn storage_candidate() -> (MachineWir, TargetPackage) {
         let (mut machine, target) = machine_candidate();
         machine.name = "zero-initialized-storage-image".to_owned();
@@ -4344,6 +4481,63 @@ mod contract_tests {
             ),
             Err(CodegenError::UnsupportedMachineContract(
                 "unauthenticated aggregate cleanup call",
+            ))
+        );
+    }
+
+    #[test]
+    fn ordinary_two_field_reader_is_reauthenticated_and_forgery_fails_closed() {
+        let (machine, target) = ordinary_aggregate_reader_machine_fixture();
+        let request = CodegenRequest {
+            module: &machine,
+            target: target.backend(),
+            options: CodegenOptions::standard(),
+        };
+        super::preflight(&request, &|| false)
+            .expect("exact ordinary aggregate reader passes codegen preflight");
+        let first = super::ir::render_module(&request, &|| false)
+            .expect("ordinary aggregate reader renders to bounded LLVM IR");
+        let second = super::ir::render_module(&request, &|| false)
+            .expect("ordinary aggregate reader rerenders deterministically");
+        assert_eq!(first, second);
+        let text = std::str::from_utf8(&first).expect("LLVM IR is UTF-8");
+        assert!(
+            text.contains("define internal fastcc i32 @__wrela_fn_1({ i32, i32 } %v0)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("call fastcc i32 @__wrela_fn_1({ i32, i32 } %v2)"),
+            "{text}"
+        );
+
+        let mut forged = machine.into_wir();
+        let reader = &mut forged.functions[1];
+        reader.values.push(MachineValue {
+            id: ValueId(2),
+            ty: MachineTypeId(3),
+            source_name: Some("forged".to_owned()),
+        });
+        reader.blocks[0].instructions.push(MachineInstruction {
+            id: InstructionId(1),
+            results: vec![ValueId(2)],
+            operation: MachineOperation::Copy { value: ValueId(1) },
+            source: reader.source,
+        });
+        reader.blocks[0].terminator = MachineTerminator::Return(vec![ValueId(2)]);
+        let forged = forged
+            .validate_for_target(&target)
+            .expect("extra reader computation remains structurally valid");
+        assert_eq!(
+            super::preflight(
+                &CodegenRequest {
+                    module: &forged,
+                    target: target.backend(),
+                    options: CodegenOptions::standard(),
+                },
+                &|| false,
+            ),
+            Err(CodegenError::UnsupportedMachineContract(
+                "void or non-scalar function parameter",
             ))
         );
     }

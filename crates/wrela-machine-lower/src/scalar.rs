@@ -5013,8 +5013,18 @@ fn validate_native_struct_locality_contract(
     } else {
         None
     };
+    let reader_state = if has_native_parameter {
+        input
+            .map(|input| authenticated_flat_structure_reader(input, function, is_cancelled))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
     if function.parameters.iter().copied().any(|parameter| {
-        native(parameter) && cleanup_state != flow_value_type(function, parameter).ok()
+        native(parameter)
+            && cleanup_state != flow_value_type(function, parameter).ok()
+            && reader_state != flow_value_type(function, parameter).ok()
     }) || function.result_types.iter().copied().any(|ty| {
         flat_u64_struct_field(types, ty).is_none() && flat_native_struct_fields(types, ty).is_some()
     }) {
@@ -5072,6 +5082,18 @@ fn validate_native_struct_locality_contract(
                         })
                         .transpose()?
                         .unwrap_or(false)
+                    && !input
+                        .map(|input| {
+                            authenticated_flat_structure_reader_call(
+                                input,
+                                function,
+                                candidate,
+                                value,
+                                is_cancelled,
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or(false)
                 {
                     return Err(unsupported(
                         "machine-flat-structure-operation-lowering-pending",
@@ -5082,6 +5104,108 @@ fn validate_native_struct_locality_contract(
         }
     }
     check_cancelled(is_cancelled)
+}
+
+/// Authenticate the first ordinary owned-aggregate function boundary without
+/// widening the general aggregate ABI. The callee is deliberately exact: one
+/// source function, one two-field flat-copy parameter, one scalar projection,
+/// and one scalar return. Every adjacent aggregate parameter/result shape
+/// remains behind the named function-boundary diagnostic.
+fn authenticated_flat_structure_reader(
+    input: &flow::FlowWir,
+    function: &flow::FlowFunction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<flow::TypeId>, MachineLowerError> {
+    check_cancelled(is_cancelled)?;
+    let flow::FunctionOrigin::SourceSemantic { semantic_function } = function.origin else {
+        return Ok(None);
+    };
+    let ([parameter], [result_ty], [block]) = (
+        function.parameters.as_slice(),
+        function.result_types.as_slice(),
+        function.blocks.as_slice(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(parameter_ty) = function
+        .values
+        .get(parameter.0 as usize)
+        .map(|value| value.ty)
+    else {
+        return Ok(None);
+    };
+    let Some(fields) = flat_native_struct_fields(&input.types, parameter_ty) else {
+        return Ok(None);
+    };
+    let ([instruction], flow::Terminator::Return(returned)) =
+        (block.instructions.as_slice(), &block.terminator)
+    else {
+        return Ok(None);
+    };
+    let ([projected], flow::FlowOperation::ExtractField { aggregate, field }) =
+        (instruction.results.as_slice(), &instruction.operation)
+    else {
+        return Ok(None);
+    };
+    let field_ty = fields.get(*field as usize).copied();
+    let exact = semantic_function == function.id.0
+        && function.role == flow::FunctionRole::Ordinary
+        && function.color == flow::FunctionColor::Sync
+        && function.entry == block.id
+        && block.id == flow::BlockId(0)
+        && block.parameters.is_empty()
+        && function.stack_bound == 0
+        && function.frame_bound == 0
+        && function.source.is_some()
+        && instruction.source.is_some()
+        && fields.len() == 2
+        && function.values.len() == 2
+        && *aggregate == *parameter
+        && returned.as_slice() == [*projected]
+        && field_ty == Some(*result_ty)
+        && function
+            .values
+            .get(projected.0 as usize)
+            .is_some_and(|value| value.ty == *result_ty);
+    Ok(exact.then_some(parameter_ty))
+}
+
+fn authenticated_flat_structure_reader_call(
+    input: &flow::FlowWir,
+    caller: &flow::FlowFunction,
+    instruction: &flow::Instruction,
+    aggregate: flow::ValueId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, MachineLowerError> {
+    let flow::FlowOperation::Call {
+        function: callee,
+        arguments,
+    } = &instruction.operation
+    else {
+        return Ok(false);
+    };
+    let Some(callee) = input.functions.get(callee.0 as usize) else {
+        return Ok(false);
+    };
+    let Some(aggregate_ty) = authenticated_flat_structure_reader(input, callee, is_cancelled)?
+    else {
+        return Ok(false);
+    };
+    let [result] = instruction.results.as_slice() else {
+        return Ok(false);
+    };
+    Ok(matches!(caller.origin,
+            flow::FunctionOrigin::SourceSemantic { semantic_function }
+                if semantic_function == caller.id.0)
+        && caller.role == flow::FunctionRole::Ordinary
+        && caller.color == flow::FunctionColor::Sync
+        && instruction.source.is_some()
+        && arguments.as_slice() == [aggregate]
+        && flow_value_type(caller, aggregate).ok() == Some(aggregate_ty)
+        && callee
+            .result_types
+            .first()
+            .is_some_and(|ty| flow_value_type(caller, *result).ok() == Some(*ty)))
 }
 
 fn authenticated_cleanup_boundary_state(
