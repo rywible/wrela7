@@ -291,76 +291,477 @@ fn unsupported(feature: &'static str) -> LowerError {
     LowerError::UnsupportedInput { feature }
 }
 
-fn reject_stored_fixed_array_lowering(
-    input: &semantic::SemanticWir,
+fn reject_stored_fixed_array_abnormal_control(
+    statements: &[semantic::SemanticStatement],
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), LowerError> {
-    for function in &input.functions {
+    let mut regions = try_vec(
+        1,
+        "stored fixed-array user-body regions",
+        limits.model_edges,
+    )?;
+    regions.push((statements, 1_u32));
+    while let Some((statements, depth)) = regions.pop() {
         check_cancelled(is_cancelled)?;
-        let mut regions = try_vec(1, "stored fixed-array region scan", limits.model_edges)?;
-        regions.push(&function.body);
-        while let Some(region) = regions.pop() {
+        if depth > limits.region_depth {
+            return Err(LowerError::ResourceLimit {
+                resource: "stored fixed-array user-body region depth",
+                limit: u64::from(limits.region_depth),
+            });
+        }
+        for statement in statements {
             check_cancelled(is_cancelled)?;
-            for statement in &region.statements {
-                check_cancelled(is_cancelled)?;
-                match statement {
-                    semantic::SemanticStatement::Let(semantic::LetStatement {
-                        results,
-                        operation: semantic::SemanticOperation::Aggregate { ty, .. },
-                        ..
-                    }) if matches!(results.as_slice(), [result]
-                    if input.types.get(ty.0 as usize).is_some_and(|record| {
-                        matches!(record.kind, semantic::TypeKind::Array { length, .. } if length > 0)
-                    })
-                    && function.values.get(result.0 as usize).is_some_and(|value| {
-                        value.id == *result && value.ty == *ty && value.name.is_some()
-                    })) =>
-                    {
-                        return Err(unsupported(
-                            "flow-for-stored-array-lowering-pending (owned local array storage and indexed iteration)",
-                        ));
-                    }
-                    semantic::SemanticStatement::If {
-                        then_region,
-                        else_region,
-                        ..
-                    } => {
-                        push_bounded(
-                            &mut regions,
-                            then_region,
-                            "stored fixed-array region scan",
-                            limits.model_edges,
-                        )?;
-                        push_bounded(
-                            &mut regions,
-                            else_region,
-                            "stored fixed-array region scan",
-                            limits.model_edges,
-                        )?;
-                    }
-                    semantic::SemanticStatement::Match { arms, .. } => {
-                        for arm in arms {
-                            push_bounded(
-                                &mut regions,
-                                &arm.body,
-                                "stored fixed-array region scan",
-                                limits.model_edges,
-                            )?;
-                        }
-                    }
-                    semantic::SemanticStatement::Loop { body, .. } => {
-                        push_bounded(
-                            &mut regions,
-                            body,
-                            "stored fixed-array region scan",
-                            limits.model_edges,
-                        )?;
-                    }
-                    _ => {}
+            match statement {
+                semantic::SemanticStatement::Return(_)
+                | semantic::SemanticStatement::Break(_)
+                | semantic::SemanticStatement::Continue(_)
+                | semantic::SemanticStatement::Unreachable
+                | semantic::SemanticStatement::Loop { .. } => {
+                    return Err(unsupported("stored fixed-array user-body control flow"));
                 }
+                semantic::SemanticStatement::If {
+                    then_region,
+                    else_region,
+                    ..
+                } => {
+                    let child_depth = depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                        resource: "stored fixed-array user-body region depth",
+                        limit: u64::from(limits.region_depth),
+                    })?;
+                    push_bounded(
+                        &mut regions,
+                        (else_region.statements.as_slice(), child_depth),
+                        "stored fixed-array user-body regions",
+                        limits.model_edges,
+                    )?;
+                    push_bounded(
+                        &mut regions,
+                        (then_region.statements.as_slice(), child_depth),
+                        "stored fixed-array user-body regions",
+                        limits.model_edges,
+                    )?;
+                }
+                semantic::SemanticStatement::Match { arms, .. } => {
+                    let child_depth = depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                        resource: "stored fixed-array user-body region depth",
+                        limit: u64::from(limits.region_depth),
+                    })?;
+                    for arm in arms.iter().rev() {
+                        push_bounded(
+                            &mut regions,
+                            (arm.body.statements.as_slice(), child_depth),
+                            "stored fixed-array user-body regions",
+                            limits.model_edges,
+                        )?;
+                    }
+                }
+                semantic::SemanticStatement::Let(_) | semantic::SemanticStatement::Yield(_) => {}
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_stored_fixed_array_protocol(
+    input: &semantic::SemanticWir,
+    function: &semantic::SemanticFunction,
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), LowerError> {
+    let source_index = index_source_definitions(function, limits, is_cancelled)?;
+    let mut named_array_initializers = 0_u64;
+    for definition in &source_index.ordered {
+        check_cancelled(is_cancelled)?;
+        let semantic::SemanticOperation::Aggregate { ty, .. } = &definition.statement.operation
+        else {
+            continue;
+        };
+        let [result] = definition.statement.results.as_slice() else {
+            continue;
+        };
+        if definition.region == 0
+            && input.types.get(ty.0 as usize).is_some_and(|record| {
+                matches!(record.kind, semantic::TypeKind::Array { length, .. } if length > 0)
+            })
+            && function.values.get(result.0 as usize).is_some_and(|value| {
+                value.id == *result
+                    && value.ty == *ty
+                    && value.name.as_deref().is_some_and(|name| !name.is_empty())
+            })
+        {
+            named_array_initializers =
+                named_array_initializers
+                    .checked_add(1)
+                    .ok_or(LowerError::ResourceLimit {
+                        resource: "stored fixed-array initializers",
+                        limit: limits.model_edges,
+                    })?;
+        }
+    }
+    let mut stored_proofs = try_vec(
+        function.proofs.len(),
+        "stored fixed-array proofs",
+        limits.model_edges,
+    )?;
+    for proof in &function.proofs {
+        check_cancelled(is_cancelled)?;
+        if input.proofs.get(proof.0 as usize).is_some_and(|record| {
+            record.id == *proof && record.subject == "stored fixed-array iteration"
+        }) {
+            stored_proofs.push(*proof);
+        }
+    }
+    if named_array_initializers == 0 && stored_proofs.is_empty() {
+        return Ok(());
+    }
+    if named_array_initializers != 1 {
+        return Err(unsupported("stored fixed-array unique initializer"));
+    }
+    let proof_id = match stored_proofs.as_slice() {
+        [proof_id] => proof_id,
+        _ => {
+            return Err(unsupported("stored fixed-array unique capacity proof"));
+        }
+    };
+    let proof = input
+        .proofs
+        .get(proof_id.0 as usize)
+        .filter(|proof| proof.id == *proof_id)
+        .ok_or(unsupported("stored fixed-array proof identity"))?;
+    if proof.kind != semantic::ProofKind::CapacityBound
+        || proof.bound.is_none_or(|bound| bound == 0)
+        || proof.sources.len() != 2
+        || proof.sources[0] == proof.sources[1]
+        || !proof.depends_on.is_empty()
+        || proof.explanation.as_slice()
+            != [
+                "the immutable local retains the initializer's exact extent and every generated index is strictly below it",
+            ]
+    {
+        return Err(unsupported("stored fixed-array proof authority"));
+    }
+    let length = proof
+        .bound
+        .ok_or(unsupported("stored fixed-array proof extent"))?;
+    let mut aggregate = None;
+    for definition in &source_index.ordered {
+        check_cancelled(is_cancelled)?;
+        let semantic::SemanticOperation::Aggregate { ty, fields } = &definition.statement.operation
+        else {
+            continue;
+        };
+        let [result] = definition.statement.results.as_slice() else {
+            continue;
+        };
+        let Some((element, exact_length)) = input
+            .types
+            .get(ty.0 as usize)
+            .filter(|record| record.linearity == semantic::Linearity::ExplicitCopy)
+            .and_then(|record| match record.kind {
+                semantic::TypeKind::Array { element, length } => Some((element, length)),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let result_matches = function.values.get(result.0 as usize).is_some_and(|value| {
+            value.id == *result
+                && value.ty == *ty
+                && value.name.as_deref().is_some_and(|name| !name.is_empty())
+                && value.origin.is_some()
+        });
+        if definition.region != 0
+            || definition.statement.source != Some(proof.sources[0])
+            || exact_length != length
+            || u64::try_from(fields.len()) != Ok(length)
+            || !result_matches
+            || !matches!(
+                scalar_primitive(input, element),
+                Some(semantic::PrimitiveType::Bool | semantic::PrimitiveType::I64)
+            )
+        {
+            continue;
+        }
+        for field in fields {
+            let field_definition = source_index
+                .definitions
+                .get(field.0 as usize)
+                .and_then(Option::as_ref)
+                .ok_or(unsupported("stored fixed-array literal definition"))?;
+            let exact_literal = matches!(
+                (
+                    &field_definition.statement.operation,
+                    scalar_primitive(input, element)
+                ),
+                (
+                    semantic::SemanticOperation::Constant(semantic::Constant::Bool(_)),
+                    Some(semantic::PrimitiveType::Bool),
+                ) | (
+                    semantic::SemanticOperation::Constant(semantic::Constant::Signed {
+                        bits: 64,
+                        ..
+                    }),
+                    Some(semantic::PrimitiveType::I64),
+                )
+            );
+            if !exact_literal
+                || field_definition.region != definition.region
+                || field_definition.position >= definition.position
+                || scalar_value_type(function, *field) != Some(element)
+                || field_definition.statement.source.is_none()
+            {
+                return Err(unsupported("stored fixed-array literal aggregate"));
+            }
+        }
+        if aggregate
+            .replace((
+                *result,
+                element,
+                definition.statement.source,
+                definition.position,
+            ))
+            .is_some()
+        {
+            return Err(unsupported("stored fixed-array unique initializer"));
+        }
+    }
+    let (aggregate, element, _, aggregate_position) =
+        aggregate.ok_or(unsupported("stored fixed-array exact initializer"))?;
+    let mut matched_loops = 0_u64;
+    for (loop_position, statement) in function.body.statements.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        let semantic::SemanticStatement::Loop {
+            body,
+            carried,
+            uninterrupted_bound,
+            source: loop_source,
+        } = statement
+        else {
+            continue;
+        };
+        let (
+            [header],
+            [start, carried_header, exit],
+            [
+                semantic::SemanticStatement::Let(condition),
+                semantic::SemanticStatement::If {
+                    condition: branch_condition,
+                    then_region,
+                    else_region,
+                    results,
+                    source: branch_source,
+                },
+            ],
+        ) = (
+            body.parameters.as_slice(),
+            carried.as_slice(),
+            body.statements.as_slice(),
+        )
+        else {
+            continue;
+        };
+        let Some(semantic::SemanticStatement::Let(indexed)) = then_region.statements.first() else {
+            continue;
+        };
+        let semantic::SemanticOperation::Index {
+            base,
+            index,
+            proof: index_proof,
+        } = indexed.operation
+        else {
+            continue;
+        };
+        if base != aggregate && index_proof != *proof_id {
+            continue;
+        }
+        let loop_source = loop_source.ok_or(unsupported("stored fixed-array loop source"))?;
+        let iterable_source = proof.sources[1];
+        let iterable_is_contained = loop_source.file == iterable_source.file
+            && loop_source.range.start <= iterable_source.range.start
+            && iterable_source.range.end <= loop_source.range.end
+            && iterable_source.range.start < iterable_source.range.end;
+        let [condition_result] = condition.results.as_slice() else {
+            return Err(unsupported("stored fixed-array loop condition result"));
+        };
+        let semantic::SemanticOperation::Binary {
+            operator: semantic::BinaryOperator::Less,
+            left: condition_left,
+            right: length_value,
+            arithmetic: semantic::ArithmeticMode::Checked,
+        } = condition.operation
+        else {
+            return Err(unsupported("stored fixed-array loop condition"));
+        };
+        let start_definition = source_index
+            .definitions
+            .get(start.0 as usize)
+            .and_then(Option::as_ref)
+            .ok_or(unsupported("stored fixed-array loop start"))?;
+        let length_definition = source_index
+            .definitions
+            .get(length_value.0 as usize)
+            .and_then(Option::as_ref)
+            .ok_or(unsupported("stored fixed-array loop length"))?;
+        let exact_start = matches!(
+            start_definition.statement.operation,
+            semantic::SemanticOperation::Constant(semantic::Constant::Unsigned {
+                bits: 64,
+                value: 0,
+            })
+        ) && start_definition.region == 0
+            && start_definition.position < loop_position
+            && start_definition.statement.source == Some(loop_source);
+        let exact_length = matches!(
+            length_definition.statement.operation,
+            semantic::SemanticOperation::Constant(semantic::Constant::Unsigned {
+                bits: 64,
+                value,
+            }) if value == u128::from(length)
+        ) && length_definition.region == 0
+            && length_definition.position < loop_position
+            && length_definition.statement.source == Some(proof.sources[0]);
+        let Some((one, next, continued)) =
+            then_region
+                .statements
+                .len()
+                .checked_sub(3)
+                .and_then(|suffix| {
+                    let [
+                        semantic::SemanticStatement::Let(one),
+                        semantic::SemanticStatement::Let(next),
+                        semantic::SemanticStatement::Continue(continued),
+                    ] = then_region.statements.get(suffix..)?
+                    else {
+                        return None;
+                    };
+                    Some((one, next, continued))
+                })
+        else {
+            return Err(unsupported("stored fixed-array loop increment suffix"));
+        };
+        let user_body_end = then_region
+            .statements
+            .len()
+            .checked_sub(3)
+            .ok_or(unsupported("stored fixed-array loop increment suffix"))?;
+        reject_stored_fixed_array_abnormal_control(
+            then_region
+                .statements
+                .get(1..user_body_end)
+                .ok_or(unsupported("stored fixed-array user body"))?,
+            limits,
+            is_cancelled,
+        )?;
+        let ([one_result], [next_result], [continued]) = (
+            one.results.as_slice(),
+            next.results.as_slice(),
+            continued.as_slice(),
+        ) else {
+            return Err(unsupported("stored fixed-array loop increment arity"));
+        };
+        let exact_one = matches!(
+            one.operation,
+            semantic::SemanticOperation::Constant(semantic::Constant::Unsigned {
+                bits: 64,
+                value: 1,
+            })
+        ) && one.source == Some(loop_source);
+        let exact_next = matches!(
+            next.operation,
+            semantic::SemanticOperation::Binary {
+                operator: semantic::BinaryOperator::Add,
+                left,
+                right,
+                arithmetic: semantic::ArithmeticMode::Checked,
+            } if left == *header && right == *one_result
+        ) && next.source == Some(loop_source)
+            && *continued == *next_result;
+        let exact_else = matches!(
+            else_region.statements.as_slice(),
+            [semantic::SemanticStatement::Break(values)] if values.as_slice() == [*header]
+        );
+        let [indexed_result] = indexed.results.as_slice() else {
+            return Err(unsupported("stored fixed-array index result arity"));
+        };
+        let u64_value = |value| {
+            scalar_value_type(function, value)
+                .is_some_and(|ty| semantic_type_is(input, ty, semantic::PrimitiveType::U64))
+        };
+        let bool_value = |value| {
+            scalar_value_type(function, value)
+                .is_some_and(|ty| semantic_type_is(input, ty, semantic::PrimitiveType::Bool))
+        };
+        if *carried_header != *header
+            || uninterrupted_bound != &Some(length)
+            || body.parameters.len() != 1
+            || condition_left != *header
+            || *branch_condition != *condition_result
+            || !results.is_empty()
+            || *branch_source != Some(loop_source)
+            || !then_region.parameters.is_empty()
+            || !else_region.parameters.is_empty()
+            || !iterable_is_contained
+            || aggregate_position >= loop_position
+            || !exact_start
+            || !exact_length
+            || !exact_one
+            || !exact_next
+            || !exact_else
+            || base != aggregate
+            || index != *header
+            || index_proof != *proof_id
+            || indexed.source != Some(proof.sources[0])
+            || function
+                .values
+                .get(indexed_result.0 as usize)
+                .is_none_or(|value| {
+                    value.id != *indexed_result
+                        || value.ty != element
+                        || value.name.as_deref().is_none_or(|name| name.is_empty())
+                })
+            || !u64_value(*start)
+            || !u64_value(*header)
+            || !u64_value(*exit)
+            || !u64_value(length_value)
+            || !u64_value(*one_result)
+            || !u64_value(*next_result)
+            || !bool_value(*condition_result)
+        {
+            return Err(unsupported("stored fixed-array canonical loop identity"));
+        }
+        matched_loops = matched_loops
+            .checked_add(1)
+            .ok_or(LowerError::ResourceLimit {
+                resource: "stored fixed-array loops",
+                limit: limits.model_edges,
+            })?;
+    }
+    if matched_loops != 1 {
+        return Err(unsupported("stored fixed-array single canonical loop"));
+    }
+    let mut related_indexes = 0_u64;
+    for definition in &source_index.ordered {
+        check_cancelled(is_cancelled)?;
+        let semantic::SemanticOperation::Index {
+            base,
+            proof: index_proof,
+            ..
+        } = definition.statement.operation
+        else {
+            continue;
+        };
+        if base == aggregate || index_proof == *proof_id {
+            related_indexes = related_indexes
+                .checked_add(1)
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "stored fixed-array related indexes",
+                    limit: limits.model_edges,
+                })?;
+        }
+    }
+    if related_indexes != 1 {
+        return Err(unsupported("stored fixed-array unique indexed consumer"));
     }
     Ok(())
 }
@@ -370,7 +771,6 @@ fn supported_input<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedSemantic<'a>, LowerError> {
-    reject_stored_fixed_array_lowering(input, limits, is_cancelled)?;
     let has_async_type = input.types.iter().any(|ty| {
         matches!(
             ty.kind,
@@ -3749,6 +4149,7 @@ fn validate_scalar_source_function(
             ));
         }
     }
+    validate_stored_fixed_array_protocol(input, function, limits, is_cancelled)?;
     validate_fixed_array_pattern_protocols(input, function, limits, is_cancelled)?;
 
     let mut regions = try_vec(1, "source region validation", limits.model_edges)?;
@@ -4090,11 +4491,11 @@ fn validate_scalar_source_function(
                                     && record.kind == semantic::ProofKind::CapacityBound
                                     && record.bound == Some(length)
                                     && record.depends_on.is_empty()
-                                    && record.sources.len() == 1
                                     && matches!(
-                                        record.subject.as_str(),
-                                        "inline fixed-array iteration"
-                                            | "inline fixed-array pattern match"
+                                        (record.subject.as_str(), record.sources.len()),
+                                        ("inline fixed-array iteration", 1)
+                                            | ("inline fixed-array pattern match", 1)
+                                            | ("stored fixed-array iteration", 2)
                                     )
                             }) && function.proofs.binary_search(proof).is_ok();
                         if scalar_value_type(function, *result) != Some(element)
@@ -17136,7 +17537,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn stored_fixed_array_identity_stops_at_named_flow_boundary() {
+    fn stored_fixed_array_protocol_authenticates_initializer_proof_and_index() {
         let mut input = fixture().into_wir();
         input.types.extend([
             semantic::TypeRecord {
@@ -17156,6 +17557,20 @@ mod contract_tests {
                 linearity: semantic::Linearity::ExplicitCopy,
                 source: Some(span(0, 20, 23)),
             },
+            semantic::TypeRecord {
+                id: semantic::TypeId(3),
+                source_name: "u64".to_owned(),
+                kind: semantic::TypeKind::Primitive(semantic::PrimitiveType::U64),
+                linearity: semantic::Linearity::CopyScalar,
+                source: None,
+            },
+            semantic::TypeRecord {
+                id: semantic::TypeId(4),
+                source_name: "bool".to_owned(),
+                kind: semantic::TypeKind::Primitive(semantic::PrimitiveType::Bool),
+                linearity: semantic::Linearity::CopyScalar,
+                source: None,
+            },
         ]);
         input.functions[0].values = vec![
             semantic::SemanticValue {
@@ -17170,24 +17585,276 @@ mod contract_tests {
                 origin: Some(span(0, 20, 23)),
                 name: Some("values".to_owned()),
             },
+            semantic::SemanticValue {
+                id: semantic::ValueId(2),
+                ty: semantic::TypeId(3),
+                origin: Some(span(0, 31, 32)),
+                name: None,
+            },
+            semantic::SemanticValue {
+                id: semantic::ValueId(3),
+                ty: semantic::TypeId(3),
+                origin: Some(span(0, 20, 23)),
+                name: None,
+            },
+            semantic::SemanticValue {
+                id: semantic::ValueId(4),
+                ty: semantic::TypeId(3),
+                origin: Some(span(0, 30, 38)),
+                name: None,
+            },
+            semantic::SemanticValue {
+                id: semantic::ValueId(5),
+                ty: semantic::TypeId(3),
+                origin: Some(span(0, 30, 38)),
+                name: None,
+            },
+            semantic::SemanticValue {
+                id: semantic::ValueId(6),
+                ty: semantic::TypeId(4),
+                origin: Some(span(0, 30, 38)),
+                name: None,
+            },
+            semantic::SemanticValue {
+                id: semantic::ValueId(7),
+                ty: semantic::TypeId(1),
+                origin: Some(span(0, 30, 38)),
+                name: Some("item".to_owned()),
+            },
+            semantic::SemanticValue {
+                id: semantic::ValueId(8),
+                ty: semantic::TypeId(3),
+                origin: Some(span(0, 30, 38)),
+                name: None,
+            },
+            semantic::SemanticValue {
+                id: semantic::ValueId(9),
+                ty: semantic::TypeId(3),
+                origin: Some(span(0, 30, 38)),
+                name: None,
+            },
         ];
-        input.functions[0].body.statements.insert(
-            0,
-            semantic::SemanticStatement::Let(semantic::LetStatement {
-                results: vec![semantic::ValueId(1)],
-                operation: semantic::SemanticOperation::Aggregate {
-                    ty: semantic::TypeId(2),
-                    fields: vec![semantic::ValueId(0)],
+        let array_source = span(0, 20, 23);
+        let iterable_source = span(0, 31, 37);
+        let loop_source = span(0, 30, 38);
+        input.proofs.push(semantic::ProofRecord {
+            id: semantic::ProofId(3),
+            kind: semantic::ProofKind::CapacityBound,
+            subject: "stored fixed-array iteration".to_owned(),
+            bound: Some(1),
+            sources: vec![array_source, iterable_source],
+            depends_on: Vec::new(),
+            explanation: vec![
+                "the immutable local retains the initializer's exact extent and every generated index is strictly below it"
+                    .to_owned(),
+            ],
+        });
+        input.functions[0].proofs.push(semantic::ProofId(3));
+        input.functions[0].body.statements =
+            vec![
+                semantic::SemanticStatement::Let(semantic::LetStatement {
+                    results: vec![semantic::ValueId(0)],
+                    operation: semantic::SemanticOperation::Constant(semantic::Constant::Signed {
+                        bits: 64,
+                        value: 7,
+                    }),
+                    source: Some(span(0, 21, 22)),
+                }),
+                semantic::SemanticStatement::Let(semantic::LetStatement {
+                    results: vec![semantic::ValueId(1)],
+                    operation: semantic::SemanticOperation::Aggregate {
+                        ty: semantic::TypeId(2),
+                        fields: vec![semantic::ValueId(0)],
+                    },
+                    source: Some(array_source),
+                }),
+                semantic::SemanticStatement::Let(semantic::LetStatement {
+                    results: vec![semantic::ValueId(2)],
+                    operation: semantic::SemanticOperation::Constant(
+                        semantic::Constant::Unsigned { bits: 64, value: 0 },
+                    ),
+                    source: Some(loop_source),
+                }),
+                semantic::SemanticStatement::Let(semantic::LetStatement {
+                    results: vec![semantic::ValueId(3)],
+                    operation: semantic::SemanticOperation::Constant(
+                        semantic::Constant::Unsigned { bits: 64, value: 1 },
+                    ),
+                    source: Some(array_source),
+                }),
+                semantic::SemanticStatement::Loop {
+                    body: semantic::SemanticRegion {
+                        parameters: vec![semantic::ValueId(4)],
+                        statements: vec![
+                            semantic::SemanticStatement::Let(semantic::LetStatement {
+                                results: vec![semantic::ValueId(6)],
+                                operation: semantic::SemanticOperation::Binary {
+                                    operator: semantic::BinaryOperator::Less,
+                                    left: semantic::ValueId(4),
+                                    right: semantic::ValueId(3),
+                                    arithmetic: semantic::ArithmeticMode::Checked,
+                                },
+                                source: Some(array_source),
+                            }),
+                            semantic::SemanticStatement::If {
+                                condition: semantic::ValueId(6),
+                                then_region: semantic::SemanticRegion {
+                                    parameters: Vec::new(),
+                                    statements: vec![
+                                        semantic::SemanticStatement::Let(semantic::LetStatement {
+                                            results: vec![semantic::ValueId(7)],
+                                            operation: semantic::SemanticOperation::Index {
+                                                base: semantic::ValueId(1),
+                                                index: semantic::ValueId(4),
+                                                proof: semantic::ProofId(3),
+                                            },
+                                            source: Some(array_source),
+                                        }),
+                                        semantic::SemanticStatement::Let(semantic::LetStatement {
+                                            results: vec![semantic::ValueId(8)],
+                                            operation: semantic::SemanticOperation::Constant(
+                                                semantic::Constant::Unsigned { bits: 64, value: 1 },
+                                            ),
+                                            source: Some(loop_source),
+                                        }),
+                                        semantic::SemanticStatement::Let(semantic::LetStatement {
+                                            results: vec![semantic::ValueId(9)],
+                                            operation: semantic::SemanticOperation::Binary {
+                                                operator: semantic::BinaryOperator::Add,
+                                                left: semantic::ValueId(4),
+                                                right: semantic::ValueId(8),
+                                                arithmetic: semantic::ArithmeticMode::Checked,
+                                            },
+                                            source: Some(loop_source),
+                                        }),
+                                        semantic::SemanticStatement::Continue(vec![
+                                            semantic::ValueId(9),
+                                        ]),
+                                    ],
+                                },
+                                else_region: semantic::SemanticRegion {
+                                    parameters: Vec::new(),
+                                    statements: vec![semantic::SemanticStatement::Break(vec![
+                                        semantic::ValueId(4),
+                                    ])],
+                                },
+                                results: Vec::new(),
+                                source: Some(loop_source),
+                            },
+                        ],
+                    },
+                    carried: vec![
+                        semantic::ValueId(2),
+                        semantic::ValueId(4),
+                        semantic::ValueId(5),
+                    ],
+                    uninterrupted_bound: Some(1),
+                    source: Some(loop_source),
                 },
-                source: Some(span(0, 20, 23)),
-            }),
-        );
+                semantic::SemanticStatement::Return(Vec::new()),
+            ];
+        let validate = |module: &semantic::SemanticWir| {
+            super::validate_stored_fixed_array_protocol(
+                module,
+                &module.functions[0],
+                LoweringLimits::standard(),
+                &|| false,
+            )
+        };
+        validate(&input).expect("exact stored fixed-array protocol");
+
+        let mut wrong_explanation = input.clone();
+        wrong_explanation.proofs[3].explanation[0].push('!');
         assert!(matches!(
-            super::reject_stored_fixed_array_lowering(&input, LoweringLimits::standard(), &|| {
-                false
-            },),
+            validate(&wrong_explanation),
             Err(LowerError::UnsupportedInput {
-                feature: "flow-for-stored-array-lowering-pending (owned local array storage and indexed iteration)",
+                feature: "stored fixed-array proof authority"
+            })
+        ));
+
+        let mut wrong_base = input.clone();
+        let semantic::SemanticStatement::Loop { body, .. } =
+            &mut wrong_base.functions[0].body.statements[4]
+        else {
+            panic!("stored fixed-array loop")
+        };
+        let semantic::SemanticStatement::If { then_region, .. } = &mut body.statements[1] else {
+            panic!("stored fixed-array branch")
+        };
+        let semantic::SemanticStatement::Let(index) = &mut then_region.statements[0] else {
+            panic!("stored fixed-array indexed binding")
+        };
+        let semantic::SemanticOperation::Index { base, .. } = &mut index.operation else {
+            panic!("stored fixed-array index operation")
+        };
+        *base = semantic::ValueId(0);
+        assert!(matches!(
+            validate(&wrong_base),
+            Err(LowerError::UnsupportedInput {
+                feature: "stored fixed-array canonical loop identity"
+            })
+        ));
+
+        let mut wrong_bound = input.clone();
+        let semantic::SemanticStatement::Loop {
+            uninterrupted_bound,
+            ..
+        } = &mut wrong_bound.functions[0].body.statements[4]
+        else {
+            panic!("stored fixed-array loop")
+        };
+        *uninterrupted_bound = Some(2);
+        assert!(matches!(
+            validate(&wrong_bound),
+            Err(LowerError::UnsupportedInput {
+                feature: "stored fixed-array canonical loop identity"
+            })
+        ));
+
+        let mut extra_consumer = input.clone();
+        let mut extra_value = extra_consumer.functions[0].values[7].clone();
+        extra_value.id = semantic::ValueId(10);
+        extra_value.name = Some("other".to_owned());
+        extra_consumer.functions[0].values.push(extra_value);
+        let semantic::SemanticStatement::Loop { body, .. } =
+            &mut extra_consumer.functions[0].body.statements[4]
+        else {
+            panic!("stored fixed-array loop")
+        };
+        let semantic::SemanticStatement::If { then_region, .. } = &mut body.statements[1] else {
+            panic!("stored fixed-array branch")
+        };
+        let mut extra_index = then_region.statements[0].clone();
+        let semantic::SemanticStatement::Let(extra_index) = &mut extra_index else {
+            panic!("stored fixed-array indexed binding")
+        };
+        extra_index.results[0] = semantic::ValueId(10);
+        then_region
+            .statements
+            .insert(1, semantic::SemanticStatement::Let(extra_index.clone()));
+        assert!(matches!(
+            validate(&extra_consumer),
+            Err(LowerError::UnsupportedInput {
+                feature: "stored fixed-array unique indexed consumer"
+            })
+        ));
+
+        let mut abnormal_control = input.clone();
+        let semantic::SemanticStatement::Loop { body, .. } =
+            &mut abnormal_control.functions[0].body.statements[4]
+        else {
+            panic!("stored fixed-array loop")
+        };
+        let semantic::SemanticStatement::If { then_region, .. } = &mut body.statements[1] else {
+            panic!("stored fixed-array branch")
+        };
+        then_region
+            .statements
+            .insert(1, semantic::SemanticStatement::Unreachable);
+        assert!(matches!(
+            validate(&abnormal_control),
+            Err(LowerError::UnsupportedInput {
+                feature: "stored fixed-array user-body control flow"
             })
         ));
     }

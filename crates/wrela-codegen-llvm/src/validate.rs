@@ -2346,12 +2346,14 @@ fn validate_operation(
                                 && record.bound == Some(length)
                                 && record.depends_on.is_empty()
                                 && [
-                                    "inline fixed-array iteration",
-                                    "inline fixed-array pattern match",
+                                    ("FlowWir proof: inline fixed-array iteration", 1),
+                                    ("FlowWir proof: inline fixed-array pattern match", 1),
+                                    ("FlowWir proof: stored fixed-array iteration", 2),
                                 ]
                                 .iter()
-                                .any(|subject| record.statement.contains(subject))
-                                && !record.sources.is_empty()
+                                .any(|(subject, sources)| {
+                                    record.statement == *subject && record.sources.len() == *sources
+                                })
                         })
                         && function
                             .stack_slots

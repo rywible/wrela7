@@ -520,6 +520,13 @@ it. It injects phase implementations and bounded host capabilities, while
   equality/left-fold order, branch-local binding provenance, source-ordered
   branch chain, and exhaustive fallback. The same schema-neutral operations
   cross FlowWir/wire v19 and MachineWir v20 to deterministic native COFF.
+- One inferred immutable local may retain an exact nonempty homogeneous
+  boolean/default-`i64` literal array for one later direct `for`. SemanticWir
+  v15 evaluates the initializer exactly once; FlowWir v19 independently joins
+  its unique named root aggregate, literal fields, two-source `CapacityBound`,
+  canonical generated loop, and sole nested index consumer. MachineWir v21
+  and LLVM retain the exact proof statement, two-source attachment, extent,
+  types, and stack-backed access; they do not reinterpret source provenance.
 - MachineWir v20 retains same-block nongeneric flat values with two or more
   primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
   `InsertField`, and `ExtractField` carry exact SSA joins through independent
@@ -527,15 +534,16 @@ it. It injects phase implementations and bounded host capabilities, while
   first-class `insertvalue`/`extractvalue`. One-field `u64` structs retain the
   established erased bitcast representation. Aggregate function/block
   boundaries, packed/empty/non-flat structs, and nested aggregates fail closed.
-- MachineWir v20 also retains the exact inline, nonempty, homogeneous
-  boolean/default-`i64` fixed-array iteration and statement-pattern profiles.
+- MachineWir v21 also retains the exact inline and single-stored, nonempty,
+  homogeneous boolean/default-`i64` fixed-array iteration profiles plus the
+  inline statement-pattern profile.
   `MakeArray` authenticates
   the source-ordered element vector and `ExtractIndex` carries the exact
   `CapacityBound` from FlowWir v19. Validation joins the array extent, generated
   unsigned-64 index, proof bound, result element type, and function proof set;
   the LLVM consumer repeats that join before emitting target-laid-out array
   storage plus one proved dynamic element access. Empty, heterogeneous,
-  stored/dynamic, taking, mutable, suspended, and function-boundary arrays stay
+  broader stored/dynamic, taking, mutable, suspended, and function-boundary arrays stay
   fail-closed; pattern guards, alternatives, negative literals, nesting, and
   `take` remain named semantic boundaries.
 - MachineWir v20 records one exact optional logical payload type per enum tag.

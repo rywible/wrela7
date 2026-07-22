@@ -5701,12 +5701,13 @@ fn validate_operation(
                         proof.id == *capacity
                             && proof.kind == ProofKind::CapacityBound
                             && matches!(
-                                proof.subject.as_str(),
-                                "inline fixed-array iteration" | "inline fixed-array pattern match"
+                                (proof.subject.as_str(), proof.sources.len()),
+                                ("inline fixed-array iteration", 1)
+                                    | ("inline fixed-array pattern match", 1)
+                                    | ("stored fixed-array iteration", 2)
                             )
                             && proof.bound == Some(length)
                             && proof.depends_on.is_empty()
-                            && !proof.sources.is_empty()
                     }) && function.proofs.binary_search(capacity).is_ok()
                         && matches!(instruction.results.as_slice(), [result]
                             if function.values.get(result.0 as usize)

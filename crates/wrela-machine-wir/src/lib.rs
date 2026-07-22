@@ -7384,12 +7384,15 @@ fn validate_operation_types(
                                     && record.bound == Some(length)
                                     && record.depends_on.is_empty()
                                     && [
-                                        "inline fixed-array iteration",
-                                        "inline fixed-array pattern match",
+                                        ("FlowWir proof: inline fixed-array iteration", 1),
+                                        ("FlowWir proof: inline fixed-array pattern match", 1),
+                                        ("FlowWir proof: stored fixed-array iteration", 2),
                                     ]
                                     .iter()
-                                    .any(|subject| record.statement.contains(subject))
-                                    && !record.sources.is_empty()
+                                    .any(|(subject, sources)| {
+                                        record.statement == *subject
+                                            && record.sources.len() == *sources
+                                    })
                             })
                             && aggregate_ty.is_some_and(|aggregate_ty| {
                                 function.stack_slots.get(slot.0 as usize).is_some_and(|slot| {

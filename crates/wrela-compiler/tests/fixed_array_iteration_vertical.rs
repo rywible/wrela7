@@ -51,6 +51,9 @@ pub fn boot() -> Image:
 @test(runtime)
 fn fixed_array_runtime():
     label = "fixed"
+    stored = [4, 5]
+    for stored_item in stored:
+        consume(stored_item)
     for item in [1, 2, 3]:
         consume(item)
     for flag in [true, false, true]:
@@ -271,6 +274,121 @@ fn fixed_array_iteration_and_patterns_reach_flow_machine_and_deterministic_nativ
     assert!(debug.contains("Aggregate"));
     assert!(debug.contains("Index"));
     assert_eq!(debug.matches("uninterrupted_bound: Some(3)").count(), 2);
+    assert!(debug.contains("name: Some(\"stored\")"));
+    let stored_semantic_proof = wir
+        .proofs
+        .iter()
+        .find(|proof| proof.subject == "stored fixed-array iteration")
+        .expect("stored-array semantic capacity proof")
+        .id;
+    let stored_function = wir
+        .functions
+        .iter()
+        .position(|function| {
+            function
+                .proofs
+                .binary_search(&stored_semantic_proof)
+                .is_ok()
+        })
+        .expect("function owning stored-array proof");
+    let reject_semantic_forgery = |forged: wrela_semantic_lower::semantic_wir::SemanticWir,
+                                   claim: &str| {
+        let validated = forged
+            .validate()
+            .expect("stored-array forgery remains structurally valid SemanticWir");
+        assert!(
+            matches!(
+                CanonicalFlowLowerer::new().lower(
+                    FlowLowerRequest {
+                        input: validated,
+                        limits: FlowLoweringLimits::standard(),
+                    },
+                    &never_cancelled,
+                ),
+                Err(FlowLowerError::UnsupportedInput { .. })
+            ),
+            "Flow lowering must reject {claim}"
+        );
+    };
+
+    let mut forged_subject = wir.clone();
+    let proof = &mut forged_subject.proofs[stored_semantic_proof.0 as usize];
+    proof.subject = "inline fixed-array iteration".to_owned();
+    proof.sources.truncate(1);
+    reject_semantic_forgery(forged_subject, "a relabelled stored-array proof");
+
+    let mut forged_loop_bound = wir.clone();
+    let stored_loop = forged_loop_bound.functions[stored_function]
+        .body
+        .statements
+        .iter_mut()
+        .find(|statement| {
+            matches!(
+                statement,
+                wrela_semantic_lower::semantic_wir::SemanticStatement::Loop {
+                    uninterrupted_bound: Some(2),
+                    ..
+                }
+            )
+        })
+        .expect("stored-array canonical loop");
+    let wrela_semantic_lower::semantic_wir::SemanticStatement::Loop {
+        uninterrupted_bound,
+        ..
+    } = stored_loop
+    else {
+        unreachable!("selected stored-array loop")
+    };
+    *uninterrupted_bound = Some(1);
+    reject_semantic_forgery(forged_loop_bound, "a substituted stored-array loop bound");
+
+    let mut forged_index_header = wir.clone();
+    let stored_loop = forged_index_header.functions[stored_function]
+        .body
+        .statements
+        .iter_mut()
+        .find(|statement| {
+            matches!(
+                statement,
+                wrela_semantic_lower::semantic_wir::SemanticStatement::Loop {
+                    uninterrupted_bound: Some(2),
+                    ..
+                }
+            )
+        })
+        .expect("stored-array canonical loop");
+    let wrela_semantic_lower::semantic_wir::SemanticStatement::Loop { body, carried, .. } =
+        stored_loop
+    else {
+        unreachable!("selected stored-array loop")
+    };
+    let start = carried[0];
+    let wrela_semantic_lower::semantic_wir::SemanticStatement::If { then_region, .. } =
+        &mut body.statements[1]
+    else {
+        panic!("stored-array canonical branch")
+    };
+    let index = then_region
+        .statements
+        .iter_mut()
+        .find_map(|statement| match statement {
+            wrela_semantic_lower::semantic_wir::SemanticStatement::Let(statement) => {
+                match &mut statement.operation {
+                    wrela_semantic_lower::semantic_wir::SemanticOperation::Index {
+                        index, ..
+                    } => Some(index),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .expect("stored-array canonical index");
+    *index = start;
+    reject_semantic_forgery(
+        forged_index_header,
+        "a substituted stored-array index header",
+    );
+
     let first_flow = CanonicalFlowLowerer::new()
         .lower(
             FlowLowerRequest {
@@ -347,6 +465,36 @@ fn fixed_array_iteration_and_patterns_reach_flow_machine_and_deterministic_nativ
         .expect("fixed array reaches FlowWir");
     assert_eq!(first_flow.wir().as_wir(), flow.wir().as_wir());
     assert_eq!(flow.wir().as_wir().version, 19);
+    let stored_flow_proof = flow
+        .wir()
+        .as_wir()
+        .proofs
+        .iter()
+        .find(|proof| proof.subject == "stored fixed-array iteration")
+        .expect("stored-array Flow capacity proof");
+    assert_eq!(stored_flow_proof.sources.len(), 2);
+    assert_eq!(
+        flow.wir()
+            .as_wir()
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(
+                instruction.operation,
+                FlowOperation::ExtractIndex { proof, .. } if proof == stored_flow_proof.id
+            ))
+            .count(),
+        1
+    );
+    let mut forged_stored_flow_sources = flow.wir().as_wir().clone();
+    forged_stored_flow_sources.proofs[stored_flow_proof.id.0 as usize]
+        .sources
+        .pop();
+    assert!(
+        forged_stored_flow_sources.validate().is_err(),
+        "FlowWir must reject a stored-array proof missing iterable provenance"
+    );
     assert_eq!(
         flow.wir()
             .as_wir()
@@ -367,7 +515,7 @@ fn fixed_array_iteration_and_patterns_reach_flow_machine_and_deterministic_nativ
                 matches!(instruction.operation, FlowOperation::ExtractIndex { .. })
             })
             .count(),
-        8
+        9
     );
     let flow_pattern_extracts = flow
         .wir()
@@ -444,6 +592,45 @@ fn fixed_array_iteration_and_patterns_reach_flow_machine_and_deterministic_nativ
     );
     let machine = prepared.machine().wir().as_wir();
     assert_eq!(machine.version, 21);
+    let stored_machine_proof = machine
+        .proofs
+        .iter()
+        .find(|proof| proof.statement == "FlowWir proof: stored fixed-array iteration")
+        .expect("stored-array Machine capacity proof");
+    assert_eq!(stored_machine_proof.sources.len(), 2);
+    assert_eq!(
+        machine
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(
+                instruction.operation,
+                MachineOperation::ExtractIndex { proof, .. } if proof == stored_machine_proof.id
+            ))
+            .count(),
+        1
+    );
+    let mut forged_stored_machine_sources = machine.clone();
+    forged_stored_machine_sources.proofs[stored_machine_proof.id.0 as usize]
+        .sources
+        .pop();
+    assert!(
+        forged_stored_machine_sources
+            .validate_for_target(&target)
+            .is_err(),
+        "MachineWir must reject a stored-array proof missing its second retained source"
+    );
+    let mut forged_stored_machine_statement = machine.clone();
+    forged_stored_machine_statement.proofs[stored_machine_proof.id.0 as usize]
+        .statement
+        .push('!');
+    assert!(
+        forged_stored_machine_statement
+            .validate_for_target(&target)
+            .is_err(),
+        "MachineWir must reject a stored-array proof statement suffix"
+    );
     assert!(machine.types.iter().any(|ty| {
         ty.kind == MachineTypeKind::StaticString { bytes: 5 }
             && ty.size == 5
@@ -471,7 +658,7 @@ fn fixed_array_iteration_and_patterns_reach_flow_machine_and_deterministic_nativ
                 matches!(instruction.operation, MachineOperation::ExtractIndex { .. })
             })
             .count(),
-        8
+        9
     );
     assert_eq!(
         machine
@@ -483,7 +670,7 @@ fn fixed_array_iteration_and_patterns_reach_flow_machine_and_deterministic_nativ
                 matches!(instruction.operation, MachineOperation::MakeArray { .. })
             })
             .count(),
-        5
+        6
     );
     let mut fixed_array_slot_sizes = machine
         .functions
@@ -493,7 +680,7 @@ fn fixed_array_iteration_and_patterns_reach_flow_machine_and_deterministic_nativ
         .map(|slot| slot.size)
         .collect::<Vec<_>>();
     fixed_array_slot_sizes.sort_unstable();
-    assert_eq!(fixed_array_slot_sizes, [2, 2, 3, 16, 16, 16, 16, 24]);
+    assert_eq!(fixed_array_slot_sizes, [2, 2, 3, 16, 16, 16, 16, 16, 24]);
     assert_eq!(
         machine
             .functions
@@ -506,7 +693,7 @@ fn fixed_array_iteration_and_patterns_reach_flow_machine_and_deterministic_nativ
             })
             .map(|function| function.stack_bytes)
             .collect::<Vec<_>>(),
-        [112]
+        [128]
     );
     let mut forged_static_extent = machine.clone();
     let static_ty = forged_static_extent
@@ -542,6 +729,7 @@ fn fixed_array_iteration_and_patterns_reach_flow_machine_and_deterministic_nativ
     for subject in [
         "inline fixed-array iteration",
         "inline fixed-array pattern match",
+        "stored fixed-array iteration",
     ] {
         let mut forged_machine = machine.clone();
         let proof = forged_machine
@@ -712,6 +900,7 @@ fn fixed_array_iteration_and_patterns_reach_flow_machine_and_deterministic_nativ
     for subject in [
         "inline fixed-array iteration",
         "inline fixed-array pattern match",
+        "stored fixed-array iteration",
     ] {
         let mut forged = flow.wir().as_wir().clone();
         let proof = forged

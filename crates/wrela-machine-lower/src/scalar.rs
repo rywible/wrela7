@@ -5144,13 +5144,13 @@ fn authenticated_fixed_array_type(
                                 record.id == *proof
                                     && record.kind == flow::ProofKind::CapacityBound
                                     && matches!(
-                                        record.subject.as_str(),
-                                        "inline fixed-array iteration"
-                                            | "inline fixed-array pattern match"
+                                        (record.subject.as_str(), record.sources.len()),
+                                        ("inline fixed-array iteration", 1)
+                                            | ("inline fixed-array pattern match", 1)
+                                            | ("stored fixed-array iteration", 2)
                                     )
                                     && record.bound == Some(length)
                                     && record.depends_on.is_empty()
-                                    && !record.sources.is_empty()
                             })
                             && function.proofs.binary_search(proof).is_ok();
                         if !source || !exact {
@@ -6958,12 +6958,13 @@ fn validate_supported_operation(
                 record.id == *proof
                     && record.kind == flow::ProofKind::CapacityBound
                     && matches!(
-                        record.subject.as_str(),
-                        "inline fixed-array iteration" | "inline fixed-array pattern match"
+                        (record.subject.as_str(), record.sources.len()),
+                        ("inline fixed-array iteration", 1)
+                            | ("inline fixed-array pattern match", 1)
+                            | ("stored fixed-array iteration", 2)
                     )
                     && record.bound == Some(length)
                     && record.depends_on.is_empty()
-                    && !record.sources.is_empty()
             }) && function.proofs.binary_search(proof).is_ok();
             if flow_value_type(function, result)? != element || !index_is_u64 || !proof_matches {
                 return Err(unsupported("an unauthenticated fixed-array index"));
@@ -9537,12 +9538,13 @@ fn lower_operation(
                 record.id == *proof
                     && record.kind == flow::ProofKind::CapacityBound
                     && matches!(
-                        record.subject.as_str(),
-                        "inline fixed-array iteration" | "inline fixed-array pattern match"
+                        (record.subject.as_str(), record.sources.len()),
+                        ("inline fixed-array iteration", 1)
+                            | ("inline fixed-array pattern match", 1)
+                            | ("stored fixed-array iteration", 2)
                     )
                     && record.bound == Some(length)
                     && record.depends_on.is_empty()
-                    && !record.sources.is_empty()
             }) && function.proofs.binary_search(proof).is_ok();
             if flow_value_type(function, result)? != element
                 || input
