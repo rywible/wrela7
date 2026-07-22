@@ -7659,13 +7659,7 @@ fn validate_exact_statement_fact(
             let iterable_fact = exact_child_expression(analysis, function.id, *iterable)
                 .filter(|fact| {
                     fact.result.is_none()
-                        && matches!(
-                            fact.resolution,
-                            ExpressionResolution::ClosedRange {
-                                inclusive: false,
-                                ..
-                            }
-                        )
+                        && matches!(fact.resolution, ExpressionResolution::ClosedRange { .. })
                 })
                 .ok_or_else(|| invalid("for iterable is not an exact closed range"))?;
             let local_record = program
@@ -9189,7 +9183,7 @@ fn exact_closed_literal_range_matches(
     resolved_inclusive: bool,
     maximum_iterations: u64,
 ) -> bool {
-    if source_inclusive || resolved_inclusive || range.result.is_some() {
+    if source_inclusive != resolved_inclusive || range.result.is_some() {
         return false;
     }
     let endpoint = |expression, value| {
@@ -9229,7 +9223,12 @@ fn exact_closed_literal_range_matches(
                 pointer_sized: false,
             }
         )
-    }) && maximum_iterations == half_open_trip_count(start_constant, end_constant)
+    }) && Some(maximum_iterations)
+        == if source_inclusive {
+            inclusive_trip_count(start_constant, end_constant)
+        } else {
+            Some(half_open_trip_count(start_constant, end_constant))
+        }
         && range.effects == EffectSet(start_fact.effects.0 | end_fact.effects.0)
 }
 
@@ -9240,6 +9239,14 @@ fn half_open_trip_count(start: u64, end: u64) -> u64 {
     match end.checked_sub(start) {
         Some(iterations) => iterations,
         None => 0,
+    }
+}
+
+fn inclusive_trip_count(start: u64, end: u64) -> Option<u64> {
+    if end < start {
+        Some(0)
+    } else {
+        end.checked_sub(start)?.checked_add(1)
     }
 }
 

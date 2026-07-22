@@ -51,6 +51,12 @@ fn closed_range_runtime():
         consume(index)
     return
 
+@test(runtime)
+fn inclusive_range_runtime():
+    for index in 2 ..= 4:
+        consume(index)
+    return
+
 fn consume(value: u64) -> u64:
     return value
 "#;
@@ -68,7 +74,7 @@ fn never_cancelled() -> bool {
 }
 
 #[test]
-fn closed_literal_range_reaches_flow_machine_and_deterministic_native_emission() {
+fn literal_ranges_reach_flow_machine_and_deterministic_native_emission() {
     let source_graph_digest = Sha256Digest::from_bytes([0x81; 32]);
     let core_package_digest = Sha256Digest::from_bytes([0x82; 32]);
     let target_digest = Sha256Digest::from_bytes([0x83; 32]);
@@ -162,7 +168,7 @@ fn closed_literal_range_reaches_flow_machine_and_deterministic_native_emission()
             .iter()
             .filter(|statement| matches!(statement.kind, StatementKind::For { .. }))
             .count(),
-        1
+        2
     );
     let image_entry = *program.image_candidates.first().expect("image entry");
     let hir = Arc::new(hir_output.into_parts().0.into_program());
@@ -251,8 +257,9 @@ fn closed_literal_range_reaches_flow_machine_and_deterministic_native_emission()
         )
         .expect("closed range lowers to SemanticWir");
     let semantic_debug = format!("{:?}", semantic_output.wir().as_wir());
-    assert_eq!(semantic_debug.matches("Loop {").count(), 1);
+    assert_eq!(semantic_debug.matches("Loop {").count(), 2);
     assert!(semantic_debug.contains("uninterrupted_bound: Some(4)"));
+    assert!(semantic_debug.contains("uninterrupted_bound: Some(3)"));
 
     let (semantic_wir, _) = semantic_output.into_parts();
     let first_flow = CanonicalFlowLowerer::new()
@@ -307,16 +314,16 @@ fn closed_literal_range_reaches_flow_machine_and_deterministic_native_emission()
             .iter()
             .filter(|block| matches!(block.terminator, MachineTerminator::Branch { .. }))
             .count(),
-        1,
-        "the generated range comparison remains an executable machine branch"
+        3,
+        "the half-open header and inclusive header/terminal checks remain executable machine branches"
     );
     assert_eq!(
         source_blocks
             .iter()
             .filter(|block| !block.parameters.is_empty())
             .count(),
-        2,
-        "range header and exit carry the exact induction value"
+        4,
+        "both range headers and exits carry their exact induction values"
     );
 
     match emit_prepared_object(&prepared, &target, &never_cancelled) {

@@ -8841,7 +8841,7 @@ impl SourceFunctionLowerer<'_> {
         self.validate_range_body_has_no_abnormal_exit(body)?;
         self.push_seen_expression(iterable)?;
 
-        let (start_expression, end_expression, range_source) = self
+        let (start_expression, end_expression, inclusive, range_source) = self
             .input
             .hir()
             .as_program()
@@ -8850,8 +8850,8 @@ impl SourceFunctionLowerer<'_> {
                 wrela_hir::ExpressionKind::Range {
                     start,
                     end,
-                    inclusive: false,
-                } => Some((start, end, expression.source)),
+                    inclusive,
+                } => Some((start, end, inclusive, expression.source)),
                 _ => None,
             })
             .ok_or_else(|| self.fact_mismatch("closed range HIR shape"))?;
@@ -8860,9 +8860,9 @@ impl SourceFunctionLowerer<'_> {
             sema::ExpressionResolution::ClosedRange {
                 start,
                 end,
-                inclusive: false,
+                inclusive: resolved_inclusive,
                 maximum_iterations,
-            } => (start, end, maximum_iterations),
+            } if resolved_inclusive == inclusive => (start, end, maximum_iterations),
             _ => return Err(self.fact_mismatch("closed range semantic resolution")),
         };
         let element_ty = range_fact.ty;
@@ -8958,7 +8958,11 @@ impl SourceFunctionLowerer<'_> {
             &mut header_statements,
             condition,
             wir::SemanticOperation::Binary {
-                operator: wir::BinaryOperator::Less,
+                operator: if inclusive {
+                    wir::BinaryOperator::LessEqual
+                } else {
+                    wir::BinaryOperator::Less
+                },
                 left: header,
                 right: end,
                 arithmetic: wir::ArithmeticMode::Checked,
@@ -8982,14 +8986,15 @@ impl SourceFunctionLowerer<'_> {
                 "semantic-for-range-abnormal-control-lowering-pending (lowered early exit)",
             ));
         }
+        let mut increment = Vec::new();
         self.push_let(
-            &mut then_region.statements,
+            &mut increment,
             one,
             wir::SemanticOperation::Constant(wir::Constant::Unsigned { bits: 64, value: 1 }),
             Some(statement_source),
         )?;
         self.push_let(
-            &mut then_region.statements,
+            &mut increment,
             next,
             wir::SemanticOperation::Binary {
                 operator: wir::BinaryOperator::Add,
@@ -9000,9 +9005,44 @@ impl SourceFunctionLowerer<'_> {
             Some(statement_source),
         )?;
         self.push_statement(
-            &mut then_region.statements,
+            &mut increment,
             wir::SemanticStatement::Continue(one_value_vec(next, self.limits.model_edges)?),
         )?;
+        if inclusive {
+            let at_end = self.allocate_synthetic_value(bool_ty, range_source)?;
+            self.push_let(
+                &mut then_region.statements,
+                at_end,
+                wir::SemanticOperation::Binary {
+                    operator: wir::BinaryOperator::Equal,
+                    left: header,
+                    right: end,
+                    arithmetic: wir::ArithmeticMode::Checked,
+                },
+                Some(range_source),
+            )?;
+            self.push_statement(
+                &mut then_region.statements,
+                wir::SemanticStatement::If {
+                    condition: at_end,
+                    then_region: wir::SemanticRegion {
+                        parameters: Vec::new(),
+                        statements: vec![wir::SemanticStatement::Break(one_value_vec(
+                            header,
+                            self.limits.model_edges,
+                        )?)],
+                    },
+                    else_region: wir::SemanticRegion {
+                        parameters: Vec::new(),
+                        statements: increment,
+                    },
+                    results: Vec::new(),
+                    source: Some(statement_source),
+                },
+            )?;
+        } else {
+            then_region.statements.extend(increment);
+        }
         let else_region = wir::SemanticRegion {
             parameters: Vec::new(),
             statements: vec![wir::SemanticStatement::Break(one_value_vec(
@@ -25339,6 +25379,45 @@ pub fn boot() -> Image:
             ),
             Err(LowerError::InvalidReport(_))
         ));
+    }
+
+    #[test]
+    fn inclusive_literal_range_breaks_at_end_before_incrementing() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        for index in 18446744073709551615 ..= 18446744073709551615:
+            pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("inclusive literal range should lower without incrementing its endpoint");
+        let debug = format!("{:?}", lowered.wir().as_wir());
+        assert!(debug.contains("operator: LessEqual"));
+        assert!(debug.contains("operator: Equal"));
+        assert!(debug.contains("uninterrupted_bound: Some(1)"));
     }
 
     #[test]

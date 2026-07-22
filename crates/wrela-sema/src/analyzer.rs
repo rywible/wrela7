@@ -3444,12 +3444,12 @@ fn bounded_while_shape(
 fn closed_literal_range_shape(
     program: &wrela_hir::Program,
     iterable: ExpressionId,
-) -> Option<(ExpressionId, ExpressionId, u64, u64)> {
+) -> Option<(ExpressionId, ExpressionId, bool, u64, u64)> {
     let expression = program.expression(iterable)?;
     let ExpressionKind::Range {
         start,
         end,
-        inclusive: false,
+        inclusive,
     } = expression.kind
     else {
         return None;
@@ -3460,7 +3460,7 @@ fn closed_literal_range_shape(
         }
         _ => None,
     };
-    Some((start, end, parse(start)?, parse(end)?))
+    Some((start, end, inclusive, parse(start)?, parse(end)?))
 }
 
 fn runtime_body_work_bound(program: &wrela_hir::Program, body: BodyId) -> Option<u64> {
@@ -3490,10 +3490,20 @@ fn runtime_body_work_bound(program: &wrela_hir::Program, body: BodyId) -> Option
             }
             StatementKind::For { iterable, body, .. } => {
                 let body_work = runtime_body_work_bound(program, *body)?.checked_add(1)?;
-                if let Some((_, _, start, end)) = closed_literal_range_shape(program, *iterable) {
-                    half_open_trip_count(start, end)
-                        .checked_mul(body_work)?
-                        .checked_add(1)?
+                if let Some((_, _, inclusive, start, end)) =
+                    closed_literal_range_shape(program, *iterable)
+                {
+                    let iterations = if inclusive {
+                        // The unrepresentable complete-u64-domain case is
+                        // diagnosed by `analyze_closed_range_for` before any
+                        // partial proof can be sealed. Use zero only to keep
+                        // this preliminary shape census bounded enough to
+                        // reach that named rejection.
+                        inclusive_trip_count(start, end).unwrap_or(0)
+                    } else {
+                        half_open_trip_count(start, end)
+                    };
+                    iterations.checked_mul(body_work)?.checked_add(1)?
                 } else {
                     // Unsupported forms still need enough provisional shape
                     // to reach their stable diagnostic. No successful fact
@@ -6204,17 +6214,7 @@ fn analyze_closed_range_for(
             "remove both take markers from the range loop",
         ));
     }
-    if inclusive {
-        return Err(runtime_type_diagnostic(
-            request,
-            iterable_record.source,
-            "semantic-for-inclusive-range-pending",
-            "inclusive range iteration is not yet admitted by this analysis slice",
-            "maximum-endpoint execution needs its distinct non-overflowing lowering contract",
-            "use a half-open literal range until inclusive range lowering lands",
-        ));
-    }
-    let Some((start_expression, end_expression, start_constant, end_constant)) =
+    let Some((start_expression, end_expression, shape_inclusive, start_constant, end_constant)) =
         closed_literal_range_shape(program, iterable)
     else {
         return Err(runtime_type_diagnostic(
@@ -6226,7 +6226,23 @@ fn analyze_closed_range_for(
             "use two u64-representable integer literals or retain a canonical bounded while loop",
         ));
     };
-    let maximum_iterations = half_open_trip_count(start_constant, end_constant);
+    if shape_inclusive != inclusive {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    let maximum_iterations = if inclusive {
+        inclusive_trip_count(start_constant, end_constant).ok_or_else(|| {
+            runtime_type_diagnostic(
+                request,
+                iterable_record.source,
+                "semantic-for-inclusive-range-too-large",
+                "inclusive range trip count cannot be represented by the closed work bound",
+                "the complete u64 domain contains 2^64 values, one more than the largest admitted iteration bound",
+                "split the range or choose an endpoint below u64::MAX when starting at zero",
+            )
+        })?
+    } else {
+        half_open_trip_count(start_constant, end_constant)
+    };
     let element_ty = ensure_primitive_type(
         request,
         partial,
@@ -6295,7 +6311,7 @@ fn analyze_closed_range_for(
             resolution: ExpressionResolution::ClosedRange {
                 start: start_value,
                 end: end_value,
-                inclusive: false,
+                inclusive,
                 maximum_iterations,
             },
             effects: EffectSet(start.effects.0 | end.effects.0),
@@ -37520,11 +37536,40 @@ fn projection_fixture():
     }
 
     #[test]
+    fn inclusive_literal_range_has_exact_nonoverflowing_trip_count() {
+        let source = dot_variant_actor_source(
+            "async fn checkpoint():\n    for index in 2 ..= 4:\n        observed: u64 = index\n        pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("inclusive literal range analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "the finite inclusive range must analyze cleanly: {:?}",
+            output.diagnostics()
+        );
+        let image = output.successful().expect("sealed inclusive range image");
+        assert!(image.facts().expressions.iter().any(|fact| matches!(
+            fact.resolution,
+            ExpressionResolution::ClosedRange {
+                inclusive: true,
+                maximum_iterations: 3,
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn closed_range_for_tails_fail_closed_by_name() {
         for (body, code) in [
             (
-                "    for index in 0 ..= 4:\n        pass\n",
-                "semantic-for-inclusive-range-pending",
+                "    for index in 0 ..= 18446744073709551615:\n        pass\n",
+                "semantic-for-inclusive-range-too-large",
             ),
             (
                 "    limit: u64 = 4\n    for index in 0 .. limit:\n        pass\n",
