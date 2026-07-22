@@ -278,6 +278,7 @@ fn validate_scalar_surface(
             && !supported_struct_type(machine, ty.id)
             && !supported_runtime_fixed_array(machine, ty.id)
             && !supported_static_byte_array(machine, ty.id)
+            && !supported_static_string_type(ty)
             && !supported_passive_function_type(machine, ty.id, is_cancelled)?
         {
             return Err(CodegenError::UnsupportedMachineContract(
@@ -285,6 +286,7 @@ fn validate_scalar_surface(
             ));
         }
     }
+    validate_static_string_profile(request, is_cancelled)?;
     let valid_proofs = validate_proofs(request, is_cancelled)?;
     validate_static_globals(request, is_cancelled)?;
     validate_sections_and_symbols(request, is_cancelled)?;
@@ -2293,6 +2295,8 @@ fn validate_operation(
         | MachineOperation::MailboxDispatch { .. }
         | MachineOperation::TestAssert { .. }
         | MachineOperation::Fence(_) => {}
+        MachineOperation::Immediate(MachineImmediate::Bytes(bytes))
+            if static_string_instruction_matches(machine, function, instruction, bytes) => {}
         MachineOperation::MakeArray { ty, elements } => {
             let valid = matches!(instruction.results.as_slice(), [result]
                 if value_type(machine, function, *result) == Some(*ty))
@@ -2990,9 +2994,274 @@ fn supported_scalar_type(kind: &MachineTypeKind, size: u64, alignment: u32) -> b
         | MachineTypeKind::Pointer { .. }
         | MachineTypeKind::Vector { .. }
         | MachineTypeKind::Array { .. }
+        | MachineTypeKind::StaticString { .. }
         | MachineTypeKind::Struct { .. }
         | MachineTypeKind::TaggedEnum { .. }
         | MachineTypeKind::Function { .. } => false,
+    }
+}
+
+fn supported_static_string_type(ty: &wrela_machine_wir::MachineType) -> bool {
+    matches!(ty.kind, MachineTypeKind::StaticString { bytes }
+        if bytes > 0
+            && ty.source_name.as_deref() == Some("Static[Str]")
+            && ty.size == bytes
+            && ty.alignment == 1)
+}
+
+fn static_string_instruction_matches(
+    machine: &wrela_machine_wir::MachineWir,
+    function: &MachineFunction,
+    instruction: &MachineInstruction,
+    bytes: &[u8],
+) -> bool {
+    let [result] = instruction.results.as_slice() else {
+        return false;
+    };
+    let Some(value) = function.values.get(result.0 as usize) else {
+        return false;
+    };
+    let Some(ty) = machine.types.get(value.ty.0 as usize) else {
+        return false;
+    };
+    matches!(
+        function.origin,
+        MachineFunctionOrigin::SourceSemantic { .. }
+    ) && function.role == MachineFunctionRole::Test
+        && function.parameters.is_empty()
+        && machine
+            .types
+            .get(function.result.0 as usize)
+            .is_some_and(|ty| ty.kind == MachineTypeKind::Void)
+        && supported_static_string_type(ty)
+        && matches!(ty.kind, MachineTypeKind::StaticString { bytes: extent }
+            if usize::try_from(extent).ok() == Some(bytes.len()))
+        && std::str::from_utf8(bytes).is_ok()
+        && instruction.source.is_some_and(|literal| {
+            literal.range.start < literal.range.end
+                && function.source.is_some_and(|owner| {
+                    owner.file == literal.file
+                        && owner.range.start <= literal.range.start
+                        && owner.range.end >= literal.range.end
+                })
+        })
+        && value
+            .source_name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+}
+
+fn validate_static_string_profile(
+    request: &CodegenRequest<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), CodegenError> {
+    let machine = request.module.as_wir();
+    let static_types = machine
+        .types
+        .iter()
+        .filter(|ty| matches!(ty.kind, MachineTypeKind::StaticString { .. }))
+        .count();
+    if static_types == 0 {
+        return Ok(());
+    }
+    let invalid = || {
+        CodegenError::UnsupportedMachineContract(
+            "static text outside one exact generated source-test local",
+        )
+    };
+    if static_types != 1
+        || machine.tests.len() != 1
+        || !machine
+            .functions
+            .get(machine.image_entry.0 as usize)
+            .is_some_and(|entry| {
+                matches!(
+                    entry.origin,
+                    MachineFunctionOrigin::GeneratedTestHarness { .. }
+                )
+            })
+    {
+        return Err(invalid());
+    }
+
+    let mut static_value = None;
+    let mut literals = 0_u64;
+    for function in &machine.functions {
+        check_cancelled(is_cancelled)?;
+        for value in &function.values {
+            check_cancelled(is_cancelled)?;
+            if machine
+                .types
+                .get(value.ty.0 as usize)
+                .is_some_and(|ty| matches!(ty.kind, MachineTypeKind::StaticString { .. }))
+                && static_value.replace((function.id, value.id)).is_some()
+            {
+                return Err(invalid());
+            }
+        }
+        if function.parameters.iter().any(|value| {
+            function.values.get(value.0 as usize).is_some_and(|value| {
+                machine
+                    .types
+                    .get(value.ty.0 as usize)
+                    .is_some_and(|ty| matches!(ty.kind, MachineTypeKind::StaticString { .. }))
+            })
+        }) {
+            return Err(invalid());
+        }
+        for block in &function.blocks {
+            check_cancelled(is_cancelled)?;
+            if block.parameters.iter().any(|value| {
+                function.values.get(value.0 as usize).is_some_and(|value| {
+                    machine
+                        .types
+                        .get(value.ty.0 as usize)
+                        .is_some_and(|ty| matches!(ty.kind, MachineTypeKind::StaticString { .. }))
+                })
+            }) {
+                return Err(invalid());
+            }
+            for instruction in &block.instructions {
+                check_cancelled(is_cancelled)?;
+                if let MachineOperation::Immediate(MachineImmediate::Bytes(bytes)) =
+                    &instruction.operation
+                {
+                    if instruction.results.first().is_some_and(|result| {
+                        function.values.get(result.0 as usize).is_some_and(|value| {
+                            machine.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                                matches!(ty.kind, MachineTypeKind::StaticString { .. })
+                            })
+                        })
+                    }) {
+                        if !static_string_instruction_matches(machine, function, instruction, bytes)
+                        {
+                            return Err(invalid());
+                        }
+                        literals = literals.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    let Some((owner, value)) = static_value else {
+        return Err(invalid());
+    };
+    if literals != 1 {
+        return Err(invalid());
+    }
+    let function = machine
+        .functions
+        .get(owner.0 as usize)
+        .filter(|function| function.id == owner)
+        .ok_or_else(invalid)?;
+    for block in &function.blocks {
+        check_cancelled(is_cancelled)?;
+        for instruction in &block.instructions {
+            check_cancelled(is_cancelled)?;
+            if machine_operation_uses_value(&instruction.operation, value) {
+                return Err(invalid());
+            }
+        }
+        if machine_terminator_uses_value(&block.terminator, value) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn machine_operation_uses_value(operation: &MachineOperation, sought: ValueId) -> bool {
+    let same = |value: ValueId| value == sought;
+    match operation {
+        MachineOperation::Immediate(_)
+        | MachineOperation::StackAddress(_)
+        | MachineOperation::GlobalAddress(_)
+        | MachineOperation::ActorReserve { .. }
+        | MachineOperation::ActorReplyRequest { .. }
+        | MachineOperation::MailboxReceive { .. }
+        | MachineOperation::MailboxDispatch { .. }
+        | MachineOperation::Fence(_) => false,
+        MachineOperation::Arithmetic { left, right, .. }
+        | MachineOperation::CheckedInteger { left, right, .. }
+        | MachineOperation::IntegerCompare { left, right, .. }
+        | MachineOperation::FloatCompare { left, right, .. } => same(*left) || same(*right),
+        MachineOperation::Unary { value, .. }
+        | MachineOperation::Convert { value, .. }
+        | MachineOperation::CheckedConvert { value, .. }
+        | MachineOperation::Copy { value }
+        | MachineOperation::EnumTag { value }
+        | MachineOperation::EnumPayload { value, .. }
+        | MachineOperation::ExtractField {
+            aggregate: value, ..
+        }
+        | MachineOperation::TestAssert {
+            condition: value, ..
+        }
+        | MachineOperation::ActorReplyResolve { outcome: value, .. } => same(*value),
+        MachineOperation::MakeStruct { fields, .. } => fields.contains(&sought),
+        MachineOperation::MakeArray { elements, .. } => elements.contains(&sought),
+        MachineOperation::MakeEnum { payload, .. } => payload == &Some(sought),
+        MachineOperation::InsertField {
+            aggregate, value, ..
+        } => same(*aggregate) || same(*value),
+        MachineOperation::ExtractIndex {
+            aggregate, index, ..
+        } => same(*aggregate) || same(*index),
+        MachineOperation::Select {
+            condition,
+            then_value,
+            else_value,
+        } => same(*condition) || same(*then_value) || same(*else_value),
+        MachineOperation::AddressOffset {
+            base, byte_offset, ..
+        } => same(*base) || same(*byte_offset),
+        MachineOperation::Load { address, .. } => same(*address),
+        MachineOperation::Store { address, value, .. } => same(*address) || same(*value),
+        MachineOperation::ActorCommit { reservation, .. } => same(*reservation),
+        MachineOperation::MemoryCopy {
+            destination,
+            source,
+            bytes,
+            ..
+        } => same(*destination) || same(*source) || same(*bytes),
+        MachineOperation::MemorySet {
+            destination,
+            byte,
+            bytes,
+            ..
+        } => same(*destination) || same(*byte) || same(*bytes),
+        MachineOperation::Call { arguments, .. }
+        | MachineOperation::RuntimeCall { arguments, .. } => arguments.contains(&sought),
+    }
+}
+
+fn machine_terminator_uses_value(terminator: &MachineTerminator, sought: ValueId) -> bool {
+    match terminator {
+        MachineTerminator::Jump { arguments, .. }
+        | MachineTerminator::Return(arguments)
+        | MachineTerminator::TailCall { arguments, .. } => arguments.contains(&sought),
+        MachineTerminator::Branch {
+            condition,
+            then_arguments,
+            else_arguments,
+            ..
+        } => {
+            *condition == sought
+                || then_arguments.contains(&sought)
+                || else_arguments.contains(&sought)
+        }
+        MachineTerminator::Switch {
+            value,
+            cases,
+            default_arguments,
+            ..
+        } => {
+            *value == sought
+                || default_arguments.contains(&sought)
+                || cases
+                    .iter()
+                    .any(|(_, _, arguments)| arguments.contains(&sought))
+        }
+        MachineTerminator::Unreachable => false,
     }
 }
 

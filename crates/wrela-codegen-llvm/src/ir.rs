@@ -1228,9 +1228,31 @@ fn render_immediate(
             ir.push_cancellable(symbol, is_cancelled)?;
             ir.push(", i64 0\n")
         }
-        MachineImmediate::Bytes(_) => Err(CodegenError::UnsupportedMachineContract(
-            "byte-string immediate in scalar IR",
-        )),
+        MachineImmediate::Bytes(bytes) => {
+            let MachineTypeKind::StaticString { bytes: extent } = type_kind(machine, result_ty)?
+            else {
+                return Err(CodegenError::UnsupportedMachineContract(
+                    "byte-string immediate outside exact static text",
+                ));
+            };
+            if *extent == 0 || usize::try_from(*extent).ok() != Some(bytes.len()) {
+                return Err(CodegenError::UnsupportedMachineContract(
+                    "static text extent differs from its bytes",
+                ));
+            }
+            ir.push("freeze ")?;
+            render_type(ir, machine, result_ty)?;
+            ir.push(" [")?;
+            for (index, byte) in bytes.iter().enumerate() {
+                check_periodically(index, is_cancelled)?;
+                if index != 0 {
+                    ir.push(", ")?;
+                }
+                ir.push("i8 ")?;
+                ir.number(u128::from(*byte))?;
+            }
+            ir.push("]\n")
+        }
     }
 }
 
@@ -3798,6 +3820,11 @@ fn render_type(
             ir.push(" x ")?;
             render_type(ir, machine, *element)?;
             ir.push("]")
+        }
+        MachineTypeKind::StaticString { bytes } => {
+            ir.push("[")?;
+            ir.number(u128::from(*bytes))?;
+            ir.push(" x i8]")
         }
         MachineTypeKind::TaggedEnum {
             tag,

@@ -7,7 +7,8 @@ use wrela_backend::{
     BackendContentHasher, BackendPreparationOptions, BackendPreparationServices,
     CanonicalBackendContentHasher, CanonicalFlowOptimizer, CanonicalMachineLowerer, CodegenError,
     MachineLowerError, MachineLoweringLimits, OptimizationLimits, OptimizationProfile,
-    emit_prepared_object, llvm_backend_available, machine_wir::MachineOperation,
+    emit_prepared_object, llvm_backend_available,
+    machine_wir::{MachineImmediate, MachineOperation, MachineTypeKind},
     prepare_canonical_frame_for_codegen, prepare_for_codegen,
 };
 use wrela_build_model::{
@@ -49,6 +50,7 @@ pub fn boot() -> Image:
 
 @test(runtime)
 fn fixed_array_runtime():
+    label = "fixed"
     for item in [1, 2, 3]:
         consume(item)
     for flag in [true, false, true]:
@@ -358,7 +360,24 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
             .expect("fixed-array MachineWir preparation");
     let machine = prepared.machine().wir().as_wir();
-    assert_eq!(machine.version, 19);
+    assert_eq!(machine.version, 20);
+    assert!(machine.types.iter().any(|ty| {
+        ty.kind == MachineTypeKind::StaticString { bytes: 5 }
+            && ty.size == 5
+            && ty.alignment == 1
+            && ty.source_name.as_deref() == Some("Static[Str]")
+    }));
+    let static_literals = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.operation {
+            MachineOperation::Immediate(MachineImmediate::Bytes(bytes)) => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(static_literals, [b"fixed".as_slice()]);
     assert_eq!(
         machine
             .functions
@@ -416,6 +435,37 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
     assert!(
         forged_machine.validate_for_target(&target).is_err(),
         "MachineWir must independently reject a forged fixed-array extent proof"
+    );
+    let mut forged_static_extent = machine.clone();
+    let static_ty = forged_static_extent
+        .types
+        .iter_mut()
+        .find(|ty| matches!(ty.kind, MachineTypeKind::StaticString { .. }))
+        .expect("exact lowered static text type");
+    static_ty.kind = MachineTypeKind::StaticString { bytes: 4 };
+    assert!(
+        forged_static_extent.validate_for_target(&target).is_err(),
+        "MachineWir must reject a static text extent/layout substitution"
+    );
+    let mut forged_static_utf8 = machine.clone();
+    let static_bytes = forged_static_utf8
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.operation {
+            MachineOperation::Immediate(MachineImmediate::Bytes(bytes))
+                if bytes.as_slice() == b"fixed" =>
+            {
+                Some(bytes)
+            }
+            _ => None,
+        })
+        .expect("exact lowered static text bytes");
+    static_bytes[0] = 0xff;
+    assert!(
+        forged_static_utf8.validate_for_target(&target).is_err(),
+        "MachineWir must reject invalid UTF-8 under an exact static text identity"
     );
 
     let codec = CanonicalFlowWirCodec;
@@ -484,6 +534,32 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
         .unwrap_or(0)
         .max(1);
     exact_machine_limits = exact_machine_limits.with_aligned_validation();
+    let mut payload_low = 1_u64;
+    let mut payload_high = exact_machine_limits.payload_bytes;
+    while payload_low < payload_high {
+        let midpoint = payload_low + (payload_high - payload_low) / 2;
+        let mut candidate = exact_machine_limits;
+        candidate.payload_bytes = midpoint;
+        candidate = candidate.with_aligned_validation();
+        match prepare_with(candidate, &never_cancelled) {
+            Ok(_) => payload_high = midpoint,
+            Err(error)
+                if matches!(
+                    error.machine_lower_error(),
+                    Some(MachineLowerError::ResourceLimit {
+                        resource: "MachineWir payload bytes",
+                        ..
+                    })
+                ) =>
+            {
+                payload_low = midpoint + 1;
+            }
+            Err(error) => panic!("unexpected payload-bound failure: {error}"),
+        }
+    }
+    assert!(payload_low >= 5, "the exact inline UTF-8 bytes are metered");
+    exact_machine_limits.payload_bytes = payload_low;
+    exact_machine_limits = exact_machine_limits.with_aligned_validation();
     let exact = prepare_with(exact_machine_limits, &never_cancelled)
         .expect("fixed array accepts its exact MachineWir instruction ceiling");
     assert_eq!(exact.machine().wir().as_wir(), machine);
@@ -497,6 +573,18 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
         Some(&MachineLowerError::ResourceLimit {
             resource: "MachineWir instructions",
             limit: instruction_count - 1,
+        })
+    );
+    let mut payload_one_under = exact_machine_limits;
+    payload_one_under.payload_bytes -= 1;
+    payload_one_under = payload_one_under.with_aligned_validation();
+    let payload_error = prepare_with(payload_one_under, &never_cancelled)
+        .expect_err("one fewer MachineWir payload byte must fail");
+    assert_eq!(
+        payload_error.machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir payload bytes",
+            limit: payload_low - 1,
         })
     );
     let machine_polls = Cell::new(0_u64);

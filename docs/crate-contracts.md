@@ -476,6 +476,18 @@ it. It injects phase implementations and bounded host capabilities, while
   optimizer preserve the model. Machine lowering rejects the type by name at
   `machine-static-bytes-lowering-pending` until runtime storage and a consumer
   ABI are specified.
+- MachineWir v20 retains one exact nonempty UTF-8 `Static[Str]` value for the
+  sealed generated source-test profile. The Flow lowerer authenticates the
+  synchronous function color and exact binding-to-literal relationship before
+  erasing that source-only authority. Machine validation independently requires
+  one nominal exact-extent type, one matching byte literal, one source-test
+  owner, and no parameter, result, block, global, operation, or terminator
+  transport or use. LLVM repeats the retained extent/UTF-8/inert-profile checks
+  and renders the literal as `[N x i8]`. The unused literal has no claimed
+  runtime observation; repeat COFF proves deterministic artifact emission only.
+  Consumers, multiple values, actor/async owners, empty/invalid UTF-8 literals,
+  bounded formatting, static bytes, and broader string storage remain named
+  fail-closed.
 - SemanticWir v15 retains the exact privileged fallible-await profile as
   distinct `AsyncExit` and ephemeral `AsyncOutcome` types plus
   `AwaitAsyncOutcome` and `AsyncOutcomeAuthenticated` proof authority. The
@@ -492,14 +504,14 @@ it. It injects phase implementations and bounded host capabilities, while
   exhaustive cover. Flow rejects the pattern proof authority by name at
   `flow-fixed-array-match-lowering-pending`; no Flow or native execution is
   claimed.
-- MachineWir v19 retains same-block nongeneric flat values with two or more
+- MachineWir v20 retains same-block nongeneric flat values with two or more
   primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
   `InsertField`, and `ExtractField` carry exact SSA joins through independent
   validation, equality, and resource metering; LLVM renders them with
   first-class `insertvalue`/`extractvalue`. One-field `u64` structs retain the
   established erased bitcast representation. Aggregate function/block
   boundaries, packed/empty/non-flat structs, and nested aggregates fail closed.
-- MachineWir v19 also retains the exact inline, nonempty, homogeneous
+- MachineWir v20 also retains the exact inline, nonempty, homogeneous
   boolean/default-`i64` fixed-array iteration profile. `MakeArray` authenticates
   the source-ordered element vector and `ExtractIndex` carries the exact
   `CapacityBound` from FlowWir v19. Validation joins the array extent, generated
@@ -508,7 +520,7 @@ it. It injects phase implementations and bounded host capabilities, while
   storage plus one proved dynamic element access. Empty, heterogeneous,
   stored/dynamic, taking, mutable, suspended, and function-boundary arrays stay
   fail-closed.
-- MachineWir v19 records one exact optional logical payload type per enum tag.
+- MachineWir v20 records one exact optional logical payload type per enum tag.
   Uniform scalar enums retain that scalar as the physical shared-slot type;
   all-unit enums retain neither a slot nor logical payloads and remain exactly
   one tag byte. The first heterogeneous profile is deliberately narrower: two
@@ -519,7 +531,7 @@ it. It injects phase implementations and bounded host capabilities, while
   validation rejects nominal, tag, logical-type, or storage substitution. LLVM
   independently rechecks the profile and uses a zero-initialized aligned local
   slot to copy the exact logical payload bits into the physical union value.
-  FlowWir v19 and MachineWir v19 additionally admit exact per-tag projection
+  FlowWir v19 and MachineWir v20 additionally admit exact per-tag projection
   for two unary variants with distinct primitive-scalar payloads. `EnumPayload`
   carries `Some(tag)` for that profile, while the canonical uniform-payload
   representation retains `None`; validators join the tag to the logical result
@@ -847,7 +859,7 @@ it. It injects phase implementations and bounded host capabilities, while
   and the unique `ImageClosed` root must close over activation capacities and a
   `TypeChecked`/`EffectsAllowed` ancestry. This is a compiled startup-task
   subset, not mailbox admission, recurring scheduling, or cancellation
-  execution. MachineWir v19 extends that same sealed plan to the exact
+  execution. MachineWir v20 extends that same sealed plan to the exact
   constant-`u64` delivery profile described below while preserving unit.
 - Floating not-equal is explicitly unordered-or-not-equal, matching the source
   language rule that NaN compares unequal to itself. Version 5 also makes
@@ -863,21 +875,21 @@ it. It injects phase implementations and bounded host capabilities, while
   runtime requirements, the unique UEFI entry, the closed set of no-argument
   interrupt handlers, and target/build consistency. Firmware and interrupt
   entries cannot be ordinary direct or tail-call targets.
-- MachineWir v19 admits one exact same-core typed-reply profile. The caller is
+- MachineWir v20 admits one exact same-core typed-reply profile. The caller is
   a single-flight task entry with one 16-byte, 8-aligned stack slot; request,
   mailbox receive, and target resolve must agree on actor, method, capacity
   permit, and `ActorReplyExactlyOnce` proof. The request carries distinct
   state-mismatch and duplicate-resolve fatal provenances, and the target must
   have no parameters and return exact `u64`. Reserve/commit/dispatch and
   activation records are forbidden in this profile.
-- MachineWir v19 also admits one exact structured scope-return activation
+- MachineWir v20 also admits one exact structured scope-return activation
   shape: a five-block actor caller branches to an authenticated generated
   cleanup plus return, or to the same cleanup followed by its already-proved
   immediate unit activation and resume. Validation rejoins the flat state,
   generated-cleanup origin, both calls, branch/jump targets, activation call,
   and empty resume. Deleting or substituting either cleanup invalidates the
   activation plan; arbitrary branched activation callers remain invalid.
-- MachineWir v19 also admits the first typed internal-async delivery without a
+- MachineWir v20 also admits the first typed internal-async delivery without a
   schema change: the existing activation plan may bind an ordinary no-argument
   callee whose complete body is one exact unsigned-`u64` constant and return.
   The caller's internal call defines that same `u64` directly, its resume block
@@ -1005,7 +1017,7 @@ it. It injects phase implementations and bounded host capabilities, while
   `TestEmit` result, exact-zero switch, and unchanged-status return. It cannot
   erase, merge, or substitute those guards; independent textual and native
   evidence checks the two-emission fixture before accepting the object.
-- For the sealed MachineWir v19 typed-reply profile, LLVM allocates the exact
+- For the sealed MachineWir v20 typed-reply profile, LLVM allocates the exact
   16-byte caller slot and emits atomic state transitions around the exact
   direct same-core target call. State mismatch and duplicate resolution route
   to fatal codes 7 and 8. `ActorReplyResolve` is a validated authority marker

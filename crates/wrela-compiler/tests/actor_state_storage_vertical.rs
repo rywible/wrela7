@@ -574,7 +574,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
         14,
         "both lifetime markers are erased before exact MachineWir instruction accounting"
     );
-    assert_eq!(machine.version, 19);
+    assert_eq!(machine.version, 20);
     let machine_state = machine
         .region_storage
         .iter()

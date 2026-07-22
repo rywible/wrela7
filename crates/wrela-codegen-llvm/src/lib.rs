@@ -2781,6 +2781,37 @@ mod contract_tests {
         runtime_test_fixture_with_frames(canonical_passing_frames(TestId(1)))
     }
 
+    fn static_string_runtime_test_fixture() -> (ValidatedMachineWir, TargetPackage) {
+        let (validated, target, _) = runtime_test_fixture();
+        let mut machine = validated.into_wir();
+        machine.types.push(MachineType {
+            id: MachineTypeId(9),
+            kind: MachineTypeKind::StaticString { bytes: 5 },
+            size: 5,
+            alignment: 1,
+            source_name: Some("Static[Str]".to_owned()),
+        });
+        let test = &mut machine.functions[1];
+        test.values.push(MachineValue {
+            id: ValueId(0),
+            ty: MachineTypeId(9),
+            source_name: Some("label".to_owned()),
+        });
+        test.blocks[0].instructions.push(MachineInstruction {
+            id: InstructionId(0),
+            results: vec![ValueId(0)],
+            operation: MachineOperation::Immediate(MachineImmediate::Bytes(b"fixed".to_vec())),
+            source: Some(Span {
+                file: FileId(0),
+                range: TextRange { start: 8, end: 11 },
+            }),
+        });
+        let machine = machine
+            .validate_for_target(&target)
+            .expect("exact static text remains valid MachineWir");
+        (machine, target)
+    }
+
     fn runtime_test_fixture_with_frames(
         frames: Vec<Vec<u8>>,
     ) -> (ValidatedMachineWir, TargetPackage, Vec<Vec<u8>>) {
@@ -5358,7 +5389,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn real_checked_scalar_surface_reaches_machine_v18_and_textual_llvm() {
+    fn real_checked_scalar_surface_reaches_machine_v20_and_textual_llvm() {
         let cases = [
             (
                 semantic::BinaryOperator::Add,
@@ -5417,7 +5448,7 @@ mod contract_tests {
                     right: semantic::ValueId(1),
                     arithmetic,
                 });
-            assert_eq!(machine.as_wir().version, 19);
+            assert_eq!(machine.as_wir().version, 20);
             assert!(
                 machine
                     .as_wir()
@@ -5967,6 +5998,101 @@ mod contract_tests {
             machine.as_wir().functions[0].origin,
             MachineFunctionOrigin::GeneratedTestHarness { group: 9, .. }
         ));
+    }
+
+    #[test]
+    fn exact_static_string_renders_and_machine_validation_rejects_profile_forgeries() {
+        let (machine, target) = static_string_runtime_test_fixture();
+        let request = CodegenRequest {
+            module: &machine,
+            target: target.backend(),
+            options: CodegenOptions::standard(),
+        };
+        super::preflight(&request, &|| false).expect("exact static text codegen preflight");
+        let rendered = super::ir::render_module(&request, &|| false)
+            .expect("exact static text renders to LLVM IR");
+        let rendered = std::str::from_utf8(&rendered).expect("rendered LLVM text");
+        assert!(
+            rendered.contains("%v0 = freeze [5 x i8] [i8 102, i8 105, i8 120, i8 101, i8 100]")
+        );
+        let assert_profile_invalid = |candidate: MachineWir, reason: &str| {
+            let errors = candidate.validate_for_target(&target).expect_err(reason);
+            assert!(
+                errors.0.iter().any(|error| matches!(
+                    error,
+                    ValidationError::InvalidRecord {
+                        kind: "static string profile",
+                        ..
+                    }
+                )),
+                "{reason}: {errors:?}"
+            );
+        };
+
+        let mut consumed = machine.as_wir().clone();
+        consumed.functions[1].values.push(MachineValue {
+            id: ValueId(1),
+            ty: MachineTypeId(9),
+            source_name: Some("copied".to_owned()),
+        });
+        consumed.functions[1].blocks[0]
+            .instructions
+            .push(MachineInstruction {
+                id: InstructionId(1),
+                results: vec![ValueId(1)],
+                operation: MachineOperation::Copy { value: ValueId(0) },
+                source: Some(Span {
+                    file: FileId(0),
+                    range: TextRange { start: 16, end: 21 },
+                }),
+            });
+        assert_profile_invalid(
+            consumed,
+            "MachineWir rejects a consumed and multiply-defined static value",
+        );
+
+        let mut duplicated_type = machine.as_wir().clone();
+        duplicated_type.types.push(MachineType {
+            id: MachineTypeId(10),
+            kind: MachineTypeKind::StaticString { bytes: 5 },
+            size: 5,
+            alignment: 1,
+            source_name: Some("Static[Str]".to_owned()),
+        });
+        assert_profile_invalid(
+            duplicated_type,
+            "MachineWir rejects an unused duplicate static-string type",
+        );
+
+        let assert_invalid = |mutate: fn(&mut wrela_machine_wir::MachineWir), reason: &str| {
+            let mut candidate = machine.as_wir().clone();
+            mutate(&mut candidate);
+            assert_profile_invalid(candidate, reason);
+        };
+        assert_invalid(
+            |candidate| candidate.functions[1].parameters.push(ValueId(0)),
+            "MachineWir rejects a static-string parameter",
+        );
+        assert_invalid(
+            |candidate| candidate.functions[1].result = MachineTypeId(9),
+            "MachineWir rejects a static-string result",
+        );
+        assert_invalid(
+            |candidate| candidate.functions[1].blocks[0].parameters.push(ValueId(0)),
+            "MachineWir rejects static-string block transport",
+        );
+        assert_invalid(
+            |candidate| {
+                candidate.globals[0].ty = MachineTypeId(9);
+                candidate.globals[0].alignment = 1;
+                candidate.globals[0].initializer = MachineImmediate::Bytes(b"fixed".to_vec());
+            },
+            "MachineWir rejects static-string global storage",
+        );
+        assert_invalid(
+            |candidate| candidate.functions[1].role = MachineFunctionRole::ActorTurn(0),
+            "MachineWir rejects an actor-owned static-string literal",
+        );
     }
 
     #[test]

@@ -182,6 +182,10 @@ fn type_kind_equal(
             },
         ) => left_element == right_element && left_length == right_length,
         (
+            MachineTypeKind::StaticString { bytes: left },
+            MachineTypeKind::StaticString { bytes: right },
+        ) => left == right,
+        (
             MachineTypeKind::Struct {
                 fields: left_fields,
                 packed: left_packed,
@@ -1221,5 +1225,17 @@ mod tests {
             Err(MachineLowerError::Cancelled)
         );
         assert_eq!(polls.get(), 2);
+    }
+
+    #[test]
+    fn same_length_static_string_content_substitution_is_not_equal() {
+        assert!(
+            !immediate_equal(
+                &MachineImmediate::Bytes(b"fixed".to_vec()),
+                &MachineImmediate::Bytes(b"faked".to_vec()),
+                &|| false,
+            )
+            .expect("same-length byte comparison remains cancellable")
+        );
     }
 }
