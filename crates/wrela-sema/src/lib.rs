@@ -11073,18 +11073,32 @@ fn valid_actor_state_accesses(
 pub(crate) const ACTOR_STATE_PROMOTION_REASON: &str =
     "actor state store outlives its non-reentrant turn frame";
 
+fn actor_state_region_inference_candidate(
+    kind: ActorStateAccessKind,
+) -> Option<(StatementId, ValueId, &'static str)> {
+    match kind {
+        ActorStateAccessKind::Write {
+            statement, value, ..
+        } => Some((statement, value, "actor-state-store")),
+        ActorStateAccessKind::CompoundAssign {
+            statement, result, ..
+        } => Some((statement, result, "actor-state-compound-store")),
+        ActorStateAccessKind::Read { .. } => None,
+    }
+}
+
 fn valid_region_inference(
     analysis: &PartialAnalysis,
     program: &wrela_hir::Program,
     graph: &ImageGraph,
 ) -> bool {
-    let direct_write_count = analysis
+    let promotion_count = analysis
         .actor_state_accesses
         .iter()
-        .filter(|access| matches!(access.kind, ActorStateAccessKind::Write { .. }))
+        .filter(|access| actor_state_region_inference_candidate(access.kind).is_some())
         .count();
-    if analysis.region_assignments.len() != direct_write_count
-        || analysis.promotions.len() != direct_write_count
+    if analysis.region_assignments.len() != promotion_count
+        || analysis.promotions.len() != promotion_count
     {
         return false;
     }
@@ -11096,13 +11110,11 @@ fn valid_region_inference(
             analysis
                 .actor_state_accesses
                 .iter()
-                .filter(|access| matches!(access.kind, ActorStateAccessKind::Write { .. })),
+                .filter(|access| actor_state_region_inference_candidate(access.kind).is_some()),
         )
         .enumerate()
     {
-        let ActorStateAccessKind::Write {
-            statement, value, ..
-        } = access.kind
+        let Some((statement, value, name)) = actor_state_region_inference_candidate(access.kind)
         else {
             return false;
         };
@@ -11115,7 +11127,7 @@ fn valid_region_inference(
         let allocation = format!("alloc:{}:{}", assignment.id.0, assignment.name);
         let source_statement = program.statement(statement);
         if assignment.id.0 as usize != index
-            || assignment.name != "actor-state-store"
+            || assignment.name != name
             || assignment.function != access.function
             || assignment.statement != statement
             || assignment.value != value

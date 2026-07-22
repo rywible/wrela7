@@ -2432,6 +2432,7 @@ fn exact_actor_state_prefix(
             [loaded],
             Some(immediate),
             Some(binary),
+            Some(promotion),
             Some(store_address),
             Some(store),
         ) = (
@@ -2441,6 +2442,7 @@ fn exact_actor_state_prefix(
             instructions.get(index + 3),
             instructions.get(index + 4),
             instructions.get(index + 5),
+            instructions.get(index + 6),
         ) {
             let compound_matches = matches!(
                 (&immediate.operation, immediate.results.as_slice()),
@@ -2471,6 +2473,20 @@ fn exact_actor_state_prefix(
                                 .is_some_and(|ty| ty.kind == flow::FlowTypeKind::Scalar(
                                     flow::ScalarType::Integer { signed: false, bits: 64 }
                                 ))
+                            && exact_actor_state_promotion(
+                                input,
+                                function,
+                                actor,
+                                promotion,
+                            )
+                            && matches!(
+                                promotion.operation,
+                                flow::FlowOperation::Promote {
+                                    value,
+                                    destination,
+                                    ..
+                                } if value == *result && destination == *region
+                            )
                             && matches!(
                                 (&store_address.operation, store_address.results.as_slice()),
                                 (
@@ -2504,11 +2520,12 @@ fn exact_actor_state_prefix(
                             )
                     )
                     && binary.source == address_instruction.source
+                    && promotion.source == address_instruction.source
                     && store_address.source == address_instruction.source
                     && store.source == address_instruction.source
             );
             if compound_matches {
-                index += 6;
+                index += 7;
                 continue;
             }
         }

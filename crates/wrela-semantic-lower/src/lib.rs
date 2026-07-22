@@ -7406,7 +7406,8 @@ impl SourceFunctionLowerer<'_> {
                     else {
                         return Err(self.fact_mismatch("actor state compound RHS value"));
                     };
-                    let result = self.value_map.get(result)?;
+                    let semantic_result = result;
+                    let result = self.value_map.get(semantic_result)?;
                     self.push_let(
                         &mut statements,
                         result,
@@ -7417,6 +7418,67 @@ impl SourceFunctionLowerer<'_> {
                             arithmetic: wir::ArithmeticMode::Checked,
                         },
                         Some(statement_source),
+                    )?;
+                    let assignment = self
+                        .input
+                        .facts()
+                        .region_assignments
+                        .iter()
+                        .find(|assignment| {
+                            assignment.function == self.function.id
+                                && assignment.statement == statement_id
+                        })
+                        .ok_or_else(|| {
+                            self.fact_mismatch("actor state compound region assignment")
+                        })?;
+                    let promotion = self
+                        .input
+                        .facts()
+                        .promotions
+                        .iter()
+                        .find(|promotion| promotion.allocation == assignment.id)
+                        .ok_or_else(|| self.fact_mismatch("actor state compound promotion"))?;
+                    if assignment.name != "actor-state-compound-store"
+                        || assignment.value != semantic_result
+                        || assignment.region != access.region
+                        || assignment.source != statement_source
+                        || promotion.value != semantic_result
+                        || promotion.destination != access.region
+                        || promotion.source != statement_source
+                        || self
+                            .input
+                            .facts()
+                            .proofs
+                            .get(promotion.proof.0 as usize)
+                            .is_none_or(|proof| proof.kind != sema::ProofKind::RegionBound)
+                    {
+                        return Err(self.fact_mismatch("actor state compound promotion provenance"));
+                    }
+                    let promotion_proof = wir::ProofId(promotion.proof.0);
+                    if self
+                        .function
+                        .proofs
+                        .binary_search(&promotion.proof)
+                        .is_err()
+                        && !self.required_proofs.contains(&promotion_proof)
+                    {
+                        push_bounded_proof(
+                            &mut self.required_proofs,
+                            promotion_proof,
+                            self.limits.model_edges,
+                        )?;
+                    }
+                    self.push_statement(
+                        &mut statements,
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            results: Vec::new(),
+                            operation: wir::SemanticOperation::Promote {
+                                value: result,
+                                destination: wir::RegionId(promotion.destination.0),
+                                proof: promotion_proof,
+                            },
+                            source: Some(statement_source),
+                        }),
                     )?;
                     self.push_statement(
                         &mut statements,
@@ -7469,15 +7531,22 @@ impl SourceFunctionLowerer<'_> {
                         .iter()
                         .find(|promotion| promotion.allocation == assignment.id)
                         .ok_or_else(|| self.fact_mismatch("actor state promotion"))?;
-                    if assignment.value
-                        != match access.kind {
-                            sema::ActorStateAccessKind::Write { value, .. } => value,
-                            _ => return Err(self.fact_mismatch("actor state direct write")),
-                        }
+                    if assignment.name != "actor-state-store"
+                        || assignment.value
+                            != match access.kind {
+                                sema::ActorStateAccessKind::Write { value, .. } => value,
+                                _ => return Err(self.fact_mismatch("actor state direct write")),
+                            }
                         || assignment.region != access.region
                         || promotion.value != assignment.value
                         || promotion.destination != access.region
                         || promotion.source != statement_source
+                        || self
+                            .input
+                            .facts()
+                            .proofs
+                            .get(promotion.proof.0 as usize)
+                            .is_none_or(|proof| proof.kind != sema::ProofKind::RegionBound)
                     {
                         return Err(self.fact_mismatch("actor state promotion provenance"));
                     }
@@ -16549,6 +16618,32 @@ pub fn boot() -> Image:
     installed = img.service(Worker, mailbox=2)
     return img
 "#;
+    const PROMOTED_STATE_ACTOR_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    value: u64 = 0
+
+    pub async fn ping(mut self):
+        self.value = 5
+        self.value += 7
+        await checkpoint()
+
+    @task
+    async fn pulse(mut self):
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#;
     const ACTOR_REPLY_SOURCE: &str = r#"module app
 
 from core.image import Image, Target
@@ -18968,6 +19063,198 @@ pub fn boot() -> Image:
             seal(&request, wrong_owner, report, &|| false),
             Err(LowerError::InvalidOutput(_))
         ));
+    }
+
+    #[test]
+    fn checked_actor_state_result_promotion_is_exact_bounded_and_cancellable() {
+        let image = analyze_parsed_actor_source(PROMOTED_STATE_ACTOR_SOURCE);
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("direct and checked actor-state promotions lower");
+        let baseline = output.wir().as_wir().clone();
+        let turn = baseline
+            .functions
+            .iter()
+            .find(|function| function.role == wir::FunctionRole::ActorTurn(wir::ActorId(0)))
+            .expect("promoted actor turn");
+        let state_operations = turn
+            .body
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(statement)
+                    if matches!(
+                        statement.operation,
+                        wir::SemanticOperation::Promote { .. }
+                            | wir::SemanticOperation::ActorStateLoad { .. }
+                            | wir::SemanticOperation::Binary { .. }
+                            | wir::SemanticOperation::ActorStateStore { .. }
+                    ) =>
+                {
+                    Some(statement)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [
+            direct_promotion,
+            direct_store,
+            load,
+            binary,
+            compound_promotion,
+            compound_store,
+        ] = state_operations.as_slice()
+        else {
+            panic!("exact direct plus compound actor-state operation sequence")
+        };
+        let wir::SemanticOperation::Binary {
+            operator: wir::BinaryOperator::Add,
+            right,
+            arithmetic: wir::ArithmeticMode::Checked,
+            ..
+        } = binary.operation
+        else {
+            panic!("checked actor-state add")
+        };
+        let [checked_result] = binary.results.as_slice() else {
+            panic!("checked actor-state add result")
+        };
+        let wir::SemanticOperation::Promote {
+            value: compound_promoted,
+            destination: compound_destination,
+            proof: compound_proof,
+        } = compound_promotion.operation
+        else {
+            panic!("checked-result promotion")
+        };
+        let wir::SemanticOperation::ActorStateStore {
+            region: compound_region,
+            value: compound_value,
+            ..
+        } = compound_store.operation
+        else {
+            panic!("checked-result state store")
+        };
+        assert_eq!(compound_promoted, *checked_result);
+        assert_ne!(compound_promoted, right, "the RHS is not the escaped value");
+        assert_eq!(compound_promoted, compound_value);
+        assert_eq!(compound_destination, compound_region);
+        assert_eq!(binary.source, compound_promotion.source);
+        assert_eq!(compound_promotion.source, compound_store.source);
+        assert!(turn.proofs.contains(&compound_proof));
+        assert_eq!(
+            baseline.proofs[compound_proof.0 as usize].kind,
+            wir::ProofKind::RegionBound
+        );
+        assert!(matches!(
+            direct_promotion.operation,
+            wir::SemanticOperation::Promote { .. }
+        ));
+        assert!(matches!(
+            direct_store.operation,
+            wir::SemanticOperation::ActorStateStore { .. }
+        ));
+        assert!(matches!(
+            load.operation,
+            wir::SemanticOperation::ActorStateLoad { .. }
+        ));
+
+        let mut forged = baseline.clone();
+        let forged_turn = forged
+            .functions
+            .iter_mut()
+            .find(|function| function.role == wir::FunctionRole::ActorTurn(wir::ActorId(0)))
+            .expect("forged actor turn");
+        let forged_promotion = forged_turn
+            .body
+            .statements
+            .iter_mut()
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(statement)
+                    if matches!(statement.operation, wir::SemanticOperation::Promote { .. }) =>
+                {
+                    Some(statement)
+                }
+                _ => None,
+            })
+            .nth(1)
+            .expect("forged compound promotion");
+        let wir::SemanticOperation::Promote { value, .. } = &mut forged_promotion.operation else {
+            unreachable!("filtered promotion")
+        };
+        *value = right;
+        let request = LowerRequest {
+            input: image.clone(),
+            limits: LoweringLimits::standard(),
+        };
+        assert!(matches!(
+            seal(&request, forged, output.report().clone(), &|| false),
+            Err(LowerError::InvalidReport(_)) | Err(LowerError::InvalidOutput(_))
+        ));
+
+        let mut exact = LoweringLimits::standard();
+        exact.operations = output.report().operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact repeated-promotion operation limit");
+        let mut one_under = exact;
+        one_under.operations -= 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == one_under.operations
+        ));
+
+        let polls = Cell::new(0_u64);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            )
+            .expect("measure repeated-promotion cancellation polls");
+        let cancel_at = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next == cancel_at
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), cancel_at);
     }
 
     #[test]

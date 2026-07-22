@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use wrela_backend::{
-    CodegenError, emit_prepared_object, flow_wir as flow, llvm_backend_available,
+    CodegenError, MachineLowerError, emit_prepared_object, flow_wir as flow,
+    llvm_backend_available,
     machine_wir::{CheckedIntegerOp, MachineOperation, MachineRegionStorageKind, ValidationError},
     prepare_canonical_frame_for_codegen,
 };
@@ -11,6 +12,7 @@ use wrela_build_model::{
     BuildConfiguration, BuildIdentity, BuildProfile, LanguageRevision, Sha256Digest,
     TargetIdentity, seal_build_configuration,
 };
+use wrela_compiler::{AnalysisFactAssembler, AnalysisFactRequest, CanonicalAnalysisFactAssembler};
 use wrela_flow_lower::{
     CanonicalFlowLowerer, FlowLowerer, LowerRequest as FlowLowerRequest,
     LoweringLimits as FlowLoweringLimits,
@@ -227,6 +229,44 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
         state.owner,
         wrela_sema::ImageOwner::Actor(wrela_sema::ActorId(0))
     );
+    let report = CanonicalAnalysisFactAssembler::new()
+        .assemble(
+            AnalysisFactRequest {
+                analysis: &analyzed,
+                limits: wrela_image_report::AnalysisFactLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("compound actor-state promotions reach the image report");
+    let report = report.as_facts();
+    assert_eq!(
+        report
+            .region_assignments
+            .iter()
+            .map(|fact| fact.allocation.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "alloc:0:actor-state-store",
+            "alloc:1:actor-state-compound-store",
+        ]
+    );
+    assert_eq!(
+        report
+            .promotions
+            .iter()
+            .map(|fact| fact.allocation.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "alloc:0:actor-state-store",
+            "alloc:1:actor-state-compound-store",
+        ]
+    );
+    assert!(report.promotions.iter().all(|fact| {
+        fact.source_region == wrela_image_report::RegionClass::TaskFrame
+            && fact.destination_region == wrela_image_report::RegionClass::Image
+            && fact.reason == "actor state store outlives its non-reentrant turn frame"
+            && report.proofs[fact.proof as usize].category == "region-bound"
+    }));
 
     let semantic_output = CanonicalSemanticLowerer::new()
         .lower(
@@ -319,6 +359,15 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
                 ..
             },
             semantic::LetStatement {
+                results: compound_promotion_results,
+                operation: semantic::SemanticOperation::Promote {
+                    value: compound_promoted,
+                    destination: compound_promotion_region,
+                    proof: compound_promotion_proof,
+                },
+                source: compound_promotion_source,
+            },
+            semantic::LetStatement {
                 results: stored_results,
                 operation: semantic::SemanticOperation::ActorStateStore {
                     actor: semantic::ActorId(0),
@@ -326,7 +375,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
                     value: stored,
                     proof: store_proof,
                 },
-                ..
+                source: compound_store_source,
             },
         ] if promotion_results.is_empty()
             && direct_store_results.is_empty()
@@ -342,6 +391,11 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             && store_proof == proof
             && matches!(loaded.as_slice(), [loaded] if loaded == left)
             && matches!(summed.as_slice(), [sum] if sum == stored)
+            && compound_promotion_results.is_empty()
+            && compound_promoted == stored
+            && *compound_promotion_region == semantic_state.id
+            && semantic_actor_turn.proofs.contains(compound_promotion_proof)
+            && *compound_promotion_source == *compound_store_source
             && stored_results.is_empty()
     ));
 
@@ -389,7 +443,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             )
         })
         .count();
-    assert_eq!(flow_promotions, 1);
+    assert_eq!(flow_promotions, 2);
     let flow_state_addresses = flow_actor_turn
         .blocks
         .iter()
@@ -442,6 +496,61 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             .count(),
         2
     );
+    let mut forged_flow = flow_output.wir().as_wir().clone();
+    let forged_turn = forged_flow
+        .functions
+        .iter_mut()
+        .find(|function| function.role == flow::FunctionRole::ActorTurn(flow::ActorId(0)))
+        .expect("forged FlowWir actor turn");
+    let compound_right = forged_turn
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match instruction.operation {
+            flow::FlowOperation::Binary {
+                op: flow::BinaryOp::AddChecked,
+                right,
+                ..
+            } => Some(right),
+            _ => None,
+        })
+        .expect("compound RHS value");
+    let compound_promotion = forged_turn
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .filter(|instruction| matches!(instruction.operation, flow::FlowOperation::Promote { .. }))
+        .nth(1)
+        .expect("compound promotion marker");
+    let flow::FlowOperation::Promote { value, .. } = &mut compound_promotion.operation else {
+        unreachable!("filtered compound promotion")
+    };
+    *value = compound_right;
+    let forged_flow = forged_flow
+        .validate()
+        .expect("RHS substitution remains structurally valid FlowWir");
+    let forged_encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &forged_flow,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("RHS substitution remains structurally valid FlowWir");
+    let error = prepare_canonical_frame_for_codegen(
+        forged_encoded.bytes(),
+        &target,
+        &build,
+        &never_cancelled,
+    )
+    .expect_err("Machine lowering must reject compound promotion of the RHS");
+    assert_eq!(
+        error.machine_lower_error(),
+        Some(&MachineLowerError::UnsupportedInput {
+            feature: "machine-async-result-delivery-pending",
+        })
+    );
     let encoded = encode_and_verify(
         &CanonicalFlowWirCodec,
         EncodeRequest {
@@ -463,7 +572,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
             .map(|block| block.instructions.len())
             .sum::<usize>(),
         14,
-        "the lifetime marker is erased before exact MachineWir instruction accounting"
+        "both lifetime markers are erased before exact MachineWir instruction accounting"
     );
     assert_eq!(machine.version, 15);
     let machine_state = machine

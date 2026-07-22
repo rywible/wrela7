@@ -14500,59 +14500,70 @@ fn no_promote_target_diagnostic(request: &AnalysisRequest<'_>, source: Span) -> 
     RuntimeFailure::Diagnostic(Box::new(diagnostic))
 }
 
+fn actor_state_promotion_candidate(
+    kind: ActorStateAccessKind,
+) -> Option<(StatementId, ValueId, &'static str)> {
+    match kind {
+        ActorStateAccessKind::Write {
+            statement, value, ..
+        } => Some((statement, value, "actor-state-store")),
+        ActorStateAccessKind::CompoundAssign {
+            statement, result, ..
+        } => Some((statement, result, "actor-state-compound-store")),
+        ActorStateAccessKind::Read { .. } => None,
+    }
+}
+
 fn infer_actor_state_promotions(
     request: &AnalysisRequest<'_>,
     partial: &mut PartialAnalysis,
     is_cancelled: &dyn Fn() -> bool,
 ) -> RuntimeResult<()> {
     let program = request.hir.as_program();
-    let mut direct_write_count = 0usize;
+    let mut promotion_count = 0usize;
     for access in &partial.actor_state_accesses {
         check_cancelled(is_cancelled)?;
-        if matches!(access.kind, ActorStateAccessKind::Write { .. }) {
-            direct_write_count = direct_write_count
+        if actor_state_promotion_candidate(access.kind).is_some() {
+            promotion_count = promotion_count
                 .checked_add(1)
                 .ok_or_else(|| fact_resource(request, "actor state promotion facts"))?;
         }
     }
-    if direct_write_count > request.limits.image_nodes as usize
+    if promotion_count > request.limits.image_nodes as usize
         || partial
             .proofs
             .len()
-            .checked_add(direct_write_count)
+            .checked_add(promotion_count)
             .is_none_or(|count| count > request.limits.proofs as usize)
     {
         return Err(fact_resource(request, "actor state promotion facts").into());
     }
-    let mut direct_writes = Vec::new();
-    direct_writes
-        .try_reserve_exact(direct_write_count)
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(promotion_count)
         .map_err(|_| fact_resource(request, "actor state promotion work"))?;
     for access in &partial.actor_state_accesses {
         check_cancelled(is_cancelled)?;
-        if let ActorStateAccessKind::Write {
-            statement, value, ..
-        } = access.kind
-        {
-            direct_writes.push((*access, statement, value));
+        if let Some((statement, value, name)) = actor_state_promotion_candidate(access.kind) {
+            candidates.push((*access, statement, value, name));
         }
     }
     partial
         .region_assignments
-        .try_reserve_exact(direct_write_count)
+        .try_reserve_exact(promotion_count)
         .map_err(|_| fact_resource(request, "actor state region assignments"))?;
     partial
         .promotions
-        .try_reserve_exact(direct_write_count)
+        .try_reserve_exact(promotion_count)
         .map_err(|_| fact_resource(request, "actor state promotions"))?;
 
-    for (access, statement, value) in direct_writes {
+    for (access, statement, value, name) in candidates {
         check_cancelled(is_cancelled)?;
         let id = AllocationId(
             u32::try_from(partial.region_assignments.len())
                 .map_err(|_| fact_resource(request, "actor state region assignments"))?,
         );
-        let allocation = format!("alloc:{}:actor-state-store", id.0);
+        let allocation = format!("alloc:{}:{name}", id.0);
         let statement_record = program
             .statement(statement)
             .ok_or(AnalysisFailure::RequestMismatch)?;
@@ -14621,7 +14632,7 @@ fn infer_actor_state_promotions(
         });
         partial.region_assignments.push(RegionAssignment {
             id,
-            name: "actor-state-store".to_owned(),
+            name: name.to_owned(),
             function: access.function,
             statement,
             value,
@@ -29908,6 +29919,35 @@ pub fn boot() -> Image:
             assert!(diagnostic.message.contains("development"));
             assert!(output.successful().is_none());
         }
+
+        let source = STATE_ACCESS_ACTOR_SOURCE
+            .replace("self.value = 7", "self.value += 1")
+            .replace(
+                "    pub async fn ping(mut self):",
+                "    @no_promote\n    pub async fn ping(mut self):",
+            );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("compound @no_promote escape is a source diagnostic");
+        let [diagnostic] = output.diagnostics() else {
+            panic!("one exact compound @no_promote rejection expected")
+        };
+        assert_eq!(
+            diagnostic.code.as_deref(),
+            Some("semantic-no-promote-escape")
+        );
+        assert!(
+            diagnostic
+                .message
+                .contains("alloc:0:actor-state-compound-store")
+        );
+        assert!(diagnostic.message.contains("development"));
+        assert!(output.successful().is_none());
     }
 
     #[test]
@@ -29989,7 +30029,20 @@ pub fn boot() -> Image:
             facts.values[result.0 as usize].origin,
             SemanticValueOrigin::ActorStateCompoundResult(*statement)
         );
+        let [assignment] = facts.region_assignments.as_slice() else {
+            panic!("checked compound state store must receive one inferred region assignment");
+        };
+        let [promotion] = facts.promotions.as_slice() else {
+            panic!("checked compound state store must receive one inferred promotion");
+        };
+        assert_eq!(assignment.name, "actor-state-compound-store");
+        assert_eq!(assignment.value, *result);
+        assert_eq!(promotion.value, *result);
+        assert_eq!(promotion.allocation, assignment.id);
 
+        let current = *current;
+        let result = *result;
+        let right = *value;
         let mut forged = facts.clone();
         forged.values[current.0 as usize].origin =
             SemanticValueOrigin::ActorStateCompoundResult(*statement);
@@ -29997,6 +30050,18 @@ pub fn boot() -> Image:
             .validate_partial_structure()
             .expect("origin substitution remains prefix-valid");
         assert!(forged.validate_for_seal(image.hir(), &|| false).is_err());
+
+        let mut forged = facts.clone();
+        forged.region_assignments[0].value = right;
+        forged.promotions[0].value = right;
+        forged
+            .validate_partial_structure()
+            .expect("compound RHS promotion substitution remains prefix-valid");
+        assert!(
+            forged.validate_for_seal(image.hir(), &|| false).is_err(),
+            "the compound RHS cannot replace the checked result as promotion authority"
+        );
+        assert_ne!(result, right);
     }
 
     #[test]
