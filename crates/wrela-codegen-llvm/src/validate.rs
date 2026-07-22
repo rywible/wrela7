@@ -1,11 +1,11 @@
 use wrela_machine_wir::{
     AtomicOrdering, BackendFacts, BackendProofKind, CallingConvention, CheckedIntegerOp,
     ConversionOp, Endianness, IntegerSignedness, Linkage, MACHINE_WIR_VERSION,
-    MachineActivationOwner, MachineActivationSchedule, MachineFunction, MachineFunctionRole,
-    MachineImmediate, MachineInstruction, MachineOperation, MachineRegionStorageKind,
-    MachineTerminator, MachineTypeId, MachineTypeKind, MachineUnaryOp, MemorySemantics,
-    REGION_STORAGE_SECTION_PREFIX, ScalarFailureKind, Section, SectionKind, SymbolDefinition,
-    SymbolVisibility, ValueId,
+    MachineActivationOwner, MachineActivationSchedule, MachineFunction, MachineFunctionOrigin,
+    MachineFunctionRole, MachineImmediate, MachineInstruction, MachineOperation,
+    MachineRegionStorageKind, MachineTerminator, MachineTypeId, MachineTypeKind, MachineUnaryOp,
+    MemorySemantics, REGION_STORAGE_SECTION_PREFIX, ScalarFailureKind, Section, SectionKind,
+    SymbolDefinition, SymbolVisibility, ValueId,
 };
 use wrela_runtime_abi::{
     INTERRUPT_ROUTE_LAYOUT, INTERRUPT_ROUTE_SECTION, INTERRUPT_ROUTE_TABLE_SYMBOL,
@@ -1413,10 +1413,12 @@ fn validate_function(
         ));
     }
     validate_scalar_value_types(&machine.types, &function.values, is_cancelled)?;
+    let cleanup_state = authenticated_cleanup_boundary_state(machine, function, is_cancelled)?;
     poll_values(&function.parameters, is_cancelled)?;
     for (parameter_index, parameter) in function.parameters.iter().enumerate() {
         check_periodically(parameter_index, is_cancelled)?;
-        if value_type(machine, function, *parameter).is_none_or(|ty| !is_basic_scalar(machine, ty))
+        if value_type(machine, function, *parameter)
+            .is_none_or(|ty| !is_basic_scalar(machine, ty) && cleanup_state != Some(ty))
         {
             return Err(CodegenError::UnsupportedMachineContract(
                 "void or non-scalar function parameter",
@@ -1494,7 +1496,6 @@ fn validate_operation(
         | MachineOperation::MakeEnum { .. }
         | MachineOperation::EnumTag { .. }
         | MachineOperation::EnumPayload { .. }
-        | MachineOperation::Call { .. }
         | MachineOperation::GlobalAddress(_)
         | MachineOperation::ActorReserve { .. }
         | MachineOperation::ActorCommit { .. }
@@ -1502,6 +1503,29 @@ fn validate_operation(
         | MachineOperation::MailboxDispatch { .. }
         | MachineOperation::TestAssert { .. }
         | MachineOperation::Fence(_) => {}
+        MachineOperation::Call {
+            function: callee,
+            arguments,
+            ..
+        } => {
+            let has_aggregate = arguments.iter().any(|argument| {
+                value_type(machine, function, *argument)
+                    .is_some_and(|ty| !is_basic_scalar(machine, ty))
+            });
+            if has_aggregate
+                && !authenticated_generated_cleanup_call(
+                    machine,
+                    function,
+                    instruction,
+                    *callee,
+                    arguments,
+                )
+            {
+                return Err(CodegenError::UnsupportedMachineContract(
+                    "unauthenticated aggregate cleanup call",
+                ));
+            }
+        }
         MachineOperation::RuntimeCall { intrinsic, .. }
             if *intrinsic != wrela_runtime_abi::RuntimeIntrinsic::TestAssertionFail => {}
         MachineOperation::RuntimeCall { .. } => return Err(unsupported()),
@@ -2056,7 +2080,7 @@ fn supported_struct_layout(types: &[wrela_machine_wir::MachineType], id: Machine
     else {
         return false;
     };
-    if fields.len() < 2 {
+    if fields.is_empty() {
         return false;
     }
     let mut end = 0_u64;
@@ -2089,6 +2113,166 @@ fn supported_struct_layout(types: &[wrela_machine_wir::MachineType], id: Machine
         .checked_add(aggregate_alignment - 1)
         .map(|size| size & !(aggregate_alignment - 1));
     ty.alignment == alignment && expected_size == Some(ty.size)
+}
+
+fn authenticated_cleanup_boundary_state(
+    machine: &wrela_machine_wir::MachineWir,
+    function: &MachineFunction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<MachineTypeId>, CodegenError> {
+    if let Some(state) = authenticated_generated_cleanup_state(machine, function)? {
+        return Ok(Some(state));
+    }
+    let MachineFunctionOrigin::SourceSemantic { semantic_function } = function.origin else {
+        return Ok(None);
+    };
+    if semantic_function != function.flow_function || function.role != MachineFunctionRole::Cleanup
+    {
+        return Ok(None);
+    }
+    let mut state = None;
+    for (index, candidate) in machine.functions.iter().enumerate() {
+        check_periodically(index, is_cancelled)?;
+        if !matches!(candidate.origin,
+            MachineFunctionOrigin::GeneratedCleanup {
+                semantic_function: helper,
+                ..
+            } if helper == semantic_function)
+        {
+            continue;
+        }
+        let candidate_state = authenticated_generated_cleanup_state(machine, candidate)?.ok_or(
+            CodegenError::UnsupportedMachineContract("unauthenticated generated cleanup function"),
+        )?;
+        if state.is_some_and(|previous| previous != candidate_state) {
+            return Err(CodegenError::UnsupportedMachineContract(
+                "unauthenticated generated cleanup function",
+            ));
+        }
+        state = Some(candidate_state);
+    }
+    Ok(state)
+}
+
+fn authenticated_generated_cleanup_state(
+    machine: &wrela_machine_wir::MachineWir,
+    function: &MachineFunction,
+) -> Result<Option<MachineTypeId>, CodegenError> {
+    let MachineFunctionOrigin::GeneratedCleanup {
+        semantic_function,
+        scope,
+    } = function.origin
+    else {
+        return Ok(None);
+    };
+    let generated_count = machine
+        .functions
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.origin,
+                MachineFunctionOrigin::GeneratedCleanup { .. }
+            )
+        })
+        .count();
+    let first_generated = machine.functions.len().checked_sub(generated_count);
+    let expected_id = first_generated
+        .and_then(|first| first.checked_add(scope as usize))
+        .and_then(|id| u32::try_from(id).ok());
+    let helper = machine.functions.get(semantic_function as usize);
+    let parameter_type = |candidate: &MachineFunction| {
+        let [parameter] = candidate.parameters.as_slice() else {
+            return None;
+        };
+        candidate
+            .values
+            .get(parameter.0 as usize)
+            .map(|value| value.ty)
+    };
+    let Some(helper) = helper else {
+        return Err(CodegenError::UnsupportedMachineContract(
+            "unauthenticated generated cleanup function",
+        ));
+    };
+    let state = parameter_type(function);
+    let helper_state = parameter_type(helper);
+    let proof_matches = matches!(helper.proofs.as_slice(), [helper_proof]
+    if matches!(function.proofs.as_slice(), [generated_helper, cleanup]
+        if generated_helper == helper_proof
+            && machine.proofs.get(helper_proof.0 as usize).is_some_and(|proof| {
+                proof.id == *helper_proof
+                    && proof.kind == wrela_machine_wir::BackendProofKind::CleanupAcyclic
+                    && proof.bound == Some(1)
+            })
+            && machine.proofs.get(cleanup.0 as usize).is_some_and(|proof| {
+                proof.id == *cleanup
+                    && proof.kind == wrela_machine_wir::BackendProofKind::CleanupAcyclic
+                    && proof.depends_on.as_slice() == [*helper_proof]
+            })));
+    let helper_identity = matches!(helper.origin,
+        MachineFunctionOrigin::SourceSemantic { semantic_function: helper_semantic }
+            if helper_semantic == semantic_function && helper.flow_function == semantic_function);
+    let state_is_supported = state.is_some_and(|ty| supported_struct_type(machine, ty));
+    let void_result = |candidate: &MachineFunction| {
+        machine
+            .types
+            .get(candidate.result.0 as usize)
+            .is_some_and(|ty| matches!(ty.kind, MachineTypeKind::Void))
+    };
+    if first_generated.is_none_or(|first| semantic_function as usize >= first)
+        || expected_id != Some(function.id.0)
+        || function.flow_function != function.id.0
+        || function.role != MachineFunctionRole::Cleanup
+        || helper.role != MachineFunctionRole::Cleanup
+        || function.linkage != Linkage::Private
+        || helper.linkage != Linkage::Private
+        || function.convention != CallingConvention::Internal
+        || helper.convention != CallingConvention::Internal
+        || !void_result(function)
+        || !void_result(helper)
+        || function.stack_bytes != 0
+        || helper.stack_bytes != 0
+        || !function.stack_slots.is_empty()
+        || !helper.stack_slots.is_empty()
+        || function.source != helper.source
+        || function.values != helper.values
+        || function.blocks != helper.blocks
+        || state.is_none()
+        || state != helper_state
+        || !state_is_supported
+        || !helper_identity
+        || !proof_matches
+    {
+        return Err(CodegenError::UnsupportedMachineContract(
+            "unauthenticated generated cleanup function",
+        ));
+    }
+    Ok(state)
+}
+
+fn authenticated_generated_cleanup_call(
+    machine: &wrela_machine_wir::MachineWir,
+    caller: &MachineFunction,
+    instruction: &wrela_machine_wir::MachineInstruction,
+    callee: wrela_machine_wir::FunctionId,
+    arguments: &[ValueId],
+) -> bool {
+    let Some(callee) = machine.functions.get(callee.0 as usize) else {
+        return false;
+    };
+    let Ok(Some(state)) = authenticated_generated_cleanup_state(machine, callee) else {
+        return false;
+    };
+    let activation_proof = callee
+        .proofs
+        .get(1)
+        .and_then(|proof| machine.proofs.get(proof.0 as usize));
+    instruction.results.is_empty()
+        && matches!(arguments, [argument]
+            if value_type(machine, caller, *argument) == Some(state))
+        && instruction.source.is_some_and(|source| {
+            activation_proof.is_some_and(|proof| proof.sources.contains(&source))
+        })
 }
 
 fn supported_passive_function_type(

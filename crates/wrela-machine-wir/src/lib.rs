@@ -5664,7 +5664,7 @@ fn validate_operation_types(
                     matches!(&record.kind, MachineTypeKind::Struct {
                         fields: expected,
                         packed: false,
-                    } if expected.len() >= 2
+                    } if !expected.is_empty()
                         && expected.len() == fields.len()
                         && expected.iter().zip(fields).all(|(field, value)| {
                             value_ty(*value) == Some(field.ty)

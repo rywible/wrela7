@@ -2888,7 +2888,7 @@ fn flat_native_struct_fields(
     let flow::FlowTypeKind::Struct { fields } = &types.get(ty.0 as usize)?.kind else {
         return None;
     };
-    if fields.len() < 2
+    if fields.is_empty()
         || fields.iter().any(|field| {
             types
                 .get(field.0 as usize)
@@ -3877,7 +3877,7 @@ fn validate_function_surface(
     if function.result_types.len() > 1 {
         return Err(unsupported("functions with multiple return values"));
     }
-    validate_native_struct_locality(&input.types, function, is_cancelled)?;
+    validate_native_struct_locality_in(input, function, is_cancelled)?;
     if (function.stack_bound != 0 || function.frame_bound != 0) && !activation_function {
         return Err(unsupported("nonzero scalar function stack or frame bounds"));
     }
@@ -3923,23 +3923,49 @@ fn validate_function_surface(
     Ok(())
 }
 
+fn validate_native_struct_locality_in(
+    input: &flow::FlowWir,
+    function: &flow::FlowFunction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), MachineLowerError> {
+    validate_native_struct_locality_contract(&input.types, Some(input), function, is_cancelled)
+}
+
+#[cfg(test)]
 fn validate_native_struct_locality(
     types: &[flow::FlowType],
     function: &flow::FlowFunction,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), MachineLowerError> {
+    validate_native_struct_locality_contract(types, None, function, is_cancelled)
+}
+
+fn validate_native_struct_locality_contract(
+    types: &[flow::FlowType],
+    input: Option<&flow::FlowWir>,
+    function: &flow::FlowFunction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), MachineLowerError> {
     let native = |value: flow::ValueId| {
-        flow_value_type(function, value)
-            .ok()
-            .is_some_and(|ty| flat_native_struct_fields(types, ty).is_some())
+        flow_value_type(function, value).ok().is_some_and(|ty| {
+            flat_u64_struct_field(types, ty).is_none()
+                && flat_native_struct_fields(types, ty).is_some()
+        })
     };
-    if function.parameters.iter().copied().any(native)
-        || function
-            .result_types
-            .iter()
-            .copied()
-            .any(|ty| flat_native_struct_fields(types, ty).is_some())
-    {
+    let has_native_parameter = function.parameters.iter().copied().any(native);
+    let cleanup_state = if has_native_parameter {
+        input
+            .map(|input| authenticated_cleanup_boundary_state(input, function, is_cancelled))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    if function.parameters.iter().copied().any(|parameter| {
+        native(parameter) && cleanup_state != flow_value_type(function, parameter).ok()
+    }) || function.result_types.iter().copied().any(|ty| {
+        flat_u64_struct_field(types, ty).is_none() && flat_native_struct_fields(types, ty).is_some()
+    }) {
         return Err(unsupported(
             "machine-flat-structure-function-boundary-lowering-pending",
         ));
@@ -3982,6 +4008,18 @@ fn validate_native_struct_locality(
                             | flow::FlowOperation::Move { .. }
                             | flow::FlowOperation::Copy { .. }
                     )
+                    && !input
+                        .map(|input| {
+                            authenticated_generated_cleanup_call(
+                                input,
+                                function,
+                                candidate,
+                                value,
+                                is_cancelled,
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or(false)
                 {
                     return Err(unsupported(
                         "machine-flat-structure-operation-lowering-pending",
@@ -3992,6 +4030,182 @@ fn validate_native_struct_locality(
         }
     }
     check_cancelled(is_cancelled)
+}
+
+fn authenticated_cleanup_boundary_state(
+    input: &flow::FlowWir,
+    function: &flow::FlowFunction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<flow::TypeId>, MachineLowerError> {
+    if let Some(state) = authenticated_generated_cleanup_state(input, function, is_cancelled)? {
+        return Ok(Some(state));
+    }
+    let flow::FunctionOrigin::SourceSemantic { semantic_function } = function.origin else {
+        return Ok(None);
+    };
+    if semantic_function != function.id.0 || function.role != flow::FunctionRole::Cleanup {
+        return Ok(None);
+    }
+    let mut matched = None;
+    for candidate in &input.functions {
+        check_cancelled(is_cancelled)?;
+        if !matches!(candidate.origin,
+            flow::FunctionOrigin::GeneratedCleanup {
+                semantic_function: helper,
+                ..
+            } if helper == semantic_function)
+        {
+            continue;
+        }
+        let state = authenticated_generated_cleanup_state(input, candidate, is_cancelled)?.ok_or(
+            unsupported("machine-generated-cleanup-boundary-authentication"),
+        )?;
+        if matched.is_some_and(|previous| previous != state) {
+            return Err(unsupported(
+                "machine-generated-cleanup-boundary-authentication",
+            ));
+        }
+        matched = Some(state);
+    }
+    Ok(matched)
+}
+
+fn authenticated_generated_cleanup_state(
+    input: &flow::FlowWir,
+    function: &flow::FlowFunction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<flow::TypeId>, MachineLowerError> {
+    let flow::FunctionOrigin::GeneratedCleanup {
+        semantic_function,
+        scope,
+    } = function.origin
+    else {
+        return Ok(None);
+    };
+    check_cancelled(is_cancelled)?;
+    let generated_count = input
+        .functions
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.origin,
+                flow::FunctionOrigin::GeneratedCleanup { .. }
+            )
+        })
+        .count();
+    let first_generated = input.functions.len().checked_sub(generated_count).ok_or(
+        MachineLowerError::ResourceLimit {
+            resource: "MachineWir functions",
+            limit: u64::MAX,
+        },
+    )?;
+    let expected_id = first_generated
+        .checked_add(scope as usize)
+        .and_then(|id| u32::try_from(id).ok());
+    let helper = input.functions.get(semantic_function as usize);
+    let parameter_types = |candidate: &flow::FlowFunction| {
+        let [parameter] = candidate.parameters.as_slice() else {
+            return None;
+        };
+        candidate
+            .values
+            .get(parameter.0 as usize)
+            .map(|value| value.ty)
+    };
+    let body_is_pass_only = |candidate: &flow::FlowFunction| {
+        matches!(candidate.blocks.as_slice(), [block]
+            if block.id == candidate.entry
+                && block.parameters.is_empty()
+                && block.instructions.is_empty()
+                && matches!(&block.terminator, flow::Terminator::Return(values) if values.is_empty()))
+    };
+    let Some(helper) = helper else {
+        return Err(unsupported(
+            "machine-generated-cleanup-boundary-authentication",
+        ));
+    };
+    let state = parameter_types(function);
+    let helper_state = parameter_types(helper);
+    let proof_matches = matches!(helper.proofs.as_slice(), [helper_proof]
+    if matches!(function.proofs.as_slice(), [generated_helper, cleanup]
+        if generated_helper == helper_proof
+            && input.proofs.get(helper_proof.0 as usize).is_some_and(|proof| {
+                proof.id == *helper_proof
+                    && proof.kind == flow::ProofKind::CleanupAcyclic
+                    && proof.bound == Some(1)
+            })
+            && input.proofs.get(cleanup.0 as usize).is_some_and(|proof| {
+                proof.id == *cleanup
+                    && proof.kind == flow::ProofKind::CleanupAcyclic
+                    && proof.depends_on.as_slice() == [*helper_proof]
+            })));
+    let helper_identity_matches = matches!(helper.origin,
+        flow::FunctionOrigin::SourceSemantic { semantic_function: helper_semantic }
+            if helper_semantic == semantic_function);
+    if expected_id != Some(function.id.0)
+        || semantic_function as usize >= first_generated
+        || function.role != flow::FunctionRole::Cleanup
+        || helper.role != flow::FunctionRole::Cleanup
+        || function.color != flow::FunctionColor::Sync
+        || helper.color != flow::FunctionColor::Sync
+        || !function.result_types.is_empty()
+        || !helper.result_types.is_empty()
+        || function.stack_bound != 0
+        || function.frame_bound != 0
+        || helper.stack_bound != 0
+        || helper.frame_bound != 0
+        || function.name != helper.name
+        || function.source != helper.source
+        || function.values != helper.values
+        || !body_is_pass_only(function)
+        || function.blocks != helper.blocks
+        || state.is_none()
+        || state != helper_state
+        || state.is_none_or(|ty| flat_native_struct_fields(&input.types, ty).is_none())
+        || !helper_identity_matches
+        || !proof_matches
+    {
+        return Err(unsupported(
+            "machine-generated-cleanup-boundary-authentication",
+        ));
+    }
+    Ok(state)
+}
+
+fn authenticated_generated_cleanup_call(
+    input: &flow::FlowWir,
+    _caller: &flow::FlowFunction,
+    instruction: &flow::Instruction,
+    state: flow::ValueId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, MachineLowerError> {
+    let flow::FlowOperation::Call {
+        function: callee,
+        arguments,
+    } = &instruction.operation
+    else {
+        return Ok(false);
+    };
+    let Some(callee) = input.functions.get(callee.0 as usize) else {
+        return Ok(false);
+    };
+    let Some(state_ty) = authenticated_generated_cleanup_state(input, callee, is_cancelled)? else {
+        return Ok(false);
+    };
+    let activation_proof = callee
+        .proofs
+        .get(1)
+        .and_then(|proof| input.proofs.get(proof.0 as usize));
+    Ok(instruction.results.is_empty()
+        && arguments.as_slice() == [state]
+        && callee
+            .parameters
+            .first()
+            .and_then(|parameter| callee.values.get(parameter.0 as usize))
+            .is_some_and(|value| value.ty == state_ty)
+        && instruction.source.is_some_and(|source| {
+            activation_proof.is_some_and(|proof| proof.sources.contains(&source))
+        }))
 }
 
 fn flow_operation_uses_value(operation: &flow::FlowOperation, sought: flow::ValueId) -> bool {
@@ -6751,7 +6965,9 @@ fn lower_operation(
             if flow_value_type(function, result)? != ty {
                 return Err(unsupported("a copy with mismatched value types"));
             }
-            if flat_native_struct_fields(&input.types, ty).is_some() {
+            if flat_u64_struct_field(&input.types, ty).is_none()
+                && flat_native_struct_fields(&input.types, ty).is_some()
+            {
                 MachineOperation::Copy {
                     value: map_value(*value, mapping)?,
                 }
@@ -6977,6 +7193,7 @@ fn validate_flat_structure_field_update(
         .filter(|_| field == 0)
         .or_else(|| {
             flat_native_struct_fields(types, aggregate_type)
+                .filter(|fields| fields.len() >= 2)
                 .and_then(|fields| fields.get(field as usize).copied())
         });
     if expected != Some(flow_value_type(function, value)?)

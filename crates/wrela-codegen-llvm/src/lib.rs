@@ -1126,6 +1126,223 @@ mod contract_tests {
         (validated, target)
     }
 
+    fn normal_cleanup_machine_fixture() -> (ValidatedMachineWir, TargetPackage) {
+        let (mut machine, target) = machine_candidate();
+        let cleanup_source = Span {
+            file: FileId(0),
+            range: TextRange { start: 40, end: 49 },
+        };
+        let scope_source = Span {
+            file: FileId(0),
+            range: TextRange { start: 70, end: 79 },
+        };
+        machine.name = "normal-scope-cleanup".to_owned();
+        machine.types.extend([
+            MachineType {
+                id: MachineTypeId(3),
+                kind: MachineTypeKind::Integer { bits: 32 },
+                size: 4,
+                alignment: 4,
+                source_name: Some("u32".to_owned()),
+            },
+            MachineType {
+                id: MachineTypeId(4),
+                kind: MachineTypeKind::Struct {
+                    fields: vec![wrela_machine_wir::MachineField {
+                        ty: MachineTypeId(3),
+                        offset: 0,
+                    }],
+                    packed: false,
+                },
+                size: 4,
+                alignment: 4,
+                source_name: Some("Masked".to_owned()),
+            },
+        ]);
+
+        let mut metadata = machine.sections.remove(1);
+        metadata.id = SectionId(3);
+        machine.sections.extend([
+            Section {
+                id: SectionId(1),
+                name: ".text.wrela.1".to_owned(),
+                kind: SectionKind::Code,
+                alignment: 16,
+                reserved_bytes: 64,
+                owner: "function".to_owned(),
+            },
+            Section {
+                id: SectionId(2),
+                name: ".text.wrela.2".to_owned(),
+                kind: SectionKind::Code,
+                alignment: 16,
+                reserved_bytes: 64,
+                owner: "function".to_owned(),
+            },
+            metadata,
+        ]);
+
+        let entry_symbol = machine.symbols.remove(0);
+        let mut metadata_symbol = machine
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == INTERRUPT_ROUTE_TABLE_SYMBOL)
+            .cloned()
+            .expect("interrupt metadata symbol");
+        metadata_symbol.id = SymbolId(3);
+        metadata_symbol.definition = SymbolDefinition::SectionOffset {
+            section: SectionId(3),
+            offset: 0,
+            bytes: u64::from(INTERRUPT_ROUTE_LAYOUT.header_bytes),
+        };
+        let mut runtime_symbol = machine
+            .symbols
+            .iter()
+            .find(|symbol| {
+                symbol.definition == SymbolDefinition::ExternalRuntime(RuntimeIntrinsic::ImageEnter)
+            })
+            .cloned()
+            .expect("image-enter symbol");
+        runtime_symbol.id = SymbolId(4);
+        machine.symbols = vec![
+            entry_symbol,
+            Symbol {
+                id: SymbolId(1),
+                name: "__wrela_fn_1".to_owned(),
+                visibility: SymbolVisibility::Private,
+                definition: SymbolDefinition::Function(FunctionId(1)),
+            },
+            Symbol {
+                id: SymbolId(2),
+                name: "__wrela_fn_2".to_owned(),
+                visibility: SymbolVisibility::Private,
+                definition: SymbolDefinition::Function(FunctionId(2)),
+            },
+            metadata_symbol,
+            runtime_symbol,
+        ];
+
+        machine.proofs.extend([
+            BackendProof {
+                id: ProofId(1),
+                source_proofs: vec![1],
+                kind: BackendProofKind::CleanupAcyclic,
+                depends_on: Vec::new(),
+                bound: Some(1),
+                sources: vec![cleanup_source],
+                statement: "one pass-only scope exit helper".to_owned(),
+                source: Some(cleanup_source),
+            },
+            BackendProof {
+                id: ProofId(2),
+                source_proofs: vec![2],
+                kind: BackendProofKind::CleanupAcyclic,
+                depends_on: vec![ProofId(1)],
+                bound: Some(0),
+                sources: vec![scope_source],
+                statement: "one normal scope cleanup activation".to_owned(),
+                source: Some(scope_source),
+            },
+        ]);
+        let helper = MachineFunction {
+            id: FunctionId(1),
+            flow_function: 1,
+            origin: MachineFunctionOrigin::SourceSemantic {
+                semantic_function: 1,
+            },
+            role: MachineFunctionRole::Cleanup,
+            symbol: SymbolId(1),
+            section: SectionId(1),
+            linkage: Linkage::Private,
+            convention: CallingConvention::Internal,
+            parameters: vec![ValueId(0)],
+            result: MachineTypeId(0),
+            proofs: vec![ProofId(1)],
+            values: vec![MachineValue {
+                id: ValueId(0),
+                ty: MachineTypeId(4),
+                source_name: Some("state".to_owned()),
+            }],
+            stack_slots: Vec::new(),
+            blocks: vec![MachineBlock {
+                id: BlockId(0),
+                parameters: Vec::new(),
+                instructions: Vec::new(),
+                terminator: MachineTerminator::Return(Vec::new()),
+            }],
+            entry: BlockId(0),
+            stack_bytes: 0,
+            source: Some(cleanup_source),
+        };
+        let mut generated = helper.clone();
+        generated.id = FunctionId(2);
+        generated.flow_function = 2;
+        generated.origin = MachineFunctionOrigin::GeneratedCleanup {
+            semantic_function: 1,
+            scope: 0,
+        };
+        generated.symbol = SymbolId(2);
+        generated.section = SectionId(2);
+        generated.proofs.push(ProofId(2));
+        machine.functions.extend([helper, generated]);
+
+        let entry = &mut machine.functions[0];
+        entry.values.extend([
+            MachineValue {
+                id: ValueId(4),
+                ty: MachineTypeId(3),
+                source_name: None,
+            },
+            MachineValue {
+                id: ValueId(5),
+                ty: MachineTypeId(4),
+                source_name: Some("mask".to_owned()),
+            },
+        ]);
+        entry.blocks[0].instructions.extend([
+            MachineInstruction {
+                id: InstructionId(1),
+                results: vec![ValueId(4)],
+                operation: MachineOperation::Immediate(MachineImmediate::Integer {
+                    ty: MachineTypeId(3),
+                    bytes_le: 1_u32.to_le_bytes().to_vec(),
+                }),
+                source: Some(scope_source),
+            },
+            MachineInstruction {
+                id: InstructionId(2),
+                results: vec![ValueId(5)],
+                operation: MachineOperation::MakeStruct {
+                    ty: MachineTypeId(4),
+                    fields: vec![ValueId(4)],
+                },
+                source: Some(scope_source),
+            },
+            MachineInstruction {
+                id: InstructionId(3),
+                results: Vec::new(),
+                operation: MachineOperation::Call {
+                    function: FunctionId(2),
+                    arguments: vec![ValueId(5)],
+                    convention: CallingConvention::Internal,
+                },
+                source: Some(scope_source),
+            },
+        ]);
+        let mut next_instruction = 0_u32;
+        for block in &mut entry.blocks {
+            for instruction in &mut block.instructions {
+                instruction.id = InstructionId(next_instruction);
+                next_instruction += 1;
+            }
+        }
+        machine.sections[0].reserved_bytes = 896;
+        let validated = machine
+            .validate_for_target(&target)
+            .expect("valid authenticated cleanup MachineWir fixture");
+        (validated, target)
+    }
+
     fn storage_candidate() -> (MachineWir, TargetPackage) {
         let (mut machine, target) = machine_candidate();
         machine.name = "zero-initialized-storage-image".to_owned();
@@ -4062,6 +4279,102 @@ mod contract_tests {
             super::ir::render_module(&request, &|| true),
             Err(CodegenError::Cancelled)
         );
+    }
+
+    #[test]
+    fn authenticated_normal_cleanup_call_renders_exact_aggregate_llvm_boundary() {
+        let (machine, target) = normal_cleanup_machine_fixture();
+        let request = CodegenRequest {
+            module: &machine,
+            target: target.backend(),
+            options: CodegenOptions::standard(),
+        };
+        super::preflight(&request, &|| false)
+            .expect("authenticated cleanup aggregate passes codegen preflight");
+        let first = super::ir::render_module(&request, &|| false)
+            .expect("cleanup aggregate renders to bounded LLVM IR");
+        let second = super::ir::render_module(&request, &|| false)
+            .expect("cleanup aggregate rerenders deterministically");
+        assert_eq!(first, second);
+        let text = std::str::from_utf8(&first).expect("LLVM IR is UTF-8");
+        assert!(
+            text.contains("define internal fastcc void @__wrela_fn_2({ i32 } %v0)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("call fastcc void @__wrela_fn_2({ i32 } %v5)"),
+            "{text}"
+        );
+
+        let mut ordinary_boundary = machine.clone().into_wir();
+        ordinary_boundary.functions[1].role = MachineFunctionRole::Ordinary;
+        let ordinary_boundary = ordinary_boundary
+            .validate_for_target(&target)
+            .expect("ordinary aggregate parameter remains structurally valid");
+        assert_eq!(
+            super::preflight(
+                &CodegenRequest {
+                    module: &ordinary_boundary,
+                    target: target.backend(),
+                    options: CodegenOptions::standard(),
+                },
+                &|| false,
+            ),
+            Err(CodegenError::UnsupportedMachineContract(
+                "unauthenticated aggregate cleanup call",
+            ))
+        );
+
+        let mut forged = machine.into_wir();
+        forged.functions[2].origin = MachineFunctionOrigin::GeneratedCleanup {
+            semantic_function: 1,
+            scope: 1,
+        };
+        let forged = forged
+            .validate_for_target(&target)
+            .expect("forged cleanup origin remains structurally valid");
+        assert_eq!(
+            super::preflight(
+                &CodegenRequest {
+                    module: &forged,
+                    target: target.backend(),
+                    options: CodegenOptions::standard(),
+                },
+                &|| false,
+            ),
+            Err(CodegenError::UnsupportedMachineContract(
+                "unauthenticated aggregate cleanup call",
+            ))
+        );
+    }
+
+    #[cfg(feature = "llvm")]
+    #[test]
+    fn authenticated_normal_cleanup_emits_deterministic_native_coff() {
+        let (machine, target) = normal_cleanup_machine_fixture();
+        let emit = || {
+            CanonicalLlvmCodeGenerator::new()
+                .emit_object(
+                    CodegenRequest {
+                        module: &machine,
+                        target: target.backend(),
+                        options: CodegenOptions::standard(),
+                    },
+                    &|| false,
+                )
+                .expect("authenticated cleanup aggregate emits through pinned LLVM")
+        };
+        let first = emit();
+        let second = emit();
+        assert_eq!(
+            first, second,
+            "identical cleanup input must seal identically"
+        );
+        assert_eq!(first.bytes().get(..2), Some(&[0x64, 0xaa][..]));
+        super::coff::measure_object(first.bytes(), &machine, CodegenOptions::standard(), &|| {
+            false
+        })
+        .expect("cleanup COFF passes the independent object consumer");
     }
 
     #[test]

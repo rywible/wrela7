@@ -3176,6 +3176,175 @@ mod contract_tests {
         (optimized_fixture(identity), target, build)
     }
 
+    fn normal_scope_cleanup_flow_fixture()
+    -> (OptimizedFlowWir, TargetPackage, ValidatedBuildConfiguration) {
+        let (optimized, target, build) = fixture();
+        let (validated, _) = optimized.into_parts();
+        let mut flow = validated.into_wir();
+        let source = span(0, 40, 80);
+        flow.source_summary.semantic_functions = 3;
+        flow.source_summary.reachable_declarations = 3;
+        flow.source_summary.monomorphized_instantiations = 3;
+        flow.types.extend([
+            FlowType {
+                id: TypeId(1),
+                kind: FlowTypeKind::Scalar(ScalarType::Integer {
+                    signed: false,
+                    bits: 32,
+                }),
+                name: Some("u32".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+            FlowType {
+                id: TypeId(2),
+                kind: FlowTypeKind::Struct {
+                    fields: vec![TypeId(1)],
+                },
+                name: Some("Masked".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+        ]);
+        flow.proofs[2].id = FlowProofId(4);
+        for proof in &mut flow.functions[0].proofs {
+            if *proof == FlowProofId(2) {
+                *proof = FlowProofId(4);
+            }
+        }
+        flow.proofs.extend([
+            FlowProof {
+                id: FlowProofId(2),
+                kind: ProofKind::CleanupAcyclic,
+                subject: "scope protocol cleanup: irqs_masked".to_owned(),
+                sources: vec![source],
+                depends_on: Vec::new(),
+                bound: Some(1),
+                explanation: vec!["one pass-only exit helper".to_owned()],
+            },
+            FlowProof {
+                id: FlowProofId(3),
+                kind: ProofKind::CleanupAcyclic,
+                subject: "scope activation cleanup: irqs_masked".to_owned(),
+                sources: vec![source],
+                depends_on: vec![FlowProofId(2)],
+                bound: Some(0),
+                explanation: vec!["one normal-exit activation".to_owned()],
+            },
+        ]);
+        flow.proofs.sort_unstable_by_key(|proof| proof.id);
+        let entry = &mut flow.functions[0];
+        entry.values.extend([
+            FlowValue {
+                id: FlowValueId(0),
+                ty: TypeId(1),
+                source_name: None,
+                source: Some(source),
+            },
+            FlowValue {
+                id: FlowValueId(1),
+                ty: TypeId(2),
+                source_name: Some("mask".to_owned()),
+                source: Some(source),
+            },
+        ]);
+        entry.blocks[0].instructions = vec![
+            FlowInstruction {
+                id: FlowInstructionId(0),
+                results: vec![FlowValueId(0)],
+                operation: FlowOperation::Immediate(FlowImmediate::Integer {
+                    bits: 32,
+                    bytes_le: 1_u32.to_le_bytes().to_vec(),
+                }),
+                source: Some(source),
+            },
+            FlowInstruction {
+                id: FlowInstructionId(1),
+                results: vec![FlowValueId(1)],
+                operation: FlowOperation::MakeAggregate {
+                    ty: TypeId(2),
+                    fields: vec![FlowValueId(0)],
+                },
+                source: Some(source),
+            },
+            FlowInstruction {
+                id: FlowInstructionId(2),
+                results: Vec::new(),
+                operation: FlowOperation::Call {
+                    function: FlowFunctionId(3),
+                    arguments: vec![FlowValueId(1)],
+                },
+                source: Some(source),
+            },
+        ];
+        let helper = FlowFunction {
+            id: FlowFunctionId(2),
+            name: "irqs_masked.__scope_exit".to_owned(),
+            origin: FunctionOrigin::SourceSemantic {
+                semantic_function: 2,
+            },
+            role: FunctionRole::Cleanup,
+            color: wrela_flow_wir::FunctionColor::Sync,
+            parameters: vec![FlowValueId(0)],
+            result_types: Vec::new(),
+            values: vec![FlowValue {
+                id: FlowValueId(0),
+                ty: TypeId(2),
+                source_name: Some("state".to_owned()),
+                source: Some(source),
+            }],
+            blocks: vec![FlowBlock {
+                id: FlowBlockId(0),
+                parameters: Vec::new(),
+                instructions: Vec::new(),
+                terminator: FlowTerminator::Return(Vec::new()),
+                source: Some(source),
+            }],
+            entry: FlowBlockId(0),
+            stack_bound: 0,
+            frame_bound: 0,
+            proofs: vec![FlowProofId(2)],
+            source: Some(source),
+        };
+        let mut generated = helper.clone();
+        generated.id = FlowFunctionId(3);
+        generated.origin = FunctionOrigin::GeneratedCleanup {
+            semantic_function: 2,
+            scope: 0,
+        };
+        generated.proofs.push(FlowProofId(3));
+        flow.functions.push(FlowFunction {
+            id: FlowFunctionId(1),
+            name: "scope_caller".to_owned(),
+            origin: FunctionOrigin::SourceSemantic {
+                semantic_function: 1,
+            },
+            role: FunctionRole::Ordinary,
+            color: wrela_flow_wir::FunctionColor::Sync,
+            parameters: Vec::new(),
+            result_types: Vec::new(),
+            values: Vec::new(),
+            blocks: vec![FlowBlock {
+                id: FlowBlockId(0),
+                parameters: Vec::new(),
+                instructions: Vec::new(),
+                terminator: FlowTerminator::Return(Vec::new()),
+                source: Some(source),
+            }],
+            entry: FlowBlockId(0),
+            stack_bound: 0,
+            frame_bound: 0,
+            proofs: vec![FlowProofId(0), FlowProofId(1)],
+            source: Some(source),
+        });
+        flow.functions.push(helper);
+        flow.functions.push(generated);
+        let validated = flow
+            .validate()
+            .expect("valid authenticated normal cleanup FlowWir");
+        (optimize(validated), target, build)
+    }
+
     fn async_activation_fixture() -> (OptimizedFlowWir, TargetPackage, ValidatedBuildConfiguration)
     {
         let (optimized, target, build) = fixture();
@@ -5868,6 +6037,123 @@ mod contract_tests {
             .clone()
             .validate_for_target(&target)
             .expect("MachineWir consumer accepts nonempty scalar CFG");
+    }
+
+    #[test]
+    fn authenticated_normal_scope_cleanup_carries_flat_state_to_machine_wir() {
+        let (optimized, target, build) = normal_scope_cleanup_flow_fixture();
+        let output = lower(
+            &optimized,
+            &target,
+            &build,
+            MachineLoweringLimits::standard(),
+            &|| false,
+        )
+        .expect("authenticated aggregate cleanup boundary reaches MachineWir");
+        let machine = output.wir().as_wir();
+        assert!(matches!(
+            machine.types[2].kind,
+            MachineTypeKind::Struct { ref fields, packed: false }
+                if fields.len() == 1 && fields[0].ty == wrela_machine_wir::MachineTypeId(1)
+        ));
+        assert!(matches!(
+            machine.functions[3].origin,
+            MachineFunctionOrigin::GeneratedCleanup {
+                semantic_function: 2,
+                scope: 0,
+            }
+        ));
+        assert_eq!(machine.functions[3].parameters, [ValueId(0)]);
+        let entry_instructions = machine.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .collect::<Vec<_>>();
+        let state = entry_instructions
+            .iter()
+            .find_map(|instruction| match &instruction.operation {
+                MachineOperation::MakeStruct { ty, fields }
+                    if *ty == wrela_machine_wir::MachineTypeId(2) && fields.len() == 1 =>
+                {
+                    instruction.results.first().copied()
+                }
+                _ => None,
+            })
+            .expect("one-field scope state construction");
+        assert!(entry_instructions.iter().any(|instruction| matches!(
+            &instruction.operation,
+            MachineOperation::Call {
+                function,
+                arguments,
+                convention: CallingConvention::Internal,
+            } if *function == wrela_machine_wir::FunctionId(3)
+                && arguments.as_slice() == [state]
+        )));
+
+        let (validated, _) = optimized.clone().into_parts();
+        let mut forged = validated.into_wir();
+        forged.functions[3].origin = FunctionOrigin::GeneratedCleanup {
+            semantic_function: 2,
+            scope: 1,
+        };
+        let forged = optimize(
+            forged
+                .validate()
+                .expect("structurally valid forged scope origin"),
+        );
+        assert_eq!(
+            lower(
+                &forged,
+                &target,
+                &build,
+                MachineLoweringLimits::standard(),
+                &|| false,
+            ),
+            Err(MachineLowerError::UnsupportedInput {
+                feature: "machine-generated-cleanup-boundary-authentication",
+            })
+        );
+
+        let mut exact = MachineLoweringLimits::standard();
+        exact.functions = 4;
+        lower(&optimized, &target, &build, exact, &|| false).expect("exact cleanup function bound");
+        exact.functions = 3;
+        assert_eq!(
+            lower(&optimized, &target, &build, exact, &|| false),
+            Err(MachineLowerError::ResourceLimit {
+                resource: "MachineWir functions",
+                limit: 3,
+            })
+        );
+
+        let polls = Cell::new(0_u64);
+        lower(
+            &optimized,
+            &target,
+            &build,
+            MachineLoweringLimits::standard(),
+            &|| {
+                polls.set(polls.get() + 1);
+                false
+            },
+        )
+        .expect("count cleanup lowering cancellation boundaries");
+        let cancel_at = polls.get() / 2;
+        let observed = Cell::new(0_u64);
+        assert_eq!(
+            lower(
+                &optimized,
+                &target,
+                &build,
+                MachineLoweringLimits::standard(),
+                &|| {
+                    observed.set(observed.get() + 1);
+                    observed.get() == cancel_at
+                },
+            ),
+            Err(MachineLowerError::Cancelled)
+        );
+        assert_eq!(observed.get(), cancel_at);
     }
 
     #[test]
