@@ -111,10 +111,18 @@ terminal scalar match with observably distinct return values reaches exact
 FlowWir/MachineWir switching and repeat byte-identical native COFF
 (`unit_pattern_alternative_group_reaches_flow_machine_and_deterministic_native_coff`).
 Multiple alternative groups, coexistence with a source wildcard, guarded
-fallback overlap, and payload-binding alternatives remain named fail-closed
+fallback overlap, and payload-alternative lowering remain named fail-closed
 (`multiple_pattern_alternative_groups_stay_named_fail_closed`,
-`pattern_alternative_default_composition_tails_fail_closed_by_name`); broader
-executable alternatives are not claimed.
+`pattern_alternative_default_composition_tails_fail_closed_by_name`,
+`shared_payload_pattern_alternative_stops_at_named_lowering_boundary`). At the
+analysis tier, payload-bearing alternatives may share exactly one HIR local
+when every variant exposes the same semantic payload type; one semantic value
+and definition are sealed for the arm body
+(`runtime_adt_match_alternatives_share_one_exact_payload_binding`). Mixed
+unit/payload groups, differing payload types, wildcard payloads, and `take`
+remain named fail-closed
+(`runtime_adt_match_alternative_tails_fail_closed_by_name`). Broader executable
+alternatives are not claimed.
 
 B1a.2 retention-boundary evidence additionally includes
 `lexical_projection_loop_liveness_remains_named_and_fail_closed`,

@@ -6888,6 +6888,8 @@ fn analyze_closed_enum_match(
             alternative_variants
                 .try_reserve_exact(pattern.alternatives.len())
                 .map_err(|_| fact_resource(request, "runtime match alternatives"))?;
+            let mut alternative_binding: Option<(LocalId, SemanticTypeId)> = None;
+            let mut saw_unit_variant = false;
             for alternative in &pattern.alternatives {
                 check_cancelled(is_cancelled)?;
                 let wrela_hir::PrimaryPattern::Constructor {
@@ -6916,29 +6918,122 @@ fn analyze_closed_enum_match(
                     ));
                 };
                 let variant_index = candidate.variant as usize;
-                let unit_variant = partial
+                let payload_ty = partial
                     .types
                     .get(scrutinee.ty.0 as usize)
                     .and_then(|record| match &record.kind {
-                        SemanticTypeKind::Enumeration { variants, .. } => {
-                            variants.get(variant_index)
-                        }
+                        SemanticTypeKind::Enumeration { variants, .. } => variants
+                            .get(variant_index)
+                            .map(|variant| variant.fields.first().map(|field| field.ty)),
                         _ => None,
                     })
-                    .is_some_and(|variant| variant.fields.is_empty());
-                if candidate.enumeration.declaration != enumeration
-                    || variant_index >= variants
-                    || !unit_variant
-                    || !arguments.is_empty()
-                {
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                if candidate.enumeration.declaration != enumeration || variant_index >= variants {
                     return Err(runtime_type_diagnostic(
                         request,
                         alternative.source,
-                        "semantic-runtime-match-alternative-binding-pending",
-                        "runtime enum alternatives currently require payload-free variants",
-                        "payload binding across alternatives needs one shared binding and type witness",
-                        "use unit variants here or split payload variants into separate arms",
+                        "semantic-runtime-match-alternative-shape",
+                        "runtime enum alternative names a constructor outside the scrutinee enum",
+                        "closed alternative coverage requires one exact nominal enum identity",
+                        "use variants declared by the matched enum",
                     ));
+                }
+                match payload_ty {
+                    None => {
+                        if !arguments.is_empty() {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                alternative.source,
+                                "semantic-runtime-match-alternative-binding-shape",
+                                "unit enum alternative cannot bind a payload",
+                                "this variant declares no payload field",
+                                "remove the payload pattern from the unit alternative",
+                            ));
+                        }
+                        if alternative_binding.is_some() {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                alternative.source,
+                                "semantic-runtime-match-alternative-payload-type",
+                                "runtime enum alternatives mix unit and payload variants",
+                                "one shared arm binding requires every alternative to expose the same payload type",
+                                "split the unit and payload variants into separate arms",
+                            ));
+                        }
+                        saw_unit_variant = true;
+                    }
+                    Some(payload_ty) => {
+                        if saw_unit_variant {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                alternative.source,
+                                "semantic-runtime-match-alternative-payload-type",
+                                "runtime enum alternatives mix unit and payload variants",
+                                "one shared arm binding requires every alternative to expose the same payload type",
+                                "split the unit and payload variants into separate arms",
+                            ));
+                        }
+                        let [argument] = arguments.as_slice() else {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                alternative.source,
+                                "semantic-runtime-match-alternative-binding-shape",
+                                "payload enum alternative requires one shared binding",
+                                "every alternative must bind its one payload to the same local name",
+                                "bind the payload once with the same name in every alternative",
+                            ));
+                        };
+                        if argument.take {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                argument.source,
+                                "semantic-runtime-match-alternative-binding-shape",
+                                "runtime enum alternative payload cannot use `take`",
+                                "the admitted shared payload is copied into one arm-local binding",
+                                "remove `take` from the alternative payload binding",
+                            ));
+                        }
+                        let payload_pattern = request
+                            .hir
+                            .as_program()
+                            .patterns
+                            .get(argument.pattern.0 as usize)
+                            .ok_or(AnalysisFailure::RequestMismatch)?;
+                        let [payload_alternative] = payload_pattern.alternatives.as_slice() else {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                payload_pattern.source,
+                                "semantic-runtime-match-alternative-binding-shape",
+                                "runtime enum alternative payload requires one binding pattern",
+                                "nested or alternative payload patterns do not establish one shared local",
+                                "bind the payload directly with the same name",
+                            ));
+                        };
+                        let wrela_hir::PrimaryPattern::Bind(local) = payload_alternative.kind
+                        else {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                payload_alternative.source,
+                                "semantic-runtime-match-alternative-binding-shape",
+                                "runtime enum alternatives require one shared payload name",
+                                "wildcard or nested payload patterns do not create a value for the shared arm body",
+                                "bind every payload to the same local name",
+                            ));
+                        };
+                        if alternative_binding
+                            .is_some_and(|(existing, ty)| existing != local || ty != payload_ty)
+                        {
+                            return Err(runtime_type_diagnostic(
+                                request,
+                                payload_alternative.source,
+                                "semantic-runtime-match-alternative-payload-type",
+                                "runtime enum alternatives do not share one payload type and binding",
+                                "the arm body must receive one local with one exact semantic type on every path",
+                                "split differently typed variants into separate arms",
+                            ));
+                        }
+                        alternative_binding = Some((local, payload_ty));
+                    }
                 }
                 if covered[variant_index] || alternative_variants.contains(&variant_index) {
                     return Err(runtime_type_diagnostic(
@@ -6957,6 +7052,49 @@ fn analyze_closed_enum_match(
             }
             let mut arm_locals = copy_binding_map(locals, request.limits.values)?;
             let mut arm_parameters = copy_binding_map(parameters, request.limits.values)?;
+            let binding_local = if let Some((local, payload_ty)) = alternative_binding {
+                let local_record = request
+                    .hir
+                    .as_program()
+                    .locals
+                    .get(local.0 as usize)
+                    .filter(|record| record.id == local && record.body == arm.body)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                let value = append_semantic_value(
+                    request,
+                    partial,
+                    function,
+                    payload_ty,
+                    (
+                        SemanticValueOrigin::Local(local),
+                        Some(local_record.source),
+                        Some(local_record.name.as_str()),
+                    ),
+                    is_cancelled,
+                )?;
+                definitions
+                    .try_reserve(1)
+                    .map_err(|_| fact_resource(request, "runtime match bindings"))?;
+                definitions.push(LocalDefinition { local, value });
+                let slot = arm_locals
+                    .get_mut(local.0 as usize)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                if slot
+                    .replace(RuntimeBinding {
+                        value,
+                        state: OwnershipState::Owned,
+                        authority: RuntimeAuthority::Own,
+                        origin: RuntimeBindingOrigin::Local(local),
+                        source: local_record.source,
+                    })
+                    .is_some()
+                {
+                    return Err(AnalysisFailure::RequestMismatch.into());
+                }
+                Some(local)
+            } else {
+                None
+            };
             let fact_start = partial.statements.len();
             analyze_runtime_body(
                 request,
@@ -6975,9 +7113,11 @@ fn analyze_closed_enum_match(
                 check_cancelled(is_cancelled)?;
                 state_changed |= left != right;
             }
-            for (left, right) in arm_locals.iter().zip(locals.iter()) {
+            for (index, (left, right)) in arm_locals.iter().zip(locals.iter()).enumerate() {
                 check_cancelled(is_cancelled)?;
-                state_changed |= left != right;
+                if binding_local.is_none_or(|local| index != local.0 as usize) {
+                    state_changed |= left != right;
+                }
             }
             if state_changed {
                 return Err(runtime_type_diagnostic(
@@ -35312,6 +35452,120 @@ fn projection_fixture():
     }
 
     #[test]
+    fn runtime_adt_match_alternatives_share_one_exact_payload_binding() {
+        let source = dot_variant_actor_source(
+            "pub enum Signal:\n    low(u64)\n    high(u64)\n    idle\n\nfn consume(value: u64):\n    pass\n\nasync fn checkpoint():\n    signal: Signal = Signal.high(7)\n    match signal:\n        case Signal.low(code) | Signal.high(code):\n            consume(code)\n        case Signal.idle:\n            pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("shared alternative payload analysis is recoverable");
+        assert!(
+            output.diagnostics().is_empty(),
+            "same-typed alternatives must share one payload binding: {:?}",
+            output.diagnostics()
+        );
+        let successful = output
+            .successful()
+            .expect("sealed shared alternative payload binding");
+        let payload_values = successful
+            .facts()
+            .values
+            .iter()
+            .filter(|value| value.source_name.as_deref() == Some("code"))
+            .collect::<Vec<_>>();
+        assert_eq!(payload_values.len(), 1);
+        assert!(successful.facts().statements.iter().any(|statement| {
+            statement.definitions.as_slice()
+                == [LocalDefinition {
+                    local: match payload_values[0].origin {
+                        SemanticValueOrigin::Local(local) => local,
+                        _ => return false,
+                    },
+                    value: payload_values[0].id,
+                }]
+        }));
+
+        let payload = payload_values[0];
+        let replacement = successful
+            .facts()
+            .values
+            .iter()
+            .find(|value| value.function == payload.function && value.id != payload.id)
+            .expect("same-function substitution value")
+            .id;
+        let mut forged = successful.facts().clone();
+        let forged_definition = forged
+            .statements
+            .iter_mut()
+            .find_map(|statement| {
+                statement
+                    .definitions
+                    .iter_mut()
+                    .find(|definition| definition.value == payload.id)
+            })
+            .expect("mutable shared payload definition");
+        forged_definition.value = replacement;
+        assert!(
+            forged
+                .validate_for_seal(successful.hir(), &|| false)
+                .is_err()
+        );
+
+        let value_count = u32::try_from(successful.facts().values.len())
+            .expect("bounded shared-payload semantic values");
+        let mut exact = AnalysisLimits::standard();
+        exact.values = value_count;
+        assert!(
+            CanonicalSemanticAnalyzer::new()
+                .analyze(parsed_actor_request(&fixture, &changes, exact), &|| false)
+                .expect("exact shared-payload value limit")
+                .successful()
+                .is_some()
+        );
+        let mut one_under = exact;
+        one_under.values = value_count - 1;
+        let below_result = CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, one_under), &|| {
+                false
+            });
+        assert!(matches!(
+            below_result,
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "semantic values",
+                ..
+            })
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            })
+            .expect("count shared-payload cancellation polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, exact),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
     fn runtime_adt_match_alternative_tails_fail_closed_by_name() {
         let cases = [
             (
@@ -35320,7 +35574,19 @@ fn projection_fixture():
             ),
             (
                 "pub enum Status:\n    idle\n    active(u8)\n\nasync fn checkpoint():\n    state: Status = .active(1)\n    match state:\n        case Status.idle | Status.active(_):\n            pass\n\n",
-                "semantic-runtime-match-alternative-binding-pending",
+                "semantic-runtime-match-alternative-payload-type",
+            ),
+            (
+                "pub enum Mixed:\n    left(u64)\n    right(bool)\n\nasync fn checkpoint():\n    state: Mixed = Mixed.left(1)\n    match state:\n        case Mixed.left(value) | Mixed.right(value):\n            pass\n\n",
+                "semantic-runtime-match-alternative-payload-type",
+            ),
+            (
+                "pub enum Signal:\n    low(u64)\n    high(u64)\n\nasync fn checkpoint():\n    state: Signal = Signal.low(1)\n    match state:\n        case Signal.low(_) | Signal.high(_):\n            pass\n\n",
+                "semantic-runtime-match-alternative-binding-shape",
+            ),
+            (
+                "pub enum Signal:\n    low(u64)\n    high(u64)\n\nasync fn checkpoint():\n    state: Signal = Signal.low(1)\n    match state:\n        case Signal.low(take value) | Signal.high(take value):\n            pass\n\n",
+                "semantic-runtime-match-alternative-binding-shape",
             ),
             (
                 "pub enum Mode:\n    cold\n    warm\n\nasync fn checkpoint():\n    state: Mode = .cold\n    match state:\n        case Mode.cold | Mode.warm if true:\n            pass\n\n",

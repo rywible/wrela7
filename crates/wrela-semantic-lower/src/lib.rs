@@ -8099,8 +8099,6 @@ impl SourceFunctionLowerer<'_> {
                                         || self.fact_mismatch("unit match alternative range"),
                                     )?;
                                 if candidate.enumeration.declaration != declaration
-                                    || !semantic_variant.fields.is_empty()
-                                    || !arguments.is_empty()
                                     || *covered
                                     || seen_variants
                                         .get(candidate.variant as usize)
@@ -8110,6 +8108,11 @@ impl SourceFunctionLowerer<'_> {
                                     return Err(
                                         self.fact_mismatch("unit match alternative exact coverage")
                                     );
+                                }
+                                if !semantic_variant.fields.is_empty() || !arguments.is_empty() {
+                                    return Err(unsupported(
+                                        "semantic-match-alternative-payload-lowering-pending",
+                                    ));
                                 }
                                 *covered = true;
                             }
@@ -21875,6 +21878,60 @@ pub fn boot() -> Image:
                 "unexpected alternative composition result: {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn shared_payload_pattern_alternative_stops_at_named_lowering_boundary() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub enum Signal[T]:
+    low(T)
+    high(T)
+    idle
+
+fn consume(value: u64):
+    pass
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        signal: Signal[u64] = Signal.high(7)
+        match signal:
+            case Signal.low(code) | Signal.high(code):
+                consume(code)
+            case Signal.idle:
+                pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let result = CanonicalSemanticLowerer::new().lower(
+            LowerRequest {
+                input: image,
+                limits: LoweringLimits::standard(),
+            },
+            &|| false,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(LowerError::UnsupportedInput {
+                    feature: "semantic-match-alternative-payload-lowering-pending"
+                })
+            ),
+            "unexpected shared-payload alternative lowering result: {result:?}"
+        );
     }
 
     #[test]

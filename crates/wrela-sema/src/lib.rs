@@ -3703,26 +3703,33 @@ fn exact_match_payload_local(
     arm: &wrela_hir::MatchArm,
 ) -> Option<wrela_hir::LocalId> {
     let pattern = program.patterns.get(arm.pattern.0 as usize)?;
-    let [alternative] = pattern.alternatives.as_slice() else {
-        return None;
-    };
-    let wrela_hir::PrimaryPattern::Constructor { arguments, .. } = &alternative.kind else {
-        return None;
-    };
-    let [argument] = arguments.as_slice() else {
-        return None;
-    };
-    if argument.take {
-        return None;
+    let mut shared = None;
+    for alternative in &pattern.alternatives {
+        let wrela_hir::PrimaryPattern::Constructor { arguments, .. } = &alternative.kind else {
+            return None;
+        };
+        if arguments.is_empty() {
+            continue;
+        }
+        let [argument] = arguments.as_slice() else {
+            return None;
+        };
+        if argument.take {
+            return None;
+        }
+        let payload = program.patterns.get(argument.pattern.0 as usize)?;
+        let [alternative] = payload.alternatives.as_slice() else {
+            return None;
+        };
+        let wrela_hir::PrimaryPattern::Bind(local) = alternative.kind else {
+            return None;
+        };
+        if shared.is_some_and(|existing| existing != local) {
+            return None;
+        }
+        shared = Some(local);
     }
-    let payload = program.patterns.get(argument.pattern.0 as usize)?;
-    let [alternative] = payload.alternatives.as_slice() else {
-        return None;
-    };
-    let wrela_hir::PrimaryPattern::Bind(local) = alternative.kind else {
-        return None;
-    };
-    Some(local)
+    shared
 }
 
 fn validate_exact_expression_fact(
@@ -6909,6 +6916,8 @@ fn validate_exact_statement_fact(
                     if arm.guard.is_some() {
                         return Err(invalid("guarded enum match alternatives are not canonical"));
                     }
+                    let mut shared_binding: Option<(wrela_hir::LocalId, SemanticTypeId)> = None;
+                    let mut saw_unit_variant = false;
                     for alternative in &pattern.alternatives {
                         check_analysis_cancelled(is_cancelled)?;
                         let wrela_hir::PrimaryPattern::Constructor {
@@ -6939,27 +6948,117 @@ fn validate_exact_statement_fact(
                                         })
                             })
                             .is_some();
-                        let unit_variant = analysis
+                        let payload_ty = analysis
                             .types
                             .get(scrutinee_fact.ty.0 as usize)
                             .and_then(|record| match &record.kind {
-                                SemanticTypeKind::Enumeration { variants, .. } => {
-                                    variants.get(variant)
-                                }
+                                SemanticTypeKind::Enumeration { variants, .. } => variants
+                                    .get(variant)
+                                    .map(|variant| variant.fields.first().map(|field| field.ty)),
                                 _ => None,
                             })
-                            .is_some_and(|variant| variant.fields.is_empty());
-                        if !exact_constructor
-                            || variant >= variant_count
-                            || !unit_variant
-                            || !arguments.is_empty()
-                            || covered[variant]
-                        {
+                            .ok_or_else(|| {
+                                invalid("enum match alternative payload type is missing")
+                            })?;
+                        if !exact_constructor || variant >= variant_count || covered[variant] {
                             return Err(invalid(
-                                "enum match unit alternative coverage differs from HIR",
+                                "enum match alternative coverage differs from HIR",
                             ));
                         }
+                        match payload_ty {
+                            None => {
+                                if !arguments.is_empty() || shared_binding.is_some() {
+                                    return Err(invalid(
+                                        "enum match unit alternative binding differs from HIR",
+                                    ));
+                                }
+                                saw_unit_variant = true;
+                            }
+                            Some(payload_ty) => {
+                                if saw_unit_variant {
+                                    return Err(invalid(
+                                        "enum match alternatives mix unit and payload variants",
+                                    ));
+                                }
+                                let [argument] = arguments.as_slice() else {
+                                    return Err(invalid(
+                                        "enum match alternative payload arity differs",
+                                    ));
+                                };
+                                if argument.take {
+                                    return Err(invalid(
+                                        "enum match alternative payload unexpectedly takes ownership",
+                                    ));
+                                }
+                                let payload_pattern = program
+                                    .patterns
+                                    .get(argument.pattern.0 as usize)
+                                    .filter(|pattern| pattern.id == argument.pattern)
+                                    .ok_or_else(|| {
+                                        invalid("enum match alternative payload pattern is missing")
+                                    })?;
+                                let [payload_alternative] = payload_pattern.alternatives.as_slice()
+                                else {
+                                    return Err(invalid(
+                                        "enum match alternative payload is not one binding",
+                                    ));
+                                };
+                                let wrela_hir::PrimaryPattern::Bind(local) =
+                                    payload_alternative.kind
+                                else {
+                                    return Err(invalid(
+                                        "enum match alternative payload is not a shared local",
+                                    ));
+                                };
+                                if shared_binding.is_some_and(|(existing, ty)| {
+                                    existing != local || ty != payload_ty
+                                }) {
+                                    return Err(invalid(
+                                        "enum match alternative shared payload differs from HIR",
+                                    ));
+                                }
+                                shared_binding = Some((local, payload_ty));
+                            }
+                        }
                         covered[variant] = true;
+                    }
+                    if let Some((local, payload_ty)) = shared_binding {
+                        let definition =
+                            fact.definitions.get(definition_index).ok_or_else(|| {
+                                invalid("enum match alternative payload definition is missing")
+                            })?;
+                        definition_index += 1;
+                        let local_record = program
+                            .locals
+                            .get(local.0 as usize)
+                            .filter(|record| record.id == local && record.body == arm.body)
+                            .ok_or_else(|| {
+                                invalid("enum match alternative payload local differs from body")
+                            })?;
+                        let value_record = analysis
+                            .values
+                            .get(definition.value.0 as usize)
+                            .filter(|record| {
+                                definition.local == local
+                                    && record.function == function.id
+                                    && record.ty == payload_ty
+                                    && record.origin == SemanticValueOrigin::Local(local)
+                                    && record.source == Some(local_record.source)
+                                    && record.source_name.as_deref()
+                                        == Some(local_record.name.as_str())
+                            })
+                            .ok_or_else(|| {
+                                invalid("enum match alternative payload provenance is invalid")
+                            })?;
+                        if analysis.expressions.iter().any(|expression| {
+                            expression.function == function.id
+                                && expression.result == Some(value_record.id)
+                        }) {
+                            return Err(invalid(
+                                "enum match alternative payload is an expression result",
+                            ));
+                        }
+                        increment_definition(definitions, definition.value)?;
                     }
                     continue;
                 }
