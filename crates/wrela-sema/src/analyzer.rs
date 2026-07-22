@@ -8094,13 +8094,39 @@ fn analyze_result_try_expression(
             "propagate a freshly returned or constructed Result value",
         ));
     }
+    let program = request.hir.as_program();
+    let contextual_constructor = program
+        .expression(operand)
+        .is_some_and(|operand| match &operand.kind {
+            ExpressionKind::Reference(Definition::Variant(_)) | ExpressionKind::DotName { .. } => {
+                true
+            }
+            ExpressionKind::Call { callee, .. } => {
+                program.expression(*callee).is_some_and(|callee| {
+                    matches!(
+                        callee.kind,
+                        ExpressionKind::Reference(Definition::Variant(_))
+                            | ExpressionKind::DotName { .. }
+                    )
+                })
+            }
+            _ => false,
+        });
+    let constructor_context = contextual_constructor
+        .then(|| {
+            partial
+                .functions
+                .get(function.0 as usize)
+                .map(|function| function.result)
+        })
+        .flatten();
     let operand_outcome = analyze_runtime_expression(
         request,
         partial,
         function,
         operand,
         RuntimeExpressionRequest {
-            expected: None,
+            expected: constructor_context,
             desired_result: None,
             access: AccessMode::Value,
         },
@@ -8164,6 +8190,115 @@ fn analyze_result_try_expression(
         module: result_declaration.module,
         declaration: *declaration,
     };
+    let option_supported = is_exact_core_option_declaration(request, &resolved, result_declaration)
+        && matches!(arguments.as_slice(), [SemanticArgument::Type(_)])
+        && matches!(variants.as_slice(), [some, none]
+            if some.name == "Some"
+                && matches!(some.fields.as_slice(), [field]
+                    if matches!(arguments.as_slice(), [SemanticArgument::Type(argument)]
+                        if field.ty == *argument))
+                && none.name == "None"
+                && none.fields.is_empty());
+    if option_supported {
+        let payload_type = variants[0].fields[0].ty;
+        if runtime_scalar_type(partial, payload_type).is_none() {
+            return Err(runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-runtime-option-question-payload",
+                "postfix question Option payload is outside the supported scalar subset",
+                "linear, nominal, and aggregate propagation require cleanup-aware Option semantics",
+                "use Option[S] with a supported stored copy scalar S",
+            ));
+        }
+        let enclosing_result = partial
+            .functions
+            .get(function.0 as usize)
+            .map(|function| function.result)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if enclosing_result != result_type {
+            return Err(runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-runtime-option-question-enclosing",
+                "postfix question requires the enclosing function to return the same Option type",
+                "the None branch returns early without conversion",
+                "change the function result to the exact operand Option[S] specialization",
+            ));
+        }
+        if expression_request
+            .expected
+            .is_some_and(|expected| expected != payload_type)
+        {
+            return Err(runtime_type_diagnostic(
+                request,
+                source,
+                "semantic-runtime-option-question-payload",
+                "postfix question Option payload does not match its required context",
+                "the Some branch yields the exact scalar stored by Option[S]",
+                "use the propagated scalar directly or change the surrounding type",
+            ));
+        }
+        let some_payload = append_semantic_value(
+            request,
+            partial,
+            function,
+            payload_type,
+            (
+                SemanticValueOrigin::Expression(expression),
+                Some(source),
+                None,
+            ),
+            is_cancelled,
+        )?;
+        let propagated = append_semantic_value(
+            request,
+            partial,
+            function,
+            result_type,
+            (
+                SemanticValueOrigin::Expression(expression),
+                Some(source),
+                None,
+            ),
+            is_cancelled,
+        )?;
+        let result = expression_result(
+            request,
+            partial,
+            function,
+            (expression, source),
+            payload_type,
+            expression_request.desired_result,
+            is_cancelled,
+        )?;
+        append_expression_fact(
+            request,
+            partial,
+            RuntimeExpressionFact {
+                function,
+                expression,
+                ty: payload_type,
+                result: Some(result),
+                resolution: ExpressionResolution::OptionTry {
+                    option_type: result_type,
+                    some_variant: 0,
+                    none_variant: 1,
+                    some_payload,
+                    propagated,
+                },
+                effects: operand_outcome.effects,
+                ownership_before: OwnershipState::Owned,
+                ownership_after: OwnershipState::Owned,
+            },
+        )?;
+        return Ok(RuntimeExpression {
+            ty: payload_type,
+            result: Some(result),
+            referenced: None,
+            effects: operand_outcome.effects,
+        });
+    }
     let supported = is_exact_core_result_declaration(request, &resolved, result_declaration)
         && matches!(arguments.as_slice(), [SemanticArgument::Type(ok), SemanticArgument::Type(err)] if ok == err)
         && matches!(variants.as_slice(), [ok, err]
@@ -16383,6 +16518,51 @@ fn is_exact_core_result_declaration(
                     } if *candidate == generic && arguments.is_empty()))
         };
     exact_variant(ok, "Ok", *ok_generic) && exact_variant(err, "Err", *err_generic)
+}
+
+fn is_exact_core_option_declaration(
+    request: &AnalysisRequest<'_>,
+    resolved: &wrela_hir::ResolvedDeclaration,
+    record: &wrela_hir::Declaration,
+) -> bool {
+    if resolved.package != request.standard_library_package
+        || record.visibility != wrela_hir::Visibility::Public
+        || record.name.as_ref().map(wrela_hir::Name::as_str) != Some("Option")
+        || request
+            .hir
+            .as_program()
+            .modules
+            .get(resolved.module.0 as usize)
+            .is_none_or(|module| module.path.dotted() != "option")
+    {
+        return false;
+    }
+    let DeclarationKind::Enumeration(enumeration) = &record.kind else {
+        return false;
+    };
+    let [generic] = enumeration.generics.as_slice() else {
+        return false;
+    };
+    let Some(generic_record) = request.hir.as_program().generic_parameter(*generic) else {
+        return false;
+    };
+    generic_record.owner == record.id
+        && matches!(
+            generic_record.kind,
+            wrela_hir::GenericParameterKind::Type { bound: None }
+        )
+        && enumeration.members.is_empty()
+        && enumeration.deriving.is_empty()
+        && matches!(enumeration.variants.as_slice(), [some, none]
+            if some.name.as_str() == "Some"
+                && matches!(some.fields.as_slice(), [field]
+                    if field.name.is_none()
+                        && matches!(&field.ty.kind, TypeExpressionKind::Named {
+                            definition: Definition::Generic(candidate),
+                            arguments,
+                        } if *candidate == *generic && arguments.is_empty()))
+                && none.name.as_str() == "None"
+                && none.fields.is_empty())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -25781,6 +25961,8 @@ mod tests {
     const PARSED_CORE_ACTOR_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/actor.wr");
     const PARSED_CORE_RESULT_SOURCE: &str =
         include_str!("../../../std/wrela-core-0.1/src/result.wr");
+    const PARSED_CORE_OPTION_SOURCE: &str =
+        include_str!("../../../std/wrela-core-0.1/src/option.wr");
     const PARSED_COMPTIME_IMAGE_SOURCE: &str = "module app.image\n\nfrom core.image import Image, Target\n\n@image\npub fn boot() -> Image:\n    return Image(name=\"bootstrap\", target=Target.aarch64_qemu_virt_uefi)\n";
     const PARSED_COMPTIME_MATH_SOURCE: &str = "module app.math\n\npub fn add(left: u32, right: u32) -> u32:\n    return left + right\n\npub fn leaf(value: u32) -> u32:\n    return add(left=value, right=1)\n\npub fn middle(value: u32) -> u32:\n    return leaf(value)\n";
     const PARSED_COMPTIME_TEST_SOURCE: &str = "module app.math_test\n\nfrom app.math import add, middle\n\n@test\nfn imported_scalars_work():\n    caller: u32 = 40\n    nested: u32 = middle(caller)\n    caller = add(left=caller, right=2)\n    valid: bool = nested == 41 and not false\n    if valid:\n        comptime assert caller == 42, \"caller local was not preserved\"\n    else:\n        comptime assert false, \"nested scalar call failed\"\n";
@@ -25823,16 +26005,21 @@ pub struct Packet:
     }
 
     fn parsed_actor_fixture(application_source: &str) -> ParsedActorFixture {
-        parsed_actor_fixture_with_core_actor(application_source, false)
+        parsed_actor_fixture_with_core_modules(application_source, false, false)
     }
 
     fn parsed_actor_admission_fixture(application_source: &str) -> ParsedActorFixture {
-        parsed_actor_fixture_with_core_actor(application_source, true)
+        parsed_actor_fixture_with_core_modules(application_source, true, false)
     }
 
-    fn parsed_actor_fixture_with_core_actor(
+    fn parsed_actor_option_fixture(application_source: &str) -> ParsedActorFixture {
+        parsed_actor_fixture_with_core_modules(application_source, false, true)
+    }
+
+    fn parsed_actor_fixture_with_core_modules(
         application_source: &str,
         include_actor: bool,
+        include_option: bool,
     ) -> ParsedActorFixture {
         let mut sources = SourceDatabase::default();
         let actor_file = include_actor
@@ -25869,10 +26056,22 @@ pub struct Packet:
             })
             .transpose()
             .expect("core result source");
+        let option_file = include_option
+            .then(|| {
+                sources.add(SourceInput {
+                    path: "option.wr".to_owned(),
+                    text: PARSED_CORE_OPTION_SOURCE.to_owned(),
+                    digest: Sha256Digest::from_bytes([0xc4; 32]),
+                })
+            })
+            .transpose()
+            .expect("core option source");
         let mut parsed_files = Vec::new();
         parsed_files
             .try_reserve_exact(
-                2 + usize::from(actor_file.is_some()) + usize::from(result_file.is_some()),
+                2 + usize::from(actor_file.is_some())
+                    + usize::from(result_file.is_some())
+                    + usize::from(option_file.is_some()),
             )
             .expect("bounded parsed actor files");
         for file in [
@@ -25880,6 +26079,7 @@ pub struct Packet:
             Some(application_file),
             Some(core_file),
             result_file,
+            option_file,
         ]
         .into_iter()
         .flatten()
@@ -25939,6 +26139,15 @@ pub struct Packet:
                     result_file,
                 )
                 .expect("core result module");
+        }
+        if let Some(option_file) = option_file {
+            graph
+                .add_module(
+                    core,
+                    ModulePath::new(["option".to_owned()]).expect("core option module path"),
+                    option_file,
+                )
+                .expect("core option module");
         }
         graph
             .add_module(
@@ -35566,6 +35775,281 @@ fn projection_fixture():
                 .is_err(),
             "full sealing must authenticate specialized variant names against exact HIR"
         );
+    }
+
+    const CORE_OPTION_QUESTION_ACTOR_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+fn make_option() -> Option[u64]:
+    return Some(9)
+
+fn propagate_option() -> Option[u64]:
+    payload: u64 = make_option()?
+    return Some(payload)
+
+@service
+pub struct Worker:
+    @task
+    async fn pulse(mut self):
+        outcome: Option[u64] = propagate_option()
+        match outcome:
+            case .None:
+                pass
+            case .Some(payload):
+                pass
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#;
+
+    fn option_question_actor_source(declarations: &str, pulse_body: &str) -> String {
+        format!(
+            r#"module app
+
+from core.image import Image, Target
+
+{declarations}
+
+@service
+pub struct Worker:
+    @task
+    async fn pulse(mut self):
+{pulse_body}
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#
+        )
+    }
+
+    #[test]
+    fn core_option_scalar_rvalue_question_propagates_none_and_yields_some_payload() {
+        let fixture = parsed_actor_option_fixture(CORE_OPTION_QUESTION_ACTOR_SOURCE);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("Option question analysis is recoverable");
+        assert!(
+            output.diagnostics().is_empty(),
+            "exact core Option[u64] rvalue propagation must analyze: {:?}",
+            output.diagnostics()
+        );
+        let image = output.successful().expect("sealed Option question image");
+        let option_try = image
+            .facts()
+            .expressions
+            .iter()
+            .find(|fact| matches!(fact.resolution, ExpressionResolution::OptionTry { .. }))
+            .expect("exact Option question fact");
+        let ExpressionResolution::OptionTry {
+            option_type,
+            some_variant,
+            none_variant,
+            some_payload,
+            propagated,
+        } = &option_try.resolution
+        else {
+            unreachable!("selected Option question resolution")
+        };
+        assert_eq!((*some_variant, *none_variant), (0, 1));
+        assert_eq!(
+            image.facts().values[some_payload.0 as usize].ty,
+            option_try.ty
+        );
+        assert_eq!(image.facts().values[propagated.0 as usize].ty, *option_type);
+    }
+
+    #[test]
+    fn core_option_question_full_seal_rejects_variant_and_value_substitution() {
+        let fixture = parsed_actor_option_fixture(CORE_OPTION_QUESTION_ACTOR_SOURCE);
+        let changes = no_changes();
+        let image = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("Option question analysis")
+            .successful()
+            .expect("sealed Option question image")
+            .clone();
+        let fact_index = image
+            .facts()
+            .expressions
+            .iter()
+            .position(|fact| matches!(fact.resolution, ExpressionResolution::OptionTry { .. }))
+            .expect("Option question fact");
+        let rejects = |mutate: &dyn Fn(&mut PartialAnalysis)| {
+            let (hir, mut facts) = image.clone().into_parts();
+            mutate(&mut facts);
+            assert!(facts.validate_for_seal(hir.as_ref(), &|| false).is_err());
+        };
+        rejects(&|facts| {
+            let ExpressionResolution::OptionTry { some_variant, .. } =
+                &mut facts.expressions[fact_index].resolution
+            else {
+                panic!("Option question fact")
+            };
+            *some_variant = 1;
+        });
+        rejects(&|facts| {
+            let ExpressionResolution::OptionTry { none_variant, .. } =
+                &mut facts.expressions[fact_index].resolution
+            else {
+                panic!("Option question fact")
+            };
+            *none_variant = 0;
+        });
+        rejects(&|facts| {
+            let ExpressionResolution::OptionTry { propagated, .. } =
+                &facts.expressions[fact_index].resolution
+            else {
+                panic!("Option question fact")
+            };
+            let propagated = *propagated;
+            facts.values[propagated.0 as usize].ty = SemanticTypeId(0);
+        });
+    }
+
+    #[test]
+    fn core_option_question_adjacent_ownership_and_identity_tails_fail_closed_by_name() {
+        let diagnostic = |source: String| {
+            let fixture = parsed_actor_option_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("Option question rejection is recoverable");
+            assert!(output.successful().is_none());
+            output
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.as_deref())
+                .expect("named Option question rejection")
+                .to_owned()
+        };
+
+        let named_place = option_question_actor_source(
+            "fn make_option() -> Option[u64]:\n    return Some(9)\n\nfn named_place() -> Option[u64]:\n    held: Option[u64] = make_option()\n    payload: u64 = held?\n    return Some(payload)",
+            "        outcome: Option[u64] = named_place()\n        pass",
+        );
+        assert_eq!(
+            diagnostic(named_place),
+            "semantic-runtime-try-rvalue-required"
+        );
+
+        let wrong_enclosing = option_question_actor_source(
+            "fn make_option() -> Option[u64]:\n    return Some(9)\n\nfn wrong_enclosing() -> u64:\n    return make_option()?",
+            "        value: u64 = wrong_enclosing()\n        pass",
+        );
+        assert_eq!(
+            diagnostic(wrong_enclosing),
+            "semantic-runtime-option-question-enclosing"
+        );
+
+        let lookalike = option_question_actor_source(
+            "pub enum Maybe[T]:\n    Some(T)\n    None\n\nfn make_maybe() -> Maybe[u64]:\n    return Maybe.Some(9)\n\nfn reject_lookalike() -> Maybe[u64]:\n    payload: u64 = make_maybe()?\n    return Maybe.Some(payload)",
+            "        outcome: Maybe[u64] = reject_lookalike()\n        pass",
+        );
+        assert_eq!(
+            diagnostic(lookalike),
+            "semantic-runtime-try-result-required"
+        );
+    }
+
+    #[test]
+    fn core_option_question_accepts_fresh_contextual_some_and_none_constructors() {
+        let source = option_question_actor_source(
+            "fn direct_constructor() -> Option[u64]:\n    payload: u64 = Some(9)?\n    return Some(payload)\n\nfn direct_none() -> Option[u64]:\n    payload: u64 = None?\n    return Some(payload)",
+            "        present: Option[u64] = direct_constructor()\n        absent: Option[u64] = direct_none()\n        pass",
+        );
+        let fixture = parsed_actor_option_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("contextual Option constructor question is recoverable");
+        assert!(
+            output.diagnostics().is_empty(),
+            "fresh contextual Some question must analyze: {:?}",
+            output.diagnostics()
+        );
+        output
+            .successful()
+            .expect("sealed contextual Option constructor question");
+    }
+
+    #[test]
+    fn core_option_question_value_budget_is_exact_and_analysis_cancels_at_last_poll() {
+        const EXACT_VALUES: u32 = 10;
+        const EXPECTED_RESOURCE_LIMIT: u64 = 1_000_000_000;
+        let fixture = parsed_actor_option_fixture(CORE_OPTION_QUESTION_ACTOR_SOURCE);
+        let changes = no_changes();
+        let baseline = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("baseline Option question analysis");
+        assert_eq!(baseline.partial().values.len(), EXACT_VALUES as usize);
+
+        let mut exact = AnalysisLimits::standard();
+        exact.values = EXACT_VALUES;
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| false)
+            .expect("exact Option question value limit");
+        let mut one_under = exact;
+        one_under.values = EXACT_VALUES - 1;
+        let under = CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, one_under), &|| {
+                false
+            });
+        assert!(
+            matches!(
+                under,
+                Err(AnalysisFailure::ResourceLimit {
+                    resource: "semantic values",
+                    limit,
+                }) if limit == EXPECTED_RESOURCE_LIMIT
+            ),
+            "unexpected one-under Option question result: {under:?}"
+        );
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            })
+            .expect("count Option question analysis polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, exact),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
     }
 
     #[test]

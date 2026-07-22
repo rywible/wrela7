@@ -721,6 +721,16 @@ pub enum ExpressionResolution {
         err_payload: ValueId,
         propagated: ValueId,
     },
+    /// Postfix `?` over the exact core `Option[S]` scalar specialization.
+    /// `Some` yields `some_payload`; `None` reconstructs `propagated` and
+    /// returns it from the enclosing function.
+    OptionTry {
+        option_type: SemanticTypeId,
+        some_variant: u32,
+        none_variant: u32,
+        some_payload: ValueId,
+        propagated: ValueId,
+    },
     /// Analysis-only closed iterator. `ExpressionFact::ty` is the yielded
     /// integer type rather than a first-class range value type; ranges are
     /// consumable only by the enclosing `for` statement in this slice.
@@ -4311,6 +4321,36 @@ fn validate_exact_expression_fact(
             increment_definition(definitions, *propagated)?;
         }
         (
+            wrela_hir::ExpressionKind::Try(operand),
+            ExpressionResolution::OptionTry {
+                option_type,
+                some_variant,
+                none_variant,
+                some_payload,
+                propagated,
+            },
+            Some(_),
+        ) => {
+            if !exact_option_try_matches(
+                analysis,
+                program,
+                function,
+                *operand,
+                fact,
+                *option_type,
+                *some_variant,
+                *none_variant,
+                *some_payload,
+                *propagated,
+            ) {
+                return Err(invalid(
+                    "Option postfix question semantic facts differ from HIR",
+                ));
+            }
+            increment_definition(definitions, *some_payload)?;
+            increment_definition(definitions, *propagated)?;
+        }
+        (
             wrela_hir::ExpressionKind::TrySend(operand),
             ExpressionResolution::Builtin(IntrinsicOperation::ActorTrySend { actor }),
             Some(result),
@@ -4547,6 +4587,85 @@ fn exact_result_try_matches(
         && internal_value(propagated, result_type)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn exact_option_try_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    function: &FunctionInstance,
+    operand: ExpressionId,
+    fact: &ExpressionFact,
+    option_type: SemanticTypeId,
+    some_variant: u32,
+    none_variant: u32,
+    some_payload: ValueId,
+    propagated: ValueId,
+) -> bool {
+    let Some(operand_fact) = exact_child_expression(analysis, function.id, operand) else {
+        return false;
+    };
+    if program.expression(operand).is_none_or(|operand| {
+        matches!(
+            operand.kind,
+            wrela_hir::ExpressionKind::Reference(
+                wrela_hir::Definition::Local(_) | wrela_hir::Definition::Parameter(_)
+            ) | wrela_hir::ExpressionKind::Field { .. }
+        )
+    }) {
+        return false;
+    }
+    let Some(result) = fact.result else {
+        return false;
+    };
+    if operand_fact.ty != option_type
+        || operand_fact.result.is_none()
+        || matches!(operand_fact.resolution, ExpressionResolution::Value(_))
+        || function.result != option_type
+        || fact.effects != operand_fact.effects
+        || result == some_payload
+        || result == propagated
+        || some_payload == propagated
+    {
+        return false;
+    }
+    let Some(SemanticTypeKind::Enumeration {
+        declaration,
+        arguments,
+        variants,
+    }) = analysis
+        .types
+        .get(option_type.0 as usize)
+        .map(|record| &record.kind)
+    else {
+        return false;
+    };
+    let Some(payload_type) = variants
+        .first()
+        .and_then(|variant| variant.fields.first())
+        .map(|field| field.ty)
+    else {
+        return false;
+    };
+    let internal_value = |value: ValueId, ty: SemanticTypeId| {
+        analysis.values.get(value.0 as usize).is_some_and(|value| {
+            value.function == function.id
+                && value.ty == ty
+                && value.category == ValueCategory::Value
+                && value.origin == SemanticValueOrigin::Expression(fact.expression)
+                && value.source_name.is_none()
+        })
+    };
+    some_variant == 0
+        && none_variant == 1
+        && exact_core_option_declaration_matches(program, *declaration)
+        && runtime_enum_arguments_supported(arguments, variants)
+        && matches!(variants.as_slice(), [some, none]
+            if matches!(some.fields.as_slice(), [field] if field.ty == payload_type)
+                && none.fields.is_empty())
+        && fact.ty == payload_type
+        && internal_value(some_payload, payload_type)
+        && internal_value(propagated, option_type)
+}
+
 fn exact_core_result_declaration_matches(
     program: &wrela_hir::Program,
     declaration: DeclarationId,
@@ -4603,6 +4722,62 @@ fn exact_core_result_declaration_matches(
         && generic_is_type(*err_generic)
         && exact_variant(ok, "Ok", *ok_generic)
         && exact_variant(err, "Err", *err_generic)
+}
+
+fn exact_core_option_declaration_matches(
+    program: &wrela_hir::Program,
+    declaration: DeclarationId,
+) -> bool {
+    let Some(core_package) = program
+        .packages
+        .package(program.packages.root())
+        .and_then(|root| {
+            root.dependencies
+                .iter()
+                .find(|dependency| dependency.alias.as_str() == "core")
+                .map(|dependency| dependency.package)
+        })
+    else {
+        return false;
+    };
+    let Some(record) = program.declaration(declaration) else {
+        return false;
+    };
+    if record.visibility != wrela_hir::Visibility::Public
+        || record.name.as_ref().map(wrela_hir::Name::as_str) != Some("Option")
+        || program
+            .modules
+            .get(record.module.0 as usize)
+            .is_none_or(|module| module.package != core_package || module.path.dotted() != "option")
+    {
+        return false;
+    }
+    let wrela_hir::DeclarationKind::Enumeration(source) = &record.kind else {
+        return false;
+    };
+    let [generic] = source.generics.as_slice() else {
+        return false;
+    };
+    let Some(generic_record) = program.generic_parameter(*generic) else {
+        return false;
+    };
+    generic_record.owner == declaration
+        && matches!(
+            generic_record.kind,
+            wrela_hir::GenericParameterKind::Type { bound: None }
+        )
+        && source.members.is_empty()
+        && source.deriving.is_empty()
+        && matches!(source.variants.as_slice(), [some, none]
+            if some.name.as_str() == "Some"
+                && matches!(some.fields.as_slice(), [field]
+                    if field.name.is_none()
+                        && matches!(&field.ty.kind, wrela_hir::TypeExpressionKind::Named {
+                            definition: wrela_hir::Definition::Generic(candidate),
+                            arguments,
+                        } if *candidate == *generic && arguments.is_empty()))
+                && none.name.as_str() == "None"
+                && none.fields.is_empty())
 }
 
 fn exact_enum_constructor_reference_matches(
@@ -8879,6 +9054,21 @@ fn valid_expression_resolution(
             *err_payload,
             *propagated,
         ),
+        ExpressionResolution::OptionTry {
+            option_type,
+            some_variant,
+            none_variant,
+            some_payload,
+            propagated,
+        } => valid_option_try_resolution(
+            analysis,
+            function,
+            *option_type,
+            *some_variant,
+            *none_variant,
+            *some_payload,
+            *propagated,
+        ),
         ExpressionResolution::ClosedRange { start, end, .. } => {
             start != end && value_id(*start) && value_id(*end)
         }
@@ -9684,6 +9874,51 @@ fn valid_result_try_resolution(
         && value_matches(propagated, result_type)
 }
 
+fn valid_option_try_resolution(
+    analysis: &PartialAnalysis,
+    function: FunctionInstanceId,
+    option_type: SemanticTypeId,
+    some_variant: u32,
+    none_variant: u32,
+    some_payload: ValueId,
+    propagated: ValueId,
+) -> bool {
+    let Some(SemanticTypeKind::Enumeration {
+        arguments,
+        variants,
+        ..
+    }) = analysis
+        .types
+        .get(option_type.0 as usize)
+        .map(|record| &record.kind)
+    else {
+        return false;
+    };
+    let Some(payload_type) = variants
+        .first()
+        .and_then(|variant| variant.fields.first())
+        .map(|field| field.ty)
+    else {
+        return false;
+    };
+    let value_matches = |value: ValueId, ty: SemanticTypeId| {
+        analysis.values.get(value.0 as usize).is_some_and(|value| {
+            value.function == function && value.ty == ty && value.category == ValueCategory::Value
+        })
+    };
+    some_variant == 0
+        && none_variant == 1
+        && some_payload != propagated
+        && runtime_enum_arguments_supported(arguments, variants)
+        && matches!(variants.as_slice(), [some, none]
+            if some.name == "Some"
+                && matches!(some.fields.as_slice(), [field] if field.ty == payload_type)
+                && none.name == "None"
+                && none.fields.is_empty())
+        && value_matches(some_payload, payload_type)
+        && value_matches(propagated, option_type)
+}
+
 fn valid_expression_region(
     fact: &ExpressionFact,
     analysis: &PartialAnalysis,
@@ -9723,6 +9958,7 @@ fn valid_expression_region(
             | ExpressionResolution::Constructor { .. }
             | ExpressionResolution::InitializerConstruction { .. }
             | ExpressionResolution::ResultTry { .. }
+            | ExpressionResolution::OptionTry { .. }
             | ExpressionResolution::ClosedRange { .. }
             | ExpressionResolution::DirectCall { .. }
             | ExpressionResolution::MethodCall { .. }
@@ -11795,6 +12031,7 @@ fn validate_fact_resources(
             | ExpressionResolution::Constructor { .. }
             | ExpressionResolution::InitializerConstruction { .. }
             | ExpressionResolution::ResultTry { .. }
+            | ExpressionResolution::OptionTry { .. }
             | ExpressionResolution::ClosedRange { .. }
             | ExpressionResolution::ActorRequest { .. }
             | ExpressionResolution::Field { .. }

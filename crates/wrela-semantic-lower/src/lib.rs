@@ -6450,6 +6450,20 @@ struct ResultTryInput {
     effects: sema::EffectSet,
 }
 
+struct OptionTryInput {
+    expression: wrela_hir::ExpressionId,
+    source: Span,
+    operand: wrela_hir::ExpressionId,
+    payload_type: sema::SemanticTypeId,
+    option_type: sema::SemanticTypeId,
+    some_variant: u32,
+    none_variant: u32,
+    some_payload: sema::ValueId,
+    propagated: sema::ValueId,
+    result: sema::ValueId,
+    effects: sema::EffectSet,
+}
+
 enum SourceStatementPlan {
     Pass,
     Initialize {
@@ -6561,6 +6575,7 @@ enum SourceExpressionPlan {
     Binary(ScalarBinaryInput),
     Convert(ScalarConvertInput),
     ResultTry(ResultTryInput),
+    OptionTry(OptionTryInput),
     InlineIf(InlineIfInput),
     Await {
         expression: wrela_hir::ExpressionId,
@@ -9595,6 +9610,30 @@ impl SourceFunctionLowerer<'_> {
                         effects: fact.effects,
                     }),
                     (
+                        wrela_hir::ExpressionKind::Try(operand),
+                        sema::ExpressionResolution::OptionTry {
+                            option_type,
+                            some_variant,
+                            none_variant,
+                            some_payload,
+                            propagated,
+                        },
+                    ) => SourceExpressionPlan::OptionTry(OptionTryInput {
+                        expression: expression_id,
+                        source: expression.source,
+                        operand: *operand,
+                        payload_type: fact.ty,
+                        option_type: *option_type,
+                        some_variant: *some_variant,
+                        none_variant: *none_variant,
+                        some_payload: *some_payload,
+                        propagated: *propagated,
+                        result: fact
+                            .result
+                            .ok_or_else(|| self.fact_mismatch("Option postfix question result"))?,
+                        effects: fact.effects,
+                    }),
+                    (
                         wrela_hir::ExpressionKind::Unary {
                             operator: wrela_hir::UnaryOperator::Await,
                             operand,
@@ -9901,6 +9940,9 @@ impl SourceFunctionLowerer<'_> {
             }
             SourceExpressionPlan::ResultTry(result_try) => {
                 self.lower_result_try(result_try, statements)
+            }
+            SourceExpressionPlan::OptionTry(option_try) => {
+                self.lower_option_try(option_try, statements)
             }
             SourceExpressionPlan::InlineIf(inline_if) => {
                 self.lower_inline_if(inline_if, source, statements)
@@ -10654,6 +10696,202 @@ impl SourceFunctionLowerer<'_> {
                 arms,
                 results: one_value_vec(result, self.limits.model_edges)?,
                 source: Some(result_try.source),
+            },
+        )?;
+        Ok(LoweredExpression::Value(result))
+    }
+
+    fn lower_option_try(
+        &mut self,
+        option_try: OptionTryInput,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<LoweredExpression, LowerError> {
+        let operand_fact = self.expression_fact(option_try.operand)?;
+        if operand_fact.ty != option_try.option_type
+            || operand_fact.result.is_none()
+            || matches!(
+                operand_fact.resolution,
+                sema::ExpressionResolution::Value(_)
+            )
+            || operand_fact.effects != option_try.effects
+            || self.function.result != option_try.option_type
+        {
+            return Err(self.fact_mismatch("Option postfix question operand and enclosing type"));
+        }
+        let declaration = self
+            .input
+            .facts()
+            .types
+            .get(option_try.option_type.0 as usize)
+            .and_then(|record| match &record.kind {
+                sema::SemanticTypeKind::Enumeration {
+                    declaration,
+                    arguments,
+                    variants,
+                } if matches!(arguments.as_slice(), [sema::SemanticArgument::Type(payload)]
+                    if *payload == option_try.payload_type)
+                    && matches!(variants.as_slice(), [some, none]
+                        if some.name == "Some"
+                            && matches!(some.fields.as_slice(), [field]
+                                if field.ty == option_try.payload_type)
+                            && none.name == "None"
+                            && none.fields.is_empty()) =>
+                {
+                    Some(*declaration)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| self.fact_mismatch("Option postfix question type"))?;
+        let program = self.input.hir().as_program();
+        let declaration_record = program
+            .declaration(declaration)
+            .ok_or_else(|| self.fact_mismatch("Option postfix question declaration"))?;
+        let module = program
+            .modules
+            .get(declaration_record.module.0 as usize)
+            .ok_or_else(|| self.fact_mismatch("Option postfix question module"))?;
+        let core_package = program
+            .packages
+            .package(program.packages.root())
+            .and_then(|root| {
+                root.dependencies
+                    .iter()
+                    .find(|dependency| dependency.alias.as_str() == "core")
+                    .map(|dependency| dependency.package)
+            })
+            .ok_or_else(|| self.fact_mismatch("Option postfix question core package"))?;
+        let exact_source = match &declaration_record.kind {
+            wrela_hir::DeclarationKind::Enumeration(source) => {
+                let [generic] = source.generics.as_slice() else {
+                    return Err(self.fact_mismatch("Option postfix question generic"));
+                };
+                program.generic_parameter(*generic).is_some_and(|record| {
+                    record.owner == declaration
+                        && matches!(
+                            record.kind,
+                            wrela_hir::GenericParameterKind::Type { bound: None }
+                        )
+                }) && source.members.is_empty()
+                    && source.deriving.is_empty()
+                    && matches!(source.variants.as_slice(), [some, none]
+                        if some.name.as_str() == "Some"
+                            && matches!(some.fields.as_slice(), [field]
+                                if field.name.is_none()
+                                    && matches!(&field.ty.kind,
+                                        wrela_hir::TypeExpressionKind::Named {
+                                            definition: wrela_hir::Definition::Generic(candidate),
+                                            arguments,
+                                        } if *candidate == *generic && arguments.is_empty()))
+                            && none.name.as_str() == "None"
+                            && none.fields.is_empty())
+            }
+            _ => false,
+        };
+        if declaration_record.visibility != wrela_hir::Visibility::Public
+            || declaration_record
+                .name
+                .as_ref()
+                .is_none_or(|name| name.as_str() != "Option")
+            || module.package != core_package
+            || module.path.dotted() != "option"
+            || !exact_source
+            || option_try.some_variant != 0
+            || option_try.none_variant != 1
+        {
+            return Err(self.fact_mismatch("Option postfix question canonical identity"));
+        }
+        let internal = |value: sema::ValueId, ty: sema::SemanticTypeId| {
+            self.input
+                .facts()
+                .values
+                .get(value.0 as usize)
+                .filter(|record| {
+                    record.function == self.function.id
+                        && record.ty == ty
+                        && record.category == sema::ValueCategory::Value
+                        && record.origin
+                            == sema::SemanticValueOrigin::Expression(option_try.expression)
+                        && record.source == Some(option_try.source)
+                        && record.source_name.is_none()
+                })
+                .map(|_| self.value_map.get(value))
+                .transpose()
+                .ok()
+                .flatten()
+        };
+        let some_payload = internal(option_try.some_payload, option_try.payload_type)
+            .ok_or_else(|| self.fact_mismatch("Option postfix question Some payload"))?;
+        let propagated = internal(option_try.propagated, option_try.option_type)
+            .ok_or_else(|| self.fact_mismatch("Option postfix question propagated None"))?;
+        let result = self.lowered_expression_result(
+            option_try.expression,
+            option_try.result,
+            option_try.payload_type,
+            option_try.source,
+        )?;
+        let LoweredExpression::Value(operand) =
+            self.lower_expression(option_try.operand, sema::AccessMode::Value, statements)?
+        else {
+            return Err(self.fact_mismatch("Option postfix question operand value"));
+        };
+        let mut some_statements = try_vec(
+            1,
+            "Option postfix question Some arm",
+            self.limits.model_edges,
+        )?;
+        self.push_statement(
+            &mut some_statements,
+            wir::SemanticStatement::Yield(one_value_vec(some_payload, self.limits.model_edges)?),
+        )?;
+        let mut none_statements = try_vec(
+            2,
+            "Option postfix question None arm",
+            self.limits.model_edges,
+        )?;
+        self.push_let(
+            &mut none_statements,
+            propagated,
+            wir::SemanticOperation::ConstructEnum {
+                ty: wir::TypeId(option_try.option_type.0),
+                variant: option_try.none_variant,
+                payload: None,
+            },
+            Some(option_try.source),
+        )?;
+        self.push_statement(
+            &mut none_statements,
+            wir::SemanticStatement::Return(one_value_vec(propagated, self.limits.model_edges)?),
+        )?;
+        let mut arms = try_vec(
+            2,
+            "Option postfix question match arms",
+            self.limits.model_edges,
+        )?;
+        arms.push(wir::SemanticMatchArm {
+            variant: Some(option_try.some_variant),
+            bindings: one_value_vec(some_payload, self.limits.model_edges)?,
+            guard: None,
+            body: wir::SemanticRegion {
+                parameters: one_value_vec(some_payload, self.limits.model_edges)?,
+                statements: some_statements,
+            },
+        });
+        arms.push(wir::SemanticMatchArm {
+            variant: Some(option_try.none_variant),
+            bindings: Vec::new(),
+            guard: None,
+            body: wir::SemanticRegion {
+                parameters: Vec::new(),
+                statements: none_statements,
+            },
+        });
+        self.push_statement(
+            statements,
+            wir::SemanticStatement::Match {
+                scrutinee: operand,
+                arms,
+                results: one_value_vec(result, self.limits.model_edges)?,
+                source: Some(option_try.source),
             },
         )?;
         Ok(LoweredExpression::Value(result))
@@ -15710,6 +15948,8 @@ mod contract_tests {
     const PARSED_CORE_ACTOR_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/actor.wr");
     const PARSED_CORE_RESULT_SOURCE: &str =
         include_str!("../../../std/wrela-core-0.1/src/result.wr");
+    const PARSED_CORE_OPTION_SOURCE: &str =
+        include_str!("../../../std/wrela-core-0.1/src/option.wr");
     const PARSED_CORE_TIME_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/time.wr");
     const PARSED_CORE_OPS_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/ops.wr");
     const PARSED_STDLIB_TIME_RUNTIME_SOURCE: &str =
@@ -15828,6 +16068,19 @@ pub fn boot() -> Image:
     }
 
     fn analyze_parsed_actor_source(application_source: &str) -> wrela_sema::AnalyzedImage {
+        analyze_parsed_actor_source_with_modules(application_source, false)
+    }
+
+    fn analyze_parsed_actor_source_with_option(
+        application_source: &str,
+    ) -> wrela_sema::AnalyzedImage {
+        analyze_parsed_actor_source_with_modules(application_source, true)
+    }
+
+    fn analyze_parsed_actor_source_with_modules(
+        application_source: &str,
+        include_option: bool,
+    ) -> wrela_sema::AnalyzedImage {
         let base = fixture();
         let mut sources = SourceDatabase::default();
         let actor_file = sources
@@ -15851,6 +16104,16 @@ pub fn boot() -> Image:
                 digest: Sha256Digest::from_bytes([0xc1; 32]),
             })
             .expect("core image source");
+        let option_file = include_option
+            .then(|| {
+                sources.add(SourceInput {
+                    path: "option.wr".to_owned(),
+                    text: PARSED_CORE_OPTION_SOURCE.to_owned(),
+                    digest: Sha256Digest::from_bytes([0xc3; 32]),
+                })
+            })
+            .transpose()
+            .expect("core option source");
         let result_file = sources
             .add(SourceInput {
                 path: "result.wr".to_owned(),
@@ -15860,9 +16123,18 @@ pub fn boot() -> Image:
             .expect("core result source");
         let mut parsed_files = Vec::new();
         parsed_files
-            .try_reserve_exact(4)
-            .expect("four parsed actor files");
-        for file in [actor_file, application_file, core_file, result_file] {
+            .try_reserve_exact(4 + usize::from(option_file.is_some()))
+            .expect("bounded parsed actor files");
+        for file in [
+            Some(actor_file),
+            Some(application_file),
+            Some(core_file),
+            option_file,
+            Some(result_file),
+        ]
+        .into_iter()
+        .flatten()
+        {
             let output = WrelaSyntaxParser::new()
                 .parse(
                     ParseRequest {
@@ -15915,6 +16187,15 @@ pub fn boot() -> Image:
                 core_file,
             )
             .expect("core module");
+        if let Some(option_file) = option_file {
+            packages
+                .add_module(
+                    core,
+                    ModulePath::new(["option".to_owned()]).expect("core option module path"),
+                    option_file,
+                )
+                .expect("core option module");
+        }
         packages
             .add_module(
                 core,
@@ -20592,6 +20873,146 @@ pub fn boot() -> Image:
             ),
             "unexpected static lowering result: {result:?}"
         );
+    }
+
+    #[test]
+    fn core_option_scalar_question_lowers_to_exact_some_none_match() {
+        const EXACT_OPERATIONS: u64 = 6;
+        let image = analyze_parsed_actor_source_with_option(
+            r#"module app
+
+from core.image import Image, Target
+
+fn make_option() -> Option[u64]:
+    return Some(9)
+
+fn propagate_option() -> Option[u64]:
+    payload: u64 = make_option()?
+    return Some(payload)
+
+@service
+pub struct Worker:
+    @task
+    async fn pulse(mut self):
+        outcome: Option[u64] = propagate_option()
+        match outcome:
+            case .None:
+                pass
+            case .Some(payload):
+                pass
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#,
+        );
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("core Option question SemanticWir lowering");
+        let option_match = output
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .find(|function| function.name.ends_with("propagate_option"))
+            .expect("propagate_option function")
+            .body
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Match {
+                    arms,
+                    results,
+                    source: Some(_),
+                    ..
+                } if results.len() == 1 => Some(arms),
+                _ => None,
+            })
+            .expect("Option question match");
+        assert!(matches!(option_match.as_slice(), [some, none]
+            if some.variant == Some(0)
+                && some.bindings.len() == 1
+                && matches!(some.body.statements.as_slice(),
+                    [wir::SemanticStatement::Yield(values)] if values == &some.bindings)
+                && none.variant == Some(1)
+                && none.bindings.is_empty()
+                && matches!(none.body.statements.as_slice(),
+                    [wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::ConstructEnum {
+                            variant: 1,
+                            payload: None,
+                            ..
+                        },
+                        ..
+                    }), wir::SemanticStatement::Return(values)] if values.len() == 1)));
+
+        assert_eq!(output.report().operations, EXACT_OPERATIONS);
+        let mut exact = LoweringLimits::standard();
+        exact.operations = EXACT_OPERATIONS;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact Option question operation limit");
+        let mut one_under = exact;
+        one_under.operations = EXACT_OPERATIONS - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == EXACT_OPERATIONS - 1
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("count Option question lowering polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
     }
 
     #[test]

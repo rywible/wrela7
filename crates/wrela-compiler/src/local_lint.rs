@@ -338,6 +338,7 @@ impl CanonicalSemanticLinter {
                 | ExpressionResolution::Constructor { .. }
                 | ExpressionResolution::InitializerConstruction { .. }
                 | ExpressionResolution::ResultTry { .. }
+                | ExpressionResolution::OptionTry { .. }
                 | ExpressionResolution::DirectCall { .. }
                 | ExpressionResolution::MethodCall { .. }
                 | ExpressionResolution::ScopeCall { .. }

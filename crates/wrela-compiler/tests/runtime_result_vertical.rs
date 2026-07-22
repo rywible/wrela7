@@ -191,6 +191,11 @@ fn source_fixture_for(application_source: &str) -> SourceFixture {
         .unwrap_or_else(|diagnostics| panic!("HIR diagnostics: {diagnostics:?}"))
 }
 
+fn source_fixture_for_option(application_source: &str) -> SourceFixture {
+    try_source_fixture_with_modules(application_source, None, true)
+        .unwrap_or_else(|diagnostics| panic!("HIR diagnostics: {diagnostics:?}"))
+}
+
 fn try_source_fixture_for(
     application_source: &str,
 ) -> Result<SourceFixture, Vec<wrela_diagnostics::Diagnostic>> {
@@ -201,9 +206,19 @@ fn try_source_fixture_with_forged_result(
     application_source: &str,
     forged_result_source: Option<&str>,
 ) -> Result<SourceFixture, Vec<wrela_diagnostics::Diagnostic>> {
+    try_source_fixture_with_modules(application_source, forged_result_source, false)
+}
+
+fn try_source_fixture_with_modules(
+    application_source: &str,
+    forged_result_source: Option<&str>,
+    include_option: bool,
+) -> Result<SourceFixture, Vec<wrela_diagnostics::Diagnostic>> {
     let (root, core_identity) = package_identities(application_source, forged_result_source);
     let mut sources = SourceDatabase::default();
     let core_file = add_source(&mut sources, "core/image.wr", CORE_IMAGE_SOURCE);
+    let core_option_file =
+        include_option.then(|| add_source(&mut sources, "core/option.wr", CORE_OPTION_SOURCE));
     let core_result_file = add_source(&mut sources, "core/result.wr", CORE_RESULT_SOURCE);
     let application_file = add_source(&mut sources, "runtime_result/image.wr", application_source);
     let forged_result_file =
@@ -241,6 +256,15 @@ fn try_source_fixture_with_forged_result(
             core_file,
         )
         .expect("core image module record");
+    if let Some(core_option_file) = core_option_file {
+        graph
+            .add_module(
+                core,
+                ModulePath::new(["option".to_owned()]).expect("core option module"),
+                core_option_file,
+            )
+            .expect("core option module record");
+    }
     graph
         .add_module(
             core,
@@ -910,6 +934,117 @@ fn match_value() -> u64:
             let digest = HASHER.sha256(first.bytes());
             assert_eq!(digest, HASHER.sha256(second.bytes()));
             inspect_native_object(first.bytes(), digest);
+        }
+    }
+}
+
+#[test]
+fn core_option_scalar_question_reaches_deterministic_native_coff() {
+    let fixture = source_fixture_for_option(
+        r#"module runtime_result.image
+
+from core.image import Image, Target
+
+@image
+pub fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+fn make_option() -> Option[u64]:
+    return Some(9)
+
+fn propagate_option() -> Option[u64]:
+    payload: u64 = make_option()?
+    return Some(payload)
+
+@test(runtime)
+fn option_question_runtime():
+    outcome: Option[u64] = propagate_option()
+    match outcome:
+        case .None:
+            return
+        case .Some(payload):
+            return
+"#,
+    );
+    let image = analyze_selected(&fixture, "option_question_runtime");
+    assert!(image.facts().expressions.iter().any(|fact| {
+        matches!(
+            fact.resolution,
+            wrela_sema::ExpressionResolution::OptionTry { .. }
+        )
+    }));
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: image,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("core Option question SemanticWir")
+        .into_parts()
+        .0;
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("core Option question FlowWir");
+    assert!(flow.diagnostics().is_empty());
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("core Option question canonical FlowWir frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("core Option question MachineWir preparation");
+    let constructors = prepared
+        .machine()
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.operation {
+            MachineOperation::MakeEnum {
+                variant, payload, ..
+            } => Some((*variant, payload.is_some())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        constructors.contains(&(0, true)),
+        "Some must retain its payload"
+    );
+    assert!(
+        constructors.contains(&(1, false)),
+        "the propagated None path must construct no payload"
+    );
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("core Option question native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat core Option question native emission");
+            assert_eq!(first.bytes(), second.bytes());
+            assert_eq!(HASHER.sha256(first.bytes()), HASHER.sha256(second.bytes()));
         }
     }
 }

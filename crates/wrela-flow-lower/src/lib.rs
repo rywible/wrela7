@@ -3079,14 +3079,15 @@ fn validate_scalar_source_function(
                             || !matches!(contract, ScalarRegionContract::Root)
                             || index + 1 != region.statements.len()))
                         || (!terminal
-                            && (arms.len() != variant_count
-                                || !exact_result_try_match_protocol(
-                                    input,
-                                    function,
-                                    enum_ty.ok_or_else(|| unsupported("result match enum type"))?,
-                                    arms,
-                                    results,
-                                )))
+                            && (arms.len() != variant_count || {
+                                let enum_ty = enum_ty
+                                    .ok_or_else(|| unsupported("question match enum type"))?;
+                                !exact_result_try_match_protocol(
+                                    input, function, enum_ty, arms, results,
+                                ) && !exact_option_try_match_protocol(
+                                    input, function, enum_ty, arms, results,
+                                )
+                            }))
                     {
                         return Err(unsupported("terminal closed enum match contract"));
                     }
@@ -3352,6 +3353,68 @@ fn exact_result_try_match_protocol(
             variant: 1,
             payload: Some(payload),
         } if ty == enum_type.id && payload == *err_binding
+    ) && returned.as_slice() == [*propagated_value]
+        && scalar_value_type(function, *propagated_value) == Some(enum_type.id)
+}
+
+fn exact_option_try_match_protocol(
+    input: &semantic::SemanticWir,
+    function: &semantic::SemanticFunction,
+    enum_type: &semantic::TypeRecord,
+    arms: &[semantic::SemanticMatchArm],
+    results: &[semantic::ValueId],
+) -> bool {
+    let semantic::TypeKind::Enum { variants } = &enum_type.kind else {
+        return false;
+    };
+    let ([some_variant, none_variant], [some_arm, none_arm], [result]) =
+        (variants.as_slice(), arms, results)
+    else {
+        return false;
+    };
+    let ([some_field], [some_binding]) =
+        (some_variant.fields.as_slice(), some_arm.bindings.as_slice())
+    else {
+        return false;
+    };
+    if some_variant.name != "Some"
+        || none_variant.name != "None"
+        || !some_field.name.is_empty()
+        || !some_field.public
+        || !none_variant.fields.is_empty()
+        || scalar_primitive(input, some_field.ty).is_none()
+        || function.result != enum_type.id
+        || scalar_value_type(function, *result) != Some(some_field.ty)
+        || some_arm.variant != Some(0)
+        || none_arm.variant != Some(1)
+        || some_arm.guard.is_some()
+        || none_arm.guard.is_some()
+        || some_arm.body.parameters.as_slice() != [*some_binding]
+        || !none_arm.bindings.is_empty()
+        || !none_arm.body.parameters.is_empty()
+        || scalar_value_type(function, *some_binding) != Some(some_field.ty)
+        || !matches!(some_arm.body.statements.as_slice(),
+            [semantic::SemanticStatement::Yield(values)] if values.as_slice() == [*some_binding])
+    {
+        return false;
+    }
+    let [
+        semantic::SemanticStatement::Let(propagated),
+        semantic::SemanticStatement::Return(returned),
+    ] = none_arm.body.statements.as_slice()
+    else {
+        return false;
+    };
+    let [propagated_value] = propagated.results.as_slice() else {
+        return false;
+    };
+    matches!(
+        propagated.operation,
+        semantic::SemanticOperation::ConstructEnum {
+            ty,
+            variant: 1,
+            payload: None,
+        } if ty == enum_type.id
     ) && returned.as_slice() == [*propagated_value]
         && scalar_value_type(function, *propagated_value) == Some(enum_type.id)
 }
