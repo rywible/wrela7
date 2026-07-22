@@ -60,6 +60,15 @@ the AArch64 QEMU-virt UEFI target under
 
 ## Oracle track (roadmap)
 
+> **PARTIALLY SUPERSEDED (2026-07-21).** The native machine model (`wrela-virt`)
+> is retired. QEMU stays a **development-time differential oracle and is still
+> removed** once the Wrela VMM and native backend reach parity — but it is
+> **never bundled**, and cross-arch execution is not a goal (AArch64 hosts only).
+> See [`runtime-platform.md`](runtime-platform.md). The native AArch64 codegen and
+> native linker survive; their direction is now
+> [`adr/0001-native-backend.md`](adr/0001-native-backend.md), where the linker's
+> first output target is a flat image (not EFI).
+
 LLVM, lld-link, and QEMU are temporary differential oracles. The world-class
 roadmap replaces them with a native machine model (`wrela-virt`), native
 AArch64 codegen, and a native EFI linker, then deletes the oracles once

@@ -116,6 +116,17 @@ Each task uses the vertical-slice template. Inventory rows cited per task.
 
 ## Lane C — The wrela-virt machine model (oracle track, phase 1)
 
+> **SUPERSEDED (2026-07-21) by [`docs/runtime-platform.md`](../../runtime-platform.md).**
+> The `wrela-virt` AArch64 interpreter / machine model (C1–C10) is **not
+> pursued**. QEMU stays a **temporary differential oracle and is still removed** —
+> but validated against the new Wrela VMM and native backend rather than the
+> interpreter, and **never bundled** (AArch64 hosts only; cross-arch is not a
+> goal). Deterministic execution is provided by two-layer determinism
+> (event-sourcing + bounded record/replay at the virtio boundary). Verticals such
+> as B9 use QEMU as an oracle during bring-up only. The native-codegen and
+> native-linker goals survive in
+> [`docs/adr/0001-native-backend.md`](../../adr/0001-native-backend.md).
+
 New crates (names match the deleted scaffolding, now real): wrela-aarch64-decode, wrela-aarch64-interpreter, wrela-machine-memory, wrela-machine-bus, wrela-machine-model, wrela-uefi-pe-loader, wrela-uefi-firmware-model, wrela-gicv3-model, wrela-gicv3-its-model, wrela-pcie-model, wrela-virtio-pci-model, wrela-generic-timer-model, wrela-oracle-profile. Every crate enters docs/crate-contracts.md and the xtask slice inventory.
 
 - **C1 Machine contract first.** Write docs/machine-contract.md (versioned; after C10 this document IS the target) + tests/contracts/machine/v1/ fixtures. Must define: observable equivalence = canonical test-protocol event stream (wrela-test-protocol) + exit code + published report facts, NOT instruction traces or byte-identical images; the pinned device inventory (cortex-a57 base ISA subset, PL011, GICv3+ITS, generic timer, PCIe ECAM, virtio 1.2 CS01 modern PCI transport, virtio-blk); determinism rules (test-controlled interrupt injection timing, deterministic timebase); core topology: 1 core for the advertised profile plus a 2-core variant for the B9 placement vertical, with per-core scheduler state and cross-core SPSC ring memory-ordering semantics pinned per design §5; the target rename at retirement (`aarch64-wrela-virt-uefi`). AC: doc + fixtures + xarch contracts land together.
