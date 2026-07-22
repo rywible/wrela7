@@ -87,6 +87,10 @@ and versioned boundary fixtures are described in
 
 Rows 2.3.3, 2.3.4, and 2.5.3 gain one exact lowering increment: a two-unary-variant primitive-scalar generic-enum specialization may contain one fixed nongeneric flat-structure payload and now retains its nominal type plus Aggregate/MakeEnum operations through authenticated FlowWir v15 and canonical wire encoding. This is the sole exception to the earlier T0.3p Flow-boundary wording. `fixed_flat_generic_enum_payload_reaches_exact_flow_and_named_machine_boundary` proves the source-to-Flow composition and the stable `machine-enum-nominal-payload-lowering-pending` stop; `fixed_flat_enum_payload_accepts_exact_nominal_operations_and_rejects_substitution` proves Flow validation rejects tag/payload identity substitution. This does not admit matching/projecting the heterogeneous payload in Flow, Machine/native layout, nongeneric nominal-payload semantic lowering, fixed enum payloads, or broader nominal profiles; the latter retain `flow-enum-nominal-payload-lowering-pending` (`flat_structure_enum_payload_stops_at_named_flow_boundary`).
 
+### Chapter 02 incremental evidence — T0.3s
+
+Rows 2.3.2, 2.5.3, and 2.6 gain end-to-end evidence for the exact two-field `Cell[u64]` owned-local replacement profile. `generic_flat_field_update_reaches_flow_machine_and_deterministic_coff` proves canonical FlowWir v15 encoding, field-bound forgery rejection, exact Flow and Machine instruction N/N−1 ceilings, cancellation at both lowering boundaries, the unpacked 16-byte/alignment-8 MachineWir v16 construct/insert/extract chain, and repeat byte-identical native COFF. The concrete specialization is erased only after its source identity has been authenticated upstream. This supersedes the earlier “no native vertical” wording only for this exact profile; other field counts and type arguments, compound/nested/nonlocal replacement, generic aggregate call boundaries, and runtime generic metadata remain unclaimed or fail closed.
+
 ## Chapter 03 — Values, views, and regions
 
 | Spec | Contract inventory | Layers/evidence | Status / delivery owner |

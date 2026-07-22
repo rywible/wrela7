@@ -290,6 +290,28 @@ fn native_pair_field_update_runs():
     return
 "#;
 
+const GENERIC_NATIVE_PAIR_SOURCE: &str = r#"module app.duration
+
+pub struct Cell[T]:
+    pub left: T
+    pub right: T
+
+pub fn update_and_read() -> u64:
+    value: Cell[u64] = Cell(left=1, right=2)
+    value.right = 9
+    return value.right
+"#;
+
+const GENERIC_NATIVE_PAIR_TEST_SOURCE: &str = r#"module app.duration_test
+
+from app.duration import update_and_read
+
+@test(runtime)
+fn generic_native_pair_field_update_runs():
+    value: u64 = update_and_read()
+    return
+"#;
+
 const NATIVE_PAIR_ARGUMENT_SOURCE: &str = r#"module app.duration
 
 pub struct Pair:
@@ -1648,6 +1670,313 @@ fn two_field_flat_local_reaches_unpacked_machine_wir_and_deterministic_coff() {
                 first.bytes(),
                 second.bytes(),
                 "identical two-field MachineWir emits byte-identical ARM64 COFF"
+            );
+        }
+    }
+}
+
+#[test]
+fn generic_flat_field_update_reaches_flow_machine_and_deterministic_coff() {
+    let fixture = fixture(GENERIC_NATIVE_PAIR_SOURCE, GENERIC_NATIVE_PAIR_TEST_SOURCE);
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed(&fixture),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("generic field update lowers to SemanticWir");
+    let semantic_wir = semantic.into_parts().0;
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("generic field update reaches FlowWir");
+    let flow_model = flow.wir().as_wir();
+    let cell = flow_model
+        .types
+        .iter()
+        .find(|ty| ty.name.as_deref() == Some("Cell"))
+        .expect("concrete Cell[u64] FlowWir type");
+    let FlowTypeKind::Struct { fields } = &cell.kind else {
+        panic!("Cell[u64] must remain a FlowWir structure")
+    };
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0], fields[1]);
+    let update = flow_model
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .find(|instruction| {
+            matches!(
+                instruction.operation,
+                FlowOperation::InsertField { field: 1, .. }
+            )
+        })
+        .expect("exact generic FlowWir field update");
+    assert_eq!(flow_model.functions.iter().flat_map(|function| &function.blocks).flat_map(|block| &block.instructions).filter(|instruction| matches!(instruction.operation, FlowOperation::MakeAggregate { ty, .. } if ty == cell.id)).count(), 1);
+    assert_eq!(
+        flow_model
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(
+                instruction.operation,
+                FlowOperation::ExtractField { field: 1, .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(update.results.len(), 1);
+
+    let flow_instruction_count = flow.report().instructions;
+    let mut exact_flow_limits = FlowLoweringLimits::standard();
+    exact_flow_limits.instructions = flow_instruction_count;
+    CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: exact_flow_limits,
+            },
+            &never_cancelled,
+        )
+        .expect("generic field update accepts its exact FlowWir instruction ceiling");
+    let mut one_under_flow = exact_flow_limits;
+    one_under_flow.instructions = flow_instruction_count - 1;
+    assert!(matches!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: one_under_flow,
+            },
+            &never_cancelled,
+        ),
+        Err(FlowLowerError::ResourceLimit {
+            resource: "FlowWir instructions",
+            limit,
+        }) if limit == flow_instruction_count - 1
+    ));
+    let flow_polls = Cell::new(0_u64);
+    CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: exact_flow_limits,
+            },
+            &|| {
+                flow_polls.set(flow_polls.get().saturating_add(1));
+                false
+            },
+        )
+        .expect("count generic field-update FlowWir cancellation polls");
+    let flow_cancel_at = flow_polls.get().saturating_sub(2);
+    assert!(flow_cancel_at > 2);
+    let cancelled_flow_polls = Cell::new(0_u64);
+    let cancelled_flow = CanonicalFlowLowerer::new().lower(
+        FlowLowerRequest {
+            input: semantic_wir,
+            limits: exact_flow_limits,
+        },
+        &|| {
+            let next = cancelled_flow_polls.get().saturating_add(1);
+            cancelled_flow_polls.set(next);
+            next >= flow_cancel_at
+        },
+    );
+    assert!(matches!(cancelled_flow, Err(FlowLowerError::Cancelled)));
+
+    let flow_wir = flow.into_parts().0;
+    let mut forged_flow = flow_wir.as_wir().clone();
+    let forged_field = forged_flow
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.operation {
+            FlowOperation::InsertField { field, .. } if *field == 1 => Some(field),
+            _ => None,
+        })
+        .expect("mutable generic FlowWir field update");
+    *forged_field = 2;
+    assert!(
+        forged_flow.validate().is_err(),
+        "FlowWir validation must reject a forged generic field identity before encoding"
+    );
+
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("generic field-update FlowWir canonical frame");
+    let decoded = CanonicalFlowWirCodec
+        .decode(
+            DecodeRequest {
+                bytes: encoded.bytes(),
+                limits: CodecLimits::standard(),
+                expected_build: Some(fixture.build.identity()),
+            },
+            &never_cancelled,
+        )
+        .expect("generic field-update FlowWir v15 decode");
+    assert_eq!(decoded, flow_wir);
+
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("generic field update reaches MachineWir");
+    let machine = prepared.machine().wir().as_wir();
+    let cell = machine
+        .types
+        .iter()
+        .find(|ty| ty.source_name.as_deref() == Some("Cell"))
+        .expect("concrete Cell[u64] MachineWir type");
+    assert!(matches!(
+        &cell.kind,
+        MachineTypeKind::Struct {
+            fields,
+            packed: false,
+        } if fields.len() == 2
+    ));
+    assert_eq!((cell.size, cell.alignment), (16, 8));
+    let operations = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.operation {
+            MachineOperation::MakeStruct { ty, .. } if ty == cell.id => Some(0_u8),
+            MachineOperation::InsertField { field: 1, .. } => Some(1_u8),
+            MachineOperation::ExtractField { field: 1, .. } => Some(2_u8),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(operations, [0, 1, 2]);
+
+    let codec = CanonicalFlowWirCodec;
+    let hasher = CanonicalBackendContentHasher::new();
+    let optimizer = CanonicalFlowOptimizer::new();
+    let machine_lowerer = CanonicalMachineLowerer::new();
+    let expected_digest = hasher
+        .sha256(encoded.bytes(), &never_cancelled)
+        .expect("generic field-update frame digest");
+    let optimization = OptimizationProfile::from_build_policy(
+        &fixture.build.profile.optimization,
+        fixture.build.identity.compiler,
+    )
+    .expect("generic field-update optimization profile");
+    let prepare_with = |machine_limits: MachineLoweringLimits, is_cancelled: &dyn Fn() -> bool| {
+        prepare_for_codegen(
+            BackendPreparationServices {
+                codec: &codec,
+                hasher: &hasher,
+                optimizer: &optimizer,
+                machine_lowerer: &machine_lowerer,
+            },
+            encoded.bytes(),
+            expected_digest,
+            &fixture.target,
+            &fixture.build,
+            BackendPreparationOptions {
+                codec_limits: CodecLimits::standard(),
+                optimization: optimization.clone(),
+                optimization_limits: OptimizationLimits::standard(),
+                machine_limits,
+            },
+            is_cancelled,
+        )
+    };
+    let instruction_count = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .map(|block| block.instructions.len() as u64)
+        .sum::<u64>();
+    let mut exact_machine_limits = MachineLoweringLimits::standard();
+    exact_machine_limits.types = machine.types.len() as u64;
+    exact_machine_limits.functions = machine.functions.len() as u64;
+    exact_machine_limits.sections = machine.sections.len() as u32;
+    exact_machine_limits.symbols = machine.symbols.len() as u32;
+    exact_machine_limits.globals = machine.globals.len() as u32;
+    exact_machine_limits.instructions = instruction_count;
+    exact_machine_limits.stack_slots = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_slots.len() as u64)
+        .sum::<u64>()
+        .max(1);
+    exact_machine_limits.proofs = machine.proofs.len() as u32;
+    exact_machine_limits.static_bytes = machine
+        .sections
+        .iter()
+        .map(|section| section.reserved_bytes)
+        .sum();
+    exact_machine_limits.stack_bytes_per_function = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_bytes)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    exact_machine_limits = exact_machine_limits.with_aligned_validation();
+    let exact = prepare_with(exact_machine_limits, &never_cancelled)
+        .expect("generic field update accepts exact MachineWir instruction ceiling");
+    assert_eq!(exact.machine().wir().as_wir(), machine);
+    let mut one_under_machine = exact_machine_limits;
+    one_under_machine.instructions -= 1;
+    one_under_machine = one_under_machine.with_aligned_validation();
+    let one_under_error = prepare_with(one_under_machine, &never_cancelled)
+        .expect_err("one fewer generic field-update MachineWir instruction must fail");
+    assert_eq!(
+        one_under_error.machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir instructions",
+            limit: instruction_count - 1,
+        })
+    );
+    let machine_polls = Cell::new(0_u64);
+    prepare_with(MachineLoweringLimits::standard(), &|| {
+        machine_polls.set(machine_polls.get().saturating_add(1));
+        false
+    })
+    .expect("count generic field-update MachineWir cancellation polls");
+    let machine_cancel_at = machine_polls.get().saturating_sub(2);
+    assert!(machine_cancel_at > 2);
+    let cancelled_machine_polls = Cell::new(0_u64);
+    let cancellation = prepare_with(MachineLoweringLimits::standard(), &|| {
+        let next = cancelled_machine_polls.get().saturating_add(1);
+        cancelled_machine_polls.set(next);
+        next >= machine_cancel_at
+    })
+    .expect_err("late generic field-update MachineWir cancellation must propagate");
+    assert!(cancellation.is_cancelled());
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("generic field-update native object emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat generic field-update native emission");
+            assert_eq!(
+                first.bytes(),
+                second.bytes(),
+                "identical generic field-update MachineWir emits byte-identical ARM64 COFF"
             );
         }
     }
