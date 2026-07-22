@@ -1185,6 +1185,13 @@ fn validate_activation_table(
                         .is_some_and(|source| proof.sources.as_slice() == [source])
             });
         let entry = caller.blocks.get(caller.entry.0 as usize);
+        let exact_u64_type = |ty: MachineTypeId| {
+            machine.types.get(ty.0 as usize).is_some_and(|ty| {
+                ty.kind == MachineTypeKind::Integer { bits: 64 }
+                    && ty.size == 8
+                    && ty.alignment == 8
+            })
+        };
         let call_matches = entry.is_some_and(|entry| {
             let Some(instruction) = entry.instructions.last() else {
                 return false;
@@ -1297,9 +1304,18 @@ fn validate_activation_table(
                         ))
                 }
             };
+            let result_matches = (machine
+                .types
+                .get(callee.result.0 as usize)
+                .is_some_and(|ty| ty.kind == MachineTypeKind::Void)
+                && instruction.results.is_empty())
+                || (exact_u64_type(callee.result)
+                    && matches!(instruction.results.as_slice(), [result]
+                        if caller.values.get(result.0 as usize)
+                            .is_some_and(|value| value.ty == callee.result)));
             prefix_matches
                 && instruction.id == activation.call_instruction
-                && instruction.results.is_empty()
+                && result_matches
                 && instruction.source == Some(activation.source)
                 && matches!(&instruction.operation,
                     MachineOperation::Call {
@@ -1320,19 +1336,37 @@ fn validate_activation_table(
                     && matches!(&resume.terminator,
                         MachineTerminator::Return(values) if values.is_empty())
             });
-        let callee_matches = callee.role == MachineFunctionRole::Ordinary
-            && callee.convention == CallingConvention::Internal
-            && callee.parameters.is_empty()
-            && machine
-                .types
-                .get(callee.result.0 as usize)
-                .is_some_and(|ty| matches!(ty.kind, MachineTypeKind::Void))
+        let unit_callee = machine
+            .types
+            .get(callee.result.0 as usize)
+            .is_some_and(|ty| matches!(ty.kind, MachineTypeKind::Void))
             && matches!(callee.blocks.as_slice(), [block]
                 if block.id == callee.entry
                     && block.parameters.is_empty()
                     && block.instructions.is_empty()
                     && matches!(&block.terminator,
                         MachineTerminator::Return(values) if values.is_empty()));
+        let u64_callee = exact_u64_type(callee.result)
+            && matches!(callee.blocks.as_slice(), [block]
+                if block.id == callee.entry
+                    && block.parameters.is_empty()
+                    && matches!(block.instructions.as_slice(), [constant]
+                        if constant.source.is_some()
+                            && matches!(constant.results.as_slice(), [value]
+                                if callee.values.get(value.0 as usize)
+                                    .is_some_and(|value| value.ty == callee.result))
+                            && matches!(&constant.operation,
+                                MachineOperation::Immediate(MachineImmediate::Integer {
+                                    ty,
+                                    bytes_le,
+                                }) if *ty == callee.result && bytes_le.len() == 8)
+                            && matches!(&block.terminator,
+                                MachineTerminator::Return(values)
+                                    if values.as_slice() == constant.results.as_slice())));
+        let callee_matches = callee.role == MachineFunctionRole::Ordinary
+            && callee.convention == CallingConvention::Internal
+            && callee.parameters.is_empty()
+            && (unit_callee || u64_callee);
         let schedule_matches = activation_codegen_schedule_matches(
             machine,
             activation.caller,

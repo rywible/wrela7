@@ -3743,7 +3743,8 @@ fn validate_activations(module: &MachineWir, errors: &mut ValidationContext<'_>)
             && activation.capacity_bound == u64::from(activation.maximum_live)
             && activation.source.range.start <= activation.source.range.end;
 
-        let call_shape_matches = activation_call_shape_matches(module, caller, activation, errors);
+        let call_shape_matches =
+            activation_call_shape_matches(module, caller, callee, activation, errors);
         let callee_shape_matches = immediate_activation_callee_matches(module, callee);
         let schedule_matches = activation_schedule_matches(module, activation, errors);
         if !owner_matches
@@ -4331,6 +4332,7 @@ fn text_ends_with(actual: &str, suffix: &str, errors: &mut ValidationContext<'_>
 fn activation_call_shape_matches(
     module: &MachineWir,
     caller: &MachineFunction,
+    callee: &MachineFunction,
     activation: &MachineActivationPlan,
     errors: &mut ValidationContext<'_>,
 ) -> bool {
@@ -4348,7 +4350,16 @@ fn activation_call_shape_matches(
                 continue;
             }
             matched = matched.saturating_add(1);
-            valid &= instruction.results.is_empty()
+            let unit_result = module
+                .types
+                .get(callee.result.0 as usize)
+                .is_some_and(|ty| ty.kind == MachineTypeKind::Void)
+                && instruction.results.is_empty();
+            let u64_result = exact_machine_u64_type(module, callee.result)
+                && matches!(instruction.results.as_slice(), [result]
+                    if caller.values.get(result.0 as usize)
+                        .is_some_and(|value| value.ty == callee.result));
+            valid &= (unit_result || u64_result)
                 && instruction.source == Some(activation.source)
                 && matches!(
                     &instruction.operation,
@@ -4510,18 +4521,42 @@ fn structured_scope_activation_shape_matches(
 }
 
 fn immediate_activation_callee_matches(module: &MachineWir, callee: &MachineFunction) -> bool {
-    callee.role == MachineFunctionRole::Ordinary
-        && callee.convention == CallingConvention::Internal
-        && callee.parameters.is_empty()
-        && module
-            .types
-            .get(callee.result.0 as usize)
-            .is_some_and(|ty| matches!(ty.kind, MachineTypeKind::Void))
+    let unit = module
+        .types
+        .get(callee.result.0 as usize)
+        .is_some_and(|ty| matches!(ty.kind, MachineTypeKind::Void))
         && matches!(callee.blocks.as_slice(), [block]
             if block.id == callee.entry
                 && block.parameters.is_empty()
                 && block.instructions.is_empty()
-                && matches!(&block.terminator, MachineTerminator::Return(values) if values.is_empty()))
+                && matches!(&block.terminator, MachineTerminator::Return(values) if values.is_empty()));
+    let u64_result = exact_machine_u64_type(module, callee.result)
+        && matches!(callee.blocks.as_slice(), [block]
+            if block.id == callee.entry
+                && block.parameters.is_empty()
+                && matches!(block.instructions.as_slice(), [constant]
+                    if constant.source.is_some()
+                        && matches!(constant.results.as_slice(), [value]
+                            if callee.values.get(value.0 as usize)
+                                .is_some_and(|value| value.ty == callee.result))
+                        && matches!(&constant.operation,
+                            MachineOperation::Immediate(MachineImmediate::Integer {
+                                ty,
+                                bytes_le,
+                            }) if *ty == callee.result && bytes_le.len() == 8)
+                        && matches!(&block.terminator,
+                            MachineTerminator::Return(values)
+                                if values.as_slice() == constant.results.as_slice())));
+    callee.role == MachineFunctionRole::Ordinary
+        && callee.convention == CallingConvention::Internal
+        && callee.parameters.is_empty()
+        && (unit || u64_result)
+}
+
+fn exact_machine_u64_type(module: &MachineWir, ty: MachineTypeId) -> bool {
+    module.types.get(ty.0 as usize).is_some_and(|ty| {
+        ty.kind == MachineTypeKind::Integer { bits: 64 } && ty.size == 8 && ty.alignment == 8
+    })
 }
 
 fn activation_schedule_matches(

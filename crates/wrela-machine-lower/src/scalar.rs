@@ -1771,6 +1771,7 @@ fn lower_activation_subset(
             .types
             .get(result.0 as usize)
             .is_some_and(|ty| ty.kind == flow::FlowTypeKind::Unit);
+        let result_is_u64 = flow_type_is_exact_u64(input, result);
         let (state, resume_id) = (call_site.state, call_site.resume_id);
         if call_site.activation != *activation_value {
             return Err(unsupported("an async call without its exact suspend edge"));
@@ -1788,15 +1789,33 @@ fn lower_activation_subset(
             && matches!(&resume.terminator, flow::Terminator::Return(values) if values.is_empty())
             && matches!(resume.parameters.as_slice(), [value]
                 if caller.values.get(value.0 as usize).is_some_and(|value| value.ty == result));
-        let callee_matches = callee.role == flow::FunctionRole::Ordinary
-            && callee.color == flow::FunctionColor::Async
-            && callee.parameters.is_empty()
+        let unit_callee_matches = result_is_unit
             && callee.result_types.is_empty()
             && matches!(callee.blocks.as_slice(), [block]
                 if block.id == callee.entry
                     && block.parameters.is_empty()
                     && block.instructions.is_empty()
                     && matches!(&block.terminator, flow::Terminator::Return(values) if values.is_empty()));
+        let u64_callee_matches = result_is_u64
+            && callee.result_types.as_slice() == [result]
+            && matches!(callee.blocks.as_slice(), [block]
+                if block.id == callee.entry
+                    && block.parameters.is_empty()
+                    && matches!(block.instructions.as_slice(), [constant]
+                        if matches!(constant.results.as_slice(), [value]
+                            if flow_value_type(callee, *value).ok() == Some(result))
+                            && matches!(&constant.operation,
+                                flow::FlowOperation::Immediate(flow::Immediate::Integer {
+                                    bits: 64,
+                                    bytes_le,
+                                }) if bytes_le.len() == 8)
+                            && matches!(&block.terminator,
+                                flow::Terminator::Return(values)
+                                    if values.as_slice() == constant.results.as_slice())));
+        let callee_matches = callee.role == flow::FunctionRole::Ordinary
+            && callee.color == flow::FunctionColor::Async
+            && callee.parameters.is_empty()
+            && (unit_callee_matches || u64_callee_matches);
         let mut caller_has_capacity = false;
         for proof in &caller.proofs {
             check_cancelled(is_cancelled)?;
@@ -1840,7 +1859,8 @@ fn lower_activation_subset(
             || caller.color != flow::FunctionColor::Async
             || !activation_type.strict_linear
             || activation_type.copyable
-            || !result_is_unit
+            || !(result_is_unit || result_is_u64)
+            || (call_site.structured_scope && result_is_u64)
             || !call_matches
             || !resume_matches
             || !callee_matches
@@ -1848,9 +1868,7 @@ fn lower_activation_subset(
             || !frame_matches
             || shared_callee.is_some_and(|shared| shared != plan.callee)
         {
-            return Err(unsupported(
-                "an activation outside the immediate unit helper subset",
-            ));
+            return Err(unsupported("machine-async-result-delivery-pending"));
         }
         shared_callee = Some(plan.callee);
         let call_instruction =
@@ -1901,6 +1919,39 @@ fn lower_activation_subset(
     }
     check_cancelled(is_cancelled)?;
     Ok(output)
+}
+
+fn flow_type_is_exact_u64(input: &flow::FlowWir, ty: flow::TypeId) -> bool {
+    input.types.get(ty.0 as usize).is_some_and(|ty| {
+        ty.kind
+            == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                signed: false,
+                bits: 64,
+            })
+    })
+}
+
+fn typed_activation_resume_value(
+    input: &flow::FlowWir,
+    function: &flow::FlowFunction,
+    activations: &[MachineActivationPlan],
+    activation: MachineActivationId,
+) -> Result<Option<flow::ValueId>, MachineLowerError> {
+    let Some(plan) = activations
+        .iter()
+        .find(|plan| plan.id == activation && plan.caller.0 == function.id.0)
+    else {
+        return Ok(None);
+    };
+    let resume = function
+        .blocks
+        .get(plan.resume_block.0 as usize)
+        .ok_or(unsupported("machine-async-result-delivery-pending"))?;
+    let [value] = resume.parameters.as_slice() else {
+        return Ok(None);
+    };
+    let ty = flow_value_type(function, *value)?;
+    Ok(flow_type_is_exact_u64(input, ty).then_some(*value))
 }
 
 struct AuthenticatedActivationCallSite<'a> {
@@ -3148,8 +3199,22 @@ fn preflight_output_model_resources(
 
         for block in &function.blocks {
             check_cancelled(is_cancelled)?;
-            let parameters =
-                retained_value_count(input, function, &block.parameters, is_cancelled)?;
+            let typed_resume = activations
+                .iter()
+                .find(|activation| {
+                    activation.caller.0 == function.id.0 && activation.resume_block.0 == block.id.0
+                })
+                .map(|activation| {
+                    typed_activation_resume_value(input, function, activations, activation.id)
+                })
+                .transpose()?
+                .flatten()
+                .is_some();
+            let parameters = if typed_resume {
+                0
+            } else {
+                retained_value_count(input, function, &block.parameters, is_cancelled)?
+            };
             edges = add_edges(edges, parameters, edge_limit)?;
             let mut machine_instructions = if image_entry && block.id == function.entry {
                 startup_instructions
@@ -3180,8 +3245,18 @@ fn preflight_output_model_resources(
                         limit: edge_limit,
                     },
                 )?;
-                let results =
-                    retained_value_count(input, function, &instruction.results, is_cancelled)?;
+                let results = match &instruction.operation {
+                    flow::FlowOperation::AsyncCall { plan, .. } => usize::from(
+                        typed_activation_resume_value(
+                            input,
+                            function,
+                            activations,
+                            MachineActivationId(plan.0),
+                        )?
+                        .is_some(),
+                    ),
+                    _ => retained_value_count(input, function, &instruction.results, is_cancelled)?,
+                };
                 edges = add_edges(edges, results, edge_limit)?;
                 match &instruction.operation {
                     flow::FlowOperation::Call { arguments, .. }
@@ -7245,8 +7320,22 @@ fn lower_block(
     )?;
     let mut source = None;
     let mut current_id = BlockId(block.id.0);
-    let mut current_parameters =
-        map_values(&block.parameters, mapping, limits.model_edges, is_cancelled)?;
+    let typed_resume = plan
+        .activations
+        .iter()
+        .find(|activation| {
+            activation.caller.0 == function.id.0 && activation.resume_block.0 == block.id.0
+        })
+        .map(|activation| {
+            typed_activation_resume_value(input, function, &plan.activations, activation.id)
+        })
+        .transpose()?
+        .flatten();
+    let mut current_parameters = if typed_resume.is_some() {
+        Vec::new()
+    } else {
+        map_values(&block.parameters, mapping, limits.model_edges, is_cancelled)?
+    };
     if let Some(task) = startup_task {
         instructions.push(MachineInstruction {
             id: take_instruction_id(instruction_cursor)?,
@@ -7397,14 +7486,37 @@ fn lower_block(
             limits,
             is_cancelled,
         )? {
-            instructions.push(MachineInstruction {
-                id: take_instruction_id(instruction_cursor)?,
-                results: map_values(
+            let results = match &instruction.operation {
+                flow::FlowOperation::AsyncCall {
+                    plan: activation, ..
+                } => {
+                    let resumed = typed_activation_resume_value(
+                        input,
+                        function,
+                        &plan.activations,
+                        MachineActivationId(activation.0),
+                    )?;
+                    let mut results = try_vec(
+                        usize::from(resumed.is_some()),
+                        "MachineWir model edges",
+                        limits.model_edges,
+                        is_cancelled,
+                    )?;
+                    if let Some(value) = resumed {
+                        results.push(map_value(value, mapping)?);
+                    }
+                    results
+                }
+                _ => map_values(
                     &instruction.results,
                     mapping,
                     limits.model_edges,
                     is_cancelled,
                 )?,
+            };
+            instructions.push(MachineInstruction {
+                id: take_instruction_id(instruction_cursor)?,
+                results,
                 operation,
                 source: instruction.source,
             });

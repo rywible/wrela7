@@ -49,17 +49,17 @@ const ACTOR_SOURCE: &str = r#"module app
 
 from core.image import Image, Target
 
-async fn checkpoint():
-    pass
+async fn checkpoint() -> u64:
+    return 41
 
 @service
 pub struct Worker:
     pub async fn ping(mut self):
-        await checkpoint()
+        value: u64 = await checkpoint()
 
     @task
     async fn pulse(mut self):
-        await checkpoint()
+        value: u64 = await checkpoint()
 
 @image
 pub fn boot() -> Image:
@@ -81,7 +81,7 @@ fn never_cancelled() -> bool {
 }
 
 #[test]
-fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds() {
+fn parsed_actor_source_delivers_exact_u64_immediate_async_results_to_actor_and_task() {
     let source_graph_digest = Sha256Digest::from_bytes([0xa1; 32]);
     let core_package_digest = Sha256Digest::from_bytes([0xa2; 32]);
     let target_digest = Sha256Digest::from_bytes([0xa3; 32]);
@@ -250,8 +250,8 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
     assert_eq!(task_entry.effects.0, (1 << 1) | (1 << 3));
     assert_eq!(semantic.regions.len(), 5);
     assert_eq!(semantic.activations.len(), 2);
-    assert_eq!(semantic.static_bytes, 96);
-    assert_eq!(semantic.peak_bytes, 96);
+    assert_eq!(semantic.static_bytes, 128);
+    assert_eq!(semantic.peak_bytes, 128);
     for (index, plan) in semantic.activations.iter().enumerate() {
         assert_eq!(plan.id.0, index as u32);
         assert_eq!(plan.region.0, 3 + index as u32);
@@ -316,7 +316,7 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
         .iter()
         .find(|proof| proof.kind == semantic::ProofKind::ImageClosed)
         .expect("activation-aware semantic image closure");
-    assert_eq!(semantic_closed.bound, Some(96));
+    assert_eq!(semantic_closed.bound, Some(128));
     assert_eq!(semantic_closed.depends_on.len(), 3);
     assert_eq!(
         &semantic_closed.depends_on[1..],
@@ -351,8 +351,8 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
     assert_eq!(flow.actors[0].mailbox_capacity, 2);
     assert_eq!(flow.tasks[0].id.0, 0);
     assert_eq!(flow.tasks[0].slots, 1);
-    assert_eq!(flow.static_bytes, 96);
-    assert_eq!(flow.peak_bytes, 96);
+    assert_eq!(flow.static_bytes, 128);
+    assert_eq!(flow.peak_bytes, 128);
     assert_eq!(
         flow.startup_order,
         [
@@ -370,15 +370,31 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
         ]
     );
 
+    let helper = flow
+        .functions
+        .iter()
+        .find(|function| {
+            function.role == flow::FunctionRole::Ordinary
+                && function.color == flow::FunctionColor::Async
+        })
+        .expect("closed ordinary async helper");
+    let [helper_result] = helper.result_types.as_slice() else {
+        panic!("typed helper has one result");
+    };
     let activation = flow
         .types
         .iter()
-        .find(|ty| ty.name.as_deref() == Some("__wrela_activation_0"))
-        .expect("unit activation type retained from real async source");
+        .find(|ty| {
+            ty.kind
+                == (flow::FlowTypeKind::Activation {
+                    result: *helper_result,
+                })
+        })
+        .expect("u64 activation type retained from real async source");
     assert_eq!(
         activation.kind,
         flow::FlowTypeKind::Activation {
-            result: flow::TypeId(0),
+            result: *helper_result,
         }
     );
     assert!(!activation.copyable && activation.strict_linear);
@@ -395,14 +411,6 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
         })
         .collect::<Vec<_>>();
     assert_eq!(actor_functions.len(), 2);
-    let helper = flow
-        .functions
-        .iter()
-        .find(|function| {
-            function.role == flow::FunctionRole::Ordinary
-                && function.color == flow::FunctionColor::Async
-        })
-        .expect("closed ordinary async helper");
     for function in actor_functions {
         let plan = flow
             .activations
@@ -442,14 +450,15 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
             .expect("Flow activation callee cleanup proof");
         assert_eq!(capacity.depends_on.as_slice(), [cleanup]);
 
-        assert_eq!(function.values[1].ty, activation.id);
+        assert_eq!(function.values[1].ty, *helper_result);
+        assert_eq!(function.values[2].ty, activation.id);
         let [entry, resume] = function.blocks.as_slice() else {
             panic!("one entry and one resume block per async actor function");
         };
         let [call] = entry.instructions.as_slice() else {
             panic!("one async call before suspension");
         };
-        assert_eq!(call.results[0].0, 1);
+        assert_eq!(call.results[0].0, 2);
         assert!(matches!(
             &call.operation,
             flow::FlowOperation::AsyncCall {
@@ -462,12 +471,12 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
             entry.terminator,
             flow::Terminator::Suspend {
                 state: 0,
-                activation: flow::ValueId(1),
+                activation: flow::ValueId(2),
                 resume: flow::BlockId(1),
             }
         );
         assert_eq!(resume.parameters.len(), 1);
-        assert_eq!(resume.parameters[0].0, 2);
+        assert_eq!(resume.parameters[0].0, 1);
         assert_eq!(resume.terminator, flow::Terminator::Return(Vec::new()));
     }
     let flow_closed = flow
@@ -475,7 +484,7 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
         .iter()
         .find(|proof| proof.kind == flow::ProofKind::ImageClosed)
         .expect("activation-aware Flow image closure");
-    assert_eq!(flow_closed.bound, Some(96));
+    assert_eq!(flow_closed.bound, Some(128));
     assert_eq!(flow_closed.depends_on.len(), 3);
     assert_eq!(
         &flow_closed.depends_on[1..],
@@ -511,6 +520,114 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
         &never_cancelled,
     )
     .expect("real actor FlowWir has a canonical private-backend frame");
+    let prepare_forged_flow = |forged: flow::FlowWir, tail: &str| {
+        let sealed = forged
+            .validate()
+            .unwrap_or_else(|errors| panic!("producer-shaped {tail} FlowWir: {errors:?}"));
+        let frame = encode_and_verify(
+            &CanonicalFlowWirCodec,
+            EncodeRequest {
+                wir: &sealed,
+                limits: CodecLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .unwrap_or_else(|error| panic!("encode producer-shaped {tail}: {error:?}"));
+        let error =
+            prepare_canonical_frame_for_codegen(frame.bytes(), &target, &build, &never_cancelled)
+                .unwrap_err();
+        assert_eq!(
+            error.machine_lower_error(),
+            Some(&MachineLowerError::UnsupportedInput {
+                feature: "machine-async-result-delivery-pending",
+            }),
+            "{tail}"
+        );
+    };
+
+    let mut nonconstant = flow.clone();
+    let nonconstant_helper = &mut nonconstant.functions[helper.id.0 as usize];
+    let helper_block = &mut nonconstant_helper.blocks[0];
+    let extra_value = flow::ValueId(nonconstant_helper.values.len() as u32);
+    nonconstant_helper.values.push(flow::Value {
+        id: extra_value,
+        ty: *helper_result,
+        source_name: None,
+        source: helper_block.source,
+    });
+    helper_block.instructions.push(flow::Instruction {
+        id: flow::InstructionId(helper_block.instructions.len() as u32),
+        results: vec![extra_value],
+        operation: flow::FlowOperation::Copy {
+            value: helper_block.instructions[0].results[0],
+        },
+        source: helper_block.source,
+    });
+    helper_block.terminator = flow::Terminator::Return(vec![extra_value]);
+    prepare_forged_flow(nonconstant, "nonconstant async helper tail");
+
+    let mut argumented = flow.clone();
+    let argument_helper = &mut argumented.functions[helper.id.0 as usize];
+    let helper_parameter = flow::ValueId(argument_helper.values.len() as u32);
+    argument_helper.values.push(flow::Value {
+        id: helper_parameter,
+        ty: *helper_result,
+        source_name: Some("ignored".to_owned()),
+        source: argument_helper.source,
+    });
+    argument_helper.parameters.push(helper_parameter);
+    for plan in &argumented.activations {
+        let caller = &mut argumented.functions[plan.caller.0 as usize];
+        let argument = flow::ValueId(caller.values.len() as u32);
+        caller.values.push(flow::Value {
+            id: argument,
+            ty: *helper_result,
+            source_name: None,
+            source: Some(plan.source),
+        });
+        let entry = &mut caller.blocks[caller.entry.0 as usize];
+        entry.instructions[0].id = flow::InstructionId(1);
+        let mut call = entry.instructions.remove(0);
+        let flow::FlowOperation::AsyncCall { arguments, .. } = &mut call.operation else {
+            panic!("producer-shaped async call");
+        };
+        arguments.push(argument);
+        entry.instructions.push(flow::Instruction {
+            id: flow::InstructionId(0),
+            results: vec![argument],
+            operation: flow::FlowOperation::Immediate(flow::Immediate::Integer {
+                bits: 64,
+                bytes_le: 7_u64.to_le_bytes().to_vec(),
+            }),
+            source: Some(plan.source),
+        });
+        entry.instructions.push(call);
+    }
+    prepare_forged_flow(argumented, "argumented async helper");
+
+    let mut non_u64 = flow.clone();
+    let signed_type = *helper_result;
+    non_u64.types[signed_type.0 as usize].kind =
+        flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+            signed: true,
+            bits: 64,
+        });
+    for ty in &mut non_u64.types {
+        if ty.id == activation.id {
+            ty.kind = flow::FlowTypeKind::Activation {
+                result: signed_type,
+            };
+        }
+    }
+    let non_u64_helper = &mut non_u64.functions[helper.id.0 as usize];
+    non_u64_helper.result_types[0] = signed_type;
+    non_u64_helper.values[0].ty = signed_type;
+    for plan in &non_u64.activations {
+        let caller = &mut non_u64.functions[plan.caller.0 as usize];
+        caller.values[caller.blocks[1].parameters[0].0 as usize].ty = signed_type;
+    }
+    prepare_forged_flow(non_u64, "non-u64 async result");
+
     let prepared =
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
             .expect("real parsed actor source reaches sealed MachineWir v15");
@@ -622,7 +739,7 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
         reserved_region_bytes += storage.capacity_bytes;
     }
     assert_eq!(reserved_region_bytes, flow.static_bytes);
-    assert_eq!(reserved_region_bytes, 96);
+    assert_eq!(reserved_region_bytes, 128);
     assert!(matches!(
         machine.region_storage[0].kind,
         MachineRegionStorageKind::ActorMailbox {
@@ -717,6 +834,57 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
         machine.functions[task_activation.caller.0 as usize].role,
         MachineFunctionRole::TaskEntry(0)
     );
+    assert_eq!(actor_activation.callee, task_activation.callee);
+    let machine_helper = &machine.functions[actor_activation.callee.0 as usize];
+    let helper_result = &machine.types[machine_helper.result.0 as usize];
+    assert_eq!(helper_result.kind, MachineTypeKind::Integer { bits: 64 });
+    assert_eq!((helper_result.size, helper_result.alignment), (8, 8));
+    let [helper_block] = machine_helper.blocks.as_slice() else {
+        panic!("immediate typed async helper has one machine block");
+    };
+    let [helper_constant] = helper_block.instructions.as_slice() else {
+        panic!("immediate typed async helper has one machine instruction");
+    };
+    let [helper_value] = helper_constant.results.as_slice() else {
+        panic!("immediate typed async helper defines one u64");
+    };
+    assert!(matches!(
+        &helper_constant.operation,
+        MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le })
+            if *ty == machine_helper.result && bytes_le.as_slice() == 41_u64.to_le_bytes()
+    ));
+    assert!(matches!(
+        &helper_block.terminator,
+        MachineTerminator::Return(values) if values.as_slice() == [*helper_value]
+    ));
+    for activation in [actor_activation, task_activation] {
+        let caller = &machine.functions[activation.caller.0 as usize];
+        let entry = &caller.blocks[caller.entry.0 as usize];
+        let call = entry.instructions.last().expect("typed activation call");
+        let [delivered] = call.results.as_slice() else {
+            panic!("typed activation call defines one delivered u64");
+        };
+        assert_eq!(
+            caller.values[delivered.0 as usize].ty,
+            machine_helper.result
+        );
+        assert!(matches!(
+            &call.operation,
+            MachineOperation::Call {
+                function,
+                arguments,
+                convention: CallingConvention::Internal,
+            } if *function == machine_helper.id && arguments.is_empty()
+        ));
+        assert!(matches!(
+            &entry.terminator,
+            MachineTerminator::Jump { block, arguments }
+                if *block == activation.resume_block && arguments.is_empty()
+        ));
+        let resume = &caller.blocks[activation.resume_block.0 as usize];
+        assert!(resume.parameters.is_empty());
+        assert!(resume.instructions.is_empty());
+    }
     let image = &machine.functions[machine.image_entry.0 as usize];
     let image_entry = &image.blocks[image.entry.0 as usize];
     let (success_id, failure_id) = match &image_entry.terminator {
@@ -933,6 +1101,93 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
             .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
     );
 
+    let task_caller = task_activation.caller.0 as usize;
+    let task_entry = machine.functions[task_caller].entry.0 as usize;
+    let task_call_index = machine.functions[task_caller].blocks[task_entry]
+        .instructions
+        .len()
+        - 1;
+    let mut missing_delivery = machine.clone();
+    missing_delivery.functions[task_caller].blocks[task_entry].instructions[task_call_index]
+        .results
+        .clear();
+    assert!(
+        missing_delivery
+            .validate_for_target(&target)
+            .expect_err("typed activation cannot erase its delivered u64")
+            .0
+            .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
+    );
+
+    let delivered =
+        machine.functions[task_caller].blocks[task_entry].instructions[task_call_index].results[0];
+    let mut wrong_delivery_type = machine.clone();
+    wrong_delivery_type.functions[task_caller].values[delivered.0 as usize].ty =
+        machine.types[0].id;
+    assert!(
+        wrong_delivery_type
+            .validate_for_target(&target)
+            .expect_err("typed activation result type cannot be substituted")
+            .0
+            .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
+    );
+
+    let mut forged_resume_parameter = machine.clone();
+    forged_resume_parameter.functions[task_caller].blocks[task_activation.resume_block.0 as usize]
+        .parameters
+        .push(delivered);
+    assert!(
+        forged_resume_parameter
+            .validate_for_target(&target)
+            .expect_err("typed activation resume block remains parameterless")
+            .0
+            .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
+    );
+
+    let mut forged_jump_argument = machine.clone();
+    let MachineTerminator::Jump { arguments, .. } =
+        &mut forged_jump_argument.functions[task_caller].blocks[task_entry].terminator
+    else {
+        panic!("typed activation lowers suspend to jump");
+    };
+    arguments.push(delivered);
+    assert!(
+        forged_jump_argument
+            .validate_for_target(&target)
+            .expect_err("typed activation jump carries no SSA argument")
+            .0
+            .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
+    );
+
+    let mut forged_callee_constant = machine.clone();
+    let helper_id = machine_helper.id.0 as usize;
+    let MachineOperation::Immediate(MachineImmediate::Integer { bytes_le, .. }) =
+        &mut forged_callee_constant.functions[helper_id].blocks[0].instructions[0].operation
+    else {
+        panic!("typed helper machine constant");
+    };
+    bytes_le.pop();
+    assert!(
+        forged_callee_constant
+            .validate_for_target(&target)
+            .expect_err("typed activation helper constant must remain exact u64")
+            .0
+            .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
+    );
+
+    let mut forged_plan_source = machine.clone();
+    forged_plan_source.activations[task_activation.id.0 as usize]
+        .source
+        .range
+        .start += 1;
+    assert!(
+        forged_plan_source
+            .validate_for_target(&target)
+            .expect_err("typed activation source provenance is authenticated")
+            .0
+            .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
+    );
+
     let mut self_dependent = machine.clone();
     self_dependent.proofs[task_activation.capacity_proof.0 as usize].depends_on =
         vec![task_activation.capacity_proof];
@@ -1061,6 +1316,18 @@ fn parsed_actor_source_reaches_flow_with_exact_authority_activations_and_bounds(
         Some(&MachineLowerError::ResourceLimit {
             resource: "MachineWir globals",
             limit: u64::from(below_globals.globals),
+        })
+    );
+
+    let mut below_instructions = exact_machine_limits;
+    below_instructions.instructions = exact_instructions - 1;
+    let below_instructions_error = prepare_with_machine_limits(below_instructions)
+        .expect_err("one instruction below typed delivery must fail closed");
+    assert_eq!(
+        below_instructions_error.machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir instructions",
+            limit: exact_instructions - 1,
         })
     );
 

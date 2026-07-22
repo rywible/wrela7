@@ -768,10 +768,10 @@ it. It injects phase implementations and bounded host capabilities, while
   predecessor. Runtime-call results, `Switch`, and `Return` were already
   representable when this rule landed; version 7 retains the narrowed valid
   generated-harness shape without a compatibility reader.
-- MachineWir version 7 adds the exact downstream consumer for the bounded
+- MachineWir version 7 added the exact downstream consumer for the bounded
   FlowWir activation subset. One installed stateless actor turn and one
   single-slot static task each retain their source plan, caller/callee,
-  immediate unit-helper call/resume edge, frame region/layout, maximum-live
+  immediate helper call/resume edge, frame region/layout, maximum-live
   bound, cancellation disposition, and capacity/cleanup proof authority. The
   strict-linear Flow token is erased only after those joins: the helper becomes
   an ordinary private internal call and the suspend becomes its named resume
@@ -781,7 +781,8 @@ it. It injects phase implementations and bounded host capabilities, while
   and the unique `ImageClosed` root must close over activation capacities and a
   `TypeChecked`/`EffectsAllowed` ancestry. This is a compiled startup-task
   subset, not mailbox admission, recurring scheduling, or cancellation
-  execution.
+  execution. MachineWir v15 extends that same sealed plan to the exact
+  constant-`u64` delivery profile described below while preserving unit.
 - Floating not-equal is explicitly unordered-or-not-equal, matching the source
   language rule that NaN compares unequal to itself. Version 5 also makes
   boolean not, integer bitwise not, and floating negation first-class unary
@@ -810,6 +811,14 @@ it. It injects phase implementations and bounded host capabilities, while
   generated-cleanup origin, both calls, branch/jump targets, activation call,
   and empty resume. Deleting or substituting either cleanup invalidates the
   activation plan; arbitrary branched activation callers remain invalid.
+- MachineWir v15 also admits the first typed internal-async delivery without a
+  schema change: the existing activation plan may bind an ordinary no-argument
+  callee whose complete body is one exact unsigned-`u64` constant and return.
+  The caller's internal call defines that same `u64` directly, its resume block
+  has no Machine parameter, and the suspend edge is an empty-argument jump.
+  Validation rejoins call result type, callee result/body, plan source and
+  proofs. The older immediate-unit representation remains valid; computed,
+  argumented, non-`u64`, multistate, and parked activations remain closed.
 - Codegen may translate facts; it may not strengthen them.
 
 ### `wrela-machine-lower`
@@ -851,9 +860,18 @@ it. It injects phase implementations and bounded host capabilities, while
   five-block Flow shape and reauthenticates its literal flat state, unary
   synchronous Boolean predicate, identical generated-cleanup calls, taken
   return, fallthrough jump, exact async call/suspend, and empty resume. The
-  existing two-block activation contract is unchanged, and the structured
+  existing two-block unit activation contract is unchanged, and the structured
   path uses the named
   `machine-structured-scope-activation-boundary-authentication` rejection.
+- For the two-block immediate activation profile, lowering now accepts either
+  the existing unit helper or one exact unsigned-`u64` helper consisting only
+  of a constant and return. Flow's activation token remains erased; for the
+  typed case the internal Machine call defines the mapped Flow resume value,
+  the Machine resume block has no parameter, and `Suspend` becomes an
+  empty-argument `Jump`. Output edge/resource preflight applies the same
+  result-for-parameter substitution before allocation. Argumented, computed,
+  non-`u64`, structured typed, multistate, parking/wake, and cancellation-
+  execution tails reject as `machine-async-result-delivery-pending`.
 - Generated test harnesses receive a measured read-only global for every
   canonical protocol frame. MachineWir uses explicit global-address values and
   exact `TestEmit(address, length)` / nonreturning `TestFinish(outcome)` runtime
@@ -864,8 +882,9 @@ it. It injects phase implementations and bounded host capabilities, while
   emit for the exact-zero continuation and unchanged-status return, meters the
   added blocks/case/return edges before construction, recanonicalizes dense
   instruction IDs after expansion, and polls cancellation during every new
-  scan. The separate closed actor slice accepts exactly the version-7
-  one-actor/one-task immediate-unit-helper contract above. Aggregate values are
+  scan. The separate closed actor slice accepts exactly the authenticated
+  one-actor/one-task immediate-helper contract above, including its exact
+  constant-`u64` result profile. Aggregate values are
   additionally limited to same-block flat primitive-scalar locals; richer aggregates,
   ownership operations, mailbox/actor-method dispatch, multi-slot or recurring
   task scheduling, device operations, interrupt functions, and dynamic test
@@ -925,6 +944,10 @@ it. It injects phase implementations and bounded host capabilities, while
   type records may name a supported flat-struct return so the source scope
   protocol survives the type table, but first-class function values and
   unauthenticated aggregate function boundaries remain rejected.
+- For the sealed immediate typed-async profile, codegen independently checks
+  the no-argument internal call's one exact `u64` result, the constant-return
+  callee, parameterless resume, and empty jump before using the ordinary call
+  renderer. No scheduler, parked frame, or cancellation runtime is inferred.
 - The implemented writable-storage subset is deliberately narrow. Private,
   dense, exactly covering byte-array globals may use `WritableData` with a
   typed zero initializer in exact `.data` or in the canonical
