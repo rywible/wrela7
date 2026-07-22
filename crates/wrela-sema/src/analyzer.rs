@@ -3498,6 +3498,15 @@ fn runtime_body_work_bound(program: &wrela_hir::Program, body: BodyId) -> Option
                         half_open_trip_count(start, end)
                     };
                     iterations.checked_mul(body_work)?.checked_add(1)?
+                } else if let Some(length) =
+                    program
+                        .expression(*iterable)
+                        .and_then(|expression| match &expression.kind {
+                            ExpressionKind::Array(elements) => u64::try_from(elements.len()).ok(),
+                            _ => None,
+                        })
+                {
+                    length.checked_mul(body_work)?.checked_add(1)?
                 } else {
                     // Unsupported forms still need enough provisional shape
                     // to reach their stable diagnostic. No successful fact
@@ -3925,6 +3934,15 @@ fn inspect_runtime_expression_shape(
                 reserve_runtime_shape(&mut pending, 2, limit, "runtime expression scratch")?;
                 pending.push(*end);
                 pending.push(*start);
+            }
+            ExpressionKind::Array(elements) => {
+                reserve_runtime_shape(
+                    &mut pending,
+                    elements.len(),
+                    limit,
+                    "runtime expression scratch",
+                )?;
+                pending.extend(elements.iter().rev().copied());
             }
             ExpressionKind::Field { base, .. } => {
                 reserve_runtime_shape(&mut pending, 1, limit, "runtime expression scratch")?;
@@ -6188,131 +6206,322 @@ fn analyze_closed_range_for(
     let iterable_record = program
         .expression(iterable)
         .ok_or(AnalysisFailure::RequestMismatch)?;
-    let ExpressionKind::Range { inclusive, .. } = iterable_record.kind else {
-        return Err(runtime_type_diagnostic(
-            request,
-            iterable_record.source,
-            "semantic-for-iteration-target",
-            "for-loop target is not an admitted closed iterator",
-            "revision 0.1 has no user-defined iteration protocol; fixed arrays and standard-container iterators require their own authenticated producers",
-            "use a half-open literal integer range in this analysis slice",
-        ));
-    };
-    if take_binding || take_iterable {
-        return Err(runtime_type_diagnostic(
-            request,
-            statement_record.source,
-            "semantic-for-range-take-forbidden",
-            "integer range iteration cannot use take syntax",
-            "range elements are generated copyable integers rather than elements moved from owned storage",
-            "remove both take markers from the range loop",
-        ));
-    }
-    let Some((start_expression, end_expression, shape_inclusive, start_constant, end_constant)) =
-        closed_literal_range_shape(program, iterable)
-    else {
-        return Err(runtime_type_diagnostic(
-            request,
-            iterable_record.source,
-            "semantic-for-range-bound-not-constant",
-            "range bounds are not both nonnegative integer literals",
-            "this slice authenticates an exact finite trip count directly from the two HIR literal spellings",
-            "use two u64-representable integer literals or retain a canonical bounded while loop",
-        ));
-    };
-    if shape_inclusive != inclusive {
-        return Err(AnalysisFailure::RequestMismatch.into());
-    }
-    let maximum_iterations = if inclusive {
-        inclusive_trip_count(start_constant, end_constant).ok_or_else(|| {
-            runtime_type_diagnostic(
+    let (element_ty, iterable_effects) = match &iterable_record.kind {
+        ExpressionKind::Range { inclusive, .. } => {
+            if take_binding || take_iterable {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    statement_record.source,
+                    "semantic-for-range-take-forbidden",
+                    "integer range iteration cannot use take syntax",
+                    "range elements are generated copyable integers rather than elements moved from owned storage",
+                    "remove both take markers from the range loop",
+                ));
+            }
+            let Some((
+                start_expression,
+                end_expression,
+                shape_inclusive,
+                start_constant,
+                end_constant,
+            )) = closed_literal_range_shape(program, iterable)
+            else {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    iterable_record.source,
+                    "semantic-for-range-bound-not-constant",
+                    "range bounds are not both nonnegative integer literals",
+                    "this slice authenticates an exact finite trip count directly from the two HIR literal spellings",
+                    "use two u64-representable integer literals or retain a canonical bounded while loop",
+                ));
+            };
+            if shape_inclusive != *inclusive {
+                return Err(AnalysisFailure::RequestMismatch.into());
+            }
+            let maximum_iterations = if *inclusive {
+                inclusive_trip_count(start_constant, end_constant).ok_or_else(|| {
+                    runtime_type_diagnostic(
+                        request,
+                        iterable_record.source,
+                        "semantic-for-inclusive-range-too-large",
+                        "inclusive range trip count cannot be represented by the closed work bound",
+                        "the complete u64 domain contains 2^64 values, one more than the largest admitted iteration bound",
+                        "split the range or choose an endpoint below u64::MAX when starting at zero",
+                    )
+                })?
+            } else {
+                half_open_trip_count(start_constant, end_constant)
+            };
+            let element_ty = ensure_primitive_type(
+                request,
+                partial,
+                PrimitiveSemanticType::Integer {
+                    signed: false,
+                    bits: 64,
+                    pointer_sized: false,
+                },
+                aggregate_work,
+                is_cancelled,
+            )?;
+            // Retain the exact comparison result type required by the
+            // canonical lowering of this analyzed iterator.
+            let _condition_ty = ensure_primitive_type(
+                request,
+                partial,
+                PrimitiveSemanticType::Bool,
+                aggregate_work,
+                is_cancelled,
+            )?;
+            let mut state = RuntimeState {
+                locals: &mut *locals,
+                parameters: &mut *parameters,
+                aggregate_work: &mut *aggregate_work,
+                allow_assertions,
+                allow_scope_call: false,
+            };
+            let start = analyze_runtime_expression(
+                request,
+                partial,
+                function,
+                start_expression,
+                RuntimeExpressionRequest {
+                    expected: Some(element_ty),
+                    desired_result: None,
+                    access: AccessMode::Value,
+                },
+                &mut state,
+                is_cancelled,
+            )?;
+            let end = analyze_runtime_expression(
+                request,
+                partial,
+                function,
+                end_expression,
+                RuntimeExpressionRequest {
+                    expected: Some(element_ty),
+                    desired_result: None,
+                    access: AccessMode::Value,
+                },
+                &mut state,
+                is_cancelled,
+            )?;
+            let (Some(start_value), Some(end_value)) = (start.result, end.result) else {
+                return Err(AnalysisFailure::RequestMismatch.into());
+            };
+            let effects = EffectSet(start.effects.0 | end.effects.0);
+            append_expression_fact(
+                request,
+                partial,
+                RuntimeExpressionFact {
+                    function,
+                    expression: iterable,
+                    ty: element_ty,
+                    result: None,
+                    resolution: ExpressionResolution::ClosedRange {
+                        start: start_value,
+                        end: end_value,
+                        inclusive: *inclusive,
+                        maximum_iterations,
+                    },
+                    effects,
+                    ownership_before: OwnershipState::Owned,
+                    ownership_after: OwnershipState::Owned,
+                },
+            )?;
+            (element_ty, effects)
+        }
+        ExpressionKind::Array(source_elements) => {
+            if take_binding || take_iterable {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    statement_record.source,
+                    "semantic-for-array-take-pending",
+                    "fixed-array iteration does not yet admit take syntax",
+                    "this slice copies primitive scalar elements from an inline fixed array; moving array storage needs place-level indexed ownership",
+                    "remove both take markers or use a scalar-copy array literal",
+                ));
+            }
+            let Some(first) = source_elements.first().copied() else {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    iterable_record.source,
+                    "semantic-for-array-empty-type-pending",
+                    "empty fixed-array iteration has no inferred element type",
+                    "revision 0.1 has no contextual iterator element annotation on a for binding",
+                    "use a nonempty homogeneous primitive-scalar array literal",
+                ));
+            };
+            // The canonical indexed-loop lowering carries a u64 index and a
+            // boolean header condition even when neither is an element type.
+            let _index_ty = ensure_primitive_type(
+                request,
+                partial,
+                PrimitiveSemanticType::Integer {
+                    signed: false,
+                    bits: 64,
+                    pointer_sized: false,
+                },
+                aggregate_work,
+                is_cancelled,
+            )?;
+            let _condition_ty = ensure_primitive_type(
+                request,
+                partial,
+                PrimitiveSemanticType::Bool,
+                aggregate_work,
+                is_cancelled,
+            )?;
+            if u64::try_from(source_elements.len())
+                .map_or(true, |length| length > request.limits.fact_edges)
+            {
+                return Err(fact_resource(request, "fixed-array elements").into());
+            }
+            for source_element in source_elements {
+                let supported = program.expression(*source_element).is_some_and(|element| {
+                    matches!(
+                        element.kind,
+                        ExpressionKind::Literal(Literal::Boolean(_))
+                            | ExpressionKind::Literal(Literal::Integer(_))
+                    )
+                });
+                if !supported {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        program
+                            .expression(*source_element)
+                            .map_or(iterable_record.source, |element| element.source),
+                        "semantic-for-array-element-shape",
+                        "fixed-array iterator element is not an admitted scalar literal",
+                        "this first slice authenticates only homogeneous inline boolean or default-i64 literal elements",
+                        "use boolean literals or nonnegative integer literals of one inferred type",
+                    ));
+                }
+            }
+            let first_is_bool = program.expression(first).is_some_and(|element| {
+                matches!(element.kind, ExpressionKind::Literal(Literal::Boolean(_)))
+            });
+            if source_elements.iter().any(|source_element| {
+                program.expression(*source_element).is_none_or(|element| {
+                    matches!(element.kind, ExpressionKind::Literal(Literal::Boolean(_)))
+                        != first_is_bool
+                })
+            }) {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    iterable_record.source,
+                    "semantic-for-array-element-type",
+                    "fixed-array iterator elements do not have one inferred scalar type",
+                    "boolean and default-i64 literals cannot share one homogeneous fixed-array element type",
+                    "use only booleans or only nonnegative integer literals in this inline array",
+                ));
+            }
+            let mut state = RuntimeState {
+                locals: &mut *locals,
+                parameters: &mut *parameters,
+                aggregate_work: &mut *aggregate_work,
+                allow_assertions,
+                allow_scope_call: false,
+            };
+            let first_outcome = analyze_runtime_expression(
+                request,
+                partial,
+                function,
+                first,
+                RuntimeExpressionRequest {
+                    expected: None,
+                    desired_result: None,
+                    access: AccessMode::Value,
+                },
+                &mut state,
+                is_cancelled,
+            )?;
+            let element_ty = first_outcome.ty;
+            if partial.types.get(element_ty.0 as usize).is_none_or(|ty| {
+                ty.linearity != Linearity::ScalarCopy
+                    || !matches!(
+                        ty.kind,
+                        SemanticTypeKind::Bool | SemanticTypeKind::Integer { .. }
+                    )
+            }) {
+                return Err(AnalysisFailure::RequestMismatch.into());
+            }
+            let mut elements = Vec::new();
+            elements
+                .try_reserve_exact(source_elements.len())
+                .map_err(|_| fact_resource(request, "fixed-array elements"))?;
+            elements.push(
+                first_outcome
+                    .result
+                    .ok_or(AnalysisFailure::RequestMismatch)?,
+            );
+            let mut effects = first_outcome.effects;
+            for source_element in &source_elements[1..] {
+                check_cancelled(is_cancelled)?;
+                let outcome = analyze_runtime_expression(
+                    request,
+                    partial,
+                    function,
+                    *source_element,
+                    RuntimeExpressionRequest {
+                        expected: Some(element_ty),
+                        desired_result: None,
+                        access: AccessMode::Value,
+                    },
+                    &mut state,
+                    is_cancelled,
+                )?;
+                elements.push(outcome.result.ok_or(AnalysisFailure::RequestMismatch)?);
+                effects.0 |= outcome.effects.0;
+            }
+            let maximum_iterations = u64::try_from(elements.len())
+                .map_err(|_| fact_resource(request, "fixed-array elements"))?;
+            let array_ty = ensure_closed_fixed_array_type(
+                request,
+                partial,
+                element_ty,
+                maximum_iterations,
+                aggregate_work,
+                is_cancelled,
+            )?;
+            let bounds = append_capacity_proof(
+                request,
+                partial,
+                "inline fixed-array iteration".to_owned(),
+                vec![iterable_record.source],
+                maximum_iterations,
+                "every generated index is strictly below the exact inline array length",
+            )?;
+            append_expression_fact(
+                request,
+                partial,
+                RuntimeExpressionFact {
+                    function,
+                    expression: iterable,
+                    ty: array_ty,
+                    result: None,
+                    resolution: ExpressionResolution::ClosedArray {
+                        elements,
+                        maximum_iterations,
+                        bounds,
+                    },
+                    effects,
+                    ownership_before: OwnershipState::Owned,
+                    ownership_after: OwnershipState::Owned,
+                },
+            )?;
+            (element_ty, effects)
+        }
+        _ => {
+            return Err(runtime_type_diagnostic(
                 request,
                 iterable_record.source,
-                "semantic-for-inclusive-range-too-large",
-                "inclusive range trip count cannot be represented by the closed work bound",
-                "the complete u64 domain contains 2^64 values, one more than the largest admitted iteration bound",
-                "split the range or choose an endpoint below u64::MAX when starting at zero",
-            )
-        })?
-    } else {
-        half_open_trip_count(start_constant, end_constant)
+                "semantic-for-iteration-target",
+                "for-loop target is not an admitted closed iterator",
+                "revision 0.1 admits exact literal ranges and inline homogeneous primitive-scalar fixed arrays; standard-container iterators require authenticated producers",
+                "use a literal range or inline fixed-array literal",
+            ));
+        }
     };
-    let element_ty = ensure_primitive_type(
-        request,
-        partial,
-        PrimitiveSemanticType::Integer {
-            signed: false,
-            bits: 64,
-            pointer_sized: false,
-        },
-        aggregate_work,
-        is_cancelled,
-    )?;
-    // Retain the exact comparison result type required by the canonical
-    // lowering of this analyzed iterator. The range expression itself is
-    // intentionally not a first-class value, but its loop header is.
-    let _condition_ty = ensure_primitive_type(
-        request,
-        partial,
-        PrimitiveSemanticType::Bool,
-        aggregate_work,
-        is_cancelled,
-    )?;
-    let mut state = RuntimeState {
-        locals: &mut *locals,
-        parameters: &mut *parameters,
-        aggregate_work: &mut *aggregate_work,
-        allow_assertions,
-        allow_scope_call: false,
-    };
-    let start = analyze_runtime_expression(
-        request,
-        partial,
-        function,
-        start_expression,
-        RuntimeExpressionRequest {
-            expected: Some(element_ty),
-            desired_result: None,
-            access: AccessMode::Value,
-        },
-        &mut state,
-        is_cancelled,
-    )?;
-    let end = analyze_runtime_expression(
-        request,
-        partial,
-        function,
-        end_expression,
-        RuntimeExpressionRequest {
-            expected: Some(element_ty),
-            desired_result: None,
-            access: AccessMode::Value,
-        },
-        &mut state,
-        is_cancelled,
-    )?;
-    let (Some(start_value), Some(end_value)) = (start.result, end.result) else {
-        return Err(AnalysisFailure::RequestMismatch.into());
-    };
-    append_expression_fact(
-        request,
-        partial,
-        RuntimeExpressionFact {
-            function,
-            expression: iterable,
-            ty: element_ty,
-            result: None,
-            resolution: ExpressionResolution::ClosedRange {
-                start: start_value,
-                end: end_value,
-                inclusive,
-                maximum_iterations,
-            },
-            effects: EffectSet(start.effects.0 | end.effects.0),
-            ownership_before: OwnershipState::Owned,
-            ownership_after: OwnershipState::Owned,
-        },
-    )?;
     let local_record = program
         .locals
         .get(binding.0 as usize)
@@ -6411,7 +6620,7 @@ fn analyze_closed_range_for(
             "read the binding without assigning, moving, or taking it",
         ));
     }
-    let mut effects = EffectSet(start.effects.0 | end.effects.0);
+    let mut effects = iterable_effects;
     for nested in partial
         .statements
         .get(nested_fact_start..)
@@ -19616,6 +19825,52 @@ fn ensure_primitive_type(
         id,
         kind,
         linearity: Linearity::ScalarCopy,
+        size_upper_bound: Some(size),
+        alignment_lower_bound: alignment,
+        source: None,
+    });
+    Ok(id)
+}
+
+fn ensure_closed_fixed_array_type(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    element: SemanticTypeId,
+    length: u64,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<SemanticTypeId, AnalysisFailure> {
+    let kind = SemanticTypeKind::Array { element, length };
+    for existing in &partial.types {
+        charge_runtime_aggregate_lookup(request, &mut *aggregate_work, is_cancelled)?;
+        if existing.kind == kind {
+            return Ok(existing.id);
+        }
+    }
+    let element_record = partial
+        .types
+        .get(element.0 as usize)
+        .filter(|record| record.linearity == Linearity::ScalarCopy)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let size = element_record
+        .size_upper_bound
+        .and_then(|size| size.checked_mul(length))
+        .ok_or_else(|| fact_resource(request, "fixed-array byte bound"))?;
+    let alignment = element_record.alignment_lower_bound;
+    if partial.types.len() >= request.limits.types as usize {
+        return Err(fact_resource(request, "semantic types"));
+    }
+    let id = SemanticTypeId(
+        u32::try_from(partial.types.len()).map_err(|_| fact_resource(request, "semantic types"))?,
+    );
+    partial
+        .types
+        .try_reserve(1)
+        .map_err(|_| fact_resource(request, "semantic types"))?;
+    partial.types.push(SemanticType {
+        id,
+        kind,
+        linearity: Linearity::ExplicitCopy,
         size_upper_bound: Some(size),
         alignment_lower_bound: alignment,
         source: None,
@@ -38629,6 +38884,169 @@ fn projection_fixture():
     }
 
     #[test]
+    fn closed_fixed_array_for_loop_analyzes_with_exact_elements_and_bound() {
+        let source = dot_variant_actor_source(
+            "async fn checkpoint():\n    for item in [1, 2, 3]:\n        observed: i64 = item\n        pass\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("closed fixed-array analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "the canonical fixed array must analyze cleanly: {:?}",
+            output.diagnostics()
+        );
+        let image = output.successful().expect("sealed fixed-array image");
+        let binding = image
+            .facts()
+            .values
+            .iter()
+            .find(|value| value.source_name.as_deref() == Some("item"))
+            .expect("fixed-array binding value");
+        assert!(matches!(
+            image.facts().types[binding.ty.0 as usize].kind,
+            SemanticTypeKind::Integer {
+                signed: true,
+                bits: 64,
+                pointer_sized: false,
+            }
+        ));
+        let array = image
+            .facts()
+            .expressions
+            .iter()
+            .find(|fact| matches!(fact.resolution, ExpressionResolution::ClosedArray { .. }))
+            .expect("closed array fact");
+        let ExpressionResolution::ClosedArray {
+            ref elements,
+            maximum_iterations,
+            bounds,
+        } = array.resolution
+        else {
+            unreachable!()
+        };
+        assert_eq!(elements.len(), 3);
+        assert_eq!(maximum_iterations, 3);
+        let array_expression = array.expression;
+        let array_ty = array.ty;
+
+        let mut wrong_order = image.facts().clone();
+        let ExpressionResolution::ClosedArray { elements, .. } = &mut wrong_order
+            .expressions
+            .iter_mut()
+            .find(|fact| fact.expression == array_expression)
+            .expect("mutable fixed-array fact")
+            .resolution
+        else {
+            unreachable!()
+        };
+        elements.swap(0, 1);
+        assert!(
+            wrong_order
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut wrong_bound = image.facts().clone();
+        let ExpressionResolution::ClosedArray {
+            maximum_iterations, ..
+        } = &mut wrong_bound
+            .expressions
+            .iter_mut()
+            .find(|fact| fact.expression == array_expression)
+            .expect("mutable fixed-array fact")
+            .resolution
+        else {
+            unreachable!()
+        };
+        *maximum_iterations = 2;
+        assert!(
+            wrong_bound
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut wrong_proof = image.facts().clone();
+        wrong_proof.proofs[bounds.0 as usize].bound = Some(2);
+        assert!(
+            wrong_proof
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut wrong_type = image.facts().clone();
+        let SemanticTypeKind::Array { length, .. } =
+            &mut wrong_type.types[array_ty.0 as usize].kind
+        else {
+            unreachable!()
+        };
+        *length = 2;
+        assert!(
+            wrong_type
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let exact_count =
+            u32::try_from(image.facts().expressions.len()).expect("fixed-array expression facts");
+        let mut exact_limits = AnalysisLimits::standard();
+        exact_limits.expression_facts = exact_count;
+        assert!(
+            CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, exact_limits),
+                    &|| false,
+                )
+                .expect("exact fixed-array expression-fact limit")
+                .successful()
+                .is_some()
+        );
+        let mut one_under = exact_limits;
+        one_under.expression_facts = exact_count - 1;
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new()
+                .analyze(parsed_actor_request(&fixture, &changes, one_under), &|| {
+                    false
+                },),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "expression facts",
+                ..
+            })
+        ));
+
+        let polls = Cell::new(0_u32);
+        let counted = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, exact_limits),
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("count fixed-array analysis polls");
+        assert!(counted.successful().is_some());
+        let final_poll = polls.get();
+        let polls = Cell::new(0_u32);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, exact_limits),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next == final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
     fn closed_literal_range_zero_trip_and_exact_fact_limit_are_admitted() {
         let source = dot_variant_actor_source(
             "async fn checkpoint():\n    for index in 4 .. 0:\n        observed: u64 = index\n        pass\n\n",
@@ -38744,6 +39162,48 @@ fn projection_fixture():
                     &|| false,
                 )
                 .expect("range tail is a diagnostic");
+            assert_eq!(
+                output
+                    .diagnostics()
+                    .first()
+                    .and_then(|diagnostic| diagnostic.code.as_deref()),
+                Some(code),
+                "{body}: {:?}",
+                output.diagnostics()
+            );
+            assert!(output.successful().is_none());
+        }
+    }
+
+    #[test]
+    fn closed_fixed_array_for_tails_fail_closed_by_name() {
+        for (body, code) in [
+            (
+                "    for item in []:\n        pass\n",
+                "semantic-for-array-empty-type-pending",
+            ),
+            (
+                "    for item in [1, true]:\n        pass\n",
+                "semantic-for-array-element-type",
+            ),
+            (
+                "    for item in [\"text\"]:\n        pass\n",
+                "semantic-for-array-element-shape",
+            ),
+            (
+                "    for take item in take [1, 2]:\n        pass\n",
+                "semantic-for-array-take-pending",
+            ),
+        ] {
+            let source = dot_variant_actor_source(&format!("async fn checkpoint():\n{body}\n"));
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("fixed-array tail is a diagnostic");
             assert_eq!(
                 output
                     .diagnostics()

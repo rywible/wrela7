@@ -2180,6 +2180,34 @@ fn supported_generated_tests<'a>(
                 }
             }
             semantic::TypeKind::Array { element, length } => {
+                if !saw_frame
+                    && ty.source_name == "array"
+                    && *length > 0
+                    && input.types.get(element.0 as usize).is_some_and(|element| {
+                        matches!(
+                            element.kind,
+                            semantic::TypeKind::Primitive(
+                                semantic::PrimitiveType::Bool
+                                    | semantic::PrimitiveType::U8
+                                    | semantic::PrimitiveType::U16
+                                    | semantic::PrimitiveType::U32
+                                    | semantic::PrimitiveType::U64
+                                    | semantic::PrimitiveType::U128
+                                    | semantic::PrimitiveType::I8
+                                    | semantic::PrimitiveType::I16
+                                    | semantic::PrimitiveType::I32
+                                    | semantic::PrimitiveType::I64
+                                    | semantic::PrimitiveType::I128
+                                    | semantic::PrimitiveType::Usize
+                                    | semantic::PrimitiveType::Isize
+                            )
+                        ) && element.linearity == semantic::Linearity::CopyScalar
+                    })
+                    && ty.linearity == semantic::Linearity::ExplicitCopy
+                    && ty.source.is_none()
+                {
+                    continue;
+                }
                 saw_frame = true;
                 let name_length = ty
                     .source_name
@@ -2413,6 +2441,16 @@ fn supported_source_value_type(input: &semantic::SemanticWir, ty: semantic::Type
                 && !variants.is_empty()
                 && variants.len() <= 256
                 && canonical_semantic_enum_shape(input, record, variants)
+        }
+        semantic::TypeKind::Array { element, length } => {
+            record.source_name == "array"
+                && record.linearity == semantic::Linearity::ExplicitCopy
+                && record.source.is_none()
+                && *length > 0
+                && scalar_primitive(input, *element).is_some_and(|primitive| {
+                    primitive == semantic::PrimitiveType::Bool
+                        || integer_primitive(primitive).is_some()
+                })
         }
         _ => false,
     }
@@ -2915,30 +2953,47 @@ fn validate_scalar_source_function(
                         let [result] = statement.results.as_slice() else {
                             return Err(unsupported("flat aggregate result arity"));
                         };
-                        let expected_fields = input
+                        let aggregate_kind = input
                             .types
                             .get(ty.0 as usize)
-                            .and_then(|record| match &record.kind {
-                                semantic::TypeKind::Struct { fields }
-                                    if supported_source_value_type(input, *ty) =>
-                                {
-                                    Some(fields)
-                                }
-                                _ => None,
-                            })
+                            .filter(|_| supported_source_value_type(input, *ty))
+                            .map(|record| &record.kind)
                             .ok_or(unsupported("flat aggregate type"))?;
-                        if scalar_value_type(function, *result) != Some(*ty)
-                            || fields.len() != expected_fields.len()
-                        {
+                        if scalar_value_type(function, *result) != Some(*ty) {
                             return Err(unsupported("flat aggregate result type"));
                         }
-                        for (value, expected) in fields.iter().zip(expected_fields) {
-                            check_cancelled(is_cancelled)?;
-                            if scalar_value_type(function, *value) != Some(expected.ty)
-                                || scalar_primitive(input, expected.ty).is_none()
-                            {
-                                return Err(unsupported("flat aggregate field type"));
+                        match aggregate_kind {
+                            semantic::TypeKind::Struct {
+                                fields: expected_fields,
+                            } => {
+                                if fields.len() != expected_fields.len() {
+                                    return Err(unsupported("flat aggregate result type"));
+                                }
+                                for (value, expected) in fields.iter().zip(expected_fields) {
+                                    check_cancelled(is_cancelled)?;
+                                    if scalar_value_type(function, *value) != Some(expected.ty)
+                                        || scalar_primitive(input, expected.ty).is_none()
+                                    {
+                                        return Err(unsupported("flat aggregate field type"));
+                                    }
+                                }
                             }
+                            semantic::TypeKind::Array { element, length } => {
+                                if u64::try_from(fields.len()) != Ok(*length) {
+                                    return Err(unsupported("fixed-array aggregate arity"));
+                                }
+                                for value in fields {
+                                    check_cancelled(is_cancelled)?;
+                                    if scalar_value_type(function, *value) != Some(*element)
+                                        || scalar_primitive(input, *element).is_none()
+                                    {
+                                        return Err(unsupported(
+                                            "fixed-array aggregate element type",
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => return Err(unsupported("flat aggregate type")),
                         }
                     }
                     semantic::SemanticOperation::InsertField {
@@ -3121,6 +3176,11 @@ fn validate_scalar_source_function(
                         if !result_matches {
                             return Err(unsupported("scalar call results"));
                         }
+                    }
+                    semantic::SemanticOperation::Index { .. } => {
+                        return Err(unsupported(
+                            "flow-fixed-array-index-lowering-pending (indexed aggregate extraction has no authenticated FlowWir operation)",
+                        ));
                     }
                     _ => return Err(unsupported("non-scalar source operation")),
                 },
@@ -7113,6 +7173,9 @@ fn lower_generated_operation(
                 },
             })
         }
+        semantic::SemanticOperation::Index { .. } => Err(unsupported(
+            "flow-fixed-array-index-lowering-pending (indexed aggregate extraction has no authenticated FlowWir operation)",
+        )),
         semantic::SemanticOperation::Constant(
             semantic::Constant::Char(_)
             | semantic::Constant::String(_)
@@ -7124,7 +7187,6 @@ fn lower_generated_operation(
         | semantic::SemanticOperation::ActorStateLoad { .. }
         | semantic::SemanticOperation::ActorStateStore { .. }
         | semantic::SemanticOperation::Project { .. }
-        | semantic::SemanticOperation::Index { .. }
         | semantic::SemanticOperation::BeginAccess { .. }
         | semantic::SemanticOperation::EndAccess { .. }
         | semantic::SemanticOperation::Move { .. }
@@ -8959,8 +9021,8 @@ mod contract_tests {
     use super::{
         CanonicalFlowLowerer, FlowLowerer, LowerError, LowerRequest, LoweringLimits,
         LoweringReport, actor_flow_program_matches, exact_enum_type_test_match_protocol,
-        lower_proof_kind, measure_actor_flow_output_resources, preflight_input, seal,
-        supported_actor_image, supported_source_value_type,
+        lower_generated_operation, lower_proof_kind, measure_actor_flow_output_resources,
+        preflight_input, seal, supported_actor_image, supported_source_value_type,
     };
     use wrela_build_model::{BuildIdentity, LanguageRevision, Sha256Digest, TargetIdentity};
     use wrela_flow_wir as flow;
@@ -15258,6 +15320,26 @@ mod contract_tests {
             ),
             Err(LowerError::UnsupportedInput {
                 feature: "semantic operations or structured bodies",
+            })
+        ));
+    }
+
+    #[test]
+    fn fixed_array_index_stops_at_its_named_flow_boundary() {
+        let input = fixture();
+        assert!(matches!(
+            lower_generated_operation(
+                input.as_wir(),
+                &semantic::SemanticOperation::Index {
+                    base: semantic::ValueId(0),
+                    index: semantic::ValueId(0),
+                    proof: semantic::ProofId(0),
+                },
+                LoweringLimits::standard(),
+                &|| false,
+            ),
+            Err(LowerError::UnsupportedInput {
+                feature: "flow-fixed-array-index-lowering-pending (indexed aggregate extraction has no authenticated FlowWir operation)",
             })
         ));
     }

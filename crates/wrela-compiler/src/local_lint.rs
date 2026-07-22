@@ -330,6 +330,16 @@ impl CanonicalSemanticLinter {
                         )?;
                     }
                 }
+                ExpressionResolution::ClosedArray { elements, .. } => {
+                    for value in elements {
+                        mark_value(
+                            &mut value_state,
+                            *value,
+                            VALUE_STATE_USED,
+                            &self.unused_local,
+                        )?;
+                    }
+                }
                 ExpressionResolution::BoundedInterpolation { parts, .. } => {
                     for part in parts {
                         match part {

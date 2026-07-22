@@ -746,6 +746,14 @@ pub enum ExpressionResolution {
         inclusive: bool,
         maximum_iterations: u64,
     },
+    /// Analysis-only fixed-array iterator. The HIR array literal is retained
+    /// as an exact source-ordered element-value witness and is consumable only
+    /// by its enclosing `for` statement in this slice.
+    ClosedArray {
+        elements: Vec<ValueId>,
+        maximum_iterations: u64,
+        bounds: ProofId,
+    },
     DirectCall {
         function: FunctionInstanceId,
         /// Exact source-to-parameter permutation. Records are canonical by
@@ -2620,6 +2628,14 @@ fn validate_exact_expression_local_values(
                     }
                 }
             }
+            wrela_hir::ExpressionKind::Array(elements) => {
+                reserve_validation_scratch(
+                    &mut pending,
+                    elements.len(),
+                    program.expressions.len() as u64,
+                )?;
+                pending.extend(elements.iter().rev().copied());
+            }
             wrela_hir::ExpressionKind::Literal(_)
             | wrela_hir::ExpressionKind::Reference(_)
             | wrela_hir::ExpressionKind::DotName { .. } => {}
@@ -3083,9 +3099,13 @@ fn validate_exact_body_local_value_flow(
                 )?;
                 let iterable_effects = exact_child_expression(analysis, function.id, *iterable)
                     .filter(|fact| {
-                        matches!(fact.resolution, ExpressionResolution::ClosedRange { .. })
+                        matches!(
+                            fact.resolution,
+                            ExpressionResolution::ClosedRange { .. }
+                                | ExpressionResolution::ClosedArray { .. }
+                        )
                     })
-                    .ok_or_else(|| invalid("for iterable fact is not a closed range"))?
+                    .ok_or_else(|| invalid("for iterable fact is not a closed iterator"))?
                     .effects;
                 let [definition] = fact.definitions.as_slice() else {
                     return Err(invalid("for local-value binding is missing"));
@@ -3790,6 +3810,14 @@ fn collect_source_body_closure(
                     pending_expressions.push(*base);
                 }
             }
+            wrela_hir::ExpressionKind::Array(elements) => {
+                reserve_validation_scratch(
+                    &mut pending_expressions,
+                    elements.len(),
+                    program.expressions.len() as u64,
+                )?;
+                pending_expressions.extend(elements.iter().rev().copied());
+            }
             wrela_hir::ExpressionKind::If {
                 condition,
                 then_branch,
@@ -3974,6 +4002,18 @@ fn validate_exact_expression_fact(
             *end_value,
             *resolved_inclusive,
             *maximum_iterations,
+        ) => {}
+        (
+            wrela_hir::ExpressionKind::Array(source_elements),
+            resolution @ ExpressionResolution::ClosedArray { .. },
+            None,
+        ) if exact_closed_fixed_array_matches(
+            analysis,
+            program,
+            function.id,
+            fact,
+            source_elements,
+            resolution,
         ) => {}
         (
             wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(local)),
@@ -7860,14 +7900,23 @@ fn validate_exact_statement_fact(
             body,
         } => {
             let [definition] = fact.definitions.as_slice() else {
-                return Err(invalid("closed range loop lacks one exact binding"));
+                return Err(invalid("closed iterator loop lacks one exact binding"));
             };
             let iterable_fact = exact_child_expression(analysis, function.id, *iterable)
-                .filter(|fact| {
-                    fact.result.is_none()
-                        && matches!(fact.resolution, ExpressionResolution::ClosedRange { .. })
-                })
-                .ok_or_else(|| invalid("for iterable is not an exact closed range"))?;
+                .filter(|fact| fact.result.is_none())
+                .ok_or_else(|| invalid("for iterable is not an exact closed iterator"))?;
+            let element_ty = match iterable_fact.resolution {
+                ExpressionResolution::ClosedRange { .. } => iterable_fact.ty,
+                ExpressionResolution::ClosedArray { .. } => analysis
+                    .types
+                    .get(iterable_fact.ty.0 as usize)
+                    .and_then(|record| match record.kind {
+                        SemanticTypeKind::Array { element, .. } => Some(element),
+                        _ => None,
+                    })
+                    .ok_or_else(|| invalid("fixed-array iterator has no exact element type"))?,
+                _ => return Err(invalid("for iterable is not an exact closed iterator")),
+            };
             let local_record = program
                 .locals
                 .get(binding.0 as usize)
@@ -7881,7 +7930,7 @@ fn validate_exact_statement_fact(
                 .filter(|record| {
                     definition.local == *binding
                         && record.function == function.id
-                        && record.ty == iterable_fact.ty
+                        && record.ty == element_ty
                         && record.origin == SemanticValueOrigin::Local(*binding)
                         && record.source == Some(local_record.source)
                         && record.source_name.as_deref() == Some(local_record.name.as_str())
@@ -7895,7 +7944,7 @@ fn validate_exact_statement_fact(
                     expression.function == function.id && expression.result == Some(value_record.id)
                 })
             {
-                return Err(invalid("for binding differs from the closed range HIR"));
+                return Err(invalid("for binding differs from the closed iterator HIR"));
             }
             increment_definition(definitions, definition.value)?;
         }
@@ -9438,6 +9487,127 @@ fn exact_closed_literal_range_matches(
         && range.effects == EffectSet(start_fact.effects.0 | end_fact.effects.0)
 }
 
+fn exact_closed_fixed_array_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    function: FunctionInstanceId,
+    array: &ExpressionFact,
+    source_elements: &[ExpressionId],
+    resolution: &ExpressionResolution,
+) -> bool {
+    let ExpressionResolution::ClosedArray {
+        elements,
+        maximum_iterations,
+        bounds,
+    } = resolution
+    else {
+        return false;
+    };
+    let Ok(length) = u64::try_from(source_elements.len()) else {
+        return false;
+    };
+    if length == 0
+        || *maximum_iterations != length
+        || source_elements.len() != elements.len()
+        || array.result.is_some()
+    {
+        return false;
+    }
+    let Some(source) = program
+        .expression(array.expression)
+        .map(|expression| expression.source)
+    else {
+        return false;
+    };
+    let Some(proof) = analysis
+        .proofs
+        .get(bounds.0 as usize)
+        .filter(|proof| proof.id == *bounds)
+    else {
+        return false;
+    };
+    if proof.kind != ProofKind::CapacityBound
+        || proof.subject != "inline fixed-array iteration"
+        || proof.sources.as_slice() != [source]
+        || !proof.depends_on.is_empty()
+        || proof.bound != Some(length)
+        || proof.explanation.as_slice()
+            != ["every generated index is strictly below the exact inline array length"]
+    {
+        return false;
+    }
+    let mut element_ty = None;
+    let mut effects = 0_u64;
+    for (source_element, element) in source_elements.iter().zip(elements) {
+        let Some(source_record) = program.expression(*source_element) else {
+            return false;
+        };
+        if !matches!(
+            source_record.kind,
+            wrela_hir::ExpressionKind::Literal(wrela_hir::Literal::Boolean(_))
+                | wrela_hir::ExpressionKind::Literal(wrela_hir::Literal::Integer(_))
+        ) {
+            return false;
+        }
+        let Some(child) = exact_child_expression(analysis, function, *source_element) else {
+            return false;
+        };
+        if child.result != Some(*element)
+            || !matches!(child.resolution, ExpressionResolution::Constant(_))
+            || analysis
+                .values
+                .get(element.0 as usize)
+                .is_none_or(|record| {
+                    record.function != function
+                        || record.ty != child.ty
+                        || record.origin != SemanticValueOrigin::Expression(*source_element)
+                })
+        {
+            return false;
+        }
+        if let Some(expected) = element_ty {
+            if child.ty != expected {
+                return false;
+            }
+        } else {
+            element_ty = Some(child.ty);
+        }
+        effects |= child.effects.0;
+    }
+    let Some(element_ty) = element_ty else {
+        return false;
+    };
+    let Some(element_record) = analysis.types.get(element_ty.0 as usize) else {
+        return false;
+    };
+    if element_record.linearity != Linearity::ScalarCopy
+        || !matches!(
+            element_record.kind,
+            SemanticTypeKind::Bool | SemanticTypeKind::Integer { .. }
+        )
+    {
+        return false;
+    }
+    analysis
+        .types
+        .get(array.ty.0 as usize)
+        .is_some_and(|record| {
+            record.kind
+                == (SemanticTypeKind::Array {
+                    element: element_ty,
+                    length,
+                })
+                && record.linearity == Linearity::ExplicitCopy
+                && record.size_upper_bound
+                    == element_record
+                        .size_upper_bound
+                        .and_then(|size| size.checked_mul(length))
+                && record.alignment_lower_bound == element_record.alignment_lower_bound
+                && record.source.is_none()
+        })
+        && array.effects == EffectSet(effects)
+}
+
 // Keep the subtraction explicit: the sealed proof is defined in terms of a
 // checked difference, with an empty range on underflow.
 #[allow(clippy::manual_unwrap_or, clippy::manual_unwrap_or_default)]
@@ -10080,6 +10250,24 @@ fn valid_expression_resolution(
         ExpressionResolution::ClosedRange { start, end, .. } => {
             start != end && value_id(*start) && value_id(*end)
         }
+        ExpressionResolution::ClosedArray {
+            elements,
+            maximum_iterations,
+            bounds,
+        } => elements
+            .first()
+            .and_then(|first| analysis.values.get(first.0 as usize))
+            .is_some_and(|first| {
+                first.function == function
+                    && !elements.is_empty()
+                    && u64::try_from(elements.len()) == Ok(*maximum_iterations)
+                    && proof_id(*bounds)
+                    && elements.iter().all(|value| {
+                        analysis.values.get(value.0 as usize).is_some_and(|record| {
+                            record.function == function && record.ty == first.ty
+                        })
+                    })
+            }),
         ExpressionResolution::DirectCall {
             function: target,
             arguments,
@@ -11110,6 +11298,7 @@ fn valid_expression_region(
             | ExpressionResolution::ResultTry { .. }
             | ExpressionResolution::OptionTry { .. }
             | ExpressionResolution::ClosedRange { .. }
+            | ExpressionResolution::ClosedArray { .. }
             | ExpressionResolution::DirectCall { .. }
             | ExpressionResolution::MethodCall { .. }
             | ExpressionResolution::ScopeCall { .. }
@@ -13627,6 +13816,7 @@ fn validate_fact_resources(
                     }
                 }
             }
+            ExpressionResolution::ClosedArray { elements, .. } => meter.edges(elements),
             ExpressionResolution::Error
             | ExpressionResolution::Value(_)
             | ExpressionResolution::Function(_)
