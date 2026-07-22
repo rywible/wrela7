@@ -47,7 +47,8 @@ use wrela_sema::{
 use wrela_semantic_lower::{
     CanonicalSemanticLowerer, LowerError as SemanticLowerError,
     LowerRequest as SemanticLowerRequest, LoweringLimits as SemanticLoweringLimits,
-    SemanticLowerer, SemanticOperation, SemanticTypeKind, semantic_wir::SEMANTIC_WIR_VERSION,
+    SemanticLowerer, SemanticOperation, SemanticTypeKind,
+    semantic_wir::{SEMANTIC_WIR_VERSION, SemanticStatement},
 };
 use wrela_source::{FileId, SourceDatabase, SourceInput};
 use wrela_syntax::{ParseLimits, ParseRequest, SyntaxParser, WrelaSyntaxParser};
@@ -3735,4 +3736,583 @@ fn reject_enclosing_result():
     ] {
         assert_discovery_diagnostic(&format!("{prefix}{body}"), code);
     }
+}
+
+const CORE_OPTION_MATCH_SOURCE: &str = r#"module runtime_result.image
+
+from core.image import Image, Target
+
+@image
+pub fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+fn make_option() -> Option[u64]:
+    return Some(9)
+
+fn unwrap_or_zero(outcome: Option[u64]) -> u64:
+    match outcome:
+        case .Some(payload):
+            return payload
+        case .None:
+            return 0
+
+fn is_absent(outcome: Option[u64]) -> bool:
+    return outcome is .None
+
+@test(runtime)
+fn core_option_match_runtime():
+    unwrap_or_zero(make_option())
+    is_absent(make_option())
+    return
+"#;
+
+/// A1 tail: exhaustive payload-binding `match` and unit-variant `is` over the
+/// exact `core.option.Option[u64]` specialization, carried from sealed analysis
+/// through FlowWir v19 and MachineWir v21 to repeat byte-identical native COFF.
+#[test]
+fn core_option_scalar_match_and_type_test_reach_flow_machine_and_deterministic_native_coff() {
+    let fixture = source_fixture_for_option(CORE_OPTION_MATCH_SOURCE);
+    let image = analyze_selected(&fixture, "core_option_match_runtime");
+
+    // The scrutinee is the exact public core `Option` declaration specialized
+    // over one stored copy scalar, not a structural lookalike.
+    let program = fixture.hir.as_program();
+    let option_declaration = program
+        .declarations
+        .iter()
+        .find(|declaration| {
+            declaration
+                .name
+                .as_ref()
+                .is_some_and(|name| name.as_str() == "Option")
+                && matches!(declaration.kind, wrela_hir::DeclarationKind::Enumeration(_))
+        })
+        .map(|declaration| declaration.id)
+        .expect("core Option declaration");
+    let u64_type = image
+        .facts()
+        .types
+        .iter()
+        .find(|ty| {
+            matches!(
+                ty.kind,
+                SemaTypeKind::Integer {
+                    signed: false,
+                    bits: 64,
+                    pointer_sized: false
+                }
+            )
+        })
+        .expect("canonical u64 semantic type")
+        .id;
+    let option_type = image
+        .facts()
+        .types
+        .iter()
+        .find(|ty| {
+            matches!(&ty.kind, SemaTypeKind::Enumeration { declaration, arguments, variants }
+                if *declaration == option_declaration
+                    && arguments.len() == 1
+                    && matches!(variants.as_slice(), [some, none]
+                        if some.name == "Some"
+                            && matches!(some.fields.as_slice(), [field] if field.ty == u64_type)
+                            && none.name == "None"
+                            && none.fields.is_empty()))
+        })
+        .expect("exact core Option[u64] specialization")
+        .id;
+
+    // `outcome is .None` records one exact enum tag identity against that type.
+    let type_test = image
+        .facts()
+        .expressions
+        .iter()
+        .find(|fact| {
+            matches!(
+                fact.resolution,
+                wrela_sema::ExpressionResolution::EnumTypeTest { .. }
+            )
+        })
+        .expect("core Option unit-variant type test fact");
+    let wrela_sema::ExpressionResolution::EnumTypeTest {
+        enumeration,
+        variant,
+        scrutinee,
+    } = type_test.resolution
+    else {
+        unreachable!("selected enum type-test resolution")
+    };
+    assert_eq!((enumeration, variant), (option_type, 1));
+    assert_eq!(image.facts().values[scrutinee.0 as usize].ty, option_type);
+
+    // Forgery 1: the sealer independently re-derives the tested tag, so the
+    // structurally valid sibling variant must break the full seal.
+    let mut forged_tag = image.facts().clone();
+    let forged_variant = forged_tag
+        .expressions
+        .iter_mut()
+        .find_map(|fact| match &mut fact.resolution {
+            wrela_sema::ExpressionResolution::EnumTypeTest { variant, .. } => Some(variant),
+            _ => None,
+        })
+        .expect("forged Option type-test tag");
+    *forged_variant = 0;
+    assert!(
+        forged_tag
+            .validate_for_seal(image.hir(), &never_cancelled)
+            .is_err(),
+        "full sealing must reject the sibling Option tag"
+    );
+
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: image,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("core Option match SemanticWir")
+        .into_parts()
+        .0;
+    assert_eq!(semantic.as_wir().version, SEMANTIC_WIR_VERSION);
+    assert!(semantic.as_wir().types.iter().any(|ty| {
+        matches!(&ty.kind, SemanticTypeKind::Enum { variants }
+            if matches!(variants.as_slice(), [some, none]
+                if some.name == "Some" && some.fields.len() == 1
+                    && none.name == "None" && none.fields.is_empty()))
+    }));
+    // Both the exhaustive `match` and the `is` tag test reach SemanticWir as
+    // authenticated two-arm variant matches: the source `match` binds the
+    // `Some` payload, and the tag test binds nothing and yields constants.
+    let semantic_matches = semantic
+        .as_wir()
+        .functions
+        .iter()
+        .flat_map(|function| &function.body.statements)
+        .filter_map(|statement| match statement {
+            SemanticStatement::Match { arms, .. } => Some(arms),
+            _ => None,
+        })
+        .map(|arms| {
+            (
+                arms.iter().map(|arm| arm.variant).collect::<Vec<_>>(),
+                arms.iter()
+                    .map(|arm| arm.bindings.len())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        semantic_matches,
+        [
+            (vec![Some(0), Some(1)], vec![1, 0]),
+            (vec![Some(0), Some(1)], vec![0, 0]),
+        ]
+    );
+
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("core Option match FlowWir");
+    assert!(flow.diagnostics().is_empty());
+    let flow_instruction_count = flow.report().instructions;
+    let flow_model = flow.wir().as_wir();
+    let flow_option = flow_model
+        .types
+        .iter()
+        .find(|ty| ty.name.as_deref() == Some("Option"))
+        .expect("Option FlowWir type");
+    let flow_u64 = flow_model
+        .types
+        .iter()
+        .find(|ty| ty.name.as_deref() == Some("u64"))
+        .expect("canonical u64 FlowWir type");
+    assert!(matches!(&flow_option.kind, FlowTypeKind::Enum { variants }
+        if variants.as_slice() == [vec![flow_u64.id], Vec::new()]));
+    let flow_projections = flow_model
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.operation {
+            FlowOperation::EnumPayload { variant, .. } => Some(variant),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // `Option[u64]` carries exactly one payload-bearing variant, so the shared
+    // storage slot needs no per-tag discrimination and the projection is
+    // recorded untagged.
+    assert_eq!(flow_projections, [None]);
+    let flow_switches = flow_model
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .filter(|block| matches!(block.terminator, Terminator::Switch { .. }))
+        .count();
+    assert_eq!(flow_switches, 2);
+
+    // Forgery 2: FlowWir independently authenticates the projected tag, so
+    // reading the `Some` payload out of the payload-free `None` arm is
+    // rejected without consulting the source.
+    let mut forged_flow = flow_model.clone();
+    let projected = forged_flow
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.operation {
+            FlowOperation::EnumPayload { variant, .. } if variant.is_none() => Some(variant),
+            _ => None,
+        })
+        .expect("core Option FlowWir payload projection");
+    *projected = Some(1);
+    assert!(forged_flow.validate().is_err());
+
+    // The reported FlowWir instruction total is the emitted body; the lowerer's
+    // exact admitted ceiling is one higher because the tail `match` result
+    // reservation is charged before the emitted terminator replaces it.
+    const REPORTED_FLOW_INSTRUCTIONS: u64 = 23;
+    const EXACT_FLOW_INSTRUCTIONS: u64 = 24;
+    assert_eq!(flow_instruction_count, REPORTED_FLOW_INSTRUCTIONS);
+    let mut exact_flow = FlowLoweringLimits::standard();
+    exact_flow.instructions = EXACT_FLOW_INSTRUCTIONS;
+    CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: exact_flow,
+            },
+            &never_cancelled,
+        )
+        .expect("core Option match accepts the exact FlowWir instruction ceiling");
+    let mut one_under_flow = exact_flow;
+    one_under_flow.instructions = EXACT_FLOW_INSTRUCTIONS - 1;
+    assert!(matches!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: one_under_flow,
+            },
+            &never_cancelled,
+        ),
+        Err(FlowLowerError::ResourceLimit {
+            resource: "FlowWir instructions",
+            limit,
+        }) if limit == EXACT_FLOW_INSTRUCTIONS - 1
+    ));
+    let flow_polls = Cell::new(0_u64);
+    CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: exact_flow,
+            },
+            &|| {
+                flow_polls.set(flow_polls.get().saturating_add(1));
+                false
+            },
+        )
+        .expect("count core Option match Flow lowering polls");
+    let final_flow_poll = flow_polls.get();
+    assert!(final_flow_poll > 3);
+    flow_polls.set(0);
+    assert!(matches!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: exact_flow,
+            },
+            &|| {
+                let next = flow_polls.get().saturating_add(1);
+                flow_polls.set(next);
+                next >= final_flow_poll
+            },
+        ),
+        Err(FlowLowerError::Cancelled)
+    ));
+    assert_eq!(flow_polls.get(), final_flow_poll);
+
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("core Option match canonical FlowWir frame");
+    decode_and_verify(
+        &CanonicalFlowWirCodec,
+        DecodeRequest {
+            bytes: encoded.bytes(),
+            limits: CodecLimits::standard(),
+            expected_build: Some(&flow_wir.as_wir().build),
+        },
+        &never_cancelled,
+    )
+    .expect("core Option match FlowWir frame round-trips");
+
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("core Option match MachineWir preparation");
+    let machine = prepared.machine().wir().as_wir();
+    let machine_u64 = machine
+        .types
+        .iter()
+        .find(|ty| matches!(ty.kind, MachineTypeKind::Integer { bits: 64 }))
+        .expect("canonical u64 MachineWir type");
+    let mut machine_tags = 0usize;
+    let mut machine_switches = 0usize;
+    let mut machine_projections = Vec::new();
+    for function in &machine.functions {
+        if !matches!(
+            function.origin,
+            MachineFunctionOrigin::SourceSemantic { .. }
+        ) {
+            continue;
+        }
+        for block in &function.blocks {
+            machine_tags += block
+                .instructions
+                .iter()
+                .filter(|instruction| {
+                    matches!(instruction.operation, MachineOperation::EnumTag { .. })
+                })
+                .count();
+            machine_switches +=
+                usize::from(matches!(block.terminator, MachineTerminator::Switch { .. }));
+            machine_projections.extend(block.instructions.iter().filter_map(|instruction| {
+                match instruction.operation {
+                    MachineOperation::EnumPayload { variant, .. } => Some((
+                        variant,
+                        function.values[instruction.results[0].0 as usize].ty,
+                    )),
+                    _ => None,
+                }
+            }));
+        }
+    }
+    assert_eq!((machine_tags, machine_switches), (2, 2));
+    assert_eq!(machine_projections, [(None, machine_u64.id)]);
+
+    // Forgery 3: MachineWir re-authenticates the projected tag against the
+    // per-tag logical payload types behind the shared storage slot.
+    let mut forged_machine = machine.clone();
+    let projected = forged_machine
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.operation {
+            MachineOperation::EnumPayload { variant, .. } if variant.is_none() => Some(variant),
+            _ => None,
+        })
+        .expect("core Option MachineWir payload projection");
+    *projected = Some(1);
+    assert!(forged_machine.validate_for_target(&fixture.target).is_err());
+
+    let codec = CanonicalFlowWirCodec;
+    let hasher = CanonicalBackendContentHasher::new();
+    let optimizer = CanonicalFlowOptimizer::new();
+    let machine_lowerer = CanonicalMachineLowerer::new();
+    let expected_digest = hasher
+        .sha256(encoded.bytes(), &never_cancelled)
+        .expect("core Option match frame digest");
+    let optimization = OptimizationProfile::from_build_policy(
+        &fixture.build.profile.optimization,
+        fixture.build.identity.compiler,
+    )
+    .expect("core Option match optimization profile");
+    let prepare_with = |machine_limits: MachineLoweringLimits, is_cancelled: &dyn Fn() -> bool| {
+        prepare_for_codegen(
+            BackendPreparationServices {
+                codec: &codec,
+                hasher: &hasher,
+                optimizer: &optimizer,
+                machine_lowerer: &machine_lowerer,
+            },
+            encoded.bytes(),
+            expected_digest,
+            &fixture.target,
+            &fixture.build,
+            BackendPreparationOptions {
+                codec_limits: CodecLimits::standard(),
+                optimization: optimization.clone(),
+                optimization_limits: OptimizationLimits::standard(),
+                machine_limits,
+            },
+            is_cancelled,
+        )
+    };
+
+    // Repeat MachineWir preparation is identity-stable.
+    let repeated = prepare_with(MachineLoweringLimits::standard(), &never_cancelled)
+        .expect("repeat core Option match MachineWir preparation");
+    assert_eq!(repeated.machine().wir().as_wir(), machine);
+
+    let instruction_count = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .map(|block| block.instructions.len() as u64)
+        .sum::<u64>();
+    let mut exact_machine = MachineLoweringLimits::standard();
+    exact_machine.instructions = instruction_count;
+    prepare_with(exact_machine, &never_cancelled)
+        .expect("core Option match accepts the exact MachineWir instruction ceiling");
+    let mut one_under_machine = exact_machine;
+    one_under_machine.instructions = instruction_count - 1;
+    let one_under = prepare_with(one_under_machine, &never_cancelled)
+        .expect_err("one fewer core Option match MachineWir instruction must fail");
+    assert_eq!(
+        one_under.machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir instructions",
+            limit: instruction_count - 1,
+        })
+    );
+    let machine_polls = Cell::new(0_u64);
+    prepare_with(MachineLoweringLimits::standard(), &|| {
+        machine_polls.set(machine_polls.get().saturating_add(1));
+        false
+    })
+    .expect("count core Option match MachineWir polls");
+    let cancellation_at = machine_polls.get().saturating_sub(2);
+    assert!(cancellation_at > 3);
+    let cancelled_polls = Cell::new(0_u64);
+    let cancellation = prepare_with(MachineLoweringLimits::standard(), &|| {
+        let next = cancelled_polls.get().saturating_add(1);
+        cancelled_polls.set(next);
+        next >= cancellation_at
+    })
+    .expect_err("late core Option match MachineWir cancellation must propagate");
+    assert!(cancellation.is_cancelled());
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("core Option match native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat core Option match native emission");
+            assert_eq!(first.bytes(), second.bytes());
+            let digest = HASHER.sha256(first.bytes());
+            assert_eq!(digest, HASHER.sha256(second.bytes()));
+            inspect_native_object(first.bytes(), digest);
+        }
+    }
+}
+
+/// The adjacent `match`/`is` shapes around the admitted `Option[S]` profile stay
+/// fail-closed under their own named diagnostics.
+#[test]
+fn core_option_match_and_type_test_tails_fail_closed_by_name() {
+    let diagnostic = |declarations: &str, call: &str| {
+        let source = format!(
+            r#"module runtime_result.image
+
+from core.image import Image, Target
+
+@image
+pub fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+fn make_option() -> Option[u64]:
+    return Some(9)
+
+{declarations}
+
+@test(runtime)
+fn core_option_tail_runtime():
+{call}    return
+"#
+        );
+        let fixture = try_source_fixture_with_modules(&source, None, true)
+            .unwrap_or_else(|diagnostics| panic!("HIR diagnostics: {diagnostics:?}"));
+        let discovery = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                AnalysisRequest {
+                    hir: Arc::clone(&fixture.hir),
+                    standard_library_package: wrela_package::PackageId(1),
+                    target: fixture.target.semantic(),
+                    build: &fixture.build,
+                    mode: AnalysisMode::DiscoverTests {
+                        image_name: IMAGE_NAME,
+                        image_entry: fixture.entry,
+                        declared_image_tests: &[],
+                        source_selection: TestDiscoverySelection::NameContains(
+                            "core_option_tail_runtime",
+                        ),
+                    },
+                    changes: &AnalysisChangeSet {
+                        previous_source_graph: None,
+                        changed_declarations: Vec::new(),
+                    },
+                    limits: AnalysisLimits::standard(),
+                },
+                &never_cancelled,
+            )
+            .expect("core Option tail rejection is recoverable");
+        assert!(discovery.successful().is_none());
+        discovery
+            .diagnostics()
+            .first()
+            .and_then(|diagnostic| diagnostic.code.as_deref())
+            .expect("named core Option tail rejection")
+            .to_owned()
+    };
+
+    // A bare prelude name is a binding pattern, never a tag test.
+    assert_eq!(
+        diagnostic(
+            "fn probe() -> bool:\n    outcome: Option[u64] = make_option()\n    return outcome is None",
+            "    probe()\n",
+        ),
+        "semantic-runtime-is-pattern-shape"
+    );
+    // `is` still refuses to bind the `Some` payload.
+    assert_eq!(
+        diagnostic(
+            "fn probe() -> bool:\n    outcome: Option[u64] = make_option()\n    return outcome is .Some(payload)",
+            "    probe()\n",
+        ),
+        "semantic-runtime-is-binding-pending"
+    );
+    // A same-named foreign variant never substitutes for the core identity.
+    assert_eq!(
+        diagnostic(
+            "pub enum Marker:\n    None\n    Present\n\nfn probe() -> bool:\n    outcome: Option[u64] = make_option()\n    return outcome is Marker.None",
+            "    probe()\n",
+        ),
+        "semantic-runtime-is-pattern-type"
+    );
+    // Dropping an arm is not admitted by the specialization.
+    assert_eq!(
+        diagnostic(
+            "fn probe() -> u64:\n    outcome: Option[u64] = make_option()\n    match outcome:\n        case .Some(payload):\n            return payload",
+            "    probe()\n",
+        ),
+        "semantic-runtime-match-nonexhaustive"
+    );
+    // A nested `Option` payload is outside the copy-scalar specialization.
+    assert_eq!(
+        diagnostic(
+            "fn nested() -> Option[Option[u64]]:\n    return Some(Some(9))\n\nfn probe() -> u64:\n    outcome: Option[Option[u64]] = nested()\n    match outcome:\n        case .Some(payload):\n            return 1\n        case .None:\n            return 0",
+            "    probe()\n",
+        ),
+        "semantic-runtime-generic-enum-argument-type"
+    );
 }
