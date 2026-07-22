@@ -4494,6 +4494,8 @@ fn activation_call_shape_matches(
                 continue;
             }
             matched = matched.saturating_add(1);
+            let call_tail =
+                exact_machine_activation_call_tail(module, caller, callee, block, instruction);
             let unit_result = module
                 .types
                 .get(callee.result.0 as usize)
@@ -4504,6 +4506,7 @@ fn activation_call_shape_matches(
                     if caller.values.get(result.0 as usize)
                         .is_some_and(|value| value.ty == callee.result));
             valid &= (unit_result || u64_result)
+                && (call_tail == Some(1) || (two_await && call_tail == Some(2)))
                 && instruction.source == Some(activation.source)
                 && matches!(
                     &instruction.operation,
@@ -4511,7 +4514,7 @@ fn activation_call_shape_matches(
                         function,
                         arguments,
                         convention: CallingConvention::Internal,
-                    } if *function == activation.callee && arguments.is_empty()
+                    } if *function == activation.callee
                 )
                 && matches!(
                     &block.terminator,
@@ -4567,6 +4570,9 @@ fn two_await_activation_shape_matches(
     let (Some(state_zero), Some(state_one)) = (state_zero, state_one) else {
         return false;
     };
+    let Some(callee) = module.functions.get(activation.callee.0 as usize) else {
+        return false;
+    };
     caller_count == 2
         && caller.entry == entry.id
         && entry.id == BlockId(0)
@@ -4575,13 +4581,19 @@ fn two_await_activation_shape_matches(
         && entry.parameters.is_empty()
         && middle.parameters.is_empty()
         && terminal.parameters.is_empty()
-        && matches!(entry.instructions.as_slice(), [call]
-            if call.id == state_zero.call_instruction)
+        && entry.instructions.last().is_some_and(|call| {
+            call.id == state_zero.call_instruction
+                && exact_machine_activation_call_tail(module, caller, callee, entry, call)
+                    == Some(entry.instructions.len())
+        })
         && matches!(&entry.terminator,
             MachineTerminator::Jump { block, arguments }
                 if *block == middle.id && arguments.is_empty())
-        && matches!(middle.instructions.as_slice(), [call]
-            if call.id == state_one.call_instruction)
+        && middle.instructions.last().is_some_and(|call| {
+            call.id == state_one.call_instruction
+                && exact_machine_activation_call_tail(module, caller, callee, middle, call)
+                    == Some(middle.instructions.len())
+        })
         && matches!(&middle.terminator,
             MachineTerminator::Jump { block, arguments }
                 if *block == terminal.id && arguments.is_empty())
@@ -4590,6 +4602,47 @@ fn two_await_activation_shape_matches(
             MachineTerminator::Return(values) if values.is_empty())
         && state_zero.resume_block == middle.id
         && state_one.resume_block == terminal.id
+}
+
+fn exact_machine_activation_call_tail(
+    module: &MachineWir,
+    caller: &MachineFunction,
+    callee: &MachineFunction,
+    block: &MachineBlock,
+    call: &MachineInstruction,
+) -> Option<usize> {
+    if block.instructions.last() != Some(call) {
+        return None;
+    }
+    let MachineOperation::Call { arguments, .. } = &call.operation else {
+        return None;
+    };
+    match (callee.parameters.as_slice(), arguments.as_slice()) {
+        ([], []) => Some(1),
+        ([parameter], [argument]) => {
+            let argument_instruction = block
+                .instructions
+                .get(block.instructions.len().checked_sub(2)?)?;
+            matches!(argument_instruction.results.as_slice(), [value] if value == argument)
+                .then_some(())?;
+            matches!(&argument_instruction.operation,
+                MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le })
+                    if *ty == callee.result && bytes_le.len() == 8)
+            .then_some(())?;
+            (exact_machine_u64_type(module, callee.result)
+                && caller
+                    .values
+                    .get(argument.0 as usize)
+                    .is_some_and(|value| value.ty == callee.result)
+                && callee
+                    .values
+                    .get(parameter.0 as usize)
+                    .is_some_and(|value| value.ty == callee.result)
+                && argument_instruction.source.is_some())
+            .then_some(2)
+        }
+        _ => None,
+    }
 }
 
 fn structured_scope_activation_shape_matches(
@@ -4746,7 +4799,6 @@ fn immediate_activation_callee_matches(module: &MachineWir, callee: &MachineFunc
     let u64_result = exact_bounded_u64_activation_callee(module, callee);
     callee.role == MachineFunctionRole::Ordinary
         && callee.convention == CallingConvention::Internal
-        && callee.parameters.is_empty()
         && (unit || u64_result)
 }
 
@@ -4778,12 +4830,12 @@ fn exact_bounded_u64_activation_callee(module: &MachineWir, callee: &MachineFunc
     let [block] = callee.blocks.as_slice() else {
         return false;
     };
-    let [call, constant, first, tail @ ..] = block.instructions.as_slice() else {
+    let [initial, constant, first, tail @ ..] = block.instructions.as_slice() else {
         return false;
     };
-    let (left, right) = match (
-        &call.operation,
-        call.results.as_slice(),
+    let (left, right, parameterized) = match (
+        &initial.operation,
+        initial.results.as_slice(),
         &constant.operation,
         constant.results.as_slice(),
     ) {
@@ -4818,7 +4870,35 @@ fn exact_bounded_u64_activation_callee(module: &MachineWir, callee: &MachineFunc
                         && exact_constant_u64_machine_function(module, seed)
                 }) =>
         {
-            (*left, *right)
+            (*left, *right, false)
+        }
+        (
+            MachineOperation::Convert {
+                op: ConversionOp::Bitcast,
+                value: parameter,
+                destination,
+            },
+            [left],
+            MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le }),
+            [right],
+        ) if *destination == callee.result
+            && *ty == callee.result
+            && bytes_le.len() == 8
+            && callee.parameters.as_slice() == [*parameter]
+            && callee
+                .values
+                .get(parameter.0 as usize)
+                .is_some_and(|value| value.ty == callee.result)
+            && callee
+                .values
+                .get(left.0 as usize)
+                .is_some_and(|value| value.ty == callee.result)
+            && callee
+                .values
+                .get(right.0 as usize)
+                .is_some_and(|value| value.ty == callee.result) =>
+        {
+            (*left, *right, true)
         }
         _ => return false,
     };
@@ -4860,10 +4940,10 @@ fn exact_bounded_u64_activation_callee(module: &MachineWir, callee: &MachineFunc
         _ => return false,
     };
     exact_machine_u64_type(module, callee.result)
-        && callee.parameters.is_empty()
+        && (parameterized || callee.parameters.is_empty())
         && block.id == callee.entry
         && block.parameters.is_empty()
-        && call.source.is_some()
+        && initial.source.is_some()
         && constant.source.is_some()
         && matches!(&block.terminator,
             MachineTerminator::Return(values) if values.as_slice() == [final_sum])

@@ -8,10 +8,10 @@ use wrela_backend::{
     MachineLowerError, MachineLoweringLimits, OptimizationLimits, OptimizationProfile,
     emit_prepared_object, flow_wir as flow, llvm_backend_available,
     machine_wir::{
-        BackendProofKind, CallingConvention, MachineActivationCancellation, MachineActivationOwner,
-        MachineActivationSchedule, MachineFunctionRole, MachineImmediate, MachineOperation,
-        MachineRegionStorageKind, MachineTerminator, MachineTypeKind, SectionKind,
-        SymbolDefinition, ValidationError,
+        BackendProofKind, CallingConvention, ConversionOp, MachineActivationCancellation,
+        MachineActivationOwner, MachineActivationSchedule, MachineFunctionRole, MachineImmediate,
+        MachineOperation, MachineRegionStorageKind, MachineTerminator, MachineTypeKind,
+        SectionKind, SymbolDefinition, ValidationError,
     },
     prepare_canonical_frame_for_codegen, prepare_for_codegen,
 };
@@ -49,11 +49,8 @@ const ACTOR_SOURCE: &str = r#"module app
 
 from core.image import Image, Target
 
-fn seed() -> u64:
-    return 40
-
-async fn checkpoint() -> u64:
-    left: u64 = seed()
+async fn checkpoint(seed: u64) -> u64:
+    left: u64 = seed
     right: u64 = 1
     middle: u64 = left + right
     return middle + right
@@ -61,13 +58,13 @@ async fn checkpoint() -> u64:
 @service
 pub struct Worker:
     pub async fn ping(mut self):
-        first: u64 = await checkpoint()
-        second: u64 = await checkpoint()
+        first: u64 = await checkpoint(40)
+        second: u64 = await checkpoint(40)
 
     @task
     async fn pulse(mut self):
-        first: u64 = await checkpoint()
-        second: u64 = await checkpoint()
+        first: u64 = await checkpoint(40)
+        second: u64 = await checkpoint(40)
 
 @image
 pub fn boot() -> Image:
@@ -288,7 +285,7 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
                             arguments,
                             activation: Some(activation),
                         } if *function == plan.callee
-                            && arguments.is_empty()
+                            && arguments.len() == 1
                             && *activation == plan.id
                     ) && statement.source == Some(plan.source)
             )
@@ -392,22 +389,18 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
     let [helper_block] = helper.blocks.as_slice() else {
         panic!("computed helper has one Flow block");
     };
-    let [helper_call, helper_constant, helper_binary, helper_tail] =
+    let [helper_copy, helper_constant, helper_binary, helper_tail] =
         helper_block.instructions.as_slice()
     else {
-        panic!("computed helper has one call, constant, and two checked adds");
+        panic!("computed helper has one parameter copy, constant, and two checked adds");
     };
-    let (seed_function, helper_left) =
-        match (&helper_call.operation, helper_call.results.as_slice()) {
-            (
-                flow::FlowOperation::Call {
-                    function,
-                    arguments,
-                },
-                [left],
-            ) if arguments.is_empty() => (*function, *left),
-            other => panic!("computed helper seed call: {other:?}"),
-        };
+    let [helper_parameter] = helper.parameters.as_slice() else {
+        panic!("computed helper has one u64 parameter");
+    };
+    let helper_left = match (&helper_copy.operation, helper_copy.results.as_slice()) {
+        (flow::FlowOperation::Copy { value }, [left]) if value == helper_parameter => *left,
+        other => panic!("computed helper parameter copy: {other:?}"),
+    };
     let helper_right = match (
         &helper_constant.operation,
         helper_constant.results.as_slice(),
@@ -444,26 +437,6 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         helper_block.terminator,
         flow::Terminator::Return(vec![helper_final])
     );
-    let seed = &flow.functions[seed_function.0 as usize];
-    assert_eq!(seed.role, flow::FunctionRole::Ordinary);
-    assert_eq!(seed.color, flow::FunctionColor::Sync);
-    assert!(seed.parameters.is_empty());
-    let [seed_block] = seed.blocks.as_slice() else {
-        panic!("seed has one Flow block");
-    };
-    assert!(matches!(
-        seed_block.instructions.as_slice(),
-        [flow::Instruction {
-            results,
-            operation: flow::FlowOperation::Immediate(flow::Immediate::Integer {
-                bits: 64,
-                bytes_le,
-            }),
-            ..
-        }] if bytes_le.as_slice() == 40_u64.to_le_bytes()
-            && matches!(&seed_block.terminator, flow::Terminator::Return(values)
-                if values.as_slice() == results.as_slice())
-    ));
     let activation = flow
         .types
         .iter()
@@ -535,55 +508,54 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
             assert_eq!(capacity.depends_on.as_slice(), [cleanup]);
         }
 
-        assert_eq!(function.values[1].ty, *helper_result);
-        assert_eq!(function.values[2].ty, activation.id);
-        assert_eq!(function.values[3].ty, *helper_result);
-        assert_eq!(function.values[4].ty, activation.id);
         let [entry, middle, resume] = function.blocks.as_slice() else {
             panic!("one entry and two resume blocks per async actor function");
         };
-        for (state, block, plan, token, delivered, next) in [
-            (
-                0,
-                entry,
-                plans[0],
-                flow::ValueId(2),
-                flow::ValueId(1),
-                middle.id,
-            ),
-            (
-                1,
-                middle,
-                plans[1],
-                flow::ValueId(4),
-                flow::ValueId(3),
-                resume.id,
-            ),
+        for (state, block, plan, next) in [
+            (0, entry, plans[0], middle.id),
+            (1, middle, plans[1], resume.id),
         ] {
-            let [call] = block.instructions.as_slice() else {
-                panic!("one async call before each suspension");
+            let [argument, call] = block.instructions.as_slice() else {
+                panic!("one literal argument and async call before each suspension");
             };
-            assert_eq!(call.results.as_slice(), [token]);
+            let [argument_value] = argument.results.as_slice() else {
+                panic!("activation argument defines one u64");
+            };
+            assert!(matches!(
+                &argument.operation,
+                flow::FlowOperation::Immediate(flow::Immediate::Integer { bits: 64, bytes_le })
+                    if bytes_le.as_slice() == 40_u64.to_le_bytes()
+            ));
+            assert_eq!(
+                function.values[argument_value.0 as usize].ty,
+                *helper_result
+            );
+            let [token] = call.results.as_slice() else {
+                panic!("async call defines one activation token");
+            };
+            assert_eq!(call.results.as_slice(), [*token]);
             assert!(matches!(
                 &call.operation,
                 flow::FlowOperation::AsyncCall {
                     function: callee,
                     arguments,
                     plan: activation_plan,
-                } if *callee == helper.id && arguments.is_empty() && *activation_plan == plan.id
+                } if *callee == helper.id
+                    && arguments.as_slice() == [*argument_value]
+                    && *activation_plan == plan.id
             ));
             assert_eq!(
                 block.terminator,
                 flow::Terminator::Suspend {
                     state,
-                    activation: token,
+                    activation: *token,
                     resume: next,
                 }
             );
-            assert_eq!(
-                function.blocks[next.0 as usize].parameters.as_slice(),
-                [delivered]
-            );
+            let [delivered] = function.blocks[next.0 as usize].parameters.as_slice() else {
+                panic!("typed resume defines one delivered u64");
+            };
+            assert_eq!(function.values[delivered.0 as usize].ty, *helper_result);
         }
         assert_eq!(resume.terminator, flow::Terminator::Return(Vec::new()));
     }
@@ -710,8 +682,8 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
     std::mem::swap(left, right);
     prepare_forged_flow(swapped_tail, "swapped computed async helper tail operands");
 
-    let mut argumented = flow.clone();
-    let argument_helper = &mut argumented.functions[helper.id.0 as usize];
+    let mut over_arity = flow.clone();
+    let argument_helper = &mut over_arity.functions[helper.id.0 as usize];
     let helper_parameter = flow::ValueId(argument_helper.values.len() as u32);
     argument_helper.values.push(flow::Value {
         id: helper_parameter,
@@ -720,9 +692,9 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         source: argument_helper.source,
     });
     argument_helper.parameters.push(helper_parameter);
-    let argumented_plans = argumented.activations.clone();
+    let argumented_plans = over_arity.activations.clone();
     for plan in &argumented_plans {
-        let caller = &mut argumented.functions[plan.caller.0 as usize];
+        let caller = &mut over_arity.functions[plan.caller.0 as usize];
         let argument = flow::ValueId(caller.values.len() as u32);
         caller.values.push(flow::Value {
             id: argument,
@@ -769,7 +741,7 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         );
         block.instructions.insert(call_index + 1, call);
     }
-    for caller in &mut argumented.functions {
+    for caller in &mut over_arity.functions {
         let mut instruction = 0_u32;
         for block in &mut caller.blocks {
             for operation in &mut block.instructions {
@@ -778,7 +750,24 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
             }
         }
     }
-    prepare_forged_flow(argumented, "argumented async helper");
+    prepare_forged_flow(over_arity, "two-argument async helper");
+
+    let mut substituted_argument = flow.clone();
+    let second_actor_plan = substituted_argument.activations[1].clone();
+    let actor_caller = &mut substituted_argument.functions[second_actor_plan.caller.0 as usize];
+    let retained_first_result = actor_caller.blocks[1].parameters[0];
+    let second_call = actor_caller.blocks[1]
+        .instructions
+        .last_mut()
+        .expect("second actor activation call");
+    let flow::FlowOperation::AsyncCall { arguments, .. } = &mut second_call.operation else {
+        panic!("second actor activation operation");
+    };
+    arguments[0] = retained_first_result;
+    prepare_forged_flow(
+        substituted_argument,
+        "substituted same-typed activation argument",
+    );
 
     let mut non_u64 = flow.clone();
     let signed_type = *helper_result;
@@ -1078,41 +1067,24 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
     let [helper_block] = machine_helper.blocks.as_slice() else {
         panic!("computed typed async helper has one machine block");
     };
-    let [helper_call, helper_constant, helper_binary, helper_tail] =
+    let [helper_bridge, helper_constant, helper_binary, helper_tail] =
         helper_block.instructions.as_slice()
     else {
-        panic!("computed typed async helper has call, constant, and two checked adds");
+        panic!("computed typed async helper has parameter bridge, constant, and two checked adds");
     };
-    let [helper_left] = helper_call.results.as_slice() else {
-        panic!("computed helper call defines one u64");
+    let [helper_parameter] = machine_helper.parameters.as_slice() else {
+        panic!("computed helper has one machine u64 parameter");
     };
-    let MachineOperation::Call {
-        function: seed_function,
-        arguments: seed_arguments,
-        convention: CallingConvention::Internal,
-    } = &helper_call.operation
-    else {
-        panic!("computed helper calls the exact synchronous seed");
-    };
-    assert!(seed_arguments.is_empty());
-    let seed = &machine.functions[seed_function.0 as usize];
-    let [seed_block] = seed.blocks.as_slice() else {
-        panic!("seed has one block");
-    };
-    let [seed_constant] = seed_block.instructions.as_slice() else {
-        panic!("seed has one constant");
-    };
-    let [seed_value] = seed_constant.results.as_slice() else {
-        panic!("seed defines one u64");
+    let [helper_left] = helper_bridge.results.as_slice() else {
+        panic!("computed helper parameter bridge defines one u64");
     };
     assert!(matches!(
-        &seed_constant.operation,
-        MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le })
-            if *ty == machine_helper.result && bytes_le.as_slice() == 40_u64.to_le_bytes()
-    ));
-    assert!(matches!(
-        &seed_block.terminator,
-        MachineTerminator::Return(values) if values.as_slice() == [*seed_value]
+        &helper_bridge.operation,
+        MachineOperation::Convert {
+            op: ConversionOp::Bitcast,
+            value,
+            destination,
+        } if *value == *helper_parameter && *destination == machine_helper.result
     ));
     let [helper_right] = helper_constant.results.as_slice() else {
         panic!("computed helper constant defines one u64");
@@ -1163,6 +1135,15 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
             .instructions
             .last()
             .expect("typed activation call");
+        let argument = &call_block.instructions[call_block.instructions.len() - 2];
+        let [argument_value] = argument.results.as_slice() else {
+            panic!("typed activation argument defines one u64");
+        };
+        assert!(matches!(
+            &argument.operation,
+            MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le })
+                if *ty == machine_helper.result && bytes_le.as_slice() == 40_u64.to_le_bytes()
+        ));
         let [delivered] = call.results.as_slice() else {
             panic!("typed activation call defines one delivered u64");
         };
@@ -1176,7 +1157,7 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
                 function,
                 arguments,
                 convention: CallingConvention::Internal,
-            } if *function == machine_helper.id && arguments.is_empty()
+            } if *function == machine_helper.id && arguments.as_slice() == [*argument_value]
         ));
         assert!(matches!(
             &call_block.terminator,
@@ -1458,6 +1439,30 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
             .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
     );
 
+    let mut substituted_machine_argument = machine.clone();
+    let first_task_call = substituted_machine_argument.functions[task_caller].blocks[0]
+        .instructions
+        .last()
+        .expect("first task activation call")
+        .results[0];
+    let second_task_call = substituted_machine_argument.functions[task_caller].blocks[1]
+        .instructions
+        .last_mut()
+        .expect("second task activation call");
+    let MachineOperation::Call { arguments, .. } = &mut second_task_call.operation else {
+        panic!("second task machine activation call");
+    };
+    arguments[0] = first_task_call;
+    assert!(
+        substituted_machine_argument
+            .validate_for_target(&target)
+            .expect_err("activation argument must remain its adjacent literal value")
+            .0
+            .contains(&ValidationError::InvalidActivationPlan(
+                task_second_activation.id
+            ))
+    );
+
     let mut forged_resume_parameter = machine.clone();
     forged_resume_parameter.functions[task_caller].blocks[task_activation.resume_block.0 as usize]
         .parameters
@@ -1485,24 +1490,23 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
             .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
     );
 
-    let mut forged_callee_constant = machine.clone();
-    let seed_id = seed.id.0 as usize;
-    let MachineOperation::Immediate(MachineImmediate::Integer { bytes_le, .. }) =
-        &mut forged_callee_constant.functions[seed_id].blocks[0].instructions[0].operation
+    let helper_id = machine_helper.id.0 as usize;
+    let mut forged_parameter_bridge = machine.clone();
+    let MachineOperation::Convert { destination, .. } =
+        &mut forged_parameter_bridge.functions[helper_id].blocks[0].instructions[0].operation
     else {
-        panic!("typed helper seed constant");
+        panic!("typed helper parameter bridge");
     };
-    bytes_le.pop();
+    *destination = machine.types[0].id;
     assert!(
-        forged_callee_constant
+        forged_parameter_bridge
             .validate_for_target(&target)
-            .expect_err("typed activation helper constant must remain exact u64")
+            .expect_err("typed activation helper parameter bridge must remain exact u64")
             .0
             .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
     );
 
     let mut forged_computation = machine.clone();
-    let helper_id = machine_helper.id.0 as usize;
     let MachineOperation::CheckedInteger { left, right, .. } =
         &mut forged_computation.functions[helper_id].blocks[0].instructions[2].operation
     else {

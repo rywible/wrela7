@@ -1608,6 +1608,9 @@ fn lower_activation_subset(
         let entry = call_site.entry;
         let call = call_site.call;
         let resume = call_site.resume;
+        let call_tail = exact_activation_call_tail(input, caller, callee, entry, call);
+        let call_arguments_supported = call_tail == Some(1)
+            || (two_await_chain && call_tail == Some(2) && !call_site.structured_scope);
         let message_shape = match (owner, schedule, dispatch) {
             (
                 MachineActivationOwner::Actor { actor, .. },
@@ -1672,12 +1675,14 @@ fn lower_activation_subset(
                 None,
             ) => {
                 call_site.structured_scope
-                    || exact_actor_state_prefix(
-                        input,
-                        caller,
-                        actor.id,
-                        &entry.instructions[..entry.instructions.len().saturating_sub(1)],
-                    )
+                    || call_tail.is_some_and(|tail| {
+                        exact_actor_state_prefix(
+                            input,
+                            caller,
+                            actor.id,
+                            &entry.instructions[..entry.instructions.len().saturating_sub(tail)],
+                        )
+                    })
             }
             (
                 MachineActivationOwner::Task { .. },
@@ -1757,7 +1762,7 @@ fn lower_activation_subset(
                 }
             }
             (MachineActivationOwner::Task { .. }, MachineActivationSchedule::StartupOnce, None) => {
-                entry.instructions.len() == 1
+                call_tail == Some(entry.instructions.len())
             }
             _ => false,
         };
@@ -1787,32 +1792,29 @@ fn lower_activation_subset(
             &call.operation,
             flow::FlowOperation::AsyncCall {
                 function,
-                arguments,
+                arguments: _,
                 plan: call_plan,
-            } if *function == plan.callee && arguments.is_empty() && *call_plan == plan.id
-        );
+            } if *function == plan.callee && *call_plan == plan.id
+        ) && call_arguments_supported;
         let resume_result_matches = matches!(resume.parameters.as_slice(), [value]
             if caller.values.get(value.0 as usize).is_some_and(|value| value.ty == result));
         let resume_matches = resume.id == resume_id
             && resume_result_matches
             && if two_await_chain && state == 0 {
-                matches!(
-                    (resume.instructions.as_slice(), &resume.terminator),
-                    ([next], flow::Terminator::Suspend {
-                        state: 1,
-                        activation,
-                        resume: final_block,
-                    }) if matches!(
-                        (&next.operation, next.results.as_slice()),
-                        (
-                            flow::FlowOperation::AsyncCall {
-                                function,
-                                arguments,
-                                plan: next_plan,
-                            },
-                            [next_activation],
-                        ) if *function == plan.callee
-                            && arguments.is_empty()
+                resume.instructions.last().is_some_and(|next| {
+                    matches!(
+                        (&next.operation, next.results.as_slice(), &resume.terminator),
+                        (flow::FlowOperation::AsyncCall {
+                            function,
+                            arguments: _,
+                            plan: next_plan,
+                        }, [next_activation], flow::Terminator::Suspend {
+                            state: 1,
+                            activation,
+                            resume: final_block,
+                        }) if *function == plan.callee
+                            && exact_activation_call_tail(input, caller, callee, resume, next)
+                                .is_some()
                             && *next_activation == *activation
                             && input.activations.get(next_plan.0 as usize).is_some_and(|next_plan| {
                                 next_plan.id.0 != plan.id.0
@@ -1826,7 +1828,7 @@ fn lower_activation_subset(
                                         flow::Terminator::Return(values) if values.is_empty())
                             })
                     )
-                )
+                })
             } else {
                 resume.instructions.is_empty()
                     && matches!(&resume.terminator, flow::Terminator::Return(values) if values.is_empty())
@@ -1842,7 +1844,6 @@ fn lower_activation_subset(
             result_is_u64 && exact_bounded_u64_activation_callee(input, callee, result);
         let callee_matches = callee.role == flow::FunctionRole::Ordinary
             && callee.color == flow::FunctionColor::Async
-            && callee.parameters.is_empty()
             && (unit_callee_matches || u64_callee_matches);
         let mut caller_has_capacity = false;
         for proof in &caller.proofs {
@@ -1997,6 +1998,46 @@ fn flow_type_is_exact_u64(input: &flow::FlowWir, ty: flow::TypeId) -> bool {
     })
 }
 
+fn exact_activation_call_tail(
+    input: &flow::FlowWir,
+    caller: &flow::FlowFunction,
+    callee: &flow::FlowFunction,
+    block: &flow::Block,
+    call: &flow::Instruction,
+) -> Option<usize> {
+    if block.instructions.last() != Some(call) {
+        return None;
+    }
+    let flow::FlowOperation::AsyncCall { arguments, .. } = &call.operation else {
+        return None;
+    };
+    match (callee.parameters.as_slice(), arguments.as_slice()) {
+        ([], []) => Some(1),
+        ([parameter], [argument]) => {
+            let argument_instruction = block
+                .instructions
+                .get(block.instructions.len().checked_sub(2)?)?;
+            matches!(argument_instruction.results.as_slice(), [value] if value == argument)
+                .then_some(())?;
+            matches!(&argument_instruction.operation,
+                flow::FlowOperation::Immediate(flow::Immediate::Integer {
+                    bits: 64,
+                    bytes_le,
+                }) if bytes_le.len() == 8)
+            .then_some(())?;
+            let [result] = callee.result_types.as_slice() else {
+                return None;
+            };
+            (flow_type_is_exact_u64(input, *result)
+                && flow_value_type(callee, *parameter).ok() == Some(*result)
+                && flow_value_type(caller, *argument).ok() == Some(*result)
+                && argument_instruction.source.is_some())
+            .then_some(2)
+        }
+        _ => None,
+    }
+}
+
 fn exact_constant_u64_flow_function(
     input: &flow::FlowWir,
     function: &flow::FlowFunction,
@@ -2032,12 +2073,12 @@ fn exact_bounded_u64_activation_callee(
     let [block] = callee.blocks.as_slice() else {
         return false;
     };
-    let [call, constant, first, tail @ ..] = block.instructions.as_slice() else {
+    let [initial, constant, first, tail @ ..] = block.instructions.as_slice() else {
         return false;
     };
-    let (left, right) = match (
-        &call.operation,
-        call.results.as_slice(),
+    let (left, right, parameterized) = match (
+        &initial.operation,
+        initial.results.as_slice(),
         &constant.operation,
         constant.results.as_slice(),
     ) {
@@ -2064,7 +2105,20 @@ fn exact_bounded_u64_activation_callee(
                         && exact_constant_u64_flow_function(input, seed, result)
                 }) =>
         {
-            (*left, *right)
+            (*left, *right, false)
+        }
+        (
+            flow::FlowOperation::Copy { value: parameter },
+            [left],
+            flow::FlowOperation::Immediate(flow::Immediate::Integer { bits: 64, bytes_le }),
+            [right],
+        ) if bytes_le.len() == 8
+            && callee.parameters.as_slice() == [*parameter]
+            && flow_value_type(callee, *parameter).ok() == Some(result)
+            && flow_value_type(callee, *left).ok() == Some(result)
+            && flow_value_type(callee, *right).ok() == Some(result) =>
+        {
+            (*left, *right, true)
         }
         _ => return false,
     };
@@ -2100,9 +2154,10 @@ fn exact_bounded_u64_activation_callee(
         _ => return false,
     };
     callee.result_types.as_slice() == [result]
+        && (parameterized || callee.parameters.is_empty())
         && block.id == callee.entry
         && block.parameters.is_empty()
-        && call.source.is_some()
+        && initial.source.is_some()
         && constant.source.is_some()
         && matches!(&block.terminator,
             flow::Terminator::Return(values) if values.as_slice() == [final_sum])
@@ -2352,7 +2407,7 @@ fn authenticated_activation_call_site<'a>(
         return Err(boundary());
     }
     Ok(AuthenticatedActivationCallSite {
-        entry,
+        entry: fallthrough,
         call,
         resume,
         state: suspend_state,
@@ -5978,7 +6033,7 @@ fn validate_supported_operation(
             function: callee,
             arguments,
             plan,
-        } if arguments.is_empty()
+        } if arguments.len() <= 1
             && activations.iter().any(|activation| {
                 activation.id.0 == plan.0
                     && activation.caller.0 == function.id.0
