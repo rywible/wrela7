@@ -314,6 +314,30 @@ fn native_pair_argument_reaches_reader():
     return
 "#;
 
+const NATIVE_PAIR_RESULT_SOURCE: &str = r#"module app.duration
+
+pub struct Pair:
+    pub count: u32
+    pub total: u64
+
+pub fn make_pair(count: u32, total: u64) -> Pair:
+    return Pair(count=count, total=total)
+
+pub fn call_builder() -> u64:
+    value: Pair = make_pair(count=1, total=42)
+    return value.total
+"#;
+
+const NATIVE_PAIR_RESULT_TEST_SOURCE: &str = r#"module app.duration_test
+
+from app.duration import call_builder
+
+@test(runtime)
+fn native_pair_result_reaches_caller():
+    observed: u64 = call_builder()
+    return
+"#;
+
 const SCALAR_VIEW_SOURCE: &str = r#"module app.duration
 
 pub struct Packet:
@@ -1800,6 +1824,230 @@ fn two_field_owned_argument_reaches_scalar_reader_and_deterministic_coff() {
         Ok(first) => {
             let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
                 .expect("repeat owned aggregate argument native object emission");
+            assert_eq!(first.bytes(), second.bytes());
+        }
+    }
+}
+
+#[test]
+fn two_field_owned_result_reaches_caller_and_deterministic_coff() {
+    let fixture = fixture(NATIVE_PAIR_RESULT_SOURCE, NATIVE_PAIR_RESULT_TEST_SOURCE);
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed(&fixture),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("owned two-field result lowers to SemanticWir");
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.into_parts().0,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("owned two-field result lowers to FlowWir");
+    let flow_wir = flow.into_parts().0;
+    let mut forged_flow = flow_wir.as_wir().clone();
+    let builder = forged_flow
+        .functions
+        .iter_mut()
+        .find(|function| {
+            function.result_types.len() == 1
+                && function.blocks.iter().any(|block| {
+                    matches!(
+                        block.instructions.as_slice(),
+                        [instruction]
+                            if matches!(instruction.operation, FlowOperation::MakeAggregate { .. })
+                    )
+                })
+        })
+        .expect("exact FlowWir aggregate builder");
+    let built = builder.blocks[0].instructions[0].results[0];
+    let forged_value = flow::ValueId(builder.values.len() as u32);
+    builder.values.push(flow::Value {
+        id: forged_value,
+        ty: builder.result_types[0],
+        source_name: Some("forged_copy".to_owned()),
+        source: builder.source,
+    });
+    builder.blocks[0].instructions.push(flow::Instruction {
+        id: flow::InstructionId(1),
+        results: vec![forged_value],
+        operation: flow::FlowOperation::Copy { value: built },
+        source: builder.source,
+    });
+    builder.blocks[0].terminator = flow::Terminator::Return(vec![forged_value]);
+    let forged_flow = forged_flow
+        .validate()
+        .expect("extra builder computation remains structurally valid FlowWir");
+    let forged_encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &forged_flow,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("forged builder FlowWir canonical frame");
+    let forged_error = prepare_canonical_frame_for_codegen(
+        forged_encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect_err("Machine lowering must reauthenticate the exact builder body");
+    assert_eq!(
+        forged_error.machine_lower_error(),
+        Some(&MachineLowerError::UnsupportedInput {
+            feature: "machine-flat-structure-operation-lowering-pending",
+        })
+    );
+
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("owned two-field result FlowWir canonical frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("owned two-field result reaches MachineWir");
+    let machine = prepared.machine().wir().as_wir();
+    assert!(machine.functions.iter().any(|function| {
+        function.parameters.len() == 2
+            && matches!(
+                machine.types[function.result.0 as usize].kind,
+                MachineTypeKind::Struct { ref fields, packed: false } if fields.len() == 2
+            )
+            && matches!(
+                function.blocks.as_slice(),
+                [block]
+                    if matches!(block.instructions.as_slice(), [instruction]
+                        if matches!(instruction.operation, MachineOperation::MakeStruct { .. }))
+            )
+    }));
+
+    let codec = CanonicalFlowWirCodec;
+    let hasher = CanonicalBackendContentHasher::new();
+    let optimizer = CanonicalFlowOptimizer::new();
+    let machine_lowerer = CanonicalMachineLowerer::new();
+    let expected_digest = hasher
+        .sha256(encoded.bytes(), &never_cancelled)
+        .expect("owned aggregate-result frame digest");
+    let optimization = OptimizationProfile::from_build_policy(
+        &fixture.build.profile.optimization,
+        fixture.build.identity.compiler,
+    )
+    .expect("owned aggregate-result optimization profile");
+    let prepare_with = |machine_limits: MachineLoweringLimits, is_cancelled: &dyn Fn() -> bool| {
+        prepare_for_codegen(
+            BackendPreparationServices {
+                codec: &codec,
+                hasher: &hasher,
+                optimizer: &optimizer,
+                machine_lowerer: &machine_lowerer,
+            },
+            encoded.bytes(),
+            expected_digest,
+            &fixture.target,
+            &fixture.build,
+            BackendPreparationOptions {
+                codec_limits: CodecLimits::standard(),
+                optimization: optimization.clone(),
+                optimization_limits: OptimizationLimits::standard(),
+                machine_limits,
+            },
+            is_cancelled,
+        )
+    };
+    let instruction_count = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .map(|block| block.instructions.len() as u64)
+        .sum::<u64>();
+    let mut exact_limits = MachineLoweringLimits::standard();
+    exact_limits.types = machine.types.len() as u64;
+    exact_limits.functions = machine.functions.len() as u64;
+    exact_limits.sections = machine.sections.len() as u32;
+    exact_limits.symbols = machine.symbols.len() as u32;
+    exact_limits.globals = machine.globals.len() as u32;
+    exact_limits.instructions = instruction_count;
+    exact_limits.stack_slots = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_slots.len() as u64)
+        .sum::<u64>()
+        .max(1);
+    exact_limits.proofs = machine.proofs.len() as u32;
+    exact_limits.static_bytes = machine
+        .sections
+        .iter()
+        .map(|section| section.reserved_bytes)
+        .sum();
+    exact_limits.stack_bytes_per_function = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_bytes)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    exact_limits = exact_limits.with_aligned_validation();
+    let exact = prepare_with(exact_limits, &never_cancelled)
+        .expect("owned aggregate result accepts its exact instruction ceiling");
+    assert_eq!(exact.machine().wir().as_wir(), machine);
+
+    let mut one_under = exact_limits;
+    one_under.instructions = one_under.instructions.saturating_sub(1);
+    one_under = one_under.with_aligned_validation();
+    let one_under_error = prepare_with(one_under, &never_cancelled)
+        .expect_err("one fewer MachineWir result instruction must fail closed");
+    assert_eq!(
+        one_under_error.machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir instructions",
+            limit: instruction_count - 1,
+        })
+    );
+
+    let polls = Cell::new(0_u64);
+    prepare_with(MachineLoweringLimits::standard(), &|| {
+        polls.set(polls.get().saturating_add(1));
+        false
+    })
+    .expect("count owned aggregate-result preparation polls");
+    let cancel_at = polls.get().saturating_sub(2);
+    assert!(cancel_at > 2);
+    let cancelled = Cell::new(0_u64);
+    let cancellation = prepare_with(MachineLoweringLimits::standard(), &|| {
+        let next = cancelled.get().saturating_add(1);
+        cancelled.set(next);
+        next >= cancel_at
+    })
+    .expect_err("late aggregate-result preparation cancellation must propagate");
+    assert!(cancellation.is_cancelled());
+    assert!(cancelled.get() >= cancel_at);
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("two-field result native object emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat two-field result native object emission");
             assert_eq!(first.bytes(), second.bytes());
         }
     }

@@ -5021,12 +5021,18 @@ fn validate_native_struct_locality_contract(
     } else {
         None
     };
+    let builder_state = input
+        .map(|input| authenticated_flat_structure_builder(input, function, is_cancelled))
+        .transpose()?
+        .flatten();
     if function.parameters.iter().copied().any(|parameter| {
         native(parameter)
             && cleanup_state != flow_value_type(function, parameter).ok()
             && reader_state != flow_value_type(function, parameter).ok()
     }) || function.result_types.iter().copied().any(|ty| {
-        flat_u64_struct_field(types, ty).is_none() && flat_native_struct_fields(types, ty).is_some()
+        flat_u64_struct_field(types, ty).is_none()
+            && flat_native_struct_fields(types, ty).is_some()
+            && builder_state != Some(ty)
     }) {
         return Err(unsupported(
             "machine-flat-structure-function-boundary-lowering-pending",
@@ -5044,6 +5050,17 @@ fn validate_native_struct_locality_contract(
                         | flow::FlowOperation::Move { .. }
                         | flow::FlowOperation::Copy { .. }
                 )
+                && !input
+                    .map(|input| {
+                        authenticated_flat_structure_builder_call(
+                            input,
+                            function,
+                            instruction,
+                            is_cancelled,
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(false)
             {
                 return Err(unsupported(
                     "machine-flat-structure-operation-lowering-pending",
@@ -5100,10 +5117,113 @@ fn validate_native_struct_locality_contract(
                     ));
                 }
             }
-            validate_native_struct_terminator_use(&block.terminator, value)?;
+            validate_native_struct_terminator_use(
+                &block.terminator,
+                value,
+                builder_state == flow_value_type(function, value).ok(),
+            )?;
         }
     }
     check_cancelled(is_cancelled)
+}
+
+/// Authenticate the first owned-aggregate result boundary without widening
+/// the general aggregate ABI. The callee is exactly a two-field primitive
+/// flat-structure builder: two scalar parameters, one construction, and one
+/// return of that construction.
+fn authenticated_flat_structure_builder(
+    input: &flow::FlowWir,
+    function: &flow::FlowFunction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<flow::TypeId>, MachineLowerError> {
+    check_cancelled(is_cancelled)?;
+    let flow::FunctionOrigin::SourceSemantic { semantic_function } = function.origin else {
+        return Ok(None);
+    };
+    let ([first, second], [result_ty], [block]) = (
+        function.parameters.as_slice(),
+        function.result_types.as_slice(),
+        function.blocks.as_slice(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(field_types) = flat_native_struct_fields(&input.types, *result_ty) else {
+        return Ok(None);
+    };
+    let ([instruction], flow::Terminator::Return(returned)) =
+        (block.instructions.as_slice(), &block.terminator)
+    else {
+        return Ok(None);
+    };
+    let ([built], flow::FlowOperation::MakeAggregate { ty, fields }) =
+        (instruction.results.as_slice(), &instruction.operation)
+    else {
+        return Ok(None);
+    };
+    let exact = semantic_function == function.id.0
+        && function.role == flow::FunctionRole::Ordinary
+        && function.color == flow::FunctionColor::Sync
+        && function.entry == block.id
+        && block.id == flow::BlockId(0)
+        && block.parameters.is_empty()
+        && function.stack_bound == 0
+        && function.frame_bound == 0
+        && function.source.is_some()
+        && instruction.source.is_some()
+        && field_types.len() == 2
+        && function.values.len() == 3
+        && *ty == *result_ty
+        && fields.as_slice() == [*first, *second]
+        && returned.as_slice() == [*built]
+        && function
+            .values
+            .get(first.0 as usize)
+            .is_some_and(|value| value.ty == field_types[0])
+        && function
+            .values
+            .get(second.0 as usize)
+            .is_some_and(|value| value.ty == field_types[1])
+        && function
+            .values
+            .get(built.0 as usize)
+            .is_some_and(|value| value.ty == *result_ty);
+    Ok(exact.then_some(*result_ty))
+}
+
+fn authenticated_flat_structure_builder_call(
+    input: &flow::FlowWir,
+    caller: &flow::FlowFunction,
+    instruction: &flow::Instruction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, MachineLowerError> {
+    let flow::FlowOperation::Call {
+        function: callee,
+        arguments,
+    } = &instruction.operation
+    else {
+        return Ok(false);
+    };
+    let Some(callee) = input.functions.get(callee.0 as usize) else {
+        return Ok(false);
+    };
+    let Some(result_ty) = authenticated_flat_structure_builder(input, callee, is_cancelled)? else {
+        return Ok(false);
+    };
+    let ([result], [first, second]) = (instruction.results.as_slice(), arguments.as_slice()) else {
+        return Ok(false);
+    };
+    let [callee_first, callee_second] = callee.parameters.as_slice() else {
+        return Ok(false);
+    };
+    Ok(matches!(caller.origin,
+            flow::FunctionOrigin::SourceSemantic { semantic_function }
+                if semantic_function == caller.id.0)
+        && caller.role == flow::FunctionRole::Ordinary
+        && caller.color == flow::FunctionColor::Sync
+        && instruction.source.is_some()
+        && flow_value_type(caller, *result).ok() == Some(result_ty)
+        && flow_value_type(caller, *first).ok() == flow_value_type(callee, *callee_first).ok()
+        && flow_value_type(caller, *second).ok() == flow_value_type(callee, *callee_second).ok())
 }
 
 /// Authenticate the first ordinary owned-aggregate function boundary without
@@ -5520,12 +5640,17 @@ fn for_each_flow_operation_value(
 fn validate_native_struct_terminator_use(
     terminator: &flow::Terminator,
     sought: flow::ValueId,
+    authenticated_builder_result: bool,
 ) -> Result<(), MachineLowerError> {
     match terminator {
         flow::Terminator::Jump { .. } => Ok(()),
-        flow::Terminator::Return(values) if values.contains(&sought) => Err(unsupported(
-            "machine-flat-structure-function-boundary-lowering-pending",
-        )),
+        flow::Terminator::Return(values)
+            if values.contains(&sought) && !authenticated_builder_result =>
+        {
+            Err(unsupported(
+                "machine-flat-structure-function-boundary-lowering-pending",
+            ))
+        }
         flow::Terminator::TailCall { arguments, .. } if arguments.contains(&sought) => Err(
             unsupported("machine-flat-structure-function-boundary-lowering-pending"),
         ),

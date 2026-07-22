@@ -2138,6 +2138,7 @@ fn validate_function(
     validate_scalar_value_types(&machine.types, &function.values, is_cancelled)?;
     let cleanup_state = authenticated_cleanup_boundary_state(machine, function, is_cancelled)?;
     let reader_state = authenticated_flat_structure_reader_state(machine, function);
+    let builder_state = authenticated_flat_structure_builder_state(machine, function);
     poll_values(&function.parameters, is_cancelled)?;
     for (parameter_index, parameter) in function.parameters.iter().enumerate() {
         check_periodically(parameter_index, is_cancelled)?;
@@ -2149,7 +2150,7 @@ fn validate_function(
             ));
         }
     }
-    if !is_return_type(machine, function.result) {
+    if !is_return_type(machine, function.result) && builder_state != Some(function.result) {
         return Err(CodegenError::UnsupportedMachineContract(
             "non-scalar function result",
         ));
@@ -2238,6 +2239,10 @@ fn validate_operation(
                 value_type(machine, function, *argument)
                     .is_some_and(|ty| !is_basic_scalar(machine, ty))
             });
+            let has_aggregate_result = instruction.results.iter().any(|result| {
+                value_type(machine, function, *result)
+                    .is_some_and(|ty| !is_basic_scalar(machine, ty))
+            });
             if has_aggregate
                 && !authenticated_generated_cleanup_call(
                     machine,
@@ -2269,6 +2274,19 @@ fn validate_operation(
                     "unauthenticated ordinary aggregate reader call"
                 };
                 return Err(CodegenError::UnsupportedMachineContract(boundary));
+            }
+            if has_aggregate_result
+                && !authenticated_flat_structure_builder_call(
+                    machine,
+                    function,
+                    instruction,
+                    *callee,
+                    arguments,
+                )
+            {
+                return Err(CodegenError::UnsupportedMachineContract(
+                    "unauthenticated ordinary aggregate builder call",
+                ));
             }
         }
         MachineOperation::RuntimeCall { intrinsic, .. }
@@ -2951,6 +2969,94 @@ fn authenticated_flat_structure_reader_state(
         && value_type(machine, callee, *projected) == Some(callee.result)
         && is_basic_scalar(machine, callee.result))
     .then_some(parameter_ty)
+}
+
+/// Independently authenticate the narrow aggregate-result ABI admitted by
+/// machine lowering: one private ordinary function with two scalar parameters,
+/// one exact two-field construction, and a return of that construction.
+fn authenticated_flat_structure_builder_state(
+    machine: &wrela_machine_wir::MachineWir,
+    callee: &MachineFunction,
+) -> Option<MachineTypeId> {
+    let ([first, second], [block]) = (callee.parameters.as_slice(), callee.blocks.as_slice())
+    else {
+        return None;
+    };
+    let aggregate = machine.types.get(callee.result.0 as usize)?;
+    let MachineTypeKind::Struct {
+        fields,
+        packed: false,
+    } = &aggregate.kind
+    else {
+        return None;
+    };
+    let ([construction], MachineTerminator::Return(returned)) =
+        (block.instructions.as_slice(), &block.terminator)
+    else {
+        return None;
+    };
+    let ([built], MachineOperation::MakeStruct { ty, fields: values }) =
+        (construction.results.as_slice(), &construction.operation)
+    else {
+        return None;
+    };
+    (matches!(callee.origin,
+        MachineFunctionOrigin::SourceSemantic { semantic_function }
+            if semantic_function == callee.flow_function
+                && semantic_function == callee.id.0)
+        && callee.role == MachineFunctionRole::Ordinary
+        && callee.linkage == Linkage::Private
+        && callee.convention == CallingConvention::Internal
+        && callee.entry == block.id
+        && block.id == BlockId(0)
+        && block.parameters.is_empty()
+        && callee.stack_bytes == 0
+        && callee.stack_slots.is_empty()
+        && callee.source.is_some()
+        && construction.source.is_some()
+        && fields.len() == 2
+        && supported_struct_type(machine, callee.result)
+        && callee.values.len() == 3
+        && *ty == callee.result
+        && values.as_slice() == [*first, *second]
+        && returned.as_slice() == [*built]
+        && value_type(machine, callee, *first) == Some(fields[0].ty)
+        && value_type(machine, callee, *second) == Some(fields[1].ty)
+        && value_type(machine, callee, *built) == Some(callee.result)
+        && is_basic_scalar(machine, fields[0].ty)
+        && is_basic_scalar(machine, fields[1].ty))
+    .then_some(callee.result)
+}
+
+fn authenticated_flat_structure_builder_call(
+    machine: &wrela_machine_wir::MachineWir,
+    caller: &MachineFunction,
+    instruction: &MachineInstruction,
+    callee_id: wrela_machine_wir::FunctionId,
+    arguments: &[ValueId],
+) -> bool {
+    let Some(callee) = machine.functions.get(callee_id.0 as usize) else {
+        return false;
+    };
+    let ([first, second], [result]) = (arguments, instruction.results.as_slice()) else {
+        return false;
+    };
+    let [callee_first, callee_second] = callee.parameters.as_slice() else {
+        return false;
+    };
+    let Some(result_ty) = authenticated_flat_structure_builder_state(machine, callee) else {
+        return false;
+    };
+    matches!(caller.origin,
+        MachineFunctionOrigin::SourceSemantic { semantic_function }
+            if semantic_function == caller.flow_function
+                && semantic_function == caller.id.0)
+        && caller.role == MachineFunctionRole::Ordinary
+        && caller.convention == CallingConvention::Internal
+        && instruction.source.is_some()
+        && value_type(machine, caller, *result) == Some(result_ty)
+        && value_type(machine, caller, *first) == value_type(machine, callee, *callee_first)
+        && value_type(machine, caller, *second) == value_type(machine, callee, *callee_second)
 }
 
 fn authenticated_cleanup_boundary_state(

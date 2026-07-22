@@ -1480,6 +1480,93 @@ mod contract_tests {
         (validated, target)
     }
 
+    fn ordinary_aggregate_builder_machine_fixture() -> (ValidatedMachineWir, TargetPackage) {
+        let (validated, target) = ordinary_aggregate_reader_machine_fixture();
+        let mut machine = validated.into_wir();
+        machine.name = "ordinary-aggregate-builder".to_owned();
+        let source = machine.functions[1].source.expect("reader source");
+
+        let builder = &mut machine.functions[1];
+        builder.parameters = vec![ValueId(0), ValueId(1)];
+        builder.result = MachineTypeId(4);
+        builder.values = vec![
+            MachineValue {
+                id: ValueId(0),
+                ty: MachineTypeId(3),
+                source_name: Some("first".to_owned()),
+            },
+            MachineValue {
+                id: ValueId(1),
+                ty: MachineTypeId(3),
+                source_name: Some("second".to_owned()),
+            },
+            MachineValue {
+                id: ValueId(2),
+                ty: MachineTypeId(4),
+                source_name: Some("built".to_owned()),
+            },
+        ];
+        builder.blocks[0].instructions = vec![MachineInstruction {
+            id: InstructionId(0),
+            results: vec![ValueId(2)],
+            operation: MachineOperation::MakeStruct {
+                ty: MachineTypeId(4),
+                fields: vec![ValueId(0), ValueId(1)],
+            },
+            source: Some(source),
+        }];
+        builder.blocks[0].terminator = MachineTerminator::Return(vec![ValueId(2)]);
+
+        let caller = &mut machine.functions[2];
+        caller.values = vec![
+            MachineValue {
+                id: ValueId(0),
+                ty: MachineTypeId(3),
+                source_name: None,
+            },
+            MachineValue {
+                id: ValueId(1),
+                ty: MachineTypeId(3),
+                source_name: None,
+            },
+            MachineValue {
+                id: ValueId(2),
+                ty: MachineTypeId(4),
+                source_name: Some("pair".to_owned()),
+            },
+            MachineValue {
+                id: ValueId(3),
+                ty: MachineTypeId(3),
+                source_name: Some("observed".to_owned()),
+            },
+        ];
+        caller.blocks[0].instructions[2] = MachineInstruction {
+            id: InstructionId(2),
+            results: vec![ValueId(2)],
+            operation: MachineOperation::Call {
+                function: FunctionId(1),
+                arguments: vec![ValueId(0), ValueId(1)],
+                convention: CallingConvention::Internal,
+            },
+            source: Some(source),
+        };
+        caller.blocks[0].instructions[3] = MachineInstruction {
+            id: InstructionId(3),
+            results: vec![ValueId(3)],
+            operation: MachineOperation::ExtractField {
+                aggregate: ValueId(2),
+                field: 1,
+            },
+            source: Some(source),
+        };
+        caller.blocks[0].terminator = MachineTerminator::Return(vec![ValueId(3)]);
+
+        let validated = machine
+            .validate_for_target(&target)
+            .expect("valid ordinary aggregate builder MachineWir fixture");
+        (validated, target)
+    }
+
     fn storage_candidate() -> (MachineWir, TargetPackage) {
         let (mut machine, target) = machine_candidate();
         machine.name = "zero-initialized-storage-image".to_owned();
@@ -4538,6 +4625,63 @@ mod contract_tests {
             ),
             Err(CodegenError::UnsupportedMachineContract(
                 "void or non-scalar function parameter",
+            ))
+        );
+    }
+
+    #[test]
+    fn ordinary_two_field_builder_is_reauthenticated_and_forgery_fails_closed() {
+        let (machine, target) = ordinary_aggregate_builder_machine_fixture();
+        let request = CodegenRequest {
+            module: &machine,
+            target: target.backend(),
+            options: CodegenOptions::standard(),
+        };
+        super::preflight(&request, &|| false)
+            .expect("exact ordinary aggregate builder passes codegen preflight");
+        let first = super::ir::render_module(&request, &|| false)
+            .expect("ordinary aggregate builder renders to bounded LLVM IR");
+        let second = super::ir::render_module(&request, &|| false)
+            .expect("ordinary aggregate builder rerenders deterministically");
+        assert_eq!(first, second);
+        let text = std::str::from_utf8(&first).expect("LLVM IR is UTF-8");
+        assert!(
+            text.contains("define internal fastcc { i32, i32 } @__wrela_fn_1(i32 %v0, i32 %v1)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("call fastcc { i32, i32 } @__wrela_fn_1(i32 %v0, i32 %v1)"),
+            "{text}"
+        );
+
+        let mut forged = machine.into_wir();
+        let builder = &mut forged.functions[1];
+        builder.values.push(MachineValue {
+            id: ValueId(3),
+            ty: MachineTypeId(4),
+            source_name: Some("forged".to_owned()),
+        });
+        builder.blocks[0].instructions.push(MachineInstruction {
+            id: InstructionId(1),
+            results: vec![ValueId(3)],
+            operation: MachineOperation::Copy { value: ValueId(2) },
+            source: builder.source,
+        });
+        builder.blocks[0].terminator = MachineTerminator::Return(vec![ValueId(3)]);
+        let forged = forged
+            .validate_for_target(&target)
+            .expect("extra builder computation remains structurally valid");
+        assert_eq!(
+            super::preflight(
+                &CodegenRequest {
+                    module: &forged,
+                    target: target.backend(),
+                    options: CodegenOptions::standard(),
+                },
+                &|| false,
+            ),
+            Err(CodegenError::UnsupportedMachineContract(
+                "non-scalar function result",
             ))
         );
     }
