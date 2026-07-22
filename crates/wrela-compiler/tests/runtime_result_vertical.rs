@@ -648,7 +648,7 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
             .expect("runtime-result FlowWir");
         assert!(flow.diagnostics().is_empty());
         let flow_model = flow.wir().as_wir();
-        assert_eq!(flow_model.version, 11);
+        assert_eq!(flow_model.version, 12);
         assert!(
             flow_model.types.iter().any(
                 |ty| matches!(&ty.kind, FlowTypeKind::Enum { variants } if variants.len() == 2)
@@ -711,8 +711,8 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
             },
             &never_cancelled,
         )
-        .expect("runtime-result FlowWir v11 frame");
-        assert_eq!(encoded.header().wire_version, 11);
+        .expect("runtime-result FlowWir v12 frame");
+        assert_eq!(encoded.header().wire_version, 12);
         let prepared = prepare_canonical_frame_for_codegen(
             encoded.bytes(),
             &fixture.target,
@@ -721,7 +721,7 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
         )
         .expect("runtime-result MachineWir preparation");
         let machine = prepared.machine().wir().as_wir();
-        assert_eq!(machine.version, 12);
+        assert_eq!(machine.version, 13);
         assert!(
             machine
                 .types
@@ -768,6 +768,148 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
                 assert_eq!(digest, HASHER.sha256(second.bytes()));
                 inspect_native_object(first.bytes(), digest);
             }
+        }
+    }
+}
+
+#[test]
+fn mixed_arity_generic_enum_reaches_exact_flow_machine_and_native_coff() {
+    let fixture = source_fixture_for(
+        r#"module runtime_result.image
+
+from core.image import Image, Target
+
+pub enum Maybe[T]:
+    none
+    some(T)
+
+@image
+pub fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn mixed_arity_generic_enum_runtime():
+    match_empty()
+    match_value()
+    return
+
+fn match_empty() -> u64:
+    empty: Maybe[u64] = Maybe.none
+    match empty:
+        case Maybe.none:
+            return 0
+        case Maybe.some(payload):
+            return payload
+
+fn match_value() -> u64:
+    value: Maybe[u64] = Maybe.some(7)
+    match value:
+        case Maybe.none:
+            return 0
+        case Maybe.some(payload):
+            return payload
+"#,
+    );
+    let image = analyze_selected(&fixture, "mixed_arity_generic_enum_runtime");
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: image,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("mixed-arity generic enum SemanticWir")
+        .into_parts()
+        .0;
+    assert!(semantic.as_wir().types.iter().any(|ty| {
+        matches!(&ty.kind, SemanticTypeKind::Enum { variants }
+            if matches!(variants.as_slice(), [none, some]
+                if none.name == "none" && none.fields.is_empty()
+                    && some.name == "some" && some.fields.len() == 1))
+    }));
+
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("mixed-arity generic enum FlowWir");
+    let flow_model = flow.wir().as_wir();
+    assert!(flow_model.types.iter().any(|ty| {
+        matches!(&ty.kind, FlowTypeKind::Enum { variants }
+            if matches!(variants.as_slice(), [none, some]
+                if none.is_empty() && some.len() == 1))
+    }));
+    let flow_enum_constructors = flow_model
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.operation {
+            FlowOperation::MakeEnum {
+                variant, payload, ..
+            } => Some((*variant, payload.is_some())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(flow_enum_constructors, [(0, false), (1, true)]);
+
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("mixed-arity generic enum FlowWir v12 frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("mixed-arity generic enum MachineWir preparation");
+    let machine = prepared.machine().wir().as_wir();
+    assert!(machine.types.iter().any(|ty| {
+        matches!(&ty.kind, MachineTypeKind::TaggedEnum {
+            variants: 2,
+            payload_variants,
+            ..
+        } if payload_variants.as_slice() == [false, true])
+    }));
+    let machine_enum_constructors = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.operation {
+            MachineOperation::MakeEnum {
+                variant, payload, ..
+            } => Some((*variant, payload.is_some())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(machine_enum_constructors, [(0, false), (1, true)]);
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("mixed-arity generic enum native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat mixed-arity generic enum native emission");
+            assert_eq!(first.bytes(), second.bytes());
+            let digest = HASHER.sha256(first.bytes());
+            assert_eq!(digest, HASHER.sha256(second.bytes()));
+            inspect_native_object(first.bytes(), digest);
         }
     }
 }
@@ -1104,7 +1246,7 @@ fn checked_in_runtime_result_try_reaches_exact_early_return_switch() {
             )
             .expect("runtime-result Try FlowWir");
         assert!(flow.diagnostics().is_empty());
-        assert_eq!(flow.wir().as_wir().version, 11);
+        assert_eq!(flow.wir().as_wir().version, 12);
         let flow_propagation = flow
             .wir()
             .as_wir()
@@ -1162,8 +1304,8 @@ fn checked_in_runtime_result_try_reaches_exact_early_return_switch() {
             },
             &never_cancelled,
         )
-        .expect("runtime-result Try FlowWir v11 frame");
-        assert_eq!(encoded.header().wire_version, 11);
+        .expect("runtime-result Try FlowWir v12 frame");
+        assert_eq!(encoded.header().wire_version, 12);
         let prepared = prepare_canonical_frame_for_codegen(
             encoded.bytes(),
             &fixture.target,
@@ -1172,7 +1314,7 @@ fn checked_in_runtime_result_try_reaches_exact_early_return_switch() {
         )
         .expect("runtime-result Try MachineWir preparation");
         let machine = prepared.machine().wir().as_wir();
-        assert_eq!(machine.version, 12);
+        assert_eq!(machine.version, 13);
         let machine_propagation = machine
             .functions
             .iter()

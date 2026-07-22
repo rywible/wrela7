@@ -2975,15 +2975,17 @@ fn closed_scalar_enum_payload(types: &[flow::FlowType], ty: flow::TypeId) -> Opt
     if variants.is_empty() || variants.len() > 256 {
         return None;
     }
-    let [payload] = variants.first()?.as_slice() else {
-        return None;
-    };
-    if !variants
-        .iter()
-        .all(|variant| variant.as_slice() == [*payload])
-    {
-        return None;
+    let mut payload = None;
+    for variant in variants {
+        match variant.as_slice() {
+            [] => {}
+            [candidate] if payload.is_none_or(|payload| payload == *candidate) => {
+                payload = Some(*candidate);
+            }
+            _ => return None,
+        }
     }
+    let payload = payload?;
     matches!(
         types.get(payload.0 as usize)?.kind,
         flow::FlowTypeKind::Scalar(
@@ -2996,7 +2998,7 @@ fn closed_scalar_enum_payload(types: &[flow::FlowType], ty: flow::TypeId) -> Opt
                 | flow::ScalarType::Float64
         )
     )
-    .then_some(*payload)
+    .then_some(payload)
 }
 
 fn canonical_u8_type(types: &[flow::FlowType]) -> Option<flow::TypeId> {
@@ -4387,7 +4389,11 @@ fn for_each_flow_operation_value(
         flow::FlowOperation::MakeAggregate { fields, .. } => {
             fields.iter().copied().for_each(&mut visit)
         }
-        flow::FlowOperation::MakeEnum { payload, .. } => visit(*payload),
+        flow::FlowOperation::MakeEnum { payload, .. } => {
+            if let Some(payload) = payload {
+                visit(*payload);
+            }
+        }
         flow::FlowOperation::InsertField {
             aggregate, value, ..
         }
@@ -4845,18 +4851,26 @@ fn validate_supported_operation(
             let result = require_single_result(instruction)?;
             let payload_ty = closed_scalar_enum_payload(&input.types, *ty)
                 .ok_or(unsupported("a noncanonical enum construction"))?;
-            let variant_count = input
+            let variant_fields = input
                 .types
                 .get(ty.0 as usize)
                 .and_then(|record| match &record.kind {
-                    flow::FlowTypeKind::Enum { variants } => Some(variants.len()),
+                    flow::FlowTypeKind::Enum { variants } => {
+                        variants.get(usize::from(*variant)).map(Vec::as_slice)
+                    }
                     _ => None,
                 })
-                .ok_or(unsupported("an enum construction without an enum type"))?;
-            if usize::from(*variant) >= variant_count
-                || flow_value_type(function, result)? != *ty
-                || flow_value_type(function, *payload)? != payload_ty
-            {
+                .ok_or(unsupported(
+                    "an enum construction without a valid enum variant",
+                ))?;
+            let payload_matches = match (variant_fields, payload) {
+                ([], None) => true,
+                ([expected], Some(payload)) => {
+                    *expected == payload_ty && flow_value_type(function, *payload)? == payload_ty
+                }
+                _ => false,
+            };
+            if flow_value_type(function, result)? != *ty || !payload_matches {
                 return Err(unsupported(
                     "an enum construction with mismatched tag or payload",
                 ));
@@ -5180,9 +5194,26 @@ fn lower_types(
                 )?;
                 let size =
                     (unaligned_size + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
-                let variant_count = match &ty.kind {
-                    flow::FlowTypeKind::Enum { variants } => u16::try_from(variants.len())
-                        .map_err(|_| unsupported("an enum exceeding 256 variants"))?,
+                let (variant_count, payload_variants) = match &ty.kind {
+                    flow::FlowTypeKind::Enum { variants } => {
+                        let count = u16::try_from(variants.len())
+                            .map_err(|_| unsupported("an enum exceeding 256 variants"))?;
+                        let mut presence = try_vec(
+                            variants.len(),
+                            "machine enum payload-presence map",
+                            limits.model_edges,
+                            is_cancelled,
+                        )?;
+                        for variant in variants {
+                            check_cancelled(is_cancelled)?;
+                            match variant.as_slice() {
+                                [] => presence.push(false),
+                                [candidate] if *candidate == payload => presence.push(true),
+                                _ => return Err(unsupported("a noncanonical enum variant shape")),
+                            }
+                        }
+                        (count, presence)
+                    }
                     _ => return Err(unsupported("a non-enum tagged representation")),
                 };
                 (
@@ -5190,6 +5221,7 @@ fn lower_types(
                         tag: MachineTypeId(tag.0),
                         payload: MachineTypeId(payload.0),
                         variants: variant_count,
+                        payload_variants,
                     },
                     size,
                     alignment,
@@ -7012,7 +7044,9 @@ fn lower_operation(
         } => MachineOperation::MakeEnum {
             ty: MachineTypeId(ty.0),
             variant: *variant,
-            payload: map_value(*payload, mapping)?,
+            payload: payload
+                .map(|payload| map_value(payload, mapping))
+                .transpose()?,
         },
         flow::FlowOperation::EnumTag { value } => MachineOperation::EnumTag {
             value: map_value(*value, mapping)?,

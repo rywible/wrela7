@@ -1442,7 +1442,7 @@ fn encode_operation(writer: &mut Writer<'_>, value: &FlowOperation) -> Result<()
             writer.u8(49)?;
             writer.u32(ty.0)?;
             writer.u8(*variant)?;
-            writer.u32(payload.0)
+            writer.option(payload, |writer, payload| writer.u32(payload.0))
         }
         FlowOperation::EnumTag { value } => {
             writer.u8(50)?;
@@ -2587,7 +2587,7 @@ impl Reader<'_> {
             49 => FlowOperation::MakeEnum {
                 ty: TypeId(self.u32()?),
                 variant: self.u8()?,
-                payload: ValueId(self.u32()?),
+                payload: self.option(|reader| Ok(ValueId(reader.u32()?)))?,
             },
             50 => FlowOperation::EnumTag {
                 value: ValueId(self.u32()?),
@@ -2682,7 +2682,7 @@ mod tests {
             name: "canonical-image".to_owned(),
             build: build_identity(7),
             source_summary: SourceSummary {
-                semantic_wir_version: 10,
+                semantic_wir_version: 11,
                 semantic_functions: 2,
                 hir_files: 1,
                 hir_declarations: 2,
@@ -3076,7 +3076,7 @@ mod tests {
         harness_name.clone_from(&name);
         model
             .validate()
-            .expect("valid long-prefix FlowWir v11 fixture")
+            .expect("valid long-prefix FlowWir v12 fixture")
     }
 
     struct SubstitutingCodec<'a> {
@@ -3389,7 +3389,12 @@ mod tests {
             FlowOperation::MakeEnum {
                 ty: TypeId(3),
                 variant: 4,
-                payload: v,
+                payload: Some(v),
+            },
+            FlowOperation::MakeEnum {
+                ty: TypeId(3),
+                variant: 2,
+                payload: None,
             },
             FlowOperation::EnumTag { value: v },
             FlowOperation::EnumPayload { value: v },
@@ -3545,7 +3550,7 @@ mod tests {
                 },
             },
         ];
-        assert_eq!(operations.len(), 52);
+        assert_eq!(operations.len(), 53);
         for value in operations {
             roundtrip_operation(&value);
         }
@@ -4135,17 +4140,17 @@ mod tests {
         );
 
         let mut stale_wire = encoded.bytes.clone();
-        stale_wire[8..12].copy_from_slice(&7_u32.to_le_bytes());
+        stale_wire[8..12].copy_from_slice(&11_u32.to_le_bytes());
         assert_eq!(
             codec.inspect_header(&stale_wire, &|| false),
-            Err(CodecError::UnsupportedWireVersion(7))
+            Err(CodecError::UnsupportedWireVersion(11))
         );
 
         let mut stale_header_flow = encoded.bytes.clone();
-        stale_header_flow[12..16].copy_from_slice(&7_u32.to_le_bytes());
+        stale_header_flow[12..16].copy_from_slice(&11_u32.to_le_bytes());
         assert_eq!(
             codec.inspect_header(&stale_header_flow, &|| false),
-            Err(CodecError::UnsupportedFlowWirVersion(7))
+            Err(CodecError::UnsupportedFlowWirVersion(11))
         );
 
         let mut trailing = encoded.bytes.clone();
@@ -4199,7 +4204,7 @@ mod tests {
         let parsed = parse_header(&encoded.bytes, &|| false).expect("parsed header");
         let mut stale_payload_flow = encoded.bytes.clone();
         stale_payload_flow[parsed.payload_start..parsed.payload_start + 4]
-            .copy_from_slice(&7_u32.to_le_bytes());
+            .copy_from_slice(&11_u32.to_le_bytes());
         assert_eq!(
             codec.decode(
                 DecodeRequest {
@@ -4209,12 +4214,12 @@ mod tests {
                 },
                 &|| false,
             ),
-            Err(CodecError::UnsupportedFlowWirVersion(7))
+            Err(CodecError::UnsupportedFlowWirVersion(11))
         );
         let semantic_version_offset = parsed.payload_start + 4 + 4 + "canonical-image".len();
         let mut stale_semantic_provenance = encoded.bytes.clone();
         stale_semantic_provenance[semantic_version_offset..semantic_version_offset + 4]
-            .copy_from_slice(&5_u32.to_le_bytes());
+            .copy_from_slice(&10_u32.to_le_bytes());
         assert!(matches!(
             codec.decode(
                 DecodeRequest {
@@ -4462,7 +4467,7 @@ mod tests {
                 &|| false,
             ),
             Err(CodecError::NonCanonical(
-                "codec output differs from the canonical FlowWir v11 encoding"
+                "codec output differs from the canonical FlowWir v12 encoding"
             ))
         ));
     }
@@ -4921,7 +4926,7 @@ mod tests {
             FlowOperation::MakeEnum {
                 ty: TypeId(3),
                 variant: 4,
-                payload: ValueId(5),
+                payload: Some(ValueId(5)),
             },
             FlowOperation::EnumTag { value: ValueId(5) },
             FlowOperation::EnumPayload { value: ValueId(5) },

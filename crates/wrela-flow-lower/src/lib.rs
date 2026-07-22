@@ -1873,7 +1873,6 @@ fn supported_generated_tests<'a>(
                 {
                     return Err(unsupported("generated test closed enum types"));
                 }
-                let mut payload = None;
                 for variant in variants {
                     check_cancelled(is_cancelled)?;
                     add_bounded(
@@ -1882,17 +1881,9 @@ fn supported_generated_tests<'a>(
                         "generated test source type edges",
                         limits.model_edges,
                     )?;
-                    let [field] = variant.fields.as_slice() else {
-                        return Err(unsupported("generated test enum payload shape"));
-                    };
-                    if field.name.is_empty()
-                        && scalar_primitive(input, field.ty).is_some()
-                        && payload.is_none_or(|expected| expected == field.ty)
-                    {
-                        payload = Some(field.ty);
-                    } else {
-                        return Err(unsupported("generated test enum payload type"));
-                    }
+                }
+                if canonical_semantic_enum_payload(input, variants).is_none() {
+                    return Err(unsupported("generated test enum payload type"));
                 }
             }
             semantic::TypeKind::Array { element, length } => {
@@ -2122,24 +2113,36 @@ fn supported_source_value_type(input: &semantic::SemanticWir, ty: semantic::Type
                     .all(|field| scalar_primitive(input, field.ty).is_some())
         }
         semantic::TypeKind::Enum { variants } => {
-            let payload = variants
-                .first()
-                .and_then(|variant| variant.fields.first())
-                .map(|field| field.ty);
             record.linearity == semantic::Linearity::ExplicitCopy
                 && record.source.is_some()
                 && !variants.is_empty()
                 && variants.len() <= 256
-                && payload.is_some_and(|payload| {
-                    scalar_primitive(input, payload).is_some()
-                        && variants.iter().all(|variant| {
-                            matches!(variant.fields.as_slice(), [field]
-                                if field.name.is_empty() && field.ty == payload)
-                        })
-                })
+                && canonical_semantic_enum_payload(input, variants).is_some()
         }
         _ => false,
     }
+}
+
+fn canonical_semantic_enum_payload(
+    input: &semantic::SemanticWir,
+    variants: &[semantic::VariantType],
+) -> Option<semantic::TypeId> {
+    let mut payload = None;
+    for variant in variants {
+        match variant.fields.as_slice() {
+            [] => {}
+            [field]
+                if field.name.is_empty()
+                    && field.public
+                    && payload.is_none_or(|payload| payload == field.ty)
+                    && scalar_primitive(input, field.ty).is_some() =>
+            {
+                payload = Some(field.ty);
+            }
+            _ => return None,
+        }
+    }
+    payload
 }
 
 fn integer_primitive(primitive: semantic::PrimitiveType) -> Option<(bool, u8)> {
@@ -2597,7 +2600,7 @@ fn validate_scalar_source_function(
                         let [result] = statement.results.as_slice() else {
                             return Err(unsupported("closed enum result arity"));
                         };
-                        let expected_payload = input
+                        let expected_fields = input
                             .types
                             .get(ty.0 as usize)
                             .and_then(|record| match &record.kind {
@@ -2606,16 +2609,20 @@ fn validate_scalar_source_function(
                                 {
                                     variants
                                         .get(*variant as usize)
-                                        .and_then(|variant| variant.fields.first())
-                                        .map(|field| field.ty)
+                                        .map(|variant| variant.fields.as_slice())
                                 }
                                 _ => None,
                             })
                             .ok_or(unsupported("closed enum constructor type"))?;
-                        if scalar_value_type(function, *result) != Some(*ty)
-                            || scalar_value_type(function, *payload) != Some(expected_payload)
-                            || scalar_primitive(input, expected_payload).is_none()
-                        {
+                        let payload_matches = match (expected_fields, payload) {
+                            ([], None) => true,
+                            ([field], Some(payload)) => {
+                                scalar_value_type(function, *payload) == Some(field.ty)
+                                    && scalar_primitive(input, field.ty).is_some()
+                            }
+                            _ => false,
+                        };
+                        if scalar_value_type(function, *result) != Some(*ty) || !payload_matches {
                             return Err(unsupported("closed enum constructor payload"));
                         }
                     }
@@ -2805,14 +2812,15 @@ fn validate_scalar_source_function(
                 } => {
                     let enum_ty = scalar_value_type(function, *scrutinee)
                         .and_then(|ty| input.types.get(ty.0 as usize));
-                    let variant_count = enum_ty.and_then(|ty| match &ty.kind {
-                        semantic::TypeKind::Enum { variants } => Some(variants.len()),
+                    let variants = enum_ty.and_then(|ty| match &ty.kind {
+                        semantic::TypeKind::Enum { variants } => Some(variants.as_slice()),
                         _ => None,
                     });
                     let terminal = results.is_empty();
-                    let Some(variant_count) = variant_count else {
+                    let Some(variants) = variants else {
                         return Err(unsupported("terminal closed enum match contract"));
                     };
+                    let variant_count = variants.len();
                     if (terminal
                         && (arms.is_empty()
                             || !matches!(contract, ScalarRegionContract::Root)
@@ -2844,9 +2852,20 @@ fn validate_scalar_source_function(
                         check_cancelled(is_cancelled)?;
                         let canonical = match arm.variant {
                             Some(variant) => {
-                                seen.get_mut(variant as usize)
-                                    .is_some_and(|slot| !std::mem::replace(slot, true))
-                                    && arm.bindings.len() == 1
+                                let Some(slot) = seen.get_mut(variant as usize) else {
+                                    return Err(unsupported("enum match variant range"));
+                                };
+                                let expected_fields = variants
+                                    .get(variant as usize)
+                                    .map(|variant| variant.fields.as_slice())
+                                    .ok_or_else(|| unsupported("enum match variant type"))?;
+                                let bindings_match = expected_fields.len() == arm.bindings.len()
+                                    && expected_fields.iter().zip(&arm.bindings).all(
+                                        |(field, binding)| {
+                                            scalar_value_type(function, *binding) == Some(field.ty)
+                                        },
+                                    );
+                                !std::mem::replace(slot, true) && bindings_match
                             }
                             None => {
                                 terminal
@@ -3078,7 +3097,7 @@ fn exact_result_try_match_protocol(
         semantic::SemanticOperation::ConstructEnum {
             ty,
             variant: 1,
-            payload,
+            payload: Some(payload),
         } if ty == enum_type.id && payload == *err_binding
     ) && returned.as_slice() == [*propagated_value]
         && scalar_value_type(function, *propagated_value) == Some(enum_type.id)
@@ -5617,18 +5636,19 @@ fn lower_generated_function(
                         .get(scrutinee.0 as usize)
                         .map(|value| value.ty)
                         .ok_or_else(|| unsupported("enum match scrutinee value"))?;
-                    let (variant_count, payload_ty) = input
+                    let variants = input
                         .types
                         .get(enum_ty.0 as usize)
                         .and_then(|record| match &record.kind {
-                            semantic::TypeKind::Enum { variants } => variants
-                                .first()
-                                .and_then(|variant| variant.fields.first())
-                                .map(|field| (variants.len(), field.ty)),
+                            semantic::TypeKind::Enum { variants }
+                                if canonical_semantic_enum_payload(input, variants).is_some() =>
+                            {
+                                Some(variants.as_slice())
+                            }
                             _ => None,
                         })
                         .ok_or_else(|| unsupported("enum match scrutinee type"))?;
-                    if arms.is_empty() || arms.len() > variant_count {
+                    if arms.is_empty() || arms.len() > variants.len() {
                         return Err(unsupported("enum match exhaustiveness"));
                     }
                     let tag_ty = input
@@ -5656,23 +5676,33 @@ fn lower_generated_function(
                         "FlowWir values",
                         limits.model_edges,
                     )?;
-                    let payload = flow::ValueId(u32::try_from(values.len()).map_err(|_| {
-                        LowerError::ResourceLimit {
-                            resource: "FlowWir values",
-                            limit: limits.model_edges,
-                        }
-                    })?);
-                    push_bounded(
-                        &mut values,
-                        flow::Value {
-                            id: payload,
-                            ty: flow::TypeId(payload_ty.0),
-                            source_name: None,
-                            source: *source,
-                        },
-                        "FlowWir values",
-                        limits.model_edges,
-                    )?;
+                    let shared_payload = if variants
+                        .iter()
+                        .all(|variant| matches!(variant.fields.as_slice(), [_]))
+                    {
+                        let payload_ty = canonical_semantic_enum_payload(input, variants)
+                            .ok_or_else(|| unsupported("enum match canonical payload type"))?;
+                        let payload = flow::ValueId(u32::try_from(values.len()).map_err(|_| {
+                            LowerError::ResourceLimit {
+                                resource: "FlowWir values",
+                                limit: limits.model_edges,
+                            }
+                        })?);
+                        push_bounded(
+                            &mut values,
+                            flow::Value {
+                                id: payload,
+                                ty: flow::TypeId(payload_ty.0),
+                                source_name: None,
+                                source: *source,
+                            },
+                            "FlowWir values",
+                            limits.model_edges,
+                        )?;
+                        Some(payload)
+                    } else {
+                        None
+                    };
                     {
                         let block = pending_block_mut(&mut pending_blocks, item.block)?;
                         push_bounded(
@@ -5687,18 +5717,20 @@ fn lower_generated_function(
                             "FlowWir instructions",
                             limits.instructions,
                         )?;
-                        push_bounded(
-                            &mut block.instructions,
-                            PendingInstruction {
-                                results: vec![payload],
-                                operation: flow::FlowOperation::EnumPayload {
-                                    value: flow::ValueId(scrutinee.0),
+                        if let Some(payload) = shared_payload {
+                            push_bounded(
+                                &mut block.instructions,
+                                PendingInstruction {
+                                    results: vec![payload],
+                                    operation: flow::FlowOperation::EnumPayload {
+                                        value: flow::ValueId(scrutinee.0),
+                                    },
+                                    source: *source,
                                 },
-                                source: *source,
-                            },
-                            "FlowWir instructions",
-                            limits.instructions,
-                        )?;
+                                "FlowWir instructions",
+                                limits.instructions,
+                            )?;
+                        }
                     }
                     let mut default = None;
                     let merge_block = if results.is_empty() {
@@ -5739,19 +5771,53 @@ fn lower_generated_function(
                         let block = allocate_pending_block(&mut pending_blocks, *source, limits)?;
                         match arm.variant {
                             Some(variant) => {
-                                let [binding] = arm.bindings.as_slice() else {
-                                    return Err(unsupported("enum match payload binding"));
-                                };
-                                push_bounded(
-                                    &mut pending_block_mut(&mut pending_blocks, block)?.parameters,
-                                    flow::ValueId(binding.0),
-                                    "FlowWir block parameters",
-                                    limits.model_edges,
-                                )?;
+                                let variant_fields = variants
+                                    .get(variant as usize)
+                                    .map(|variant| variant.fields.as_slice())
+                                    .ok_or_else(|| unsupported("enum match variant range"))?;
+                                let mut arguments =
+                                    try_vec(1, "FlowWir enum case arguments", limits.model_edges)?;
+                                match (variant_fields, arm.bindings.as_slice()) {
+                                    ([], []) => {}
+                                    ([field], [binding])
+                                        if function
+                                            .values
+                                            .get(binding.0 as usize)
+                                            .is_some_and(|value| value.ty == field.ty) =>
+                                    {
+                                        if let Some(payload) = shared_payload {
+                                            push_bounded(
+                                                &mut pending_block_mut(&mut pending_blocks, block)?
+                                                    .parameters,
+                                                flow::ValueId(binding.0),
+                                                "FlowWir block parameters",
+                                                limits.model_edges,
+                                            )?;
+                                            arguments.push(payload);
+                                        } else {
+                                            push_bounded(
+                                                &mut pending_block_mut(&mut pending_blocks, block)?
+                                                    .instructions,
+                                                PendingInstruction {
+                                                    results: vec![flow::ValueId(binding.0)],
+                                                    operation: flow::FlowOperation::EnumPayload {
+                                                        value: flow::ValueId(scrutinee.0),
+                                                    },
+                                                    source: *source,
+                                                },
+                                                "FlowWir instructions",
+                                                limits.instructions,
+                                            )?;
+                                        }
+                                    }
+                                    _ => {
+                                        return Err(unsupported("enum match payload binding"));
+                                    }
+                                }
                                 cases.push(flow::SwitchCase {
                                     value: u128::from(variant),
                                     target: block,
-                                    arguments: vec![payload],
+                                    arguments,
                                 });
                             }
                             None if arm.bindings.is_empty() && results.is_empty() => {
@@ -6178,7 +6244,7 @@ fn lower_generated_operation(
             ty: flow::TypeId(ty.0),
             variant: u8::try_from(*variant)
                 .map_err(|_| unsupported("enum variant exceeds canonical u8 tag"))?,
-            payload: flow::ValueId(payload.0),
+            payload: payload.map(|payload| flow::ValueId(payload.0)),
         }),
         semantic::SemanticOperation::Project {
             base,

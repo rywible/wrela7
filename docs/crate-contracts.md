@@ -462,11 +462,11 @@ it. It injects phase implementations and bounded host capabilities, while
   preserves the analyzer's exact proof-kind vocabulary and every proof source,
   as well as function instance keys, attached proof IDs, recursive-depth
   bounds, and the HIR declaration/file bounds used to validate provenance.
-- SemanticWir v9 adds exact SSA aggregate field replacement as `InsertField`.
+- SemanticWir v11 retains exact SSA aggregate field replacement as `InsertField`.
   Validation joins the prior aggregate's struct type, selected field, inserted
-  value type, and single result of the unchanged aggregate type; FlowWir v10
+  value type, and single result of the unchanged aggregate type; FlowWir v12
   preserves the same operation and independently repeats that join.
-- MachineWir v11 retains same-block nongeneric flat values with two or more
+- MachineWir v13 retains same-block nongeneric flat values with two or more
   primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
   `InsertField`, and `ExtractField` carry exact SSA joins through independent
   validation, equality, and resource metering; LLVM renders them with
@@ -960,8 +960,8 @@ it. It injects phase implementations and bounded host capabilities, while
 - That schema is the only accepted report shape. Its tag rejects stale or
   mismatched artifacts at the trust boundary; there is no legacy reader,
   migration, adapter, or fallback contract. Its embedded interface facts must
-  be exactly SemanticWir 5, FlowWir 7, Flow wire 7, MachineWir 7, and runtime
-  ABI 1; nonzero stale or future values are rejected rather than tolerated.
+  be exactly SemanticWir 11, FlowWir 12, Flow wire 12, MachineWir 13, and runtime
+  ABI 2; nonzero stale or future values are rejected rather than tolerated.
 - Schema v10 also projects sealed actor, task, reportable region, and async
   activation plans into
   canonical dense-ID-qualified nodes, supervision edges, and capacity/frame/

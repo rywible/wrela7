@@ -190,7 +190,7 @@ fn canonical_wir(build: BuildIdentity) -> Vec<u8> {
         name: "canonical-process-image".to_owned(),
         build: build.clone(),
         source_summary: SourceSummary {
-            semantic_wir_version: 10,
+            semantic_wir_version: 11,
             semantic_functions: 1,
             hir_files: 1,
             hir_declarations: 1,
@@ -603,7 +603,7 @@ fn valid_front_boundary_reports_native_success_or_honest_default_failure() {
             u64::try_from(report_bytes.len()).expect("bounded report byte count"),
             &|| false,
         )
-        .expect("published schema-v10 report authenticates independently");
+        .expect("published schema-v13 report authenticates independently");
         assert!(report.analysis().region_capacity_evidence.is_empty());
         assert_eq!(report.backend().artifact_digest, success.artifact_digest);
         assert!(report.backend().relocation_directory_bytes > 0);

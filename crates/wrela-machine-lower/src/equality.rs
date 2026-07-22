@@ -199,16 +199,19 @@ fn type_kind_equal(
                 tag: left_tag,
                 payload: left_payload,
                 variants: left_variants,
+                payload_variants: left_payload_variants,
             },
             MachineTypeKind::TaggedEnum {
                 tag: right_tag,
                 payload: right_payload,
                 variants: right_variants,
+                payload_variants: right_payload_variants,
             },
         ) => {
             left_tag == right_tag
                 && left_payload == right_payload
                 && left_variants == right_variants
+                && fixed_slice_equal(left_payload_variants, right_payload_variants, is_cancelled)?
         }
         (
             MachineTypeKind::Function {

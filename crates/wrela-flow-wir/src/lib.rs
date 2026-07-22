@@ -13,9 +13,9 @@ use wrela_source::Span;
 
 pub use wrela_test_model::TestPlanLimits;
 
-pub const FLOW_WIR_VERSION: u32 = 11;
+pub const FLOW_WIR_VERSION: u32 = 12;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
-pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 10;
+pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 11;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -230,7 +230,8 @@ pub enum FlowOperation {
     MakeEnum {
         ty: TypeId,
         variant: u8,
-        payload: ValueId,
+        /// Present exactly when the selected variant has one payload field.
+        payload: Option<ValueId>,
     },
     /// Read the canonical u8 discriminant of an enum value.
     EnumTag {
@@ -4351,7 +4352,11 @@ fn for_each_flow_operation_value(operation: &FlowOperation, mut visit: impl FnMu
                 visit(*field);
             }
         }
-        FlowOperation::MakeEnum { payload, .. } => visit(*payload),
+        FlowOperation::MakeEnum { payload, .. } => {
+            if let Some(payload) = payload {
+                visit(*payload);
+            }
+        }
         FlowOperation::InsertField {
             aggregate, value, ..
         }
@@ -4600,6 +4605,40 @@ fn validate_flow_terminator_types(
     }
 }
 
+fn canonical_enum_payload(module: &FlowWir, variants: &[Vec<TypeId>]) -> Option<TypeId> {
+    if variants.is_empty() || variants.len() > 256 {
+        return None;
+    }
+    let mut payload = None;
+    for variant in variants {
+        match variant.as_slice() {
+            [] => {}
+            [candidate] if payload.is_none_or(|payload| payload == *candidate) => {
+                payload = Some(*candidate);
+            }
+            _ => return None,
+        }
+    }
+    payload.filter(|payload| {
+        module.types.get(payload.0 as usize).is_some_and(|record| {
+            record.copyable
+                && !record.strict_linear
+                && matches!(
+                    record.kind,
+                    FlowTypeKind::Scalar(
+                        ScalarType::Bool
+                            | ScalarType::Integer {
+                                bits: 8 | 16 | 32 | 64 | 128,
+                                ..
+                            }
+                            | ScalarType::Float32
+                            | ScalarType::Float64
+                    )
+                )
+        })
+    })
+}
+
 fn validate_type(module: &FlowWir, ty: &FlowType, errors: &mut ValidationContext<'_>) {
     macro_rules! use_type {
         ($id:expr) => {
@@ -4619,36 +4658,11 @@ fn validate_type(module: &FlowWir, ty: &FlowType, errors: &mut ValidationContext
             for id in variants.iter().flatten() {
                 use_type!(*id);
             }
-            let payload = variants
-                .first()
-                .and_then(|variant| match variant.as_slice() {
-                    [payload] => Some(*payload),
-                    _ => None,
-                });
             let canonical = !variants.is_empty()
                 && variants.len() <= 256
                 && ty.copyable
                 && !ty.strict_linear
-                && payload.is_some_and(|payload| {
-                    module.types.get(payload.0 as usize).is_some_and(|record| {
-                        record.copyable
-                            && !record.strict_linear
-                            && matches!(
-                                record.kind,
-                                FlowTypeKind::Scalar(
-                                    ScalarType::Bool
-                                        | ScalarType::Integer {
-                                            bits: 8 | 16 | 32 | 64 | 128,
-                                            ..
-                                        }
-                                        | ScalarType::Float32
-                                        | ScalarType::Float64
-                                )
-                            )
-                    }) && variants
-                        .iter()
-                        .all(|variant| variant.as_slice() == [payload])
-                });
+                && canonical_enum_payload(module, variants).is_some();
             if !canonical {
                 errors.push(ValidationError::InvalidRecord {
                     kind: "closed enum type",
@@ -4801,12 +4815,19 @@ fn validate_operation(
             payload,
         } => {
             require_id("enum type", ty.0, module.types.len(), errors);
-            value!(*payload);
+            if let Some(payload) = payload {
+                value!(*payload);
+            }
             if !module.types.get(ty.0 as usize).is_some_and(|record| {
                 matches!(&record.kind, FlowTypeKind::Enum { variants }
                     if variants.get(usize::from(*variant)).is_some_and(|fields| {
-                        matches!(fields.as_slice(), [expected]
-                            if function.values.get(payload.0 as usize).is_some_and(|value| value.ty == *expected))
+                        match (fields.as_slice(), payload) {
+                            ([], None) => true,
+                            ([expected], Some(payload)) => function.values
+                                .get(payload.0 as usize)
+                                .is_some_and(|value| value.ty == *expected),
+                            _ => false,
+                        }
                     }))
                     && matches!(instruction.results.as_slice(), [result]
                         if function.values.get(result.0 as usize).is_some_and(|value| value.ty == *ty))
@@ -4822,8 +4843,7 @@ fn validate_operation(
             let valid_enum = function.values.get(value.0 as usize).is_some_and(|value| {
                 module.types.get(value.ty.0 as usize).is_some_and(|record| {
                     matches!(&record.kind, FlowTypeKind::Enum { variants }
-                        if !variants.is_empty() && variants.len() <= 256
-                            && variants.iter().all(|fields| fields.len() == 1))
+                        if canonical_enum_payload(module, variants).is_some())
                 })
             });
             let valid_result = matches!(instruction.results.as_slice(), [result]
@@ -4849,15 +4869,7 @@ fn validate_operation(
                     .types
                     .get(value.ty.0 as usize)
                     .and_then(|record| match &record.kind {
-                        FlowTypeKind::Enum { variants }
-                            if !variants.is_empty()
-                                && variants.len() <= 256
-                                && variants
-                                    .iter()
-                                    .all(|fields| fields.as_slice() == variants[0].as_slice()) =>
-                        {
-                            variants[0].first().copied()
-                        }
+                        FlowTypeKind::Enum { variants } => canonical_enum_payload(module, variants),
                         _ => None,
                     })
             });
@@ -5620,7 +5632,7 @@ mod tests {
                             ty: TypeId(2),
                             variant: u8::try_from(variants.saturating_sub(1).min(255))
                                 .expect("bounded variant"),
-                            payload: ValueId(0),
+                            payload: Some(ValueId(0)),
                         },
                         source: Some(source),
                     },
@@ -5821,6 +5833,11 @@ mod tests {
         closed_enum_fixture(256)
             .validate()
             .expect("256-variant enum");
+        for rejected in [11, 13] {
+            let mut wrong_version = closed_enum_fixture(2);
+            wrong_version.version = rejected;
+            assert!(wrong_version.validate().is_err());
+        }
         assert!(closed_enum_fixture(0).validate().is_err());
         assert!(closed_enum_fixture(257).validate().is_err());
 
@@ -5847,6 +5864,31 @@ mod tests {
         let mut wrong_payload = closed_enum_fixture(2);
         wrong_payload.functions[1].values[3].ty = TypeId(0);
         assert!(wrong_payload.validate().is_err());
+
+        let mut mixed_arity = closed_enum_fixture(2);
+        let FlowTypeKind::Enum { variants } = &mut mixed_arity.types[2].kind else {
+            unreachable!();
+        };
+        variants[0].clear();
+        mixed_arity
+            .clone()
+            .validate()
+            .expect("unit plus unary enum is canonical");
+        let mut wrong_presence = mixed_arity.clone();
+        let FlowOperation::MakeEnum { variant, .. } =
+            &mut wrong_presence.functions[1].blocks[0].instructions[0].operation
+        else {
+            unreachable!();
+        };
+        *variant = 0;
+        assert!(wrong_presence.validate().is_err());
+        let FlowOperation::MakeEnum { payload, .. } =
+            &mut mixed_arity.functions[1].blocks[0].instructions[0].operation
+        else {
+            unreachable!();
+        };
+        *payload = None;
+        assert!(mixed_arity.validate().is_err());
     }
 
     #[test]

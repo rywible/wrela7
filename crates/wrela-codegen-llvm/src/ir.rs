@@ -709,23 +709,36 @@ fn render_instruction(
             payload,
         } => {
             let result = required_result(result)?;
-            ir.push("  %t")?;
-            ir.number(u128::from(instruction.id.0))?;
-            ir.push("_enum_tag = insertvalue ")?;
-            render_type(ir, machine, *ty)?;
-            ir.push(" poison, i8 ")?;
-            ir.number(u128::from(*variant))?;
-            ir.push(", 0\n  %v")?;
-            ir.number(u128::from(result.0))?;
-            ir.push(" = insertvalue ")?;
-            render_type(ir, machine, *ty)?;
-            ir.push(" %t")?;
-            ir.number(u128::from(instruction.id.0))?;
-            ir.push("_enum_tag, ")?;
-            render_value_type(ir, machine, function, *payload)?;
-            ir.push(" %v")?;
-            ir.number(u128::from(payload.0))?;
-            ir.push(", 1\n")?;
+            match payload {
+                Some(payload) => {
+                    ir.push("  %t")?;
+                    ir.number(u128::from(instruction.id.0))?;
+                    ir.push("_enum_tag = insertvalue ")?;
+                    render_type(ir, machine, *ty)?;
+                    ir.push(" zeroinitializer, i8 ")?;
+                    ir.number(u128::from(*variant))?;
+                    ir.push(", 0\n  %v")?;
+                    ir.number(u128::from(result.0))?;
+                    ir.push(" = insertvalue ")?;
+                    render_type(ir, machine, *ty)?;
+                    ir.push(" %t")?;
+                    ir.number(u128::from(instruction.id.0))?;
+                    ir.push("_enum_tag, ")?;
+                    render_value_type(ir, machine, function, *payload)?;
+                    ir.push(" %v")?;
+                    ir.number(u128::from(payload.0))?;
+                    ir.push(", 1\n")?;
+                }
+                None => {
+                    ir.push("  %v")?;
+                    ir.number(u128::from(result.0))?;
+                    ir.push(" = insertvalue ")?;
+                    render_type(ir, machine, *ty)?;
+                    ir.push(" zeroinitializer, i8 ")?;
+                    ir.number(u128::from(*variant))?;
+                    ir.push(", 0\n")?;
+                }
+            }
         }
         MachineOperation::EnumTag { value } => {
             render_result(ir, result)?;

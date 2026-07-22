@@ -409,7 +409,7 @@ fn canonical_checked_add_actor_state_reaches_native_machine_storage() {
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
             .expect("canonical actor state reaches MachineWir");
     let machine = prepared.machine().wir().as_wir();
-    assert_eq!(machine.version, 12);
+    assert_eq!(machine.version, 13);
     let machine_state = machine
         .region_storage
         .iter()

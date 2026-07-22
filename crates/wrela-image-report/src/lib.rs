@@ -19,10 +19,10 @@ pub use decode::decode_image_report_json;
 /// as [`ReportError::UnsupportedSchema`].
 pub const REPORT_SCHEMA_VERSION: u32 = 13;
 
-const CURRENT_SEMANTIC_WIR_VERSION: u32 = 10;
-const CURRENT_FLOW_WIR_VERSION: u32 = 11;
-const CURRENT_FLOW_WIR_WIRE_VERSION: u32 = 11;
-const CURRENT_MACHINE_WIR_VERSION: u32 = 12;
+const CURRENT_SEMANTIC_WIR_VERSION: u32 = 11;
+const CURRENT_FLOW_WIR_VERSION: u32 = 12;
+const CURRENT_FLOW_WIR_WIRE_VERSION: u32 = 12;
+const CURRENT_MACHINE_WIR_VERSION: u32 = 13;
 const CURRENT_RUNTIME_ABI_VERSION: u32 = 2;
 
 /// One finite capacity or memory fact established by the build.
@@ -3515,10 +3515,10 @@ mod tests {
             sections: Vec::new(),
             symbols: Vec::new(),
             representations: super::RepresentationFacts {
-                semantic_wir_version: 10,
-                flow_wir_version: 11,
-                flow_wir_wire_version: 11,
-                machine_wir_version: 12,
+                semantic_wir_version: 11,
+                flow_wir_version: 12,
+                flow_wir_wire_version: 12,
+                machine_wir_version: 13,
                 runtime_abi_version: 2,
                 optimization_pipeline_name: "fixture".to_owned(),
                 optimization_pipeline_revision: 1,
@@ -4709,15 +4709,15 @@ mod tests {
     fn every_non_current_representation_version_fails_closed() {
         let digest = Sha256Digest::from_bytes([0x6a; 32]);
         let mutations: [fn(&mut super::RepresentationFacts); 10] = [
-            |versions| versions.semantic_wir_version = 5,
-            |versions| versions.semantic_wir_version = 7,
-            |versions| versions.flow_wir_version = 7,
-            |versions| versions.flow_wir_version = 9,
-            |versions| versions.flow_wir_wire_version = 7,
-            |versions| versions.flow_wir_wire_version = 9,
-            |versions| versions.machine_wir_version = 11,
-            |versions| versions.machine_wir_version = 13,
-            |versions| versions.runtime_abi_version = 0,
+            |versions| versions.semantic_wir_version = 10,
+            |versions| versions.semantic_wir_version = 12,
+            |versions| versions.flow_wir_version = 11,
+            |versions| versions.flow_wir_version = 13,
+            |versions| versions.flow_wir_wire_version = 11,
+            |versions| versions.flow_wir_wire_version = 13,
+            |versions| versions.machine_wir_version = 12,
+            |versions| versions.machine_wir_version = 14,
+            |versions| versions.runtime_abi_version = 1,
             |versions| versions.runtime_abi_version = 3,
         ];
 

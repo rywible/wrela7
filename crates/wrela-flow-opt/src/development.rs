@@ -2200,7 +2200,11 @@ fn map_operation_values(
         FlowOperation::MakeAggregate { fields, .. } => {
             map_value_slice(fields, value_map, "aggregate", work)?;
         }
-        FlowOperation::MakeEnum { payload, .. } => map_value(payload, value_map, work)?,
+        FlowOperation::MakeEnum { payload, .. } => {
+            if let Some(payload) = payload {
+                map_value(payload, value_map, work)?;
+            }
+        }
         FlowOperation::InsertField {
             aggregate, value, ..
         }
@@ -2710,7 +2714,11 @@ fn for_each_operation_value(
                 visit_value(*value)?;
             }
         }
-        FlowOperation::MakeEnum { payload, .. } => visit_value(*payload)?,
+        FlowOperation::MakeEnum { payload, .. } => {
+            if let Some(payload) = payload {
+                visit_value(*payload)?;
+            }
+        }
         FlowOperation::InsertField {
             aggregate, value, ..
         }

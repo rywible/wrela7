@@ -2358,18 +2358,15 @@ fn validate_supported_source_type(
             arguments,
             variants,
         } => {
-            if !arguments.is_empty()
-                && variants
-                    .iter()
-                    .any(|variant| !matches!(variant.fields.as_slice(), [_]))
-            {
+            if !arguments.is_empty() && variants.iter().all(|variant| variant.fields.is_empty()) {
                 return Err(unsupported(
-                    "semantic-generic-enum-mixed-arity-lowering-pending (unit or non-unary generic enum variants)",
+                    "semantic-generic-enum-all-unit-lowering-pending (no authenticated shared payload type)",
                 ));
             }
-            // Every variant is exactly one supported copy scalar (no unit
-            // variants); this is the payload-bearing runtime enum shape the
-            // machine lowering below packs into one shared tagged-union slot.
+            // This recognizes the older all-unary copy-scalar shape for its
+            // nongeneric heterogeneous-payload guard below. The final shape
+            // check separately admits unit variants only on a generic
+            // specialization that still has at least one scalar payload.
             let all_single_scalar_payload = !variants.is_empty()
                 && variants.iter().all(|variant| {
                     matches!(variant.fields.as_slice(), [field]
@@ -2433,15 +2430,16 @@ fn validate_supported_source_type(
                 && !variants.is_empty()
                 && variants.len() <= 256
                 && variants.iter().all(|variant| {
-                    matches!(variant.fields.as_slice(), [field]
-                    if field.name.is_empty()
-                        && field.public
-                        && facts.types.get(field.ty.0 as usize).is_some_and(|field_ty| {
-                        field_ty.linearity == sema::Linearity::ScalarCopy
-                            && matches!(field_ty.kind, sema::SemanticTypeKind::Bool
-                                | sema::SemanticTypeKind::Integer { .. }
-                                | sema::SemanticTypeKind::Float { bits: 32 | 64 })
-                    }))
+                    (!arguments.is_empty() && variant.fields.is_empty())
+                        || matches!(variant.fields.as_slice(), [field]
+                        if field.name.is_empty()
+                            && field.public
+                            && facts.types.get(field.ty.0 as usize).is_some_and(|field_ty| {
+                            field_ty.linearity == sema::Linearity::ScalarCopy
+                                && matches!(field_ty.kind, sema::SemanticTypeKind::Bool
+                                    | sema::SemanticTypeKind::Integer { .. }
+                                    | sema::SemanticTypeKind::Float { bits: 32 | 64 })
+                        }))
                 })
                 && layout.is_some_and(|(size, alignment)| {
                     ty.size_upper_bound == Some(size) && ty.alignment_lower_bound == alignment
@@ -2523,8 +2521,10 @@ fn canonical_runtime_enum_layout(
     let mut payload_size = 0_u64;
     let mut payload_alignment = 1_u32;
     for variant in variants {
-        let [field] = variant.fields.as_slice() else {
-            return None;
+        let field = match variant.fields.as_slice() {
+            [] => continue,
+            [field] => field,
+            _ => return None,
         };
         let payload = facts.types.get(field.ty.0 as usize)?;
         let size = payload.size_upper_bound?;
@@ -3474,52 +3474,23 @@ fn lower_actor_types(
                     variants.iter().zip(&source_enum.variants).enumerate()
                 {
                     check_cancelled(is_cancelled)?;
-                    let [field] = variant.fields.as_slice() else {
-                        return Err(unsupported("noncanonical actor enum payload shape"));
-                    };
-                    let [source_field] = source_variant.fields.as_slice() else {
-                        return Err(unsupported("noncanonical actor enum source payload shape"));
-                    };
-                    let source_payload_matches = if specialized_result {
-                        source_enum.generics.get(variant_index).is_some_and(|generic| {
-                            matches!(&source_field.ty.kind, wrela_hir::TypeExpressionKind::Named {
-                                definition: wrela_hir::Definition::Generic(candidate),
-                                arguments,
-                            } if candidate == generic && arguments.is_empty())
-                                && matches!(arguments.as_slice(), [sema::SemanticArgument::Type(payload), _]
-                                    if *payload == field.ty)
-                        })
-                    } else if specialized_generic_enum {
-                        generic_enum_source_payload_matches(
-                            facts,
-                            source_enum,
-                            arguments,
-                            &source_field.ty,
-                            field.ty,
-                        )
-                    } else {
-                        source_type_matches_semantic(facts, &source_field.ty, field.ty)
-                    };
-                    if variant.name != source_variant.name.as_str()
-                        || source_field.name.is_some()
-                        || !field.name.is_empty()
-                        || !field.public
-                        || !source_payload_matches
-                    {
+                    if variant.name != source_variant.name.as_str() {
                         return Err(unsupported(
                             "actor runtime enum semantic facts differ from source",
                         ));
                     }
-                    let mut fields = try_vec(
-                        1,
+                    let fields = lower_runtime_enum_variant_fields(
+                        facts,
+                        source_enum,
+                        arguments,
+                        specialized_result,
+                        specialized_generic_enum,
+                        variant_index,
+                        variant,
+                        source_variant,
                         "SemanticWir actor enum payload field",
-                        limits.model_edges,
+                        limits,
                     )?;
-                    fields.push(wir::FieldType {
-                        name: copy_text(&field.name, limits.payload_bytes)?,
-                        ty: wir::TypeId(field.ty.0),
-                        public: field.public,
-                    });
                     lowered.push(wir::VariantType {
                         name: copy_text(&variant.name, limits.payload_bytes)?,
                         fields,
@@ -4601,49 +4572,23 @@ fn lower_source_types(
                     variants.iter().zip(&source_enum.variants).enumerate()
                 {
                     check_cancelled(is_cancelled)?;
-                    let [field] = variant.fields.as_slice() else {
-                        return Err(unsupported("noncanonical enum payload shape"));
-                    };
-                    let [source_field] = source_variant.fields.as_slice() else {
-                        return Err(unsupported("noncanonical enum source payload shape"));
-                    };
-                    let source_payload_matches = if specialized_result {
-                        source_enum.generics.get(variant_index).is_some_and(|generic| {
-                            matches!(&source_field.ty.kind, wrela_hir::TypeExpressionKind::Named {
-                                definition: wrela_hir::Definition::Generic(candidate),
-                                arguments,
-                            } if candidate == generic && arguments.is_empty())
-                                && matches!(arguments.as_slice(), [sema::SemanticArgument::Type(payload), _]
-                                    if *payload == field.ty)
-                        })
-                    } else if specialized_generic_enum {
-                        generic_enum_source_payload_matches(
-                            facts,
-                            source_enum,
-                            arguments,
-                            &source_field.ty,
-                            field.ty,
-                        )
-                    } else {
-                        source_type_matches_semantic(facts, &source_field.ty, field.ty)
-                    };
-                    if variant.name != source_variant.name.as_str()
-                        || source_field.name.is_some()
-                        || !field.name.is_empty()
-                        || !field.public
-                        || !source_payload_matches
-                    {
+                    if variant.name != source_variant.name.as_str() {
                         return Err(unsupported(
                             "runtime enum semantic facts differ from source",
                         ));
                     }
-                    let mut fields =
-                        try_vec(1, "SemanticWir enum payload field", limits.model_edges)?;
-                    fields.push(wir::FieldType {
-                        name: copy_text(&field.name, limits.payload_bytes)?,
-                        ty: wir::TypeId(field.ty.0),
-                        public: field.public,
-                    });
+                    let fields = lower_runtime_enum_variant_fields(
+                        facts,
+                        source_enum,
+                        arguments,
+                        specialized_result,
+                        specialized_generic_enum,
+                        variant_index,
+                        variant,
+                        source_variant,
+                        "SemanticWir enum payload field",
+                        limits,
+                    )?;
                     lowered.push(wir::VariantType {
                         name: copy_text(&variant.name, limits.payload_bytes)?,
                         fields,
@@ -4887,6 +4832,70 @@ fn generic_enum_source_payload_matches(
                 matches!(argument, sema::SemanticArgument::Type(argument) if *argument == ty)
             }),
         _ => source_type_matches_semantic(facts, source, ty),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_runtime_enum_variant_fields(
+    facts: &sema::PartialAnalysis,
+    source_enum: &wrela_hir::EnumDeclaration,
+    arguments: &[sema::SemanticArgument],
+    specialized_result: bool,
+    specialized_generic_enum: bool,
+    variant_index: usize,
+    variant: &sema::SemanticVariant,
+    source_variant: &wrela_hir::EnumVariant,
+    resource: &'static str,
+    limits: LoweringLimits,
+) -> Result<Vec<wir::FieldType>, LowerError> {
+    match (variant.fields.as_slice(), source_variant.fields.as_slice()) {
+        ([], []) if specialized_generic_enum && !specialized_result => {
+            try_vec(0, resource, limits.model_edges)
+        }
+        ([field], [source_field]) => {
+            let source_payload_matches = if specialized_result {
+                source_enum
+                    .generics
+                    .get(variant_index)
+                    .is_some_and(|generic| {
+                        matches!(&source_field.ty.kind, wrela_hir::TypeExpressionKind::Named {
+                        definition: wrela_hir::Definition::Generic(candidate),
+                        arguments,
+                    } if candidate == generic && arguments.is_empty())
+                            && matches!(arguments, [sema::SemanticArgument::Type(payload), _]
+                            if *payload == field.ty)
+                    })
+            } else if specialized_generic_enum {
+                generic_enum_source_payload_matches(
+                    facts,
+                    source_enum,
+                    arguments,
+                    &source_field.ty,
+                    field.ty,
+                )
+            } else {
+                source_type_matches_semantic(facts, &source_field.ty, field.ty)
+            };
+            if source_field.name.is_some()
+                || !field.name.is_empty()
+                || !field.public
+                || !source_payload_matches
+            {
+                return Err(unsupported(
+                    "runtime enum semantic facts differ from source payload",
+                ));
+            }
+            let mut fields = try_vec(1, resource, limits.model_edges)?;
+            fields.push(wir::FieldType {
+                name: copy_text(&field.name, limits.payload_bytes)?,
+                ty: wir::TypeId(field.ty.0),
+                public: field.public,
+            });
+            Ok(fields)
+        }
+        _ => Err(unsupported(
+            "runtime enum semantic facts differ from source payload shape",
+        )),
     }
 }
 
@@ -5744,7 +5753,7 @@ struct InlineIfInput {
 
 struct PendingLoweredMatchArm {
     variant: u32,
-    binding: wir::ValueId,
+    binding: Option<wir::ValueId>,
     guard: Option<wir::ValueId>,
     guard_prelude: Vec<wir::SemanticStatement>,
     body: wir::SemanticRegion,
@@ -7086,9 +7095,9 @@ impl SourceFunctionLowerer<'_> {
                                 arguments,
                                 variants,
                             } if supported_runtime_enum_type_arguments(arguments)
-                                && variants
-                                    .iter()
-                                    .all(|variant| matches!(variant.fields.as_slice(), [_])) =>
+                                && variants.iter().all(|variant| {
+                                    matches!(variant.fields.as_slice(), [] | [_])
+                                }) =>
                             {
                                 Some((*declaration, variants))
                             }
@@ -7176,14 +7185,15 @@ impl SourceFunctionLowerer<'_> {
                         else {
                             return Err(self.fact_mismatch("constructor-only runtime match"));
                         };
-                        let ([candidate], [argument]) =
-                            (candidates.as_slice(), arguments.as_slice())
-                        else {
+                        let [candidate] = candidates.as_slice() else {
                             return Err(self.fact_mismatch("match constructor identity"));
                         };
-                        if candidate.enumeration.declaration != declaration || argument.take {
-                            return Err(self.fact_mismatch("match constructor payload access"));
+                        if candidate.enumeration.declaration != declaration {
+                            return Err(self.fact_mismatch("match constructor nominal identity"));
                         }
+                        let semantic_variant = semantic_variants
+                            .get(candidate.variant as usize)
+                            .ok_or_else(|| self.fact_mismatch("match variant range"))?;
                         let covered = seen_variants
                             .get_mut(candidate.variant as usize)
                             .ok_or_else(|| self.fact_mismatch("match variant range"))?;
@@ -7193,84 +7203,106 @@ impl SourceFunctionLowerer<'_> {
                         if arm.guard.is_none() {
                             *covered = true;
                         }
-                        let payload_pattern = self
-                            .input
-                            .hir()
-                            .as_program()
-                            .patterns
-                            .get(argument.pattern.0 as usize)
-                            .ok_or_else(|| self.fact_mismatch("match payload pattern"))?;
-                        let [payload_alternative] = payload_pattern.alternatives.as_slice() else {
-                            return Err(self.fact_mismatch("match payload alternatives"));
-                        };
                         let mut arm_state = local_state.copy(self.limits)?;
-                        let binding = match &payload_alternative.kind {
-                            wrela_hir::PrimaryPattern::Bind(local) => {
-                                let mut matching = statement_definitions
-                                    .iter()
-                                    .filter(|definition| definition.local == *local);
-                                let definition = matching.next().ok_or_else(|| {
-                                    self.fact_mismatch("match binding definition")
-                                })?;
-                                if matching.next().is_some()
-                                    || used_values.contains(&definition.value)
-                                {
+                        let binding =
+                            match (semantic_variant.fields.as_slice(), arguments.as_slice()) {
+                                ([], []) => None,
+                                ([field], [argument]) if !argument.take => {
+                                    let payload_pattern = self
+                                        .input
+                                        .hir()
+                                        .as_program()
+                                        .patterns
+                                        .get(argument.pattern.0 as usize)
+                                        .ok_or_else(|| {
+                                            self.fact_mismatch("match payload pattern")
+                                        })?;
+                                    let [payload_alternative] =
+                                        payload_pattern.alternatives.as_slice()
+                                    else {
+                                        return Err(
+                                            self.fact_mismatch("match payload alternatives")
+                                        );
+                                    };
+                                    match &payload_alternative.kind {
+                                        wrela_hir::PrimaryPattern::Bind(local) => {
+                                            let mut matching = statement_definitions
+                                                .iter()
+                                                .filter(|definition| definition.local == *local);
+                                            let definition = matching.next().ok_or_else(|| {
+                                                self.fact_mismatch("match binding definition")
+                                            })?;
+                                            if matching.next().is_some()
+                                                || used_values.contains(&definition.value)
+                                            {
+                                                return Err(self.fact_mismatch(
+                                                    "unique match binding definition",
+                                                ));
+                                            }
+                                            used_values.push(definition.value);
+                                            let local_record = self
+                                                .input
+                                                .hir()
+                                                .as_program()
+                                                .locals
+                                                .get(local.0 as usize)
+                                                .filter(|record| {
+                                                    record.id == *local && record.body == arm.body
+                                                })
+                                                .ok_or_else(|| {
+                                                    self.fact_mismatch(
+                                                        "match binding local ownership",
+                                                    )
+                                                })?;
+                                            let binding_record = self
+                                                .input
+                                                .facts()
+                                                .values
+                                                .get(definition.value.0 as usize)
+                                                .filter(|record| {
+                                                    record.function == self.function.id
+                                                        && record.ty == field.ty
+                                                        && record.origin
+                                                            == sema::SemanticValueOrigin::Local(
+                                                                *local,
+                                                            )
+                                                        && record.source
+                                                            == Some(local_record.source)
+                                                        && record.source_name.as_deref()
+                                                            == Some(local_record.name.as_str())
+                                                })
+                                                .ok_or_else(|| {
+                                                    self.fact_mismatch(
+                                                        "match binding value provenance",
+                                                    )
+                                                })?;
+                                            let _ = binding_record;
+                                            used_definitions += 1;
+                                            if arm_state.get(*local).is_some() {
+                                                return Err(self.fact_mismatch(
+                                                    "match binding shadows live local",
+                                                ));
+                                            }
+                                            arm_state.set(*local, definition.value)?;
+                                            Some(self.value_map.get(definition.value)?)
+                                        }
+                                        wrela_hir::PrimaryPattern::Wildcard => {
+                                            Some(self.allocate_synthetic_value(
+                                                field.ty,
+                                                statement_source,
+                                            )?)
+                                        }
+                                        _ => {
+                                            return Err(self.fact_mismatch("match payload binding"));
+                                        }
+                                    }
+                                }
+                                _ => {
                                     return Err(
-                                        self.fact_mismatch("unique match binding definition")
+                                        self.fact_mismatch("match constructor payload shape")
                                     );
                                 }
-                                used_values.push(definition.value);
-                                let local_record = self
-                                    .input
-                                    .hir()
-                                    .as_program()
-                                    .locals
-                                    .get(local.0 as usize)
-                                    .filter(|record| record.id == *local && record.body == arm.body)
-                                    .ok_or_else(|| {
-                                        self.fact_mismatch("match binding local ownership")
-                                    })?;
-                                let binding_record = self
-                                    .input
-                                    .facts()
-                                    .values
-                                    .get(definition.value.0 as usize)
-                                    .filter(|record| {
-                                        let payload_ty = semantic_variants
-                                            .get(candidate.variant as usize)
-                                            .and_then(|variant| variant.fields.first())
-                                            .map(|field| field.ty);
-                                        record.function == self.function.id
-                                            && Some(record.ty) == payload_ty
-                                            && record.origin
-                                                == sema::SemanticValueOrigin::Local(*local)
-                                            && record.source == Some(local_record.source)
-                                            && record.source_name.as_deref()
-                                                == Some(local_record.name.as_str())
-                                    })
-                                    .ok_or_else(|| {
-                                        self.fact_mismatch("match binding value provenance")
-                                    })?;
-                                let _ = binding_record;
-                                used_definitions += 1;
-                                if arm_state.get(*local).is_some() {
-                                    return Err(
-                                        self.fact_mismatch("match binding shadows live local")
-                                    );
-                                }
-                                arm_state.set(*local, definition.value)?;
-                                self.value_map.get(definition.value)?
-                            }
-                            wrela_hir::PrimaryPattern::Wildcard => {
-                                let payload_ty = semantic_variants
-                                    .get(candidate.variant as usize)
-                                    .and_then(|variant| variant.fields.first())
-                                    .map(|field| field.ty)
-                                    .ok_or_else(|| self.fact_mismatch("match payload type"))?;
-                                self.allocate_synthetic_value(payload_ty, statement_source)?
-                            }
-                            _ => return Err(self.fact_mismatch("match payload binding")),
-                        };
+                            };
                         let mut guard_prelude = try_vec(
                             0,
                             "SemanticWir match guard prelude",
@@ -7350,6 +7382,11 @@ impl SourceFunctionLowerer<'_> {
                         }
                         let mut folded = last.body;
                         if root_binding != last.binding {
+                            let (Some(root_binding), Some(last_binding)) =
+                                (root_binding, last.binding)
+                            else {
+                                return Err(self.fact_mismatch("match binding shape"));
+                            };
                             let rebound_capacity = folded.statements.len().checked_add(1).ok_or(
                                 LowerError::ResourceLimit {
                                     resource: "SemanticWir match binding copy",
@@ -7363,7 +7400,7 @@ impl SourceFunctionLowerer<'_> {
                             )?;
                             self.push_let(
                                 &mut rebound,
-                                last.binding,
+                                last_binding,
                                 wir::SemanticOperation::Copy {
                                     value: root_binding,
                                 },
@@ -7381,9 +7418,16 @@ impl SourceFunctionLowerer<'_> {
                             let mut prelude = arm.guard_prelude;
                             let mut then_region = arm.body;
                             then_region.parameters = Vec::new();
+                            let binding_copy = match (root_binding, binding) {
+                                (Some(root), Some(binding)) if root != binding => {
+                                    Some((root, binding))
+                                }
+                                (Some(_), Some(_)) | (None, None) => None,
+                                _ => return Err(self.fact_mismatch("match binding shape")),
+                            };
                             let nested_capacity = prelude
                                 .len()
-                                .checked_add(usize::from(binding != root_binding))
+                                .checked_add(usize::from(binding_copy.is_some()))
                                 .ok_or(LowerError::ResourceLimit {
                                     resource: "SemanticWir match guard prelude",
                                     limit: self.limits.model_edges,
@@ -7393,7 +7437,7 @@ impl SourceFunctionLowerer<'_> {
                                 "SemanticWir match guard prelude",
                                 self.limits.model_edges,
                             )?;
-                            if binding != root_binding {
+                            if let Some((root_binding, binding)) = binding_copy {
                                 self.push_let(
                                     &mut nested,
                                     binding,
@@ -7423,14 +7467,20 @@ impl SourceFunctionLowerer<'_> {
                             )?;
                             folded.statements = nested;
                         }
-                        folded.parameters = one_value_vec(root_binding, self.limits.model_edges)?;
+                        folded.parameters = root_binding
+                            .map(|binding| one_value_vec(binding, self.limits.model_edges))
+                            .transpose()?
+                            .unwrap_or_default();
                         lowered_arms.push(wir::SemanticMatchArm {
                             variant: Some(
                                 u32::try_from(variant_index).map_err(|_| {
                                     self.fact_mismatch("folded match variant index")
                                 })?,
                             ),
-                            bindings: one_value_vec(root_binding, self.limits.model_edges)?,
+                            bindings: root_binding
+                                .map(|binding| one_value_vec(binding, self.limits.model_edges))
+                                .transpose()?
+                                .unwrap_or_default(),
                             guard: None,
                             body: folded,
                         });
@@ -8649,29 +8699,69 @@ impl SourceFunctionLowerer<'_> {
                     .hir()
                     .resolved_variant(&source)
                     .ok_or_else(|| self.fact_mismatch("enum constructor declaration"))?;
-                let nominal_matches = self
-                    .input
-                    .facts()
-                    .types
-                    .get(ty.0 as usize)
-                    .is_some_and(|record| {
-                        matches!(&record.kind, sema::SemanticTypeKind::Enumeration {
-                            declaration,
-                            arguments,
-                            variants,
-                        } if *declaration == source.enumeration.declaration
-                            && supported_runtime_enum_type_arguments(arguments)
-                            && variants.get(variant as usize)
-                                .is_some_and(|candidate| candidate.name == source_variant.name.as_str()))
-                    });
-                if !nominal_matches
+                let semantic_variant =
+                    self.input
+                        .facts()
+                        .types
+                        .get(ty.0 as usize)
+                        .and_then(|record| match &record.kind {
+                            sema::SemanticTypeKind::Enumeration {
+                                declaration,
+                                arguments,
+                                variants,
+                            } if *declaration == source.enumeration.declaration
+                                && supported_runtime_enum_type_arguments(arguments) =>
+                            {
+                                variants.get(variant as usize)
+                            }
+                            _ => None,
+                        });
+                let Some(semantic_variant) = semantic_variant else {
+                    return Err(self.fact_mismatch("enum constructor nominal identity"));
+                };
+                if semantic_variant.name != source_variant.name.as_str()
                     || variant != source.variant
-                    || result.is_some()
                     || effects.0 != 0
                 {
                     return Err(self.fact_mismatch("enum constructor reference state"));
                 }
-                Ok(LoweredExpression::EnumConstructor(ty, variant))
+                match (
+                    semantic_variant.fields.as_slice(),
+                    source_variant.fields.as_slice(),
+                ) {
+                    ([], []) => {
+                        let expression_source = self
+                            .input
+                            .hir()
+                            .as_program()
+                            .expression(expression_id)
+                            .map(|expression| expression.source)
+                            .ok_or_else(|| self.fact_mismatch("unit enum constructor source"))?;
+                        let result = result
+                            .ok_or_else(|| self.fact_mismatch("unit enum constructor result"))?;
+                        let result = self.lowered_expression_result(
+                            expression_id,
+                            result,
+                            ty,
+                            expression_source,
+                        )?;
+                        self.push_let(
+                            statements,
+                            result,
+                            wir::SemanticOperation::ConstructEnum {
+                                ty: wir::TypeId(ty.0),
+                                variant,
+                                payload: None,
+                            },
+                            Some(expression_source),
+                        )?;
+                        Ok(LoweredExpression::Value(result))
+                    }
+                    ([_], [_]) if result.is_none() => {
+                        Ok(LoweredExpression::EnumConstructor(ty, variant))
+                    }
+                    _ => Err(self.fact_mismatch("enum constructor payload shape")),
+                }
             }
             SourceExpressionPlan::Aggregate(aggregate) => {
                 self.lower_flat_aggregate(aggregate, statements)
@@ -9286,7 +9376,7 @@ impl SourceFunctionLowerer<'_> {
             wir::SemanticOperation::ConstructEnum {
                 ty: wir::TypeId(result_try.result_type.0),
                 variant: result_try.err_variant,
-                payload: err_payload,
+                payload: Some(err_payload),
             },
             Some(result_try.source),
         )?;
@@ -9933,7 +10023,7 @@ impl SourceFunctionLowerer<'_> {
             wir::SemanticOperation::ConstructEnum {
                 ty: wir::TypeId(aggregate.ty.0),
                 variant: aggregate.variant,
-                payload,
+                payload: Some(payload),
             },
             Some(aggregate.source),
         )?;
@@ -19428,7 +19518,7 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn mixed_arity_generic_enum_lowering_fails_closed_by_name() {
+    fn mixed_arity_generic_enum_specialization_lowers_exactly() {
         let image = analyze_parsed_actor_source(
             r#"module app
 
@@ -19444,7 +19534,201 @@ async fn checkpoint():
 @service
 pub struct Worker:
     pub async fn ping(mut self):
+        empty: Maybe[u64] = Maybe.none
         value: Maybe[u64] = Maybe.some(7)
+        match empty:
+            case Maybe.none:
+                pass
+            case Maybe.some(payload):
+                pass
+        match value:
+            case Maybe.none:
+                pass
+            case Maybe.some(payload):
+                pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("mixed-arity copy-scalar generic enum specialization should lower");
+        let wir = lowered.wir().as_wir();
+        let maybe = wir
+            .types
+            .iter()
+            .find(|ty| ty.source_name == "Maybe")
+            .expect("lowered Maybe specialization");
+        assert!(matches!(&maybe.kind, wir::TypeKind::Enum { variants }
+            if matches!(variants.as_slice(), [none, some]
+                if none.name == "none" && none.fields.is_empty()
+                    && some.name == "some" && some.fields.len() == 1)));
+
+        let exact_operations = lowered.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact mixed-arity enum operation limit");
+        let mut one_under = exact;
+        one_under.operations = exact_operations - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == exact_operations - 1
+        ));
+        let polls = Cell::new(0_u64);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            )
+            .expect("measure mixed-arity enum cancellation polls");
+        let cancellation_at = polls.get();
+        let polls = Cell::new(0_u64);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next == cancellation_at
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), cancellation_at);
+
+        let payload_bindings = wir
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Match { arms, .. } => {
+                    arms.iter().find_map(|arm| match arm.bindings.as_slice() {
+                        [binding] => Some(*binding),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [first_binding, second_binding] = payload_bindings.as_slice() else {
+            panic!("both mixed-arity matches must retain one payload binding")
+        };
+        let mut forged_binding = wir.clone();
+        let mut swapped = 0_u8;
+        for function in &mut forged_binding.functions {
+            for statement in &mut function.body.statements {
+                let wir::SemanticStatement::Match { arms, .. } = statement else {
+                    continue;
+                };
+                for arm in arms {
+                    let replacement = match arm.bindings.as_slice() {
+                        [binding] if binding == first_binding => Some(*second_binding),
+                        [binding] if binding == second_binding => Some(*first_binding),
+                        _ => None,
+                    };
+                    if let Some(replacement) = replacement {
+                        arm.bindings[0] = replacement;
+                        arm.body.parameters[0] = replacement;
+                        swapped += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(swapped, 2, "both payload-arm identities must be forged");
+        let forged_binding_result = seal(
+            &LowerRequest {
+                input: image.clone(),
+                limits: LoweringLimits::standard(),
+            },
+            forged_binding,
+            lowered.report().clone(),
+            &|| false,
+        );
+        assert!(
+            matches!(forged_binding_result, Err(LowerError::InvalidReport(_))),
+            "{forged_binding_result:?}"
+        );
+
+        let mut forged = wir.clone();
+        let forged_maybe = forged
+            .types
+            .iter_mut()
+            .find(|ty| ty.source_name == "Maybe")
+            .expect("forged Maybe specialization");
+        let wir::TypeKind::Enum { variants } = &mut forged_maybe.kind else {
+            panic!("Maybe must remain an enum")
+        };
+        variants.swap(0, 1);
+        let forged_result = seal(
+            &LowerRequest {
+                input: image,
+                limits: LoweringLimits::standard(),
+            },
+            forged,
+            lowered.report().clone(),
+            &|| false,
+        );
+        assert!(
+            matches!(forged_result, Err(LowerError::InvalidOutput(_))),
+            "{forged_result:?}"
+        );
+    }
+
+    #[test]
+    fn all_unit_generic_enum_keeps_named_shared_payload_boundary() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub enum Marker[T]:
+    first
+    second
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        value: Marker[u64] = Marker.first
         await checkpoint()
 
 @image
@@ -19463,7 +19747,7 @@ pub fn boot() -> Image:
                 &|| false,
             ),
             Err(LowerError::UnsupportedInput {
-                feature: "semantic-generic-enum-mixed-arity-lowering-pending (unit or non-unary generic enum variants)"
+                feature: "semantic-generic-enum-all-unit-lowering-pending (no authenticated shared payload type)"
             })
         ));
     }

@@ -19,7 +19,7 @@ use wrela_target::{InterruptDomain, TargetError, TargetPackage};
 use wrela_test_model::{GuestTestOutcome, TestEvent, TestEventKind, TestId};
 use wrela_test_protocol::{CanonicalTestEventCodec, ProtocolLimits, TestEventCodec};
 
-pub const MACHINE_WIR_VERSION: u32 = 12;
+pub const MACHINE_WIR_VERSION: u32 = 13;
 pub const REGION_STORAGE_SECTION_PREFIX: &str = ".data$wrela$region$";
 pub const REGION_STORAGE_SYMBOL_PREFIX: &str = "__wrela_region_storage_";
 
@@ -89,6 +89,8 @@ pub enum MachineTypeKind {
         tag: MachineTypeId,
         payload: MachineTypeId,
         variants: u16,
+        /// One exact payload-presence bit per discriminant, in tag order.
+        payload_variants: Vec<bool>,
     },
     Function {
         parameters: Vec<MachineTypeId>,
@@ -504,7 +506,7 @@ pub enum MachineOperation {
     MakeEnum {
         ty: MachineTypeId,
         variant: u8,
-        payload: ValueId,
+        payload: Option<ValueId>,
     },
     EnumTag {
         value: ValueId,
@@ -736,7 +738,7 @@ pub struct MachineFunction {
     pub source: Option<Span>,
 }
 
-/// The only scheduler ownership admitted by MachineWir v12. An actor turn is
+/// The only scheduler ownership admitted by MachineWir v13. An actor turn is
 /// compiled but remains dormant until a real mailbox admission operation
 /// exists; a single-slot static task is invoked exactly once during startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -770,7 +772,7 @@ pub enum MachineActivationCancellation {
     DropCalleeThenPropagate,
 }
 
-/// Exact machine-consumer join for one FlowWir v11 immediate activation.
+/// Exact machine-consumer join for one FlowWir v12 immediate activation.
 ///
 /// The current closed subset lowers an ordinary async helper that is proven
 /// to return without another suspension into a private direct call followed
@@ -808,7 +810,7 @@ pub enum MachineRegionStorageKind {
         actor: u32,
         mailbox_capacity: u32,
     },
-    /// Canonical, actor-owned persistent state cell. MachineWir v12 admits
+    /// Canonical, actor-owned persistent state cell. MachineWir v13 admits
     /// exactly one zero-initialized `u64` cell for a stateful actor; richer
     /// state layouts remain outside this closed representation.
     ActorState {
@@ -1246,7 +1248,12 @@ fn model_resource_usage(
         }
         match &ty.kind {
             MachineTypeKind::Struct { fields, .. } => meter.edge_slice(fields)?,
-            MachineTypeKind::TaggedEnum { .. } => meter.edges(2)?,
+            MachineTypeKind::TaggedEnum {
+                payload_variants, ..
+            } => {
+                meter.edges(2)?;
+                meter.edge_slice(payload_variants)?;
+            }
             MachineTypeKind::Function { parameters, .. } => meter.edge_slice(parameters)?,
             MachineTypeKind::Void
             | MachineTypeKind::Integer { .. }
@@ -2510,6 +2517,7 @@ fn validate_type(module: &MachineWir, ty: &MachineType, errors: &mut ValidationC
             tag,
             payload,
             variants,
+            payload_variants,
         } => {
             require_id("tagged enum tag type", tag.0, module.types.len(), errors);
             require_id(
@@ -2549,7 +2557,14 @@ fn validate_type(module: &MachineWir, ty: &MachineType, errors: &mut ValidationC
                     == Some(ty.size)
                     && ty.alignment == alignment
             });
-            if *variants == 0 || *variants > 256 || !tag_valid || !payload_valid || !layout_valid {
+            if *variants == 0
+                || *variants > 256
+                || usize::from(*variants) != payload_variants.len()
+                || !payload_variants.iter().any(|present| *present)
+                || !tag_valid
+                || !payload_valid
+                || !layout_valid
+            {
                 errors.push(ValidationError::InvalidRecord {
                     kind: "tagged enum type",
                     id: ty.id.0,
@@ -5202,9 +5217,10 @@ fn for_each_operation_value(
         | MachineOperation::TestAssert {
             condition: value, ..
         } => visit(*value),
-        MachineOperation::MakeEnum { payload: value, .. }
-        | MachineOperation::EnumTag { value }
-        | MachineOperation::EnumPayload { value } => visit(*value),
+        MachineOperation::MakeEnum { payload, .. } => payload.is_none_or(&mut visit),
+        MachineOperation::EnumTag { value } | MachineOperation::EnumPayload { value } => {
+            visit(*value)
+        }
         MachineOperation::MakeStruct { fields, .. } => fields.iter().copied().all(&mut visit),
         MachineOperation::InsertField {
             aggregate, value, ..
@@ -5426,7 +5442,9 @@ fn validate_operation(
         MachineOperation::ExtractField { aggregate, .. } => value!(*aggregate),
         MachineOperation::MakeEnum { ty, payload, .. } => {
             require_id("constructed enum type", ty.0, module.types.len(), errors);
-            value!(*payload);
+            if let Some(payload) = payload {
+                value!(*payload);
+            }
         }
         MachineOperation::EnumTag { value } | MachineOperation::EnumPayload { value } => {
             value!(*value)
@@ -5879,9 +5897,12 @@ fn validate_operation_types(
                     matches!(&record.kind, MachineTypeKind::TaggedEnum {
                         payload: expected,
                         variants,
+                        payload_variants,
                         ..
                     } if u16::from(*variant) < *variants
-                        && value_ty(*payload) == Some(*expected))
+                        && payload_variants.get(usize::from(*variant)).copied()
+                            == Some(payload.is_some())
+                        && payload.is_none_or(|payload| value_ty(payload) == Some(*expected)))
                 })
         }
         MachineOperation::EnumTag { value } => {
@@ -7453,6 +7474,7 @@ mod tests {
                 tag: MachineTypeId(3),
                 payload: MachineTypeId(3),
                 variants,
+                payload_variants: vec![true; usize::from(variants)],
             },
             size: 2,
             alignment: 1,
@@ -7512,7 +7534,7 @@ mod tests {
                             ty: MachineTypeId(4),
                             variant: u8::try_from(variants.saturating_sub(1).min(255))
                                 .expect("bounded variant"),
-                            payload: ValueId(0),
+                            payload: Some(ValueId(0)),
                         },
                         source: None,
                     },
@@ -7979,6 +8001,72 @@ mod tests {
         let (mut wrong_payload, target) = closed_enum_fixture(2);
         wrong_payload.functions[1].values[3].ty = MachineTypeId(0);
         assert!(wrong_payload.validate_for_target(&target).is_err());
+
+        let (mut mixed_arity, target) = closed_enum_fixture(2);
+        let MachineTypeKind::TaggedEnum {
+            payload_variants, ..
+        } = &mut mixed_arity.types[4].kind
+        else {
+            unreachable!();
+        };
+        payload_variants[0] = false;
+        mixed_arity
+            .clone()
+            .validate_for_target(&target)
+            .expect("unit plus unary machine enum is canonical");
+        let (exact, usage) = exact_validation_policy(&mixed_arity);
+        mixed_arity
+            .clone()
+            .validate_with_limits(&target, exact, &|| false)
+            .expect("exact mixed-arity validation bound");
+        let one_under = ValidationLimits {
+            model_edges: usage.model_edges - 1,
+            ..exact
+        };
+        assert_eq!(
+            mixed_arity
+                .clone()
+                .validate_with_limits(&target, one_under, &|| false),
+            Err(ValidationFailure::ResourceLimit {
+                resource: "model edges",
+                limit: usage.model_edges - 1,
+            })
+        );
+        let polls = Cell::new(0_u64);
+        mixed_arity
+            .clone()
+            .validate_with_limits(&target, exact, &|| {
+                polls.set(polls.get() + 1);
+                false
+            })
+            .expect("measure mixed-arity cancellation polls");
+        let cancellation_at = polls.get() - 1;
+        let polls = Cell::new(0_u64);
+        assert_eq!(
+            mixed_arity
+                .clone()
+                .validate_with_limits(&target, exact, &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next >= cancellation_at
+                }),
+            Err(ValidationFailure::Cancelled)
+        );
+        let mut wrong_presence = mixed_arity.clone();
+        let MachineOperation::MakeEnum { variant, .. } =
+            &mut wrong_presence.functions[1].blocks[0].instructions[0].operation
+        else {
+            unreachable!();
+        };
+        *variant = 0;
+        assert!(wrong_presence.validate_for_target(&target).is_err());
+        let MachineOperation::MakeEnum { payload, .. } =
+            &mut mixed_arity.functions[1].blocks[0].instructions[0].operation
+        else {
+            unreachable!();
+        };
+        *payload = None;
+        assert!(mixed_arity.validate_for_target(&target).is_err());
     }
 
     #[test]
@@ -8278,8 +8366,8 @@ mod tests {
     }
 
     #[test]
-    fn actor_state_schema_revision_accepts_only_exact_machine_wir_v12() {
-        assert_eq!(MACHINE_WIR_VERSION, 12);
+    fn actor_state_schema_revision_accepts_only_exact_machine_wir_v13() {
+        assert_eq!(MACHINE_WIR_VERSION, 13);
         assert_eq!(
             CheckedIntegerOp::ShiftLeft.invalid_shift_count_fatal_code(),
             Some(RuntimeFatalCode::InvalidShiftCount)
@@ -8302,12 +8390,12 @@ mod tests {
         );
         assert_eq!(CheckedIntegerOp::Add.invalid_shift_count_fatal_code(), None);
         let (module, target) = fixture();
-        for rejected in [11, 13] {
+        for rejected in [12, 14] {
             let mut changed = module.clone();
             changed.version = rejected;
             let errors = changed
                 .validate_for_target(&target)
-                .expect_err("only exact-current MachineWir v12 is accepted");
+                .expect_err("only exact-current MachineWir v13 is accepted");
             assert!(
                 errors
                     .0

@@ -2163,6 +2163,7 @@ fn supported_enum_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeI
         tag,
         payload,
         variants,
+        payload_variants,
     } = &ty.kind
     else {
         return false;
@@ -2180,6 +2181,8 @@ fn supported_enum_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeI
         .map(|size| (size + u64::from(alignment) - 1) & !(u64::from(alignment) - 1));
     *variants != 0
         && *variants <= 256
+        && usize::from(*variants) == payload_variants.len()
+        && payload_variants.iter().any(|present| *present)
         && tag_ty.kind == MachineTypeKind::Integer { bits: 8 }
         && tag_ty.size == 1
         && tag_ty.alignment == 1

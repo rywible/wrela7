@@ -16,7 +16,7 @@ pub use wrela_test_model::{
     TestDescriptor, TestId as ModelTestId, TestKind as ModelTestKind,
 };
 
-pub const SEMANTIC_WIR_VERSION: u32 = 10;
+pub const SEMANTIC_WIR_VERSION: u32 = 11;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 
 macro_rules! id_type {
@@ -335,7 +335,8 @@ pub enum SemanticOperation {
     ConstructEnum {
         ty: TypeId,
         variant: u32,
-        payload: ValueId,
+        /// Present exactly when the selected variant has one payload field.
+        payload: Option<ValueId>,
     },
     Project {
         base: ValueId,
@@ -2235,28 +2236,29 @@ fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut ValidationE
                 && variants.len() <= 256
                 && ty.linearity == Linearity::ExplicitCopy
                 && variants.iter().enumerate().all(|(index, variant)| {
-                    let scalar_payload = matches!(variant.fields.as_slice(), [field]
-                    if field.name.is_empty()
-                        && field.public
-                        && module.types.get(field.ty.0 as usize).is_some_and(|record| {
-                            record.linearity == Linearity::CopyScalar
-                                && matches!(record.kind, TypeKind::Primitive(
-                                    PrimitiveType::Bool
-                                        | PrimitiveType::I8
-                                        | PrimitiveType::I16
-                                        | PrimitiveType::I32
-                                        | PrimitiveType::I64
-                                        | PrimitiveType::I128
-                                        | PrimitiveType::U8
-                                        | PrimitiveType::U16
-                                        | PrimitiveType::U32
-                                        | PrimitiveType::U64
-                                        | PrimitiveType::U128
-                                        | PrimitiveType::F32
-                                        | PrimitiveType::F64
-                                ))
-                        }));
-                    scalar_payload
+                    let supported_shape = variant.fields.is_empty()
+                        || matches!(variant.fields.as_slice(), [field]
+                        if field.name.is_empty()
+                            && field.public
+                            && module.types.get(field.ty.0 as usize).is_some_and(|record| {
+                                record.linearity == Linearity::CopyScalar
+                                    && matches!(record.kind, TypeKind::Primitive(
+                                        PrimitiveType::Bool
+                                            | PrimitiveType::I8
+                                            | PrimitiveType::I16
+                                            | PrimitiveType::I32
+                                            | PrimitiveType::I64
+                                            | PrimitiveType::I128
+                                            | PrimitiveType::U8
+                                            | PrimitiveType::U16
+                                            | PrimitiveType::U32
+                                            | PrimitiveType::U64
+                                            | PrimitiveType::U128
+                                            | PrimitiveType::F32
+                                            | PrimitiveType::F64
+                                    ))
+                            }));
+                    supported_shape
                         && !variant.name.is_empty()
                         && !variants[..index]
                             .iter()
@@ -3370,13 +3372,19 @@ fn validate_operation(
             payload,
         } => {
             require_id("enum type", ty.0, module.types.len(), errors);
-            value!(*payload);
+            if let Some(payload) = payload {
+                value!(*payload);
+            }
             if !module.types.get(ty.0 as usize).is_some_and(|record| {
                 matches!(&record.kind, TypeKind::Enum { variants }
                     if variants.get(*variant as usize).is_some_and(|item| {
-                        matches!(item.fields.as_slice(), [field]
-                            if function.values.get(payload.0 as usize)
-                                .is_some_and(|value| value.ty == field.ty))
+                        match (item.fields.as_slice(), payload) {
+                            ([], None) => true,
+                            ([field], Some(payload)) => function.values
+                                .get(payload.0 as usize)
+                                .is_some_and(|value| value.ty == field.ty),
+                            _ => false,
+                        }
                     }))
                     && matches!(results, [result]
                         if function.values.get(result.0 as usize).is_some_and(|value| value.ty == *ty))
@@ -4314,7 +4322,7 @@ mod tests {
                         ty: TypeId(2),
                         variant: u32::try_from(variants.saturating_sub(1).min(255))
                             .expect("bounded variant"),
-                        payload: ValueId(0),
+                        payload: Some(ValueId(0)),
                     },
                     source: Some(span(0)),
                 }),
@@ -4831,6 +4839,11 @@ mod tests {
         closed_enum_fixture(256)
             .validate()
             .expect("256-variant enum");
+        for rejected in [10, 12] {
+            let mut wrong_version = closed_enum_fixture(2);
+            wrong_version.version = rejected;
+            assert!(wrong_version.validate().is_err());
+        }
         assert!(closed_enum_fixture(0).validate().is_err());
         assert!(closed_enum_fixture(257).validate().is_err());
 
@@ -4903,6 +4916,35 @@ mod tests {
         };
         *variant = 2;
         assert!(wrong_variant.validate().is_err());
+
+        let mut mixed_arity = closed_enum_fixture(2);
+        let TypeKind::Enum { variants } = &mut mixed_arity.types[2].kind else {
+            unreachable!();
+        };
+        variants[0].fields.clear();
+        mixed_arity
+            .clone()
+            .validate()
+            .expect("unit plus unary enum is canonical");
+        let mut wrong_presence = mixed_arity.clone();
+        let SemanticStatement::Let(statement) = &mut wrong_presence.functions[1].body.statements[0]
+        else {
+            unreachable!();
+        };
+        let SemanticOperation::ConstructEnum { variant, .. } = &mut statement.operation else {
+            unreachable!();
+        };
+        *variant = 0;
+        assert!(wrong_presence.validate().is_err());
+        let SemanticStatement::Let(statement) = &mut mixed_arity.functions[1].body.statements[0]
+        else {
+            unreachable!();
+        };
+        let SemanticOperation::ConstructEnum { payload, .. } = &mut statement.operation else {
+            unreachable!();
+        };
+        *payload = None;
+        assert!(mixed_arity.validate().is_err());
     }
 
     #[test]
