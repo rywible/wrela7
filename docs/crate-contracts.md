@@ -507,8 +507,14 @@ it. It injects phase implementations and bounded host capabilities, while
   `AwaitAsyncOutcome` and `AsyncOutcomeAuthenticated` proof authority. The
   validator joins the direct callee's declared `Result[u64,u64]`, the effective
   `Result[u64,AsyncExit[u64]]`, all three sealed zero-size cause identities, the
-  await source, and the base type/effect proofs. Flow lowering fails closed at
-  `flow-async-outcome-lowering-pending`; no runtime delivery ABI is claimed.
+  await source, and the base type/effect proofs. Flow lowering independently
+  reauthenticates the exact single-call/root-region profile and widens the exact
+  helper Flow result ABI plus its matching activation result. FlowWir/model+wire
+  v19 validates and canonically preserves the resulting closed enums, `Suspend`
+  delivery, outcome resume parameter, and explicit tag/payload projections and
+  switches. Machine lowering fails closed
+  at `machine-async-outcome-lowering-pending (scheduler cancellation and
+  deadline delivery)`; no runtime delivery ABI is claimed.
 - SemanticWir v15 retains the bounded inline fixed-array statement-pattern
   profile as an exact `Aggregate`, proof-bearing positional `Index`
   operations, scalar equality/boolean conjunctions, and source-ordered nested

@@ -5100,7 +5100,78 @@ fn canonical_enum_shape(module: &FlowWir, variants: &[Vec<TypeId>]) -> bool {
         && (variants.iter().all(Vec::is_empty)
             || canonical_enum_payload(module, variants).is_some()
             || exact_fixed_flat_enum_profile(module, variants)
-            || exact_heterogeneous_scalar_enum_profile(module, variants))
+            || exact_heterogeneous_scalar_enum_profile(module, variants)
+            || exact_async_exit_enum_profile(module, variants)
+            || exact_async_outcome_enum_profile(module, variants))
+}
+
+fn exact_async_exit_enum_profile(module: &FlowWir, variants: &[Vec<TypeId>]) -> bool {
+    let [operation, cancelled, deadline_rejected, deadline_exceeded] = variants else {
+        return false;
+    };
+    let ([operation], [cancelled], [deadline_rejected], [deadline_exceeded]) = (
+        operation.as_slice(),
+        cancelled.as_slice(),
+        deadline_rejected.as_slice(),
+        deadline_exceeded.as_slice(),
+    ) else {
+        return false;
+    };
+    let u64_type = module
+        .types
+        .get(operation.0 as usize)
+        .is_some_and(|record| {
+            record.id == *operation
+                && record.copyable
+                && !record.strict_linear
+                && record.kind
+                    == FlowTypeKind::Scalar(ScalarType::Integer {
+                        signed: false,
+                        bits: 64,
+                    })
+        });
+    let exact_cause = |ty: TypeId, name: &str| {
+        module.types.get(ty.0 as usize).is_some_and(|record| {
+            record.id == ty
+                && record.copyable
+                && !record.strict_linear
+                && record.name.as_deref() == Some(name)
+                && matches!(&record.kind, FlowTypeKind::Struct { fields } if fields.is_empty())
+        })
+    };
+    u64_type
+        && cancelled != deadline_rejected
+        && cancelled != deadline_exceeded
+        && deadline_rejected != deadline_exceeded
+        && exact_cause(*cancelled, "Cancelled")
+        && exact_cause(*deadline_rejected, "DeadlineRejected")
+        && exact_cause(*deadline_exceeded, "DeadlineExceeded")
+}
+
+fn exact_async_outcome_enum_profile(module: &FlowWir, variants: &[Vec<TypeId>]) -> bool {
+    let [ok, err] = variants else {
+        return false;
+    };
+    let ([ok], [exit]) = (ok.as_slice(), err.as_slice()) else {
+        return false;
+    };
+    let value_is_u64 = module.types.get(ok.0 as usize).is_some_and(|record| {
+        record.id == *ok
+            && record.copyable
+            && !record.strict_linear
+            && record.kind
+                == FlowTypeKind::Scalar(ScalarType::Integer {
+                    signed: false,
+                    bits: 64,
+                })
+    });
+    value_is_u64
+        && module.types.get(exit.0 as usize).is_some_and(|record| {
+            record.id == *exit
+                && record.name.as_deref() == Some("AsyncExit")
+                && matches!(&record.kind, FlowTypeKind::Enum { variants }
+                    if exact_async_exit_enum_profile(module, variants))
+        })
 }
 
 fn exact_heterogeneous_scalar_enum_profile(module: &FlowWir, variants: &[Vec<TypeId>]) -> bool {
@@ -5222,8 +5293,13 @@ fn validate_type(module: &FlowWir, ty: &FlowType, errors: &mut ValidationContext
             for id in variants.iter().flatten() {
                 use_type!(*id);
             }
-            let canonical =
-                ty.copyable && !ty.strict_linear && canonical_enum_shape(module, variants);
+            let async_exit = exact_async_exit_enum_profile(module, variants);
+            let async_outcome = exact_async_outcome_enum_profile(module, variants);
+            let canonical = ty.copyable
+                && !ty.strict_linear
+                && canonical_enum_shape(module, variants)
+                && (!async_exit || ty.name.as_deref() == Some("AsyncExit"))
+                && (!async_outcome || ty.name.as_deref() == Some("Result"));
             if !canonical {
                 errors.push(ValidationError::InvalidRecord {
                     kind: "closed enum type",
@@ -5646,7 +5722,9 @@ fn validate_operation(
                             None => canonical_enum_payload(module, variants),
                             Some(variant)
                                 if exact_heterogeneous_scalar_enum_profile(module, variants)
-                                    || exact_fixed_flat_enum_profile(module, variants) =>
+                                    || exact_fixed_flat_enum_profile(module, variants)
+                                    || exact_async_exit_enum_profile(module, variants)
+                                    || exact_async_outcome_enum_profile(module, variants) =>
                             {
                                 variants
                                     .get(usize::from(*variant))

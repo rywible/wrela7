@@ -1366,6 +1366,11 @@ fn lower_supported(
     request: &MachineLoweringRequest<'_>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(MachineWir, MachineLoweringReport), MachineLowerError> {
+    if has_pending_async_outcome_delivery(request.input.wir().as_wir(), is_cancelled)? {
+        return Err(unsupported(
+            "machine-async-outcome-lowering-pending (scheduler cancellation and deadline delivery)",
+        ));
+    }
     require_exact_core_zero_scheduler_ownership(request.input.wir().as_wir(), is_cancelled)?;
     if let Ok(minimum) = supported_minimum(request.input) {
         preflight_minimum_output(
@@ -1386,6 +1391,97 @@ fn lower_supported(
     } else {
         scalar::lower_scalar_image(request, is_cancelled)
     }
+}
+
+fn has_pending_async_outcome_delivery(
+    wir: &flow::FlowWir,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, MachineLowerError> {
+    for function in &wir.functions {
+        check_cancelled(is_cancelled)?;
+        for block in &function.blocks {
+            check_cancelled(is_cancelled)?;
+            let flow::Terminator::Suspend { resume, .. } = block.terminator else {
+                continue;
+            };
+            let Some(resume) = function.blocks.get(resume.0 as usize) else {
+                continue;
+            };
+            let [delivered] = resume.parameters.as_slice() else {
+                continue;
+            };
+            if function
+                .values
+                .get(delivered.0 as usize)
+                .is_some_and(|value| exact_pending_async_outcome_type(wir, value.ty))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn exact_pending_async_outcome_type(wir: &flow::FlowWir, ty: flow::TypeId) -> bool {
+    let Some(outcome) = wir.types.get(ty.0 as usize) else {
+        return false;
+    };
+    let flow::FlowTypeKind::Enum { variants } = &outcome.kind else {
+        return false;
+    };
+    let [ok, err] = variants.as_slice() else {
+        return false;
+    };
+    let ([ok], [exit]) = (ok.as_slice(), err.as_slice()) else {
+        return false;
+    };
+    let ok_is_u64 = wir.types.get(ok.0 as usize).is_some_and(|record| {
+        record.id == *ok
+            && record.kind
+                == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                    signed: false,
+                    bits: 64,
+                })
+    });
+    let exact_zero_sized_cause = |ty: flow::TypeId, name: &str| {
+        wir.types.get(ty.0 as usize).is_some_and(|record| {
+            record.id == ty
+                && record.name.as_deref() == Some(name)
+                && record.copyable
+                && !record.strict_linear
+                && matches!(&record.kind, flow::FlowTypeKind::Struct { fields } if fields.is_empty())
+        })
+    };
+    let exit_is_authenticated_shape = wir.types.get(exit.0 as usize).is_some_and(|record| {
+        let flow::FlowTypeKind::Enum { variants } = &record.kind else {
+            return false;
+        };
+        let [operation, cancelled, rejected, exceeded] = variants.as_slice() else {
+            return false;
+        };
+        let ([operation], [cancelled], [rejected], [exceeded]) = (
+            operation.as_slice(),
+            cancelled.as_slice(),
+            rejected.as_slice(),
+            exceeded.as_slice(),
+        ) else {
+            return false;
+        };
+        record.id == *exit
+            && record.name.as_deref() == Some("AsyncExit")
+            && record.copyable
+            && !record.strict_linear
+            && operation == ok
+            && exact_zero_sized_cause(*cancelled, "Cancelled")
+            && exact_zero_sized_cause(*rejected, "DeadlineRejected")
+            && exact_zero_sized_cause(*exceeded, "DeadlineExceeded")
+    });
+    outcome.id == ty
+        && outcome.name.as_deref() == Some("Result")
+        && outcome.copyable
+        && !outcome.strict_linear
+        && ok_is_u64
+        && exit_is_authenticated_shape
 }
 
 fn require_exact_core_zero_scheduler_ownership(

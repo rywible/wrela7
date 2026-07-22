@@ -287,6 +287,616 @@ enum SupportedSemantic<'a> {
     GeneratedTests(GeneratedTestSemantic<'a>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AsyncOutcomeFlowProfile {
+    caller: semantic::FunctionId,
+    callee: semantic::FunctionId,
+    declared_result: semantic::TypeId,
+    outcome: semantic::TypeId,
+    exit: semantic::TypeId,
+    causes: [semantic::TypeId; 3],
+    activation: semantic::ActivationId,
+    awaitable: semantic::ValueId,
+    callee_result_value: semantic::ValueId,
+}
+
+fn primitive_type_id_polled(
+    input: &semantic::SemanticWir,
+    primitive: semantic::PrimitiveType,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<semantic::TypeId>, LowerError> {
+    for ty in &input.types {
+        check_cancelled(is_cancelled)?;
+        if ty.kind == semantic::TypeKind::Primitive(primitive) {
+            return Ok(Some(ty.id));
+        }
+    }
+    Ok(None)
+}
+
+fn async_outcome_flow_profile(
+    input: &semantic::SemanticWir,
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<AsyncOutcomeFlowProfile>, LowerError> {
+    let mut exit_record = None;
+    let mut outcome_record = None;
+    for ty in &input.types {
+        check_cancelled(is_cancelled)?;
+        let slot = match ty.kind {
+            semantic::TypeKind::AsyncExit { .. } => &mut exit_record,
+            semantic::TypeKind::AsyncOutcome { .. } => &mut outcome_record,
+            _ => continue,
+        };
+        if slot.replace(ty).is_some() {
+            return Err(unsupported(
+                "flow-async-outcome-profile-pending (multiple or partial authenticated outcomes)",
+            ));
+        }
+    }
+    if exit_record.is_none() && outcome_record.is_none() {
+        return Ok(None);
+    }
+    let mut await_record = None;
+    for function in &input.functions {
+        check_cancelled(is_cancelled)?;
+        let mut regions = try_vec(
+            1,
+            "async-outcome authentication regions",
+            limits.model_edges,
+        )?;
+        regions.push(&function.body);
+        while let Some(region) = regions.pop() {
+            for (statement_index, statement) in region.statements.iter().enumerate() {
+                check_cancelled(is_cancelled)?;
+                match statement {
+                    semantic::SemanticStatement::Let(
+                        statement @ semantic::LetStatement {
+                            operation: semantic::SemanticOperation::AwaitAsyncOutcome { .. },
+                            ..
+                        },
+                    ) => match await_record.replace((function, region, statement_index, statement))
+                    {
+                        None => {}
+                        Some(_) => {
+                            return Err(unsupported(
+                                "flow-async-outcome-profile-pending (multiple or partial authenticated outcomes)",
+                            ));
+                        }
+                    },
+                    semantic::SemanticStatement::If {
+                        then_region,
+                        else_region,
+                        ..
+                    } => {
+                        push_bounded(
+                            &mut regions,
+                            then_region,
+                            "async-outcome authentication regions",
+                            limits.model_edges,
+                        )?;
+                        push_bounded(
+                            &mut regions,
+                            else_region,
+                            "async-outcome authentication regions",
+                            limits.model_edges,
+                        )?;
+                    }
+                    semantic::SemanticStatement::Match { arms, .. } => {
+                        for arm in arms {
+                            push_bounded(
+                                &mut regions,
+                                &arm.body,
+                                "async-outcome authentication regions",
+                                limits.model_edges,
+                            )?;
+                        }
+                    }
+                    semantic::SemanticStatement::Loop { body, .. } => push_bounded(
+                        &mut regions,
+                        body,
+                        "async-outcome authentication regions",
+                        limits.model_edges,
+                    )?,
+                    _ => {}
+                }
+            }
+        }
+    }
+    let (
+        Some(exit_record),
+        Some(outcome_record),
+        Some((caller, region, await_index, await_statement)),
+    ) = (exit_record, outcome_record, await_record)
+    else {
+        return Err(unsupported(
+            "flow-async-outcome-profile-pending (multiple or partial authenticated outcomes)",
+        ));
+    };
+    let semantic::TypeKind::AsyncExit {
+        operation_error,
+        cancelled,
+        deadline_rejected,
+        deadline_exceeded,
+    } = exit_record.kind
+    else {
+        unreachable!()
+    };
+    let semantic::TypeKind::AsyncOutcome {
+        value,
+        declared_error,
+        exit,
+    } = outcome_record.kind
+    else {
+        unreachable!()
+    };
+    let semantic::SemanticOperation::AwaitAsyncOutcome {
+        awaitable,
+        exit: operation_exit,
+        proof,
+    } = await_statement.operation
+    else {
+        unreachable!()
+    };
+    let [delivered] = await_statement.results.as_slice() else {
+        return Err(unsupported(
+            "flow-async-outcome-authentication (await result)",
+        ));
+    };
+    if exit != exit_record.id
+        || operation_exit != exit
+        || value != operation_error
+        || declared_error != operation_error
+        || !semantic_type_is(input, operation_error, semantic::PrimitiveType::U64)
+        || exit_record.source_name != "AsyncExit"
+        || outcome_record.source_name != "Result"
+        || exit_record.linearity != semantic::Linearity::ExplicitCopy
+        || outcome_record.linearity != semantic::Linearity::ExplicitCopy
+        || exit_record.source.is_none()
+        || outcome_record.source.is_none()
+        || !matches!(
+            [cancelled, deadline_rejected, deadline_exceeded].map(|id| {
+                input.types.get(id.0 as usize).map(|record| (
+                    record.source_name.as_str(),
+                    &record.kind,
+                    record.linearity,
+                    record.source,
+                ))
+            }),
+            [
+                Some(("Cancelled", semantic::TypeKind::Struct { fields: left }, semantic::Linearity::ExplicitCopy, Some(_))),
+                Some(("DeadlineRejected", semantic::TypeKind::Struct { fields: middle }, semantic::Linearity::ExplicitCopy, Some(_))),
+                Some(("DeadlineExceeded", semantic::TypeKind::Struct { fields: right }, semantic::Linearity::ExplicitCopy, Some(_))),
+            ] if left.is_empty() && middle.is_empty() && right.is_empty()
+        )
+        || caller.color != semantic::FunctionColor::Async
+        || !matches!(caller.role, semantic::FunctionRole::TaskEntry(_))
+        || caller.result != semantic::TypeId(0)
+        || caller
+            .values
+            .get(delivered.0 as usize)
+            .is_none_or(|record| {
+                record.id != *delivered
+                    || record.ty != outcome_record.id
+                    || record.origin != await_statement.source
+            })
+    {
+        return Err(unsupported(
+            "flow-async-outcome-authentication (type and await identity)",
+        ));
+    }
+    if !std::ptr::eq(region, &caller.body) {
+        return Err(unsupported(
+            "flow-async-outcome-consumer-pending (nested await region)",
+        ));
+    }
+    let (callee_id, activation) =
+        match region
+            .statements
+            .get(await_index.checked_sub(1).ok_or(unsupported(
+                "flow-async-outcome-authentication (call position)",
+            ))?) {
+            Some(semantic::SemanticStatement::Let(semantic::LetStatement {
+                results,
+                operation:
+                    semantic::SemanticOperation::Call {
+                        function,
+                        arguments,
+                        activation: Some(activation),
+                    },
+                source,
+            })) if results.as_slice() == [awaitable]
+                && arguments.is_empty()
+                && *source
+                    == input
+                        .activations
+                        .get(activation.0 as usize)
+                        .map(|plan| Some(plan.source))
+                        .unwrap_or(None) =>
+            {
+                (*function, *activation)
+            }
+            _ => {
+                return Err(unsupported(
+                    "flow-async-outcome-authentication (direct call protocol)",
+                ));
+            }
+        };
+    let callee = input
+        .functions
+        .get(callee_id.0 as usize)
+        .filter(|callee| {
+            callee.id == callee_id
+                && callee.origin == semantic::FunctionOrigin::Source
+                && callee.role == semantic::FunctionRole::Ordinary
+                && callee.color == semantic::FunctionColor::Async
+                && callee.parameters.is_empty()
+                && callee.result.0 as usize != outcome_record.id.0 as usize
+        })
+        .ok_or(unsupported(
+            "flow-async-outcome-authentication (callee identity)",
+        ))?;
+    let mut callee_call_count = 0_usize;
+    for function in &input.functions {
+        check_cancelled(is_cancelled)?;
+        let mut regions = try_vec(
+            1,
+            "async-outcome callee-use authentication regions",
+            limits.model_edges,
+        )?;
+        regions.push(&function.body);
+        while let Some(candidate_region) = regions.pop() {
+            for statement in &candidate_region.statements {
+                check_cancelled(is_cancelled)?;
+                match statement {
+                    semantic::SemanticStatement::Let(semantic::LetStatement {
+                        operation: semantic::SemanticOperation::Call { function, .. },
+                        ..
+                    }) if *function == callee.id => {
+                        callee_call_count =
+                            callee_call_count
+                                .checked_add(1)
+                                .ok_or(LowerError::ResourceLimit {
+                                    resource: "FlowWir async-outcome callee call census",
+                                    limit: limits.model_edges,
+                                })?;
+                    }
+                    semantic::SemanticStatement::If {
+                        then_region,
+                        else_region,
+                        ..
+                    } => {
+                        push_bounded(
+                            &mut regions,
+                            then_region,
+                            "async-outcome callee-use authentication regions",
+                            limits.model_edges,
+                        )?;
+                        push_bounded(
+                            &mut regions,
+                            else_region,
+                            "async-outcome callee-use authentication regions",
+                            limits.model_edges,
+                        )?;
+                    }
+                    semantic::SemanticStatement::Match { arms, .. } => {
+                        for arm in arms {
+                            push_bounded(
+                                &mut regions,
+                                &arm.body,
+                                "async-outcome callee-use authentication regions",
+                                limits.model_edges,
+                            )?;
+                        }
+                    }
+                    semantic::SemanticStatement::Loop { body, .. } => push_bounded(
+                        &mut regions,
+                        body,
+                        "async-outcome callee-use authentication regions",
+                        limits.model_edges,
+                    )?,
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut callee_activation_count = 0_usize;
+    for candidate in &input.activations {
+        check_cancelled(is_cancelled)?;
+        if candidate.callee == callee.id {
+            callee_activation_count =
+                callee_activation_count
+                    .checked_add(1)
+                    .ok_or(LowerError::ResourceLimit {
+                        resource: "FlowWir async-outcome callee activation census",
+                        limit: limits.model_edges,
+                    })?;
+        }
+    }
+    if callee_call_count != 1 || callee_activation_count != 1 {
+        return Err(unsupported(
+            "flow-async-outcome-callee-reuse-pending (helper has multiple call sites)",
+        ));
+    }
+    let semantic::TypeKind::Enum { variants } = &input
+        .types
+        .get(callee.result.0 as usize)
+        .ok_or(unsupported(
+            "flow-async-outcome-authentication (declared Result)",
+        ))?
+        .kind
+    else {
+        return Err(unsupported(
+            "flow-async-outcome-authentication (declared Result)",
+        ));
+    };
+    if !matches!(variants.as_slice(), [ok, err]
+        if ok.name == "Ok" && err.name == "Err"
+            && matches!(ok.fields.as_slice(), [field] if field.ty == value && field.name.is_empty() && field.public)
+            && matches!(err.fields.as_slice(), [field] if field.ty == declared_error && field.name.is_empty() && field.public))
+    {
+        return Err(unsupported(
+            "flow-async-outcome-authentication (declared Result shape)",
+        ));
+    }
+    let [
+        semantic::SemanticStatement::Let(constant),
+        semantic::SemanticStatement::Let(constructed),
+        semantic::SemanticStatement::Return(returned),
+    ] = callee.body.statements.as_slice()
+    else {
+        return Err(unsupported(
+            "flow-async-outcome-producer-pending (noncanonical helper body)",
+        ));
+    };
+    let ([constant_value], [constructed_value]) =
+        (constant.results.as_slice(), constructed.results.as_slice())
+    else {
+        return Err(unsupported(
+            "flow-async-outcome-producer-pending (noncanonical helper values)",
+        ));
+    };
+    if !matches!(
+        constant.operation,
+        semantic::SemanticOperation::Constant(semantic::Constant::Unsigned { bits: 64, .. })
+    ) || !matches!(constructed.operation, semantic::SemanticOperation::ConstructEnum { ty, variant: 0, payload: Some(payload) }
+            if ty == callee.result && payload == *constant_value)
+        || returned.as_slice() != [*constructed_value]
+        || scalar_value_type(callee, *constant_value) != Some(value)
+        || scalar_value_type(callee, *constructed_value) != Some(callee.result)
+    {
+        return Err(unsupported(
+            "flow-async-outcome-producer-pending (only direct Ok[u64])",
+        ));
+    }
+    let proof_record = input
+        .proofs
+        .get(proof.0 as usize)
+        .filter(|record| {
+            record.id == proof
+                && record.kind == semantic::ProofKind::AsyncOutcomeAuthenticated
+                && record.subject == "direct fallible await widens to AsyncExit[u64]"
+                && record.bound == Some(1)
+                && record.sources.as_slice() == await_statement.source.as_slice()
+                && record.depends_on.as_slice() == [semantic::ProofId(0), semantic::ProofId(1)]
+                && record.explanation.as_slice() == [
+                    "the direct non-actor async callee returns Result[u64,u64]; this await alone widens the error to compiler-authenticated AsyncExit[u64] for immediate match or is consumption",
+                ]
+                && caller.proofs.binary_search(&proof).is_ok()
+        })
+        .ok_or(unsupported("flow-async-outcome-authentication (proof)"))?;
+    let _ = proof_record;
+    let plan = input
+        .activations
+        .get(activation.0 as usize)
+        .filter(|plan| {
+            plan.id == activation
+                && plan.caller == caller.id
+                && plan.callee == callee.id
+                && plan.maximum_live == 1
+                && plan.cancellation == semantic::ActivationCancellation::DropCalleeThenPropagate
+        })
+        .ok_or(unsupported(
+            "flow-async-outcome-authentication (activation plan)",
+        ))?;
+    let consumer = region.statements.get(await_index + 1).ok_or(unsupported(
+        "flow-async-outcome-consumer-pending (non-immediate match or is)",
+    ))?;
+    let direct_is = matches!(consumer, semantic::SemanticStatement::Match { results, .. } if results.len() == 1);
+    let nested_match = matches!(consumer, semantic::SemanticStatement::Match { results, .. } if results.is_empty());
+    let caller_parameter_matches = matches!(caller.parameters.as_slice(), [parameter]
+    if caller.body.parameters.as_slice() == [*parameter]
+        && caller.values.get(parameter.0 as usize).is_some_and(|value| {
+            value.id == *parameter
+                && value.name.as_deref() == Some("self")
+                && value.origin.is_some()
+                && matches!(caller.role, semantic::FunctionRole::TaskEntry(task)
+                    if input.tasks.get(task.0 as usize).is_some_and(|record| {
+                        record.id == task
+                            && record.entry == caller.id
+                            && record.slots == 1
+                            && record.supervisor.and_then(|actor| input.actors.get(actor.0 as usize))
+                                .is_some_and(|actor| actor.ty == value.ty)
+                    }))
+        }));
+    let callee_proofs_match = matches!(callee.proofs.as_slice(), [type_proof, effects_proof, view_proof, cleanup_proof]
+    if input.proofs.get(type_proof.0 as usize).is_some_and(|record| {
+        record.id == *type_proof
+            && record.kind == semantic::ProofKind::TypeChecked
+            && record.bound.is_none()
+            && record.sources.as_slice() == callee.source.as_slice()
+            && record.depends_on.is_empty()
+    }) && input.proofs.get(effects_proof.0 as usize).is_some_and(|record| {
+        record.id == *effects_proof
+            && record.kind == semantic::ProofKind::EffectsAllowed
+            && record.bound == Some(2)
+            && record.sources.as_slice() == callee.source.as_slice()
+            && record.depends_on.as_slice() == [*type_proof]
+    }) && input.proofs.get(view_proof.0 as usize).is_some_and(|record| {
+        record.id == *view_proof
+            && record.kind == semantic::ProofKind::ViewDoesNotEscape
+            && record.bound == Some(0)
+            && record.sources.as_slice() == callee.source.as_slice()
+            && record.depends_on.as_slice() == [*type_proof]
+    }) && input.proofs.get(cleanup_proof.0 as usize).is_some_and(|record| {
+        record.id == *cleanup_proof
+            && record.kind == semantic::ProofKind::CleanupAcyclic
+            && record.bound == Some(0)
+            && record.sources.as_slice() == callee.source.as_slice()
+            && record.depends_on.as_slice() == [*type_proof, *view_proof]
+    }));
+    let consumer_metadata_matches = (direct_is
+        && caller.values.len() == 6
+        && caller.frame_bound == 32
+        && caller.uninterrupted_bound == Some(2))
+        || (nested_match
+            && caller.values.len() == 9
+            && caller.frame_bound == 16
+            && caller.uninterrupted_bound == Some(8));
+    if caller.origin != semantic::FunctionOrigin::Source
+        || caller.effects
+            != semantic::EffectSet(semantic::EffectSet::TASK_SPAWN | semantic::EffectSet::SUSPEND)
+        || caller.source.is_none()
+        || !caller_parameter_matches
+        || caller.stack_bound != 64
+        || caller.recursive_depth_bound != Some(1)
+        || !consumer_metadata_matches
+        || callee.origin != semantic::FunctionOrigin::Source
+        || !callee.parameters.is_empty()
+        || !callee.body.parameters.is_empty()
+        || callee.values.len() != 2
+        || callee.effects != semantic::EffectSet(semantic::EffectSet::SUSPEND)
+        || callee.source.is_none()
+        || callee.stack_bound != 0
+        || callee.frame_bound != plan.frame_bytes
+        || callee.frame_bound != 16
+        || callee.uninterrupted_bound != Some(2)
+        || callee.recursive_depth_bound != Some(1)
+        || !callee_proofs_match
+    {
+        return Err(unsupported(
+            "flow-async-outcome-authentication (function metadata)",
+        ));
+    }
+    if await_statement.source.is_none()
+        || await_index != 1
+        || !exact_async_outcome_consumer(
+            input,
+            caller,
+            *delivered,
+            exit,
+            [
+                operation_error,
+                cancelled,
+                deadline_rejected,
+                deadline_exceeded,
+            ],
+            consumer,
+        )
+        || region.statements.get(await_index + 2)
+            != Some(&semantic::SemanticStatement::Return(Vec::new()))
+        || region.statements.len() != await_index + 3
+        || plan.source
+            != region
+                .statements
+                .get(await_index - 1)
+                .and_then(|statement| match statement {
+                    semantic::SemanticStatement::Let(statement) => statement.source,
+                    _ => None,
+                })
+                .ok_or(unsupported(
+                    "flow-async-outcome-authentication (call source)",
+                ))?
+    {
+        return Err(unsupported(
+            "flow-async-outcome-consumer-pending (non-immediate match or is)",
+        ));
+    }
+    Ok(Some(AsyncOutcomeFlowProfile {
+        caller: caller.id,
+        callee: callee.id,
+        declared_result: callee.result,
+        outcome: outcome_record.id,
+        exit,
+        causes: [cancelled, deadline_rejected, deadline_exceeded],
+        activation,
+        awaitable,
+        callee_result_value: *constructed_value,
+    }))
+}
+
+fn exact_async_outcome_consumer(
+    input: &semantic::SemanticWir,
+    function: &semantic::SemanticFunction,
+    delivered: semantic::ValueId,
+    exit: semantic::TypeId,
+    exit_payloads: [semantic::TypeId; 4],
+    statement: &semantic::SemanticStatement,
+) -> bool {
+    let semantic::SemanticStatement::Match {
+        scrutinee,
+        arms,
+        results,
+        ..
+    } = statement
+    else {
+        return false;
+    };
+    if *scrutinee != delivered || arms.len() != 2 {
+        return false;
+    }
+    let outer_bindings = arms.iter().enumerate().all(|(index, arm)| {
+        arm.variant == u32::try_from(index).ok()
+            && arm.guard.is_none()
+            && if results.is_empty() {
+                matches!(arm.bindings.as_slice(), [binding]
+                    if scalar_value_type(function, *binding) == Some(if index == 0 { exit_payloads[0] } else { exit }))
+                    && arm.body.parameters == arm.bindings
+            } else {
+                arm.bindings.is_empty() && arm.body.parameters.is_empty()
+            }
+    });
+    if !outer_bindings {
+        return false;
+    }
+    if results.is_empty() {
+        let [ok, err] = arms.as_slice() else {
+            return false;
+        };
+        let [exit_binding] = err.bindings.as_slice() else {
+            return false;
+        };
+        matches!(ok.body.statements.as_slice(), [semantic::SemanticStatement::Yield(values)] if values.is_empty())
+            && matches!(err.body.statements.as_slice(), [semantic::SemanticStatement::Match { scrutinee, arms, results, .. }, semantic::SemanticStatement::Yield(values)]
+            if *scrutinee == *exit_binding && results.is_empty() && values.is_empty()
+                && arms.len() == 4
+                && arms.iter().zip(exit_payloads).enumerate().all(|(index, (arm, payload))| {
+                    arm.variant == u32::try_from(index).ok()
+                        && arm.guard.is_none()
+                        && matches!(arm.bindings.as_slice(), [binding] if scalar_value_type(function, *binding) == Some(payload))
+                        && arm.body.parameters == arm.bindings
+                        && matches!(arm.body.statements.as_slice(), [semantic::SemanticStatement::Yield(values)] if values.is_empty())
+                }))
+    } else {
+        let [result] = results.as_slice() else {
+            return false;
+        };
+        let result_is_bool = semantic_type_is(
+            input,
+            scalar_value_type(function, *result).unwrap_or(semantic::TypeId(u32::MAX)),
+            semantic::PrimitiveType::Bool,
+        );
+        let arms_are_exact = arms.iter().enumerate().all(|(index, arm)| {
+            matches!(arm.body.statements.as_slice(), [semantic::SemanticStatement::Let(constant), semantic::SemanticStatement::Yield(values)]
+                if matches!(constant.operation, semantic::SemanticOperation::Constant(semantic::Constant::Bool(value))
+                    if value == (index == 1))
+                    && matches!(constant.results.as_slice(), [value] if values.as_slice() == [*value]
+                        && scalar_value_type(function, *value) == scalar_value_type(function, *result)))
+        });
+        result_is_bool && arms_are_exact
+    }
+}
+
 fn unsupported(feature: &'static str) -> LowerError {
     LowerError::UnsupportedInput { feature }
 }
@@ -771,23 +1381,7 @@ fn supported_input<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedSemantic<'a>, LowerError> {
-    let has_async_type = input.types.iter().any(|ty| {
-        matches!(
-            ty.kind,
-            semantic::TypeKind::AsyncExit { .. } | semantic::TypeKind::AsyncOutcome { .. }
-        )
-    });
-    let mut has_async_operation = false;
-    for function in &input.functions {
-        check_cancelled(is_cancelled)?;
-        has_async_operation |=
-            contains_async_outcome_operation(&function.body, limits.model_edges, is_cancelled)?;
-    }
-    if has_async_type || has_async_operation {
-        return Err(unsupported(
-            "flow-async-outcome-lowering-pending (structured async exit delivery)",
-        ));
-    }
+    async_outcome_flow_profile(input, limits, is_cancelled)?;
     reject_unadmitted_nominal_enum_payload(input, is_cancelled)?;
     if input.tests.is_empty() {
         if input.actors.is_empty()
@@ -803,65 +1397,6 @@ fn supported_input<'a>(
         supported_generated_tests(input, limits, is_cancelled)
             .map(SupportedSemantic::GeneratedTests)
     }
-}
-
-fn contains_async_outcome_operation(
-    root: &semantic::SemanticRegion,
-    limit: u64,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<bool, LowerError> {
-    let mut regions = try_vec(1, "semantic async-outcome regions", limit)?;
-    regions.push(root);
-    while let Some(region) = regions.pop() {
-        check_cancelled(is_cancelled)?;
-        for statement in &region.statements {
-            check_cancelled(is_cancelled)?;
-            match statement {
-                semantic::SemanticStatement::Let(semantic::LetStatement {
-                    operation: semantic::SemanticOperation::AwaitAsyncOutcome { .. },
-                    ..
-                }) => return Ok(true),
-                semantic::SemanticStatement::If {
-                    then_region,
-                    else_region,
-                    ..
-                } => {
-                    push_bounded(
-                        &mut regions,
-                        then_region,
-                        "semantic async-outcome regions",
-                        limit,
-                    )?;
-                    push_bounded(
-                        &mut regions,
-                        else_region,
-                        "semantic async-outcome regions",
-                        limit,
-                    )?;
-                }
-                semantic::SemanticStatement::Match { arms, .. } => {
-                    for arm in arms {
-                        push_bounded(
-                            &mut regions,
-                            &arm.body,
-                            "semantic async-outcome regions",
-                            limit,
-                        )?;
-                    }
-                }
-                semantic::SemanticStatement::Loop { body, .. } => {
-                    push_bounded(&mut regions, body, "semantic async-outcome regions", limit)?
-                }
-                semantic::SemanticStatement::Let(_)
-                | semantic::SemanticStatement::Return(_)
-                | semantic::SemanticStatement::Yield(_)
-                | semantic::SemanticStatement::Break(_)
-                | semantic::SemanticStatement::Continue(_)
-                | semantic::SemanticStatement::Unreachable => {}
-            }
-        }
-    }
-    Ok(false)
 }
 
 fn reject_unadmitted_nominal_enum_payload(
@@ -1006,6 +1541,7 @@ fn supported_actor_image<'a>(
         ));
     }
 
+    let async_outcome = async_outcome_flow_profile(input, limits, is_cancelled)?;
     for ty in &input.types {
         check_cancelled(is_cancelled)?;
         match &ty.kind {
@@ -1033,6 +1569,10 @@ fn supported_actor_image<'a>(
                         ty.linearity,
                         semantic::Linearity::Reclaimable | semantic::Linearity::Strict
                     ))
+                    || (fields.is_empty()
+                        && ty.linearity == semantic::Linearity::ExplicitCopy
+                        && async_outcome
+                            .is_some_and(|profile| profile.causes.contains(&ty.id)))
                     || (ty.linearity == semantic::Linearity::ExplicitCopy
                         && fields.iter().all(|field| {
                             scalar_primitive(input, field.ty).is_some() && !field.name.is_empty()
@@ -1049,6 +1589,12 @@ fn supported_actor_image<'a>(
                         == 1 => {}
             semantic::TypeKind::Reservation
                 if ty.linearity == semantic::Linearity::Strict && ty.source.is_none() => {}
+            semantic::TypeKind::Enum { .. }
+                if async_outcome.is_some_and(|profile| profile.declared_result == ty.id) => {}
+            semantic::TypeKind::AsyncExit { .. }
+                if async_outcome.is_some_and(|profile| profile.exit == ty.id) => {}
+            semantic::TypeKind::AsyncOutcome { .. }
+                if async_outcome.is_some_and(|profile| profile.outcome == ty.id) => {}
             semantic::TypeKind::Function(function) => {
                 if (function.result.0 as usize) >= input.types.len() {
                     return Err(unsupported(
@@ -1116,7 +1662,17 @@ fn supported_actor_image<'a>(
         if function.id == entry.id {
             continue;
         }
-        validate_actor_source_function(input, function, &mut scope_uses, limits, is_cancelled)?;
+        if async_outcome
+            .is_some_and(|profile| profile.caller == function.id || profile.callee == function.id)
+        {
+            if !input.scopes.is_empty() {
+                return Err(unsupported(
+                    "flow-async-outcome-consumer-pending (scoped outcome consumer)",
+                ));
+            }
+        } else {
+            validate_actor_source_function(input, function, &mut scope_uses, limits, is_cancelled)?;
+        }
     }
     if scope_uses.contains(&0) {
         return Err(unsupported("actor scope activation census"));
@@ -5414,6 +5970,7 @@ fn preflight_input(
                         if matches!(
                             statement.operation,
                             semantic::SemanticOperation::Await { .. }
+                                | semantic::SemanticOperation::AwaitAsyncOutcome { .. }
                         ) {
                             async_states = async_states
                                 .checked_add(1)
@@ -6059,6 +6616,24 @@ fn lower_actor_type(
             }
             flow::FlowTypeKind::Struct { fields: lowered }
         }
+        semantic::TypeKind::Enum { variants } => {
+            let mut lowered = try_vec(
+                variants.len(),
+                "FlowWir actor enum variants",
+                limits.model_edges,
+            )?;
+            for variant in variants {
+                check_cancelled(is_cancelled)?;
+                let mut fields = try_vec(
+                    variant.fields.len(),
+                    "FlowWir actor enum payload fields",
+                    limits.model_edges,
+                )?;
+                fields.extend(variant.fields.iter().map(|field| flow::TypeId(field.ty.0)));
+                lowered.push(fields);
+            }
+            flow::FlowTypeKind::Enum { variants: lowered }
+        }
         semantic::TypeKind::Function(function) => {
             let mut parameters = try_vec(
                 function.parameters.len(),
@@ -6094,6 +6669,22 @@ fn lower_actor_type(
         semantic::TypeKind::BoundedString { capacity } => flow::FlowTypeKind::BoundedString {
             capacity: *capacity,
         },
+        semantic::TypeKind::AsyncExit {
+            operation_error,
+            cancelled,
+            deadline_rejected,
+            deadline_exceeded,
+        } => flow::FlowTypeKind::Enum {
+            variants: vec![
+                vec![flow::TypeId(operation_error.0)],
+                vec![flow::TypeId(cancelled.0)],
+                vec![flow::TypeId(deadline_rejected.0)],
+                vec![flow::TypeId(deadline_exceeded.0)],
+            ],
+        },
+        semantic::TypeKind::AsyncOutcome { value, exit, .. } => flow::FlowTypeKind::Enum {
+            variants: vec![vec![flow::TypeId(value.0)], vec![flow::TypeId(exit.0)]],
+        },
         _ => return Err(unsupported("actor type changed after shape validation")),
     };
     Ok(flow::FlowType {
@@ -6114,6 +6705,7 @@ fn append_activation_types(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<Option<flow::TypeId>>, LowerError> {
+    let async_outcome = async_outcome_flow_profile(input, limits, is_cancelled)?;
     let mut required = try_vec(
         input.types.len(),
         "FlowWir activation type map",
@@ -6129,6 +6721,7 @@ fn append_activation_types(
                 check_cancelled(is_cancelled)?;
                 match statement {
                     semantic::SemanticStatement::Let(semantic::LetStatement {
+                        results,
                         operation: semantic::SemanticOperation::Call { function, .. },
                         ..
                     }) => {
@@ -6137,8 +6730,14 @@ fn append_activation_types(
                             .get(function.0 as usize)
                             .filter(|callee| callee.color == semantic::FunctionColor::Async)
                         {
+                            let result = async_outcome
+                                .filter(|profile| {
+                                    profile.callee == callee.id
+                                        && results.as_slice() == [profile.awaitable]
+                                })
+                                .map_or(callee.result, |profile| profile.outcome);
                             let slot = required
-                                .get_mut(callee.result.0 as usize)
+                                .get_mut(result.0 as usize)
                                 .ok_or(unsupported("async call result type identity"))?;
                             *slot = true;
                         }
@@ -6240,6 +6839,7 @@ fn activation_values_for_function(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<Option<flow::TypeId>>, LowerError> {
+    let async_outcome = async_outcome_flow_profile(input, limits, is_cancelled)?;
     let mut values = try_vec(
         function.values.len(),
         "FlowWir activation values",
@@ -6254,19 +6854,30 @@ fn activation_values_for_function(
             match statement {
                 semantic::SemanticStatement::Let(semantic::LetStatement {
                     results,
-                    operation: semantic::SemanticOperation::Call { function, .. },
+                    operation:
+                        semantic::SemanticOperation::Call {
+                            function: callee_id,
+                            ..
+                        },
                     ..
                 }) => {
                     if let Some(callee) = input
                         .functions
-                        .get(function.0 as usize)
+                        .get(callee_id.0 as usize)
                         .filter(|callee| callee.color == semantic::FunctionColor::Async)
                     {
                         let [result] = results.as_slice() else {
                             return Err(unsupported("async call activation result"));
                         };
+                        let result_type = async_outcome
+                            .filter(|profile| {
+                                profile.caller == function.id
+                                    && profile.callee == callee.id
+                                    && results.as_slice() == [profile.awaitable]
+                            })
+                            .map_or(callee.result, |profile| profile.outcome);
                         let activation_type = activation_types
-                            .get(callee.result.0 as usize)
+                            .get(result_type.0 as usize)
                             .copied()
                             .flatten()
                             .ok_or(unsupported("async call activation type"))?;
@@ -6348,6 +6959,7 @@ fn measure_actor_flow_output_resources(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<ResourceMeter, LowerError> {
+    let async_outcome = async_outcome_flow_profile(input, limits, is_cancelled)?;
     let mut activation_results = try_vec(
         input.types.len(),
         "FlowWir actor activation resource map",
@@ -6356,12 +6968,14 @@ fn measure_actor_flow_output_resources(
     activation_results.resize(input.types.len(), false);
     for plan in &input.activations {
         check_cancelled(is_cancelled)?;
-        let result = input
+        let callee = input
             .functions
             .get(plan.callee.0 as usize)
             .filter(|callee| callee.id == plan.callee)
-            .ok_or(unsupported("actor activation callee identity"))?
-            .result;
+            .ok_or(unsupported("actor activation callee identity"))?;
+        let result = async_outcome
+            .filter(|profile| profile.activation == plan.id && profile.callee == callee.id)
+            .map_or(callee.result, |profile| profile.outcome);
         *activation_results
             .get_mut(result.0 as usize)
             .ok_or(unsupported("actor activation result type identity"))? = true;
@@ -6383,31 +6997,37 @@ fn measure_actor_flow_output_resources(
     let mut meter = ResourceMeter::default();
     meter.text(&input.name);
     meter.text(input.build.target.as_str());
-    for count in
-        [
-            input.types.len().checked_add(activation_type_count).ok_or(
-                LowerError::ResourceLimit {
-                    resource: "FlowWir actor output model edges",
-                    limit: limits.model_edges,
-                },
-            )?,
-            input
-                .functions
-                .len()
-                .checked_add(input.scopes.len())
-                .ok_or(LowerError::ResourceLimit {
-                    resource: "FlowWir actor output model edges",
-                    limit: limits.model_edges,
-                })?,
-            input.actors.len(),
-            input.tasks.len(),
-            input.regions.len(),
-            input.activations.len(),
-            input.proofs.len(),
-            input.startup_order.len(),
-            input.shutdown_order.len(),
-        ]
-    {
+    let synthetic_async_tag = usize::from(
+        async_outcome.is_some()
+            && primitive_type_id_polled(input, semantic::PrimitiveType::U8, is_cancelled)?
+                .is_none(),
+    );
+    for count in [
+        input
+            .types
+            .len()
+            .checked_add(activation_type_count)
+            .and_then(|count| count.checked_add(synthetic_async_tag))
+            .ok_or(LowerError::ResourceLimit {
+                resource: "FlowWir actor output model edges",
+                limit: limits.model_edges,
+            })?,
+        input
+            .functions
+            .len()
+            .checked_add(input.scopes.len())
+            .ok_or(LowerError::ResourceLimit {
+                resource: "FlowWir actor output model edges",
+                limit: limits.model_edges,
+            })?,
+        input.actors.len(),
+        input.tasks.len(),
+        input.regions.len(),
+        input.activations.len(),
+        input.proofs.len(),
+        input.startup_order.len(),
+        input.shutdown_order.len(),
+    ] {
         meter.add_edges(count);
     }
     if !input.actors.is_empty() || !input.tasks.is_empty() {
@@ -6422,6 +7042,15 @@ fn measure_actor_flow_output_resources(
         match &ty.kind {
             semantic::TypeKind::Function(function) => meter.edges(&function.parameters),
             semantic::TypeKind::Struct { fields } => meter.edges(fields),
+            semantic::TypeKind::Enum { variants } => {
+                meter.edges(variants);
+                for variant in variants {
+                    meter.text(&variant.name);
+                    meter.edges(&variant.fields);
+                }
+            }
+            semantic::TypeKind::AsyncExit { .. } => meter.add_edges(4),
+            semantic::TypeKind::AsyncOutcome { .. } => meter.add_edges(2),
             semantic::TypeKind::Primitive(_)
             | semantic::TypeKind::StaticString { .. }
             | semantic::TypeKind::StaticBytes { .. }
@@ -6431,6 +7060,9 @@ fn measure_actor_flow_output_resources(
             | semantic::TypeKind::Reservation => {}
             _ => return Err(unsupported("actor type changed after shape validation")),
         }
+    }
+    if synthetic_async_tag != 0 {
+        meter.text("__wrela_async_outcome_tag");
     }
     const ACTIVATION_TYPE_PREFIX: &str = "__wrela_activation_";
     for (result, required) in activation_results.into_iter().enumerate() {
@@ -6477,6 +7109,7 @@ fn measure_actor_flow_output_resources(
                         if matches!(
                             statement.operation,
                             semantic::SemanticOperation::Await { .. }
+                                | semantic::SemanticOperation::AwaitAsyncOutcome { .. }
                         ) {
                             block_count =
                                 block_count
@@ -6551,6 +7184,7 @@ fn measure_actor_flow_output_resources(
                                 }
                             }
                             semantic::SemanticOperation::Constant(_)
+                            | semantic::SemanticOperation::ConstructEnum { .. }
                             | semantic::SemanticOperation::Copy { .. }
                             | semantic::SemanticOperation::Binary { .. }
                             | semantic::SemanticOperation::Unary { .. }
@@ -6606,8 +7240,40 @@ fn measure_actor_flow_output_resources(
                     semantic::SemanticStatement::Return(values)
                     | semantic::SemanticStatement::Yield(values) => meter.edges(values),
                     semantic::SemanticStatement::Unreachable => {}
-                    semantic::SemanticStatement::Match { .. }
-                    | semantic::SemanticStatement::Loop { .. }
+                    semantic::SemanticStatement::Match { arms, results, .. } => {
+                        block_count = block_count
+                            .checked_add(arms.len().saturating_add(2))
+                            .ok_or(LowerError::ResourceLimit {
+                                resource: "FlowWir actor output model edges",
+                                limit: limits.model_edges,
+                            })?;
+                        instruction_count = instruction_count
+                            .checked_add(1_usize.saturating_add(
+                                arms.iter().map(|arm| arm.bindings.len()).sum::<usize>(),
+                            ))
+                            .ok_or(LowerError::ResourceLimit {
+                                resource: "FlowWir actor output model edges",
+                                limit: limits.model_edges,
+                            })?;
+                        block_parameter_count = block_parameter_count
+                            .checked_add(results.len())
+                            .ok_or(LowerError::ResourceLimit {
+                                resource: "FlowWir actor output model edges",
+                                limit: limits.model_edges,
+                            })?;
+                        meter.edges(arms);
+                        meter.edges(results);
+                        for arm in arms {
+                            meter.edges(&arm.bindings);
+                            push_bounded(
+                                &mut regions,
+                                &arm.body,
+                                "FlowWir actor output resource scan",
+                                limits.model_edges,
+                            )?;
+                        }
+                    }
+                    semantic::SemanticStatement::Loop { .. }
                     | semantic::SemanticStatement::Break(_)
                     | semantic::SemanticStatement::Continue(_) => {
                         return Err(unsupported(
@@ -6693,6 +7359,32 @@ fn lower_actor_image(
     let mut types = try_vec(input.types.len(), "FlowWir actor types", limits.model_edges)?;
     for ty in &input.types {
         types.push(lower_actor_type(ty, &input.actors, limits, is_cancelled)?);
+    }
+    if async_outcome_flow_profile(input, limits, is_cancelled)?.is_some()
+        && primitive_type_id_polled(input, semantic::PrimitiveType::U8, is_cancelled)?.is_none()
+    {
+        let id =
+            flow::TypeId(
+                u32::try_from(types.len()).map_err(|_| LowerError::ResourceLimit {
+                    resource: "FlowWir async-outcome tag type",
+                    limit: limits.model_edges,
+                })?,
+            );
+        push_bounded(
+            &mut types,
+            flow::FlowType {
+                id,
+                kind: flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                    signed: false,
+                    bits: 8,
+                }),
+                name: Some("__wrela_async_outcome_tag".to_owned()),
+                copyable: true,
+                strict_linear: false,
+            },
+            "FlowWir actor types",
+            limits.model_edges,
+        )?;
     }
     let actor_state_address_type = if input
         .regions
@@ -7274,6 +7966,7 @@ fn lower_generated_function(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<flow::FlowFunction, LowerError> {
+    let async_outcome = async_outcome_flow_profile(input, limits, is_cancelled)?;
     let activation_values =
         activation_values_for_function(input, function, activation_types, limits, is_cancelled)?;
     let mut values = try_vec(function.values.len(), "FlowWir values", limits.model_edges)?;
@@ -7282,10 +7975,17 @@ fn lower_generated_function(
         let source = static_bytes_flow_value_source(input, function, value)?;
         values.push(flow::Value {
             id: flow::ValueId(value.id.0),
-            ty: activation_values
-                .get(value.id.0 as usize)
-                .copied()
-                .flatten()
+            ty: async_outcome
+                .filter(|profile| {
+                    profile.callee == function.id && profile.callee_result_value == value.id
+                })
+                .map(|profile| flow::TypeId(profile.outcome.0))
+                .or_else(|| {
+                    activation_values
+                        .get(value.id.0 as usize)
+                        .copied()
+                        .flatten()
+                })
                 .unwrap_or(flow::TypeId(value.ty.0)),
             source_name: value
                 .name
@@ -7532,7 +8232,10 @@ fn lower_generated_function(
                         item.next_statement += 1;
                         continue;
                     }
-                    if let semantic::SemanticOperation::Await { awaitable } = &statement.operation {
+                    if let semantic::SemanticOperation::Await { awaitable }
+                    | semantic::SemanticOperation::AwaitAsyncOutcome { awaitable, .. } =
+                        &statement.operation
+                    {
                         if u64::from(next_async_state) >= u64::from(limits.states_per_function) {
                             return Err(LowerError::ResourceLimit {
                                 resource: "FlowWir async states",
@@ -7573,12 +8276,39 @@ fn lower_generated_function(
                         limits.model_edges,
                     )?;
                     results.extend(statement.results.iter().map(|value| flow::ValueId(value.0)));
-                    let operation = lower_generated_operation(
-                        input,
-                        &statement.operation,
-                        limits,
-                        is_cancelled,
-                    )?;
+                    let operation = if async_outcome.is_some_and(|profile| {
+                        profile.callee == function.id
+                            && statement.results.as_slice() == [profile.callee_result_value]
+                            && matches!(
+                                &statement.operation,
+                                semantic::SemanticOperation::ConstructEnum {
+                                    ty,
+                                    variant: 0,
+                                    ..
+                                } if *ty == profile.declared_result
+                            )
+                    }) {
+                        let profile = async_outcome.expect("profile checked above");
+                        let semantic::SemanticOperation::ConstructEnum {
+                            variant, payload, ..
+                        } = &statement.operation
+                        else {
+                            unreachable!()
+                        };
+                        flow::FlowOperation::MakeEnum {
+                            ty: flow::TypeId(profile.outcome.0),
+                            variant: u8::try_from(*variant)
+                                .map_err(|_| unsupported("async-outcome producer variant range"))?,
+                            payload: payload.map(|value| flow::ValueId(value.0)),
+                        }
+                    } else {
+                        lower_generated_operation(
+                            input,
+                            &statement.operation,
+                            limits,
+                            is_cancelled,
+                        )?
+                    };
                     let block = pending_block_mut(&mut pending_blocks, item.block)?;
                     push_bounded(
                         &mut block.instructions,
@@ -7718,9 +8448,6 @@ fn lower_generated_function(
                     results,
                     source,
                 } => {
-                    if results.is_empty() && !matches!(item.exit, RegionExit::Root) {
-                        return Err(unsupported("terminal closed enum match lowering"));
-                    }
                     let enum_ty = function
                         .values
                         .get(scrutinee.0 as usize)
@@ -7730,27 +8457,86 @@ fn lower_generated_function(
                         .types
                         .get(enum_ty.0 as usize)
                         .ok_or_else(|| unsupported("enum match scrutinee type"))?;
-                    let semantic::TypeKind::Enum { variants } = &enum_type.kind else {
-                        return Err(unsupported("enum match scrutinee type"));
+                    let synthetic_variants;
+                    let variants = match &enum_type.kind {
+                        semantic::TypeKind::Enum { variants } => {
+                            if !canonical_semantic_enum_shape(input, enum_type, variants) {
+                                return Err(unsupported("enum match scrutinee type"));
+                            }
+                            variants.as_slice()
+                        }
+                        semantic::TypeKind::AsyncExit {
+                            operation_error,
+                            cancelled,
+                            deadline_rejected,
+                            deadline_exceeded,
+                        } => {
+                            synthetic_variants = [
+                                ("Operation", *operation_error),
+                                ("Cancelled", *cancelled),
+                                ("DeadlineRejected", *deadline_rejected),
+                                ("DeadlineExceeded", *deadline_exceeded),
+                            ]
+                            .into_iter()
+                            .map(|(name, ty)| semantic::VariantType {
+                                name: name.to_owned(),
+                                fields: vec![semantic::FieldType {
+                                    name: String::new(),
+                                    ty,
+                                    public: true,
+                                }],
+                            })
+                            .collect::<Vec<_>>();
+                            synthetic_variants.as_slice()
+                        }
+                        semantic::TypeKind::AsyncOutcome { value, exit, .. } => {
+                            synthetic_variants = [("Ok", *value), ("Err", *exit)]
+                                .into_iter()
+                                .map(|(name, ty)| semantic::VariantType {
+                                    name: name.to_owned(),
+                                    fields: vec![semantic::FieldType {
+                                        name: String::new(),
+                                        ty,
+                                        public: true,
+                                    }],
+                                })
+                                .collect::<Vec<_>>();
+                            synthetic_variants.as_slice()
+                        }
+                        _ => return Err(unsupported("enum match scrutinee type")),
                     };
-                    if !canonical_semantic_enum_shape(input, enum_type, variants) {
-                        return Err(unsupported("enum match scrutinee type"));
-                    }
-                    let variants = variants.as_slice();
                     let exact_type_test = exact_enum_type_test_match_protocol(
                         input, function, enum_type, arms, results,
-                    );
+                    ) || (matches!(
+                        enum_type.kind,
+                        semantic::TypeKind::AsyncOutcome { .. }
+                    ) && matches!(results.as_slice(), [result]
+                    if scalar_value_type(function, *result).is_some_and(|ty| {
+                        semantic_type_is(input, ty, semantic::PrimitiveType::Bool)
+                    })) && arms.len() == variants.len()
+                        && arms.iter().all(|arm| {
+                            arm.bindings.is_empty()
+                                && arm.body.parameters.is_empty()
+                                && arm.guard.is_none()
+                        }));
                     if arms.is_empty() || arms.len() > variants.len() {
                         return Err(unsupported("enum match exhaustiveness"));
                     }
-                    let tag_ty = input
-                        .types
-                        .iter()
-                        .find(|ty| {
-                            ty.kind == semantic::TypeKind::Primitive(semantic::PrimitiveType::U8)
-                        })
-                        .map(|ty| flow::TypeId(ty.id.0))
-                        .ok_or_else(|| unsupported("enum match canonical u8 tag type"))?;
+                    let tag_ty =
+                        primitive_type_id_polled(input, semantic::PrimitiveType::U8, is_cancelled)?
+                            .map(|ty| flow::TypeId(ty.0))
+                            .or_else(|| {
+                                if matches!(
+                                    enum_type.kind,
+                                    semantic::TypeKind::AsyncExit { .. }
+                                        | semantic::TypeKind::AsyncOutcome { .. }
+                                ) {
+                                    u32::try_from(input.types.len()).ok().map(flow::TypeId)
+                                } else {
+                                    None
+                                }
+                            })
+                            .ok_or_else(|| unsupported("enum match canonical u8 tag type"))?;
                     let tag = flow::ValueId(u32::try_from(values.len()).map_err(|_| {
                         LowerError::ResourceLimit {
                             resource: "FlowWir values",
@@ -7830,9 +8616,9 @@ fn lower_generated_function(
                         }
                     }
                     let mut default = None;
-                    let merge_block = if results.is_empty() {
-                        None
-                    } else {
+                    let needs_continuation = !results.is_empty()
+                        || item.next_statement.saturating_add(1) < item.region.statements.len();
+                    let merge_block = if needs_continuation {
                         let merge = allocate_pending_block(&mut pending_blocks, *source, limits)?;
                         let mut parameters = try_vec(
                             results.len(),
@@ -7859,6 +8645,8 @@ fn lower_generated_function(
                             limits.model_edges,
                         )?;
                         Some(merge)
+                    } else {
+                        None
                     };
                     let mut cases =
                         try_vec(arms.len(), "FlowWir enum switch cases", limits.model_edges)?;
@@ -8280,7 +9068,11 @@ fn lower_generated_function(
     );
     let mut result_types = try_vec(1, "FlowWir function results", limits.model_edges)?;
     if !semantic_type_is(input, function.result, semantic::PrimitiveType::Unit) {
-        result_types.push(flow::TypeId(function.result.0));
+        result_types.push(flow::TypeId(
+            async_outcome
+                .filter(|profile| profile.callee == function.id)
+                .map_or(function.result.0, |profile| profile.outcome.0),
+        ));
     }
     let mut function_proofs = try_vec(
         function.proofs.len(),
@@ -9819,6 +10611,21 @@ fn actor_flow_type_kind_matches(
             flow::FlowTypeKind::Struct { fields: output },
         ) => polled_slices_equal(expected, output, is_cancelled)?,
         (
+            flow::FlowTypeKind::Enum { variants: expected },
+            flow::FlowTypeKind::Enum { variants: output },
+        ) => {
+            if expected.len() != output.len() {
+                false
+            } else {
+                let mut equal = true;
+                for (expected, output) in expected.iter().zip(output) {
+                    check_cancelled(is_cancelled)?;
+                    equal &= polled_slices_equal(expected, output, is_cancelled)?;
+                }
+                equal
+            }
+        }
+        (
             flow::FlowTypeKind::Function {
                 parameters: expected_parameters,
                 result: expected_result,
@@ -9961,6 +10768,36 @@ fn actor_flow_operation_matches(
             expected_ty == output_ty
                 && polled_slices_equal(expected_fields, output_fields, is_cancelled)?
         }
+        (
+            flow::FlowOperation::MakeEnum {
+                ty: expected_ty,
+                variant: expected_variant,
+                payload: expected_payload,
+            },
+            flow::FlowOperation::MakeEnum {
+                ty: output_ty,
+                variant: output_variant,
+                payload: output_payload,
+            },
+        ) => {
+            expected_ty == output_ty
+                && expected_variant == output_variant
+                && expected_payload == output_payload
+        }
+        (
+            flow::FlowOperation::EnumTag { value: expected },
+            flow::FlowOperation::EnumTag { value: output },
+        ) => expected == output,
+        (
+            flow::FlowOperation::EnumPayload {
+                value: expected_value,
+                variant: expected_variant,
+            },
+            flow::FlowOperation::EnumPayload {
+                value: output_value,
+                variant: output_variant,
+            },
+        ) => expected_value == output_value && expected_variant == output_variant,
         (
             flow::FlowOperation::FormatBoundedString {
                 ty: expected_ty,
@@ -10272,6 +11109,45 @@ fn actor_flow_terminator_matches(
             expected_state == output_state
                 && expected_activation == output_activation
                 && expected_resume == output_resume
+        }
+        (
+            flow::Terminator::Switch {
+                value: expected_value,
+                cases: expected_cases,
+                default: expected_default,
+                default_arguments: expected_default_arguments,
+            },
+            flow::Terminator::Switch {
+                value: output_value,
+                cases: output_cases,
+                default: output_default,
+                default_arguments: output_default_arguments,
+            },
+        ) => {
+            if expected_value != output_value
+                || expected_default != output_default
+                || expected_cases.len() != output_cases.len()
+                || !polled_slices_equal(
+                    expected_default_arguments,
+                    output_default_arguments,
+                    is_cancelled,
+                )?
+            {
+                false
+            } else {
+                let mut equal = true;
+                for (expected, output) in expected_cases.iter().zip(output_cases) {
+                    check_cancelled(is_cancelled)?;
+                    equal &= expected.value == output.value
+                        && expected.target == output.target
+                        && polled_slices_equal(
+                            &expected.arguments,
+                            &output.arguments,
+                            is_cancelled,
+                        )?;
+                }
+                equal
+            }
         }
         (flow::Terminator::Unreachable, flow::Terminator::Unreachable) => true,
         _ => false,
@@ -11543,7 +12419,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn authenticated_async_outcome_stops_at_named_flow_boundary() {
+    fn partial_async_outcome_retains_named_flow_boundary() {
         let mut module = fixture().into_wir();
         module.types[0].kind = semantic::TypeKind::AsyncOutcome {
             value: semantic::TypeId(0),
@@ -11553,7 +12429,7 @@ mod contract_tests {
         assert!(matches!(
             supported_input(&module, LoweringLimits::standard(), &|| false),
             Err(LowerError::UnsupportedInput {
-                feature: "flow-async-outcome-lowering-pending (structured async exit delivery)",
+                feature: "flow-async-outcome-profile-pending (multiple or partial authenticated outcomes)",
             })
         ));
     }
