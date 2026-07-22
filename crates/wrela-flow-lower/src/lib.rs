@@ -308,11 +308,86 @@ fn reject_fixed_array_pattern_index(
     }
 }
 
+fn reject_stored_fixed_array_lowering(
+    input: &semantic::SemanticWir,
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), LowerError> {
+    for function in &input.functions {
+        check_cancelled(is_cancelled)?;
+        let mut regions = try_vec(1, "stored fixed-array region scan", limits.model_edges)?;
+        regions.push(&function.body);
+        while let Some(region) = regions.pop() {
+            check_cancelled(is_cancelled)?;
+            for statement in &region.statements {
+                check_cancelled(is_cancelled)?;
+                match statement {
+                    semantic::SemanticStatement::Let(semantic::LetStatement {
+                        results,
+                        operation: semantic::SemanticOperation::Aggregate { ty, .. },
+                        ..
+                    }) if matches!(results.as_slice(), [result]
+                    if input.types.get(ty.0 as usize).is_some_and(|record| {
+                        matches!(record.kind, semantic::TypeKind::Array { length, .. } if length > 0)
+                    })
+                    && function.values.get(result.0 as usize).is_some_and(|value| {
+                        value.id == *result && value.ty == *ty && value.name.is_some()
+                    })) =>
+                    {
+                        return Err(unsupported(
+                            "flow-for-stored-array-lowering-pending (owned local array storage and indexed iteration)",
+                        ));
+                    }
+                    semantic::SemanticStatement::If {
+                        then_region,
+                        else_region,
+                        ..
+                    } => {
+                        push_bounded(
+                            &mut regions,
+                            then_region,
+                            "stored fixed-array region scan",
+                            limits.model_edges,
+                        )?;
+                        push_bounded(
+                            &mut regions,
+                            else_region,
+                            "stored fixed-array region scan",
+                            limits.model_edges,
+                        )?;
+                    }
+                    semantic::SemanticStatement::Match { arms, .. } => {
+                        for arm in arms {
+                            push_bounded(
+                                &mut regions,
+                                &arm.body,
+                                "stored fixed-array region scan",
+                                limits.model_edges,
+                            )?;
+                        }
+                    }
+                    semantic::SemanticStatement::Loop { body, .. } => {
+                        push_bounded(
+                            &mut regions,
+                            body,
+                            "stored fixed-array region scan",
+                            limits.model_edges,
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn supported_input<'a>(
     input: &'a semantic::SemanticWir,
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedSemantic<'a>, LowerError> {
+    reject_stored_fixed_array_lowering(input, limits, is_cancelled)?;
     let has_async_type = input.types.iter().any(|ty| {
         matches!(
             ty.kind,
@@ -16097,6 +16172,63 @@ mod contract_tests {
             super::reject_fixed_array_pattern_index(&input, proof),
             Err(LowerError::UnsupportedInput {
                 feature: "flow-fixed-array-match-lowering-pending (positional branch lowering)",
+            })
+        ));
+    }
+
+    #[test]
+    fn stored_fixed_array_identity_stops_at_named_flow_boundary() {
+        let mut input = fixture().into_wir();
+        input.types.extend([
+            semantic::TypeRecord {
+                id: semantic::TypeId(1),
+                source_name: "i64".to_owned(),
+                kind: semantic::TypeKind::Primitive(semantic::PrimitiveType::I64),
+                linearity: semantic::Linearity::CopyScalar,
+                source: None,
+            },
+            semantic::TypeRecord {
+                id: semantic::TypeId(2),
+                source_name: "[i64; 1]".to_owned(),
+                kind: semantic::TypeKind::Array {
+                    element: semantic::TypeId(1),
+                    length: 1,
+                },
+                linearity: semantic::Linearity::ExplicitCopy,
+                source: Some(span(0, 20, 23)),
+            },
+        ]);
+        input.functions[0].values = vec![
+            semantic::SemanticValue {
+                id: semantic::ValueId(0),
+                ty: semantic::TypeId(1),
+                origin: Some(span(0, 21, 22)),
+                name: None,
+            },
+            semantic::SemanticValue {
+                id: semantic::ValueId(1),
+                ty: semantic::TypeId(2),
+                origin: Some(span(0, 20, 23)),
+                name: Some("values".to_owned()),
+            },
+        ];
+        input.functions[0].body.statements.insert(
+            0,
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                results: vec![semantic::ValueId(1)],
+                operation: semantic::SemanticOperation::Aggregate {
+                    ty: semantic::TypeId(2),
+                    fields: vec![semantic::ValueId(0)],
+                },
+                source: Some(span(0, 20, 23)),
+            }),
+        );
+        assert!(matches!(
+            super::reject_stored_fixed_array_lowering(&input, LoweringLimits::standard(), &|| {
+                false
+            },),
+            Err(LowerError::UnsupportedInput {
+                feature: "flow-for-stored-array-lowering-pending (owned local array storage and indexed iteration)",
             })
         ));
     }

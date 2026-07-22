@@ -330,7 +330,6 @@ fn supported_input<'a>(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedInput<'a>, LowerError> {
     validate_admission_result_lowering_boundary(input.facts())?;
-    validate_stored_fixed_array_lowering_boundary(input.facts())?;
     validate_generic_function_lowering_boundary(input)?;
     validate_method_call_lowering_boundary(input.facts())?;
     match input.facts().root {
@@ -352,26 +351,6 @@ fn supported_input<'a>(
             supported_generated_tests(input, limits, is_cancelled)
                 .map(SupportedInput::GeneratedTests)
         }
-    }
-}
-
-fn validate_stored_fixed_array_lowering_boundary(
-    facts: &sema::PartialAnalysis,
-) -> Result<(), LowerError> {
-    if facts.expressions.iter().any(|fact| {
-        matches!(
-            fact.resolution,
-            sema::ExpressionResolution::ClosedArray {
-                storage: Some(_),
-                ..
-            }
-        )
-    }) {
-        Err(unsupported(
-            "semantic-for-stored-array-lowering-pending (owned local array storage and indexed iteration)",
-        ))
-    } else {
-        Ok(())
     }
 }
 
@@ -7221,6 +7200,18 @@ struct EnumAggregateInput {
     effects: sema::EffectSet,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StoredFixedArrayInput {
+    expression: wrela_hir::ExpressionId,
+    source: Span,
+    ty: sema::SemanticTypeId,
+    result: sema::ValueId,
+    storage: sema::ClosedArrayStorage,
+    maximum_iterations: u64,
+    bounds: sema::ProofId,
+    effects: sema::EffectSet,
+}
+
 struct DerivedFromInput {
     expression: wrela_hir::ExpressionId,
     source: Span,
@@ -7461,6 +7452,7 @@ enum SourceExpressionPlan {
     Aggregate(AggregateInput),
     InitializerAggregate(InitializerAggregateInput),
     EnumAggregate(EnumAggregateInput),
+    StoredFixedArray(StoredFixedArrayInput),
     DerivedFrom(DerivedFromInput),
     Project(ProjectInput),
     DerivedEquality(DerivedEqualityInput),
@@ -8869,6 +8861,18 @@ impl SourceFunctionLowerer<'_> {
                             &mut statements,
                         )?;
                     }
+                    sema::ExpressionResolution::Value(_) => {
+                        self.lower_closed_fixed_array(
+                            binding,
+                            iterable,
+                            body,
+                            statement_source,
+                            depth,
+                            &statement_definitions,
+                            local_state,
+                            &mut statements,
+                        )?;
+                    }
                     _ => return Err(self.fact_mismatch("closed for iterator resolution")),
                 },
                 SourceStatementPlan::With {
@@ -10145,53 +10149,177 @@ impl SourceFunctionLowerer<'_> {
             "semantic-for-array-abnormal-control-lowering-pending (return, break, or continue)",
         )?;
         self.push_seen_expression(iterable)?;
-        let (source_elements, array_source) = {
-            let (elements, source) = self
+        let (
+            source_elements,
+            array_source,
+            array_ty,
+            fact_effects,
+            semantic_elements,
+            maximum_iterations,
+            bounds,
+            storage,
+        ) = {
+            let iterable_record = self
                 .input
                 .hir()
                 .as_program()
                 .expression(iterable)
-                .and_then(|expression| match &expression.kind {
-                    wrela_hir::ExpressionKind::Array(elements) => {
-                        Some((elements.as_slice(), expression.source))
-                    }
-                    _ => None,
-                })
                 .ok_or_else(|| self.fact_mismatch("closed fixed-array HIR shape"))?;
-            let mut copied = try_vec(
-                elements.len(),
-                "SemanticWir fixed-array source elements",
-                self.limits.model_edges,
-            )?;
-            copied.extend_from_slice(elements);
-            (copied, source)
-        };
-        let (array_ty, fact_effects, semantic_elements, maximum_iterations, bounds) = {
-            let fact = self.expression_fact(iterable)?;
-            let (elements, maximum_iterations, bounds) = match &fact.resolution {
-                sema::ExpressionResolution::ClosedArray {
-                    elements,
-                    maximum_iterations,
-                    bounds,
-                    storage: None,
-                } => (elements, *maximum_iterations, *bounds),
-                _ => return Err(self.fact_mismatch("closed fixed-array semantic resolution")),
-            };
-            if fact.function != self.function.id
-                || fact.result.is_some()
-                || fact.category != sema::ValueCategory::Value
-                || fact.region.is_some()
-                || fact.proofs != self.function.proofs
-            {
-                return Err(self.fact_mismatch("closed fixed-array semantic fact"));
+            match &iterable_record.kind {
+                wrela_hir::ExpressionKind::Array(elements) => {
+                    let fact = self.expression_fact(iterable)?;
+                    let (semantic_elements, maximum_iterations, bounds) = match &fact.resolution {
+                        sema::ExpressionResolution::ClosedArray {
+                            elements,
+                            maximum_iterations,
+                            bounds,
+                            storage: None,
+                        } => (elements, *maximum_iterations, *bounds),
+                        _ => {
+                            return Err(
+                                self.fact_mismatch("closed fixed-array semantic resolution")
+                            );
+                        }
+                    };
+                    if fact.function != self.function.id
+                        || fact.result.is_some()
+                        || fact.category != sema::ValueCategory::Value
+                        || fact.region.is_some()
+                        || fact.proofs != self.function.proofs
+                    {
+                        return Err(self.fact_mismatch("closed fixed-array semantic fact"));
+                    }
+                    let mut source_copy = try_vec(
+                        elements.len(),
+                        "SemanticWir fixed-array source elements",
+                        self.limits.model_edges,
+                    )?;
+                    source_copy.extend_from_slice(elements);
+                    let mut semantic_copy = try_vec(
+                        semantic_elements.len(),
+                        "SemanticWir fixed-array element identities",
+                        self.limits.model_edges,
+                    )?;
+                    semantic_copy.extend_from_slice(semantic_elements);
+                    (
+                        source_copy,
+                        iterable_record.source,
+                        fact.ty,
+                        fact.effects,
+                        semantic_copy,
+                        maximum_iterations,
+                        bounds,
+                        None,
+                    )
+                }
+                wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(local)) => {
+                    let iterable_fact = self.expression_fact(iterable)?;
+                    let stored_value = match iterable_fact.resolution {
+                        sema::ExpressionResolution::Value(value) => value,
+                        _ => {
+                            return Err(self
+                                .fact_mismatch("stored fixed-array iterable semantic resolution"));
+                        }
+                    };
+                    if iterable_fact.function != self.function.id
+                        || iterable_fact.result.is_some()
+                        || iterable_fact.effects.0 != 0
+                        || iterable_fact.category != sema::ValueCategory::Value
+                        || iterable_fact.region.is_some()
+                        || iterable_fact.proofs != self.function.proofs
+                        || iterable_fact.ownership_before != sema::OwnershipState::Owned
+                        || iterable_fact.ownership_after != sema::OwnershipState::Owned
+                    {
+                        return Err(self.fact_mismatch("stored fixed-array iterable fact"));
+                    }
+                    let initializer = self
+                        .input
+                        .facts()
+                        .expressions
+                        .iter()
+                        .find(|fact| {
+                            fact.function == self.function.id
+                                && fact.result == Some(stored_value)
+                                && matches!(
+                                    fact.resolution,
+                                    sema::ExpressionResolution::ClosedArray {
+                                        storage: Some(sema::ClosedArrayStorage {
+                                            local: stored_local,
+                                            value,
+                                            iterable: stored_iterable,
+                                        }),
+                                        ..
+                                    } if stored_local == *local
+                                        && value == stored_value
+                                        && stored_iterable == iterable
+                                )
+                        })
+                        .ok_or_else(|| {
+                            self.fact_mismatch("stored fixed-array initializer witness")
+                        })?;
+                    let (semantic_elements, maximum_iterations, bounds, storage) =
+                        match &initializer.resolution {
+                            sema::ExpressionResolution::ClosedArray {
+                                elements,
+                                maximum_iterations,
+                                bounds,
+                                storage: Some(storage),
+                            } => (elements, *maximum_iterations, *bounds, *storage),
+                            _ => {
+                                return Err(self.fact_mismatch(
+                                    "stored fixed-array initializer resolution changed",
+                                ));
+                            }
+                        };
+                    if initializer.ty != iterable_fact.ty
+                        || initializer.category != sema::ValueCategory::Value
+                        || initializer.region.is_some()
+                        || initializer.proofs != self.function.proofs
+                        || initializer.ownership_before != sema::OwnershipState::Owned
+                        || initializer.ownership_after != sema::OwnershipState::Owned
+                        || local_state.get(*local) != Some(stored_value)
+                    {
+                        return Err(self.fact_mismatch("stored fixed-array local identity"));
+                    }
+                    let (source, elements) = self
+                        .input
+                        .hir()
+                        .as_program()
+                        .expression(initializer.expression)
+                        .and_then(|expression| match &expression.kind {
+                            wrela_hir::ExpressionKind::Array(elements) => {
+                                Some((expression.source, elements.as_slice()))
+                            }
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            self.fact_mismatch("stored fixed-array initializer HIR shape")
+                        })?;
+                    let mut source_copy = try_vec(
+                        elements.len(),
+                        "SemanticWir stored fixed-array source elements",
+                        self.limits.model_edges,
+                    )?;
+                    source_copy.extend_from_slice(elements);
+                    let mut semantic_copy = try_vec(
+                        semantic_elements.len(),
+                        "SemanticWir stored fixed-array element identities",
+                        self.limits.model_edges,
+                    )?;
+                    semantic_copy.extend_from_slice(semantic_elements);
+                    (
+                        source_copy,
+                        source,
+                        initializer.ty,
+                        initializer.effects,
+                        semantic_copy,
+                        maximum_iterations,
+                        bounds,
+                        Some(storage),
+                    )
+                }
+                _ => return Err(self.fact_mismatch("closed fixed-array HIR shape")),
             }
-            let mut copied = try_vec(
-                elements.len(),
-                "SemanticWir fixed-array element identities",
-                self.limits.model_edges,
-            )?;
-            copied.extend_from_slice(elements);
-            (fact.ty, fact.effects, copied, maximum_iterations, bounds)
         };
         if source_elements.len() != semantic_elements.len()
             || u64::try_from(source_elements.len()) != Ok(maximum_iterations)
@@ -10219,13 +10347,33 @@ impl SourceFunctionLowerer<'_> {
             .get(bounds.0 as usize)
             .filter(|proof| proof.id == bounds)
             .ok_or_else(|| self.fact_mismatch("closed fixed-array bounds proof"))?;
+        let proof_identity_matches = match storage {
+            None => {
+                proof.subject == "inline fixed-array iteration"
+                    && proof.sources.as_slice() == [array_source]
+                    && proof.explanation.as_slice()
+                        == ["every generated index is strictly below the exact inline array length"]
+            }
+            Some(storage) => {
+                let iterable_source = self
+                    .input
+                    .hir()
+                    .as_program()
+                    .expression(storage.iterable)
+                    .map(|expression| expression.source)
+                    .ok_or_else(|| self.fact_mismatch("stored fixed-array iterable source"))?;
+                proof.subject == "stored fixed-array iteration"
+                    && proof.sources.as_slice() == [array_source, iterable_source]
+                    && proof.explanation.as_slice()
+                        == [
+                            "the immutable local retains the initializer's exact extent and every generated index is strictly below it",
+                        ]
+            }
+        };
         if proof.kind != sema::ProofKind::CapacityBound
-            || proof.subject != "inline fixed-array iteration"
-            || proof.sources.as_slice() != [array_source]
+            || !proof_identity_matches
             || !proof.depends_on.is_empty()
             || proof.bound != Some(maximum_iterations)
-            || proof.explanation.as_slice()
-                != ["every generated index is strictly below the exact inline array length"]
         {
             return Err(self.fact_mismatch("closed fixed-array bounds proof"));
         }
@@ -10260,35 +10408,64 @@ impl SourceFunctionLowerer<'_> {
             return Err(self.fact_mismatch("closed fixed-array binding identity"));
         }
 
-        let mut fields = try_vec(
-            source_elements.len(),
-            "SemanticWir fixed-array fields",
-            self.limits.model_edges,
-        )?;
-        let mut effects = 0_u64;
-        for (source_element, semantic_element) in source_elements.iter().zip(&semantic_elements) {
-            check_cancelled(self.is_cancelled)?;
-            let (child_ty, child_result, child_effects) = {
+        let array_value = if let Some(storage) = storage {
+            let mut effects = 0_u64;
+            for (source_element, semantic_element) in source_elements.iter().zip(&semantic_elements)
+            {
+                check_cancelled(self.is_cancelled)?;
                 let child = self.expression_fact(*source_element)?;
-                (child.ty, child.result, child.effects)
-            };
-            if child_ty != element_ty || child_result != Some(*semantic_element) {
-                return Err(self.fact_mismatch("closed fixed-array element identity"));
+                if child.ty != element_ty || child.result != Some(*semantic_element) {
+                    return Err(self.fact_mismatch("stored fixed-array element identity"));
+                }
+                effects |= child.effects.0;
             }
-            let LoweredExpression::Value(value) =
-                self.lower_expression(*source_element, sema::AccessMode::Value, statements)?
-            else {
-                return Err(self.fact_mismatch("closed fixed-array element value"));
-            };
-            if value != self.value_map.get(*semantic_element)? {
-                return Err(self.fact_mismatch("closed fixed-array lowered element identity"));
+            if fact_effects.0 != effects {
+                return Err(self.fact_mismatch("stored fixed-array effects"));
             }
-            fields.push(value);
-            effects |= child_effects.0;
-        }
-        if fact_effects.0 != effects {
-            return Err(self.fact_mismatch("closed fixed-array effects"));
-        }
+            self.value_map.get(storage.value)?
+        } else {
+            let mut fields = try_vec(
+                source_elements.len(),
+                "SemanticWir fixed-array fields",
+                self.limits.model_edges,
+            )?;
+            let mut effects = 0_u64;
+            for (source_element, semantic_element) in source_elements.iter().zip(&semantic_elements)
+            {
+                check_cancelled(self.is_cancelled)?;
+                let (child_ty, child_result, child_effects) = {
+                    let child = self.expression_fact(*source_element)?;
+                    (child.ty, child.result, child.effects)
+                };
+                if child_ty != element_ty || child_result != Some(*semantic_element) {
+                    return Err(self.fact_mismatch("closed fixed-array element identity"));
+                }
+                let LoweredExpression::Value(value) =
+                    self.lower_expression(*source_element, sema::AccessMode::Value, statements)?
+                else {
+                    return Err(self.fact_mismatch("closed fixed-array element value"));
+                };
+                if value != self.value_map.get(*semantic_element)? {
+                    return Err(self.fact_mismatch("closed fixed-array lowered element identity"));
+                }
+                fields.push(value);
+                effects |= child_effects.0;
+            }
+            if fact_effects.0 != effects {
+                return Err(self.fact_mismatch("closed fixed-array effects"));
+            }
+            let array_value = self.allocate_synthetic_value(array_ty, array_source)?;
+            self.push_let(
+                statements,
+                array_value,
+                wir::SemanticOperation::Aggregate {
+                    ty: wir::TypeId(array_ty.0),
+                    fields,
+                },
+                Some(array_source),
+            )?;
+            array_value
+        };
         let index_ty = self
             .input
             .facts()
@@ -10314,16 +10491,6 @@ impl SourceFunctionLowerer<'_> {
             .find(|ty| matches!(ty.kind, sema::SemanticTypeKind::Bool))
             .map(|ty| ty.id)
             .ok_or_else(|| self.fact_mismatch("closed fixed-array condition type"))?;
-        let array_value = self.allocate_synthetic_value(array_ty, array_source)?;
-        self.push_let(
-            statements,
-            array_value,
-            wir::SemanticOperation::Aggregate {
-                ty: wir::TypeId(array_ty.0),
-                fields,
-            },
-            Some(array_source),
-        )?;
         let start = self.allocate_synthetic_value(index_ty, statement_source)?;
         let length_value = self.allocate_synthetic_value(index_ty, array_source)?;
         let header = self.allocate_synthetic_value(index_ty, statement_source)?;
@@ -11220,6 +11387,26 @@ impl SourceFunctionLowerer<'_> {
                         }
                     }
                     (
+                        wrela_hir::ExpressionKind::Array(_),
+                        sema::ExpressionResolution::ClosedArray {
+                            maximum_iterations,
+                            bounds,
+                            storage: Some(storage),
+                            ..
+                        },
+                    ) => SourceExpressionPlan::StoredFixedArray(StoredFixedArrayInput {
+                        expression: expression_id,
+                        source: expression.source,
+                        ty: fact.ty,
+                        result: fact.result.ok_or_else(|| {
+                            self.fact_mismatch("stored fixed-array initializer result")
+                        })?,
+                        storage: *storage,
+                        maximum_iterations: *maximum_iterations,
+                        bounds: *bounds,
+                        effects: fact.effects,
+                    }),
+                    (
                         wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(local)),
                         sema::ExpressionResolution::Value(value),
                     ) => SourceExpressionPlan::Local(ValueReferenceInput {
@@ -12043,6 +12230,9 @@ impl SourceFunctionLowerer<'_> {
             }
             SourceExpressionPlan::EnumAggregate(aggregate) => {
                 self.lower_enum_aggregate(aggregate, statements)
+            }
+            SourceExpressionPlan::StoredFixedArray(array) => {
+                self.lower_stored_fixed_array_initializer(array, statements)
             }
             SourceExpressionPlan::DerivedFrom(conversion) => {
                 self.lower_derived_from(conversion, statements)
@@ -13711,6 +13901,210 @@ impl SourceFunctionLowerer<'_> {
             return Err(self.fact_mismatch("expression result provenance"));
         }
         self.value_map.get(result)
+    }
+
+    fn lower_stored_fixed_array_initializer(
+        &mut self,
+        input: StoredFixedArrayInput,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<LoweredExpression, LowerError> {
+        check_cancelled(self.is_cancelled)?;
+        let source_elements = self
+            .input
+            .hir()
+            .as_program()
+            .expression(input.expression)
+            .and_then(|expression| match &expression.kind {
+                wrela_hir::ExpressionKind::Array(elements) if expression.source == input.source => {
+                    Some(elements.as_slice())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| self.fact_mismatch("stored fixed-array initializer HIR shape"))?;
+        let mut source_elements_copy = try_vec(
+            source_elements.len(),
+            "SemanticWir stored fixed-array source elements",
+            self.limits.model_edges,
+        )?;
+        source_elements_copy.extend_from_slice(source_elements);
+        let (semantic_elements, fact_storage) = {
+            let fact = self.expression_fact(input.expression)?;
+            let (elements, maximum_iterations, bounds, storage) = match &fact.resolution {
+                sema::ExpressionResolution::ClosedArray {
+                    elements,
+                    maximum_iterations,
+                    bounds,
+                    storage: Some(storage),
+                } => (elements, *maximum_iterations, *bounds, *storage),
+                _ => {
+                    return Err(
+                        self.fact_mismatch("stored fixed-array initializer semantic resolution")
+                    );
+                }
+            };
+            if fact.function != self.function.id
+                || fact.ty != input.ty
+                || fact.result != Some(input.result)
+                || fact.effects != input.effects
+                || maximum_iterations != input.maximum_iterations
+                || bounds != input.bounds
+                || storage != input.storage
+            {
+                return Err(self.fact_mismatch("stored fixed-array initializer semantic fact"));
+            }
+            let mut copied = try_vec(
+                elements.len(),
+                "SemanticWir stored fixed-array element identities",
+                self.limits.model_edges,
+            )?;
+            copied.extend_from_slice(elements);
+            (copied, storage)
+        };
+        if fact_storage.local != input.storage.local
+            || fact_storage.value != input.result
+            || source_elements_copy.len() != semantic_elements.len()
+            || u64::try_from(source_elements_copy.len()) != Ok(input.maximum_iterations)
+            || input.maximum_iterations == 0
+        {
+            return Err(self.fact_mismatch("stored fixed-array initializer extent and storage"));
+        }
+        let (element_ty, length) = self
+            .input
+            .facts()
+            .types
+            .get(input.ty.0 as usize)
+            .and_then(|record| match record.kind {
+                sema::SemanticTypeKind::Array { element, length }
+                    if record.linearity == sema::Linearity::ExplicitCopy =>
+                {
+                    Some((element, length))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| self.fact_mismatch("stored fixed-array initializer type"))?;
+        if length != input.maximum_iterations
+            || self
+                .input
+                .facts()
+                .types
+                .get(element_ty.0 as usize)
+                .is_none_or(|record| {
+                    record.linearity != sema::Linearity::ScalarCopy
+                        || !matches!(
+                            record.kind,
+                            sema::SemanticTypeKind::Bool
+                                | sema::SemanticTypeKind::Integer {
+                                    signed: true,
+                                    bits: 64,
+                                    pointer_sized: false,
+                                }
+                        )
+                })
+        {
+            return Err(self.fact_mismatch("stored fixed-array initializer element type"));
+        }
+        let local = self
+            .input
+            .hir()
+            .as_program()
+            .locals
+            .get(input.storage.local.0 as usize)
+            .filter(|local| local.id == input.storage.local && local.ty.is_none())
+            .ok_or_else(|| self.fact_mismatch("stored fixed-array initializer local"))?;
+        if self
+            .input
+            .facts()
+            .values
+            .get(input.result.0 as usize)
+            .is_none_or(|value| {
+                value.id != input.result
+                    || value.function != self.function.id
+                    || value.ty != input.ty
+                    || value.category != sema::ValueCategory::Value
+                    || value.class != sema::SemanticValueClass::FirstClass
+                    || value.origin != sema::SemanticValueOrigin::Local(input.storage.local)
+                    || value.source != Some(local.source)
+                    || value.source_name.as_deref() != Some(local.name.as_str())
+            })
+        {
+            return Err(self.fact_mismatch("stored fixed-array initializer value provenance"));
+        }
+        let iterable_source = self
+            .input
+            .hir()
+            .as_program()
+            .expression(input.storage.iterable)
+            .filter(|expression| {
+                matches!(
+                    expression.kind,
+                    wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(local))
+                        if local == input.storage.local
+                )
+            })
+            .map(|expression| expression.source)
+            .ok_or_else(|| self.fact_mismatch("stored fixed-array iterable source"))?;
+        let proof = self
+            .input
+            .facts()
+            .proofs
+            .get(input.bounds.0 as usize)
+            .filter(|proof| proof.id == input.bounds)
+            .ok_or_else(|| self.fact_mismatch("stored fixed-array bounds proof"))?;
+        if proof.kind != sema::ProofKind::CapacityBound
+            || proof.subject != "stored fixed-array iteration"
+            || proof.sources.as_slice() != [input.source, iterable_source]
+            || !proof.depends_on.is_empty()
+            || proof.bound != Some(input.maximum_iterations)
+            || proof.explanation.as_slice()
+                != [
+                    "the immutable local retains the initializer's exact extent and every generated index is strictly below it",
+                ]
+        {
+            return Err(self.fact_mismatch("stored fixed-array bounds proof"));
+        }
+        let mut fields = try_vec(
+            source_elements_copy.len(),
+            "SemanticWir stored fixed-array fields",
+            self.limits.model_edges,
+        )?;
+        let mut effects = 0_u64;
+        for (source_element, semantic_element) in
+            source_elements_copy.iter().zip(&semantic_elements)
+        {
+            check_cancelled(self.is_cancelled)?;
+            let (child_ty, child_result, child_effects) = {
+                let child = self.expression_fact(*source_element)?;
+                (child.ty, child.result, child.effects)
+            };
+            if child_ty != element_ty || child_result != Some(*semantic_element) {
+                return Err(self.fact_mismatch("stored fixed-array element identity"));
+            }
+            let LoweredExpression::Value(value) =
+                self.lower_expression(*source_element, sema::AccessMode::Value, statements)?
+            else {
+                return Err(self.fact_mismatch("stored fixed-array element value"));
+            };
+            if value != self.value_map.get(*semantic_element)? {
+                return Err(self.fact_mismatch("stored fixed-array lowered element identity"));
+            }
+            fields.push(value);
+            effects |= child_effects.0;
+        }
+        if input.effects.0 != effects {
+            return Err(self.fact_mismatch("stored fixed-array initializer effects"));
+        }
+        let result =
+            self.lowered_expression_result(input.expression, input.result, input.ty, input.source)?;
+        self.push_let(
+            statements,
+            result,
+            wir::SemanticOperation::Aggregate {
+                ty: wir::TypeId(input.ty.0),
+                fields,
+            },
+            Some(input.source),
+        )?;
+        Ok(LoweredExpression::Value(result))
     }
 
     fn lower_flat_aggregate(
@@ -28487,7 +28881,69 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn stored_fixed_array_iteration_stops_at_named_semantic_lowering_boundary() {
+    fn stored_fixed_array_lowers_once_to_exact_indexed_semantic_loop() {
+        fn visit<'a>(
+            region: &'a wir::SemanticRegion,
+            statements: &mut Vec<&'a wir::SemanticStatement>,
+        ) {
+            for statement in &region.statements {
+                statements.push(statement);
+                match statement {
+                    wir::SemanticStatement::If {
+                        then_region,
+                        else_region,
+                        ..
+                    } => {
+                        visit(then_region, statements);
+                        visit(else_region, statements);
+                    }
+                    wir::SemanticStatement::Match { arms, .. } => {
+                        for arm in arms {
+                            visit(&arm.body, statements);
+                        }
+                    }
+                    wir::SemanticStatement::Loop { body, .. } => visit(body, statements),
+                    _ => {}
+                }
+            }
+        }
+
+        fn replace_first_index_base(
+            region: &mut wir::SemanticRegion,
+            replacement: wir::ValueId,
+        ) -> bool {
+            for statement in &mut region.statements {
+                let replaced = match statement {
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::Index { base, .. },
+                        ..
+                    }) => {
+                        *base = replacement;
+                        return true;
+                    }
+                    wir::SemanticStatement::If {
+                        then_region,
+                        else_region,
+                        ..
+                    } => {
+                        replace_first_index_base(then_region, replacement)
+                            || replace_first_index_base(else_region, replacement)
+                    }
+                    wir::SemanticStatement::Match { arms, .. } => arms
+                        .iter_mut()
+                        .any(|arm| replace_first_index_base(&mut arm.body, replacement)),
+                    wir::SemanticStatement::Loop { body, .. } => {
+                        replace_first_index_base(body, replacement)
+                    }
+                    _ => false,
+                };
+                if replaced {
+                    return true;
+                }
+            }
+            false
+        }
+
         let image = analyze_parsed_actor_source(
             r#"module app
 
@@ -28515,18 +28971,388 @@ pub fn boot() -> Image:
     return img
 "#,
         );
+        let (input_edges, input_payload) =
+            preflight_input(image.facts(), LoweringLimits::standard(), &|| false)
+                .expect("measure stored fixed-array semantic input");
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("stored fixed array should lower to SemanticWir");
+        let function = lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .find(|function| function.name.contains("consume_values"))
+            .expect("stored fixed-array helper");
+        let aggregates: Vec<_> = function
+            .body
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    results,
+                    operation: wir::SemanticOperation::Aggregate { fields, .. },
+                    ..
+                }) => Some((results, fields)),
+                _ => None,
+            })
+            .collect();
+        let [(aggregate_results, fields)] = aggregates.as_slice() else {
+            panic!("one exact stored-array aggregate")
+        };
+        let [array_value] = aggregate_results.as_slice() else {
+            panic!("one stored-array result")
+        };
+        assert_eq!(
+            function.values[array_value.0 as usize].name.as_deref(),
+            Some("values")
+        );
+        assert_eq!(fields.len(), 3);
+        let element_values: Vec<_> = fields
+            .iter()
+            .map(|field| {
+                function
+                    .body
+                    .statements
+                    .iter()
+                    .find_map(|statement| match statement {
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            results,
+                            operation:
+                                wir::SemanticOperation::Constant(wir::Constant::Signed {
+                                    bits: 64,
+                                    value,
+                                }),
+                            ..
+                        }) if results.as_slice() == [*field] => Some(*value),
+                        _ => None,
+                    })
+                    .expect("stored-array source element constant")
+            })
+            .collect();
+        assert_eq!(element_values, [1, 2, 3]);
+        let (loop_body, uninterrupted_bound) = function
+            .body
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Loop {
+                    body,
+                    uninterrupted_bound,
+                    ..
+                } => Some((body, uninterrupted_bound)),
+                _ => None,
+            })
+            .expect("stored-array indexed loop");
+        assert_eq!(*uninterrupted_bound, Some(3));
+        let mut nested = Vec::new();
+        visit(loop_body, &mut nested);
+        let (indexed_base, indexed_proof, binding) = nested
+            .iter()
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    results,
+                    operation: wir::SemanticOperation::Index { base, proof, .. },
+                    ..
+                }) => results.first().map(|result| (*base, *proof, *result)),
+                _ => None,
+            })
+            .expect("stored-array exact positional extraction");
+        assert_eq!(indexed_base, *array_value);
+        assert_eq!(
+            function.values[binding.0 as usize].name.as_deref(),
+            Some("item")
+        );
+        let proof = &lowered.wir().as_wir().proofs[indexed_proof.0 as usize];
+        assert_eq!(proof.subject, "stored fixed-array iteration");
+        assert_eq!(proof.bound, Some(3));
+        assert_eq!(proof.sources.len(), 2);
+
+        let request = |input| LowerRequest {
+            input,
+            limits: LoweringLimits::standard(),
+        };
+        let mut wrong_order = lowered.wir().as_wir().clone();
+        let forged_function = wrong_order
+            .functions
+            .iter_mut()
+            .find(|function| function.name.contains("consume_values"))
+            .expect("mutable stored-array helper");
+        let forged_fields = forged_function
+            .body
+            .statements
+            .iter_mut()
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::Aggregate { fields, .. },
+                    ..
+                }) => Some(fields),
+                _ => None,
+            })
+            .expect("mutable stored-array aggregate");
+        forged_fields.swap(0, 1);
+        assert!(
+            seal(
+                &request(image.clone()),
+                wrong_order,
+                lowered.report().clone(),
+                &|| false,
+            )
+            .is_err()
+        );
+
+        let mut wrong_base = lowered.wir().as_wir().clone();
+        let forged_function = wrong_base
+            .functions
+            .iter_mut()
+            .find(|function| function.name.contains("consume_values"))
+            .expect("mutable stored-array helper");
+        assert!(replace_first_index_base(
+            &mut forged_function.body,
+            fields[0],
+        ));
+        assert!(
+            seal(
+                &request(image.clone()),
+                wrong_base,
+                lowered.report().clone(),
+                &|| false,
+            )
+            .is_err()
+        );
+
+        let mut wrong_bound = lowered.wir().as_wir().clone();
+        let forged_function = wrong_bound
+            .functions
+            .iter_mut()
+            .find(|function| function.name.contains("consume_values"))
+            .expect("mutable stored-array helper");
+        let forged_bound = forged_function
+            .body
+            .statements
+            .iter_mut()
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Loop {
+                    uninterrupted_bound,
+                    ..
+                } => Some(uninterrupted_bound),
+                _ => None,
+            })
+            .expect("mutable stored-array bound");
+        *forged_bound = Some(2);
+        assert!(
+            seal(
+                &request(image.clone()),
+                wrong_bound,
+                lowered.report().clone(),
+                &|| false,
+            )
+            .is_err()
+        );
+
+        let mut wrong_proof = lowered.wir().as_wir().clone();
+        wrong_proof.proofs[indexed_proof.0 as usize]
+            .sources
+            .swap(0, 1);
+        assert!(
+            seal(
+                &request(image.clone()),
+                wrong_proof,
+                lowered.report().clone(),
+                &|| false,
+            )
+            .is_err()
+        );
+
+        let mut wrong_local = lowered.wir().as_wir().clone();
+        wrong_local
+            .functions
+            .iter_mut()
+            .find(|function| function.name.contains("consume_values"))
+            .expect("mutable stored-array helper")
+            .values[array_value.0 as usize]
+            .name = Some("forged_values".to_owned());
+        assert!(
+            seal(
+                &request(image.clone()),
+                wrong_local,
+                lowered.report().clone(),
+                &|| false,
+            )
+            .is_err()
+        );
+
+        let meter = measure_model_resources(
+            lowered.wir().as_wir().into(),
+            LoweringLimits::standard(),
+            &|| false,
+        )
+        .expect("measure stored fixed-array SemanticWir");
+        let mut exact = LoweringLimits::standard();
+        exact.operations = lowered.report().operations;
+        exact.model_edges = meter.edges.max(input_edges);
+        exact.payload_bytes = meter.payload_bytes.max(input_payload);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact stored-array operation and model limits");
+        let mut one_operation_under = exact;
+        one_operation_under.operations -= 1;
         assert!(matches!(
             CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_operation_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == exact.operations - 1
+        ));
+        let mut one_edge_under = exact;
+        one_edge_under.model_edges -= 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_edge_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit { limit, .. }) if limit == exact.model_edges - 1
+        ));
+        let polls = Cell::new(0_u64);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            )
+            .expect("count stored-array lowering cancellation polls");
+        let final_poll = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next == final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn stored_boolean_fixed_array_lowers_with_exact_element_type_and_order() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+fn consume_flags():
+    flags = [true, false, true]
+    for flag in flags:
+        observed: bool = flag
+        pass
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        consume_flags()
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
                 LowerRequest {
                     input: image,
                     limits: LoweringLimits::standard(),
                 },
                 &|| false,
-            ),
-            Err(LowerError::UnsupportedInput {
-                feature: "semantic-for-stored-array-lowering-pending (owned local array storage and indexed iteration)"
+            )
+            .expect("stored boolean fixed array should lower");
+        let module = lowered.wir().as_wir();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.contains("consume_flags"))
+            .expect("stored boolean helper");
+        let (array_ty, fields) = function
+            .body
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::Aggregate { ty, fields },
+                    ..
+                }) => Some((*ty, fields)),
+                _ => None,
             })
+            .expect("stored boolean aggregate");
+        let element_ty = module
+            .types
+            .get(array_ty.0 as usize)
+            .and_then(|record| match record.kind {
+                wir::TypeKind::Array { element, length: 3 } => Some(element),
+                _ => None,
+            })
+            .expect("exact boolean array type");
+        assert!(matches!(
+            module.types[element_ty.0 as usize].kind,
+            wir::TypeKind::Primitive(wir::PrimitiveType::Bool)
         ));
+        let values: Vec<_> = fields
+            .iter()
+            .map(|field| {
+                function
+                    .body
+                    .statements
+                    .iter()
+                    .find_map(|statement| match statement {
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            results,
+                            operation: wir::SemanticOperation::Constant(wir::Constant::Bool(value)),
+                            ..
+                        }) if results.as_slice() == [*field] => Some(*value),
+                        _ => None,
+                    })
+                    .expect("stored boolean element")
+            })
+            .collect();
+        assert_eq!(values, [true, false, true]);
     }
 
     #[test]

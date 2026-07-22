@@ -3994,13 +3994,13 @@ fn validate_operation(
                         record.id == *proof
                             && record.kind == ProofKind::CapacityBound
                             && matches!(
-                                record.subject.as_str(),
-                                "inline fixed-array iteration"
-                                    | "inline fixed-array pattern match"
+                                (record.subject.as_str(), record.sources.len()),
+                                ("inline fixed-array iteration", 1)
+                                    | ("inline fixed-array pattern match", 1)
+                                    | ("stored fixed-array iteration", 2)
                             )
                             && record.bound == Some(length)
                             && record.depends_on.is_empty()
-                            && record.sources.len() == 1
                     })
                     && function.proofs.binary_search(proof).is_ok()
             }));
