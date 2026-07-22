@@ -604,7 +604,7 @@ fn valid_front_boundary_reports_native_success_or_honest_default_failure() {
             u64::try_from(report_bytes.len()).expect("bounded report byte count"),
             &|| false,
         )
-        .expect("published schema-v14 report authenticates independently");
+        .expect("published schema-v15 report authenticates independently");
         assert!(report.analysis().region_capacity_evidence.is_empty());
         assert_eq!(report.backend().artifact_digest, success.artifact_digest);
         assert!(report.backend().relocation_directory_bytes > 0);

@@ -35,8 +35,8 @@ use wrela_image_report::{
     ActivationCancellationFact, ActivationFrameEvidenceFact, AnalysisFactLimits,
     AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts, BoundFact, HardwareFact,
     ImageEdgeFact, ImageNodeFact, ImageReport, OptimizationAction, OptimizationDecisionFact,
-    ProofFact, RegionCapacityEvidenceFact, ReportError, RepresentationFacts, SectionFact,
-    SymbolFact, WorkFact, seal_analysis_facts,
+    ProofFact, RegionCapacityEvidenceFact, ReportError, RepresentationFacts,
+    SchedulerOwnershipFact, SectionFact, SymbolFact, WorkFact, seal_analysis_facts,
 };
 use wrela_link_efi::{
     CanonicalCoffObjectInspector, CanonicalLinkedImageInspector, CoffObject, CoffObjectKind,
@@ -536,6 +536,10 @@ fn analysis_facts(
         .activation_frame_evidence
         .try_reserve_exact(flow.activations.len())
         .map_err(|_| BackendReportError::ResourceExhausted("analysis activation evidence"))?;
+    facts
+        .scheduler_ownership
+        .try_reserve_exact(flow.schedulers.len())
+        .map_err(|_| BackendReportError::ResourceExhausted("analysis scheduler ownership"))?;
     let edge_capacity = flow
         .actors
         .len()
@@ -684,6 +688,30 @@ fn analysis_facts(
             destination: supervisor,
             capacity: Some(u64::from(task.slots)),
             priority: Some(task.priority),
+        });
+    }
+    for scheduler in &flow.schedulers {
+        check_report_cancelled(is_cancelled)?;
+        let mut actors = Vec::new();
+        actors
+            .try_reserve_exact(scheduler.actors.len())
+            .map_err(|_| BackendReportError::ResourceExhausted("scheduler actor ownership"))?;
+        for actor in &scheduler.actors {
+            check_report_cancelled(is_cancelled)?;
+            actors.push(actor_identity(flow, *actor)?);
+        }
+        let mut tasks = Vec::new();
+        tasks
+            .try_reserve_exact(scheduler.tasks.len())
+            .map_err(|_| BackendReportError::ResourceExhausted("scheduler task ownership"))?;
+        for task in &scheduler.tasks {
+            check_report_cancelled(is_cancelled)?;
+            tasks.push(task_identity(flow, *task)?);
+        }
+        facts.scheduler_ownership.push(SchedulerOwnershipFact {
+            core: scheduler.core,
+            actors,
+            tasks,
         });
     }
     let semantic = target.semantic();
@@ -1316,6 +1344,19 @@ fn actor_identity(
             "actor report owner is foreign",
         ))
         .and_then(|actor| named_identity("actor", actor.id.0, &actor.name))
+}
+
+fn task_identity(
+    flow: &wrela_flow_wir::FlowWir,
+    id: wrela_flow_wir::TaskId,
+) -> Result<String, BackendReportError> {
+    flow.tasks
+        .get(id.0 as usize)
+        .filter(|task| task.id == id)
+        .ok_or(BackendReportError::Mismatch(
+            "scheduler report task owner is foreign",
+        ))
+        .and_then(|task| named_identity("task", task.id.0, &task.name))
 }
 
 const fn report_region_kind(
@@ -4246,6 +4287,13 @@ mod tests {
                 && edge.capacity == Some(2)
                 && edge.priority == Some(3)
         }));
+        assert_eq!(projected.scheduler_ownership.len(), 1);
+        assert_eq!(projected.scheduler_ownership[0].core, 0);
+        assert_eq!(
+            projected.scheduler_ownership[0].actors,
+            ["actor:0:root", "actor:1:worker"]
+        );
+        assert_eq!(projected.scheduler_ownership[0].tasks, ["task:0:flush"]);
         assert_eq!(projected.proofs[8].category, "supervision-complete");
         assert_eq!(projected.region_capacity_evidence.len(), 5);
         assert_eq!(
@@ -4274,6 +4322,12 @@ mod tests {
             projected.region_capacity_evidence.len(),
             projected.image_edges.len(),
             projected.work.len(),
+            projected.scheduler_ownership.len(),
+            projected
+                .scheduler_ownership
+                .iter()
+                .map(|fact| fact.actors.len() + fact.tasks.len())
+                .sum(),
             projected.startup_order.len(),
             projected.shutdown_order.len(),
         ]

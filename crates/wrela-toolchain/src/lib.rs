@@ -342,7 +342,7 @@ impl ToolchainCompatibility {
             flow_wir_wire: 15,
             machine_wir: 16,
             runtime_abi: 2,
-            image_report: 14,
+            image_report: 15,
             test_plan: 2,
             test_report: 2,
             image_scenario: 1,

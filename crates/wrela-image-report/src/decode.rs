@@ -13,11 +13,11 @@ use crate::{
     BoundFact, HardwareFact, ImageEdgeFact, ImageNodeFact, ImageReport, OptimizationAction,
     OptimizationDecisionFact, PromotionFact, ProofFact, REPORT_SCHEMA_VERSION, RecoveryFact,
     RegionAssignmentFact, RegionCapacityEvidenceFact, RegionClass, ReportError,
-    RepresentationFacts, SectionFact, SymbolFact, WorkFact, copy_build_identity,
-    seal_analysis_facts,
+    RepresentationFacts, SchedulerOwnershipFact, SectionFact, SymbolFact, WorkFact,
+    copy_build_identity, seal_analysis_facts,
 };
 
-/// Decode and authenticate one canonical schema-v14 image report.
+/// Decode and authenticate one canonical schema-v15 image report.
 ///
 /// The caller supplies the build identity expected at this trust boundary and
 /// all resource ceilings. The decoded facts are resealed through the same
@@ -177,6 +177,12 @@ pub fn decode_image_report_json(
         budget.analysis_payloads([&fact.subject, &fact.supervisor])?;
         Ok(fact)
     })?;
+    parser.field("scheduler_ownership", false)?;
+    let scheduler_ownership = parse_array(&mut parser, |parser| {
+        budget.analysis_item()?;
+        let fact = parse_scheduler_ownership(parser, &mut budget)?;
+        Ok(fact)
+    })?;
     parser.field("compiled_test_group", false)?;
     let compiled_test_group = parse_compiled_test_group(&mut parser, &mut budget)?;
     parser.field("startup_order", false)?;
@@ -271,6 +277,7 @@ pub fn decode_image_report_json(
         work,
         hardware,
         recovery,
+        scheduler_ownership,
         compiled_test_group,
         startup_order,
         shutdown_order,
@@ -461,6 +468,31 @@ fn parse_promotion(parser: &mut Parser<'_>) -> Result<PromotionFact, ReportError
         destination_region,
         reason,
         proof,
+    })
+}
+
+fn parse_scheduler_ownership(
+    parser: &mut Parser<'_>,
+    budget: &mut DecodeBudget,
+) -> Result<SchedulerOwnershipFact, ReportError> {
+    parser.object_start()?;
+    parser.field("core", true)?;
+    let core = parser.u32("scheduler core identifier")?;
+    parser.field("actors", false)?;
+    let actors = parse_string_array(parser, |value| {
+        budget.analysis_item()?;
+        budget.analysis_payload(value)
+    })?;
+    parser.field("tasks", false)?;
+    let tasks = parse_string_array(parser, |value| {
+        budget.analysis_item()?;
+        budget.analysis_payload(value)
+    })?;
+    parser.object_end()?;
+    Ok(SchedulerOwnershipFact {
+        core,
+        actors,
+        tasks,
     })
 }
 
@@ -1360,7 +1392,8 @@ mod tests {
         AnalysisFacts, BackendFactLimits, BackendFacts, BoundFact, HardwareFact, ImageEdgeFact,
         ImageNodeFact, ImageReport, OptimizationAction, OptimizationDecisionFact, PromotionFact,
         ProofFact, RecoveryFact, RegionAssignmentFact, RegionCapacityEvidenceFact, RegionClass,
-        ReportError, RepresentationFacts, SectionFact, SymbolFact, WorkFact, seal_analysis_facts,
+        ReportError, RepresentationFacts, SchedulerOwnershipFact, SectionFact, SymbolFact,
+        WorkFact, seal_analysis_facts,
     };
 
     use super::{Parser, decode_image_report_json};
@@ -1593,6 +1626,11 @@ mod tests {
                 reset_timeout_ns: 50,
                 quarantine_bytes: 256,
                 cleanup_path: vec!["mask".to_owned(), "reset".to_owned()],
+            }],
+            scheduler_ownership: vec![SchedulerOwnershipFact {
+                core: 0,
+                actors: vec!["actor:0:alpha".to_owned()],
+                tasks: vec!["task:0:alpha".to_owned()],
             }],
             compiled_test_group,
             startup_order: vec!["device:0:uart0".to_owned(), "task:0:alpha".to_owned()],
@@ -1833,15 +1871,15 @@ mod tests {
     #[test]
     fn schema_scalar_enum_and_json_structure_mutations_fail_closed() {
         let json = full_report(ActorLoweringKind::Queued, OptimizationAction::Retained).to_json();
-        let schema = json.replacen("\"schema\":14", "\"schema\":15", 1);
+        let schema = json.replacen("\"schema\":15", "\"schema\":16", 1);
         assert_eq!(
             decode(schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(15))
+            Err(ReportError::UnsupportedSchema(16))
         );
-        let stale_schema = json.replacen("\"schema\":14", "\"schema\":13", 1);
+        let stale_schema = json.replacen("\"schema\":15", "\"schema\":14", 1);
         assert_eq!(
             decode(stale_schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(13))
+            Err(ReportError::UnsupportedSchema(14))
         );
 
         let oversized_u32 = json.replacen(
@@ -2054,6 +2092,12 @@ mod tests {
             analysis.work.len(),
             analysis.hardware.len(),
             analysis.recovery.len(),
+            analysis.scheduler_ownership.len(),
+            analysis
+                .scheduler_ownership
+                .iter()
+                .map(|fact| fact.actors.len() + fact.tasks.len())
+                .sum(),
             analysis.startup_order.len(),
             analysis.shutdown_order.len(),
         ]

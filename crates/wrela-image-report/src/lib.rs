@@ -14,10 +14,12 @@ pub use decode::decode_image_report_json;
 ///
 /// Version 12 added whole-image region inference facts (`RegionAssignmentFact`
 /// and `PromotionFact`) to the sealed analysis section. Version 13 makes their
-/// allocation identities, final-region join, and bounded proof join exact. The
-/// decoder gates on this exact value, so every older representation is rejected
-/// as [`ReportError::UnsupportedSchema`].
-pub const REPORT_SCHEMA_VERSION: u32 = 14;
+/// allocation identities, final-region join, and bounded proof join exact.
+/// Version 14 records the MachineWir v16 representation boundary. Version 15
+/// retains the authenticated FlowWir scheduler ownership partition in the
+/// sealed analysis facts. The decoder gates on this exact value, so every older
+/// representation is rejected as [`ReportError::UnsupportedSchema`].
+pub const REPORT_SCHEMA_VERSION: u32 = 15;
 
 const CURRENT_SEMANTIC_WIR_VERSION: u32 = 12;
 const CURRENT_FLOW_WIR_VERSION: u32 = 15;
@@ -235,6 +237,17 @@ pub struct RecoveryFact {
     pub cleanup_path: Vec<String>,
 }
 
+/// Exact actor/task ownership assigned to one cooperative scheduler core.
+///
+/// This is evidence copied from validated FlowWir. It does not imply that a
+/// runtime scheduler or inferred multi-core placement has been emitted.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SchedulerOwnershipFact {
+    pub core: u32,
+    pub actors: Vec<String>,
+    pub tasks: Vec<String>,
+}
+
 /// Frontend and WIR facts independent of final object bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AnalysisFacts {
@@ -257,6 +270,7 @@ pub struct AnalysisFacts {
     pub work: Vec<WorkFact>,
     pub hardware: Vec<HardwareFact>,
     pub recovery: Vec<RecoveryFact>,
+    pub scheduler_ownership: Vec<SchedulerOwnershipFact>,
     /// Exact test-plan group compiled into this image. This remains absent for
     /// ordinary builds and is copied, never inferred, by both report producers.
     pub compiled_test_group: Option<wrela_test_model::FullImageTestGroup>,
@@ -1109,6 +1123,22 @@ impl ImageReport {
             json_string_array(&mut output, &fact.cleanup_path, is_cancelled)?;
             output.push('}');
         }
+        output.push_str("],\"scheduler_ownership\":[");
+        for (index, fact) in self.analysis.scheduler_ownership.iter().enumerate() {
+            if is_cancelled() {
+                return Err(ReportError::Cancelled);
+            }
+            if index != 0 {
+                output.push(',');
+            }
+            output.push('{');
+            json_number(&mut output, "core", u64::from(fact.core), false);
+            output.push_str(",\"actors\":");
+            json_string_array(&mut output, &fact.actors, is_cancelled)?;
+            output.push_str(",\"tasks\":");
+            json_string_array(&mut output, &fact.tasks, is_cancelled)?;
+            output.push('}');
+        }
         output.push_str("],\"compiled_test_group\":");
         json_compiled_test_group(
             &mut output,
@@ -1582,7 +1612,12 @@ fn canonicalize_analysis(
     cancellable_sort(&mut analysis.image_edges, is_cancelled)?;
     cancellable_sort(&mut analysis.work, is_cancelled)?;
     cancellable_sort(&mut analysis.hardware, is_cancelled)?;
-    cancellable_sort(&mut analysis.recovery, is_cancelled)
+    cancellable_sort(&mut analysis.recovery, is_cancelled)?;
+    for ownership in &mut analysis.scheduler_ownership {
+        cancellable_sort(&mut ownership.actors, is_cancelled)?;
+        cancellable_sort(&mut ownership.tasks, is_cancelled)?;
+    }
+    cancellable_sort(&mut analysis.scheduler_ownership, is_cancelled)
 }
 
 fn canonicalize_backend(
@@ -1639,6 +1674,7 @@ fn measure_analysis(
         analysis.work.len(),
         analysis.hardware.len(),
         analysis.recovery.len(),
+        analysis.scheduler_ownership.len(),
         analysis.startup_order.len(),
         analysis.shutdown_order.len(),
     ] {
@@ -1765,6 +1801,13 @@ fn measure_analysis(
             });
         }
         for value in &fact.cleanup_path {
+            add(value)?;
+        }
+    }
+    for fact in &analysis.scheduler_ownership {
+        add_items(fact.actors.len())?;
+        add_items(fact.tasks.len())?;
+        for value in fact.actors.iter().chain(&fact.tasks) {
             add(value)?;
         }
     }
@@ -1911,6 +1954,11 @@ fn validate_analysis(
     require_canonical("work facts", &analysis.work, is_cancelled)?;
     require_canonical("hardware facts", &analysis.hardware, is_cancelled)?;
     require_canonical("recovery facts", &analysis.recovery, is_cancelled)?;
+    require_canonical(
+        "scheduler ownership facts",
+        &analysis.scheduler_ownership,
+        is_cancelled,
+    )?;
     require_nonempty_unique("startup order", &analysis.startup_order, is_cancelled)?;
     require_nonempty_unique("shutdown order", &analysis.shutdown_order, is_cancelled)?;
     if is_cancelled() {
@@ -1988,6 +2036,58 @@ fn validate_analysis(
             || !nonempty(&fact.owner, is_cancelled)?
             || !nonempty(&fact.source, is_cancelled)?
         {
+            return Err(ReportError::InvalidFact);
+        }
+    }
+    let scheduler_identity_count =
+        analysis
+            .scheduler_ownership
+            .iter()
+            .try_fold(0usize, |count, fact| {
+                count
+                    .checked_add(fact.actors.len())
+                    .and_then(|count| count.checked_add(fact.tasks.len()))
+                    .ok_or(ReportError::MeasurementOverflow)
+            })?;
+    let scheduler_identity_limit =
+        u64::try_from(scheduler_identity_count).map_err(|_| ReportError::MeasurementOverflow)?;
+    let mut scheduler_identities = Vec::new();
+    scheduler_identities
+        .try_reserve_exact(scheduler_identity_count)
+        .map_err(|_| ReportError::ResourceLimit {
+            resource: "scheduler ownership validation index",
+            limit: scheduler_identity_limit,
+        })?;
+    for (index, fact) in analysis.scheduler_ownership.iter().enumerate() {
+        if is_cancelled() {
+            return Err(ReportError::Cancelled);
+        }
+        if usize::try_from(fact.core).map_err(|_| ReportError::MeasurementOverflow)? != index
+            || (fact.actors.is_empty() && fact.tasks.is_empty())
+            || !strictly_increasing_by(&fact.actors, |left, right| left < right, is_cancelled)?
+            || !strictly_increasing_by(&fact.tasks, |left, right| left < right, is_cancelled)?
+        {
+            return Err(ReportError::InvalidFact);
+        }
+        for actor in &fact.actors {
+            if !canonical_named_identity(actor, "actor", is_cancelled)? {
+                return Err(ReportError::InvalidFact);
+            }
+            scheduler_identities.push(("actor", actor));
+        }
+        for task in &fact.tasks {
+            if !canonical_named_identity(task, "task", is_cancelled)? {
+                return Err(ReportError::InvalidFact);
+            }
+            scheduler_identities.push(("task", task));
+        }
+    }
+    cancellable_sort(&mut scheduler_identities, is_cancelled)?;
+    for pair in scheduler_identities.windows(2) {
+        if is_cancelled() {
+            return Err(ReportError::Cancelled);
+        }
+        if pair[0] == pair[1] {
             return Err(ReportError::InvalidFact);
         }
     }
@@ -3487,8 +3587,9 @@ mod tests {
         AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts, BoundFact,
         ImageEdgeFact, ImageNodeFact, ImageReport, OptimizationAction, OptimizationDecisionFact,
         PromotionFact, ProofFact, RegionAssignmentFact, RegionCapacityEvidenceFact, RegionClass,
-        ReportError, SectionFact, SymbolFact, ValidatedAnalysisFacts, WorkFact, cancellable_sort,
-        decode_image_report_json, push_json_string_cancellable, seal_analysis_facts,
+        ReportError, SchedulerOwnershipFact, SectionFact, SymbolFact, ValidatedAnalysisFacts,
+        WorkFact, cancellable_sort, decode_image_report_json, push_json_string_cancellable,
+        seal_analysis_facts,
     };
 
     fn build(digest: Sha256Digest) -> BuildIdentity {
@@ -3914,7 +4015,7 @@ mod tests {
         };
         let sealed = seal_analysis_facts(request, facts.clone(), &|| false)
             .expect("exact actor/task/region graph limit");
-        assert_eq!(super::REPORT_SCHEMA_VERSION, 14);
+        assert_eq!(super::REPORT_SCHEMA_VERSION, 15);
         assert_eq!(sealed.as_facts().image_nodes.len(), 8);
         assert_eq!(sealed.as_facts().region_capacity_evidence.len(), 5);
         assert_eq!(sealed.as_facts().activation_frame_evidence.len(), 2);
@@ -3936,7 +4037,7 @@ mod tests {
             BackendFactLimits::standard(),
             &|| false,
         )
-        .expect("schema-v14 activation report");
+        .expect("schema-v15 activation report");
         let json = report.to_json();
         assert!(json.contains("\"activation_frame_evidence\":[{"));
         assert!(json.contains("\"kind\":\"actor-activation-frame-region\""));
@@ -3950,7 +4051,7 @@ mod tests {
                 u64::try_from(json.len()).expect("bounded activation report bytes"),
                 &|| false,
             )
-            .expect("decode exact schema-v14 activation evidence"),
+            .expect("decode exact schema-v15 activation evidence"),
             report
         );
         let corrupt_cancellation = json.replacen(
@@ -4094,6 +4195,60 @@ mod tests {
                 next == cancel_at
             }),
             Err(ReportError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn scheduler_ownership_is_canonical_exact_bounded_and_fail_closed() {
+        let digest = Sha256Digest::from_bytes([0x46; 32]);
+        let build = build(digest);
+        let request = |items| AnalysisFactRequest {
+            build: &build,
+            image_name: "scheduler-image",
+            limits: AnalysisFactLimits {
+                items,
+                proof_edges: 1,
+                payload_bytes: 64,
+            },
+        };
+        let mut facts = AnalysisFacts {
+            scheduler_ownership: vec![SchedulerOwnershipFact {
+                core: 0,
+                actors: vec!["actor:1:worker".to_owned(), "actor:0:root".to_owned()],
+                tasks: vec!["task:0:flush".to_owned()],
+            }],
+            ..AnalysisFacts::default()
+        };
+        let sealed = seal_analysis_facts(request(4), facts.clone(), &|| false)
+            .expect("one scheduler row and its three exact owners fit four items");
+        assert_eq!(
+            sealed.as_facts().scheduler_ownership[0].actors,
+            ["actor:0:root", "actor:1:worker"]
+        );
+        assert_eq!(
+            seal_analysis_facts(request(3), facts.clone(), &|| false),
+            Err(ReportError::ResourceLimit {
+                resource: "analysis fact items",
+                limit: 3,
+            })
+        );
+
+        facts.scheduler_ownership[0].actors[0] = "actor:0:root".to_owned();
+        assert_eq!(
+            seal_analysis_facts(request(4), facts, &|| false),
+            Err(ReportError::InvalidFact)
+        );
+        let gapped = AnalysisFacts {
+            scheduler_ownership: vec![SchedulerOwnershipFact {
+                core: 1,
+                actors: Vec::new(),
+                tasks: Vec::new(),
+            }],
+            ..AnalysisFacts::default()
+        };
+        assert_eq!(
+            seal_analysis_facts(request(1), gapped, &|| false),
+            Err(ReportError::InvalidFact)
         );
     }
 
@@ -4554,7 +4709,7 @@ mod tests {
         let digest = Sha256Digest::from_bytes([0x67; 32]);
         let minimum = assemble(digest, AnalysisFacts::default(), backend(digest))
             .expect("minimum one-block DIR64 relocation evidence");
-        assert_eq!(minimum.schema(), 14);
+        assert_eq!(minimum.schema(), 15);
         assert_eq!(minimum.backend().relocation_directory_bytes, 12);
         assert_eq!(minimum.backend().base_relocation_blocks, 1);
         assert_eq!(minimum.backend().base_relocation_dir64_count, 1);
@@ -5011,7 +5166,7 @@ mod tests {
         ];
         let digest_build = build(digest);
         let report = assemble(digest, facts, backend(digest)).expect("assemble region report");
-        assert_eq!(report.schema(), 14);
+        assert_eq!(report.schema(), 15);
         // Canonicalization sorted both vectors by their derived total order.
         assert_eq!(
             report

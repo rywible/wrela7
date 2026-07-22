@@ -2076,6 +2076,9 @@ fn assemble_projection(
         work,
         hardware: Vec::new(),
         recovery: Vec::new(),
+        // Scheduler ownership is introduced and authenticated by Flow
+        // lowering; source semantic facts cannot reconstruct that partition.
+        scheduler_ownership: Vec::new(),
         // Copy the sealed group verbatim. Reconstructing it from a root name
         // or function origin would lose declared scenarios and plan policy.
         compiled_test_group: projection.semantic.compiled_test_group.clone(),
