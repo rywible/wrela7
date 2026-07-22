@@ -7202,7 +7202,12 @@ fn validate_operation_types(
                                     && record.kind == BackendProofKind::CapacityBound
                                     && record.bound == Some(length)
                                     && record.depends_on.is_empty()
-                                    && record.statement.contains("inline fixed-array iteration")
+                                    && [
+                                        "inline fixed-array iteration",
+                                        "inline fixed-array pattern match",
+                                    ]
+                                    .iter()
+                                    .any(|subject| record.statement.contains(subject))
                                     && !record.sources.is_empty()
                             })
                             && aggregate_ty.is_some_and(|aggregate_ty| {

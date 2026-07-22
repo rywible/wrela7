@@ -2341,7 +2341,12 @@ fn validate_operation(
                                 && record.kind == wrela_machine_wir::BackendProofKind::CapacityBound
                                 && record.bound == Some(length)
                                 && record.depends_on.is_empty()
-                                && record.statement.contains("inline fixed-array iteration")
+                                && [
+                                    "inline fixed-array iteration",
+                                    "inline fixed-array pattern match",
+                                ]
+                                .iter()
+                                .any(|subject| record.statement.contains(subject))
                                 && !record.sources.is_empty()
                         })
                         && function

@@ -5700,7 +5700,10 @@ fn validate_operation(
                     }) && module.proofs.get(capacity.0 as usize).is_some_and(|proof| {
                         proof.id == *capacity
                             && proof.kind == ProofKind::CapacityBound
-                            && proof.subject == "inline fixed-array iteration"
+                            && matches!(
+                                proof.subject.as_str(),
+                                "inline fixed-array iteration" | "inline fixed-array pattern match"
+                            )
                             && proof.bound == Some(length)
                             && proof.depends_on.is_empty()
                             && !proof.sources.is_empty()

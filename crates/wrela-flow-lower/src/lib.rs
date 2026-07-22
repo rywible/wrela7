@@ -291,23 +291,6 @@ fn unsupported(feature: &'static str) -> LowerError {
     LowerError::UnsupportedInput { feature }
 }
 
-fn reject_fixed_array_pattern_index(
-    input: &semantic::SemanticWir,
-    proof: semantic::ProofId,
-) -> Result<(), LowerError> {
-    if input.proofs.get(proof.0 as usize).is_some_and(|record| {
-        record.id == proof
-            && record.kind == semantic::ProofKind::CapacityBound
-            && record.subject == "inline fixed-array pattern match"
-    }) {
-        Err(unsupported(
-            "flow-fixed-array-match-lowering-pending (positional branch lowering)",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 fn reject_stored_fixed_array_lowering(
     input: &semantic::SemanticWir,
     limits: LoweringLimits,
@@ -3084,6 +3067,646 @@ enum ScalarRegionContract<'a> {
     LoopBranch(usize),
 }
 
+#[derive(Clone, Copy)]
+struct SourceDefinition<'a> {
+    statement: &'a semantic::LetStatement,
+    region: u32,
+    position: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SourceBranch {
+    condition: semantic::ValueId,
+    region: u32,
+    position: usize,
+    then_region: u32,
+    else_region: u32,
+}
+
+struct SourceIndex<'a> {
+    definitions: Vec<Option<SourceDefinition<'a>>>,
+    ordered: Vec<SourceDefinition<'a>>,
+    branches: Vec<SourceBranch>,
+}
+
+fn index_source_definitions<'a>(
+    function: &'a semantic::SemanticFunction,
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<SourceIndex<'a>, LowerError> {
+    let mut definitions = try_vec(
+        function.values.len(),
+        "fixed-array pattern definition index",
+        limits.model_edges,
+    )?;
+    definitions.resize(function.values.len(), None);
+    let mut ordered = try_vec(
+        function.values.len(),
+        "fixed-array pattern statement index",
+        limits.model_edges,
+    )?;
+    let mut branches = try_vec(0, "fixed-array pattern branches", limits.model_edges)?;
+    let mut regions = try_vec(1, "fixed-array pattern regions", limits.model_edges)?;
+    regions.push((&function.body, 0_u32, 1_u32));
+    let mut next_region = 1_u32;
+    while let Some((region, region_id, depth)) = regions.pop() {
+        check_cancelled(is_cancelled)?;
+        if depth > limits.region_depth {
+            return Err(LowerError::ResourceLimit {
+                resource: "source region depth",
+                limit: u64::from(limits.region_depth),
+            });
+        }
+        for (position, statement) in region.statements.iter().enumerate() {
+            check_cancelled(is_cancelled)?;
+            match statement {
+                semantic::SemanticStatement::Let(statement) => {
+                    push_bounded(
+                        &mut ordered,
+                        SourceDefinition {
+                            statement,
+                            region: region_id,
+                            position,
+                        },
+                        "fixed-array pattern statement index",
+                        limits.model_edges,
+                    )?;
+                    for result in &statement.results {
+                        let slot = definitions
+                            .get_mut(result.0 as usize)
+                            .ok_or(unsupported("fixed-array pattern result identity"))?;
+                        if slot
+                            .replace(SourceDefinition {
+                                statement,
+                                region: region_id,
+                                position,
+                            })
+                            .is_some()
+                        {
+                            return Err(unsupported("fixed-array pattern single definition"));
+                        }
+                    }
+                }
+                semantic::SemanticStatement::If {
+                    condition,
+                    then_region,
+                    else_region,
+                    ..
+                } => {
+                    let then_id = next_region;
+                    let else_id = next_region
+                        .checked_add(1)
+                        .ok_or(LowerError::ResourceLimit {
+                            resource: "fixed-array pattern regions",
+                            limit: limits.model_edges,
+                        })?;
+                    next_region = else_id.checked_add(1).ok_or(LowerError::ResourceLimit {
+                        resource: "fixed-array pattern regions",
+                        limit: limits.model_edges,
+                    })?;
+                    push_bounded(
+                        &mut branches,
+                        SourceBranch {
+                            condition: *condition,
+                            region: region_id,
+                            position,
+                            then_region: then_id,
+                            else_region: else_id,
+                        },
+                        "fixed-array pattern branches",
+                        limits.model_edges,
+                    )?;
+                    let child_depth = depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                        resource: "source region depth",
+                        limit: u64::from(limits.region_depth),
+                    })?;
+                    push_bounded(
+                        &mut regions,
+                        (else_region, else_id, child_depth),
+                        "fixed-array pattern regions",
+                        limits.model_edges,
+                    )?;
+                    push_bounded(
+                        &mut regions,
+                        (then_region, then_id, child_depth),
+                        "fixed-array pattern regions",
+                        limits.model_edges,
+                    )?;
+                }
+                semantic::SemanticStatement::Match { arms, .. } => {
+                    let child_depth = depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                        resource: "source region depth",
+                        limit: u64::from(limits.region_depth),
+                    })?;
+                    for arm in arms.iter().rev() {
+                        let child_id = next_region;
+                        next_region =
+                            next_region
+                                .checked_add(1)
+                                .ok_or(LowerError::ResourceLimit {
+                                    resource: "fixed-array pattern regions",
+                                    limit: limits.model_edges,
+                                })?;
+                        push_bounded(
+                            &mut regions,
+                            (&arm.body, child_id, child_depth),
+                            "fixed-array pattern regions",
+                            limits.model_edges,
+                        )?;
+                    }
+                }
+                semantic::SemanticStatement::Loop { body, .. } => {
+                    let child_id = next_region;
+                    next_region = next_region
+                        .checked_add(1)
+                        .ok_or(LowerError::ResourceLimit {
+                            resource: "fixed-array pattern regions",
+                            limit: limits.model_edges,
+                        })?;
+                    let child_depth = depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                        resource: "source region depth",
+                        limit: u64::from(limits.region_depth),
+                    })?;
+                    push_bounded(
+                        &mut regions,
+                        (body, child_id, child_depth),
+                        "fixed-array pattern regions",
+                        limits.model_edges,
+                    )?;
+                }
+                semantic::SemanticStatement::Return(_)
+                | semantic::SemanticStatement::Break(_)
+                | semantic::SemanticStatement::Continue(_)
+                | semantic::SemanticStatement::Yield(_)
+                | semantic::SemanticStatement::Unreachable => {}
+            }
+        }
+    }
+    ordered.sort_by_key(|definition| (definition.region, definition.position));
+    branches.sort_by_key(|branch| (branch.region, branch.position));
+    Ok(SourceIndex {
+        definitions,
+        ordered,
+        branches,
+    })
+}
+
+fn source_statement_at<'a>(
+    ordered: &'a [SourceDefinition<'a>],
+    region: u32,
+    position: usize,
+) -> Option<&'a SourceDefinition<'a>> {
+    ordered
+        .binary_search_by_key(&(region, position), |definition| {
+            (definition.region, definition.position)
+        })
+        .ok()
+        .and_then(|index| ordered.get(index))
+}
+
+fn validate_fixed_array_pattern_protocols(
+    input: &semantic::SemanticWir,
+    function: &semantic::SemanticFunction,
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), LowerError> {
+    let mut pattern_proofs = try_vec(
+        function.proofs.len(),
+        "fixed-array pattern proofs",
+        limits.model_edges,
+    )?;
+    for proof in &function.proofs {
+        if input.proofs.get(proof.0 as usize).is_some_and(|record| {
+            record.id == *proof && record.subject == "inline fixed-array pattern match"
+        }) {
+            pattern_proofs.push(*proof);
+        }
+    }
+    if pattern_proofs.is_empty() {
+        return Ok(());
+    }
+    check_count(
+        "fixed-array pattern proofs",
+        pattern_proofs.len(),
+        limits.model_edges,
+    )?;
+    let SourceIndex {
+        definitions,
+        ordered,
+        branches,
+    } = index_source_definitions(function, limits, is_cancelled)?;
+    for proof_id in pattern_proofs {
+        check_cancelled(is_cancelled)?;
+        let proof = input
+            .proofs
+            .get(proof_id.0 as usize)
+            .filter(|proof| proof.id == proof_id)
+            .ok_or(unsupported("fixed-array pattern proof identity"))?;
+        let length = proof
+            .bound
+            .filter(|bound| *bound > 0)
+            .ok_or(unsupported("fixed-array pattern proof extent"))?;
+        if proof.kind != semantic::ProofKind::CapacityBound
+            || proof.sources.len() != 1
+            || !proof.depends_on.is_empty()
+            || proof.explanation.as_slice()
+                != [
+                    "every array-pattern position is authenticated against the exact inline array length",
+                ]
+        {
+            return Err(unsupported("fixed-array pattern proof authority"));
+        }
+
+        let mut aggregate = None;
+        for definition in definitions.iter().flatten() {
+            check_cancelled(is_cancelled)?;
+            let semantic::SemanticOperation::Aggregate { ty, fields } =
+                &definition.statement.operation
+            else {
+                continue;
+            };
+            let [result] = definition.statement.results.as_slice() else {
+                continue;
+            };
+            let Some(semantic::TypeKind::Array {
+                element,
+                length: exact_length,
+            }) = input.types.get(ty.0 as usize).map(|record| &record.kind)
+            else {
+                continue;
+            };
+            if *exact_length != length
+                || u64::try_from(fields.len()) != Ok(length)
+                || scalar_value_type(function, *result) != Some(*ty)
+                || definition.statement.source != Some(proof.sources[0])
+                || !matches!(
+                    scalar_primitive(input, *element),
+                    Some(semantic::PrimitiveType::Bool | semantic::PrimitiveType::I64)
+                )
+            {
+                continue;
+            }
+            if aggregate.replace((*result, *element, definition)).is_some() {
+                return Err(unsupported("fixed-array pattern unique inline aggregate"));
+            }
+            for field in fields {
+                let field_definition =
+                    definitions
+                        .get(field.0 as usize)
+                        .and_then(Option::as_ref)
+                        .ok_or(unsupported("fixed-array pattern inline element definition"))?;
+                let exact_literal = matches!(
+                    (
+                        &field_definition.statement.operation,
+                        scalar_primitive(input, *element),
+                    ),
+                    (
+                        semantic::SemanticOperation::Constant(semantic::Constant::Bool(_)),
+                        Some(semantic::PrimitiveType::Bool),
+                    ) | (
+                        semantic::SemanticOperation::Constant(semantic::Constant::Signed {
+                            bits: 64,
+                            ..
+                        }),
+                        Some(semantic::PrimitiveType::I64),
+                    )
+                );
+                if !exact_literal
+                    || field_definition.region != definition.region
+                    || field_definition.position >= definition.position
+                    || scalar_value_type(function, *field) != Some(*element)
+                    || field_definition.statement.source.is_none()
+                {
+                    return Err(unsupported("fixed-array pattern inline literal aggregate"));
+                }
+            }
+        }
+        let (aggregate_value, element_ty, aggregate_definition) =
+            aggregate.ok_or(unsupported("fixed-array pattern inline aggregate"))?;
+
+        let mut literal_equalities = try_vec(
+            usize::try_from(length).unwrap_or(usize::MAX),
+            "fixed-array pattern literal equalities",
+            limits.model_edges,
+        )?;
+        let mut binding_regions = try_vec(
+            usize::try_from(length).unwrap_or(usize::MAX),
+            "fixed-array pattern binding regions",
+            limits.model_edges,
+        )?;
+        let mut index_count = 0_u64;
+        for definition in definitions.iter().flatten() {
+            check_cancelled(is_cancelled)?;
+            let semantic::SemanticOperation::Index { base, index, proof } =
+                definition.statement.operation
+            else {
+                continue;
+            };
+            if proof != proof_id {
+                continue;
+            }
+            index_count = index_count
+                .checked_add(1)
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "fixed-array pattern indexes",
+                    limit: limits.model_edges,
+                })?;
+            let [result] = definition.statement.results.as_slice() else {
+                return Err(unsupported("fixed-array pattern index result"));
+            };
+            let index_definition = definitions
+                .get(index.0 as usize)
+                .and_then(Option::as_ref)
+                .ok_or(unsupported("fixed-array pattern position definition"))?;
+            let semantic::SemanticOperation::Constant(semantic::Constant::Unsigned {
+                bits: 64,
+                value: position,
+            }) = index_definition.statement.operation
+            else {
+                return Err(unsupported("fixed-array pattern exact position constant"));
+            };
+            if base != aggregate_value
+                || position >= u128::from(length)
+                || index_definition.region != definition.region
+                || index_definition.position.checked_add(1) != Some(definition.position)
+                || index_definition.statement.source != definition.statement.source
+                || scalar_value_type(function, index)
+                    .is_none_or(|ty| !semantic_type_is(input, ty, semantic::PrimitiveType::U64))
+                || scalar_value_type(function, *result) != Some(element_ty)
+            {
+                return Err(unsupported("fixed-array pattern positional extraction"));
+            }
+            let result_record = function
+                .values
+                .get(result.0 as usize)
+                .filter(|value| value.id == *result)
+                .ok_or(unsupported("fixed-array pattern result identity"))?;
+            if let Some(name) = &result_record.name {
+                if name.is_empty() || result_record.origin != definition.statement.source {
+                    return Err(unsupported("fixed-array pattern binding provenance"));
+                }
+                push_bounded(
+                    &mut binding_regions,
+                    (definition.region, definition.position, position),
+                    "fixed-array pattern binding regions",
+                    limits.model_edges,
+                )?;
+                continue;
+            }
+            let expected_definition = source_statement_at(
+                &ordered,
+                definition.region,
+                definition.position.saturating_add(1),
+            )
+            .ok_or(unsupported("fixed-array pattern literal definition"))?;
+            let equal_definition = source_statement_at(
+                &ordered,
+                definition.region,
+                definition.position.saturating_add(2),
+            )
+            .ok_or(unsupported("fixed-array pattern equality definition"))?;
+            let [expected] = expected_definition.statement.results.as_slice() else {
+                return Err(unsupported("fixed-array pattern literal result"));
+            };
+            let [equal] = equal_definition.statement.results.as_slice() else {
+                return Err(unsupported("fixed-array pattern equality result"));
+            };
+            let literal_matches = matches!(
+                (
+                    &expected_definition.statement.operation,
+                    scalar_primitive(input, element_ty)
+                ),
+                (
+                    semantic::SemanticOperation::Constant(semantic::Constant::Bool(_)),
+                    Some(semantic::PrimitiveType::Bool)
+                ) | (
+                    semantic::SemanticOperation::Constant(semantic::Constant::Signed {
+                        bits: 64,
+                        ..
+                    }),
+                    Some(semantic::PrimitiveType::I64)
+                )
+            );
+            if !literal_matches
+                || expected_definition.statement.source != definition.statement.source
+                || equal_definition.statement.source != definition.statement.source
+                || scalar_value_type(function, *expected) != Some(element_ty)
+                || !semantic_type_is(
+                    input,
+                    scalar_value_type(function, *equal)
+                        .ok_or(unsupported("fixed-array pattern equality type"))?,
+                    semantic::PrimitiveType::Bool,
+                )
+                || !matches!(
+                    equal_definition.statement.operation,
+                    semantic::SemanticOperation::Binary {
+                        operator: semantic::BinaryOperator::Equal,
+                        left,
+                        right,
+                        arithmetic: semantic::ArithmeticMode::Checked,
+                    } if left == *result && right == *expected
+                )
+            {
+                return Err(unsupported("fixed-array pattern literal comparison"));
+            }
+            push_bounded(
+                &mut literal_equalities,
+                (
+                    definition.region,
+                    definition.position,
+                    position,
+                    *equal,
+                    equal_definition.position,
+                ),
+                "fixed-array pattern literal equalities",
+                limits.model_edges,
+            )?;
+        }
+        if index_count == 0 {
+            return Err(unsupported(
+                "fixed-array pattern has no positional extraction",
+            ));
+        }
+
+        literal_equalities.sort_by_key(|entry| (entry.0, entry.1));
+        binding_regions.sort_by_key(|entry| (entry.0, entry.1));
+        let mut binding_cursor = 0usize;
+        while binding_cursor < binding_regions.len() {
+            let region = binding_regions[binding_cursor].0;
+            let start = binding_cursor;
+            while binding_cursor < binding_regions.len()
+                && binding_regions[binding_cursor].0 == region
+            {
+                binding_cursor += 1;
+            }
+            for (offset, binding) in binding_regions[start..binding_cursor].iter().enumerate() {
+                if offset > 0 {
+                    let previous = binding_regions[start + offset - 1];
+                    if previous.1.checked_add(2) != Some(binding.1) || previous.2 >= binding.2 {
+                        return Err(unsupported("fixed-array pattern binding order"));
+                    }
+                }
+            }
+        }
+        let mut pattern_branches = try_vec(
+            literal_equalities.len(),
+            "fixed-array pattern branch chain",
+            limits.model_edges,
+        )?;
+        let mut cursor = 0usize;
+        while cursor < literal_equalities.len() {
+            let region = literal_equalities[cursor].0;
+            let start = cursor;
+            while cursor < literal_equalities.len() && literal_equalities[cursor].0 == region {
+                cursor += 1;
+            }
+            let group = &literal_equalities[start..cursor];
+            let mut previous_position = None;
+            let mut condition = group[0].3;
+            let mut condition_position = group[0].4;
+            for entry in group {
+                if previous_position.is_some_and(|previous| previous >= entry.2) {
+                    return Err(unsupported("fixed-array pattern source position order"));
+                }
+                previous_position = Some(entry.2);
+            }
+            for entry in &group[1..] {
+                let combined = source_statement_at(&ordered, region, entry.4.saturating_add(1))
+                    .ok_or(unsupported("fixed-array pattern literal fold"))?;
+                let [result] = combined.statement.results.as_slice() else {
+                    return Err(unsupported("fixed-array pattern literal fold result"));
+                };
+                if combined.statement.source
+                    != definitions[entry.3.0 as usize]
+                        .as_ref()
+                        .and_then(|definition| definition.statement.source)
+                    || !matches!(
+                        combined.statement.operation,
+                        semantic::SemanticOperation::Binary {
+                            operator: semantic::BinaryOperator::BitAnd,
+                            left,
+                            right,
+                            arithmetic: semantic::ArithmeticMode::Checked,
+                        } if left == condition && right == entry.3
+                    )
+                {
+                    return Err(unsupported("fixed-array pattern left fold order"));
+                }
+                condition = *result;
+                condition_position = combined.position;
+            }
+            let branch = branches
+                .iter()
+                .find(|branch| {
+                    branch.region == region
+                        && branch.position == condition_position.saturating_add(1)
+                        && branch.condition == condition
+                })
+                .ok_or(unsupported("fixed-array pattern branch condition"))?;
+            push_bounded(
+                &mut pattern_branches,
+                *branch,
+                "fixed-array pattern branch chain",
+                limits.model_edges,
+            )?;
+            let mut used = try_vec(
+                group.len(),
+                "fixed-array pattern arm positions",
+                limits.model_edges,
+            )?;
+            used.extend(group.iter().map(|entry| entry.2));
+            for binding in binding_regions
+                .iter()
+                .filter(|binding| binding.0 == branch.then_region)
+            {
+                push_bounded(
+                    &mut used,
+                    binding.2,
+                    "fixed-array pattern arm positions",
+                    limits.model_edges,
+                )?;
+            }
+            used.sort_unstable();
+            if used
+                .windows(2)
+                .any(|positions| positions[0] == positions[1])
+            {
+                return Err(unsupported("fixed-array pattern duplicate arm position"));
+            }
+        }
+
+        if !pattern_branches.is_empty() {
+            let mut roots = pattern_branches
+                .iter()
+                .filter(|branch| branch.region == aggregate_definition.region);
+            let Some(mut branch) = roots.next().copied() else {
+                return Err(unsupported("fixed-array pattern root branch"));
+            };
+            if roots.next().is_some() {
+                return Err(unsupported("fixed-array pattern root branch"));
+            }
+            let mut branch_count = 1usize;
+            let mut allowed_binding_regions = try_vec(
+                pattern_branches.len().saturating_add(1),
+                "fixed-array pattern binding branch regions",
+                limits.model_edges,
+            )?;
+            loop {
+                check_cancelled(is_cancelled)?;
+                push_bounded(
+                    &mut allowed_binding_regions,
+                    branch.then_region,
+                    "fixed-array pattern binding branch regions",
+                    limits.model_edges,
+                )?;
+                let next = pattern_branches
+                    .iter()
+                    .find(|candidate| candidate.region == branch.else_region);
+                let Some(next) = next else {
+                    push_bounded(
+                        &mut allowed_binding_regions,
+                        branch.else_region,
+                        "fixed-array pattern binding branch regions",
+                        limits.model_edges,
+                    )?;
+                    break;
+                };
+                branch = *next;
+                branch_count += 1;
+                if branch_count > branches.len() {
+                    return Err(unsupported("fixed-array pattern branch cycle"));
+                }
+            }
+            if branch_count != pattern_branches.len() {
+                return Err(unsupported(
+                    "fixed-array pattern source-ordered branch chain",
+                ));
+            }
+            if binding_regions
+                .iter()
+                .any(|binding| !allowed_binding_regions.contains(&binding.0))
+            {
+                return Err(unsupported("fixed-array pattern branch-local binding"));
+            }
+        } else if !binding_regions
+            .iter()
+            .all(|binding| binding.0 == aggregate_definition.region)
+        {
+            return Err(unsupported(
+                "fixed-array pattern irrefutable binding region",
+            ));
+        } else if binding_regions
+            .first()
+            .is_some_and(|binding| aggregate_definition.position.checked_add(2) != Some(binding.1))
+        {
+            return Err(unsupported(
+                "fixed-array pattern irrefutable binding prefix",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_scalar_source_function(
     input: &semantic::SemanticWir,
     function: &semantic::SemanticFunction,
@@ -3126,6 +3749,7 @@ fn validate_scalar_source_function(
             ));
         }
     }
+    validate_fixed_array_pattern_protocols(input, function, limits, is_cancelled)?;
 
     let mut regions = try_vec(1, "source region validation", limits.model_edges)?;
     regions.push((&function.body, ScalarRegionContract::Root, 1_u32));
@@ -3436,7 +4060,6 @@ fn validate_scalar_source_function(
                         }
                     }
                     semantic::SemanticOperation::Index { base, index, proof } => {
-                        reject_fixed_array_pattern_index(input, *proof)?;
                         let [result] = statement.results.as_slice() else {
                             return Err(unsupported("fixed-array index result arity"));
                         };
@@ -3465,10 +4088,14 @@ fn validate_scalar_source_function(
                             input.proofs.get(proof.0 as usize).is_some_and(|record| {
                                 record.id == *proof
                                     && record.kind == semantic::ProofKind::CapacityBound
-                                    && record.subject == "inline fixed-array iteration"
                                     && record.bound == Some(length)
                                     && record.depends_on.is_empty()
-                                    && !record.sources.is_empty()
+                                    && record.sources.len() == 1
+                                    && matches!(
+                                        record.subject.as_str(),
+                                        "inline fixed-array iteration"
+                                            | "inline fixed-array pattern match"
+                                    )
                             }) && function.proofs.binary_search(proof).is_ok();
                         if scalar_value_type(function, *result) != Some(element)
                             || !index_is_u64
@@ -16161,18 +16788,289 @@ mod contract_tests {
         );
     }
 
+    fn fixed_array_pattern_fixture() -> semantic::ValidatedSemanticWir {
+        let mut module = scalar_generated_fixture().into_wir();
+        let array_source = span(0, 300, 306);
+        let literal_source = span(0, 320, 321);
+        let binding_source = span(0, 325, 331);
+        for record in &mut module.types[4..] {
+            record.id.0 += 3;
+            if let semantic::TypeKind::Array { element, .. } = &mut record.kind {
+                element.0 += 3;
+            }
+        }
+        for function in &mut module.functions {
+            for value in &mut function.values {
+                if value.ty.0 >= 4 {
+                    value.ty.0 += 3;
+                }
+            }
+        }
+        let i64_ty = semantic::TypeId(4);
+        let u64_ty = semantic::TypeId(5);
+        let array_ty = semantic::TypeId(6);
+        module.types.splice(
+            4..4,
+            [
+                semantic::TypeRecord {
+                    id: i64_ty,
+                    source_name: "i64".to_owned(),
+                    kind: semantic::TypeKind::Primitive(semantic::PrimitiveType::I64),
+                    linearity: semantic::Linearity::CopyScalar,
+                    source: None,
+                },
+                semantic::TypeRecord {
+                    id: u64_ty,
+                    source_name: "u64".to_owned(),
+                    kind: semantic::TypeKind::Primitive(semantic::PrimitiveType::U64),
+                    linearity: semantic::Linearity::CopyScalar,
+                    source: None,
+                },
+                semantic::TypeRecord {
+                    id: array_ty,
+                    source_name: "array".to_owned(),
+                    kind: semantic::TypeKind::Array {
+                        element: i64_ty,
+                        length: 2,
+                    },
+                    linearity: semantic::Linearity::ExplicitCopy,
+                    source: None,
+                },
+            ],
+        );
+        let proof = semantic::ProofId(u32::try_from(module.proofs.len()).expect("small proof id"));
+        module.proofs.push(semantic::ProofRecord {
+            id: proof,
+            kind: semantic::ProofKind::CapacityBound,
+            subject: "inline fixed-array pattern match".to_owned(),
+            bound: Some(2),
+            sources: vec![array_source],
+            depends_on: Vec::new(),
+            explanation: vec![
+                "every array-pattern position is authenticated against the exact inline array length"
+                    .to_owned(),
+            ],
+        });
+        let function = &mut module.functions[0];
+        function.values = vec![
+            scalar_source_value(0, 4, "first_literal", span(0, 301, 302)),
+            scalar_source_value(1, 4, "second_literal", span(0, 303, 304)),
+            scalar_source_value(2, 6, "array", array_source),
+            scalar_source_value(3, 5, "position_zero", literal_source),
+            scalar_source_value(4, 4, "actual", literal_source),
+            scalar_source_value(5, 4, "expected", literal_source),
+            scalar_source_value(6, 1, "equal", literal_source),
+            scalar_source_value(7, 5, "position_one", binding_source),
+            scalar_source_value(8, 4, "second", binding_source),
+        ];
+        for value in &mut function.values[2..7] {
+            value.name = None;
+        }
+        function.body = semantic::SemanticRegion {
+            parameters: Vec::new(),
+            statements: vec![
+                scalar_source_let(
+                    0,
+                    semantic::SemanticOperation::Constant(semantic::Constant::Signed {
+                        bits: 64,
+                        value: 1,
+                    }),
+                    span(0, 301, 302),
+                ),
+                scalar_source_let(
+                    1,
+                    semantic::SemanticOperation::Constant(semantic::Constant::Signed {
+                        bits: 64,
+                        value: 2,
+                    }),
+                    span(0, 303, 304),
+                ),
+                scalar_source_let(
+                    2,
+                    semantic::SemanticOperation::Aggregate {
+                        ty: array_ty,
+                        fields: vec![semantic::ValueId(0), semantic::ValueId(1)],
+                    },
+                    array_source,
+                ),
+                scalar_source_let(
+                    3,
+                    semantic::SemanticOperation::Constant(semantic::Constant::Unsigned {
+                        bits: 64,
+                        value: 0,
+                    }),
+                    literal_source,
+                ),
+                scalar_source_let(
+                    4,
+                    semantic::SemanticOperation::Index {
+                        base: semantic::ValueId(2),
+                        index: semantic::ValueId(3),
+                        proof,
+                    },
+                    literal_source,
+                ),
+                scalar_source_let(
+                    5,
+                    semantic::SemanticOperation::Constant(semantic::Constant::Signed {
+                        bits: 64,
+                        value: 1,
+                    }),
+                    literal_source,
+                ),
+                scalar_source_let(
+                    6,
+                    semantic::SemanticOperation::Binary {
+                        operator: semantic::BinaryOperator::Equal,
+                        left: semantic::ValueId(4),
+                        right: semantic::ValueId(5),
+                        arithmetic: semantic::ArithmeticMode::Checked,
+                    },
+                    literal_source,
+                ),
+                semantic::SemanticStatement::If {
+                    condition: semantic::ValueId(6),
+                    then_region: semantic::SemanticRegion {
+                        parameters: Vec::new(),
+                        statements: vec![
+                            scalar_source_let(
+                                7,
+                                semantic::SemanticOperation::Constant(
+                                    semantic::Constant::Unsigned { bits: 64, value: 1 },
+                                ),
+                                binding_source,
+                            ),
+                            scalar_source_let(
+                                8,
+                                semantic::SemanticOperation::Index {
+                                    base: semantic::ValueId(2),
+                                    index: semantic::ValueId(7),
+                                    proof,
+                                },
+                                binding_source,
+                            ),
+                        ],
+                    },
+                    else_region: semantic::SemanticRegion {
+                        parameters: Vec::new(),
+                        statements: Vec::new(),
+                    },
+                    results: Vec::new(),
+                    source: Some(span(0, 315, 340)),
+                },
+                semantic::SemanticStatement::Return(Vec::new()),
+            ],
+        };
+        function.proofs.push(proof);
+        function.proofs.sort_unstable();
+        function.uninterrupted_bound = Some(10);
+        module
+            .functions
+            .last_mut()
+            .expect("generated harness")
+            .uninterrupted_bound = Some(15);
+        module
+            .validate()
+            .expect("valid producer-shaped fixed-array pattern SemanticWir")
+    }
+
     #[test]
-    fn fixed_array_pattern_index_stops_at_named_flow_boundary() {
-        let mut input = fixture().into_wir();
-        let proof = input.proofs.first_mut().expect("fixture proof");
-        proof.kind = semantic::ProofKind::CapacityBound;
-        proof.subject = "inline fixed-array pattern match".to_owned();
-        let proof = proof.id;
+    fn fixed_array_pattern_protocol_lowers_and_rejects_semantic_substitution() {
+        let input = fixed_array_pattern_fixture();
+        let output = CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("authenticated fixed-array pattern reaches FlowWir");
+        assert_eq!(
+            output.wir().as_wir().functions[0]
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .filter(|instruction| matches!(
+                    instruction.operation,
+                    flow::FlowOperation::ExtractIndex { .. }
+                ))
+                .count(),
+            2
+        );
+
+        let reject = |mutate: fn(&mut semantic::SemanticWir)| {
+            let mut forged = input.clone().into_wir();
+            mutate(&mut forged);
+            let forged = forged
+                .validate()
+                .expect("structurally valid semantic forgery");
+            assert!(matches!(
+                CanonicalFlowLowerer::new().lower(
+                    LowerRequest {
+                        input: forged,
+                        limits: LoweringLimits::standard(),
+                    },
+                    &|| false,
+                ),
+                Err(LowerError::UnsupportedInput { .. })
+            ));
+        };
+        reject(|module| {
+            let semantic::SemanticStatement::If { then_region, .. } =
+                &mut module.functions[0].body.statements[7]
+            else {
+                panic!("pattern branch")
+            };
+            let semantic::SemanticStatement::Let(position) = &mut then_region.statements[0] else {
+                panic!("binding position")
+            };
+            position.operation =
+                semantic::SemanticOperation::Constant(semantic::Constant::Unsigned {
+                    bits: 64,
+                    value: 0,
+                });
+        });
+        reject(|module| {
+            let semantic::SemanticStatement::Let(equal) =
+                &mut module.functions[0].body.statements[6]
+            else {
+                panic!("pattern equality")
+            };
+            let semantic::SemanticOperation::Binary { operator, .. } = &mut equal.operation else {
+                panic!("pattern equality operation")
+            };
+            *operator = semantic::BinaryOperator::NotEqual;
+        });
+        reject(|module| {
+            module.proofs.last_mut().expect("pattern proof").explanation[0].push('!');
+        });
+
+        let request = LowerRequest {
+            input,
+            limits: LoweringLimits::standard(),
+        };
+        let mut forged_flow = output.wir().as_wir().clone();
+        let mut indexes = forged_flow.functions[0]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .filter_map(|instruction| match &mut instruction.operation {
+                flow::FlowOperation::ExtractIndex { index, .. } => Some(index),
+                _ => None,
+            });
+        let first = *indexes.next().expect("literal extraction");
+        *indexes.next().expect("binding extraction") = first;
+        assert!(forged_flow.clone().validate().is_ok());
         assert!(matches!(
-            super::reject_fixed_array_pattern_index(&input, proof),
-            Err(LowerError::UnsupportedInput {
-                feature: "flow-fixed-array-match-lowering-pending (positional branch lowering)",
-            })
+            seal(
+                &request,
+                forged_flow,
+                output.report().clone(),
+                Vec::new(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
         ));
     }
 

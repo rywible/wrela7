@@ -501,9 +501,11 @@ it. It injects phase implementations and bounded host capabilities, while
   `If` regions. Validation joins every extraction result to the array element
   type, a canonical `u64` index, and the exact-length `CapacityBound`; lowering
   independently replays each literal, binding position, arm order, and
-  exhaustive cover. Flow rejects the pattern proof authority by name at
-  `flow-fixed-array-match-lowering-pending`; no Flow or native execution is
-  claimed.
+  exhaustive cover. Flow lowering now independently reauthenticates that
+  distinct proof authority, exact literal aggregate, positional constants,
+  equality/left-fold order, branch-local binding provenance, source-ordered
+  branch chain, and exhaustive fallback. The same schema-neutral operations
+  cross FlowWir/wire v19 and MachineWir v20 to deterministic native COFF.
 - MachineWir v20 retains same-block nongeneric flat values with two or more
   primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
   `InsertField`, and `ExtractField` carry exact SSA joins through independent
@@ -512,14 +514,16 @@ it. It injects phase implementations and bounded host capabilities, while
   established erased bitcast representation. Aggregate function/block
   boundaries, packed/empty/non-flat structs, and nested aggregates fail closed.
 - MachineWir v20 also retains the exact inline, nonempty, homogeneous
-  boolean/default-`i64` fixed-array iteration profile. `MakeArray` authenticates
+  boolean/default-`i64` fixed-array iteration and statement-pattern profiles.
+  `MakeArray` authenticates
   the source-ordered element vector and `ExtractIndex` carries the exact
   `CapacityBound` from FlowWir v19. Validation joins the array extent, generated
   unsigned-64 index, proof bound, result element type, and function proof set;
   the LLVM consumer repeats that join before emitting target-laid-out array
   storage plus one proved dynamic element access. Empty, heterogeneous,
   stored/dynamic, taking, mutable, suspended, and function-boundary arrays stay
-  fail-closed.
+  fail-closed; pattern guards, alternatives, negative literals, nesting, and
+  `take` remain named semantic boundaries.
 - MachineWir v20 records one exact optional logical payload type per enum tag.
   Uniform scalar enums retain that scalar as the physical shared-slot type;
   all-unit enums retain neither a slot nor logical payloads and remain exactly

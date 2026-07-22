@@ -55,6 +55,20 @@ fn fixed_array_runtime():
         consume(item)
     for flag in [true, false, true]:
         consume_bool(flag)
+    match [1, 2]:
+        case [1, second]:
+            consume(second)
+        case [_, _]:
+            pass
+    match [1, 2]:
+        case [1, 2]:
+            pass
+        case _:
+            pass
+    match [true, false]:
+        case [first, second]:
+            consume_bool(first)
+            consume_bool(second)
     return
 
 fn consume(value: i64) -> i64:
@@ -77,7 +91,7 @@ fn never_cancelled() -> bool {
 }
 
 #[test]
-fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
+fn fixed_array_iteration_and_patterns_reach_flow_machine_and_deterministic_native_coff() {
     let source_graph_digest = Sha256Digest::from_bytes([0xb1; 32]);
     let core_package_digest = Sha256Digest::from_bytes([0xb2; 32]);
     let target_digest = Sha256Digest::from_bytes([0xb3; 32]);
@@ -336,6 +350,15 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
     assert_eq!(
         flow.wir()
             .as_wir()
+            .proofs
+            .iter()
+            .filter(|proof| proof.subject == "inline fixed-array pattern match")
+            .count(),
+        3
+    );
+    assert_eq!(
+        flow.wir()
+            .as_wir()
             .functions
             .iter()
             .flat_map(|function| &function.blocks)
@@ -344,7 +367,59 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
                 matches!(instruction.operation, FlowOperation::ExtractIndex { .. })
             })
             .count(),
-        2
+        8
+    );
+    let flow_pattern_extracts = flow
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| match instruction.operation {
+            FlowOperation::ExtractIndex { proof, .. } => flow
+                .wir()
+                .as_wir()
+                .proofs
+                .get(proof.0 as usize)
+                .is_some_and(|proof| proof.subject == "inline fixed-array pattern match"),
+            _ => false,
+        })
+        .count();
+    assert_eq!(flow_pattern_extracts, 6);
+    assert_eq!(
+        flow.wir()
+            .as_wir()
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(
+                instruction.operation,
+                FlowOperation::Binary {
+                    op: wrela_flow_lower::FlowBinaryOp::Equal,
+                    ..
+                }
+            ))
+            .count(),
+        3
+    );
+    assert_eq!(
+        flow.wir()
+            .as_wir()
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(
+                instruction.operation,
+                FlowOperation::Binary {
+                    op: wrela_flow_lower::FlowBinaryOp::BitAnd,
+                    ..
+                }
+            ))
+            .count(),
+        1
     );
     let encoded = encode_and_verify(
         &CanonicalFlowWirCodec,
@@ -359,6 +434,14 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
     let prepared =
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
             .expect("fixed-array MachineWir preparation");
+    let repeated_preparation =
+        prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
+            .expect("repeat fixed-array MachineWir preparation");
+    assert_eq!(
+        prepared.machine().wir().as_wir(),
+        repeated_preparation.machine().wir().as_wir(),
+        "the same canonical Flow frame must produce byte-identical MachineWir"
+    );
     let machine = prepared.machine().wir().as_wir();
     assert_eq!(machine.version, 20);
     assert!(machine.types.iter().any(|ty| {
@@ -388,7 +471,7 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
                 matches!(instruction.operation, MachineOperation::ExtractIndex { .. })
             })
             .count(),
-        2
+        8
     );
     assert_eq!(
         machine
@@ -400,7 +483,7 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
                 matches!(instruction.operation, MachineOperation::MakeArray { .. })
             })
             .count(),
-        2
+        5
     );
     let mut fixed_array_slot_sizes = machine
         .functions
@@ -410,7 +493,7 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
         .map(|slot| slot.size)
         .collect::<Vec<_>>();
     fixed_array_slot_sizes.sort_unstable();
-    assert_eq!(fixed_array_slot_sizes, [3, 24]);
+    assert_eq!(fixed_array_slot_sizes, [2, 2, 3, 16, 16, 16, 16, 24]);
     assert_eq!(
         machine
             .functions
@@ -423,18 +506,7 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
             })
             .map(|function| function.stack_bytes)
             .collect::<Vec<_>>(),
-        [32]
-    );
-    let mut forged_machine = machine.clone();
-    let proof = forged_machine
-        .proofs
-        .iter_mut()
-        .find(|proof| proof.statement.contains("inline fixed-array iteration"))
-        .expect("lowered fixed-array capacity proof");
-    proof.bound = proof.bound.and_then(|bound| bound.checked_sub(1));
-    assert!(
-        forged_machine.validate_for_target(&target).is_err(),
-        "MachineWir must independently reject a forged fixed-array extent proof"
+        [112]
     );
     let mut forged_static_extent = machine.clone();
     let static_ty = forged_static_extent
@@ -467,6 +539,22 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
         forged_static_utf8.validate_for_target(&target).is_err(),
         "MachineWir must reject invalid UTF-8 under an exact static text identity"
     );
+    for subject in [
+        "inline fixed-array iteration",
+        "inline fixed-array pattern match",
+    ] {
+        let mut forged_machine = machine.clone();
+        let proof = forged_machine
+            .proofs
+            .iter_mut()
+            .find(|proof| proof.statement.contains(subject))
+            .expect("lowered fixed-array capacity proof");
+        proof.bound = proof.bound.and_then(|bound| bound.checked_sub(1));
+        assert!(
+            forged_machine.validate_for_target(&target).is_err(),
+            "MachineWir must independently reject a forged {subject} extent proof"
+        );
+    }
 
     let codec = CanonicalFlowWirCodec;
     let hasher = CanonicalBackendContentHasher::new();
@@ -621,15 +709,20 @@ fn fixed_array_iteration_reaches_flow_machine_and_deterministic_native_coff() {
         }
     }
 
-    let mut forged = flow.wir().as_wir().clone();
-    let proof = forged
-        .proofs
-        .iter_mut()
-        .find(|proof| proof.subject == "inline fixed-array iteration")
-        .expect("fixed-array capacity proof");
-    proof.bound = proof.bound.and_then(|bound| bound.checked_sub(1));
-    assert!(
-        forged.validate().is_err(),
-        "FlowWir must independently reject a forged fixed-array extent proof"
-    );
+    for subject in [
+        "inline fixed-array iteration",
+        "inline fixed-array pattern match",
+    ] {
+        let mut forged = flow.wir().as_wir().clone();
+        let proof = forged
+            .proofs
+            .iter_mut()
+            .find(|proof| proof.subject == subject)
+            .expect("fixed-array capacity proof");
+        proof.bound = proof.bound.and_then(|bound| bound.checked_sub(1));
+        assert!(
+            forged.validate().is_err(),
+            "FlowWir must independently reject a forged {subject} extent proof"
+        );
+    }
 }

@@ -4979,7 +4979,11 @@ fn authenticated_fixed_array_type(
                             && input.proofs.get(proof.0 as usize).is_some_and(|record| {
                                 record.id == *proof
                                     && record.kind == flow::ProofKind::CapacityBound
-                                    && record.subject == "inline fixed-array iteration"
+                                    && matches!(
+                                        record.subject.as_str(),
+                                        "inline fixed-array iteration"
+                                            | "inline fixed-array pattern match"
+                                    )
                                     && record.bound == Some(length)
                                     && record.depends_on.is_empty()
                                     && !record.sources.is_empty()
@@ -6789,7 +6793,10 @@ fn validate_supported_operation(
             let proof_matches = input.proofs.get(proof.0 as usize).is_some_and(|record| {
                 record.id == *proof
                     && record.kind == flow::ProofKind::CapacityBound
-                    && record.subject == "inline fixed-array iteration"
+                    && matches!(
+                        record.subject.as_str(),
+                        "inline fixed-array iteration" | "inline fixed-array pattern match"
+                    )
                     && record.bound == Some(length)
                     && record.depends_on.is_empty()
                     && !record.sources.is_empty()
@@ -9342,7 +9349,10 @@ fn lower_operation(
             let proof_matches = input.proofs.get(proof.0 as usize).is_some_and(|record| {
                 record.id == *proof
                     && record.kind == flow::ProofKind::CapacityBound
-                    && record.subject == "inline fixed-array iteration"
+                    && matches!(
+                        record.subject.as_str(),
+                        "inline fixed-array iteration" | "inline fixed-array pattern match"
+                    )
                     && record.bound == Some(length)
                     && record.depends_on.is_empty()
                     && !record.sources.is_empty()
