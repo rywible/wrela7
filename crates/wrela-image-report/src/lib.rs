@@ -16,11 +16,12 @@ pub use decode::decode_image_report_json;
 /// and `PromotionFact`) to the sealed analysis section. Version 13 makes their
 /// allocation identities, final-region join, and bounded proof join exact.
 /// Version 14 introduced the machine-representation version binding. Version 15
-/// retains the authenticated FlowWir scheduler ownership partition and binds
-/// reports to the current MachineWir v17 contract. The decoder gates on this
-/// exact value, so every older
+/// retains the authenticated FlowWir scheduler ownership partition. Version 16
+/// adds the exact all-or-empty actor placement input set and binds reports to
+/// the current MachineWir v17 contract. The decoder gates on this exact value,
+/// so every older
 /// representation is rejected as [`ReportError::UnsupportedSchema`].
-pub const REPORT_SCHEMA_VERSION: u32 = 15;
+pub const REPORT_SCHEMA_VERSION: u32 = 16;
 
 const CURRENT_SEMANTIC_WIR_VERSION: u32 = 12;
 const CURRENT_FLOW_WIR_VERSION: u32 = 15;
@@ -249,6 +250,19 @@ pub struct SchedulerOwnershipFact {
     pub tasks: Vec<String>,
 }
 
+/// Exact actor-local inputs available before placement can be proposed.
+///
+/// `reserved_region_bytes` is deliberately narrower than the normative total
+/// reserved-byte input: it is the checked sum of sealed actor-owned FlowWir
+/// regions. Pool bytes and other actor-owned image bytes need separately
+/// authenticated producers before this record may become a placement proposal.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ActorPlacementInputFact {
+    pub actor: String,
+    pub maximum_uninterrupted_work: u64,
+    pub reserved_region_bytes: u64,
+}
+
 /// Frontend and WIR facts independent of final object bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AnalysisFacts {
@@ -271,6 +285,7 @@ pub struct AnalysisFacts {
     pub work: Vec<WorkFact>,
     pub hardware: Vec<HardwareFact>,
     pub recovery: Vec<RecoveryFact>,
+    pub actor_placement_inputs: Vec<ActorPlacementInputFact>,
     pub scheduler_ownership: Vec<SchedulerOwnershipFact>,
     /// Exact test-plan group compiled into this image. This remains absent for
     /// ordinary builds and is copied, never inferred, by both report producers.
@@ -1140,6 +1155,30 @@ impl ImageReport {
             json_string_array(&mut output, &fact.tasks, is_cancelled)?;
             output.push('}');
         }
+        output.push_str("],\"actor_placement_inputs\":[");
+        for (index, fact) in self.analysis.actor_placement_inputs.iter().enumerate() {
+            if is_cancelled() {
+                return Err(ReportError::Cancelled);
+            }
+            if index != 0 {
+                output.push(',');
+            }
+            output.push('{');
+            json_string(&mut output, "actor", &fact.actor, false, is_cancelled)?;
+            json_number(
+                &mut output,
+                "maximum_uninterrupted_work",
+                fact.maximum_uninterrupted_work,
+                true,
+            );
+            json_number(
+                &mut output,
+                "reserved_region_bytes",
+                fact.reserved_region_bytes,
+                true,
+            );
+            output.push('}');
+        }
         output.push_str("],\"compiled_test_group\":");
         json_compiled_test_group(
             &mut output,
@@ -1614,6 +1653,7 @@ fn canonicalize_analysis(
     cancellable_sort(&mut analysis.work, is_cancelled)?;
     cancellable_sort(&mut analysis.hardware, is_cancelled)?;
     cancellable_sort(&mut analysis.recovery, is_cancelled)?;
+    cancellable_sort(&mut analysis.actor_placement_inputs, is_cancelled)?;
     for ownership in &mut analysis.scheduler_ownership {
         cancellable_sort(&mut ownership.actors, is_cancelled)?;
         cancellable_sort(&mut ownership.tasks, is_cancelled)?;
@@ -1675,6 +1715,7 @@ fn measure_analysis(
         analysis.work.len(),
         analysis.hardware.len(),
         analysis.recovery.len(),
+        analysis.actor_placement_inputs.len(),
         analysis.scheduler_ownership.len(),
         analysis.startup_order.len(),
         analysis.shutdown_order.len(),
@@ -1804,6 +1845,9 @@ fn measure_analysis(
         for value in &fact.cleanup_path {
             add(value)?;
         }
+    }
+    for fact in &analysis.actor_placement_inputs {
+        add(&fact.actor)?;
     }
     for fact in &analysis.scheduler_ownership {
         add_items(fact.actors.len())?;
@@ -1956,6 +2000,11 @@ fn validate_analysis(
     require_canonical("hardware facts", &analysis.hardware, is_cancelled)?;
     require_canonical("recovery facts", &analysis.recovery, is_cancelled)?;
     require_canonical(
+        "actor placement input facts",
+        &analysis.actor_placement_inputs,
+        is_cancelled,
+    )?;
+    require_canonical(
         "scheduler ownership facts",
         &analysis.scheduler_ownership,
         is_cancelled,
@@ -1984,6 +2033,10 @@ fn validate_analysis(
     )? || !strictly_increasing_by(
         &analysis.recovery,
         |left, right| left.subject < right.subject,
+        is_cancelled,
+    )? || !strictly_increasing_by(
+        &analysis.actor_placement_inputs,
+        |left, right| left.actor < right.actor,
         is_cancelled,
     )? {
         return Err(ReportError::NonCanonical("named analysis facts"));
@@ -2053,10 +2106,17 @@ fn validate_analysis(
     let scheduler_identity_limit =
         u64::try_from(scheduler_identity_count).map_err(|_| ReportError::MeasurementOverflow)?;
     let mut scheduler_identities = Vec::new();
+    let mut scheduler_actors = Vec::new();
     scheduler_identities
         .try_reserve_exact(scheduler_identity_count)
         .map_err(|_| ReportError::ResourceLimit {
             resource: "scheduler ownership validation index",
+            limit: scheduler_identity_limit,
+        })?;
+    scheduler_actors
+        .try_reserve_exact(scheduler_identity_count)
+        .map_err(|_| ReportError::ResourceLimit {
+            resource: "actor placement validation index",
             limit: scheduler_identity_limit,
         })?;
     for (index, fact) in analysis.scheduler_ownership.iter().enumerate() {
@@ -2075,6 +2135,7 @@ fn validate_analysis(
                 return Err(ReportError::InvalidFact);
             }
             scheduler_identities.push(("actor", actor));
+            scheduler_actors.push(actor.as_str());
         }
         for task in &fact.tasks {
             if !canonical_named_identity(task, "task", is_cancelled)? {
@@ -2089,6 +2150,17 @@ fn validate_analysis(
             return Err(ReportError::Cancelled);
         }
         if pair[0] == pair[1] {
+            return Err(ReportError::InvalidFact);
+        }
+    }
+    if !analysis.actor_placement_inputs.is_empty() {
+        cancellable_sort(&mut scheduler_actors, is_cancelled)?;
+        if scheduler_actors.len() != analysis.actor_placement_inputs.len()
+            || scheduler_actors
+                .iter()
+                .zip(&analysis.actor_placement_inputs)
+                .any(|(owned, input)| *owned != input.actor)
+        {
             return Err(ReportError::InvalidFact);
         }
     }
@@ -2207,6 +2279,13 @@ fn validate_analysis(
             return Err(ReportError::InvalidFact);
         }
         require_nonempty_values(&fact.cleanup_path, is_cancelled)?;
+    }
+    for fact in &analysis.actor_placement_inputs {
+        if !canonical_named_identity(&fact.actor, "actor", is_cancelled)?
+            || fact.reserved_region_bytes == 0
+        {
+            return Err(ReportError::InvalidFact);
+        }
     }
     validate_image_graph(analysis, is_cancelled)?;
     Ok(())
@@ -3584,13 +3663,13 @@ mod tests {
     use wrela_build_model::{BuildIdentity, LanguageRevision, Sha256Digest, TargetIdentity};
 
     use super::{
-        ActivationCancellationFact, ActivationFrameEvidenceFact, AnalysisFactLimits,
-        AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts, BoundFact,
-        ImageEdgeFact, ImageNodeFact, ImageReport, OptimizationAction, OptimizationDecisionFact,
-        PromotionFact, ProofFact, RegionAssignmentFact, RegionCapacityEvidenceFact, RegionClass,
-        ReportError, SchedulerOwnershipFact, SectionFact, SymbolFact, ValidatedAnalysisFacts,
-        WorkFact, cancellable_sort, decode_image_report_json, push_json_string_cancellable,
-        seal_analysis_facts,
+        ActivationCancellationFact, ActivationFrameEvidenceFact, ActorPlacementInputFact,
+        AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts,
+        BoundFact, ImageEdgeFact, ImageNodeFact, ImageReport, OptimizationAction,
+        OptimizationDecisionFact, PromotionFact, ProofFact, RegionAssignmentFact,
+        RegionCapacityEvidenceFact, RegionClass, ReportError, SchedulerOwnershipFact, SectionFact,
+        SymbolFact, ValidatedAnalysisFacts, WorkFact, cancellable_sort, decode_image_report_json,
+        push_json_string_cancellable, seal_analysis_facts,
     };
 
     fn build(digest: Sha256Digest) -> BuildIdentity {
@@ -4016,7 +4095,7 @@ mod tests {
         };
         let sealed = seal_analysis_facts(request, facts.clone(), &|| false)
             .expect("exact actor/task/region graph limit");
-        assert_eq!(super::REPORT_SCHEMA_VERSION, 15);
+        assert_eq!(super::REPORT_SCHEMA_VERSION, 16);
         assert_eq!(sealed.as_facts().image_nodes.len(), 8);
         assert_eq!(sealed.as_facts().region_capacity_evidence.len(), 5);
         assert_eq!(sealed.as_facts().activation_frame_evidence.len(), 2);
@@ -4038,7 +4117,7 @@ mod tests {
             BackendFactLimits::standard(),
             &|| false,
         )
-        .expect("schema-v15 activation report");
+        .expect("schema-v16 activation report");
         let json = report.to_json();
         assert!(json.contains("\"activation_frame_evidence\":[{"));
         assert!(json.contains("\"kind\":\"actor-activation-frame-region\""));
@@ -4052,7 +4131,7 @@ mod tests {
                 u64::try_from(json.len()).expect("bounded activation report bytes"),
                 &|| false,
             )
-            .expect("decode exact schema-v15 activation evidence"),
+            .expect("decode exact schema-v16 activation evidence"),
             report
         );
         let corrupt_cancellation = json.replacen(
@@ -4251,6 +4330,73 @@ mod tests {
             seal_analysis_facts(request(1), gapped, &|| false),
             Err(ReportError::InvalidFact)
         );
+    }
+
+    #[test]
+    fn actor_placement_inputs_are_canonical_exact_bounded_and_fail_closed() {
+        let digest = Sha256Digest::from_bytes([0x47; 32]);
+        let build = build(digest);
+        let request = |items| AnalysisFactRequest {
+            build: &build,
+            image_name: "placement-input-image",
+            limits: AnalysisFactLimits {
+                items,
+                proof_edges: 1,
+                payload_bytes: 128,
+            },
+        };
+        let facts = AnalysisFacts {
+            actor_placement_inputs: vec![
+                ActorPlacementInputFact {
+                    actor: "actor:1:worker".to_owned(),
+                    maximum_uninterrupted_work: 7,
+                    reserved_region_bytes: 65,
+                },
+                ActorPlacementInputFact {
+                    actor: "actor:0:root".to_owned(),
+                    maximum_uninterrupted_work: 11,
+                    reserved_region_bytes: 129,
+                },
+            ],
+            scheduler_ownership: vec![SchedulerOwnershipFact {
+                core: 0,
+                actors: vec!["actor:1:worker".to_owned(), "actor:0:root".to_owned()],
+                tasks: Vec::new(),
+            }],
+            ..AnalysisFacts::default()
+        };
+        let sealed = seal_analysis_facts(request(5), facts.clone(), &|| false)
+            .expect("two placement inputs, ownership row, and two owner links fit exactly");
+        assert_eq!(
+            sealed.as_facts().actor_placement_inputs[0].actor,
+            "actor:0:root"
+        );
+        assert_eq!(
+            seal_analysis_facts(request(4), facts.clone(), &|| false),
+            Err(ReportError::ResourceLimit {
+                resource: "analysis fact items",
+                limit: 4,
+            })
+        );
+
+        let mut zero_reserved = facts.clone();
+        zero_reserved.actor_placement_inputs[0].reserved_region_bytes = 0;
+        assert_eq!(
+            seal_analysis_facts(request(5), zero_reserved, &|| false),
+            Err(ReportError::InvalidFact)
+        );
+        let mut partial = facts.clone();
+        partial.actor_placement_inputs.pop();
+        assert_eq!(
+            seal_analysis_facts(request(4), partial, &|| false),
+            Err(ReportError::InvalidFact)
+        );
+        let mut duplicate = facts;
+        duplicate.actor_placement_inputs[1].actor = "actor:1:worker".to_owned();
+        assert!(matches!(
+            seal_analysis_facts(request(5), duplicate, &|| false),
+            Err(ReportError::InvalidFact | ReportError::NonCanonical(_))
+        ));
     }
 
     #[test]
@@ -4710,7 +4856,7 @@ mod tests {
         let digest = Sha256Digest::from_bytes([0x67; 32]);
         let minimum = assemble(digest, AnalysisFacts::default(), backend(digest))
             .expect("minimum one-block DIR64 relocation evidence");
-        assert_eq!(minimum.schema(), 15);
+        assert_eq!(minimum.schema(), 16);
         assert_eq!(minimum.backend().relocation_directory_bytes, 12);
         assert_eq!(minimum.backend().base_relocation_blocks, 1);
         assert_eq!(minimum.backend().base_relocation_dir64_count, 1);
@@ -5167,7 +5313,7 @@ mod tests {
         ];
         let digest_build = build(digest);
         let report = assemble(digest, facts, backend(digest)).expect("assemble region report");
-        assert_eq!(report.schema(), 15);
+        assert_eq!(report.schema(), 16);
         // Canonicalization sorted both vectors by their derived total order.
         assert_eq!(
             report

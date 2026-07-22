@@ -2076,6 +2076,10 @@ fn assemble_projection(
         work,
         hardware: Vec::new(),
         recovery: Vec::new(),
+        // Actor placement inputs require Flow checkpoint work and the final
+        // region ownership graph. Source semantic facts cannot reconstruct
+        // either side of that join without weakening the report boundary.
+        actor_placement_inputs: Vec::new(),
         // Scheduler ownership is introduced and authenticated by Flow
         // lowering; source semantic facts cannot reconstruct that partition.
         scheduler_ownership: Vec::new(),

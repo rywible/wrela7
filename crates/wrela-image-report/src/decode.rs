@@ -9,15 +9,15 @@ use wrela_test_model::{
 
 use crate::{
     ActivationCancellationFact, ActivationFrameEvidenceFact, ActorLoweringFact, ActorLoweringKind,
-    AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts,
-    BoundFact, HardwareFact, ImageEdgeFact, ImageNodeFact, ImageReport, OptimizationAction,
-    OptimizationDecisionFact, PromotionFact, ProofFact, REPORT_SCHEMA_VERSION, RecoveryFact,
-    RegionAssignmentFact, RegionCapacityEvidenceFact, RegionClass, ReportError,
-    RepresentationFacts, SchedulerOwnershipFact, SectionFact, SymbolFact, WorkFact,
-    copy_build_identity, seal_analysis_facts,
+    ActorPlacementInputFact, AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts,
+    BackendFactLimits, BackendFacts, BoundFact, HardwareFact, ImageEdgeFact, ImageNodeFact,
+    ImageReport, OptimizationAction, OptimizationDecisionFact, PromotionFact, ProofFact,
+    REPORT_SCHEMA_VERSION, RecoveryFact, RegionAssignmentFact, RegionCapacityEvidenceFact,
+    RegionClass, ReportError, RepresentationFacts, SchedulerOwnershipFact, SectionFact, SymbolFact,
+    WorkFact, copy_build_identity, seal_analysis_facts,
 };
 
-/// Decode and authenticate one canonical schema-v15 image report.
+/// Decode and authenticate one canonical schema-v16 image report.
 ///
 /// The caller supplies the build identity expected at this trust boundary and
 /// all resource ceilings. The decoded facts are resealed through the same
@@ -183,6 +183,13 @@ pub fn decode_image_report_json(
         let fact = parse_scheduler_ownership(parser, &mut budget)?;
         Ok(fact)
     })?;
+    parser.field("actor_placement_inputs", false)?;
+    let actor_placement_inputs = parse_array(&mut parser, |parser| {
+        budget.analysis_item()?;
+        let fact = parse_actor_placement_input(parser)?;
+        budget.analysis_payload(&fact.actor)?;
+        Ok(fact)
+    })?;
     parser.field("compiled_test_group", false)?;
     let compiled_test_group = parse_compiled_test_group(&mut parser, &mut budget)?;
     parser.field("startup_order", false)?;
@@ -277,6 +284,7 @@ pub fn decode_image_report_json(
         work,
         hardware,
         recovery,
+        actor_placement_inputs,
         scheduler_ownership,
         compiled_test_group,
         startup_order,
@@ -493,6 +501,24 @@ fn parse_scheduler_ownership(
         core,
         actors,
         tasks,
+    })
+}
+
+fn parse_actor_placement_input(
+    parser: &mut Parser<'_>,
+) -> Result<ActorPlacementInputFact, ReportError> {
+    parser.object_start()?;
+    parser.field("actor", true)?;
+    let actor = parser.string()?;
+    parser.field("maximum_uninterrupted_work", false)?;
+    let maximum_uninterrupted_work = parser.u64("actor maximum uninterrupted work")?;
+    parser.field("reserved_region_bytes", false)?;
+    let reserved_region_bytes = parser.u64("actor reserved region byte count")?;
+    parser.object_end()?;
+    Ok(ActorPlacementInputFact {
+        actor,
+        maximum_uninterrupted_work,
+        reserved_region_bytes,
     })
 }
 
@@ -1388,12 +1414,12 @@ mod tests {
     use wrela_build_model::{BuildIdentity, LanguageRevision, Sha256Digest, TargetIdentity};
 
     use crate::{
-        ActorLoweringFact, ActorLoweringKind, AnalysisFactLimits, AnalysisFactRequest,
-        AnalysisFacts, BackendFactLimits, BackendFacts, BoundFact, HardwareFact, ImageEdgeFact,
-        ImageNodeFact, ImageReport, OptimizationAction, OptimizationDecisionFact, PromotionFact,
-        ProofFact, RecoveryFact, RegionAssignmentFact, RegionCapacityEvidenceFact, RegionClass,
-        ReportError, RepresentationFacts, SchedulerOwnershipFact, SectionFact, SymbolFact,
-        WorkFact, seal_analysis_facts,
+        ActorLoweringFact, ActorLoweringKind, ActorPlacementInputFact, AnalysisFactLimits,
+        AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts, BoundFact,
+        HardwareFact, ImageEdgeFact, ImageNodeFact, ImageReport, OptimizationAction,
+        OptimizationDecisionFact, PromotionFact, ProofFact, RecoveryFact, RegionAssignmentFact,
+        RegionCapacityEvidenceFact, RegionClass, ReportError, RepresentationFacts,
+        SchedulerOwnershipFact, SectionFact, SymbolFact, WorkFact, seal_analysis_facts,
     };
 
     use super::{Parser, decode_image_report_json};
@@ -1626,6 +1652,11 @@ mod tests {
                 reset_timeout_ns: 50,
                 quarantine_bytes: 256,
                 cleanup_path: vec!["mask".to_owned(), "reset".to_owned()],
+            }],
+            actor_placement_inputs: vec![ActorPlacementInputFact {
+                actor: "actor:0:alpha".to_owned(),
+                maximum_uninterrupted_work: 99,
+                reserved_region_bytes: 48,
             }],
             scheduler_ownership: vec![SchedulerOwnershipFact {
                 core: 0,
@@ -1871,15 +1902,15 @@ mod tests {
     #[test]
     fn schema_scalar_enum_and_json_structure_mutations_fail_closed() {
         let json = full_report(ActorLoweringKind::Queued, OptimizationAction::Retained).to_json();
-        let schema = json.replacen("\"schema\":15", "\"schema\":16", 1);
+        let schema = json.replacen("\"schema\":16", "\"schema\":17", 1);
         assert_eq!(
             decode(schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(16))
+            Err(ReportError::UnsupportedSchema(17))
         );
-        let stale_schema = json.replacen("\"schema\":15", "\"schema\":14", 1);
+        let stale_schema = json.replacen("\"schema\":16", "\"schema\":15", 1);
         assert_eq!(
             decode(stale_schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(14))
+            Err(ReportError::UnsupportedSchema(15))
         );
 
         let oversized_u32 = json.replacen(
@@ -2092,6 +2123,7 @@ mod tests {
             analysis.work.len(),
             analysis.hardware.len(),
             analysis.recovery.len(),
+            analysis.actor_placement_inputs.len(),
             analysis.scheduler_ownership.len(),
             analysis
                 .scheduler_ownership

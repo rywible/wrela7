@@ -32,11 +32,12 @@ use wrela_flow_wir_codec::{
     decode_and_verify as decode_flow_wir,
 };
 use wrela_image_report::{
-    ActivationCancellationFact, ActivationFrameEvidenceFact, AnalysisFactLimits,
-    AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts, BoundFact, HardwareFact,
-    ImageEdgeFact, ImageNodeFact, ImageReport, OptimizationAction, OptimizationDecisionFact,
-    ProofFact, RegionCapacityEvidenceFact, ReportError, RepresentationFacts,
-    SchedulerOwnershipFact, SectionFact, SymbolFact, WorkFact, seal_analysis_facts,
+    ActivationCancellationFact, ActivationFrameEvidenceFact, ActorPlacementInputFact,
+    AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts, BackendFactLimits, BackendFacts,
+    BoundFact, HardwareFact, ImageEdgeFact, ImageNodeFact, ImageReport, OptimizationAction,
+    OptimizationDecisionFact, ProofFact, RegionCapacityEvidenceFact, ReportError,
+    RepresentationFacts, SchedulerOwnershipFact, SectionFact, SymbolFact, WorkFact,
+    seal_analysis_facts,
 };
 use wrela_link_efi::{
     CanonicalCoffObjectInspector, CanonicalLinkedImageInspector, CoffObject, CoffObjectKind,
@@ -540,6 +541,10 @@ fn analysis_facts(
         .scheduler_ownership
         .try_reserve_exact(flow.schedulers.len())
         .map_err(|_| BackendReportError::ResourceExhausted("analysis scheduler ownership"))?;
+    facts
+        .actor_placement_inputs
+        .try_reserve_exact(flow.actors.len())
+        .map_err(|_| BackendReportError::ResourceExhausted("actor placement inputs"))?;
     let edge_capacity = flow
         .actors
         .len()
@@ -714,6 +719,7 @@ fn analysis_facts(
             tasks,
         });
     }
+    facts.actor_placement_inputs = actor_placement_inputs(flow, is_cancelled)?;
     let semantic = target.semantic();
     for device in &flow.devices {
         check_report_cancelled(is_cancelled)?;
@@ -974,6 +980,81 @@ fn analysis_facts(
         facts.shutdown_order.push(owner_name(flow, owner)?);
     }
     Ok(facts)
+}
+
+/// Join only the placement inputs that FlowWir currently authenticates.
+///
+/// This intentionally returns no rows for an image with pools, actor-owned
+/// globals, or a turn without a checkpoint work bound. Publishing a partial
+/// vector would let a later consumer mistake a subset for the normative total.
+/// Target per-core capacities and explicit-assignment provenance remain absent,
+/// so these rows are not placement proposals.
+fn actor_placement_inputs(
+    flow: &wrela_flow_wir::FlowWir,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<ActorPlacementInputFact>, BackendReportError> {
+    if !flow.pools.is_empty() {
+        return Ok(Vec::new());
+    }
+    for global in &flow.globals {
+        check_report_cancelled(is_cancelled)?;
+        if matches!(global.owner, PlanOwner::Actor(_)) {
+            return Ok(Vec::new());
+        }
+    }
+    let mut inputs = Vec::new();
+    inputs
+        .try_reserve_exact(flow.actors.len())
+        .map_err(|_| BackendReportError::ResourceExhausted("actor placement inputs"))?;
+    for actor in &flow.actors {
+        check_report_cancelled(is_cancelled)?;
+        let mut maximum_uninterrupted_work = 0_u64;
+        for function_id in &actor.turn_functions {
+            check_report_cancelled(is_cancelled)?;
+            let function = flow
+                .functions
+                .get(function_id.0 as usize)
+                .filter(|function| function.id == *function_id)
+                .ok_or(BackendReportError::Mismatch(
+                    "actor placement turn function is foreign",
+                ))?;
+            let mut function_work = None::<u64>;
+            for checkpoint in &flow.checkpoints {
+                check_report_cancelled(is_cancelled)?;
+                if checkpoint.function == function.id {
+                    function_work = Some(
+                        function_work
+                            .unwrap_or(0)
+                            .max(checkpoint.uninterrupted_bound),
+                    );
+                }
+            }
+            let Some(function_work) = function_work else {
+                return Ok(Vec::new());
+            };
+            maximum_uninterrupted_work = maximum_uninterrupted_work.max(function_work);
+        }
+        let mut reserved_region_bytes = 0_u64;
+        for region in &flow.regions {
+            check_report_cancelled(is_cancelled)?;
+            if region.owner == PlanOwner::Actor(actor.id) {
+                reserved_region_bytes = reserved_region_bytes
+                    .checked_add(region.capacity_bytes)
+                    .ok_or(BackendReportError::ResourceExhausted(
+                        "actor reserved region bytes",
+                    ))?;
+            }
+        }
+        if reserved_region_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        inputs.push(ActorPlacementInputFact {
+            actor: actor_identity(flow, actor.id)?,
+            maximum_uninterrupted_work,
+            reserved_region_bytes,
+        });
+    }
+    Ok(inputs)
 }
 
 fn reportable_activation_regions(
@@ -1724,6 +1805,7 @@ fn require_exact_analysis_binding(
         && expected.work == reported.work
         && expected.hardware == reported.hardware
         && expected.recovery == reported.recovery
+        && expected.actor_placement_inputs == reported.actor_placement_inputs
         && expected.compiled_test_group == reported.compiled_test_group
         && expected.startup_order == reported.startup_order
         && expected.shutdown_order == reported.shutdown_order;
@@ -3141,15 +3223,16 @@ mod tests {
     use wrela_build_model::{BuildIdentity, LanguageRevision, Sha256Digest, TargetIdentity};
     use wrela_flow_wir::{
         ActivationCancellation, ActivationId, ActivationPlan, ActorId, ActorPlan, Block, BlockId,
-        FLOW_WIR_VERSION, FlowFunction, FlowOperation, FlowType, FlowTypeKind, FlowWir,
-        FunctionColor, FunctionId, FunctionOrigin, FunctionRole, Instruction, InstructionId,
-        PlanOwner, Proof, ProofId, ProofKind, RegionClass, RegionId, RegionPlan, SchedulerPlan,
-        SourceSummary, TaskId, TaskPlan, Terminator, TypeId, Value, ValueId,
+        Checkpoint, CheckpointId, FLOW_WIR_VERSION, FlowFunction, FlowOperation, FlowType,
+        FlowTypeKind, FlowWir, FunctionColor, FunctionId, FunctionOrigin, FunctionRole,
+        Instruction, InstructionId, PlanOwner, Proof, ProofId, ProofKind, RegionClass, RegionId,
+        RegionPlan, SchedulerPlan, SourceSummary, TaskId, TaskPlan, Terminator, TypeId, Value,
+        ValueId,
     };
     use wrela_image_report::{
-        ActivationCancellationFact, ActivationFrameEvidenceFact, AnalysisFactLimits,
-        AnalysisFactRequest, AnalysisFacts, ProofFact, RegionCapacityEvidenceFact, ReportError,
-        seal_analysis_facts,
+        ActivationCancellationFact, ActivationFrameEvidenceFact, ActorPlacementInputFact,
+        AnalysisFactLimits, AnalysisFactRequest, AnalysisFacts, ProofFact,
+        RegionCapacityEvidenceFact, ReportError, seal_analysis_facts,
     };
     use wrela_source::{FileId, Span, TextRange};
     use wrela_target::TargetPackage;
@@ -3157,9 +3240,10 @@ mod tests {
     use super::{
         BackendContentHasher, BackendExecutionError, BackendInputError, BackendJobPathCandidate,
         BackendJobPaths, BackendLimits, BackendReportError, CanonicalBackendContentHasher,
-        MachineLowerError, analysis_facts, canonical_runtime_intrinsic_names,
-        exact_region_capacity_proof, report_artifact_measurements_match, report_region_kind,
-        reportable_activation_regions, require_exact_analysis_binding, source_identity,
+        MachineLowerError, actor_placement_inputs, analysis_facts,
+        canonical_runtime_intrinsic_names, exact_region_capacity_proof,
+        report_artifact_measurements_match, report_region_kind, reportable_activation_regions,
+        require_exact_analysis_binding, source_identity,
     };
 
     #[test]
@@ -4413,6 +4497,72 @@ mod tests {
     }
 
     #[test]
+    fn actor_placement_input_join_is_exact_and_withholds_partial_profiles() {
+        let (validated, _) = actor_report_flow_fixture();
+        assert!(
+            actor_placement_inputs(validated.as_wir(), &|| false)
+                .expect("inspect absent work inputs")
+                .is_empty(),
+            "a missing turn-work fact withholds the entire placement input set"
+        );
+
+        let mut bounded = validated.as_wir().clone();
+        let source = bounded.regions[0].source;
+        bounded.checkpoints = vec![
+            Checkpoint {
+                id: CheckpointId(0),
+                function: FunctionId(1),
+                source,
+                uninterrupted_bound: 11,
+                may_observe_cancellation: true,
+                may_yield: true,
+            },
+            Checkpoint {
+                id: CheckpointId(1),
+                function: FunctionId(2),
+                source,
+                uninterrupted_bound: 7,
+                may_observe_cancellation: true,
+                may_yield: true,
+            },
+        ];
+        let joined = actor_placement_inputs(&bounded, &|| false)
+            .expect("join exact actor work and owned-region bytes");
+        assert_eq!(joined.len(), 2);
+        assert_eq!(joined[0].actor, "actor:0:root");
+        assert_eq!(joined[0].maximum_uninterrupted_work, 11);
+        assert_eq!(joined[0].reserved_region_bytes, 129);
+        assert_eq!(joined[1].actor, "actor:1:worker");
+        assert_eq!(joined[1].maximum_uninterrupted_work, 7);
+        assert_eq!(joined[1].reserved_region_bytes, 65);
+
+        let polls = Cell::new(0_u64);
+        actor_placement_inputs(&bounded, &|| {
+            polls.set(polls.get() + 1);
+            false
+        })
+        .expect("measure exact placement-input projection polls");
+        let exact_stop = polls.get();
+        let polls = Cell::new(0_u64);
+        assert!(matches!(
+            actor_placement_inputs(&bounded, &|| {
+                let next = polls.get() + 1;
+                polls.set(next);
+                next == exact_stop
+            }),
+            Err(BackendReportError::Cancelled)
+        ));
+
+        bounded.checkpoints.pop();
+        assert!(
+            actor_placement_inputs(&bounded, &|| false)
+                .expect("inspect incomplete input set")
+                .is_empty(),
+            "one missing actor input must not publish a prefix-valid proposal source"
+        );
+    }
+
+    #[test]
     fn reportable_region_projects_exact_capacity_proof_and_nonregion_links_stay_absent() {
         let (flow, target) = actor_region_report_flow_fixture();
         let projected = analysis_facts(flow.as_wir(), &target, &|| false)
@@ -4659,6 +4809,11 @@ mod tests {
     fn exact_analysis_binding_rejects_substituted_region_capacity_proof_id() {
         let long_caller = format!("function:0:{}", "caller".repeat(2_048));
         let expected = AnalysisFacts {
+            actor_placement_inputs: vec![ActorPlacementInputFact {
+                actor: "actor:0:owner".to_owned(),
+                maximum_uninterrupted_work: 7,
+                reserved_region_bytes: 8,
+            }],
             region_capacity_evidence: vec![RegionCapacityEvidenceFact {
                 region: "region:0:frame".to_owned(),
                 capacity_proof: 3,
@@ -4710,6 +4865,12 @@ mod tests {
         wrong_region.region_capacity_evidence[0].region = "region:1:frame".to_owned();
         assert!(matches!(
             require_exact_analysis_binding(&expected, &wrong_region, &|| false),
+            Err(BackendReportError::Mismatch(_))
+        ));
+        let mut wrong_placement_input = expected.clone();
+        wrong_placement_input.actor_placement_inputs[0].reserved_region_bytes = 9;
+        assert!(matches!(
+            require_exact_analysis_binding(&expected, &wrong_placement_input, &|| false),
             Err(BackendReportError::Mismatch(_))
         ));
         for mutate in [
