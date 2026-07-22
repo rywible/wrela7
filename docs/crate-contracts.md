@@ -464,16 +464,25 @@ it. It injects phase implementations and bounded host capabilities, while
   bounds, and the HIR declaration/file bounds used to validate provenance.
 - SemanticWir v12 retains exact SSA aggregate field replacement as `InsertField`.
   Validation joins the prior aggregate's struct type, selected field, inserted
-  value type, and single result of the unchanged aggregate type; FlowWir v16
+  value type, and single result of the unchanged aggregate type; FlowWir v17
   preserves the same operation and independently repeats that join.
-- MachineWir v17 retains same-block nongeneric flat values with two or more
+- MachineWir v18 retains same-block nongeneric flat values with two or more
   primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
   `InsertField`, and `ExtractField` carry exact SSA joins through independent
   validation, equality, and resource metering; LLVM renders them with
   first-class `insertvalue`/`extractvalue`. One-field `u64` structs retain the
   established erased bitcast representation. Aggregate function/block
   boundaries, packed/empty/non-flat structs, and nested aggregates fail closed.
-- MachineWir v17 records one exact optional logical payload type per enum tag.
+- MachineWir v18 also retains the exact inline, nonempty, homogeneous
+  boolean/default-`i64` fixed-array iteration profile. `MakeArray` authenticates
+  the source-ordered element vector and `ExtractIndex` carries the exact
+  `CapacityBound` from FlowWir v17. Validation joins the array extent, generated
+  unsigned-64 index, proof bound, result element type, and function proof set;
+  the LLVM consumer repeats that join before emitting target-laid-out array
+  storage plus one proved dynamic element access. Empty, heterogeneous,
+  stored/dynamic, taking, mutable, suspended, and function-boundary arrays stay
+  fail-closed.
+- MachineWir v18 records one exact optional logical payload type per enum tag.
   Uniform scalar enums retain that scalar as the physical shared-slot type;
   all-unit enums retain neither a slot nor logical payloads and remain exactly
   one tag byte. The first heterogeneous profile is deliberately narrower: two
@@ -591,7 +600,7 @@ it. It injects phase implementations and bounded host capabilities, while
   single-slot task entry, and `DropCalleeThenPropagate` cancellation. General
   path-sensitive activations, concurrent task slots, actor methods, and runtime
   scheduling remain outside this bounded schema vertical.
-- FlowWir v16 carries one explicit cooperative-scheduler ownership plan for
+- FlowWir v17 carries one explicit cooperative-scheduler ownership plan for
   every actor image admitted by the current single-core target profile. Core
   zero must own every dense actor and task ID exactly once and in canonical
   order; images without actors or tasks must carry no scheduler plan. Flow
@@ -605,17 +614,17 @@ it. It injects phase implementations and bounded host capabilities, while
 - Every region records its closed class, owner, byte capacity, alignment,
   exact `CapacityBound` proof, and source span. Validation joins those fields
   rather than allowing report or Machine consumers to infer region provenance.
-- FlowWir v16 adds one exact actor-state `Promote` marker. Validation requires
+- FlowWir v17 adds one exact actor-state `Promote` marker. Validation requires
   an unsigned 64-bit value, the owning actor's canonical eight-byte `.state`
   image region, a source-identical eight-byte `RegionBound` proof listed on the
   turn function, and no result. This is proof/lifetime authority; the following
   store remains the concrete runtime action.
-- FlowWir v16 also appends `ActorReplyRequest` and `ActorReplyResolve` while
+- FlowWir v17 also appends `ActorReplyRequest` and `ActorReplyResolve` while
   retaining the exact actor, target, permit, reply proof, `u64` outcome, and
   request/result identity. Validation requires one request and one resolve,
   exactly one incoming typed-reply edge to the target, and the same sorted
   target-type/capacity proof dependency authenticated by SemanticWir.
-- FlowWir v16 retains compiler-minted `StaticString { bytes }` and
+- FlowWir v17 retains compiler-minted `StaticString { bytes }` and
   `BoundedString { capacity }` identities plus source-ordered
   `FormatBoundedString` parts without selecting storage. Validation
   independently authenticates static extents, aggregate capacity, part kind,
@@ -807,7 +816,7 @@ it. It injects phase implementations and bounded host capabilities, while
   and the unique `ImageClosed` root must close over activation capacities and a
   `TypeChecked`/`EffectsAllowed` ancestry. This is a compiled startup-task
   subset, not mailbox admission, recurring scheduling, or cancellation
-  execution. MachineWir v17 extends that same sealed plan to the exact
+  execution. MachineWir v18 extends that same sealed plan to the exact
   constant-`u64` delivery profile described below while preserving unit.
 - Floating not-equal is explicitly unordered-or-not-equal, matching the source
   language rule that NaN compares unequal to itself. Version 5 also makes
@@ -823,21 +832,21 @@ it. It injects phase implementations and bounded host capabilities, while
   runtime requirements, the unique UEFI entry, the closed set of no-argument
   interrupt handlers, and target/build consistency. Firmware and interrupt
   entries cannot be ordinary direct or tail-call targets.
-- MachineWir v17 admits one exact same-core typed-reply profile. The caller is
+- MachineWir v18 admits one exact same-core typed-reply profile. The caller is
   a single-flight task entry with one 16-byte, 8-aligned stack slot; request,
   mailbox receive, and target resolve must agree on actor, method, capacity
   permit, and `ActorReplyExactlyOnce` proof. The request carries distinct
   state-mismatch and duplicate-resolve fatal provenances, and the target must
   have no parameters and return exact `u64`. Reserve/commit/dispatch and
   activation records are forbidden in this profile.
-- MachineWir v17 also admits one exact structured scope-return activation
+- MachineWir v18 also admits one exact structured scope-return activation
   shape: a five-block actor caller branches to an authenticated generated
   cleanup plus return, or to the same cleanup followed by its already-proved
   immediate unit activation and resume. Validation rejoins the flat state,
   generated-cleanup origin, both calls, branch/jump targets, activation call,
   and empty resume. Deleting or substituting either cleanup invalidates the
   activation plan; arbitrary branched activation callers remain invalid.
-- MachineWir v17 also admits the first typed internal-async delivery without a
+- MachineWir v18 also admits the first typed internal-async delivery without a
   schema change: the existing activation plan may bind an ordinary no-argument
   callee whose complete body is one exact unsigned-`u64` constant and return.
   The caller's internal call defines that same `u64` directly, its resume block
@@ -875,7 +884,7 @@ it. It injects phase implementations and bounded host capabilities, while
   image entry alone receives the exact AArch64 UEFI two-pointer/`EFI_STATUS`
   boundary and an implicit `EFI_SUCCESS` value for a unit return.
 - For the canonical actor-state direct write, lowering authenticates the
-  FlowWir v16 promotion proof, owning `.state` region, value, source, and exact
+  FlowWir v17 promotion proof, owning `.state` region, value, source, and exact
   marker→address→store adjacency. The marker has no MachineWir operation and
   is excluded consistently from output, reservation, and exact instruction
   accounting; the address/store remains the concrete writable-global action.
@@ -945,6 +954,9 @@ it. It injects phase implementations and bounded host capabilities, while
 - LLVM performs mechanical translation and backend optimization only. It cannot
   establish a language capacity/safety proof or invent `noalias`, `inbounds`,
   non-null, alignment, or overflow facts.
+- The fixed-array renderer uses `inbounds` only for the sealed `ExtractIndex`
+  operation whose capacity proof exactly equals the array extent. It does not
+  infer bounds from LLVM values or admit a general runtime-indexed array ABI.
 - A function-type record with no surviving first-class value is passive
   provenance. Its parameters may therefore retain a canonical flat-scalar
   struct layout in addition to the existing scalar forms; this narrowly lets
@@ -962,7 +974,7 @@ it. It injects phase implementations and bounded host capabilities, while
   `TestEmit` result, exact-zero switch, and unchanged-status return. It cannot
   erase, merge, or substitute those guards; independent textual and native
   evidence checks the two-emission fixture before accepting the object.
-- For the sealed MachineWir v17 typed-reply profile, LLVM allocates the exact
+- For the sealed MachineWir v18 typed-reply profile, LLVM allocates the exact
   16-byte caller slot and emits atomic state transitions around the exact
   direct same-core target call. State mismatch and duplicate resolution route
   to fatal codes 7 and 8. `ActorReplyResolve` is a validated authority marker
@@ -1112,7 +1124,7 @@ it. It injects phase implementations and bounded host capabilities, while
 - That schema is the only accepted report shape. Its tag rejects stale or
   mismatched artifacts at the trust boundary; there is no legacy reader,
   migration, adapter, or fallback contract. Its embedded interface facts must
-  be exactly SemanticWir 12, FlowWir 16, Flow wire 16, MachineWir 17, and runtime
+  be exactly SemanticWir 12, FlowWir 16, Flow wire 17, MachineWir 18, and runtime
   ABI 2; nonzero stale or future values are rejected rather than tolerated.
 - Schema v10 also projects sealed actor, task, reportable region, and async
   activation plans into

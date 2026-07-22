@@ -19,7 +19,7 @@ use wrela_target::{InterruptDomain, TargetError, TargetPackage};
 use wrela_test_model::{GuestTestOutcome, TestEvent, TestEventKind, TestId};
 use wrela_test_protocol::{CanonicalTestEventCodec, ProtocolLimits, TestEventCodec};
 
-pub const MACHINE_WIR_VERSION: u32 = 17;
+pub const MACHINE_WIR_VERSION: u32 = 18;
 pub const REGION_STORAGE_SECTION_PREFIX: &str = ".data$wrela$region$";
 pub const REGION_STORAGE_SYMBOL_PREFIX: &str = "__wrela_region_storage_";
 
@@ -502,6 +502,11 @@ pub enum MachineOperation {
         ty: MachineTypeId,
         fields: Vec<ValueId>,
     },
+    /// Construct one exact target-laid-out fixed array from its elements.
+    MakeArray {
+        ty: MachineTypeId,
+        elements: Vec<ValueId>,
+    },
     /// Replace one field while preserving every other field of an unpacked struct.
     InsertField {
         aggregate: ValueId,
@@ -512,6 +517,13 @@ pub enum MachineOperation {
     ExtractField {
         aggregate: ValueId,
         field: u32,
+    },
+    /// Extract one element using a generated, capacity-proved u64 index.
+    ExtractIndex {
+        aggregate: ValueId,
+        index: ValueId,
+        proof: ProofId,
+        slot: StackSlotId,
     },
     /// Preserve one first-class machine value without changing its representation.
     Copy {
@@ -774,7 +786,7 @@ pub struct MachineFunction {
     pub source: Option<Span>,
 }
 
-/// The only scheduler ownership admitted by MachineWir v17. An actor turn is
+/// The only scheduler ownership admitted by MachineWir v18. An actor turn is
 /// compiled but remains dormant until a real mailbox admission operation
 /// exists; a single-slot static task is invoked exactly once during startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -808,7 +820,7 @@ pub enum MachineActivationCancellation {
     DropCalleeThenPropagate,
 }
 
-/// Exact machine-consumer join for one FlowWir v16 immediate activation.
+/// Exact machine-consumer join for one FlowWir v17 immediate activation.
 ///
 /// The current closed subset lowers an ordinary async helper that is proven
 /// to return without another suspension into a private direct call followed
@@ -858,7 +870,7 @@ pub enum MachineRegionStorageKind {
         actor: u32,
         mailbox_capacity: u32,
     },
-    /// Canonical, actor-owned persistent state cell. MachineWir v17 admits
+    /// Canonical, actor-owned persistent state cell. MachineWir v18 admits
     /// exactly one zero-initialized `u64` cell for a stateful actor; richer
     /// state layouts remain outside this closed representation.
     ActorState {
@@ -1555,6 +1567,10 @@ fn meter_operation(
         | MachineOperation::RuntimeCall { arguments, .. }
         | MachineOperation::MakeStruct {
             fields: arguments, ..
+        }
+        | MachineOperation::MakeArray {
+            elements: arguments,
+            ..
         } => {
             meter.edge_slice(arguments)?;
             u64::try_from(arguments.len()).map_err(|_| ValidationFailure::ResourceLimit {
@@ -1572,7 +1588,8 @@ fn meter_operation(
         MachineOperation::MakeEnum { .. }
         | MachineOperation::EnumTag { .. }
         | MachineOperation::EnumPayload { .. }
-        | MachineOperation::ExtractField { .. } => Ok(1),
+        | MachineOperation::ExtractField { .. }
+        | MachineOperation::ExtractIndex { .. } => Ok(1),
         MachineOperation::InsertField { .. } => Ok(2),
         MachineOperation::TestAssert { failure, .. } => {
             meter.payload(failure.expression.len())?;
@@ -2886,6 +2903,28 @@ fn validate_function(
         {
             errors.push(ValidationError::InvalidRecord {
                 kind: "stack slot",
+                id: slot.id.0,
+            });
+        }
+    }
+    for slot in &function.stack_slots {
+        if slot.source_name.as_deref() != Some("fixed-array.index.storage") {
+            continue;
+        }
+        let uses = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| {
+                matches!(
+                    instruction.operation,
+                    MachineOperation::ExtractIndex { slot: used, .. } if used == slot.id
+                )
+            })
+            .count();
+        if uses != 1 {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "fixed-array index stack slot",
                 id: slot.id.0,
             });
         }
@@ -6210,10 +6249,14 @@ fn for_each_operation_value(
             visit(*value)
         }
         MachineOperation::MakeStruct { fields, .. } => fields.iter().copied().all(&mut visit),
+        MachineOperation::MakeArray { elements, .. } => elements.iter().copied().all(&mut visit),
         MachineOperation::InsertField {
             aggregate, value, ..
         } => visit(*aggregate) && visit(*value),
         MachineOperation::ExtractField { aggregate, .. } => visit(*aggregate),
+        MachineOperation::ExtractIndex {
+            aggregate, index, ..
+        } => visit(*aggregate) && visit(*index),
         MachineOperation::Select {
             condition,
             then_value,
@@ -6422,6 +6465,12 @@ fn validate_operation(
                 value!(*field);
             }
         }
+        MachineOperation::MakeArray { ty, elements } => {
+            require_id("constructed array type", ty.0, module.types.len(), errors);
+            for element in elements {
+                value!(*element);
+            }
+        }
         MachineOperation::InsertField {
             aggregate, value, ..
         } => {
@@ -6429,6 +6478,27 @@ fn validate_operation(
             value!(*value);
         }
         MachineOperation::ExtractField { aggregate, .. } => value!(*aggregate),
+        MachineOperation::ExtractIndex {
+            aggregate,
+            index,
+            proof,
+            slot,
+        } => {
+            value!(*aggregate);
+            value!(*index);
+            require_id(
+                "fixed-array index proof",
+                proof.0,
+                module.proofs.len(),
+                errors,
+            );
+            require_id(
+                "fixed-array index stack slot",
+                slot.0,
+                function.stack_slots.len(),
+                errors,
+            );
+        }
         MachineOperation::MakeEnum { ty, payload, .. } => {
             require_id("constructed enum type", ty.0, module.types.len(), errors);
             if let Some(payload) = payload {
@@ -6796,6 +6866,16 @@ fn validate_operation_types(
                     MachineUnaryOp::FloatNegate => is_float(module, ty),
                 })
         }
+        MachineOperation::MakeArray { ty, elements } => {
+            result_count == 1
+                && result_ty(0) == Some(*ty)
+                && module.types.get(ty.0 as usize).is_some_and(|record| {
+                    matches!(record.kind, MachineTypeKind::Array { element, length }
+                        if length > 0
+                            && u64::try_from(elements.len()) == Ok(length)
+                            && elements.iter().all(|value| value_ty(*value) == Some(element)))
+                })
+        }
         MachineOperation::Arithmetic { op, left, right } => {
             let ty = value_ty(*left);
             let operands_match = same(*left, *right) && ty == result_ty(0);
@@ -6908,7 +6988,59 @@ fn validate_operation_types(
                         } => fields.get(*field as usize).map(|field| field.ty),
                         _ => None,
                     })
-                    .is_some_and(|expected| result_ty(0) == Some(expected))
+                .is_some_and(|expected| result_ty(0) == Some(expected))
+        }
+        MachineOperation::ExtractIndex {
+            aggregate,
+            index,
+            proof,
+            slot,
+        } => {
+            result_count == 1
+                && value_ty(*index).is_some_and(|ty| {
+                    module.types.get(ty.0 as usize).is_some_and(|record| {
+                        record.kind == MachineTypeKind::Integer { bits: 64 }
+                    })
+                })
+                && value_ty(*aggregate)
+                    .and_then(|ty| module.types.get(ty.0 as usize))
+                    .and_then(|record| match record.kind {
+                        MachineTypeKind::Array { element, length } if length > 0 => {
+                            Some((element, length))
+                        }
+                        _ => None,
+                    })
+                    .is_some_and(|(element, length)| {
+                        let aggregate_ty = value_ty(*aggregate);
+                        result_ty(0) == Some(element)
+                            && function.proofs.binary_search(proof).is_ok()
+                            && module.proofs.get(proof.0 as usize).is_some_and(|record| {
+                                record.id == *proof
+                                    && record.kind == BackendProofKind::CapacityBound
+                                    && record.bound == Some(length)
+                                    && record.depends_on.is_empty()
+                                    && record.statement.contains("inline fixed-array iteration")
+                                    && !record.sources.is_empty()
+                            })
+                            && aggregate_ty.is_some_and(|aggregate_ty| {
+                                function.stack_slots.get(slot.0 as usize).is_some_and(|slot| {
+                                    module.types.get(aggregate_ty.0 as usize).is_some_and(|array| {
+                                        slot.id.0 as usize
+                                            == function
+                                                .stack_slots
+                                                .iter()
+                                                .position(|candidate| candidate.id == slot.id)
+                                                .unwrap_or(usize::MAX)
+                                            && slot.size == array.size
+                                            && slot.alignment == array.alignment
+                                            && slot.source_name.as_deref()
+                                                == Some("fixed-array.index.storage")
+                                            && slot.live_states.is_empty()
+                                            && slot.overlay_group.is_none()
+                                    })
+                                })
+                            })
+                    })
         }
         MachineOperation::MakeEnum {
             ty,
@@ -9726,8 +9858,8 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_accepts_only_exact_machine_wir_v17() {
-        assert_eq!(MACHINE_WIR_VERSION, 17);
+    fn current_schema_accepts_only_exact_machine_wir_v18() {
+        assert_eq!(MACHINE_WIR_VERSION, 18);
         assert_eq!(
             CheckedIntegerOp::ShiftLeft.invalid_shift_count_fatal_code(),
             Some(RuntimeFatalCode::InvalidShiftCount)
@@ -9750,12 +9882,12 @@ mod tests {
         );
         assert_eq!(CheckedIntegerOp::Add.invalid_shift_count_fatal_code(), None);
         let (module, target) = fixture();
-        for rejected in [16, 18] {
+        for rejected in [17, 19] {
             let mut changed = module.clone();
             changed.version = rejected;
             let errors = changed
                 .validate_for_target(&target)
-                .expect_err("only exact-current MachineWir v17 is accepted");
+                .expect_err("only exact-current MachineWir v18 is accepted");
             assert!(
                 errors
                     .0

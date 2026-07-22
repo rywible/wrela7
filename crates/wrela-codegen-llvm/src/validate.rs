@@ -276,11 +276,12 @@ fn validate_scalar_surface(
         if !supported_scalar_type(&ty.kind, ty.size, ty.alignment)
             && !supported_enum_type(machine, ty.id)
             && !supported_struct_type(machine, ty.id)
+            && !supported_runtime_fixed_array(machine, ty.id)
             && !supported_static_byte_array(machine, ty.id)
             && !supported_passive_function_type(machine, ty.id, is_cancelled)?
         {
             return Err(CodegenError::UnsupportedMachineContract(
-                "non-scalar type other than a canonical static byte array or passive function signature",
+                "non-scalar type other than a canonical fixed array, static byte array, or passive function signature",
             ));
         }
     }
@@ -2090,27 +2091,7 @@ fn validate_function(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), CodegenError> {
     let machine = request.module.as_wir();
-    let reply_requests = function
-        .blocks
-        .iter()
-        .flat_map(|block| &block.instructions)
-        .filter(|instruction| {
-            matches!(
-                instruction.operation,
-                MachineOperation::ActorReplyRequest { .. }
-            )
-        })
-        .count();
-    let exact_reply_slot = matches!(function.stack_slots.as_slice(), [slot]
-        if slot.id.0 == 0
-            && slot.size == 16
-            && slot.alignment == 8
-            && slot.live_states.is_empty()
-            && slot.overlay_group.is_none())
-        && function.stack_bytes == 16
-        && matches!(function.role, MachineFunctionRole::TaskEntry(_))
-        && reply_requests == 1;
-    if ((!function.stack_slots.is_empty() || function.stack_bytes != 0) && !exact_reply_slot)
+    if !authenticated_function_stack(machine, function, is_cancelled)?
         || matches!(function.role, MachineFunctionRole::Isr(_))
         || function.convention == CallingConvention::InterruptHandler
     {
@@ -2164,6 +2145,91 @@ fn validate_function(
         validate_terminator(request, function, block.id, &block.terminator, is_cancelled)?;
     }
     validate_control_flow(request, function, is_cancelled)
+}
+
+fn authenticated_function_stack(
+    machine: &wrela_machine_wir::MachineWir,
+    function: &MachineFunction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, CodegenError> {
+    let mut references = vec![0_u8; function.stack_slots.len()];
+    let mut reply_requests = 0_usize;
+    for block in &function.blocks {
+        check_cancelled(is_cancelled)?;
+        for instruction in &block.instructions {
+            check_cancelled(is_cancelled)?;
+            let (slot, size, alignment, name) = match instruction.operation {
+                MachineOperation::ActorReplyRequest { slot, .. } => {
+                    reply_requests = reply_requests.saturating_add(1);
+                    (slot, 16, 8, "actor.reply.slot")
+                }
+                MachineOperation::ExtractIndex {
+                    aggregate, slot, ..
+                } => {
+                    let Some((size, alignment)) = value_type(machine, function, aggregate)
+                        .and_then(|ty| machine.types.get(ty.0 as usize))
+                        .and_then(|record| match record.kind {
+                            MachineTypeKind::Array { length, .. } if length > 0 => {
+                                Some((record.size, record.alignment))
+                            }
+                            _ => None,
+                        })
+                    else {
+                        return Ok(false);
+                    };
+                    (slot, size, alignment, "fixed-array.index.storage")
+                }
+                _ => continue,
+            };
+            let Some(record) = function.stack_slots.get(slot.0 as usize) else {
+                return Ok(false);
+            };
+            let Some(count) = references.get_mut(slot.0 as usize) else {
+                return Ok(false);
+            };
+            *count = count.saturating_add(1);
+            if *count != 1
+                || record.size != size
+                || record.alignment != alignment
+                || record.source_name.as_deref() != Some(name)
+            {
+                return Ok(false);
+            }
+        }
+    }
+    if reply_requests > 1
+        || (reply_requests == 1 && !matches!(function.role, MachineFunctionRole::TaskEntry(_)))
+        || references.iter().any(|count| *count != 1)
+    {
+        return Ok(false);
+    }
+    let mut stack_bytes = 0_u64;
+    for (index, slot) in function.stack_slots.iter().enumerate() {
+        check_cancelled(is_cancelled)?;
+        let alignment = u64::from(slot.alignment);
+        if slot.id.0 as usize != index
+            || alignment == 0
+            || !alignment.is_power_of_two()
+            || !slot.live_states.is_empty()
+            || slot.overlay_group.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(aligned) = stack_bytes
+            .checked_add(alignment - 1)
+            .map(|bytes| bytes & !(alignment - 1))
+        else {
+            return Ok(false);
+        };
+        let Some(next) = aligned.checked_add(slot.size) else {
+            return Ok(false);
+        };
+        stack_bytes = next;
+    }
+    let Some(stack_bytes) = stack_bytes.checked_add(15).map(|bytes| bytes & !15) else {
+        return Ok(false);
+    };
+    Ok(stack_bytes == function.stack_bytes)
 }
 
 fn validate_scalar_value_types(
@@ -2227,6 +2293,75 @@ fn validate_operation(
         | MachineOperation::MailboxDispatch { .. }
         | MachineOperation::TestAssert { .. }
         | MachineOperation::Fence(_) => {}
+        MachineOperation::MakeArray { ty, elements } => {
+            let valid = matches!(instruction.results.as_slice(), [result]
+                if value_type(machine, function, *result) == Some(*ty))
+                && machine.types.get(ty.0 as usize).is_some_and(|record| {
+                    matches!(record.kind, MachineTypeKind::Array { element, length }
+                    if length > 0
+                        && u64::try_from(elements.len()) == Ok(length)
+                        && elements.iter().all(|value| {
+                            value_type(machine, function, *value) == Some(element)
+                        }))
+                });
+            if !valid {
+                return Err(unsupported());
+            }
+        }
+        MachineOperation::ExtractIndex {
+            aggregate,
+            index,
+            proof,
+            slot,
+        } => {
+            let valid = value_type(machine, function, *index).is_some_and(|ty| {
+                machine
+                    .types
+                    .get(ty.0 as usize)
+                    .is_some_and(|record| record.kind == MachineTypeKind::Integer { bits: 64 })
+            }) && value_type(machine, function, *aggregate)
+                .and_then(|ty| machine.types.get(ty.0 as usize))
+                .and_then(|record| match record.kind {
+                    MachineTypeKind::Array { element, length } if length > 0 => {
+                        Some((element, length, record.size, record.alignment))
+                    }
+                    _ => None,
+                })
+                .is_some_and(|(element, length, size, alignment)| {
+                    matches!(instruction.results.as_slice(), [result]
+                        if value_type(machine, function, *result) == Some(element))
+                        && function.proofs.binary_search(proof).is_ok()
+                        && valid_proofs.get(proof.0 as usize) == Some(&1)
+                        && machine.proofs.get(proof.0 as usize).is_some_and(|record| {
+                            record.id == *proof
+                                && record.kind == wrela_machine_wir::BackendProofKind::CapacityBound
+                                && record.bound == Some(length)
+                                && record.depends_on.is_empty()
+                                && record.statement.contains("inline fixed-array iteration")
+                                && !record.sources.is_empty()
+                        })
+                        && function
+                            .stack_slots
+                            .get(slot.0 as usize)
+                            .is_some_and(|slot| {
+                                slot.id.0 as usize
+                                    == function
+                                        .stack_slots
+                                        .iter()
+                                        .position(|candidate| candidate.id == slot.id)
+                                        .unwrap_or(usize::MAX)
+                                    && slot.size == size
+                                    && slot.alignment == alignment
+                                    && slot.source_name.as_deref()
+                                        == Some("fixed-array.index.storage")
+                                    && slot.live_states.is_empty()
+                                    && slot.overlay_group.is_none()
+                            })
+                });
+            if !valid {
+                return Err(unsupported());
+            }
+        }
         MachineOperation::MakeEnum {
             ty,
             variant,
@@ -2856,6 +2991,27 @@ fn supported_static_byte_array(machine: &wrela_machine_wir::MachineWir, ty: Mach
         && ty.alignment.is_power_of_two()
         && ty.alignment <= machine.layout.maximum_object_alignment
         && ty.size % u64::from(ty.alignment) == 0
+}
+
+fn supported_runtime_fixed_array(
+    machine: &wrela_machine_wir::MachineWir,
+    ty: MachineTypeId,
+) -> bool {
+    let Some(ty) = machine.types.get(ty.0 as usize) else {
+        return false;
+    };
+    let MachineTypeKind::Array { element, length } = ty.kind else {
+        return false;
+    };
+    let Some(element) = machine.types.get(element.0 as usize) else {
+        return false;
+    };
+    length > 0
+        && matches!(element.kind, MachineTypeKind::Integer { bits: 8 | 64 })
+        && supported_scalar_type(&element.kind, element.size, element.alignment)
+        && element.size.checked_mul(length) == Some(ty.size)
+        && ty.alignment == element.alignment
+        && ty.alignment <= machine.layout.maximum_object_alignment
 }
 
 fn supported_enum_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeId) -> bool {
@@ -3600,8 +3756,10 @@ fn operation_edges(operation: &MachineOperation) -> usize {
         | MachineOperation::EnumPayload { .. }
         | MachineOperation::ExtractField { .. }
         | MachineOperation::TestAssert { .. } => 1,
+        MachineOperation::ExtractIndex { .. } => 2,
         MachineOperation::ActorReplyResolve { .. } => 1,
         MachineOperation::MakeStruct { fields, .. } => fields.len(),
+        MachineOperation::MakeArray { elements, .. } => elements.len(),
         MachineOperation::InsertField { .. } => 2,
         MachineOperation::ActorCommit { .. } => 1,
         MachineOperation::Arithmetic { .. }

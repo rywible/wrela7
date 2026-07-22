@@ -381,6 +381,16 @@ fn operation_equal(
             },
         ) => left_ty == right_ty && fixed_slice_equal(left_fields, right_fields, is_cancelled)?,
         (
+            MachineOperation::MakeArray {
+                ty: left_ty,
+                elements: left_elements,
+            },
+            MachineOperation::MakeArray {
+                ty: right_ty,
+                elements: right_elements,
+            },
+        ) => left_ty == right_ty && fixed_slice_equal(left_elements, right_elements, is_cancelled)?,
+        (
             MachineOperation::InsertField {
                 aggregate: left_aggregate,
                 field: left_field,
@@ -406,6 +416,25 @@ fn operation_equal(
                 field: right_field,
             },
         ) => left_aggregate == right_aggregate && left_field == right_field,
+        (
+            MachineOperation::ExtractIndex {
+                aggregate: left_aggregate,
+                index: left_index,
+                proof: left_proof,
+                slot: left_slot,
+            },
+            MachineOperation::ExtractIndex {
+                aggregate: right_aggregate,
+                index: right_index,
+                proof: right_proof,
+                slot: right_slot,
+            },
+        ) => {
+            left_aggregate == right_aggregate
+                && left_index == right_index
+                && left_proof == right_proof
+                && left_slot == right_slot
+        }
         (MachineOperation::Copy { value: left }, MachineOperation::Copy { value: right }) => {
             left == right
         }

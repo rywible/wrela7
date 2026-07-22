@@ -1564,11 +1564,18 @@ fn flow_mapping_matches(
                 scope,
             },
         };
+        let Some(fixed_array_stack) = fixed_array_stack_allowance(source, lowered, is_cancelled)?
+        else {
+            return Ok(false);
+        };
+        let Some(stack_bound) = source.stack_bound.checked_add(fixed_array_stack) else {
+            return Ok(false);
+        };
         if lowered.flow_function as usize != index
             || lowered.origin != origin
             || lowered.role != role
             || lowered.source != source.source
-            || lowered.stack_bytes > source.stack_bound
+            || lowered.stack_bytes > stack_bound
         {
             return Ok(false);
         }
@@ -1739,6 +1746,51 @@ fn flow_mapping_matches(
         }
     }
     Ok(true)
+}
+
+fn fixed_array_stack_allowance(
+    source: &flow::FlowFunction,
+    lowered: &MachineFunction,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<u64>, MachineLowerError> {
+    let source_indexes = source
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                flow::FlowOperation::ExtractIndex { .. }
+            )
+        })
+        .count();
+    let fixed_slots = lowered
+        .stack_slots
+        .iter()
+        .filter(|slot| slot.source_name.as_deref() == Some("fixed-array.index.storage"))
+        .collect::<Vec<_>>();
+    if source_indexes != fixed_slots.len() {
+        return Ok(None);
+    }
+    let mut bytes = 0_u64;
+    for slot in fixed_slots {
+        check_cancelled(is_cancelled)?;
+        let alignment = u64::from(slot.alignment);
+        bytes = bytes
+            .checked_add(alignment - 1)
+            .map(|bytes| bytes & !(alignment - 1))
+            .and_then(|bytes| bytes.checked_add(slot.size))
+            .ok_or(MachineLowerError::InvalidReport(
+                "fixed-array implementation stack overflows",
+            ))?;
+    }
+    bytes
+        .checked_add(15)
+        .map(|bytes| bytes & !15)
+        .map(Some)
+        .ok_or(MachineLowerError::InvalidReport(
+            "fixed-array implementation stack overflows",
+        ))
 }
 
 fn validate_report(
@@ -2199,6 +2251,10 @@ fn model_resources(
                     | MachineOperation::RuntimeCall { arguments, .. }
                     | MachineOperation::MakeStruct {
                         fields: arguments, ..
+                    }
+                    | MachineOperation::MakeArray {
+                        elements: arguments,
+                        ..
                     } => meter.edges(arguments)?,
                     MachineOperation::TestAssert { failure, .. } => {
                         meter.text(&failure.expression)?;
@@ -2217,6 +2273,7 @@ fn model_resources(
                     | MachineOperation::Select { .. }
                     | MachineOperation::InsertField { .. }
                     | MachineOperation::ExtractField { .. }
+                    | MachineOperation::ExtractIndex { .. }
                     | MachineOperation::MakeEnum { .. }
                     | MachineOperation::EnumTag { .. }
                     | MachineOperation::EnumPayload { .. }
@@ -6588,7 +6645,7 @@ mod contract_tests {
         .expect("float not-equal FlowWir reaches MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 17);
+        assert_eq!(machine.version, 18);
         assert!(matches!(machine.types[8].kind, MachineTypeKind::Float32));
         assert!(matches!(machine.types[9].kind, MachineTypeKind::Float64));
         let float_function = &machine.functions[3];
@@ -6696,7 +6753,7 @@ mod contract_tests {
         .expect("unary and lossless casts reach MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 17);
+        assert_eq!(machine.version, 18);
         assert!(matches!(
             machine.types[10].kind,
             MachineTypeKind::Integer { bits: 16 }

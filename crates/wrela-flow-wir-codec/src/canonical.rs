@@ -1532,6 +1532,16 @@ fn encode_operation(writer: &mut Writer<'_>, value: &FlowOperation) -> Result<()
             writer.u32(region.0)?;
             writer.u32(proof.0)
         }
+        FlowOperation::ExtractIndex {
+            aggregate,
+            index,
+            proof,
+        } => {
+            writer.u8(58)?;
+            writer.u32(aggregate.0)?;
+            writer.u32(index.0)?;
+            writer.u32(proof.0)
+        }
         FlowOperation::Promote {
             value,
             destination,
@@ -2770,6 +2780,11 @@ impl Reader<'_> {
                 ty: TypeId(self.u32()?),
                 parts: self.vector(VectorKind::General, Self::bounded_string_part)?,
             },
+            58 => FlowOperation::ExtractIndex {
+                aggregate: ValueId(self.u32()?),
+                index: ValueId(self.u32()?),
+                proof: ProofId(self.u32()?),
+            },
             tag => return Err(invalid_tag("FlowOperation", tag)),
         })
     }
@@ -3270,7 +3285,7 @@ mod tests {
         harness_name.clone_from(&name);
         model
             .validate()
-            .expect("valid long-prefix FlowWir v16 fixture")
+            .expect("valid long-prefix FlowWir v17 fixture")
     }
 
     struct SubstitutingCodec<'a> {
@@ -3706,6 +3721,11 @@ mod tests {
                 aggregate: v,
                 field: 4,
             },
+            FlowOperation::ExtractIndex {
+                aggregate: v,
+                index: v,
+                proof: p,
+            },
             FlowOperation::InsertField {
                 aggregate: v,
                 field: 4,
@@ -3859,7 +3879,7 @@ mod tests {
                 },
             },
         ];
-        assert_eq!(operations.len(), 55);
+        assert_eq!(operations.len(), 56);
         for value in operations {
             roundtrip_operation(&value);
         }
@@ -4780,7 +4800,7 @@ mod tests {
                 &|| false,
             ),
             Err(CodecError::NonCanonical(
-                "codec output differs from the canonical FlowWir v16 encoding"
+                "codec output differs from the canonical FlowWir v17 encoding"
             ))
         ));
     }
@@ -5301,12 +5321,29 @@ mod tests {
                 .expect("actor reply operation consumes exactly");
         }
 
-        let mut reader = Reader::new(&[58], 0, CodecLimits::standard(), &not_cancelled);
+        let operation = FlowOperation::ExtractIndex {
+            aggregate: ValueId(5),
+            index: ValueId(6),
+            proof: ProofId(7),
+        };
+        let mut writer = Writer::new(CodecLimits::standard(), &not_cancelled);
+        writer
+            .operation(&operation)
+            .expect("fixed-array extraction operation encodes");
+        let bytes = writer.finish();
+        assert_eq!(bytes[0], 58);
+        let mut reader = Reader::new(&bytes, 0, CodecLimits::standard(), &not_cancelled);
+        assert_eq!(reader.operation(), Ok(operation));
+        reader
+            .finish()
+            .expect("fixed-array extraction operation consumes exactly");
+
+        let mut reader = Reader::new(&[59], 0, CodecLimits::standard(), &not_cancelled);
         assert_eq!(
             reader.operation(),
             Err(CodecError::InvalidEnumTag {
                 kind: "FlowOperation",
-                tag: 58,
+                tag: 59,
             })
         );
     }

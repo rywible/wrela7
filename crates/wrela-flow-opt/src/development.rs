@@ -701,6 +701,7 @@ fn fold_operation(
         | FlowOperation::EnumTag { .. }
         | FlowOperation::EnumPayload { .. }
         | FlowOperation::ExtractField { .. }
+        | FlowOperation::ExtractIndex { .. }
         | FlowOperation::InsertField { .. }
         | FlowOperation::BeginAccess { .. }
         | FlowOperation::EndAccess { .. }
@@ -2205,6 +2206,12 @@ fn map_operation_values(
             map_value(left, value_map, work)?;
             map_value(right, value_map, work)?;
         }
+        FlowOperation::ExtractIndex {
+            aggregate, index, ..
+        } => {
+            map_value(aggregate, value_map, work)?;
+            map_value(index, value_map, work)?;
+        }
         FlowOperation::MakeAggregate { fields, .. } => {
             map_value_slice(fields, value_map, "aggregate", work)?;
         }
@@ -2732,6 +2739,12 @@ fn for_each_operation_value(
         FlowOperation::Binary { left, right, .. } => {
             visit_value(*left)?;
             visit_value(*right)?;
+        }
+        FlowOperation::ExtractIndex {
+            aggregate, index, ..
+        } => {
+            visit_value(*aggregate)?;
+            visit_value(*index)?;
         }
         FlowOperation::MakeAggregate { fields, .. } => {
             for value in fields {

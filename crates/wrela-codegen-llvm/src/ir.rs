@@ -687,6 +687,40 @@ fn render_instruction(
                 current = Some(index);
             }
         }
+        MachineOperation::MakeArray { ty, elements } => {
+            let result = required_result(result)?;
+            let mut current = None;
+            for (index, element) in elements.iter().enumerate() {
+                if index + 1 == elements.len() {
+                    ir.push("  %v")?;
+                    ir.number(u128::from(result.0))?;
+                } else {
+                    ir.push("  %t")?;
+                    ir.number(u128::from(instruction.id.0))?;
+                    ir.push("_array_")?;
+                    ir.number(index as u128)?;
+                }
+                ir.push(" = insertvalue ")?;
+                render_type(ir, machine, *ty)?;
+                match current {
+                    Some(previous) => {
+                        ir.push(" %t")?;
+                        ir.number(u128::from(instruction.id.0))?;
+                        ir.push("_array_")?;
+                        ir.number(previous as u128)?;
+                    }
+                    None => ir.push(" poison")?,
+                }
+                ir.push(", ")?;
+                render_value_type(ir, machine, function, *element)?;
+                ir.push(" %v")?;
+                ir.number(u128::from(element.0))?;
+                ir.push(", ")?;
+                ir.number(index as u128)?;
+                ir.push("\n")?;
+                current = Some(index);
+            }
+        }
         MachineOperation::InsertField {
             aggregate,
             field,
@@ -713,6 +747,61 @@ fn render_instruction(
             ir.number(u128::from(aggregate.0))?;
             ir.push(", ")?;
             ir.number(u128::from(*field))?;
+            ir.push("\n")?;
+        }
+        MachineOperation::ExtractIndex {
+            aggregate,
+            index,
+            slot,
+            ..
+        } => {
+            let result = required_result(result)?;
+            let aggregate_ty = function
+                .values
+                .get(aggregate.0 as usize)
+                .ok_or(CodegenError::UnsupportedMachineContract(
+                    "fixed-array aggregate value",
+                ))?
+                .ty;
+            let element_ty = match machine
+                .types
+                .get(aggregate_ty.0 as usize)
+                .map(|record| &record.kind)
+            {
+                Some(MachineTypeKind::Array { element, .. }) => *element,
+                _ => return Err(CodegenError::UnsupportedMachineContract("fixed-array type")),
+            };
+            let alignment = machine
+                .types
+                .get(element_ty.0 as usize)
+                .ok_or(CodegenError::UnsupportedMachineContract(
+                    "fixed-array element type",
+                ))?
+                .alignment;
+            ir.push("  store ")?;
+            render_type(ir, machine, aggregate_ty)?;
+            ir.push(" %v")?;
+            ir.number(u128::from(aggregate.0))?;
+            ir.push(", ptr %s")?;
+            ir.number(u128::from(slot.0))?;
+            ir.push(", align ")?;
+            ir.number(u128::from(alignment))?;
+            ir.push("\n  %t")?;
+            ir.number(u128::from(instruction.id.0))?;
+            ir.push("_array_element = getelementptr inbounds ")?;
+            render_type(ir, machine, aggregate_ty)?;
+            ir.push(", ptr %s")?;
+            ir.number(u128::from(slot.0))?;
+            ir.push(", i64 0, i64 %v")?;
+            ir.number(u128::from(index.0))?;
+            ir.push("\n  %v")?;
+            ir.number(u128::from(result.0))?;
+            ir.push(" = load ")?;
+            render_type(ir, machine, element_ty)?;
+            ir.push(", ptr %t")?;
+            ir.number(u128::from(instruction.id.0))?;
+            ir.push("_array_element, align ")?;
+            ir.number(u128::from(alignment))?;
             ir.push("\n")?;
         }
         MachineOperation::MakeEnum {

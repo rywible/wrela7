@@ -4641,6 +4641,7 @@ fn validate_payload_types(
         check_cancelled(is_cancelled)?;
         if matches!(ty.kind, flow::FlowTypeKind::Array { .. })
             && payload_types.get(ty.id.0 as usize) != Some(&true)
+            && !authenticated_fixed_array_type(input, ty.id, is_cancelled)?
         {
             return Err(unsupported(
                 "an array type outside generated static test payloads",
@@ -4648,6 +4649,126 @@ fn validate_payload_types(
         }
     }
     Ok(())
+}
+
+fn authenticated_fixed_array_type(
+    input: &flow::FlowWir,
+    ty: flow::TypeId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, MachineLowerError> {
+    let Some(record) = input.types.get(ty.0 as usize) else {
+        return Ok(false);
+    };
+    let flow::FlowTypeKind::Array { element, length } = record.kind else {
+        return Ok(false);
+    };
+    if length == 0 || !record.copyable || record.strict_linear {
+        return Ok(false);
+    }
+    let admitted_element = input.types.get(element.0 as usize).is_some_and(|element| {
+        matches!(
+            element.kind,
+            flow::FlowTypeKind::Scalar(flow::ScalarType::Bool)
+                | flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                    signed: true,
+                    bits: 64,
+                })
+        ) && element.copyable
+            && !element.strict_linear
+    });
+    if !admitted_element {
+        return Ok(false);
+    }
+    let mut array_values = 0_u64;
+    let mut constructors = 0_u64;
+    let mut indexes = 0_u64;
+    for function in &input.functions {
+        check_cancelled(is_cancelled)?;
+        let source = matches!(function.origin, flow::FunctionOrigin::SourceSemantic { .. })
+            && function.color == flow::FunctionColor::Sync;
+        for value in &function.values {
+            check_cancelled(is_cancelled)?;
+            if value.ty == ty {
+                if !source {
+                    return Ok(false);
+                }
+                array_values = array_values.saturating_add(1);
+            }
+        }
+        if function.parameters.iter().any(|value| {
+            function
+                .values
+                .get(value.0 as usize)
+                .is_some_and(|value| value.ty == ty)
+        }) || function.result_types.contains(&ty)
+        {
+            return Ok(false);
+        }
+        for block in &function.blocks {
+            check_cancelled(is_cancelled)?;
+            if block.parameters.iter().any(|value| {
+                function
+                    .values
+                    .get(value.0 as usize)
+                    .is_some_and(|value| value.ty == ty)
+            }) {
+                return Ok(false);
+            }
+            for instruction in &block.instructions {
+                check_cancelled(is_cancelled)?;
+                match &instruction.operation {
+                    flow::FlowOperation::MakeAggregate {
+                        ty: constructed,
+                        fields,
+                    } if *constructed == ty => {
+                        let exact = u64::try_from(fields.len()) == Ok(length)
+                            && fields.iter().all(|field| {
+                                flow_value_type(function, *field)
+                                    .is_ok_and(|field| field == element)
+                            })
+                            && matches!(instruction.results.as_slice(), [result]
+                                if flow_value_type(function, *result).is_ok_and(|result| result == ty));
+                        if !source || !exact {
+                            return Ok(false);
+                        }
+                        constructors = constructors.saturating_add(1);
+                    }
+                    flow::FlowOperation::ExtractIndex {
+                        aggregate,
+                        index,
+                        proof,
+                    } if flow_value_type(function, *aggregate).is_ok_and(|base| base == ty) => {
+                        let exact = matches!(instruction.results.as_slice(), [result]
+                                if flow_value_type(function, *result).is_ok_and(|result| result == element))
+                            && flow_value_type(function, *index).is_ok_and(|index| {
+                                input.types.get(index.0 as usize).is_some_and(|record| {
+                                    record.kind
+                                        == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                                            signed: false,
+                                            bits: 64,
+                                        })
+                                })
+                            })
+                            && input.proofs.get(proof.0 as usize).is_some_and(|record| {
+                                record.id == *proof
+                                    && record.kind == flow::ProofKind::CapacityBound
+                                    && record.subject == "inline fixed-array iteration"
+                                    && record.bound == Some(length)
+                                    && record.depends_on.is_empty()
+                                    && !record.sources.is_empty()
+                            })
+                            && function.proofs.binary_search(proof).is_ok();
+                        if !source || !exact {
+                            return Ok(false);
+                        }
+                        indexes = indexes.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(array_values == constructors && constructors > 0 && indexes > 0)
 }
 
 fn validate_test_payload_uses(
@@ -5770,6 +5891,12 @@ fn for_each_flow_operation_value(
             visit(*left);
             visit(*right);
         }
+        flow::FlowOperation::ExtractIndex {
+            aggregate, index, ..
+        } => {
+            visit(*aggregate);
+            visit(*index);
+        }
         flow::FlowOperation::MakeAggregate { fields, .. } => {
             fields.iter().copied().for_each(&mut visit)
         }
@@ -6217,7 +6344,27 @@ fn validate_supported_operation(
                     "an aggregate constructor with mismatched field or result types",
                 ));
             }
-            if let Some(field_type) = flat_u64_struct_field(&input.types, *ty) {
+            if let Some((element, length)) =
+                input
+                    .types
+                    .get(ty.0 as usize)
+                    .and_then(|record| match record.kind {
+                        flow::FlowTypeKind::Array { element, length } if length > 0 => {
+                            Some((element, length))
+                        }
+                        _ => None,
+                    })
+            {
+                if u64::try_from(fields.len()) != Ok(length)
+                    || fields.iter().any(|value| {
+                        !flow_value_type(function, *value).is_ok_and(|ty| ty == element)
+                    })
+                {
+                    return Err(unsupported(
+                        "an array constructor with mismatched element or result types",
+                    ));
+                }
+            } else if let Some(field_type) = flat_u64_struct_field(&input.types, *ty) {
                 let [field] = fields.as_slice() else {
                     return Err(unsupported(
                         "an aggregate constructor with mismatched field or result types",
@@ -6341,6 +6488,46 @@ fn validate_supported_operation(
                 return Err(unsupported(
                     "a field extraction with an invalid field or result type",
                 ));
+            }
+            Ok(())
+        }
+        flow::FlowOperation::ExtractIndex {
+            aggregate,
+            index,
+            proof,
+        } => {
+            let result = require_single_result(instruction)?;
+            let (element, length) = flow_value_type(function, *aggregate)
+                .ok()
+                .and_then(|ty| input.types.get(ty.0 as usize))
+                .and_then(|record| match record.kind {
+                    flow::FlowTypeKind::Array { element, length } if length > 0 => {
+                        Some((element, length))
+                    }
+                    _ => None,
+                })
+                .ok_or(unsupported(
+                    "a fixed-array index without an exact array type",
+                ))?;
+            let index_is_u64 = flow_value_type(function, *index).is_ok_and(|ty| {
+                input.types.get(ty.0 as usize).is_some_and(|record| {
+                    record.kind
+                        == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                            signed: false,
+                            bits: 64,
+                        })
+                })
+            });
+            let proof_matches = input.proofs.get(proof.0 as usize).is_some_and(|record| {
+                record.id == *proof
+                    && record.kind == flow::ProofKind::CapacityBound
+                    && record.subject == "inline fixed-array iteration"
+                    && record.bound == Some(length)
+                    && record.depends_on.is_empty()
+                    && !record.sources.is_empty()
+            }) && function.proofs.binary_search(proof).is_ok();
+            if flow_value_type(function, result)? != element || !index_is_u64 || !proof_matches {
+                return Err(unsupported("an unauthenticated fixed-array index"));
             }
             Ok(())
         }
@@ -6620,6 +6807,28 @@ fn lower_types(
     for ty in &input.types {
         check_cancelled(is_cancelled)?;
         let (kind, size, alignment) = match &ty.kind {
+            flow::FlowTypeKind::Array { element, length } => {
+                let element_record = input
+                    .types
+                    .get(element.0 as usize)
+                    .ok_or(unsupported("an array with an unknown element type"))?;
+                let (_, element_size, element_alignment) =
+                    lower_type_kind(&element_record.kind, limits, is_cancelled)?;
+                let size =
+                    element_size
+                        .checked_mul(*length)
+                        .ok_or(MachineLowerError::LayoutOverflow {
+                            subject: "fixed array".to_owned(),
+                        })?;
+                (
+                    MachineTypeKind::Array {
+                        element: MachineTypeId(element.0),
+                        length: *length,
+                    },
+                    size,
+                    element_alignment,
+                )
+            }
             flow::FlowTypeKind::Function { parameters, result } => lower_passive_function_type(
                 &input.types,
                 parameters,
@@ -7662,6 +7871,19 @@ struct LoweredBlock {
     generated: Vec<MachineBlock>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FixedArraySlotPlan {
+    instruction: flow::InstructionId,
+    slot: StackSlotId,
+}
+
+#[derive(Clone, Copy)]
+struct OperationLoweringContext<'a> {
+    mapping: ValueMapping<'a>,
+    fixed_array_slots: &'a [FixedArraySlotPlan],
+    limits: MachineLoweringLimits,
+}
+
 fn lower_function(
     input: &flow::FlowWir,
     plan: &ScalarPlan,
@@ -7686,6 +7908,121 @@ fn lower_function(
         value_count: function.values.len(),
         first: first_source_value,
     };
+    let has_reply_slot = plan
+        .actor_dispatch
+        .is_some_and(|dispatch| dispatch.reply.is_some() && dispatch.producer.0 == function.id.0);
+    let fixed_array_count = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                flow::FlowOperation::ExtractIndex { .. }
+            )
+        })
+        .count();
+    let stack_slot_capacity = fixed_array_count
+        .checked_add(usize::from(has_reply_slot))
+        .ok_or(MachineLowerError::ResourceLimit {
+            resource: "MachineWir stack slots",
+            limit: limits.stack_slots,
+        })?;
+    let mut stack_slots = try_vec(
+        stack_slot_capacity,
+        "MachineWir stack slots",
+        limits.stack_slots,
+        is_cancelled,
+    )?;
+    let mut stack_bytes = 0_u64;
+    if has_reply_slot {
+        stack_slots.push(StackSlot {
+            id: StackSlotId(0),
+            size: 16,
+            alignment: 8,
+            source_name: Some("actor.reply.slot".to_owned()),
+            live_states: Vec::new(),
+            overlay_group: None,
+        });
+        stack_bytes = 16;
+    }
+    let mut fixed_array_slots = try_vec(
+        fixed_array_count,
+        "MachineWir fixed-array stack-slot map",
+        limits.model_edges,
+        is_cancelled,
+    )?;
+    for block in &function.blocks {
+        check_cancelled(is_cancelled)?;
+        for instruction in &block.instructions {
+            check_cancelled(is_cancelled)?;
+            let flow::FlowOperation::ExtractIndex { aggregate, .. } = instruction.operation else {
+                continue;
+            };
+            let array_ty = flow_value_type(function, aggregate)?;
+            let (element, length) = input
+                .types
+                .get(array_ty.0 as usize)
+                .and_then(|record| match record.kind {
+                    flow::FlowTypeKind::Array { element, length } if length > 0 => {
+                        Some((element, length))
+                    }
+                    _ => None,
+                })
+                .ok_or(unsupported("a fixed-array index without exact storage"))?;
+            let element_record = input
+                .types
+                .get(element.0 as usize)
+                .ok_or(unsupported("a fixed array with an unknown element type"))?;
+            let (_, element_size, element_alignment) =
+                lower_type_kind(&element_record.kind, limits, is_cancelled)?;
+            let size =
+                element_size
+                    .checked_mul(length)
+                    .ok_or(MachineLowerError::LayoutOverflow {
+                        subject: "fixed-array index storage".to_owned(),
+                    })?;
+            let alignment = u64::from(element_alignment);
+            stack_bytes = stack_bytes
+                .checked_add(alignment - 1)
+                .map(|bytes| bytes & !(alignment - 1))
+                .and_then(|bytes| bytes.checked_add(size))
+                .ok_or(MachineLowerError::LayoutOverflow {
+                    subject: "fixed-array function stack".to_owned(),
+                })?;
+            let slot = StackSlotId(u32::try_from(stack_slots.len()).map_err(|_| {
+                MachineLowerError::ResourceLimit {
+                    resource: "MachineWir stack slots",
+                    limit: limits.stack_slots,
+                }
+            })?);
+            stack_slots.push(StackSlot {
+                id: slot,
+                size,
+                alignment: element_alignment,
+                source_name: Some("fixed-array.index.storage".to_owned()),
+                live_states: Vec::new(),
+                overlay_group: None,
+            });
+            fixed_array_slots.push(FixedArraySlotPlan {
+                instruction: instruction.id,
+                slot,
+            });
+        }
+    }
+    let stack_alignment = 16_u64;
+    stack_bytes = stack_bytes
+        .checked_add(stack_alignment - 1)
+        .map(|bytes| bytes & !(stack_alignment - 1))
+        .ok_or(MachineLowerError::LayoutOverflow {
+            subject: "fixed-array function stack".to_owned(),
+        })?;
+    if stack_bytes > limits.stack_bytes_per_function {
+        return Err(MachineLowerError::ResourceLimit {
+            resource: "MachineWir stack bytes per function",
+            limit: limits.stack_bytes_per_function,
+        });
+    }
     let return_count = if entry {
         count_return_blocks(function, is_cancelled)?
     } else {
@@ -7847,6 +8184,7 @@ fn lower_function(
             &mut status_cursor,
             &mut instruction_cursor,
             &mut next_block,
+            &fixed_array_slots,
             limits,
             is_cancelled,
         )?;
@@ -8012,29 +8350,10 @@ fn lower_function(
         result,
         proofs,
         values,
-        stack_slots: if plan.actor_dispatch.is_some_and(|dispatch| {
-            dispatch.reply.is_some() && dispatch.producer.0 == function.id.0
-        }) {
-            vec![StackSlot {
-                id: StackSlotId(0),
-                size: 16,
-                alignment: 8,
-                source_name: Some("actor.reply.slot".to_owned()),
-                live_states: Vec::new(),
-                overlay_group: None,
-            }]
-        } else {
-            Vec::new()
-        },
+        stack_slots,
         blocks,
         entry: machine_entry,
-        stack_bytes: if plan.actor_dispatch.is_some_and(|dispatch| {
-            dispatch.reply.is_some() && dispatch.producer.0 == function.id.0
-        }) {
-            16
-        } else {
-            0
-        },
+        stack_bytes,
         source: function.source,
     })
 }
@@ -8113,6 +8432,7 @@ fn lower_block(
     status_cursor: &mut u32,
     instruction_cursor: &mut u32,
     block_cursor: &mut u32,
+    fixed_array_slots: &[FixedArraySlotPlan],
     limits: MachineLoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<LoweredBlock, MachineLowerError> {
@@ -8322,8 +8642,11 @@ fn lower_block(
             plan,
             function,
             instruction,
-            mapping,
-            limits,
+            OperationLoweringContext {
+                mapping,
+                fixed_array_slots,
+                limits,
+            },
             is_cancelled,
         )? {
             let results = match &instruction.operation {
@@ -8453,10 +8776,14 @@ fn lower_operation(
     plan: &ScalarPlan,
     function: &flow::FlowFunction,
     instruction: &flow::Instruction,
-    mapping: ValueMapping<'_>,
-    limits: MachineLoweringLimits,
+    context: OperationLoweringContext<'_>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Option<MachineOperation>, MachineLowerError> {
+    let OperationLoweringContext {
+        mapping,
+        fixed_array_slots,
+        limits,
+    } = context;
     check_cancelled(is_cancelled)?;
     if erases_unit_definition(input, function, instruction)? {
         return Ok(None);
@@ -8549,7 +8876,41 @@ fn lower_operation(
                     "an aggregate constructor with a mismatched result type",
                 ));
             }
-            if let Some(field_type) = flat_u64_struct_field(&input.types, *ty) {
+            if let Some((element, length)) =
+                input
+                    .types
+                    .get(ty.0 as usize)
+                    .and_then(|record| match record.kind {
+                        flow::FlowTypeKind::Array { element, length } if length > 0 => {
+                            Some((element, length))
+                        }
+                        _ => None,
+                    })
+            {
+                if u64::try_from(fields.len()) != Ok(length)
+                    || fields.iter().any(|value| {
+                        !flow_value_type(function, *value).is_ok_and(|ty| ty == element)
+                    })
+                {
+                    return Err(unsupported(
+                        "an array constructor with mismatched element or result types",
+                    ));
+                }
+                let mut elements = try_vec(
+                    fields.len(),
+                    "MachineWir model edges",
+                    limits.model_edges,
+                    is_cancelled,
+                )?;
+                for element in fields {
+                    check_cancelled(is_cancelled)?;
+                    elements.push(map_value(*element, mapping)?);
+                }
+                MachineOperation::MakeArray {
+                    ty: MachineTypeId(ty.0),
+                    elements,
+                }
+            } else if let Some(field_type) = flat_u64_struct_field(&input.types, *ty) {
                 let [field] = fields.as_slice() else {
                     return Err(unsupported(
                         "an aggregate constructor without exactly one field value",
@@ -8666,6 +9027,60 @@ fn lower_operation(
                     aggregate: map_value(*aggregate, mapping)?,
                     field: *field,
                 }
+            }
+        }
+        flow::FlowOperation::ExtractIndex {
+            aggregate,
+            index,
+            proof,
+        } => {
+            let result = require_single_result(instruction)?;
+            let (element, length) = flow_value_type(function, *aggregate)
+                .ok()
+                .and_then(|ty| input.types.get(ty.0 as usize))
+                .and_then(|record| match record.kind {
+                    flow::FlowTypeKind::Array { element, length } if length > 0 => {
+                        Some((element, length))
+                    }
+                    _ => None,
+                })
+                .ok_or(unsupported(
+                    "a fixed-array index without an exact array type",
+                ))?;
+            let proof_matches = input.proofs.get(proof.0 as usize).is_some_and(|record| {
+                record.id == *proof
+                    && record.kind == flow::ProofKind::CapacityBound
+                    && record.subject == "inline fixed-array iteration"
+                    && record.bound == Some(length)
+                    && record.depends_on.is_empty()
+                    && !record.sources.is_empty()
+            }) && function.proofs.binary_search(proof).is_ok();
+            if flow_value_type(function, result)? != element
+                || input
+                    .types
+                    .get(flow_value_type(function, *index)?.0 as usize)
+                    .is_none_or(|record| {
+                        record.kind
+                            != flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                                signed: false,
+                                bits: 64,
+                            })
+                    })
+                || !proof_matches
+            {
+                return Err(unsupported("an unauthenticated fixed-array index"));
+            }
+            MachineOperation::ExtractIndex {
+                aggregate: map_value(*aggregate, mapping)?,
+                index: map_value(*index, mapping)?,
+                proof: ProofId(proof.0),
+                slot: fixed_array_slots
+                    .iter()
+                    .find(|plan| plan.instruction == instruction.id)
+                    .map(|plan| plan.slot)
+                    .ok_or(unsupported(
+                        "a fixed-array index without exact stack storage",
+                    ))?,
             }
         }
         flow::FlowOperation::Select {

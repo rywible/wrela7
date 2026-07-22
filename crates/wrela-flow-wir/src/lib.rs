@@ -13,7 +13,7 @@ use wrela_source::Span;
 
 pub use wrela_test_model::TestPlanLimits;
 
-pub const FLOW_WIR_VERSION: u32 = 16;
+pub const FLOW_WIR_VERSION: u32 = 17;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 12;
 
@@ -262,6 +262,13 @@ pub enum FlowOperation {
     ExtractField {
         aggregate: ValueId,
         field: u32,
+    },
+    /// Extract one element from an exact fixed array. The capacity proof binds
+    /// the generated index protocol to the array's authenticated extent.
+    ExtractIndex {
+        aggregate: ValueId,
+        index: ValueId,
+        proof: ProofId,
     },
     InsertField {
         aggregate: ValueId,
@@ -1385,6 +1392,7 @@ fn meter_operation(
         | FlowOperation::EnumTag { .. }
         | FlowOperation::EnumPayload { .. }
         | FlowOperation::ExtractField { .. }
+        | FlowOperation::ExtractIndex { .. }
         | FlowOperation::InsertField { .. }
         | FlowOperation::Select { .. }
         | FlowOperation::BeginAccess { .. }
@@ -4765,6 +4773,12 @@ fn for_each_flow_operation_value(operation: &FlowOperation, mut visit: impl FnMu
             visit(*left);
             visit(*right);
         }
+        FlowOperation::ExtractIndex {
+            aggregate, index, ..
+        } => {
+            visit(*aggregate);
+            visit(*index);
+        }
         FlowOperation::MakeAggregate { fields, .. } => {
             for field in fields {
                 visit(*field);
@@ -5596,6 +5610,56 @@ fn validate_operation(
             }
         }
         FlowOperation::ExtractField { aggregate, .. } => value!(*aggregate),
+        FlowOperation::ExtractIndex {
+            aggregate,
+            index,
+            proof: capacity,
+        } => {
+            value!(*aggregate);
+            value!(*index);
+            proof!(*capacity);
+            let valid = function
+                .values
+                .get(aggregate.0 as usize)
+                .and_then(|aggregate| {
+                    module
+                        .types
+                        .get(aggregate.ty.0 as usize)
+                        .and_then(|record| match record.kind {
+                            FlowTypeKind::Array { element, length } if length > 0 => {
+                                Some((element, length))
+                            }
+                            _ => None,
+                        })
+                })
+                .is_some_and(|(element, length)| {
+                    function.values.get(index.0 as usize).is_some_and(|index| {
+                        module.types.get(index.ty.0 as usize).is_some_and(|record| {
+                            record.kind
+                                == FlowTypeKind::Scalar(ScalarType::Integer {
+                                    signed: false,
+                                    bits: 64,
+                                })
+                        })
+                    }) && module.proofs.get(capacity.0 as usize).is_some_and(|proof| {
+                        proof.id == *capacity
+                            && proof.kind == ProofKind::CapacityBound
+                            && proof.subject == "inline fixed-array iteration"
+                            && proof.bound == Some(length)
+                            && proof.depends_on.is_empty()
+                            && !proof.sources.is_empty()
+                    }) && function.proofs.binary_search(capacity).is_ok()
+                        && matches!(instruction.results.as_slice(), [result]
+                            if function.values.get(result.0 as usize)
+                                .is_some_and(|result| result.ty == element))
+                });
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "fixed-array index",
+                    id: instruction.id.0,
+                });
+            }
+        }
         FlowOperation::InsertField {
             aggregate,
             field,

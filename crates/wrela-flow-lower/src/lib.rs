@@ -3246,10 +3246,46 @@ fn validate_scalar_source_function(
                             return Err(unsupported("scalar call results"));
                         }
                     }
-                    semantic::SemanticOperation::Index { .. } => {
-                        return Err(unsupported(
-                            "flow-fixed-array-index-lowering-pending (indexed aggregate extraction has no authenticated FlowWir operation)",
-                        ));
+                    semantic::SemanticOperation::Index { base, index, proof } => {
+                        let [result] = statement.results.as_slice() else {
+                            return Err(unsupported("fixed-array index result arity"));
+                        };
+                        let (element, length) = scalar_value_type(function, *base)
+                            .and_then(|ty| input.types.get(ty.0 as usize))
+                            .and_then(|record| match record.kind {
+                                semantic::TypeKind::Array { element, length }
+                                    if length > 0
+                                        && matches!(
+                                            scalar_primitive(input, element),
+                                            Some(
+                                                semantic::PrimitiveType::Bool
+                                                    | semantic::PrimitiveType::I64
+                                            )
+                                        ) =>
+                                {
+                                    Some((element, length))
+                                }
+                                _ => None,
+                            })
+                            .ok_or(unsupported("fixed-array index base"))?;
+                        let index_is_u64 = scalar_value_type(function, *index).is_some_and(|ty| {
+                            semantic_type_is(input, ty, semantic::PrimitiveType::U64)
+                        });
+                        let proof_matches =
+                            input.proofs.get(proof.0 as usize).is_some_and(|record| {
+                                record.id == *proof
+                                    && record.kind == semantic::ProofKind::CapacityBound
+                                    && record.subject == "inline fixed-array iteration"
+                                    && record.bound == Some(length)
+                                    && record.depends_on.is_empty()
+                                    && !record.sources.is_empty()
+                            }) && function.proofs.binary_search(proof).is_ok();
+                        if scalar_value_type(function, *result) != Some(element)
+                            || !index_is_u64
+                            || !proof_matches
+                        {
+                            return Err(unsupported("fixed-array index authentication"));
+                        }
                     }
                     _ => return Err(unsupported("non-scalar source operation")),
                 },
@@ -7332,9 +7368,13 @@ fn lower_generated_operation(
                 },
             })
         }
-        semantic::SemanticOperation::Index { .. } => Err(unsupported(
-            "flow-fixed-array-index-lowering-pending (indexed aggregate extraction has no authenticated FlowWir operation)",
-        )),
+        semantic::SemanticOperation::Index { base, index, proof } => {
+            Ok(flow::FlowOperation::ExtractIndex {
+                aggregate: flow::ValueId(base.0),
+                index: flow::ValueId(index.0),
+                proof: flow::ProofId(proof.0),
+            })
+        }
         semantic::SemanticOperation::Constant(
             semantic::Constant::Enum { .. }
             | semantic::Constant::Aggregate(_)
@@ -7875,6 +7915,7 @@ fn validate_model_resources(
                     | FlowOperation::EnumTag { .. }
                     | FlowOperation::EnumPayload { .. }
                     | FlowOperation::ExtractField { .. }
+                    | FlowOperation::ExtractIndex { .. }
                     | FlowOperation::InsertField { .. }
                     | FlowOperation::Select { .. }
                     | FlowOperation::BeginAccess { .. }
@@ -15671,9 +15712,9 @@ mod contract_tests {
     }
 
     #[test]
-    fn fixed_array_index_stops_at_its_named_flow_boundary() {
+    fn fixed_array_index_maps_capacity_authority_exactly() {
         let input = fixture();
-        assert!(matches!(
+        assert_eq!(
             lower_generated_operation(
                 input.as_wir(),
                 &semantic::SemanticOperation::Index {
@@ -15683,10 +15724,13 @@ mod contract_tests {
                 },
                 LoweringLimits::standard(),
                 &|| false,
-            ),
-            Err(LowerError::UnsupportedInput {
-                feature: "flow-fixed-array-index-lowering-pending (indexed aggregate extraction has no authenticated FlowWir operation)",
-            })
-        ));
+            )
+            .expect("fixed-array index operation lowering"),
+            flow::FlowOperation::ExtractIndex {
+                aggregate: flow::ValueId(0),
+                index: flow::ValueId(0),
+                proof: flow::ProofId(0),
+            }
+        );
     }
 }
