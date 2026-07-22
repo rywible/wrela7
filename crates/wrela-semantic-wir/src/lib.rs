@@ -16,7 +16,7 @@ pub use wrela_test_model::{
     TestDescriptor, TestId as ModelTestId, TestKind as ModelTestKind,
 };
 
-pub const SEMANTIC_WIR_VERSION: u32 = 11;
+pub const SEMANTIC_WIR_VERSION: u32 = 12;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 
 macro_rules! id_type {
@@ -404,6 +404,23 @@ pub enum SemanticOperation {
         reservation: ValueId,
         arguments: Vec<Argument>,
     },
+    /// Execute the exact single-flight same-core request protocol and produce
+    /// its typed u64 outcome. The reply proof authenticates one caller/callee
+    /// pair and one finite reply slot; broader payloads and concurrency stay
+    /// fail-closed in lowering.
+    ActorReplyRequest {
+        actor: ActorId,
+        method: FunctionId,
+        permit_proof: ProofId,
+        reply_proof: ProofId,
+    },
+    /// Resolve the sole reply from the actor turn before its normal return.
+    /// The backend may fuse this with the direct same-core caller transition,
+    /// but must preserve exactly-once state ordering.
+    ActorReplyResolve {
+        outcome: ValueId,
+        reply_proof: ProofId,
+    },
     /// Dequeue the next message for an actor turn. Unit messages produce no
     /// value; the concrete method identity prevents dispatch substitution.
     MailboxReceive {
@@ -762,6 +779,7 @@ pub enum ProofKind {
     ViewDoesNotEscape,
     RegionBound,
     CapacityBound,
+    ActorReplyExactlyOnce,
     WaitGraphAcyclic,
     CleanupAcyclic,
     WorkBound,
@@ -1249,6 +1267,8 @@ fn validate_model_resources(
                             | SemanticOperation::Drop { .. }
                             | SemanticOperation::ActorCapability { .. }
                             | SemanticOperation::ActorReserve { .. }
+                            | SemanticOperation::ActorReplyRequest { .. }
+                            | SemanticOperation::ActorReplyResolve { .. }
                             | SemanticOperation::MailboxReceive { .. }
                             | SemanticOperation::ActorSend { .. }
                             | SemanticOperation::ActorTrySend { .. }
@@ -3555,6 +3575,117 @@ fn validate_operation(
                 argument!(item);
             }
         }
+        SemanticOperation::ActorReplyRequest {
+            actor,
+            method,
+            permit_proof,
+            reply_proof,
+        } => {
+            require_id("actor reply target", actor.0, module.actors.len(), errors);
+            require_id(
+                "actor reply method",
+                method.0,
+                module.functions.len(),
+                errors,
+            );
+            require_id(
+                "actor reply permit",
+                permit_proof.0,
+                module.proofs.len(),
+                errors,
+            );
+            require_id(
+                "actor reply proof",
+                reply_proof.0,
+                module.proofs.len(),
+                errors,
+            );
+            let valid = matches!(results, [result]
+            if function.values.get(result.0 as usize).is_some_and(|value| {
+                module.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                    ty.kind == TypeKind::Primitive(PrimitiveType::U64)
+                        && ty.linearity == Linearity::CopyScalar
+                })
+            })) && module
+                .functions
+                .get(method.0 as usize)
+                .is_some_and(|target| {
+                    target.role == FunctionRole::ActorTurn(*actor)
+                        && target.color == FunctionColor::Async
+                        && module
+                            .types
+                            .get(target.result.0 as usize)
+                            .is_some_and(|ty| ty.kind == TypeKind::Primitive(PrimitiveType::U64))
+                })
+                && module
+                    .proofs
+                    .get(permit_proof.0 as usize)
+                    .is_some_and(|proof| {
+                        proof.kind == ProofKind::CapacityBound && proof.bound == Some(1)
+                    })
+                && module
+                    .proofs
+                    .get(reply_proof.0 as usize)
+                    .is_some_and(|proof| {
+                        let target_type_proof =
+                            module.functions.get(method.0 as usize).and_then(|target| {
+                                target.proofs.iter().copied().find(|candidate| {
+                                    module
+                                        .proofs
+                                        .get(candidate.0 as usize)
+                                        .is_some_and(|record| record.kind == ProofKind::TypeChecked)
+                                })
+                            });
+                        let mut expected =
+                            target_type_proof.map(|type_proof| [type_proof, *permit_proof]);
+                        if let Some(expected) = &mut expected {
+                            expected.sort_unstable();
+                        }
+                        proof.kind == ProofKind::ActorReplyExactlyOnce
+                            && proof.bound == Some(1)
+                            && expected.is_some_and(|expected| proof.depends_on == expected)
+                    });
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "actor reply request",
+                    id: method.0,
+                });
+            }
+        }
+        SemanticOperation::ActorReplyResolve {
+            outcome,
+            reply_proof,
+        } => {
+            value!(*outcome);
+            require_id(
+                "actor reply resolve proof",
+                reply_proof.0,
+                module.proofs.len(),
+                errors,
+            );
+            let valid = results.is_empty()
+                && function
+                    .values
+                    .get(outcome.0 as usize)
+                    .is_some_and(|value| {
+                        module
+                            .types
+                            .get(value.ty.0 as usize)
+                            .is_some_and(|ty| ty.kind == TypeKind::Primitive(PrimitiveType::U64))
+                    })
+                && module
+                    .proofs
+                    .get(reply_proof.0 as usize)
+                    .is_some_and(|proof| {
+                        proof.kind == ProofKind::ActorReplyExactlyOnce && proof.bound == Some(1)
+                    });
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "actor reply resolve",
+                    id: reply_proof.0,
+                });
+            }
+        }
         SemanticOperation::MailboxReceive { actor, method } => {
             require_id(
                 "mailbox receive actor",
@@ -4890,7 +5021,7 @@ mod tests {
         closed_enum_fixture(256)
             .validate()
             .expect("256-variant enum");
-        for rejected in [10, 12] {
+        for rejected in [11, 13] {
             let mut wrong_version = closed_enum_fixture(2);
             wrong_version.version = rejected;
             assert!(wrong_version.validate().is_err());

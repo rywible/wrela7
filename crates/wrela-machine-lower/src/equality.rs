@@ -607,6 +607,47 @@ fn operation_equal(
                 && left_failure == right_failure
         }
         (
+            MachineOperation::ActorReplyRequest {
+                slot: left_slot,
+                mailbox: left_mailbox,
+                actor: left_actor,
+                method: left_method,
+                permit: left_permit,
+                reply: left_reply,
+                failure: left_failure,
+                duplicate_failure: left_duplicate,
+            },
+            MachineOperation::ActorReplyRequest {
+                slot: right_slot,
+                mailbox: right_mailbox,
+                actor: right_actor,
+                method: right_method,
+                permit: right_permit,
+                reply: right_reply,
+                failure: right_failure,
+                duplicate_failure: right_duplicate,
+            },
+        ) => {
+            left_slot == right_slot
+                && left_mailbox == right_mailbox
+                && left_actor == right_actor
+                && left_method == right_method
+                && left_permit == right_permit
+                && left_reply == right_reply
+                && left_failure == right_failure
+                && left_duplicate == right_duplicate
+        }
+        (
+            MachineOperation::ActorReplyResolve {
+                outcome: left_outcome,
+                reply: left_reply,
+            },
+            MachineOperation::ActorReplyResolve {
+                outcome: right_outcome,
+                reply: right_reply,
+            },
+        ) => left_outcome == right_outcome && left_reply == right_reply,
+        (
             MachineOperation::ActorCommit {
                 reservation: left_reservation,
                 mailbox: left_mailbox,

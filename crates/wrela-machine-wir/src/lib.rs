@@ -19,7 +19,7 @@ use wrela_target::{InterruptDomain, TargetError, TargetPackage};
 use wrela_test_model::{GuestTestOutcome, TestEvent, TestEventKind, TestId};
 use wrela_test_protocol::{CanonicalTestEventCodec, ProtocolLimits, TestEventCodec};
 
-pub const MACHINE_WIR_VERSION: u32 = 14;
+pub const MACHINE_WIR_VERSION: u32 = 15;
 pub const REGION_STORAGE_SECTION_PREFIX: &str = ".data$wrela$region$";
 pub const REGION_STORAGE_SYMBOL_PREFIX: &str = "__wrela_region_storage_";
 
@@ -364,6 +364,8 @@ pub enum ScalarFailureKind {
     Conversion,
     ActorMailboxFull,
     ActorMailboxMismatch,
+    ActorReplyStateMismatch,
+    ActorReplyDuplicateResolve,
 }
 
 impl ScalarFailureKind {
@@ -377,6 +379,8 @@ impl ScalarFailureKind {
             Self::Conversion => RuntimeFatalCode::Conversion,
             Self::ActorMailboxFull => RuntimeFatalCode::ActorMailboxFull,
             Self::ActorMailboxMismatch => RuntimeFatalCode::ActorMailboxMismatch,
+            Self::ActorReplyStateMismatch => RuntimeFatalCode::ActorReplyStateMismatch,
+            Self::ActorReplyDuplicateResolve => RuntimeFatalCode::ActorReplyDuplicateResolve,
         }
     }
 }
@@ -549,6 +553,27 @@ pub enum MachineOperation {
         mailbox: GlobalId,
         actor: u32,
         method: FunctionId,
+    },
+    /// Execute the exact single-flight same-core reply protocol using one
+    /// statically allocated 16-byte caller-frame slot. The backend performs
+    /// Empty→Pending→Writing→Resolved→Consumed, dispatches the exact mailbox
+    /// tag once, and returns the u64 outcome.
+    ActorReplyRequest {
+        slot: StackSlotId,
+        mailbox: GlobalId,
+        actor: u32,
+        method: FunctionId,
+        permit: ProofId,
+        reply: ProofId,
+        failure: ScalarFailureProvenance,
+        duplicate_failure: ScalarFailureProvenance,
+    },
+    /// Callee-side exactly-once resolve marker. The same-core backend fuses
+    /// the physical slot write into the direct caller transition after this
+    /// result returns, while preserving the authenticated proof and outcome.
+    ActorReplyResolve {
+        outcome: ValueId,
+        reply: ProofId,
     },
     /// Consume the exact unit-message tag at the beginning of its actor turn.
     /// An absent or substituted tag abandons with source-aware provenance.
@@ -739,7 +764,7 @@ pub struct MachineFunction {
     pub source: Option<Span>,
 }
 
-/// The only scheduler ownership admitted by MachineWir v14. An actor turn is
+/// The only scheduler ownership admitted by MachineWir v15. An actor turn is
 /// compiled but remains dormant until a real mailbox admission operation
 /// exists; a single-slot static task is invoked exactly once during startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -773,7 +798,7 @@ pub enum MachineActivationCancellation {
     DropCalleeThenPropagate,
 }
 
-/// Exact machine-consumer join for one FlowWir v13 immediate activation.
+/// Exact machine-consumer join for one FlowWir v14 immediate activation.
 ///
 /// The current closed subset lowers an ordinary async helper that is proven
 /// to return without another suspension into a private direct call followed
@@ -811,7 +836,7 @@ pub enum MachineRegionStorageKind {
         actor: u32,
         mailbox_capacity: u32,
     },
-    /// Canonical, actor-owned persistent state cell. MachineWir v14 admits
+    /// Canonical, actor-owned persistent state cell. MachineWir v15 admits
     /// exactly one zero-initialized `u64` cell for a stateful actor; richer
     /// state layouts remain outside this closed representation.
     ActorState {
@@ -915,6 +940,7 @@ pub enum BackendProofKind {
     ViewDoesNotEscape,
     RegionBound,
     CapacityBound,
+    ActorReplyExactlyOnce,
     WaitGraphAcyclic,
     CleanupAcyclic,
     WorkBound,
@@ -1525,7 +1551,9 @@ fn meter_operation(
             Ok(1)
         }
         MachineOperation::ActorCommit { .. } => Ok(1),
+        MachineOperation::ActorReplyResolve { .. } => Ok(1),
         MachineOperation::ActorReserve { .. }
+        | MachineOperation::ActorReplyRequest { .. }
         | MachineOperation::MailboxReceive { .. }
         | MachineOperation::MailboxDispatch { .. } => Ok(0),
         MachineOperation::Arithmetic { .. }
@@ -2945,6 +2973,8 @@ fn validate_actor_message_contract(module: &MachineWir, errors: &mut ValidationC
         return;
     };
     let mut dispatch = None;
+    let mut reply_request = None;
+    let mut reply_resolve = None;
 
     for function in &module.functions {
         if !errors.poll() {
@@ -3125,10 +3155,145 @@ fn validate_actor_message_contract(module: &MachineWir, errors: &mut ValidationC
                             });
                         }
                     }
+                    MachineOperation::ActorReplyRequest {
+                        slot,
+                        mailbox,
+                        actor,
+                        method,
+                        permit,
+                        reply,
+                        failure,
+                        duplicate_failure,
+                    } => {
+                        let fixed = instruction.results.len() == 1
+                            && matches!(function.role, MachineFunctionRole::TaskEntry(_))
+                            && instruction.source.is_some()
+                            && failure.kind == ScalarFailureKind::ActorReplyStateMismatch
+                            && duplicate_failure.kind
+                                == ScalarFailureKind::ActorReplyDuplicateResolve
+                            && failure.flow_function == function.flow_function
+                            && duplicate_failure.flow_function == function.flow_function
+                            && failure.flow_instruction == instruction.id.0
+                            && duplicate_failure.flow_instruction == instruction.id.0
+                            && function
+                                .stack_slots
+                                .get(slot.0 as usize)
+                                .is_some_and(|slot| slot.size == 16 && slot.alignment == 8);
+                        if !fixed
+                            || reply_request
+                                .replace((
+                                    function.id,
+                                    *mailbox,
+                                    *actor,
+                                    *method,
+                                    *permit,
+                                    *reply,
+                                    instruction.source,
+                                ))
+                                .is_some()
+                        {
+                            errors.push(ValidationError::InvalidRecord {
+                                kind: "actor reply request contract",
+                                id: instruction.id.0,
+                            });
+                        }
+                    }
+                    MachineOperation::ActorReplyResolve { outcome, reply } => {
+                        let fixed = instruction.results.is_empty()
+                            && matches!(function.role, MachineFunctionRole::ActorTurn(_))
+                            && function
+                                .values
+                                .get(outcome.0 as usize)
+                                .is_some_and(|value| {
+                                    module.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                                        ty.kind == MachineTypeKind::Integer { bits: 64 }
+                                    })
+                                });
+                        if !fixed || reply_resolve.replace((function.id, *reply)).is_some() {
+                            errors.push(ValidationError::InvalidRecord {
+                                kind: "actor reply resolve contract",
+                                id: instruction.id.0,
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
         }
+    }
+
+    if let Some((producer, mailbox, actor, method, permit, reply, source)) = reply_request {
+        let startup_calls_producer = startup_success
+            .and_then(|success| {
+                module
+                    .functions
+                    .get(module.image_entry.0 as usize)
+                    .and_then(|entry| entry.blocks.get(success.0 as usize))
+            })
+            .is_some_and(|block| {
+                matches!(block.instructions.first(), Some(MachineInstruction {
+                    results,
+                    operation: MachineOperation::Call {
+                        function,
+                        arguments,
+                        convention: CallingConvention::Internal,
+                    },
+                    source: None,
+                    ..
+                }) if results.is_empty() && arguments.is_empty() && *function == producer)
+            });
+        let storage_matches = module.region_storage.iter().any(|storage| {
+            storage.global == mailbox
+                && storage.kind
+                    == MachineRegionStorageKind::ActorMailbox {
+                        actor,
+                        mailbox_capacity: 1,
+                    }
+                && storage.capacity_bytes == 16
+                && storage.alignment == 8
+        });
+        let permit_matches = module.proofs.get(permit.0 as usize).is_some_and(|proof| {
+            proof.kind == BackendProofKind::CapacityBound
+                && proof.bound == Some(1)
+                && proof.source == source
+        });
+        let reply_matches = module.proofs.get(reply.0 as usize).is_some_and(|proof| {
+            proof.kind == BackendProofKind::ActorReplyExactlyOnce
+                && proof.bound == Some(1)
+                && proof.depends_on.contains(&permit)
+                && proof.source == source
+        });
+        let target_matches = module
+            .functions
+            .get(method.0 as usize)
+            .is_some_and(|target| {
+                target.role == MachineFunctionRole::ActorTurn(actor)
+                    && target.parameters.is_empty()
+                    && module
+                        .types
+                        .get(target.result.0 as usize)
+                        .is_some_and(|ty| ty.kind == MachineTypeKind::Integer { bits: 64 })
+            });
+        if reserve_count != 0
+            || commit_count != 0
+            || receive_count != 1
+            || dispatch_count != 0
+            || receives.first().is_none_or(|receive| {
+                receive.mailbox != mailbox || receive.actor != actor || receive.method != method
+            })
+            || reply_resolve != Some((method, reply))
+            || !startup_calls_producer
+            || !storage_matches
+            || !permit_matches
+            || !reply_matches
+            || !target_matches
+        {
+            errors.push(ValidationError::InvalidRecord {
+                kind: "actor reply message contract",
+                id: 0,
+            });
+        }
+        return;
     }
 
     if reserve_count == 0 && commit_count == 0 && receive_count == 0 && dispatch_count == 0 {
@@ -3601,7 +3766,16 @@ fn validate_activations(module: &MachineWir, errors: &mut ValidationContext<'_>)
             MachineFunctionRole::ActorTurn(_) | MachineFunctionRole::TaskEntry(_)
         );
         let count = caller_counts.get(index).copied().unwrap_or(0);
-        if activation_role != (count == 1) {
+        let reply_role = function.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction.operation,
+                    MachineOperation::ActorReplyRequest { .. }
+                        | MachineOperation::ActorReplyResolve { .. }
+                )
+            })
+        });
+        if activation_role != (count == 1 || reply_role) {
             errors.push(ValidationError::InvalidRecord {
                 kind: "activation caller set",
                 id: function.id.0,
@@ -3611,7 +3785,17 @@ fn validate_activations(module: &MachineWir, errors: &mut ValidationContext<'_>)
 }
 
 fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'_>) {
-    if module.activations.is_empty() {
+    let reply_profile = module.functions.iter().any(|function| {
+        function.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction.operation,
+                    MachineOperation::ActorReplyRequest { .. }
+                )
+            })
+        })
+    });
+    if module.activations.is_empty() && !reply_profile {
         for storage in &module.region_storage {
             if !errors.poll() {
                 return;
@@ -3621,15 +3805,16 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
         return;
     }
 
-    let cross_actor = module.activations.iter().any(|activation| {
-        matches!(
-            activation.owner,
-            MachineActivationOwner::Task {
-                supervisor: Some(1),
-                ..
-            }
-        ) && activation.schedule == MachineActivationSchedule::StartupOnce
-    });
+    let cross_actor = reply_profile
+        || module.activations.iter().any(|activation| {
+            matches!(
+                activation.owner,
+                MachineActivationOwner::Task {
+                    supervisor: Some(1),
+                    ..
+                }
+            ) && activation.schedule == MachineActivationSchedule::StartupOnce
+        });
     let actor_state_count = module
         .region_storage
         .iter()
@@ -3833,7 +4018,8 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                                 actor,
                                 mailbox_capacity,
                             })
-                    }) || (cross_actor && actor == 1 && mailbox_capacity == 1))
+                    }) || (cross_actor && actor == 1 && mailbox_capacity == 1)
+                        || (reply_profile && matches!(actor, 0 | 1) && mailbox_capacity == 1))
             }
             MachineRegionStorageKind::ActorState { actor } => {
                 state_count = state_count.saturating_add(1);
@@ -3869,14 +4055,27 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                         .is_some_and(|function| {
                             function.role == MachineFunctionRole::ActorTurn(actor)
                         })
-                    && module.activations.iter().any(|activation| {
+                    && (module.activations.iter().any(|activation| {
                         matches!(
                             activation.schedule,
                             MachineActivationSchedule::DormantMailbox
                                 | MachineActivationSchedule::MailboxOnce
                                 | MachineActivationSchedule::SchedulerFifo
                         ) && activation.caller == function
-                    })
+                    }) || (reply_profile
+                        && module
+                            .functions
+                            .get(function.0 as usize)
+                            .is_some_and(|function| {
+                                function.blocks.iter().any(|block| {
+                                    block.instructions.iter().any(|instruction| {
+                                        matches!(
+                                            instruction.operation,
+                                            MachineOperation::ActorReplyResolve { .. }
+                                        )
+                                    })
+                                })
+                            })))
             }
             MachineRegionStorageKind::TaskEntryFrame {
                 task,
@@ -3895,10 +4094,23 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                         .is_some_and(|function| {
                             function.role == MachineFunctionRole::TaskEntry(task)
                         })
-                    && module.activations.iter().any(|activation| {
+                    && (module.activations.iter().any(|activation| {
                         activation.schedule == MachineActivationSchedule::StartupOnce
                             && activation.caller == function
-                    })
+                    }) || (reply_profile
+                        && module
+                            .functions
+                            .get(function.0 as usize)
+                            .is_some_and(|function| {
+                                function.blocks.iter().any(|block| {
+                                    block.instructions.iter().any(|instruction| {
+                                        matches!(
+                                            instruction.operation,
+                                            MachineOperation::ActorReplyRequest { .. }
+                                        )
+                                    })
+                                })
+                            })))
             }
             MachineRegionStorageKind::ActivationFrame { activation } => {
                 if let Some(count) = activation_counts.get_mut(activation.0 as usize) {
@@ -5216,6 +5428,7 @@ fn for_each_operation_value(
         | MachineOperation::StackAddress(_)
         | MachineOperation::GlobalAddress(_)
         | MachineOperation::ActorReserve { .. }
+        | MachineOperation::ActorReplyRequest { .. }
         | MachineOperation::MailboxReceive { .. }
         | MachineOperation::MailboxDispatch { .. }
         | MachineOperation::Fence(_) => true,
@@ -5250,6 +5463,7 @@ fn for_each_operation_value(
         MachineOperation::Load { address, .. } => visit(*address),
         MachineOperation::Store { address, value, .. } => visit(*address) && visit(*value),
         MachineOperation::ActorCommit { reservation, .. } => visit(*reservation),
+        MachineOperation::ActorReplyResolve { outcome, .. } => visit(*outcome),
         MachineOperation::MemoryCopy {
             destination,
             source,
@@ -5519,6 +5733,41 @@ fn validate_operation(
                 errors,
             );
             require_id("actor method", method.0, module.functions.len(), errors);
+        }
+        MachineOperation::ActorReplyRequest {
+            slot,
+            mailbox,
+            method,
+            permit,
+            reply,
+            failure,
+            duplicate_failure,
+            ..
+        } => {
+            require_id(
+                "actor reply slot",
+                slot.0,
+                function.stack_slots.len(),
+                errors,
+            );
+            require_id(
+                "actor mailbox global",
+                mailbox.0,
+                module.globals.len(),
+                errors,
+            );
+            require_id("actor method", method.0, module.functions.len(), errors);
+            require_id("actor permit proof", permit.0, module.proofs.len(), errors);
+            require_id("actor reply proof", reply.0, module.proofs.len(), errors);
+            checked_failure!(*failure, ScalarFailureKind::ActorReplyStateMismatch);
+            checked_failure!(
+                *duplicate_failure,
+                ScalarFailureKind::ActorReplyDuplicateResolve
+            );
+        }
+        MachineOperation::ActorReplyResolve { outcome, reply } => {
+            value!(*outcome);
+            require_id("actor reply proof", reply.0, module.proofs.len(), errors);
         }
         MachineOperation::MailboxReceive {
             mailbox,
@@ -5970,6 +6219,27 @@ fn validate_operation_types(
         }
         MachineOperation::ActorCommit { reservation, .. } => {
             result_count == 0 && value_ty(*reservation).is_some_and(|ty| is_pointer(module, ty))
+        }
+        MachineOperation::ActorReplyRequest { slot, method, .. } => {
+            let result_is_u64 = result_ty(0)
+                .and_then(|ty| module.types.get(ty.0 as usize))
+                .is_some_and(|ty| ty.kind == MachineTypeKind::Integer { bits: 64 });
+            let target_returns_u64 = module
+                .functions
+                .get(method.0 as usize)
+                .and_then(|target| module.types.get(target.result.0 as usize))
+                .is_some_and(|ty| ty.kind == MachineTypeKind::Integer { bits: 64 });
+            let slot_is_exact = function
+                .stack_slots
+                .get(slot.0 as usize)
+                .is_some_and(|slot| slot.size == 16 && slot.alignment == 8);
+            result_count == 1 && result_is_u64 && target_returns_u64 && slot_is_exact
+        }
+        MachineOperation::ActorReplyResolve { outcome, .. } => {
+            result_count == 0
+                && value_ty(*outcome)
+                    .and_then(|ty| module.types.get(ty.0 as usize))
+                    .is_some_and(|ty| ty.kind == MachineTypeKind::Integer { bits: 64 })
         }
         MachineOperation::MailboxReceive { .. } | MachineOperation::MailboxDispatch { .. } => {
             result_count == 0
@@ -8488,8 +8758,8 @@ mod tests {
     }
 
     #[test]
-    fn tag_only_enum_schema_revision_accepts_only_exact_machine_wir_v14() {
-        assert_eq!(MACHINE_WIR_VERSION, 14);
+    fn current_schema_accepts_only_exact_machine_wir_v15() {
+        assert_eq!(MACHINE_WIR_VERSION, 15);
         assert_eq!(
             CheckedIntegerOp::ShiftLeft.invalid_shift_count_fatal_code(),
             Some(RuntimeFatalCode::InvalidShiftCount)
@@ -8512,12 +8782,12 @@ mod tests {
         );
         assert_eq!(CheckedIntegerOp::Add.invalid_shift_count_fatal_code(), None);
         let (module, target) = fixture();
-        for rejected in [13, 15] {
+        for rejected in [14, 16] {
             let mut changed = module.clone();
             changed.version = rejected;
             let errors = changed
                 .validate_for_target(&target)
-                .expect_err("only exact-current MachineWir v14 is accepted");
+                .expect_err("only exact-current MachineWir v15 is accepted");
             assert!(
                 errors
                     .0

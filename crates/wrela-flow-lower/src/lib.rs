@@ -1049,6 +1049,8 @@ fn validate_actor_source_function(
 
     let mut actor_capabilities = 0_u32;
     let mut actor_reserves = 0_u32;
+    let mut actor_reply_requests = 0_u32;
+    let mut actor_reply_resolves = 0_u32;
     let mut mailbox_receives = 0_u32;
     let root_active_scopes: Vec<semantic::ScopeId> = try_vec(
         input.scopes.len(),
@@ -1390,6 +1392,9 @@ fn validate_actor_source_function(
                                     operation: semantic::SemanticOperation::ActorReserve {
                                         actor: reserve_actor,
                                         ..
+                                    } | semantic::SemanticOperation::ActorReplyRequest {
+                                        actor: reserve_actor,
+                                        ..
                                     },
                                     ..
                                 }
@@ -1548,6 +1553,111 @@ fn validate_actor_source_function(
                             )
                         {
                             return Err(unsupported("noncanonical one-way actor commit"));
+                        }
+                    }
+                    semantic::SemanticOperation::ActorReplyRequest {
+                        actor,
+                        method,
+                        permit_proof,
+                        reply_proof,
+                    } => {
+                        actor_reply_requests = actor_reply_requests.checked_add(1).ok_or(
+                            LowerError::ResourceLimit {
+                                resource: "actor reply requests",
+                                limit: limits.model_edges,
+                            },
+                        )?;
+                        let [result] = statement.results.as_slice() else {
+                            return Err(unsupported("actor reply request result"));
+                        };
+                        let target = input.functions.get(method.0 as usize);
+                        let target_type_proof = target.and_then(|target| {
+                            target.proofs.iter().copied().find(|candidate| {
+                                input
+                                    .proofs
+                                    .get(candidate.0 as usize)
+                                    .is_some_and(|record| {
+                                        record.kind == semantic::ProofKind::TypeChecked
+                                    })
+                            })
+                        });
+                        let mut expected_dependencies =
+                            target_type_proof.map(|proof| [proof, *permit_proof]);
+                        if let Some(expected) = &mut expected_dependencies {
+                            expected.sort_unstable();
+                        }
+                        let exact_task = matches!(function.role, semantic::FunctionRole::TaskEntry(task)
+                            if input.tasks.get(task.0 as usize).and_then(|task| task.supervisor)
+                                == Some(semantic::ActorId(1)));
+                        let exact_capability = matches!(
+                            index.checked_sub(1).and_then(|prior| region.statements.get(prior)),
+                            Some(semantic::SemanticStatement::Let(semantic::LetStatement {
+                                operation: semantic::SemanticOperation::ActorCapability {
+                                    actor: capability_actor,
+                                    ..
+                                },
+                                ..
+                            })) if capability_actor == actor
+                        );
+                        if input.actors.len() != 2
+                            || !exact_task
+                            || *actor != semantic::ActorId(0)
+                            || !exact_capability
+                            || !is_root
+                            || scalar_value_type(function, *result).is_none_or(|ty| {
+                                !semantic_type_is(input, ty, semantic::PrimitiveType::U64)
+                            })
+                            || target.is_none_or(|target| {
+                                target.role != semantic::FunctionRole::ActorTurn(*actor)
+                                    || Some(target.result) != scalar_value_type(function, *result)
+                            })
+                            || input
+                                .proofs
+                                .get(permit_proof.0 as usize)
+                                .is_none_or(|proof| {
+                                    proof.kind != semantic::ProofKind::CapacityBound
+                                        || proof.bound != Some(1)
+                                })
+                            || input
+                                .proofs
+                                .get(reply_proof.0 as usize)
+                                .is_none_or(|proof| {
+                                    proof.kind != semantic::ProofKind::ActorReplyExactlyOnce
+                                        || proof.bound != Some(1)
+                                        || expected_dependencies
+                                            .is_none_or(|expected| proof.depends_on != expected)
+                                })
+                            || !function.proofs.contains(permit_proof)
+                            || !function.proofs.contains(reply_proof)
+                        {
+                            return Err(unsupported("noncanonical actor reply request"));
+                        }
+                    }
+                    semantic::SemanticOperation::ActorReplyResolve {
+                        outcome,
+                        reply_proof,
+                    } => {
+                        actor_reply_resolves = actor_reply_resolves.checked_add(1).ok_or(
+                            LowerError::ResourceLimit {
+                                resource: "actor reply resolves",
+                                limit: limits.model_edges,
+                            },
+                        )?;
+                        if !statement.results.is_empty()
+                            || !is_root
+                            || !matches!(function.role, semantic::FunctionRole::ActorTurn(_))
+                            || scalar_value_type(function, *outcome).is_none_or(|ty| {
+                                !semantic_type_is(input, ty, semantic::PrimitiveType::U64)
+                            })
+                            || input
+                                .proofs
+                                .get(reply_proof.0 as usize)
+                                .is_none_or(|proof| {
+                                    proof.kind != semantic::ProofKind::ActorReplyExactlyOnce
+                                        || proof.bound != Some(1)
+                                })
+                        {
+                            return Err(unsupported("noncanonical actor reply resolve"));
                         }
                     }
                     semantic::SemanticOperation::MailboxReceive { actor, method } => {
@@ -1815,25 +1925,46 @@ fn validate_actor_source_function(
             })
         )
     });
+    let expects_reply_request = function.body.statements.iter().any(|statement| {
+        matches!(
+            statement,
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                operation: semantic::SemanticOperation::ActorReplyRequest { .. },
+                ..
+            })
+        )
+    });
+    let expects_reply_resolve = function.body.statements.iter().any(|statement| {
+        matches!(
+            statement,
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                operation: semantic::SemanticOperation::ActorReplyResolve { .. },
+                ..
+            })
+        )
+    });
     let expects_receive = matches!(function.role, semantic::FunctionRole::ActorTurn(_))
         && input.functions.iter().any(|candidate| {
             candidate.body.statements.iter().any(|statement| {
                 matches!(
                     statement,
                     semantic::SemanticStatement::Let(semantic::LetStatement {
-                        operation: semantic::SemanticOperation::ActorReserve { method, .. },
+                        operation: semantic::SemanticOperation::ActorReserve { method, .. }
+                            | semantic::SemanticOperation::ActorReplyRequest { method, .. },
                         ..
                     }) if *method == function.id
                 )
             })
         });
-    let expects_capability = expects_send
+    let expects_capability = (expects_send || expects_reply_request)
         && input.actors.len() == 2
         && matches!(function.role, semantic::FunctionRole::TaskEntry(task)
             if input.tasks.get(task.0 as usize).and_then(|task| task.supervisor)
                 == Some(semantic::ActorId(1)));
     if actor_capabilities != u32::from(expects_capability)
         || actor_reserves != u32::from(expects_send)
+        || actor_reply_requests != u32::from(expects_reply_request)
+        || actor_reply_resolves != u32::from(expects_reply_resolve)
         || mailbox_receives != u32::from(expects_receive)
     {
         return Err(unsupported("one-way actor operation census"));
@@ -3692,6 +3823,12 @@ fn preflight_input(
                                     limits.model_edges,
                                 )?;
                             }
+                            semantic::SemanticOperation::ActorReplyResolve { .. } => add_bounded(
+                                &mut edges,
+                                1,
+                                "semantic model edges",
+                                limits.model_edges,
+                            )?,
                             semantic::SemanticOperation::Constant(_)
                             | semantic::SemanticOperation::ActorStateLoad { .. }
                             | semantic::SemanticOperation::ActorStateStore { .. }
@@ -3710,6 +3847,7 @@ fn preflight_input(
                             | semantic::SemanticOperation::Drop { .. }
                             | semantic::SemanticOperation::ActorCapability { .. }
                             | semantic::SemanticOperation::ActorReserve { .. }
+                            | semantic::SemanticOperation::ActorReplyRequest { .. }
                             | semantic::SemanticOperation::MailboxReceive { .. }
                             | semantic::SemanticOperation::ActorSend { .. }
                             | semantic::SemanticOperation::ActorTrySend { .. }
@@ -4663,6 +4801,9 @@ fn measure_actor_flow_output_resources(
                             | semantic::SemanticOperation::ActorCommit { arguments, .. } => {
                                 meter.edges(arguments)
                             }
+                            semantic::SemanticOperation::ActorReplyResolve { .. } => {
+                                meter.add_edges(1)
+                            }
                             semantic::SemanticOperation::Aggregate { fields, .. } => {
                                 meter.edges(fields)
                             }
@@ -4681,6 +4822,7 @@ fn measure_actor_flow_output_resources(
                             | semantic::SemanticOperation::Convert { .. }
                             | semantic::SemanticOperation::ActorCapability { .. }
                             | semantic::SemanticOperation::ActorReserve { .. }
+                            | semantic::SemanticOperation::ActorReplyRequest { .. }
                             | semantic::SemanticOperation::MailboxReceive { .. }
                             | semantic::SemanticOperation::ActorStateLoad { .. }
                             | semantic::SemanticOperation::ActorStateStore { .. }
@@ -6520,6 +6662,24 @@ fn lower_generated_operation(
                 arguments: lowered,
             })
         }
+        semantic::SemanticOperation::ActorReplyRequest {
+            actor,
+            method,
+            permit_proof,
+            reply_proof,
+        } => Ok(flow::FlowOperation::ActorReplyRequest {
+            actor: flow::ActorId(actor.0),
+            method: flow::FunctionId(method.0),
+            permit: flow::ProofId(permit_proof.0),
+            reply: flow::ProofId(reply_proof.0),
+        }),
+        semantic::SemanticOperation::ActorReplyResolve {
+            outcome,
+            reply_proof,
+        } => Ok(flow::FlowOperation::ActorReplyResolve {
+            outcome: flow::ValueId(outcome.0),
+            reply: flow::ProofId(reply_proof.0),
+        }),
         semantic::SemanticOperation::MailboxReceive { actor, method } => {
             Ok(flow::FlowOperation::MailboxReceive {
                 actor: flow::ActorId(actor.0),
@@ -6728,6 +6888,7 @@ fn lower_proof_kind(kind: &semantic::ProofKind) -> flow::ProofKind {
         semantic::ProofKind::ViewDoesNotEscape => flow::ProofKind::ViewDoesNotEscape,
         semantic::ProofKind::RegionBound => flow::ProofKind::RegionBound,
         semantic::ProofKind::CapacityBound => flow::ProofKind::CapacityBound,
+        semantic::ProofKind::ActorReplyExactlyOnce => flow::ProofKind::ActorReplyExactlyOnce,
         semantic::ProofKind::WaitGraphAcyclic => flow::ProofKind::WaitGraphAcyclic,
         semantic::ProofKind::CleanupAcyclic => flow::ProofKind::CleanupAcyclic,
         semantic::ProofKind::WorkBound => flow::ProofKind::WorkBound,
@@ -7092,6 +7253,8 @@ fn validate_model_resources(
                     | FlowOperation::Promote { .. }
                     | FlowOperation::ActorCapability { .. }
                     | FlowOperation::ActorReserve { .. }
+                    | FlowOperation::ActorReplyRequest { .. }
+                    | FlowOperation::ActorReplyResolve { .. }
                     | FlowOperation::ActorCommit { .. }
                     | FlowOperation::ActorReject { .. }
                     | FlowOperation::MailboxReceive { .. }
@@ -7373,6 +7536,18 @@ fn validate_report(
         })
         .try_fold(0u64, u64::checked_add);
     validate_semantic_region_depth(input, limits, is_cancelled)?;
+    if blocks.is_some_and(|count| count > limits.blocks) {
+        return Err(LowerError::ResourceLimit {
+            resource: "FlowWir blocks",
+            limit: limits.blocks,
+        });
+    }
+    if instructions.is_some_and(|count| count > limits.instructions) {
+        return Err(LowerError::ResourceLimit {
+            resource: "FlowWir instructions",
+            limit: limits.instructions,
+        });
+    }
     if source_functions != Some(report.source_functions)
         || generated_functions != Some(report.generated_functions)
         || blocks != Some(report.blocks)
@@ -7388,8 +7563,8 @@ fn validate_report(
         || !generated_test_shape_matches
         || !actor_shape_matches
         || !test_metadata_matches
-        || blocks.is_none_or(|count| count > limits.blocks)
-        || instructions.is_none_or(|count| count > limits.instructions)
+        || blocks.is_none()
+        || instructions.is_none()
         || !states_within_limit
     {
         Err(LowerError::InvalidReport(
@@ -7839,6 +8014,35 @@ fn actor_flow_operation_matches(
                 && expected_method == output_method
                 && expected_proof == output_proof
         }
+        (
+            flow::FlowOperation::ActorReplyRequest {
+                actor: expected_actor,
+                method: expected_method,
+                permit: expected_permit,
+                reply: expected_reply,
+            },
+            flow::FlowOperation::ActorReplyRequest {
+                actor: output_actor,
+                method: output_method,
+                permit: output_permit,
+                reply: output_reply,
+            },
+        ) => {
+            expected_actor == output_actor
+                && expected_method == output_method
+                && expected_permit == output_permit
+                && expected_reply == output_reply
+        }
+        (
+            flow::FlowOperation::ActorReplyResolve {
+                outcome: expected_outcome,
+                reply: expected_reply,
+            },
+            flow::FlowOperation::ActorReplyResolve {
+                outcome: output_outcome,
+                reply: output_reply,
+            },
+        ) => expected_outcome == output_outcome && expected_reply == output_reply,
         (
             flow::FlowOperation::ActorCommit {
                 reservation: expected_reservation,
@@ -11207,19 +11411,23 @@ mod contract_tests {
                 4,
             ),
         ] {
-            assert!(matches!(
-                CanonicalFlowLowerer::new().lower(
-                    LowerRequest {
-                        input: actor_state_promotion_fixture(),
-                        limits,
-                    },
-                    &|| false,
-                ),
+            let result = CanonicalFlowLowerer::new().lower(
+                LowerRequest {
+                    input: actor_state_promotion_fixture(),
+                    limits,
+                },
+                &|| false,
+            );
+            assert!(
+                matches!(
+                result,
                 Err(LowerError::ResourceLimit {
                     resource: actual,
                     limit: actual_limit,
                 }) if actual == resource && actual_limit == limit
-            ));
+                ),
+                "unexpected promotion boundary result: {result:?}"
+            );
         }
 
         let polls = Cell::new(0_u32);

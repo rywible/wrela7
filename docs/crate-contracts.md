@@ -462,18 +462,18 @@ it. It injects phase implementations and bounded host capabilities, while
   preserves the analyzer's exact proof-kind vocabulary and every proof source,
   as well as function instance keys, attached proof IDs, recursive-depth
   bounds, and the HIR declaration/file bounds used to validate provenance.
-- SemanticWir v11 retains exact SSA aggregate field replacement as `InsertField`.
+- SemanticWir v12 retains exact SSA aggregate field replacement as `InsertField`.
   Validation joins the prior aggregate's struct type, selected field, inserted
-  value type, and single result of the unchanged aggregate type; FlowWir v13
+  value type, and single result of the unchanged aggregate type; FlowWir v14
   preserves the same operation and independently repeats that join.
-- MachineWir v14 retains same-block nongeneric flat values with two or more
+- MachineWir v15 retains same-block nongeneric flat values with two or more
   primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
   `InsertField`, and `ExtractField` carry exact SSA joins through independent
   validation, equality, and resource metering; LLVM renders them with
   first-class `insertvalue`/`extractvalue`. One-field `u64` structs retain the
   established erased bitcast representation. Aggregate function/block
   boundaries, packed/empty/non-flat structs, and nested aggregates fail closed.
-- MachineWir v14 also makes a closed enum's shared payload type optional. An
+- MachineWir v15 also makes a closed enum's shared payload type optional. An
   all-unit enum must have no payload type, an all-false per-tag presence map,
   size/alignment `1/1`, payload-free constructors, and no payload projection;
   any payload-bearing enum must retain the canonical scalar payload type and at
@@ -529,6 +529,12 @@ it. It injects phase implementations and bounded host capabilities, while
   canonical actor-state plain write additionally retains its exact
   `RegionBound` proof as a no-result `Promote` immediately before the concrete
   store, and attaches that proof to the actor-turn function authority set.
+- The exact typed-reply subset lowers one awaited installed-actor request to
+  `ActorReplyRequest` and injects one `ActorReplyResolve` before the target's
+  sole exact-`u64` return. Both operations carry the same sorted
+  `ActorReplyExactlyOnce` proof, which depends on the target type proof and the
+  capacity permit. Any broader result, path, request count, or consumer remains
+  a named semantic boundary rather than an invented runtime operation.
 
 ### `wrela-flow-wir`
 
@@ -572,11 +578,16 @@ it. It injects phase implementations and bounded host capabilities, while
 - Every region records its closed class, owner, byte capacity, alignment,
   exact `CapacityBound` proof, and source span. Validation joins those fields
   rather than allowing report or Machine consumers to infer region provenance.
-- FlowWir v13 adds one exact actor-state `Promote` marker. Validation requires
+- FlowWir v14 adds one exact actor-state `Promote` marker. Validation requires
   an unsigned 64-bit value, the owning actor's canonical eight-byte `.state`
   image region, a source-identical eight-byte `RegionBound` proof listed on the
   turn function, and no result. This is proof/lifetime authority; the following
   store remains the concrete runtime action.
+- FlowWir v14 also appends `ActorReplyRequest` and `ActorReplyResolve` while
+  retaining the exact actor, target, permit, reply proof, `u64` outcome, and
+  request/result identity. Validation requires one request and one resolve,
+  exactly one incoming typed-reply edge to the target, and the same sorted
+  target-type/capacity proof dependency authenticated by SemanticWir.
 
 ### `wrela-flow-lower`
 
@@ -665,8 +676,9 @@ it. It injects phase implementations and bounded host capabilities, while
   second encode is byte-identical. Backend decoding canonically re-encodes the
   validated model and requires the complete received frame and inspected header
   to match, so ignored or alternate encodings cannot cross the wire boundary.
-- Wire version 13 appends `Promote` at operation tag 54. Model and wire version
-  12 are explicitly stale and rejected; there is no compatibility decoder.
+- Wire version 14 retains `Promote` at operation tag 54 and appends actor reply
+  request/resolve at tags 55/56. Model or wire version 13 is explicitly stale
+  and rejected; there is no compatibility decoder.
 
 ### `wrela-runtime-abi`
 
@@ -677,9 +689,10 @@ it. It injects phase implementations and bounded host capabilities, while
   cache maintenance, record/replay, and test emit/finish.
 - Fatal detail uses one closed compiler-owned `RuntimeFatalCode`: arithmetic 1,
   conversion 2, actor-mailbox-full 3, actor-mailbox-mismatch 4,
-  checked-left-shift-result-loss 5, and invalid-shift-count 6. Machine lowering
-  selects the code; LLVM may implement the check but may not collapse the two
-  shift causes or infer a code from emitted text. The existing Flow
+  checked-left-shift-result-loss 5, invalid-shift-count 6,
+  actor-reply-state-mismatch 7, and actor-reply-duplicate-resolve 8. Machine
+  lowering selects the code; LLVM may implement the check but may not collapse
+  distinct causes or infer a code from emitted text. The existing Flow
   function/instruction pair remains the source-site detail.
 - Every intrinsic has one current COFF symbol spelling and one exact scalar
   signature; MachineWir validates calls against both. The discriminator in the
@@ -773,6 +786,13 @@ it. It injects phase implementations and bounded host capabilities, while
   runtime requirements, the unique UEFI entry, the closed set of no-argument
   interrupt handlers, and target/build consistency. Firmware and interrupt
   entries cannot be ordinary direct or tail-call targets.
+- MachineWir v15 admits one exact same-core typed-reply profile. The caller is
+  a single-flight task entry with one 16-byte, 8-aligned stack slot; request,
+  mailbox receive, and target resolve must agree on actor, method, capacity
+  permit, and `ActorReplyExactlyOnce` proof. The request carries distinct
+  state-mismatch and duplicate-resolve fatal provenances, and the target must
+  have no parameters and return exact `u64`. Reserve/commit/dispatch and
+  activation records are forbidden in this profile.
 - Codegen may translate facts; it may not strengthen them.
 
 ### `wrela-machine-lower`
@@ -799,12 +819,17 @@ it. It injects phase implementations and bounded host capabilities, while
   image entry alone receives the exact AArch64 UEFI two-pointer/`EFI_STATUS`
   boundary and an implicit `EFI_SUCCESS` value for a unit return.
 - For the canonical actor-state direct write, lowering authenticates the
-  FlowWir v13 promotion proof, owning `.state` region, value, source, and exact
+  FlowWir v14 promotion proof, owning `.state` region, value, source, and exact
   marker→address→store adjacency. The marker has no MachineWir operation and
   is excluded consistently from output, reservation, and exact instruction
   accounting; the address/store remains the concrete writable-global action.
   Activation call IDs are translated through this erasure so the sealed
   scheduler plan continues to name the exact dense MachineWir instruction.
+- For the typed-reply profile, lowering allocates exactly one caller-owned
+  reply slot, translates the authenticated request/resolve pair, invokes the
+  startup task once after successful image entry, and retains the installed
+  mailbox storage. It does not synthesize a scheduler activation or a parked
+  continuation; those remain outside this direct same-core profile.
 - Generated test harnesses receive a measured read-only global for every
   canonical protocol frame. MachineWir uses explicit global-address values and
   exact `TestEmit(address, length)` / nonreturning `TestFinish(outcome)` runtime
@@ -857,6 +882,12 @@ it. It injects phase implementations and bounded host capabilities, while
   `TestEmit` result, exact-zero switch, and unchanged-status return. It cannot
   erase, merge, or substitute those guards; independent textual and native
   evidence checks the two-emission fixture before accepting the object.
+- For the sealed MachineWir v15 typed-reply profile, LLVM allocates the exact
+  16-byte caller slot and emits atomic state transitions around the exact
+  direct same-core target call. State mismatch and duplicate resolution route
+  to fatal codes 7 and 8. `ActorReplyResolve` is a validated authority marker
+  fused into that direct call; codegen may not accept it outside the one
+  request/receive/resolve contract.
 - The implemented writable-storage subset is deliberately narrow. Private,
   dense, exactly covering byte-array globals may use `WritableData` with a
   typed zero initializer in exact `.data` or in the canonical
@@ -991,7 +1022,7 @@ it. It injects phase implementations and bounded host capabilities, while
 - That schema is the only accepted report shape. Its tag rejects stale or
   mismatched artifacts at the trust boundary; there is no legacy reader,
   migration, adapter, or fallback contract. Its embedded interface facts must
-  be exactly SemanticWir 11, FlowWir 13, Flow wire 13, MachineWir 14, and runtime
+  be exactly SemanticWir 12, FlowWir 14, Flow wire 14, MachineWir 15, and runtime
   ABI 2; nonzero stale or future values are rejected rather than tolerated.
 - Schema v10 also projects sealed actor, task, reportable region, and async
   activation plans into

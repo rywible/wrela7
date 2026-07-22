@@ -666,6 +666,8 @@ fn validate_actor_message_table(
         })?;
     check_cancelled(is_cancelled)?;
     let mut dispatch = None;
+    let mut reply_request = None;
+    let mut reply_resolve = None;
 
     for (function_index, function) in machine.functions.iter().enumerate() {
         check_periodically(function_index, is_cancelled)?;
@@ -797,10 +799,133 @@ fn validate_actor_message_table(
                         }
                         dispatch = Some((*mailbox, *actor, *method));
                     }
+                    MachineOperation::ActorReplyRequest {
+                        slot,
+                        mailbox,
+                        actor,
+                        method,
+                        permit,
+                        reply,
+                        failure,
+                        duplicate_failure,
+                    } => {
+                        let fixed = instruction.results.len() == 1
+                            && matches!(function.role, MachineFunctionRole::TaskEntry(_))
+                            && instruction.source.is_some()
+                            && failure.kind == ScalarFailureKind::ActorReplyStateMismatch
+                            && duplicate_failure.kind
+                                == ScalarFailureKind::ActorReplyDuplicateResolve
+                            && failure.flow_function == function.flow_function
+                            && duplicate_failure.flow_function == function.flow_function
+                            && failure.flow_instruction == instruction.id.0
+                            && duplicate_failure.flow_instruction == instruction.id.0
+                            && function
+                                .stack_slots
+                                .get(slot.0 as usize)
+                                .is_some_and(|slot| slot.size == 16 && slot.alignment == 8);
+                        if !fixed
+                            || reply_request
+                                .replace((
+                                    function.id,
+                                    *mailbox,
+                                    *actor,
+                                    *method,
+                                    *permit,
+                                    *reply,
+                                    instruction.source,
+                                ))
+                                .is_some()
+                        {
+                            return Err(invalid());
+                        }
+                    }
+                    MachineOperation::ActorReplyResolve { outcome, reply } => {
+                        let fixed = instruction.results.is_empty()
+                            && matches!(function.role, MachineFunctionRole::ActorTurn(_))
+                            && function
+                                .values
+                                .get(outcome.0 as usize)
+                                .is_some_and(|value| {
+                                    machine.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                                        ty.kind == MachineTypeKind::Integer { bits: 64 }
+                                    })
+                                });
+                        if !fixed || reply_resolve.replace((function.id, *reply)).is_some() {
+                            return Err(invalid());
+                        }
+                    }
                     _ => {}
                 }
             }
         }
+    }
+
+    if let Some((producer, mailbox, actor, method, permit, reply, source)) = reply_request {
+        let startup_calls_producer = startup_success
+            .and_then(|success| {
+                machine
+                    .functions
+                    .get(machine.image_entry.0 as usize)
+                    .and_then(|entry| entry.blocks.get(success.0 as usize))
+            })
+            .is_some_and(|block| {
+                matches!(block.instructions.first(), Some(MachineInstruction {
+                    results,
+                    operation: MachineOperation::Call {
+                        function,
+                        arguments,
+                        convention: CallingConvention::Internal,
+                    },
+                    source: None,
+                    ..
+                }) if results.is_empty() && arguments.is_empty() && *function == producer)
+            });
+        let storage_matches = machine.region_storage.iter().any(|storage| {
+            storage.global == mailbox
+                && storage.kind
+                    == MachineRegionStorageKind::ActorMailbox {
+                        actor,
+                        mailbox_capacity: 1,
+                    }
+                && storage.capacity_bytes == 16
+                && storage.alignment == 8
+        });
+        let permit_matches = machine.proofs.get(permit.0 as usize).is_some_and(|proof| {
+            proof.kind == BackendProofKind::CapacityBound
+                && proof.bound == Some(1)
+                && proof.source == source
+        });
+        let reply_matches = machine.proofs.get(reply.0 as usize).is_some_and(|proof| {
+            proof.kind == BackendProofKind::ActorReplyExactlyOnce
+                && proof.bound == Some(1)
+                && proof.depends_on.contains(&permit)
+                && proof.source == source
+        });
+        let target_matches = machine
+            .functions
+            .get(method.0 as usize)
+            .is_some_and(|target| {
+                target.role == MachineFunctionRole::ActorTurn(actor)
+                    && target.parameters.is_empty()
+                    && machine
+                        .types
+                        .get(target.result.0 as usize)
+                        .is_some_and(|ty| ty.kind == MachineTypeKind::Integer { bits: 64 })
+            });
+        if !reserves.is_empty()
+            || commit_count != 0
+            || receives.as_slice() != [(mailbox, actor, method)]
+            || dispatch.is_some()
+            || reply_resolve != Some((method, reply))
+            || !startup_calls_producer
+            || !storage_matches
+            || !permit_matches
+            || !reply_matches
+            || !target_matches
+        {
+            return Err(invalid());
+        }
+        return Ok(());
     }
 
     let any_message =
@@ -1239,7 +1364,16 @@ fn validate_activation_table(
             function.role,
             MachineFunctionRole::ActorTurn(_) | MachineFunctionRole::TaskEntry(_)
         );
-        if activation_role != (caller_counts.get(index) == Some(&1)) {
+        let reply_role = function.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction.operation,
+                    MachineOperation::ActorReplyRequest { .. }
+                        | MachineOperation::ActorReplyResolve { .. }
+                )
+            })
+        });
+        if activation_role != (caller_counts.get(index) == Some(&1) || reply_role) {
             return Err(CodegenError::UnsupportedMachineContract(
                 "an activation function without exactly one plan",
             ));
@@ -1510,8 +1644,27 @@ fn validate_function(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), CodegenError> {
     let machine = request.module.as_wir();
-    if !function.stack_slots.is_empty()
-        || function.stack_bytes != 0
+    let reply_requests = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                MachineOperation::ActorReplyRequest { .. }
+            )
+        })
+        .count();
+    let exact_reply_slot = matches!(function.stack_slots.as_slice(), [slot]
+        if slot.id.0 == 0
+            && slot.size == 16
+            && slot.alignment == 8
+            && slot.live_states.is_empty()
+            && slot.overlay_group.is_none())
+        && function.stack_bytes == 16
+        && matches!(function.role, MachineFunctionRole::TaskEntry(_))
+        && reply_requests == 1;
+    if ((!function.stack_slots.is_empty() || function.stack_bytes != 0) && !exact_reply_slot)
         || matches!(function.role, MachineFunctionRole::Isr(_))
         || function.convention == CallingConvention::InterruptHandler
     {
@@ -1623,6 +1776,8 @@ fn validate_operation(
         | MachineOperation::GlobalAddress(_)
         | MachineOperation::ActorReserve { .. }
         | MachineOperation::ActorCommit { .. }
+        | MachineOperation::ActorReplyRequest { .. }
+        | MachineOperation::ActorReplyResolve { .. }
         | MachineOperation::MailboxReceive { .. }
         | MachineOperation::MailboxDispatch { .. }
         | MachineOperation::TestAssert { .. }
@@ -2599,6 +2754,7 @@ fn operation_edges(operation: &MachineOperation) -> usize {
         | MachineOperation::StackAddress(_)
         | MachineOperation::GlobalAddress(_)
         | MachineOperation::ActorReserve { .. }
+        | MachineOperation::ActorReplyRequest { .. }
         | MachineOperation::MailboxReceive { .. }
         | MachineOperation::MailboxDispatch { .. }
         | MachineOperation::Fence(_) => 0,
@@ -2611,6 +2767,7 @@ fn operation_edges(operation: &MachineOperation) -> usize {
         | MachineOperation::EnumPayload { .. }
         | MachineOperation::ExtractField { .. }
         | MachineOperation::TestAssert { .. } => 1,
+        MachineOperation::ActorReplyResolve { .. } => 1,
         MachineOperation::MakeStruct { fields, .. } => fields.len(),
         MachineOperation::InsertField { .. } => 2,
         MachineOperation::ActorCommit { .. } => 1,

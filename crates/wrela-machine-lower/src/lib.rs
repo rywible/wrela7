@@ -33,7 +33,7 @@ use wrela_target::TargetPackage;
 // Scalar code reservation for the canonical empty body plus the mandatory
 // runtime-entry call, zero-status switch, and status-propagating failure edge.
 const MINIMUM_ENTRY_CODE_BYTES: u64 = 640;
-const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 11;
+const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 12;
 const MINIMUM_BACKEND_PROOF: &str = "the canonical empty Flow image body returns EFI_SUCCESS after successful runtime initialization without backend memory facts";
 const IMAGE_ENTER_RUNTIME_REASON: &str =
     "generated UEFI image entry initializes the target runtime";
@@ -1792,6 +1792,7 @@ fn validate_report(
                     MachineOperation::CheckedInteger { .. }
                     | MachineOperation::CheckedConvert { .. }
                     | MachineOperation::ActorReserve { .. }
+                    | MachineOperation::ActorReplyRequest { .. }
                     | MachineOperation::MailboxReceive { .. } => Some(RuntimeIntrinsic::Fatal),
                     MachineOperation::TestAssert { .. } => {
                         Some(RuntimeIntrinsic::TestAssertionFail)
@@ -2161,6 +2162,8 @@ fn model_resources(
                     | MachineOperation::Store { .. }
                     | MachineOperation::ActorReserve { .. }
                     | MachineOperation::ActorCommit { .. }
+                    | MachineOperation::ActorReplyRequest { .. }
+                    | MachineOperation::ActorReplyResolve { .. }
                     | MachineOperation::MailboxReceive { .. }
                     | MachineOperation::MailboxDispatch { .. }
                     | MachineOperation::MemoryCopy { .. }
@@ -6458,7 +6461,7 @@ mod contract_tests {
         .expect("float not-equal FlowWir reaches MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 14);
+        assert_eq!(machine.version, 15);
         assert!(matches!(machine.types[8].kind, MachineTypeKind::Float32));
         assert!(matches!(machine.types[9].kind, MachineTypeKind::Float64));
         let float_function = &machine.functions[3];
@@ -6566,7 +6569,7 @@ mod contract_tests {
         .expect("unary and lossless casts reach MachineWir");
         let (validated, report) = output.into_parts();
         let machine = validated.as_wir();
-        assert_eq!(machine.version, 14);
+        assert_eq!(machine.version, 15);
         assert!(matches!(
             machine.types[10].kind,
             MachineTypeKind::Integer { bits: 16 }

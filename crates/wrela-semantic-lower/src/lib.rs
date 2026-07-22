@@ -1614,9 +1614,28 @@ fn validate_actor_source_functions(
                         subject: function.name.clone(),
                         fact: "actor receiver parameter",
                     })?;
+            let result_kind = facts
+                .types
+                .get(function.result.0 as usize)
+                .map(|ty| &ty.kind);
+            let result_allowed = match function.role {
+                sema::FunctionRole::ActorTurn(_) => matches!(
+                    result_kind,
+                    Some(sema::SemanticTypeKind::Unit)
+                        | Some(sema::SemanticTypeKind::Integer {
+                            signed: false,
+                            bits: 64,
+                            ..
+                        })
+                ),
+                sema::FunctionRole::TaskEntry(_) => {
+                    matches!(result_kind, Some(sema::SemanticTypeKind::Unit))
+                }
+                _ => false,
+            };
             if !receiver.receiver
                 || receiver.access != wrela_hir::AccessMode::Mutate
-                || function.result != sema::SemanticTypeId(0)
+                || !result_allowed
             {
                 return Err(unsupported("noncanonical actor-owned receiver authority"));
             }
@@ -1679,6 +1698,11 @@ fn validate_actor_wait_contract(
         let target = match operand_fact.resolution {
             sema::ExpressionResolution::DirectCall {
                 function: target, ..
+            }
+            | sema::ExpressionResolution::ActorRequest {
+                method: target,
+                reply: Some(_),
+                ..
             } => target,
             _ => return Err(unsupported("non-direct actor await operands")),
         };
@@ -1723,6 +1747,7 @@ fn validate_actor_wait_contract(
             actor,
             method,
             permit,
+            reply,
         } = fact.resolution
         {
             let producer = facts
@@ -1751,9 +1776,97 @@ fn validate_actor_wait_contract(
                         && target.role == sema::FunctionRole::ActorTurn(actor)
                         && target.color == wrela_hir::FunctionColor::Async
                         && target.parameters.len() == 1
-                        && target.result == sema::SemanticTypeId(0)
                 })
                 .ok_or_else(|| unsupported("one-way actor turn target"))?;
+            if let Some(reply) = reply {
+                let result = fact
+                    .result
+                    .and_then(|value| facts.values.get(value.0 as usize))
+                    .filter(|value| value.function == fact.function && value.ty == fact.ty)
+                    .ok_or_else(|| unsupported("actor reply result value"))?;
+                let result_ty = facts
+                    .types
+                    .get(result.ty.0 as usize)
+                    .filter(|ty| {
+                        ty.linearity == sema::Linearity::ScalarCopy
+                            && matches!(
+                                ty.kind,
+                                sema::SemanticTypeKind::Integer {
+                                    signed: false,
+                                    bits: 64,
+                                    ..
+                                }
+                            )
+                    })
+                    .ok_or_else(|| unsupported("actor reply result type"))?;
+                let mailbox_proof = graph
+                    .regions
+                    .iter()
+                    .filter(|region| {
+                        region.owner == sema::ImageOwner::Actor(actor)
+                            && region.class == sema::RegionClass::Image
+                    })
+                    .map(|region| region.proof)
+                    .next()
+                    .ok_or_else(|| unsupported("actor reply mailbox proof"))?;
+                let request_source = program
+                    .expression(fact.expression)
+                    .map(|expression| expression.source)
+                    .ok_or_else(|| unsupported("actor reply request source"))?;
+                let permit_record = facts
+                    .proofs
+                    .get(permit.0 as usize)
+                    .filter(|proof| {
+                        proof.kind == sema::ProofKind::CapacityBound
+                            && proof.bound == Some(1)
+                            && proof.sources.as_slice() == [request_source]
+                            && proof.depends_on.as_slice() == [mailbox_proof]
+                    })
+                    .ok_or_else(|| unsupported("actor reply permit"))?;
+                let reply_record = facts
+                    .proofs
+                    .get(reply.0 as usize)
+                    .filter(|proof| {
+                        let target_type_proof = target.proofs.iter().copied().find(|proof| {
+                            facts
+                                .proofs
+                                .get(proof.0 as usize)
+                                .is_some_and(|record| record.kind == sema::ProofKind::TypeChecked)
+                        });
+                        let mut expected = target_type_proof.map(|type_proof| [type_proof, permit]);
+                        if let Some(expected) = &mut expected {
+                            expected.sort_unstable();
+                        }
+                        proof.kind == sema::ProofKind::ActorReplyExactlyOnce
+                            && proof.bound == Some(1)
+                            && proof.sources.as_slice() == [request_source]
+                            && expected.is_some_and(|expected| proof.depends_on == expected)
+                    })
+                    .ok_or_else(|| unsupported("actor reply exactly-once proof"))?;
+                let count = admitted
+                    .get_mut(actor.0 as usize)
+                    .ok_or_else(|| unsupported("actor reply target identity"))?;
+                *count = count.checked_add(1).ok_or(LowerError::ResourceLimit {
+                    resource: "actor reply admission counts",
+                    limit: limits.model_edges,
+                })?;
+                let cross_actor = graph.actors.len() == 2
+                    && turn_producer.is_none()
+                    && owner == sema::ActorId(1)
+                    && actor == sema::ActorId(0);
+                if !cross_actor
+                    || target.result != fact.ty
+                    || fact.ownership_before != sema::OwnershipState::Owned
+                    || fact.ownership_after != sema::OwnershipState::Owned
+                    || result_ty.source.is_some()
+                    || !producer.proofs.contains(&permit_record.id)
+                    || !producer.proofs.contains(&reply_record.id)
+                {
+                    return Err(unsupported("noncanonical actor reply admission"));
+                }
+                direct_edges.push((fact.function, actor, method));
+                continue;
+            }
             let reservation = fact
                 .result
                 .and_then(|value| facts.values.get(value.0 as usize))
@@ -1818,6 +1931,7 @@ fn validate_actor_wait_contract(
                         && proof.depends_on.is_empty()
                 });
             if (owner != actor && !cross_actor)
+                || target.result != sema::SemanticTypeId(0)
                 || fact.effects.0 != sema::EffectSet::ACTOR
                 || fact.ownership_before != sema::OwnershipState::Owned
                 || fact.ownership_after != sema::OwnershipState::Taken
@@ -5306,14 +5420,29 @@ fn lower_source_function(
     let mut lowered_body = lowerer.lower_body(body, 1, &mut local_state)?;
     let structurally_returns = lowerer.body_definitely_returns(body)?;
     let mut mailbox_receive = None;
+    let mut reply_resolve = None;
     for fact in &input.facts().expressions {
         check_cancelled(is_cancelled)?;
-        let sema::ExpressionResolution::ActorRequest { actor, method, .. } = fact.resolution else {
+        let sema::ExpressionResolution::ActorRequest {
+            actor,
+            method,
+            reply,
+            ..
+        } = fact.resolution
+        else {
             continue;
         };
         if method == function.id && mailbox_receive.replace(actor).is_some() {
             return Err(unsupported(
                 "more than one admitted startup message for one actor turn",
+            ));
+        }
+        if method == function.id
+            && let Some(reply) = reply
+            && reply_resolve.replace(reply).is_some()
+        {
+            return Err(unsupported(
+                "more than one reply authority for one actor turn",
             ));
         }
     }
@@ -5340,6 +5469,41 @@ fn lower_source_function(
             wir::SemanticOperation::MailboxReceive {
                 actor: wir::ActorId(actor.0),
                 method: wir::FunctionId(function.id.0),
+            },
+            function.source,
+        )?;
+        statements.append(&mut lowered_body.statements);
+        lowered_body.statements = statements;
+    }
+    if let Some(reply) = reply_resolve {
+        let mut return_index = None;
+        let mut outcome = None;
+        for (index, statement) in lowered_body.statements.iter().enumerate() {
+            check_cancelled(is_cancelled)?;
+            if let wir::SemanticStatement::Return(values) = statement {
+                let [value] = values.as_slice() else {
+                    return Err(unsupported("semantic-actor-reply-return-shape"));
+                };
+                if return_index.replace(index).is_some() {
+                    return Err(unsupported("semantic-actor-reply-control-flow-pending"));
+                }
+                outcome = Some(*value);
+            }
+        }
+        let index =
+            return_index.ok_or_else(|| unsupported("semantic-actor-reply-missing-return"))?;
+        let outcome = outcome.ok_or_else(|| unsupported("semantic-actor-reply-missing-return"))?;
+        let mut statements = try_vec(
+            lowered_body.statements.len().saturating_add(1),
+            "SemanticWir actor reply resolution",
+            limits.model_edges,
+        )?;
+        statements.extend(lowered_body.statements.drain(..index));
+        lowerer.push_effect(
+            &mut statements,
+            wir::SemanticOperation::ActorReplyResolve {
+                outcome,
+                reply_proof: wir::ProofId(reply.0),
             },
             function.source,
         )?;
@@ -9053,6 +9217,11 @@ impl SourceFunctionLowerer<'_> {
                 let target = match operand_fact.resolution {
                     sema::ExpressionResolution::DirectCall {
                         function: target, ..
+                    }
+                    | sema::ExpressionResolution::ActorRequest {
+                        method: target,
+                        reply: Some(_),
+                        ..
                     } => target,
                     _ => return Err(self.fact_mismatch("await direct activation")),
                 };
@@ -9066,6 +9235,22 @@ impl SourceFunctionLowerer<'_> {
                     || effects.0 != operand_fact.effects.0 | sema::EffectSet::SUSPEND
                 {
                     return Err(self.fact_mismatch("await semantic state"));
+                }
+                if matches!(
+                    operand_fact.resolution,
+                    sema::ExpressionResolution::ActorRequest { reply: Some(_), .. }
+                ) {
+                    let request_value = self.lower_actor_reply_request(operand, statements)?;
+                    let result = self.lowered_expression_result(expression, result, ty, source)?;
+                    self.push_let(
+                        statements,
+                        result,
+                        wir::SemanticOperation::Copy {
+                            value: request_value,
+                        },
+                        Some(source),
+                    )?;
+                    return Ok(LoweredExpression::Value(result));
                 }
                 let LoweredExpression::Value(awaitable) =
                     self.lower_expression(operand, sema::AccessMode::Value, statements)?
@@ -9119,6 +9304,7 @@ impl SourceFunctionLowerer<'_> {
                 actor,
                 method,
                 permit,
+                reply: None,
             } => (actor, method, permit),
             _ => return Err(self.fact_mismatch("one-way actor request")),
         };
@@ -9265,6 +9451,161 @@ impl SourceFunctionLowerer<'_> {
             },
             Some(expression.source),
         )
+    }
+
+    fn lower_actor_reply_request(
+        &mut self,
+        expression_id: wrela_hir::ExpressionId,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<wir::ValueId, LowerError> {
+        check_cancelled(self.is_cancelled)?;
+        let program = self.input.hir().as_program();
+        let expression = program
+            .expression(expression_id)
+            .ok_or_else(|| self.fact_mismatch("actor reply source expression"))?;
+        let wrela_hir::ExpressionKind::Call { callee, arguments } = &expression.kind else {
+            return Err(self.fact_mismatch("actor reply call"));
+        };
+        if !arguments.is_empty() {
+            return Err(unsupported("semantic-actor-reply-payload-pending"));
+        }
+        let callee_expression = program
+            .expression(*callee)
+            .ok_or_else(|| self.fact_mismatch("actor reply callee"))?;
+        let wrela_hir::ExpressionKind::Field { base, .. } = callee_expression.kind else {
+            return Err(self.fact_mismatch("actor reply method reference"));
+        };
+        let base_expression = program
+            .expression(base)
+            .ok_or_else(|| self.fact_mismatch("actor reply handle"))?;
+        let wrela_hir::ExpressionKind::Field { base: receiver, .. } = base_expression.kind else {
+            return Err(unsupported("semantic-actor-reply-receiver-pending"));
+        };
+        let request_fact = self.expression_fact(expression_id)?;
+        let (actor, method, permit, reply) = match request_fact.resolution {
+            sema::ExpressionResolution::ActorRequest {
+                actor,
+                method,
+                permit,
+                reply: Some(reply),
+            } => (actor, method, permit, reply),
+            _ => return Err(self.fact_mismatch("typed actor reply request")),
+        };
+        let result = request_fact
+            .result
+            .ok_or_else(|| self.fact_mismatch("actor reply result"))?;
+        let target = self
+            .input
+            .facts()
+            .functions
+            .get(method.0 as usize)
+            .ok_or_else(|| self.fact_mismatch("actor reply target"))?;
+        let result_ty = self
+            .input
+            .facts()
+            .types
+            .get(request_fact.ty.0 as usize)
+            .ok_or_else(|| self.fact_mismatch("actor reply result type"))?;
+        let permit_record = self
+            .input
+            .facts()
+            .proofs
+            .get(permit.0 as usize)
+            .ok_or_else(|| self.fact_mismatch("actor reply permit"))?;
+        let reply_record = self
+            .input
+            .facts()
+            .proofs
+            .get(reply.0 as usize)
+            .ok_or_else(|| self.fact_mismatch("actor reply proof"))?;
+        let target_type_proof = target.proofs.iter().copied().find(|proof| {
+            self.input
+                .facts()
+                .proofs
+                .get(proof.0 as usize)
+                .is_some_and(|record| record.kind == sema::ProofKind::TypeChecked)
+        });
+        let mut expected_reply_dependencies =
+            target_type_proof.map(|type_proof| [type_proof, permit]);
+        if let Some(expected) = &mut expected_reply_dependencies {
+            expected.sort_unstable();
+        }
+        let graph = self
+            .input
+            .facts()
+            .graph
+            .as_ref()
+            .ok_or_else(|| self.fact_mismatch("actor reply graph"))?;
+        let exact_caller = matches!(self.function.role, sema::FunctionRole::TaskEntry(_));
+        let exact_cross_actor = graph.actors.len() == 2
+            && actor == sema::ActorId(0)
+            && graph.tasks.iter().any(|task| {
+                matches!(self.function.role, sema::FunctionRole::TaskEntry(id) if id == task.id)
+                    && task.supervisor == Some(sema::ActorId(1))
+            });
+        if !exact_caller
+            || !exact_cross_actor
+            || target.role != sema::FunctionRole::ActorTurn(actor)
+            || target.color != wrela_hir::FunctionColor::Async
+            || target.parameters.len() != 1
+            || target.result != request_fact.ty
+            || !matches!(
+                result_ty.kind,
+                sema::SemanticTypeKind::Integer {
+                    signed: false,
+                    bits: 64,
+                    ..
+                }
+            )
+            || request_fact.effects.0 != sema::EffectSet::ACTOR
+            || request_fact.ownership_before != sema::OwnershipState::Owned
+            || request_fact.ownership_after != sema::OwnershipState::Owned
+            || permit_record.kind != sema::ProofKind::CapacityBound
+            || permit_record.bound != Some(1)
+            || reply_record.kind != sema::ProofKind::ActorReplyExactlyOnce
+            || reply_record.bound != Some(1)
+            || expected_reply_dependencies
+                .is_none_or(|expected| reply_record.depends_on != expected)
+        {
+            return Err(self.fact_mismatch("actor reply semantic contract"));
+        }
+        let base_fact = self.expression_fact(base)?;
+        let capability = base_fact
+            .result
+            .ok_or_else(|| self.fact_mismatch("actor reply capability"))?;
+        let wiring = self
+            .input
+            .facts()
+            .proofs
+            .iter()
+            .find(|proof| proof.kind == sema::ProofKind::ActorAsIf)
+            .ok_or_else(|| self.fact_mismatch("actor reply wiring proof"))?;
+        self.push_seen_expression(receiver)?;
+        self.push_seen_expression(base)?;
+        self.push_seen_expression(*callee)?;
+        self.push_seen_expression(expression_id)?;
+        self.push_let(
+            statements,
+            self.value_map.get(capability)?,
+            wir::SemanticOperation::ActorCapability {
+                actor: wir::ActorId(actor.0),
+                wiring_proof: wir::ProofId(wiring.id.0),
+            },
+            Some(expression.source),
+        )?;
+        let result = self.value_map.get(result)?;
+        self.push_let(
+            statements,
+            result,
+            wir::SemanticOperation::ActorReplyRequest {
+                actor: wir::ActorId(actor.0),
+                method: wir::FunctionId(method.0),
+                permit_proof: wir::ProofId(permit.0),
+                reply_proof: wir::ProofId(reply.0),
+            },
+            Some(expression.source),
+        )?;
+        Ok(result)
     }
 
     fn lower_scalar_unary(
@@ -12220,6 +12561,7 @@ fn lower_proof_kind(source: &sema::ProofKind) -> wir::ProofKind {
         sema::ProofKind::ViewDoesNotEscape => wir::ProofKind::ViewDoesNotEscape,
         sema::ProofKind::RegionBound => wir::ProofKind::RegionBound,
         sema::ProofKind::CapacityBound => wir::ProofKind::CapacityBound,
+        sema::ProofKind::ActorReplyExactlyOnce => wir::ProofKind::ActorReplyExactlyOnce,
         sema::ProofKind::WaitGraphAcyclic => wir::ProofKind::WaitGraphAcyclic,
         sema::ProofKind::CleanupAcyclic => wir::ProofKind::CleanupAcyclic,
         sema::ProofKind::WorkBound => wir::ProofKind::WorkBound,
@@ -13132,6 +13474,8 @@ fn measure_model_resources(
                             | SemanticOperation::Drop { .. }
                             | SemanticOperation::ActorCapability { .. }
                             | SemanticOperation::ActorReserve { .. }
+                            | SemanticOperation::ActorReplyRequest { .. }
+                            | SemanticOperation::ActorReplyResolve { .. }
                             | SemanticOperation::MailboxReceive { .. }
                             | SemanticOperation::ActorSend { .. }
                             | SemanticOperation::ActorTrySend { .. }
@@ -14122,6 +14466,30 @@ fn actor_operations_match(
             },
         ) => lr == rr && cancellable_slices_equal(la, ra, is_cancelled)?,
         (
+            wir::SemanticOperation::ActorReplyRequest {
+                actor: la,
+                method: lm,
+                permit_proof: lp,
+                reply_proof: lx,
+            },
+            wir::SemanticOperation::ActorReplyRequest {
+                actor: ra,
+                method: rm,
+                permit_proof: rp,
+                reply_proof: rx,
+            },
+        ) => la == ra && lm == rm && lp == rp && lx == rx,
+        (
+            wir::SemanticOperation::ActorReplyResolve {
+                outcome: lo,
+                reply_proof: lp,
+            },
+            wir::SemanticOperation::ActorReplyResolve {
+                outcome: ro,
+                reply_proof: rp,
+            },
+        ) => lo == ro && lp == rp,
+        (
             wir::SemanticOperation::MailboxReceive {
                 actor: la,
                 method: lm,
@@ -14573,6 +14941,30 @@ pub struct Worker:
 pub fn boot() -> Image:
     img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
     installed = img.service(Worker, mailbox=2)
+    return img
+"#;
+    const ACTOR_REPLY_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self) -> u64:
+        return 7
+
+@app
+pub struct Client:
+    worker: Actor[Worker]
+
+    @task
+    async fn request(mut self):
+        answer: u64 = await self.worker.ping()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    worker = img.service(Worker, mailbox=1)
+    client = img.app(Client, worker=worker.handle(), mailbox=1)
     return img
 "#;
     const PASS_ONLY_SCOPE_ACTOR_SOURCE: &str = r#"module app
@@ -16713,6 +17105,48 @@ pub fn boot() -> Image:
                     .explanation
                     .iter()
                     .any(|line| line.contains("reverse source order"))
+        }));
+    }
+
+    #[test]
+    fn exact_u64_actor_reply_produces_request_and_resolve_operations() {
+        let image = analyze_parsed_actor_source(ACTOR_REPLY_SOURCE);
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("actor reply lowers to SemanticWir");
+        let lowered = output.wir().as_wir();
+        let request = lowered
+            .functions
+            .iter()
+            .find(|function| matches!(function.role, wir::FunctionRole::TaskEntry(_)))
+            .expect("reply startup task");
+        assert!(request.body.statements.iter().any(|statement| matches!(
+            statement,
+            wir::SemanticStatement::Let(wir::LetStatement {
+                operation: wir::SemanticOperation::ActorReplyRequest { .. },
+                ..
+            })
+        )));
+        let turn = lowered
+            .functions
+            .iter()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(wir::ActorId(0))))
+            .expect("reply actor turn");
+        assert!(turn.body.statements.iter().any(|statement| matches!(
+            statement,
+            wir::SemanticStatement::Let(wir::LetStatement {
+                operation: wir::SemanticOperation::ActorReplyResolve { .. },
+                ..
+            })
+        )));
+        assert!(lowered.proofs.iter().any(|proof| {
+            proof.kind == wir::ProofKind::ActorReplyExactlyOnce && proof.bound == Some(1)
         }));
     }
 

@@ -444,6 +444,18 @@ fn render_block(
     ir.push("b")?;
     ir.number(u128::from(block.id.0))?;
     ir.push(":\n")?;
+    if block.id == function.entry {
+        for slot in &function.stack_slots {
+            check_cancelled(is_cancelled)?;
+            ir.push("  %s")?;
+            ir.number(u128::from(slot.id.0))?;
+            ir.push(" = alloca [")?;
+            ir.number(u128::from(slot.size))?;
+            ir.push(" x i8], align ")?;
+            ir.number(u128::from(slot.alignment))?;
+            ir.push("\n")?;
+        }
+    }
     let incoming_start = edges.partition_point(|edge| edge.target < block.id.0);
     let incoming_end = edges.partition_point(|edge| edge.target <= block.id.0);
     let incoming =
@@ -818,6 +830,26 @@ fn render_instruction(
             method,
             ..
         } => render_actor_commit(ir, *reservation, *method)?,
+        MachineOperation::ActorReplyRequest {
+            slot,
+            mailbox,
+            method,
+            failure,
+            duplicate_failure,
+            ..
+        } => render_actor_reply_request(
+            ir,
+            machine,
+            instruction.id.0,
+            result,
+            *slot,
+            *mailbox,
+            *method,
+            *failure,
+            *duplicate_failure,
+            is_cancelled,
+        )?,
+        MachineOperation::ActorReplyResolve { .. } => {}
         MachineOperation::MailboxReceive {
             mailbox,
             method,
@@ -2547,6 +2579,173 @@ fn render_actor_commit(
     ir.push(" release, align 8\n")
 }
 
+fn render_actor_reply_failure(
+    ir: &mut IrText,
+    machine: &wrela_machine_wir::MachineWir,
+    instruction: u32,
+    suffix: &str,
+    failure: ScalarFailureProvenance,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), CodegenError> {
+    let symbol = runtime_symbol(machine, RuntimeIntrinsic::Fatal)?;
+    ir.push("  br i1 %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_")?;
+    ir.push(suffix)?;
+    ir.push("_failed, label %i")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_")?;
+    ir.push(suffix)?;
+    ir.push("_fail, label %i")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_")?;
+    ir.push(suffix)?;
+    ir.push("_ok\ni")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_")?;
+    ir.push(suffix)?;
+    ir.push("_fail:\n  call void @")?;
+    ir.push_cancellable(symbol, is_cancelled)?;
+    ir.push("(i32 ")?;
+    ir.number(u128::from(failure.kind.runtime_code().as_u32()))?;
+    ir.push(", i64 ")?;
+    ir.number(u128::from(failure.runtime_detail()))?;
+    ir.push(")\n  unreachable\ni")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_")?;
+    ir.push(suffix)?;
+    ir.push("_ok:\n")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_actor_reply_request(
+    ir: &mut IrText,
+    machine: &wrela_machine_wir::MachineWir,
+    instruction: u32,
+    result: Option<ValueId>,
+    slot: wrela_machine_wir::StackSlotId,
+    mailbox: GlobalId,
+    method: FunctionId,
+    state_failure: ScalarFailureProvenance,
+    duplicate_failure: ScalarFailureProvenance,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), CodegenError> {
+    let result = required_result(result)?;
+    let mailbox_symbol = actor_mailbox_symbol(machine, mailbox)?;
+    let method_symbol = machine
+        .functions
+        .get(method.0 as usize)
+        .and_then(|function| machine.symbols.get(function.symbol.0 as usize))
+        .map(|symbol| symbol.name.as_str())
+        .ok_or(CodegenError::UnsupportedMachineContract(
+            "an actor reply target lacks its internal symbol",
+        ))?;
+    ir.push("  store atomic i64 0, ptr %s")?;
+    ir.number(u128::from(slot.0))?;
+    ir.push(" release, align 8\n  %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_claim = cmpxchg ptr %s")?;
+    ir.number(u128::from(slot.0))?;
+    ir.push(", i64 0, i64 1 acq_rel acquire, align 8\n  %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_claimed = extractvalue { i64, i1 } %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_claim, 1\n  %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_mailbox_tag = load atomic i64, ptr @")?;
+    ir.push_cancellable(mailbox_symbol, is_cancelled)?;
+    ir.push(" acquire, align 8\n  %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_mailbox_empty = icmp eq i64 %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_mailbox_tag, 0\n  %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_admitted = and i1 %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_claimed, %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_mailbox_empty\n  %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_claim_failed = xor i1 %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_admitted, true\n")?;
+    render_actor_reply_failure(
+        ir,
+        machine,
+        instruction,
+        "claim",
+        state_failure,
+        is_cancelled,
+    )?;
+    ir.push("  store atomic i64 ")?;
+    ir.number(u128::from(actor_message_tag(method)))?;
+    ir.push(", ptr @")?;
+    ir.push_cancellable(mailbox_symbol, is_cancelled)?;
+    ir.push(" release, align 8\n  %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_outcome = call fastcc i64 @")?;
+    ir.push_cancellable(method_symbol, is_cancelled)?;
+    ir.push("()\n  %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_write = cmpxchg ptr %s")?;
+    ir.number(u128::from(slot.0))?;
+    ir.push(", i64 1, i64 2 acq_rel acquire, align 8\n  %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_writing = extractvalue { i64, i1 } %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_write, 1\n  %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_write_failed = xor i1 %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_writing, true\n")?;
+    render_actor_reply_failure(
+        ir,
+        machine,
+        instruction,
+        "write",
+        duplicate_failure,
+        is_cancelled,
+    )?;
+    ir.push("  %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_outcome_slot = getelementptr i8, ptr %s")?;
+    ir.number(u128::from(slot.0))?;
+    ir.push(", i64 8\n  store i64 %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_outcome, ptr %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_outcome_slot, align 8\n  store atomic i64 3, ptr %s")?;
+    ir.number(u128::from(slot.0))?;
+    ir.push(" release, align 8\n  %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_state = load atomic i64, ptr %s")?;
+    ir.number(u128::from(slot.0))?;
+    ir.push(" acquire, align 8\n  %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_consume_failed = icmp ne i64 %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_state, 3\n")?;
+    render_actor_reply_failure(
+        ir,
+        machine,
+        instruction,
+        "consume",
+        state_failure,
+        is_cancelled,
+    )?;
+    ir.push("  %v")?;
+    ir.number(u128::from(result.0))?;
+    ir.push(" = load i64, ptr %t")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_outcome_slot, align 8\n  store atomic i64 4, ptr %s")?;
+    ir.number(u128::from(slot.0))?;
+    ir.push(" release, align 8\n  br label %i")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_ok\ni")?;
+    ir.number(u128::from(instruction))?;
+    ir.push("_ok:\n")
+}
+
 fn render_mailbox_receive(
     ir: &mut IrText,
     machine: &wrela_machine_wir::MachineWir,
@@ -3747,6 +3946,7 @@ fn checked_continuation(
             MachineOperation::CheckedInteger { .. }
                 | MachineOperation::CheckedConvert { .. }
                 | MachineOperation::ActorReserve { .. }
+                | MachineOperation::ActorReplyRequest { .. }
                 | MachineOperation::MailboxReceive { .. }
                 | MachineOperation::MailboxDispatch { .. }
                 | MachineOperation::TestAssert { .. }

@@ -11,8 +11,8 @@ use wrela_machine_wir::{
     MachineTestEntry, MachineTestId, MachineTestKind, MachineType, MachineTypeId, MachineTypeKind,
     MachineUnaryOp, MachineValue, MachineWir, MemorySemantics, ProofId,
     REGION_STORAGE_SECTION_PREFIX, REGION_STORAGE_SYMBOL_PREFIX, ScalarFailureKind,
-    ScalarFailureProvenance, Section, SectionId, SectionKind, Symbol, SymbolDefinition, SymbolId,
-    SymbolVisibility, ValueId,
+    ScalarFailureProvenance, Section, SectionId, SectionKind, StackSlot, StackSlotId, Symbol,
+    SymbolDefinition, SymbolId, SymbolVisibility, ValueId,
 };
 use wrela_runtime_abi::{
     INTERRUPT_ROUTE_LAYOUT, INTERRUPT_ROUTE_SECTION, INTERRUPT_ROUTE_TABLE_SYMBOL,
@@ -75,6 +75,7 @@ struct FlowActorDispatch {
     method: flow::FunctionId,
     producer: flow::FunctionId,
     permit: flow::ProofId,
+    reply: Option<flow::ProofId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,6 +84,7 @@ struct ActorDispatchPlan {
     method: FunctionId,
     producer: FunctionId,
     permit: ProofId,
+    reply: Option<ProofId>,
     mailbox: GlobalId,
 }
 
@@ -423,7 +425,12 @@ pub(super) fn lower_scalar_image(
                 })?,
             writable_bytes: input.static_bytes,
             zero_fill_bytes: 0,
-            maximum_stack_bytes: 0,
+            maximum_stack_bytes: wir
+                .functions
+                .iter()
+                .map(|function| function.stack_bytes)
+                .max()
+                .unwrap_or(0),
             maximum_alignment,
         },
         runtime,
@@ -440,6 +447,7 @@ fn discover_actor_dispatch(
     let mut dispatch = None;
     let mut continuation = None;
     let mut commit_count = 0_u8;
+    let mut reply_resolve = None;
     let mut receives = try_vec(2, "actor mailbox receives", 2, is_cancelled)?;
 
     for function in &input.functions {
@@ -582,6 +590,7 @@ fn discover_actor_dispatch(
                             method: *method,
                             producer: function.id,
                             permit: *proof,
+                            reply: None,
                         };
                         if matches!(function.role, flow::FunctionRole::ActorTurn(owner) if owner == *actor)
                         {
@@ -614,6 +623,151 @@ fn discover_actor_dispatch(
                             return Err(unsupported("a non-adjacent actor unit commit"));
                         }
                     }
+                    flow::FlowOperation::ActorReplyRequest {
+                        actor,
+                        method,
+                        permit,
+                        reply,
+                    } => {
+                        let [result] = instruction.results.as_slice() else {
+                            return Err(unsupported(
+                                "an actor reply request without one u64 result",
+                            ));
+                        };
+                        let task_actor = match function.role {
+                            flow::FunctionRole::TaskEntry(task) => input
+                                .tasks
+                                .get(task.0 as usize)
+                                .filter(|record| record.id == task)
+                                .and_then(|record| record.supervisor),
+                            _ => None,
+                        };
+                        let target = input.functions.get(method.0 as usize).filter(|target| {
+                            target.id == *method
+                                && target.role == flow::FunctionRole::ActorTurn(*actor)
+                                && target.color == flow::FunctionColor::Async
+                                && target.parameters.len() == 1
+                                && matches!(target.result_types.as_slice(), [ty]
+                                if input.types.get(ty.0 as usize).is_some_and(|record| {
+                                    record.kind == flow::FlowTypeKind::Scalar(
+                                        flow::ScalarType::Integer {
+                                            signed: false,
+                                            bits: 64,
+                                        },
+                                    )
+                                }))
+                        });
+                        let result_is_u64 = function
+                            .values
+                            .get(result.0 as usize)
+                            .and_then(|value| input.types.get(value.ty.0 as usize))
+                            .is_some_and(|record| {
+                                record.kind
+                                    == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                                        signed: false,
+                                        bits: 64,
+                                    })
+                            });
+                        let permit_record = input.proofs.get(permit.0 as usize);
+                        let reply_record = input.proofs.get(reply.0 as usize);
+                        let target_type_proof = target.and_then(|target| {
+                            target.proofs.iter().copied().find(|candidate| {
+                                input
+                                    .proofs
+                                    .get(candidate.0 as usize)
+                                    .is_some_and(|record| {
+                                        record.kind == flow::ProofKind::TypeChecked
+                                    })
+                            })
+                        });
+                        let mut expected_reply_dependencies =
+                            target_type_proof.map(|type_proof| [type_proof, *permit]);
+                        if let Some(expected) = &mut expected_reply_dependencies {
+                            expected.sort_unstable();
+                        }
+                        let adjacent_capability = index
+                            .checked_sub(1)
+                            .and_then(|prior| block.instructions.get(prior));
+                        let exact_capability = matches!(adjacent_capability,
+                            Some(flow::Instruction {
+                                operation: flow::FlowOperation::ActorCapability {
+                                    actor: capability_actor,
+                                    ..
+                                },
+                                ..
+                            }) if capability_actor == actor);
+                        if input.actors.len() != 2
+                            || task_actor != Some(flow::ActorId(1))
+                            || *actor != flow::ActorId(0)
+                            || target.is_none()
+                            || !result_is_u64
+                            || !exact_capability
+                            || permit_record.is_none_or(|record| {
+                                record.kind != flow::ProofKind::CapacityBound
+                                    || record.bound != Some(1)
+                                    || instruction
+                                        .source
+                                        .is_none_or(|source| record.sources.as_slice() != [source])
+                            })
+                            || reply_record.is_none_or(|record| {
+                                record.kind != flow::ProofKind::ActorReplyExactlyOnce
+                                    || record.bound != Some(1)
+                                    || expected_reply_dependencies
+                                        .is_none_or(|expected| record.depends_on != expected)
+                            })
+                            || !function.proofs.contains(permit)
+                            || !function.proofs.contains(reply)
+                        {
+                            return Err(unsupported(
+                                "an actor reply request without exact target and proof authority",
+                            ));
+                        }
+                        let record = FlowActorDispatch {
+                            actor: *actor,
+                            method: *method,
+                            producer: function.id,
+                            permit: *permit,
+                            reply: Some(*reply),
+                        };
+                        if dispatch.replace(record).is_some() {
+                            return Err(unsupported("more than one startup actor admission"));
+                        }
+                    }
+                    flow::FlowOperation::ActorReplyResolve { outcome, reply } => {
+                        let actor = match function.role {
+                            flow::FunctionRole::ActorTurn(actor) => actor,
+                            _ => {
+                                return Err(unsupported(
+                                    "an actor reply resolve outside its actor turn",
+                                ));
+                            }
+                        };
+                        let outcome_is_u64 = function
+                            .values
+                            .get(outcome.0 as usize)
+                            .and_then(|value| input.types.get(value.ty.0 as usize))
+                            .is_some_and(|record| {
+                                record.kind
+                                    == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                                        signed: false,
+                                        bits: 64,
+                                    })
+                            });
+                        if !instruction.results.is_empty()
+                            || !outcome_is_u64
+                            || input.proofs.get(reply.0 as usize).is_none_or(|record| {
+                                record.kind != flow::ProofKind::ActorReplyExactlyOnce
+                                    || record.bound != Some(1)
+                            })
+                            || reply_resolve
+                                .replace((actor, function.id, *reply))
+                                .is_some()
+                        {
+                            return Err(unsupported(
+                                "a substituted or duplicate actor reply resolve",
+                            ));
+                        }
+                    }
                     flow::FlowOperation::MailboxReceive { actor, method }
                         if !instruction.results.is_empty()
                             || block.id != function.entry
@@ -639,20 +793,38 @@ fn discover_actor_dispatch(
         }
     }
 
-    match (dispatch, continuation, receives.as_slice(), commit_count) {
-        (None, None, [], 0) => Ok(None),
-        (Some(dispatch), None, [(actor, method)], 1)
+    match (
+        dispatch,
+        continuation,
+        receives.as_slice(),
+        commit_count,
+        reply_resolve,
+    ) {
+        (None, None, [], 0, None) => Ok(None),
+        (Some(dispatch), None, [(actor, method)], 1, None)
             if (dispatch.actor, dispatch.method) == (*actor, *method) =>
         {
             Ok(Some(dispatch))
         }
-        (Some(dispatch), Some(next), receives, 2)
+        (Some(dispatch), Some(next), receives, 2, None)
             if dispatch.actor == next.actor
                 && dispatch.method == next.producer
                 && dispatch.method != next.method
                 && receives.len() == 2
                 && receives.contains(&(dispatch.actor, dispatch.method))
                 && receives.contains(&(next.actor, next.method)) =>
+        {
+            Ok(Some(dispatch))
+        }
+        (
+            Some(dispatch),
+            None,
+            [(actor, method)],
+            0,
+            Some((resolve_actor, resolve_method, reply)),
+        ) if dispatch.reply == Some(reply)
+            && (dispatch.actor, dispatch.method) == (*actor, *method)
+            && (dispatch.actor, dispatch.method) == (resolve_actor, resolve_method) =>
         {
             Ok(Some(dispatch))
         }
@@ -697,6 +869,7 @@ fn bind_actor_dispatch(
         method: FunctionId(dispatch.method.0),
         producer: FunctionId(dispatch.producer.0),
         permit: ProofId(dispatch.permit.0),
+        reply: dispatch.reply.map(|reply| ProofId(reply.0)),
         mailbox,
     }))
 }
@@ -716,7 +889,8 @@ fn preflight(
         request.limits,
         is_cancelled,
     )?;
-    let activation_subset = !activations.is_empty();
+    let activation_subset = !activations.is_empty()
+        || flow_actor_dispatch.is_some_and(|dispatch| dispatch.reply.is_some());
     if !input.globals.is_empty()
         || !input.devices.is_empty()
         || !input.pools.is_empty()
@@ -1009,11 +1183,18 @@ fn preflight(
         request.limits.report_bytes,
     )?;
     let startup_instruction_count =
-        count_startup_dispatch_instructions(&activations, request.limits, is_cancelled)?;
+        count_startup_dispatch_instructions(&activations, request.limits, is_cancelled)?
+            .checked_add(usize::from(
+                flow_actor_dispatch.is_some_and(|dispatch| dispatch.reply.is_some()),
+            ))
+            .ok_or(MachineLowerError::ResourceLimit {
+                resource: "MachineWir instructions",
+                limit: request.limits.instructions,
+            })?;
 
     for function in &input.functions {
         check_cancelled(is_cancelled)?;
-        validate_function_surface(input, function, &activations, is_cancelled)?;
+        validate_function_surface(input, function, &activations, actor_dispatch, is_cancelled)?;
         let return_count = count_return_blocks(function, is_cancelled)?;
         let generated_returns = if function.role == flow::FunctionRole::ImageEntry {
             return_count
@@ -1233,10 +1414,15 @@ fn preflight(
         region_storage,
         storage_byte_type,
         assertion_storage_type,
-        startup_task: activations.iter().find_map(|activation| {
-            (activation.schedule == MachineActivationSchedule::StartupOnce)
-                .then_some(activation.caller)
-        }),
+        startup_task: actor_dispatch
+            .filter(|dispatch| dispatch.reply.is_some())
+            .map(|dispatch| dispatch.producer)
+            .or_else(|| {
+                activations.iter().find_map(|activation| {
+                    (activation.schedule == MachineActivationSchedule::StartupOnce)
+                        .then_some(activation.caller)
+                })
+            }),
         mailbox_turn: activations.iter().find_map(|activation| {
             matches!(
                 activation.schedule,
@@ -1322,7 +1508,11 @@ fn lower_activation_subset(
         && actor.turn_functions.len() == 2
         && actor.mailbox_capacity == 1
         && dispatch.is_some();
-    if !(input.activations.len() == 2 || recurring_chain)
+    let reply_profile = input.activations.is_empty()
+        && dispatch.is_some_and(|dispatch| dispatch.reply.is_some())
+        && actor.turn_functions.len() == 1
+        && actor.mailbox_capacity == 1;
+    if !(input.activations.len() == 2 || recurring_chain || reply_profile)
         || actor.id != flow::ActorId(0)
         || actor.mailbox_capacity == 0
         || actor.message_types.len() > 1
@@ -1707,7 +1897,9 @@ fn lower_activation_subset(
         .iter()
         .filter(|plan| plan.schedule == MachineActivationSchedule::StartupOnce)
         .count();
-    if !(actor_count == 1 || (recurring_chain && actor_count == 2)) || task_count != 1 {
+    if !reply_profile
+        && (!(actor_count == 1 || (recurring_chain && actor_count == 2)) || task_count != 1)
+    {
         return Err(unsupported(
             "one actor-turn and one startup-task activation",
         ));
@@ -2092,7 +2284,7 @@ fn lower_region_storage(
     limits: MachineLoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<MachineRegionStorage>, MachineLowerError> {
-    if activations.is_empty() {
+    if activations.is_empty() && input.actors.is_empty() {
         if !input.regions.is_empty()
             || (storage_byte_type.is_some() && assertion_storage_type.is_none())
         {
@@ -3571,6 +3763,7 @@ fn count_actor_mailbox_failure_sites(
                 if matches!(
                     instruction.operation,
                     flow::FlowOperation::ActorReserve { .. }
+                        | flow::FlowOperation::ActorReplyRequest { .. }
                         | flow::FlowOperation::MailboxReceive { .. }
                 ) {
                     count = count
@@ -4142,12 +4335,17 @@ fn validate_function_surface(
     input: &flow::FlowWir,
     function: &flow::FlowFunction,
     activations: &[MachineActivationPlan],
+    actor_dispatch: Option<ActorDispatchPlan>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), MachineLowerError> {
     let activation_function = activations
         .iter()
         .any(|plan| plan.caller.0 == function.id.0 || plan.callee.0 == function.id.0);
-    if function.color != flow::FunctionColor::Sync && !activation_function {
+    let reply_function = actor_dispatch.is_some_and(|dispatch| {
+        dispatch.reply.is_some()
+            && (dispatch.producer.0 == function.id.0 || dispatch.method.0 == function.id.0)
+    });
+    if function.color != flow::FunctionColor::Sync && !activation_function && !reply_function {
         return Err(unsupported(
             "asynchronous or interrupt-colored functions without an exact runtime lowering",
         ));
@@ -4156,7 +4354,10 @@ fn validate_function_surface(
         return Err(unsupported("functions with multiple return values"));
     }
     validate_native_struct_locality_in(input, function, is_cancelled)?;
-    if (function.stack_bound != 0 || function.frame_bound != 0) && !activation_function {
+    if (function.stack_bound != 0 || function.frame_bound != 0)
+        && !activation_function
+        && !reply_function
+    {
         return Err(unsupported("nonzero scalar function stack or frame bounds"));
     }
     match function.role {
@@ -4165,7 +4366,7 @@ fn validate_function_surface(
         | flow::FunctionRole::ImageEntry
         | flow::FunctionRole::Test => {}
         flow::FunctionRole::ActorTurn(_) | flow::FunctionRole::TaskEntry(_)
-            if activation_function => {}
+            if activation_function || reply_function => {}
         flow::FunctionRole::ActorTurn(_)
         | flow::FunctionRole::TaskEntry(_)
         | flow::FunctionRole::Isr(_) => {
@@ -4502,6 +4703,7 @@ fn for_each_flow_operation_value(
         | flow::FlowOperation::RegionReset { .. }
         | flow::FlowOperation::ActorCapability { .. }
         | flow::FlowOperation::ActorReserve { .. }
+        | flow::FlowOperation::ActorReplyRequest { .. }
         | flow::FlowOperation::MailboxReceive { .. }
         | flow::FlowOperation::TaskAcquireSlot { .. }
         | flow::FlowOperation::Checkpoint { .. }
@@ -4539,7 +4741,8 @@ fn for_each_flow_operation_value(
             destination: value, ..
         }
         | flow::FlowOperation::TestEmit { payload: value }
-        | flow::FlowOperation::TestFinish { outcome: value } => visit(*value),
+        | flow::FlowOperation::TestFinish { outcome: value }
+        | flow::FlowOperation::ActorReplyResolve { outcome: value, .. } => visit(*value),
         flow::FlowOperation::Binary { left, right, .. } => {
             visit(*left);
             visit(*right);
@@ -5210,6 +5413,46 @@ fn validate_supported_operation(
                 Ok(())
             } else {
                 Err(unsupported("actor message payload lowering"))
+            }
+        }
+        flow::FlowOperation::ActorReplyRequest { .. } => {
+            let [result] = instruction.results.as_slice() else {
+                return Err(unsupported("an actor reply request without one result"));
+            };
+            if input
+                .types
+                .get(flow_value_type(function, *result)?.0 as usize)
+                .is_some_and(|ty| {
+                    ty.kind
+                        == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                            signed: false,
+                            bits: 64,
+                        })
+                })
+            {
+                Ok(())
+            } else {
+                Err(unsupported(
+                    "an actor reply request with the wrong result type",
+                ))
+            }
+        }
+        flow::FlowOperation::ActorReplyResolve { outcome, .. } => {
+            require_no_results(instruction)?;
+            if input
+                .types
+                .get(flow_value_type(function, *outcome)?.0 as usize)
+                .is_some_and(|ty| {
+                    ty.kind
+                        == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                            signed: false,
+                            bits: 64,
+                        })
+                })
+            {
+                Ok(())
+            } else {
+                Err(unsupported("an actor reply resolve with a non-u64 outcome"))
             }
         }
         flow::FlowOperation::MailboxReceive { .. } => require_no_results(instruction),
@@ -6215,6 +6458,7 @@ fn lower_proof_kind(kind: &flow::ProofKind) -> wrela_machine_wir::BackendProofKi
         Flow::ViewDoesNotEscape => Machine::ViewDoesNotEscape,
         Flow::RegionBound => Machine::RegionBound,
         Flow::CapacityBound => Machine::CapacityBound,
+        Flow::ActorReplyExactlyOnce => Machine::ActorReplyExactlyOnce,
         Flow::WaitGraphAcyclic => Machine::WaitGraphAcyclic,
         Flow::CleanupAcyclic => Machine::CleanupAcyclic,
         Flow::WorkBound => Machine::WorkBound,
@@ -6678,10 +6922,29 @@ fn lower_function(
         result,
         proofs,
         values,
-        stack_slots: Vec::new(),
+        stack_slots: if plan.actor_dispatch.is_some_and(|dispatch| {
+            dispatch.reply.is_some() && dispatch.producer.0 == function.id.0
+        }) {
+            vec![StackSlot {
+                id: StackSlotId(0),
+                size: 16,
+                alignment: 8,
+                source_name: Some("actor.reply.slot".to_owned()),
+                live_states: Vec::new(),
+                overlay_group: None,
+            }]
+        } else {
+            Vec::new()
+        },
         blocks,
         entry: machine_entry,
-        stack_bytes: 0,
+        stack_bytes: if plan.actor_dispatch.is_some_and(|dispatch| {
+            dispatch.reply.is_some() && dispatch.producer.0 == function.id.0
+        }) {
+            16
+        } else {
+            0
+        },
         source: function.source,
     })
 }
@@ -7440,6 +7703,60 @@ fn lower_operation(
                 mailbox: dispatch.mailbox,
                 actor: dispatch.actor,
                 method,
+            }
+        }
+        flow::FlowOperation::ActorReplyRequest {
+            actor,
+            method,
+            permit,
+            reply,
+        } => {
+            require_single_result(instruction)?;
+            let dispatch = plan
+                .actor_dispatch
+                .filter(|dispatch| {
+                    dispatch.reply == Some(ProofId(reply.0))
+                        && dispatch.actor == actor.0
+                        && dispatch.method.0 == method.0
+                        && dispatch.producer.0 == function.id.0
+                        && dispatch.permit.0 == permit.0
+                })
+                .ok_or(unsupported("a substituted machine actor reply request"))?;
+            MachineOperation::ActorReplyRequest {
+                slot: StackSlotId(0),
+                mailbox: dispatch.mailbox,
+                actor: dispatch.actor,
+                method: dispatch.method,
+                permit: dispatch.permit,
+                reply: ProofId(reply.0),
+                failure: scalar_failure(
+                    ScalarFailureKind::ActorReplyStateMismatch,
+                    function,
+                    instruction,
+                ),
+                duplicate_failure: scalar_failure(
+                    ScalarFailureKind::ActorReplyDuplicateResolve,
+                    function,
+                    instruction,
+                ),
+            }
+        }
+        flow::FlowOperation::ActorReplyResolve { outcome, reply } => {
+            require_no_results(instruction)?;
+            let dispatch = plan
+                .actor_dispatch
+                .filter(|dispatch| {
+                    dispatch.reply == Some(ProofId(reply.0))
+                        && dispatch.method.0 == function.id.0
+                        && matches!(function.role, flow::FunctionRole::ActorTurn(actor)
+                            if actor.0 == dispatch.actor)
+                })
+                .ok_or(unsupported("a substituted machine actor reply resolve"))?;
+            MachineOperation::ActorReplyResolve {
+                outcome: map_value(*outcome, mapping)?,
+                reply: dispatch.reply.ok_or(unsupported(
+                    "an actor reply resolve without reply authority",
+                ))?,
             }
         }
         flow::FlowOperation::MailboxReceive { actor, method } => {

@@ -3987,6 +3987,16 @@ fn test_result_is_unit(result: Option<&wrela_hir::TypeExpression>) -> bool {
     }
 }
 
+fn actor_reply_result_is_u64(result: Option<&wrela_hir::TypeExpression>) -> bool {
+    matches!(
+        result.map(|result| &result.kind),
+        Some(TypeExpressionKind::Named {
+            definition: Definition::Builtin(wrela_hir::Builtin::U64),
+            arguments,
+        }) if arguments.is_empty()
+    )
+}
+
 fn test_source_diagnostic(source: Span, code: &str, message: &str) -> Diagnostic {
     let mut diagnostic = Diagnostic::error(Category::COMPTIME, source, message);
     diagnostic.code = Some(code.to_owned());
@@ -8140,6 +8150,45 @@ fn analyze_actor_send_expression(
     state: &mut RuntimeState<'_>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> RuntimeResult<RuntimeExpression> {
+    let resolved =
+        resolve_self_actor_send(request, partial, function, expression_id, is_cancelled)?;
+    let target = partial
+        .functions
+        .get(resolved.method.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if partial
+        .types
+        .get(target.result.0 as usize)
+        .is_none_or(|ty| ty.kind != SemanticTypeKind::Unit)
+    {
+        return Err(actor_runtime_diagnostic(
+            Category::ACTOR,
+            resolved.source,
+            "semantic-actor-send-reply-discarded",
+            "one-way send cannot discard a typed actor reply",
+            "await the request from one bounded startup task, or make the actor turn return unit",
+        ));
+    }
+    analyze_actor_request_expression(
+        request,
+        partial,
+        function,
+        expression_id,
+        None,
+        state,
+        is_cancelled,
+    )
+}
+
+fn analyze_actor_request_expression(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    expression_id: ExpressionId,
+    reply: Option<ProofId>,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<RuntimeExpression> {
     check_cancelled(is_cancelled)?;
     let resolved =
         resolve_self_actor_send(request, partial, function, expression_id, is_cancelled)?;
@@ -8255,18 +8304,22 @@ fn analyze_actor_send_expression(
             ownership_after: OwnershipState::Owned,
         },
     )?;
-    let reservation_ty = partial
-        .types
-        .iter()
-        .find(|ty| ty.kind == SemanticTypeKind::Reservation)
-        .map(|ty| ty.id)
-        .ok_or(AnalysisFailure::RequestMismatch)?;
-    let reservation = expression_result(
+    let result_ty = if reply.is_some() {
+        target_result
+    } else {
+        partial
+            .types
+            .iter()
+            .find(|ty| ty.kind == SemanticTypeKind::Reservation)
+            .map(|ty| ty.id)
+            .ok_or(AnalysisFailure::RequestMismatch)?
+    };
+    let result = expression_result(
         request,
         partial,
         function,
         (expression_id, resolved.source),
-        reservation_ty,
+        result_ty,
         None,
         is_cancelled,
     )?;
@@ -8276,21 +8329,26 @@ fn analyze_actor_send_expression(
         RuntimeExpressionFact {
             function,
             expression: expression_id,
-            ty: reservation_ty,
-            result: Some(reservation),
+            ty: result_ty,
+            result: Some(result),
             resolution: ExpressionResolution::ActorRequest {
                 actor: resolved.actor,
                 method: resolved.method,
                 permit,
+                reply,
             },
             effects: EffectSet(EffectSet::ACTOR),
             ownership_before: OwnershipState::Owned,
-            ownership_after: OwnershipState::Taken,
+            ownership_after: if reply.is_some() {
+                OwnershipState::Owned
+            } else {
+                OwnershipState::Taken
+            },
         },
     )?;
     Ok(RuntimeExpression {
-        ty: reservation_ty,
-        result: Some(reservation),
+        ty: result_ty,
+        result: Some(result),
         referenced: None,
         effects: EffectSet(EffectSet::ACTOR),
     })
@@ -9029,19 +9087,85 @@ fn analyze_await_expression(
             "bind the awaited result before requesting exclusive access",
         ));
     }
-    let awaited = analyze_runtime_expression(
-        request,
-        partial,
-        function,
-        await_expression.operand,
-        RuntimeExpressionRequest {
-            expected: expression_request.expected,
-            desired_result: None,
-            access: AccessMode::Value,
-        },
-        state,
-        is_cancelled,
-    )?;
+    let program = request.hir.as_program();
+    let actor_dependency_call = program
+        .expression(await_expression.operand)
+        .and_then(|operand| match operand.kind {
+            ExpressionKind::Call { callee, .. } => program.expression(callee),
+            _ => None,
+        })
+        .and_then(|callee| match callee.kind {
+            ExpressionKind::Field { base, .. } => program.expression(base),
+            _ => None,
+        })
+        .is_some_and(|base| matches!(base.kind, ExpressionKind::Field { .. }));
+    let awaited = if actor_dependency_call {
+        let resolved = resolve_self_actor_send(
+            request,
+            partial,
+            function,
+            await_expression.operand,
+            is_cancelled,
+        )?;
+        let permit = partial
+            .proofs
+            .iter()
+            .find(|proof| {
+                proof.kind == ProofKind::CapacityBound
+                    && proof.bound == Some(1)
+                    && proof.sources.as_slice() == [resolved.source]
+                    && proof.depends_on.as_slice() == [resolved.mailbox_proof]
+            })
+            .map(|proof| proof.id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let reply = partial
+            .proofs
+            .iter()
+            .find(|proof| {
+                proof.kind == ProofKind::ActorReplyExactlyOnce
+                    && proof.bound == Some(1)
+                    && proof.sources.as_slice() == [resolved.source]
+                    && proof.depends_on.contains(&permit)
+            })
+            .map(|proof| proof.id)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        let outcome = analyze_actor_request_expression(
+            request,
+            partial,
+            function,
+            await_expression.operand,
+            Some(reply),
+            state,
+            is_cancelled,
+        )?;
+        if expression_request
+            .expected
+            .is_some_and(|expected| expected != outcome.ty)
+        {
+            return Err(actor_runtime_diagnostic(
+                Category::TYPE,
+                await_expression.source,
+                "semantic-actor-reply-type-mismatch",
+                "awaited actor reply does not match the required result type",
+                "bind the reply as u64 in the admitted typed-reply subset",
+            ));
+        }
+        outcome
+    } else {
+        analyze_runtime_expression(
+            request,
+            partial,
+            function,
+            await_expression.operand,
+            RuntimeExpressionRequest {
+                expected: expression_request.expected,
+                desired_result: None,
+                access: AccessMode::Value,
+            },
+            state,
+            is_cancelled,
+        )?
+    };
     let target_is_async = partial
         .expressions
         .iter()
@@ -21721,13 +21845,16 @@ fn inspect_actor_plans(
                     "provide a concrete bounded runtime body",
                 ));
             };
-            if !test_result_is_unit(function.result.as_ref()) || function.parameters.is_empty() {
+            let unit_result = test_result_is_unit(function.result.as_ref());
+            let bounded_reply_result = matches!(role, ActorMethodRole::Turn)
+                && actor_reply_result_is_u64(function.result.as_ref());
+            if (!unit_result && !bounded_reply_result) || function.parameters.is_empty() {
                 return Err(actor_runtime_diagnostic(
                     Category::TYPE,
                     member.source,
                     "semantic-actor-method-signature",
-                    "actor methods in this slice require a receiver and a unit result",
-                    "add `mut self` and return unit",
+                    "actor methods require a receiver and an admitted bounded result",
+                    "use unit, or u64 on a public turn consumed by the exact single-flight reply path",
                 ));
             }
             let receiver = program
@@ -22169,17 +22296,31 @@ fn resolve_self_actor_send(
         .functions
         .get(method.0 as usize)
         .ok_or(AnalysisFailure::RequestMismatch)?;
+    let result_is_unit_or_u64 = partial
+        .types
+        .get(method_record.result.0 as usize)
+        .is_some_and(|ty| {
+            ty.kind == SemanticTypeKind::Unit
+                || matches!(
+                    ty.kind,
+                    SemanticTypeKind::Integer {
+                        signed: false,
+                        bits: 64,
+                        ..
+                    }
+                )
+        });
     if method_record.role != FunctionRole::ActorTurn(actor)
         || method_record.color != FunctionColor::Async
         || method_record.parameters.len() != 1
-        || method_record.result != SemanticTypeId(0)
+        || !result_is_unit_or_u64
     {
         return Err(actor_runtime_diagnostic(
             Category::ACTOR,
             callee_expression.source,
             "semantic-actor-send-target",
-            "one-way send target must be one async unit-message actor turn",
-            "declare `pub async fn method(mut self)` with a bounded body",
+            "actor request target must be one async unit-message actor turn with unit or u64 result",
+            "declare `pub async fn method(mut self)` with a bounded body and an admitted result",
         ));
     }
     let mut mailbox_proof = None;
@@ -22287,7 +22428,9 @@ fn prepare_actor_sends(
         .try_reserve_exact(actor_count)
         .map_err(|_| fact_resource(request, "actor try-send attempt counts"))?;
     attempted.resize(actor_count, 0u32);
-    let mut any_send = false;
+    let mut reply_requests = 0_u32;
+    let mut reply_target = None;
+    let mut needs_reservation = false;
     for plan in plans {
         for method in &plan.methods {
             check_cancelled(is_cancelled)?;
@@ -22302,7 +22445,7 @@ fn prepare_actor_sends(
                 let StatementKind::Send(expression) = statement.kind else {
                     continue;
                 };
-                any_send = true;
+                needs_reservation = true;
                 let resolved =
                     resolve_self_actor_send(request, partial, caller, expression, is_cancelled)?;
                 if direct_edges.len() == 3 {
@@ -22329,13 +22472,204 @@ fn prepare_actor_sends(
                             .statement(*statement)
                             .is_some_and(|statement| statement.body == body)
                     });
+                if let ExpressionKind::Unary {
+                    operator: wrela_hir::UnaryOperator::Await,
+                    operand,
+                } = expression.kind
+                    && belongs_to_method
+                {
+                    let actor_dependency_call = program
+                        .expression(operand)
+                        .and_then(|operand| match operand.kind {
+                            ExpressionKind::Call { callee, .. } => program.expression(callee),
+                            _ => None,
+                        })
+                        .and_then(|callee| match callee.kind {
+                            ExpressionKind::Field { base, .. } => program.expression(base),
+                            _ => None,
+                        })
+                        .is_some_and(|base| matches!(base.kind, ExpressionKind::Field { .. }));
+                    if actor_dependency_call {
+                        reply_requests = reply_requests
+                            .checked_add(1)
+                            .ok_or_else(|| fact_resource(request, "actor reply requests"))?;
+                        if reply_requests != 1
+                            || !matches!(
+                                partial
+                                    .functions
+                                    .get(caller.0 as usize)
+                                    .map(|record| record.role),
+                                Some(FunctionRole::TaskEntry(_))
+                            )
+                        {
+                            return Err(actor_runtime_diagnostic(
+                                Category::ACTOR,
+                                expression.source,
+                                "semantic-actor-reply-single-flight",
+                                "typed actor replies require one exact startup-task request",
+                                "await one image-wired actor request from one bounded startup task",
+                            ));
+                        }
+                        let exact_root_request = expression.owner
+                            == wrela_hir::ExpressionOwner::Body(method.body)
+                            && program.body(method.body).is_some_and(|body| {
+                                let [statement] = body.statements.as_slice() else {
+                                    return false;
+                                };
+                                program.statement(*statement).is_some_and(|statement| {
+                                    matches!(
+                                        statement.kind,
+                                        StatementKind::Initialize { value, .. }
+                                            if value == expression.id
+                                    )
+                                })
+                            });
+                        if !exact_root_request {
+                            return Err(actor_runtime_diagnostic(
+                                Category::ACTOR,
+                                expression.source,
+                                "semantic-actor-reply-single-flight",
+                                "typed actor reply is not one exact top-level startup request",
+                                "make the awaited request the startup task's sole direct binding; branches, loops, and additional effects are not admitted",
+                            ));
+                        }
+                        let resolved = resolve_self_actor_send(
+                            request,
+                            partial,
+                            caller,
+                            operand,
+                            is_cancelled,
+                        )?;
+                        let target = partial
+                            .functions
+                            .get(resolved.method.0 as usize)
+                            .ok_or(AnalysisFailure::RequestMismatch)?;
+                        let source_returns_u64 = match target.origin {
+                            FunctionOrigin::Source { declaration, .. } => program
+                                .declaration(declaration)
+                                .and_then(|record| match &record.kind {
+                                    DeclarationKind::Function(function) => Some(function),
+                                    _ => None,
+                                })
+                                .is_some_and(|function| {
+                                    actor_reply_result_is_u64(function.result.as_ref())
+                                }),
+                            _ => false,
+                        };
+                        if !source_returns_u64 {
+                            return Err(actor_runtime_diagnostic(
+                                Category::TYPE,
+                                expression.source,
+                                "semantic-actor-reply-type-pending",
+                                "typed actor reply is outside the exact u64 result subset",
+                                "return u64 from the requested public async turn",
+                            ));
+                        }
+                        let definitely_returns = match target.origin {
+                            FunctionOrigin::Source { body, .. } => {
+                                program.body(body).is_some_and(|body| {
+                                    let [statement] = body.statements.as_slice() else {
+                                        return false;
+                                    };
+                                    program.statement(*statement).is_some_and(|statement| {
+                                        matches!(statement.kind, StatementKind::Return(Some(_)))
+                                    })
+                                })
+                            }
+                            _ => false,
+                        };
+                        if !definitely_returns {
+                            return Err(actor_runtime_diagnostic(
+                                Category::ACTOR,
+                                target.source.unwrap_or(expression.source),
+                                "semantic-actor-reply-definite-result",
+                                "typed actor reply target does not return one definite result",
+                                "use one direct `return <u64>` statement on the admitted reply turn",
+                            ));
+                        }
+                        reply_target = Some(resolved.method);
+                        let target_name = target.name.clone();
+                        let target_type_proof = target
+                            .proofs
+                            .iter()
+                            .copied()
+                            .find(|proof| {
+                                partial
+                                    .proofs
+                                    .get(proof.0 as usize)
+                                    .is_some_and(|record| record.kind == ProofKind::TypeChecked)
+                            })
+                            .ok_or(AnalysisFailure::RequestMismatch)?;
+                        let permit = append_actor_send_permit(
+                            request,
+                            partial,
+                            caller,
+                            resolved,
+                            "reply admission: ",
+                            "the startup-once producer owns one same-core capacity-one request and reply slot",
+                            is_cancelled,
+                        )?;
+                        if partial.proofs.len() >= request.limits.proofs as usize {
+                            return Err(fact_resource(request, "actor reply proof").into());
+                        }
+                        let reply = ProofId(
+                            u32::try_from(partial.proofs.len())
+                                .map_err(|_| fact_resource(request, "actor reply proof"))?,
+                        );
+                        partial
+                            .proofs
+                            .try_reserve(1)
+                            .map_err(|_| fact_resource(request, "actor reply proof"))?;
+                        let mut depends_on = Vec::new();
+                        depends_on.try_reserve_exact(2).map_err(|_| {
+                            AnalysisFailure::ResourceLimit {
+                                resource: "actor reply proof dependencies",
+                                limit: 2,
+                            }
+                        })?;
+                        depends_on.extend([target_type_proof, permit]);
+                        depends_on.sort_unstable();
+                        depends_on.dedup();
+                        partial.proofs.push(Proof {
+                            id: reply,
+                            kind: ProofKind::ActorReplyExactlyOnce,
+                            subject: bounded_actor_text(
+                                request,
+                                "single-flight reply: ",
+                                "",
+                                target_name.as_str(),
+                                is_cancelled,
+                            )?,
+                            sources: vec![resolved.source],
+                            depends_on,
+                            bound: Some(1),
+                            explanation: vec![
+                                "one static caller-owned reply slot transitions Empty→Pending→Writing→Resolved→Consumed exactly once"
+                                    .to_owned(),
+                            ],
+                        });
+                        let producer = partial
+                            .functions
+                            .get_mut(caller.0 as usize)
+                            .ok_or(AnalysisFailure::RequestMismatch)?;
+                        producer
+                            .proofs
+                            .try_reserve(1)
+                            .map_err(|_| fact_resource(request, "actor reply proof references"))?;
+                        producer.proofs.push(reply);
+                        producer.proofs.sort_unstable();
+                        producer.proofs.dedup();
+                        producer.effects.0 |= EffectSet::ACTOR;
+                        continue;
+                    }
+                }
                 let ExpressionKind::TrySend(call) = expression.kind else {
                     continue;
                 };
                 if !belongs_to_method {
                     continue;
                 }
-                any_send = true;
+                needs_reservation = true;
                 let resolved =
                     resolve_self_actor_send(request, partial, caller, call, is_cancelled)?;
                 if !matches!(
@@ -22380,10 +22714,38 @@ fn prepare_actor_sends(
             }
         }
     }
+    for plan in plans {
+        for method in &plan.methods {
+            check_cancelled(is_cancelled)?;
+            let declaration = request
+                .hir
+                .as_program()
+                .declaration(method.declaration)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            let returns_u64 = match &declaration.kind {
+                DeclarationKind::Function(function) => {
+                    actor_reply_result_is_u64(function.result.as_ref())
+                }
+                _ => false,
+            };
+            if matches!(method.role, ActorMethodRole::Turn)
+                && returns_u64
+                && method.function != reply_target
+            {
+                return Err(actor_runtime_diagnostic(
+                    Category::ACTOR,
+                    method.source,
+                    "semantic-actor-reply-unconsumed",
+                    "u64 actor turn has no exact single-flight reply consumer",
+                    "await this turn as the sole direct startup-task request, or return unit",
+                ));
+            }
+        }
+    }
     if !direct_edges.is_empty() {
         validate_and_seal_direct_actor_send_chain(request, partial, &direct_edges, is_cancelled)?;
     }
-    if any_send {
+    if needs_reservation {
         let _ = ensure_actor_reservation_type(request, partial)?;
     }
     Ok(())
@@ -22988,6 +23350,16 @@ fn append_actor_method_function(
             ty,
         });
     }
+    let result = if let Some(result) = &source.result {
+        semantic_type_from_source(request, partial, result, &mut *aggregate_work, is_cancelled)?
+    } else {
+        partial
+            .types
+            .iter()
+            .find(|ty| ty.kind == SemanticTypeKind::Unit)
+            .map(|ty| ty.id)
+            .ok_or(AnalysisFailure::RequestMismatch)?
+    };
     let first_proof = ProofId(
         u32::try_from(partial.proofs.len())
             .map_err(|_| fact_resource(request, "actor function proofs"))?,
@@ -23017,7 +23389,7 @@ fn append_actor_method_function(
         depends_on: Vec::new(),
         bound: None,
         explanation: vec![
-            "the concrete actor receiver, scalar parameters, and unit result are well typed"
+            "the concrete actor receiver, scalar parameters, and admitted bounded result are well typed"
                 .to_owned(),
         ],
     });
@@ -23163,7 +23535,7 @@ fn append_actor_method_function(
         color: plan.color,
         generic_arguments: Vec::new(),
         parameters,
-        result: SemanticTypeId(0),
+        result,
         effects: EffectSet(
             match plan.role {
                 ActorMethodRole::Turn => EffectSet::ACTOR,
@@ -23552,6 +23924,11 @@ fn analyze_wait_graph(
         let target = match operand_fact.resolution {
             ExpressionResolution::DirectCall {
                 function: target, ..
+            }
+            | ExpressionResolution::ActorRequest {
+                method: target,
+                reply: Some(_),
+                ..
             } => target,
             _ => return Err(AnalysisFailure::RequestMismatch.into()),
         };
@@ -26164,6 +26541,183 @@ pub fn boot() -> Image:
     return img
 "#
         )
+    }
+
+    const ACTOR_REPLY_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self) -> u64:
+        return 7
+
+@app
+pub struct Client:
+    worker: Actor[Worker]
+
+    @task
+    async fn request(mut self):
+        answer: u64 = await self.worker.ping()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    worker = img.service(Worker, mailbox=1)
+    client = img.app(Client, worker=worker.handle(), mailbox=1)
+    return img
+"#;
+
+    #[test]
+    fn startup_task_awaits_one_exact_u64_actor_reply() {
+        let fixture = parsed_actor_fixture(ACTOR_REPLY_SOURCE);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("actor reply analysis is recoverable");
+        assert!(
+            output.diagnostics().is_empty(),
+            "exact actor reply must analyze: {:?}",
+            output.diagnostics()
+        );
+        let image = output.successful().expect("actor reply image seals");
+        let facts = image.facts();
+        let request = facts
+            .expressions
+            .iter()
+            .find(|fact| matches!(fact.resolution, ExpressionResolution::ActorRequest { .. }))
+            .expect("awaited actor request fact");
+        assert!(matches!(
+            facts.types.get(request.ty.0 as usize).map(|ty| &ty.kind),
+            Some(SemanticTypeKind::Integer {
+                signed: false,
+                bits: 64,
+                ..
+            })
+        ));
+        assert!(facts.expressions.iter().any(|fact| {
+            fact.resolution == ExpressionResolution::Builtin(IntrinsicOperation::Await)
+                && fact.ty == request.ty
+                && fact.effects == EffectSet(EffectSet::ACTOR | EffectSet::SUSPEND)
+        }));
+        let request_index = facts
+            .expressions
+            .iter()
+            .position(|fact| fact.expression == request.expression)
+            .expect("request index");
+        let await_index = facts
+            .expressions
+            .iter()
+            .position(|fact| {
+                fact.resolution == ExpressionResolution::Builtin(IntrinsicOperation::Await)
+            })
+            .expect("await index");
+        let ExpressionResolution::ActorRequest {
+            permit,
+            reply: Some(reply),
+            ..
+        } = request.resolution
+        else {
+            panic!("typed request authority");
+        };
+
+        let mut forged_request_proofs = facts.clone();
+        forged_request_proofs.expressions[request_index]
+            .proofs
+            .retain(|proof| *proof != permit);
+        forged_request_proofs
+            .validate_partial_structure()
+            .expect("proof omission remains prefix-valid");
+        assert!(
+            forged_request_proofs
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err(),
+            "the exact request must carry its permit proof"
+        );
+
+        let mut forged_await_effects = facts.clone();
+        forged_await_effects.expressions[await_index].effects = EffectSet(EffectSet::SUSPEND);
+        forged_await_effects
+            .validate_partial_structure()
+            .expect("effect substitution remains prefix-valid");
+        assert!(
+            forged_await_effects
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err(),
+            "await must preserve actor effects"
+        );
+
+        let producer = request.function;
+        let mut forged_function_effects = facts.clone();
+        forged_function_effects.functions[producer.0 as usize].effects =
+            EffectSet(EffectSet::TASK | EffectSet::SUSPEND);
+        forged_function_effects
+            .validate_partial_structure()
+            .expect("function effect substitution remains prefix-valid");
+        assert!(
+            forged_function_effects
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err(),
+            "reply producer must retain the actor effect"
+        );
+
+        let mut forged_reply_dependencies = facts.clone();
+        forged_reply_dependencies.proofs[reply.0 as usize].depends_on = vec![permit];
+        forged_reply_dependencies
+            .validate_partial_structure()
+            .expect("dependency omission remains prefix-valid");
+        assert!(
+            forged_reply_dependencies
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err(),
+            "reply proof must depend on the target result witness"
+        );
+    }
+
+    #[test]
+    fn typed_actor_reply_rejects_nonexact_or_unconsumed_paths_by_name() {
+        let cases = [
+            (
+                ACTOR_REPLY_SOURCE.replace(
+                    "        answer: u64 = await self.worker.ping()",
+                    "        pass\n        answer: u64 = await self.worker.ping()",
+                ),
+                "semantic-actor-reply-single-flight",
+            ),
+            (
+                ACTOR_REPLY_SOURCE.replace("        return 7", "        pass"),
+                "semantic-actor-reply-definite-result",
+            ),
+            (
+                ACTOR_REPLY_SOURCE.replace(
+                    "    pub async fn ping(mut self) -> u64:\n        return 7",
+                    "    pub async fn ping(mut self) -> u64:\n        return 7\n\n    pub async fn unused(mut self) -> u64:\n        return 9",
+                ),
+                "semantic-actor-reply-unconsumed",
+            ),
+        ];
+        for (source, expected) in cases {
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("actor reply rejection is recoverable");
+            assert_eq!(
+                output
+                    .diagnostics()
+                    .first()
+                    .and_then(|diagnostic| diagnostic.code.as_deref()),
+                Some(expected),
+                "unexpected diagnostics: {:?}",
+                output.diagnostics()
+            );
+        }
     }
 
     #[test]

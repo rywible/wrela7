@@ -1044,6 +1044,7 @@ impl<'a> Writer<'a> {
             ProofKind::ValueRange => 22,
             ProofKind::Alignment => 23,
             ProofKind::NoAlias => 24,
+            ProofKind::ActorReplyExactlyOnce => 25,
         };
         self.u8(tag)
     }
@@ -1476,6 +1477,23 @@ fn encode_operation(writer: &mut Writer<'_>, value: &FlowOperation) -> Result<()
             writer.u32(value.0)?;
             writer.u32(destination.0)?;
             writer.u32(proof.0)
+        }
+        FlowOperation::ActorReplyRequest {
+            actor,
+            method,
+            permit,
+            reply,
+        } => {
+            writer.u8(55)?;
+            writer.u32(actor.0)?;
+            writer.u32(method.0)?;
+            writer.u32(permit.0)?;
+            writer.u32(reply.0)
+        }
+        FlowOperation::ActorReplyResolve { outcome, reply } => {
+            writer.u8(56)?;
+            writer.u32(outcome.0)?;
+            writer.u32(reply.0)
         }
     }
 }
@@ -2197,6 +2215,7 @@ impl<'a> Reader<'a> {
             22 => ProofKind::ValueRange,
             23 => ProofKind::Alignment,
             24 => ProofKind::NoAlias,
+            25 => ProofKind::ActorReplyExactlyOnce,
             tag => return Err(invalid_tag("ProofKind", tag)),
         })
     }
@@ -2619,6 +2638,16 @@ impl Reader<'_> {
                 destination: RegionId(self.u32()?),
                 proof: ProofId(self.u32()?),
             },
+            55 => FlowOperation::ActorReplyRequest {
+                actor: ActorId(self.u32()?),
+                method: FunctionId(self.u32()?),
+                permit: ProofId(self.u32()?),
+                reply: ProofId(self.u32()?),
+            },
+            56 => FlowOperation::ActorReplyResolve {
+                outcome: ValueId(self.u32()?),
+                reply: ProofId(self.u32()?),
+            },
             tag => return Err(invalid_tag("FlowOperation", tag)),
         })
     }
@@ -2697,7 +2726,7 @@ mod tests {
             name: "canonical-image".to_owned(),
             build: build_identity(7),
             source_summary: SourceSummary {
-                semantic_wir_version: 11,
+                semantic_wir_version: 12,
                 semantic_functions: 2,
                 hir_files: 1,
                 hir_declarations: 2,
@@ -3091,7 +3120,7 @@ mod tests {
         harness_name.clone_from(&name);
         model
             .validate()
-            .expect("valid long-prefix FlowWir v13 fixture")
+            .expect("valid long-prefix FlowWir v14 fixture")
     }
 
     struct SubstitutingCodec<'a> {
@@ -4491,7 +4520,7 @@ mod tests {
                 &|| false,
             ),
             Err(CodecError::NonCanonical(
-                "codec output differs from the canonical FlowWir v13 encoding"
+                "codec output differs from the canonical FlowWir v14 encoding"
             ))
         ));
     }
@@ -4986,12 +5015,38 @@ mod tests {
             .finish()
             .expect("promotion operation consumes exactly");
 
-        let mut reader = Reader::new(&[55], 0, CodecLimits::standard(), &not_cancelled);
+        let reply_operations = [
+            FlowOperation::ActorReplyRequest {
+                actor: ActorId(1),
+                method: FunctionId(2),
+                permit: ProofId(3),
+                reply: ProofId(4),
+            },
+            FlowOperation::ActorReplyResolve {
+                outcome: ValueId(5),
+                reply: ProofId(4),
+            },
+        ];
+        for (operation, expected_tag) in reply_operations.iter().zip([55_u8, 56]) {
+            let mut writer = Writer::new(CodecLimits::standard(), &not_cancelled);
+            writer
+                .operation(operation)
+                .expect("actor reply operation encodes");
+            let bytes = writer.finish();
+            assert_eq!(bytes[0], expected_tag);
+            let mut reader = Reader::new(&bytes, 0, CodecLimits::standard(), &not_cancelled);
+            assert_eq!(reader.operation(), Ok(operation.clone()));
+            reader
+                .finish()
+                .expect("actor reply operation consumes exactly");
+        }
+
+        let mut reader = Reader::new(&[57], 0, CodecLimits::standard(), &not_cancelled);
         assert_eq!(
             reader.operation(),
             Err(CodecError::InvalidEnumTag {
                 kind: "FlowOperation",
-                tag: 55,
+                tag: 57,
             })
         );
     }

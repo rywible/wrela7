@@ -15,7 +15,7 @@ mod canonical;
 
 pub use canonical::CanonicalFlowWirCodec;
 
-pub const FLOW_WIR_WIRE_VERSION: u32 = 13;
+pub const FLOW_WIR_WIRE_VERSION: u32 = 14;
 pub const FLOW_WIR_MAGIC: &[u8; 8] = b"WRELFLO\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,7 +178,7 @@ pub fn encode_and_verify(
     let expected = CanonicalFlowWirCodec.encode(EncodeRequest { wir, limits }, is_cancelled)?;
     if !encoded_candidate_equal(&expected, &candidate, is_cancelled)? {
         return Err(CodecError::NonCanonical(
-            "codec output differs from the canonical FlowWir v13 encoding",
+            "codec output differs from the canonical FlowWir v14 encoding",
         ));
     }
     drop(expected);
@@ -492,7 +492,7 @@ mod tests {
                 profile: digest,
             },
             source_summary: SourceSummary {
-                semantic_wir_version: 11,
+                semantic_wir_version: 12,
                 semantic_functions: 1,
                 hir_files: 1,
                 hir_declarations: 1,

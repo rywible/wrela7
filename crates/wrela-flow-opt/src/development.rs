@@ -716,6 +716,8 @@ fn fold_operation(
         | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
         | FlowOperation::ActorCommit { .. }
+        | FlowOperation::ActorReplyRequest { .. }
+        | FlowOperation::ActorReplyResolve { .. }
         | FlowOperation::ActorReject { .. }
         | FlowOperation::MailboxReceive { .. }
         | FlowOperation::ReplyResolve { .. }
@@ -2157,6 +2159,7 @@ fn map_operation_values(
         | FlowOperation::RegionReset { .. }
         | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
+        | FlowOperation::ActorReplyRequest { .. }
         | FlowOperation::MailboxReceive { .. }
         | FlowOperation::TaskAcquireSlot { .. }
         | FlowOperation::Checkpoint { .. }
@@ -2195,6 +2198,7 @@ fn map_operation_values(
         }
         | FlowOperation::TestEmit { payload: value }
         | FlowOperation::TestFinish { outcome: value }
+        | FlowOperation::ActorReplyResolve { outcome: value, .. }
         | FlowOperation::MmioWrite { value, .. } => map_value(value, value_map, work)?,
         FlowOperation::Binary { left, right, .. } => {
             map_value(left, value_map, work)?;
@@ -2670,6 +2674,7 @@ fn for_each_operation_value(
         | FlowOperation::RegionReset { .. }
         | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
+        | FlowOperation::ActorReplyRequest { .. }
         | FlowOperation::MailboxReceive { .. }
         | FlowOperation::TaskAcquireSlot { .. }
         | FlowOperation::Checkpoint { .. }
@@ -2708,6 +2713,7 @@ fn for_each_operation_value(
         }
         | FlowOperation::TestEmit { payload: value }
         | FlowOperation::TestFinish { outcome: value }
+        | FlowOperation::ActorReplyResolve { outcome: value, .. }
         | FlowOperation::MmioWrite { value, .. } => visit_value(*value)?,
         FlowOperation::Binary { left, right, .. } => {
             visit_value(*left)?;

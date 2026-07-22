@@ -779,6 +779,11 @@ pub enum ExpressionResolution {
         actor: ActorId,
         method: FunctionInstanceId,
         permit: ProofId,
+        /// Exact single-flight reply authority for an awaited typed request.
+        /// One-way sends carry `None` and retain the strict-linear reservation
+        /// result; the bounded reply slice carries `Some` and produces the
+        /// method's scalar result directly.
+        reply: Option<ProofId>,
     },
     Closure {
         function: FunctionInstanceId,
@@ -1186,6 +1191,7 @@ pub enum ProofKind {
     ViewDoesNotEscape,
     RegionBound,
     CapacityBound,
+    ActorReplyExactlyOnce,
     WaitGraphAcyclic,
     CleanupAcyclic,
     WorkBound,
@@ -2219,6 +2225,22 @@ fn validate_exact_source_facts(
             )?;
         }
         validate_exact_local_value_flow(analysis, program, function, body, is_cancelled)?;
+        let has_typed_actor_reply = analysis.expressions.iter().any(|fact| {
+            fact.function == function.id
+                && matches!(
+                    fact.resolution,
+                    ExpressionResolution::ActorRequest { reply: Some(_), .. }
+                )
+        });
+        if has_typed_actor_reply
+            && (!matches!(function.role, FunctionRole::TaskEntry(_))
+                || function.effects
+                    != EffectSet(EffectSet::TASK | EffectSet::ACTOR | EffectSet::SUSPEND))
+        {
+            return Err(invalid(
+                "typed actor reply producer effects differ from the exact startup-task contract",
+            ));
+        }
     }
 
     for value in &analysis.values {
@@ -3688,13 +3710,18 @@ fn validate_exact_expression_fact(
     let expression = program
         .expression(fact.expression)
         .ok_or_else(|| invalid("expression fact HIR node is missing"))?;
-    let ownership_matches = if matches!(fact.resolution, ExpressionResolution::ActorRequest { .. })
-    {
-        fact.ownership_before == OwnershipState::Owned
-            && fact.ownership_after == OwnershipState::Taken
-    } else {
-        exact_expression_ownership_matches(program, fact, is_cancelled)?
-    };
+    let ownership_matches =
+        if let ExpressionResolution::ActorRequest { reply, .. } = fact.resolution {
+            fact.ownership_before == OwnershipState::Owned
+                && fact.ownership_after
+                    == if reply.is_some() {
+                        OwnershipState::Owned
+                    } else {
+                        OwnershipState::Taken
+                    }
+        } else {
+            exact_expression_ownership_matches(program, fact, is_cancelled)?
+        };
     if !ownership_matches {
         return Err(invalid(
             "expression ownership transition differs from exact HIR access",
@@ -4084,6 +4111,7 @@ fn validate_exact_expression_fact(
                 actor,
                 method,
                 permit,
+                reply,
             },
             Some(_),
         ) if exact_actor_request_matches(
@@ -4096,6 +4124,7 @@ fn validate_exact_expression_fact(
             *actor,
             *method,
             *permit,
+            *reply,
         ) => {}
         (
             wrela_hir::ExpressionKind::Unary { operator, operand },
@@ -4232,7 +4261,7 @@ fn validate_exact_expression_fact(
             },
             ExpressionResolution::Builtin(IntrinsicOperation::Await),
             Some(_),
-        ) if exact_await_operand_matches(analysis, function.id, *operand, fact.ty) => {}
+        ) if exact_await_operand_matches(analysis, function.id, *operand, fact) => {}
         (
             wrela_hir::ExpressionKind::Try(operand),
             ExpressionResolution::ResultTry {
@@ -5955,7 +5984,7 @@ fn exact_await_operand_matches(
     analysis: &PartialAnalysis,
     function: FunctionInstanceId,
     operand: ExpressionId,
-    result: SemanticTypeId,
+    await_fact: &ExpressionFact,
 ) -> bool {
     analysis
         .expressions
@@ -5965,11 +5994,19 @@ fn exact_await_operand_matches(
         .ok()
         .and_then(|index| analysis.expressions.get(index))
         .is_some_and(|operand| {
-            operand.ty == result
+            operand.ty == await_fact.ty
                 && operand.result.is_some()
+                && await_fact.effects == EffectSet(operand.effects.0 | EffectSet::SUSPEND)
+                && await_fact.ownership_before == OwnershipState::Owned
+                && await_fact.ownership_after == OwnershipState::Owned
                 && match operand.resolution {
                     ExpressionResolution::DirectCall {
                         function: target, ..
+                    }
+                    | ExpressionResolution::ActorRequest {
+                        method: target,
+                        reply: Some(_),
+                        ..
                     } => analysis
                         .functions
                         .get(target.0 as usize)
@@ -7181,7 +7218,7 @@ fn exact_actor_method_reference_matches(
                 color: FunctionColor::Async,
                 parameters,
                 result,
-            } if parameters.is_empty() && *result == SemanticTypeId(0)
+            } if parameters.is_empty() && *result == target_record.result
         )
     });
     let target_actor = match target_record.role {
@@ -7206,7 +7243,20 @@ fn exact_actor_method_reference_matches(
         && target_record.id == target
         && target_record.color == FunctionColor::Async
         && target_record.parameters.len() == 1
-        && target_record.result == SemanticTypeId(0)
+        && analysis
+            .types
+            .get(target_record.result.0 as usize)
+            .is_some_and(|ty| {
+                ty.kind == SemanticTypeKind::Unit
+                    || matches!(
+                        ty.kind,
+                        SemanticTypeKind::Integer {
+                            signed: false,
+                            bits: 64,
+                            ..
+                        }
+                    )
+            })
         && method_type_matches
 }
 
@@ -7290,11 +7340,17 @@ fn exact_actor_request_matches(
     actor: ActorId,
     method: FunctionInstanceId,
     permit: ProofId,
+    reply: Option<ProofId>,
 ) -> bool {
     if !arguments.is_empty()
         || fact.effects != EffectSet(EffectSet::ACTOR)
         || fact.ownership_before != OwnershipState::Owned
-        || fact.ownership_after != OwnershipState::Taken
+        || fact.ownership_after
+            != if reply.is_some() {
+                OwnershipState::Owned
+            } else {
+                OwnershipState::Taken
+            }
     {
         return false;
     }
@@ -7304,6 +7360,12 @@ fn exact_actor_request_matches(
     let Some(producer) = analysis.functions.get(caller.0 as usize) else {
         return false;
     };
+    if fact.proofs != producer.proofs
+        || !fact.proofs.contains(&permit)
+        || reply.is_some_and(|reply| !fact.proofs.contains(&reply))
+    {
+        return false;
+    }
     let source_actor = match producer.role {
         FunctionRole::TaskEntry(task) => {
             let Some(actor) = graph
@@ -7327,23 +7389,48 @@ fn exact_actor_request_matches(
     let Some(target) = analysis.functions.get(method.0 as usize) else {
         return false;
     };
+    let target_type_proof = target.proofs.iter().copied().find(|proof| {
+        analysis
+            .proofs
+            .get(proof.0 as usize)
+            .is_some_and(|record| record.kind == ProofKind::TypeChecked)
+    });
     if target.id != method
         || target.role != FunctionRole::ActorTurn(actor)
         || target.color != FunctionColor::Async
         || target.parameters.len() != 1
-        || target.result != SemanticTypeId(0)
+        || (reply.is_none()
+            && analysis
+                .types
+                .get(target.result.0 as usize)
+                .is_none_or(|ty| ty.kind != SemanticTypeKind::Unit))
     {
         return false;
     }
-    let Some(reservation) = analysis.types.get(fact.ty.0 as usize) else {
+    let Some(result_type) = analysis.types.get(fact.ty.0 as usize) else {
         return false;
     };
-    if reservation.kind != SemanticTypeKind::Reservation
-        || reservation.linearity != Linearity::StrictLinear
-        || reservation.size_upper_bound != Some(8)
-        || reservation.alignment_lower_bound != 8
-        || reservation.source.is_some()
-    {
+    let result_matches = if reply.is_some() {
+        fact.ty == target.result
+            && matches!(
+                result_type.kind,
+                SemanticTypeKind::Integer {
+                    signed: false,
+                    bits: 64,
+                    ..
+                }
+            )
+            && result_type.linearity == Linearity::ScalarCopy
+            && result_type.size_upper_bound == Some(8)
+            && result_type.alignment_lower_bound == 8
+    } else {
+        result_type.kind == SemanticTypeKind::Reservation
+            && result_type.linearity == Linearity::StrictLinear
+            && result_type.size_upper_bound == Some(8)
+            && result_type.alignment_lower_bound == 8
+            && result_type.source.is_none()
+    };
+    if !result_matches {
         return false;
     }
     let Some(callee_source) = program.expression(callee) else {
@@ -7436,14 +7523,30 @@ fn exact_actor_request_matches(
     else {
         return false;
     };
-    analysis.proofs.get(permit.0 as usize).is_some_and(|proof| {
+    let permit_matches = analysis.proofs.get(permit.0 as usize).is_some_and(|proof| {
         proof.id == permit
             && proof.kind == ProofKind::CapacityBound
             && proof.bound == Some(1)
             && proof.sources.as_slice() == [request_source]
             && proof.depends_on.as_slice() == [mailbox_proof]
             && producer.proofs.contains(&permit)
-    })
+    });
+    permit_matches
+        && reply.is_none_or(|reply| {
+            let Some(target_type_proof) = target_type_proof else {
+                return false;
+            };
+            let mut expected_dependencies = [target_type_proof, permit];
+            expected_dependencies.sort_unstable();
+            analysis.proofs.get(reply.0 as usize).is_some_and(|proof| {
+                proof.id == reply
+                    && proof.kind == ProofKind::ActorReplyExactlyOnce
+                    && proof.bound == Some(1)
+                    && proof.sources.as_slice() == [request_source]
+                    && proof.depends_on.as_slice() == expected_dependencies
+                    && producer.proofs.contains(&reply)
+            })
+        })
 }
 
 fn exact_admission_try_send_matches(
@@ -7462,6 +7565,7 @@ fn exact_admission_try_send_matches(
         actor: request_actor,
         method: _,
         permit,
+        reply: None,
     } = request.resolution
     else {
         return false;
@@ -8453,7 +8557,13 @@ fn valid_expression_resolution(
             actor,
             method,
             permit,
-        } => (actor.0 as usize) < graph.actors.len() && function_id(*method) && proof_id(*permit),
+            reply,
+        } => {
+            (actor.0 as usize) < graph.actors.len()
+                && function_id(*method)
+                && proof_id(*permit)
+                && reply.is_none_or(&proof_id)
+        }
         ExpressionResolution::Closure {
             function: target,
             captures,

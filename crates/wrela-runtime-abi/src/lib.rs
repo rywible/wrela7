@@ -275,6 +275,8 @@ pub enum RuntimeFatalCode {
     ActorMailboxMismatch = 4,
     CheckedShiftResultLoss = 5,
     InvalidShiftCount = 6,
+    ActorReplyStateMismatch = 7,
+    ActorReplyDuplicateResolve = 8,
 }
 
 impl RuntimeFatalCode {
@@ -791,5 +793,7 @@ mod tests {
         assert_eq!(RuntimeFatalCode::ActorMailboxMismatch.as_u32(), 4);
         assert_eq!(RuntimeFatalCode::CheckedShiftResultLoss.as_u32(), 5);
         assert_eq!(RuntimeFatalCode::InvalidShiftCount.as_u32(), 6);
+        assert_eq!(RuntimeFatalCode::ActorReplyStateMismatch.as_u32(), 7);
+        assert_eq!(RuntimeFatalCode::ActorReplyDuplicateResolve.as_u32(), 8);
     }
 }

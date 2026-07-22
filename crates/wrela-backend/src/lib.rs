@@ -1518,6 +1518,7 @@ const fn proof_kind_name(kind: &ProofKind) -> &'static str {
         ProofKind::ViewDoesNotEscape => "view-does-not-escape",
         ProofKind::RegionBound => "region-bound",
         ProofKind::CapacityBound => "capacity-bound",
+        ProofKind::ActorReplyExactlyOnce => "actor-reply-exactly-once",
         ProofKind::WaitGraphAcyclic => "wait-graph-acyclic",
         ProofKind::CleanupAcyclic => "cleanup-acyclic",
         ProofKind::WorkBound => "work-bound",
@@ -3229,7 +3230,7 @@ mod tests {
             name: "actor-report-image".to_owned(),
             build,
             source_summary: SourceSummary {
-                semantic_wir_version: 11,
+                semantic_wir_version: 12,
                 // The generated image entry is the one retained base semantic
                 // function; actor/task bodies below are generated async states
                 // rooted in that dense semantic provenance ID.
@@ -3513,7 +3514,7 @@ mod tests {
             name: "actor-activation-report-image".to_owned(),
             build,
             source_summary: SourceSummary {
-                semantic_wir_version: 11,
+                semantic_wir_version: 12,
                 semantic_functions: 3,
                 hir_files: 1,
                 hir_declarations: 3,

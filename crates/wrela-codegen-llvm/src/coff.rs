@@ -68,6 +68,7 @@ struct InternalRelocationCell {
 struct RuntimeRelocationEmission {
     intrinsic: RuntimeIntrinsic,
     directly_required: bool,
+    allowed: u32,
 }
 
 impl InternalRelocationCell {
@@ -1037,22 +1038,31 @@ fn operation_runtime_relocation(operation: &MachineOperation) -> Option<RuntimeR
         MachineOperation::RuntimeCall { intrinsic, .. } => Some(RuntimeRelocationEmission {
             intrinsic: *intrinsic,
             directly_required: true,
+            allowed: 1,
         }),
         MachineOperation::CheckedInteger { .. } | MachineOperation::CheckedConvert { .. } => {
             Some(RuntimeRelocationEmission {
                 intrinsic: RuntimeIntrinsic::Fatal,
                 directly_required: false,
+                allowed: 1,
             })
         }
         MachineOperation::ActorReserve { .. } | MachineOperation::MailboxReceive { .. } => {
             Some(RuntimeRelocationEmission {
                 intrinsic: RuntimeIntrinsic::Fatal,
                 directly_required: false,
+                allowed: 1,
             })
         }
+        MachineOperation::ActorReplyRequest { .. } => Some(RuntimeRelocationEmission {
+            intrinsic: RuntimeIntrinsic::Fatal,
+            directly_required: false,
+            allowed: 3,
+        }),
         MachineOperation::TestAssert { .. } => Some(RuntimeRelocationEmission {
             intrinsic: RuntimeIntrinsic::TestAssertionFail,
             directly_required: false,
+            allowed: 1,
         }),
         _ => None,
     }
@@ -1220,6 +1230,9 @@ fn operation_internal_branch(operation: &MachineOperation) -> Option<(u32, Inter
         MachineOperation::MailboxDispatch { method, .. } => {
             Some((method.0, InternalBranchKind::Call))
         }
+        MachineOperation::ActorReplyRequest { method, .. } => {
+            Some((method.0, InternalBranchKind::Call))
+        }
         _ => None,
     }
 }
@@ -1341,7 +1354,7 @@ fn validate_relocations(
                     .get_mut(cell)
                     .ok_or_else(|| invalid_error("runtime call section is out of range"))?;
                 *count = count
-                    .checked_add(1)
+                    .checked_add(emission.allowed)
                     .ok_or_else(|| invalid_error("runtime call relocation count overflows"))?;
                 if emission.directly_required {
                     let count = required_runtime_relocations

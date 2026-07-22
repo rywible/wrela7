@@ -13,9 +13,9 @@ use wrela_source::Span;
 
 pub use wrela_test_model::TestPlanLimits;
 
-pub const FLOW_WIR_VERSION: u32 = 13;
+pub const FLOW_WIR_VERSION: u32 = 14;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
-pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 11;
+pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 12;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -323,6 +323,16 @@ pub enum FlowOperation {
     ActorCommit {
         reservation: ValueId,
         arguments: Vec<ValueId>,
+    },
+    ActorReplyRequest {
+        actor: ActorId,
+        method: FunctionId,
+        permit: ProofId,
+        reply: ProofId,
+    },
+    ActorReplyResolve {
+        outcome: ValueId,
+        reply: ProofId,
     },
     ActorReject {
         reservation: ValueId,
@@ -704,6 +714,7 @@ pub enum ProofKind {
     ViewDoesNotEscape,
     RegionBound,
     CapacityBound,
+    ActorReplyExactlyOnce,
     WaitGraphAcyclic,
     CleanupAcyclic,
     WorkBound,
@@ -1313,6 +1324,8 @@ fn meter_operation(
         | FlowOperation::Promote { .. }
         | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
+        | FlowOperation::ActorReplyRequest { .. }
+        | FlowOperation::ActorReplyResolve { .. }
         | FlowOperation::ActorReject { .. }
         | FlowOperation::MailboxReceive { .. }
         | FlowOperation::ReplyResolve { .. }
@@ -3210,6 +3223,12 @@ fn validate_actor_message_contract(module: &FlowWir, errors: &mut ValidationCont
     let Some(mut receives) = errors.filled(module.functions.len(), 0_u8) else {
         return;
     };
+    let Some(mut reply_incoming) = errors.filled(module.functions.len(), 0_u8) else {
+        return;
+    };
+    let Some(mut reply_resolves) = errors.filled(module.functions.len(), 0_u8) else {
+        return;
+    };
     let mut reservation_type_count = 0_u8;
     for ty in &module.types {
         if !errors.poll() {
@@ -3442,6 +3461,129 @@ fn validate_actor_message_contract(module: &FlowWir, errors: &mut ValidationCont
                             });
                         }
                     }
+                    FlowOperation::ActorReplyRequest {
+                        actor,
+                        method,
+                        permit,
+                        reply,
+                    } => {
+                        let task_actor = match function.role {
+                            FunctionRole::TaskEntry(task) => module
+                                .tasks
+                                .get(task.0 as usize)
+                                .filter(|record| record.id == task)
+                                .and_then(|record| record.supervisor),
+                            _ => None,
+                        };
+                        let target = module.functions.get(method.0 as usize);
+                        let result_is_u64 = matches!(instruction.results.as_slice(), [result]
+                        if flow_value_type(function, *result).and_then(|ty| {
+                            module.types.get(ty.0 as usize)
+                        }).is_some_and(|ty| {
+                            ty.kind == FlowTypeKind::Scalar(ScalarType::Integer {
+                                signed: false,
+                                bits: 64,
+                            })
+                        }));
+                        let target_type_proof = target.and_then(|target| {
+                            target.proofs.iter().copied().find(|candidate| {
+                                module
+                                    .proofs
+                                    .get(candidate.0 as usize)
+                                    .is_some_and(|record| record.kind == ProofKind::TypeChecked)
+                            })
+                        });
+                        let mut expected_dependencies =
+                            target_type_proof.map(|type_proof| [type_proof, *permit]);
+                        if let Some(expected) = &mut expected_dependencies {
+                            expected.sort_unstable();
+                        }
+                        let exact_target = target.is_some_and(|target| {
+                            target.role == FunctionRole::ActorTurn(*actor)
+                                && target.color == FunctionColor::Async
+                                && matches!(target.parameters.as_slice(), [state]
+                                    if flow_value_type(target, *state)
+                                        == module.actors.get(actor.0 as usize).map(|plan| plan.state_type))
+                                && matches!(target.result_types.as_slice(), [result]
+                                    if module.types.get(result.0 as usize).is_some_and(|ty| {
+                                        ty.kind == FlowTypeKind::Scalar(ScalarType::Integer {
+                                            signed: false,
+                                            bits: 64,
+                                        })
+                                    }))
+                        });
+                        let exact_capability = matches!(
+                            index.checked_sub(1).and_then(|prior| block.instructions.get(prior)),
+                            Some(Instruction {
+                                operation: FlowOperation::ActorCapability {
+                                    actor: capability_actor,
+                                    ..
+                                },
+                                ..
+                            }) if capability_actor == actor
+                        );
+                        let permit_matches =
+                            module.proofs.get(permit.0 as usize).is_some_and(|proof| {
+                                proof.kind == ProofKind::CapacityBound
+                                    && proof.bound == Some(1)
+                                    && function.proofs.contains(permit)
+                            });
+                        let reply_matches =
+                            module.proofs.get(reply.0 as usize).is_some_and(|proof| {
+                                proof.kind == ProofKind::ActorReplyExactlyOnce
+                                    && proof.bound == Some(1)
+                                    && expected_dependencies
+                                        .is_some_and(|expected| proof.depends_on == expected)
+                                    && function.proofs.contains(reply)
+                            });
+                        let incoming_count = incoming.get_mut(method.0 as usize).map(|count| {
+                            *count = count.saturating_add(1);
+                            *count
+                        });
+                        let reply_count = reply_incoming.get_mut(method.0 as usize).map(|count| {
+                            *count = count.saturating_add(1);
+                            *count
+                        });
+                        if module.actors.len() != 2
+                            || task_actor != Some(ActorId(1))
+                            || *actor != ActorId(0)
+                            || !result_is_u64
+                            || !exact_target
+                            || !exact_capability
+                            || !permit_matches
+                            || !reply_matches
+                            || incoming_count != Some(1)
+                            || reply_count != Some(1)
+                        {
+                            errors.push(ValidationError::InvalidRecord {
+                                kind: "actor reply request contract",
+                                id: instruction.id.0,
+                            });
+                        }
+                    }
+                    FlowOperation::ActorReplyResolve { outcome, reply } => {
+                        let resolve_count =
+                            reply_resolves.get_mut(function.id.0 as usize).map(|count| {
+                                *count = count.saturating_add(1);
+                                *count
+                            });
+                        let exact_outcome = matches!(function.result_types.as_slice(), [result]
+                            if flow_value_type(function, *outcome) == Some(*result));
+                        if !instruction.results.is_empty()
+                            || !matches!(function.role, FunctionRole::ActorTurn(_))
+                            || !exact_outcome
+                            || module.proofs.get(reply.0 as usize).is_none_or(|proof| {
+                                proof.kind != ProofKind::ActorReplyExactlyOnce
+                                    || proof.bound != Some(1)
+                            })
+                            || resolve_count != Some(1)
+                        {
+                            errors.push(ValidationError::InvalidRecord {
+                                kind: "actor reply resolve contract",
+                                id: instruction.id.0,
+                            });
+                        }
+                    }
                     FlowOperation::MailboxReceive { actor, method } => {
                         let receive_count = receives.get_mut(method.0 as usize).map(|count| {
                             *count = count.saturating_add(1);
@@ -3543,8 +3685,20 @@ fn validate_actor_message_contract(module: &FlowWir, errors: &mut ValidationCont
         }
         let expected = incoming.get(function.id.0 as usize).copied().unwrap_or(0);
         let actual = receives.get(function.id.0 as usize).copied().unwrap_or(0);
+        let expected_replies = reply_incoming
+            .get(function.id.0 as usize)
+            .copied()
+            .unwrap_or(0);
+        let actual_replies = reply_resolves
+            .get(function.id.0 as usize)
+            .copied()
+            .unwrap_or(0);
         if matches!(function.role, FunctionRole::ActorTurn(_)) {
-            if expected != actual || expected > 1 {
+            if expected != actual
+                || expected > 1
+                || expected_replies != actual_replies
+                || expected_replies > 1
+            {
                 errors.push(ValidationError::InvalidRecord {
                     kind: "actor mailbox dispatch contract",
                     id: function.id.0,
@@ -4315,6 +4469,7 @@ fn for_each_flow_operation_value(operation: &FlowOperation, mut visit: impl FnMu
         | FlowOperation::RegionReset { .. }
         | FlowOperation::ActorCapability { .. }
         | FlowOperation::ActorReserve { .. }
+        | FlowOperation::ActorReplyRequest { .. }
         | FlowOperation::MailboxReceive { .. }
         | FlowOperation::TaskAcquireSlot { .. }
         | FlowOperation::Checkpoint { .. }
@@ -4353,6 +4508,7 @@ fn for_each_flow_operation_value(operation: &FlowOperation, mut visit: impl FnMu
         }
         | FlowOperation::TestEmit { payload: value }
         | FlowOperation::TestFinish { outcome: value } => visit(*value),
+        FlowOperation::ActorReplyResolve { outcome, .. } => visit(*outcome),
         FlowOperation::Binary { left, right, .. } => {
             visit(*left);
             visit(*right);
@@ -5157,6 +5313,79 @@ fn validate_operation(
             value!(*reservation);
             for argument in arguments {
                 value!(*argument);
+            }
+        }
+        FlowOperation::ActorReplyRequest {
+            actor,
+            method,
+            permit,
+            reply,
+        } => {
+            require_id("actor reply target", actor.0, module.actors.len(), errors);
+            require_id(
+                "actor reply method",
+                method.0,
+                module.functions.len(),
+                errors,
+            );
+            proof!(*permit);
+            proof!(*reply);
+            let valid = matches!(instruction.results.as_slice(), [result]
+            if function.values.get(result.0 as usize).is_some_and(|value| {
+                module.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                    ty.kind == FlowTypeKind::Scalar(ScalarType::Integer {
+                        signed: false,
+                        bits: 64,
+                    }) && ty.copyable && !ty.strict_linear
+                })
+            })) && module
+                .functions
+                .get(method.0 as usize)
+                .is_some_and(|target| {
+                    target.role == FunctionRole::ActorTurn(*actor)
+                        && target.color == FunctionColor::Async
+                        && target.result_types.len() == 1
+                })
+                && module.proofs.get(permit.0 as usize).is_some_and(|proof| {
+                    proof.kind == ProofKind::CapacityBound && proof.bound == Some(1)
+                })
+                && module.proofs.get(reply.0 as usize).is_some_and(|proof| {
+                    let target_type_proof =
+                        module.functions.get(method.0 as usize).and_then(|target| {
+                            target.proofs.iter().copied().find(|candidate| {
+                                module
+                                    .proofs
+                                    .get(candidate.0 as usize)
+                                    .is_some_and(|record| record.kind == ProofKind::TypeChecked)
+                            })
+                        });
+                    let mut expected = target_type_proof.map(|type_proof| [type_proof, *permit]);
+                    if let Some(expected) = &mut expected {
+                        expected.sort_unstable();
+                    }
+                    proof.kind == ProofKind::ActorReplyExactlyOnce
+                        && proof.bound == Some(1)
+                        && expected.is_some_and(|expected| proof.depends_on == expected)
+                });
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "actor reply request",
+                    id: instruction.id.0,
+                });
+            }
+        }
+        FlowOperation::ActorReplyResolve { outcome, reply } => {
+            value!(*outcome);
+            proof!(*reply);
+            let valid = instruction.results.is_empty()
+                && module.proofs.get(reply.0 as usize).is_some_and(|proof| {
+                    proof.kind == ProofKind::ActorReplyExactlyOnce && proof.bound == Some(1)
+                });
+            if !valid {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "actor reply resolve",
+                    id: instruction.id.0,
+                });
             }
         }
         FlowOperation::ActorReject { reservation } => value!(*reservation),

@@ -7,7 +7,10 @@ use wrela_backend::{
     CanonicalBackendContentHasher, CanonicalFlowOptimizer, CanonicalMachineLowerer, CodegenError,
     MachineLowerError, MachineLoweringLimits, OptimizationLimits, OptimizationProfile,
     emit_prepared_object, flow_wir as flow, llvm_backend_available,
-    machine_wir::{MachineActivationSchedule, MachineOperation, ValidationError},
+    machine_wir::{
+        BackendProofKind, MachineActivationSchedule, MachineOperation, ScalarFailureKind,
+        ValidationError,
+    },
     prepare_canonical_frame_for_codegen, prepare_for_codegen,
 };
 use wrela_build_model::{
@@ -69,6 +72,31 @@ pub fn boot() -> Image:
     return img
 "#;
 
+const ACTOR_REPLY_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self) -> u64:
+        return 7
+
+@app
+pub struct Client:
+    worker: Actor[Worker]
+
+    @task
+    async fn request(mut self):
+        answer: u64 = await self.worker.ping()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-reply-image", target=Target.aarch64_qemu_virt_uefi)
+    worker = img.service(Worker, mailbox=1)
+    client = img.app(Client, worker=worker.handle(), mailbox=1)
+    return img
+"#;
+
 fn identity(name: &str, digest: Sha256Digest) -> PackageIdentity {
     PackageIdentity {
         name: PackageName::new(name).expect("package name"),
@@ -101,6 +129,406 @@ fn has_invalid_record(errors: &flow::ValidationErrors, kind: &'static str) -> bo
             } if *actual == kind
         )
     })
+}
+
+#[test]
+fn exact_u64_actor_reply_reaches_one_native_caller_owned_slot() {
+    let source_graph_digest = Sha256Digest::from_bytes([0xc1; 32]);
+    let core_package_digest = Sha256Digest::from_bytes([0xc2; 32]);
+    let target_digest = Sha256Digest::from_bytes([0xc3; 32]);
+    let mut sources = SourceDatabase::default();
+    let application_file = sources
+        .add(SourceInput {
+            path: "app.wr".to_owned(),
+            text: ACTOR_REPLY_SOURCE.to_owned(),
+            digest: Sha256Digest::from_bytes([0xc4; 32]),
+        })
+        .expect("actor reply application source");
+    let core_file = sources
+        .add(SourceInput {
+            path: "core/image.wr".to_owned(),
+            text: CORE_IMAGE_SOURCE.to_owned(),
+            digest: Sha256Digest::from_bytes([0xc5; 32]),
+        })
+        .expect("core image source");
+    let parsed_files = [application_file, core_file]
+        .into_iter()
+        .map(|file| {
+            let (parsed, diagnostics) = WrelaSyntaxParser::new()
+                .parse(
+                    ParseRequest {
+                        sources: &sources,
+                        file,
+                        limits: ParseLimits::standard(),
+                    },
+                    &never_cancelled,
+                )
+                .expect("actor reply source parses")
+                .into_parts();
+            assert!(diagnostics.is_empty(), "parse diagnostics: {diagnostics:?}");
+            parsed
+        })
+        .collect::<Vec<_>>();
+    let mut packages = PackageGraphBuilder::new(identity(
+        "actor-reply-application",
+        Sha256Digest::from_bytes([0xc6; 32]),
+    ));
+    let core = packages
+        .add_package(identity("wrela-core", core_package_digest))
+        .expect("core package");
+    packages
+        .add_dependency(
+            packages.root(),
+            DependencyAlias::new("core").expect("core alias"),
+            core,
+        )
+        .expect("core dependency");
+    packages
+        .add_module(
+            packages.root(),
+            ModulePath::new(["app".to_owned()]).expect("application module"),
+            application_file,
+        )
+        .expect("application module record");
+    packages
+        .add_module(
+            core,
+            ModulePath::new(["image".to_owned()]).expect("core image module"),
+            core_file,
+        )
+        .expect("core module record");
+    let changes = HirChangeSet {
+        previous_source_graph: None,
+        changed_files: Vec::new(),
+    };
+    let hir_output = CanonicalHirLowerer::new()
+        .lower(
+            HirLowerRequest {
+                packages: Arc::new(packages.finish().expect("actor reply package graph")),
+                source_graph_digest,
+                parsed_files: &parsed_files,
+                sources: &sources,
+                changes: &changes,
+                limits: HirLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("actor reply lowers to HIR");
+    assert!(hir_output.diagnostics().is_empty());
+    let image_entry = hir_output.lowered().program().as_program().image_candidates[0];
+    let hir = Arc::new(hir_output.into_parts().0.into_program());
+    let profile = BuildProfile::development();
+    let profile_digest = Sha256Digest::from_bytes([0xc7; 32]);
+    let build = seal_build_configuration(
+        BuildConfiguration {
+            identity: BuildIdentity {
+                compiler: Sha256Digest::from_bytes([0xc8; 32]),
+                language: LanguageRevision::Design0_1,
+                target: TargetIdentity::aarch64_qemu_virt_uefi(),
+                target_package: target_digest,
+                standard_library: Sha256Digest::from_bytes([0xc9; 32]),
+                source_graph: source_graph_digest,
+                request: Sha256Digest::from_bytes([0xca; 32]),
+                profile: profile_digest,
+            },
+            profile,
+        },
+        profile_digest,
+    )
+    .expect("validated actor reply build");
+    let target = TargetPackage::aarch64_qemu_virt_uefi(target_digest);
+    let analysis_changes = AnalysisChangeSet {
+        previous_source_graph: None,
+        changed_declarations: Vec::new(),
+    };
+    let analysis = CanonicalSemanticAnalyzer::new()
+        .analyze(
+            AnalysisRequest {
+                hir,
+                standard_library_package: PackageId(1),
+                target: target.semantic(),
+                build: &build,
+                mode: AnalysisMode::Image {
+                    name: "actor-reply-image",
+                    entry: image_entry,
+                },
+                changes: &analysis_changes,
+                limits: AnalysisLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("actor reply semantic analysis");
+    assert!(
+        analysis.diagnostics().is_empty(),
+        "semantic diagnostics: {:?}",
+        analysis.diagnostics()
+    );
+    let analyzed = analysis.into_parts().0.expect("sealed actor reply image");
+    let semantic_output = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("actor reply SemanticWir");
+    let (semantic_wir, _) = semantic_output.into_parts();
+    let flow_output = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("actor reply FlowWir");
+    let flow = flow_output.wir().as_wir();
+    assert!(
+        flow.functions
+            .iter()
+            .any(|function| function.blocks.iter().any(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(
+                        instruction.operation,
+                        flow::FlowOperation::ActorReplyRequest { .. }
+                    )
+                })
+            }))
+    );
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: flow_output.wir(),
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("actor reply canonical frame");
+    let prepared =
+        prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
+            .expect("actor reply reaches MachineWir");
+    let machine = prepared.machine().wir().as_wir();
+    let producer = machine
+        .functions
+        .iter()
+        .find(|function| {
+            function.blocks.iter().any(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(
+                        instruction.operation,
+                        MachineOperation::ActorReplyRequest { .. }
+                    )
+                })
+            })
+        })
+        .expect("machine actor reply producer");
+    assert_eq!(producer.stack_slots.len(), 1);
+    assert_eq!(producer.stack_slots[0].size, 16);
+    assert_eq!(producer.stack_slots[0].alignment, 8);
+    assert_eq!(producer.stack_bytes, 16);
+    let producer_index = producer.id.0 as usize;
+    let (request_block_index, request_index, method, permit, reply) =
+        producer
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                block.instructions.iter().enumerate().find_map(
+                    |(instruction_index, instruction)| {
+                        let MachineOperation::ActorReplyRequest {
+                            method,
+                            permit,
+                            reply,
+                            failure,
+                            duplicate_failure,
+                            ..
+                        } = instruction.operation
+                        else {
+                            return None;
+                        };
+                        assert_eq!(failure.kind, ScalarFailureKind::ActorReplyStateMismatch);
+                        assert_eq!(
+                            duplicate_failure.kind,
+                            ScalarFailureKind::ActorReplyDuplicateResolve
+                        );
+                        Some((block_index, instruction_index, method, permit, reply))
+                    },
+                )
+            })
+            .expect("machine actor reply request");
+    assert_eq!(
+        machine.proofs[reply.0 as usize].kind,
+        BackendProofKind::ActorReplyExactlyOnce
+    );
+    assert!(
+        machine.proofs[reply.0 as usize]
+            .depends_on
+            .contains(&permit)
+    );
+    let target_index = method.0 as usize;
+    let (resolve_block_index, resolve_index) = machine.functions[target_index]
+        .blocks
+        .iter()
+        .enumerate()
+        .find_map(|(block_index, block)| {
+            block
+                .instructions
+                .iter()
+                .position(|instruction| {
+                    matches!(
+                        instruction.operation,
+                        MachineOperation::ActorReplyResolve {
+                            reply: actual,
+                            ..
+                        } if actual == reply
+                    )
+                })
+                .map(|instruction_index| (block_index, instruction_index))
+        })
+        .expect("machine actor reply resolve");
+
+    let mut undersized_slot = machine.clone();
+    undersized_slot.functions[producer_index].stack_slots[0].size = 8;
+    assert!(undersized_slot.validate_for_target(&target).is_err());
+
+    let mut substituted_reply_proof = machine.clone();
+    let MachineOperation::ActorReplyRequest {
+        reply: forged_reply,
+        ..
+    } = &mut substituted_reply_proof.functions[producer_index].blocks[request_block_index]
+        .instructions[request_index]
+        .operation
+    else {
+        panic!("machine actor reply request operation");
+    };
+    *forged_reply = permit;
+    let errors = substituted_reply_proof
+        .validate_for_target(&target)
+        .expect_err("capacity proof cannot substitute for reply proof");
+    assert!(errors.0.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidRecord {
+            kind: "actor reply message contract",
+            ..
+        }
+    )));
+
+    let mut duplicate_resolve = machine.clone();
+    let duplicate = duplicate_resolve.functions[target_index].blocks[resolve_block_index]
+        .instructions[resolve_index]
+        .clone();
+    duplicate_resolve.functions[target_index].blocks[resolve_block_index]
+        .instructions
+        .insert(resolve_index + 1, duplicate);
+    let errors = duplicate_resolve
+        .validate_for_target(&target)
+        .expect_err("actor reply cannot resolve twice");
+    assert!(errors.0.iter().any(|error| matches!(
+        error,
+        ValidationError::InvalidRecord {
+            kind: "actor reply resolve contract" | "actor reply message contract",
+            ..
+        }
+    )));
+
+    let prepare_with_machine_limits = |machine_limits: MachineLoweringLimits| {
+        let codec = CanonicalFlowWirCodec;
+        let hasher = CanonicalBackendContentHasher::new();
+        let optimizer = CanonicalFlowOptimizer::new();
+        let machine_lowerer = CanonicalMachineLowerer::new();
+        let expected_digest = hasher
+            .sha256(encoded.bytes(), &never_cancelled)
+            .expect("canonical actor-reply frame digest");
+        let optimization = OptimizationProfile::from_build_policy(
+            &build.profile.optimization,
+            build.identity.compiler,
+        )
+        .expect("actor-reply optimization profile");
+        prepare_for_codegen(
+            BackendPreparationServices {
+                codec: &codec,
+                hasher: &hasher,
+                optimizer: &optimizer,
+                machine_lowerer: &machine_lowerer,
+            },
+            encoded.bytes(),
+            expected_digest,
+            &target,
+            &build,
+            BackendPreparationOptions {
+                codec_limits: CodecLimits::standard(),
+                optimization,
+                optimization_limits: OptimizationLimits::standard(),
+                machine_limits,
+            },
+            &never_cancelled,
+        )
+    };
+    let exact_static_bytes = machine
+        .sections
+        .iter()
+        .map(|section| section.reserved_bytes)
+        .sum::<u64>();
+    let exact_instructions = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .map(|block| block.instructions.len() as u64)
+        .sum::<u64>();
+    let exact_stack_slots = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_slots.len() as u64)
+        .sum::<u64>();
+    let exact_stack_bytes = machine
+        .functions
+        .iter()
+        .map(|function| function.stack_bytes)
+        .max()
+        .unwrap_or(0);
+    assert_eq!(exact_stack_slots, 1);
+    assert_eq!(exact_stack_bytes, 16);
+    let mut exact_machine_limits = MachineLoweringLimits::standard();
+    exact_machine_limits.types = machine.types.len() as u64;
+    exact_machine_limits.functions = machine.functions.len() as u64;
+    exact_machine_limits.sections = machine.sections.len() as u32;
+    exact_machine_limits.symbols = machine.symbols.len() as u32;
+    exact_machine_limits.globals = machine.globals.len() as u32;
+    exact_machine_limits.instructions = exact_instructions;
+    exact_machine_limits.stack_slots = exact_stack_slots;
+    exact_machine_limits.proofs = machine.proofs.len() as u32;
+    exact_machine_limits.static_bytes = exact_static_bytes;
+    exact_machine_limits.stack_bytes_per_function = exact_stack_bytes;
+    exact_machine_limits = exact_machine_limits.with_aligned_validation();
+    let exact_prepared = prepare_with_machine_limits(exact_machine_limits)
+        .expect("actor reply accepts exact stack-slot and stack-byte ceilings");
+    assert_eq!(machine, exact_prepared.machine().wir().as_wir());
+
+    // A zero stack-slot ceiling is not a valid backend limits object, so the
+    // representable exact boundary is proved by the one-slot model assertion
+    // above and the exact prepared-model equality here.
+    let mut below_stack_bytes = exact_machine_limits;
+    below_stack_bytes.stack_bytes_per_function -= 1;
+    let error = prepare_with_machine_limits(below_stack_bytes)
+        .expect_err("fifteen reply stack bytes must fail closed");
+    assert_eq!(
+        error.machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir stack bytes per function",
+            limit: 15,
+        })
+    );
+
+    match emit_prepared_object(&prepared, &target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("actor reply native codegen: {error}"),
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &target, &never_cancelled)
+                .expect("repeat actor reply native codegen");
+            assert_eq!(first, second);
+        }
+    }
 }
 
 #[test]

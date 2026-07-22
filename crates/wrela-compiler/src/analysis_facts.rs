@@ -2692,6 +2692,7 @@ fn proof_kind_name(kind: &ProofKind) -> &'static str {
         ProofKind::ViewDoesNotEscape => "view-does-not-escape",
         ProofKind::RegionBound => "region-bound",
         ProofKind::CapacityBound => "capacity-bound",
+        ProofKind::ActorReplyExactlyOnce => "actor-reply-exactly-once",
         ProofKind::WaitGraphAcyclic => "wait-graph-acyclic",
         ProofKind::CleanupAcyclic => "cleanup-acyclic",
         ProofKind::WorkBound => "work-bound",
