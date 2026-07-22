@@ -2571,6 +2571,40 @@ fn render_mailbox_dispatch(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), CodegenError> {
     let symbol = actor_mailbox_symbol(machine, mailbox)?;
+    let mailbox_actor = machine.region_storage.iter().find_map(|storage| {
+        if storage.global != mailbox {
+            return None;
+        }
+        match storage.kind {
+            wrela_machine_wir::MachineRegionStorageKind::ActorMailbox { actor, .. } => Some(actor),
+            _ => None,
+        }
+    });
+    let mut methods = Vec::new();
+    methods
+        .try_reserve_exact(machine.activations.len())
+        .map_err(|_| CodegenError::ResourceLimit {
+            resource: "actor scheduler method table",
+            limit: u64::try_from(machine.activations.len()).unwrap_or(u64::MAX),
+            actual: u64::MAX,
+        })?;
+    for activation in &machine.activations {
+        check_cancelled(is_cancelled)?;
+        if activation.schedule == wrela_machine_wir::MachineActivationSchedule::SchedulerFifo
+            && matches!(
+                activation.owner,
+                wrela_machine_wir::MachineActivationOwner::Actor { actor, .. }
+                    if Some(actor) == mailbox_actor
+            )
+        {
+            methods.push(activation.caller);
+        }
+    }
+    if methods.is_empty() {
+        methods.push(method);
+    }
+    methods.sort_unstable_by_key(|turn| turn.0);
+    methods.dedup();
     ir.push("  br label %i")?;
     ir.number(u128::from(instruction))?;
     ir.push("_scan\ni")?;
@@ -2587,26 +2621,72 @@ fn render_mailbox_dispatch(
     ir.number(u128::from(instruction))?;
     ir.push("_mailbox_pending, label %i")?;
     ir.number(u128::from(instruction))?;
-    ir.push("_dispatch, label %i")?;
+    ir.push(if methods.len() == 1 {
+        "_dispatch, label %i"
+    } else {
+        "_select, label %i"
+    })?;
     ir.number(u128::from(instruction))?;
     ir.push("_ok\ni")?;
     ir.number(u128::from(instruction))?;
-    ir.push("_dispatch:\n")?;
-    render_call(
-        ir,
-        machine,
-        function,
-        None,
-        method,
-        &[],
-        CallingConvention::Internal,
-        false,
-        0,
-        is_cancelled,
-    )?;
-    ir.push("  br label %i")?;
-    ir.number(u128::from(instruction))?;
-    ir.push("_scan\ni")?;
+    if methods.len() == 1 {
+        ir.push("_dispatch:\n")?;
+        render_call(
+            ir,
+            machine,
+            function,
+            None,
+            methods[0],
+            &[],
+            CallingConvention::Internal,
+            false,
+            0,
+            is_cancelled,
+        )?;
+        ir.push("  br label %i")?;
+        ir.number(u128::from(instruction))?;
+        ir.push("_scan\ni")?;
+    } else {
+        ir.push("_select:\n  switch i64 %t")?;
+        ir.number(u128::from(instruction))?;
+        ir.push("_mailbox_tag, label %i")?;
+        ir.number(u128::from(instruction))?;
+        ir.push("_call_")?;
+        ir.number(u128::from(methods[0].0))?;
+        ir.push(" [")?;
+        for turn in &methods {
+            ir.push(" i64 ")?;
+            ir.number(u128::from(actor_message_tag(*turn)))?;
+            ir.push(", label %i")?;
+            ir.number(u128::from(instruction))?;
+            ir.push("_call_")?;
+            ir.number(u128::from(turn.0))?;
+        }
+        ir.push(" ]\n")?;
+        for turn in &methods {
+            ir.push("i")?;
+            ir.number(u128::from(instruction))?;
+            ir.push("_call_")?;
+            ir.number(u128::from(turn.0))?;
+            ir.push(":\n")?;
+            render_call(
+                ir,
+                machine,
+                function,
+                None,
+                *turn,
+                &[],
+                CallingConvention::Internal,
+                false,
+                0,
+                is_cancelled,
+            )?;
+            ir.push("  br label %i")?;
+            ir.number(u128::from(instruction))?;
+            ir.push("_scan\n")?;
+        }
+        ir.push("i")?;
+    }
     ir.number(u128::from(instruction))?;
     ir.push("_ok:\n")
 }

@@ -64,6 +64,34 @@ pub fn boot() -> Image:
     return img
 "#;
 
+const RECURRING_ACTOR_SEND_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn first(mut self):
+        send self.second()
+        await checkpoint()
+
+    pub async fn second(mut self):
+        await checkpoint()
+
+    @task
+    async fn publish(mut self):
+        send self.first()
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-send-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#;
+
 fn identity(name: &str, digest: Sha256Digest) -> PackageIdentity {
     PackageIdentity {
         name: PackageName::new(name).expect("package name"),
@@ -100,6 +128,15 @@ fn has_invalid_record(errors: &flow::ValidationErrors, kind: &'static str) -> bo
 
 #[test]
 fn real_startup_send_reaches_source_derived_semantic_admission_and_mailbox_receive() {
+    run_actor_send_vertical(ACTOR_SEND_SOURCE, false);
+}
+
+#[test]
+fn capacity_one_recurring_chain_drains_two_unit_turns_to_native_coff() {
+    run_actor_send_vertical(RECURRING_ACTOR_SEND_SOURCE, true);
+}
+
+fn run_actor_send_vertical(application_source: &str, recurring: bool) {
     let source_graph_digest = Sha256Digest::from_bytes([0xb1; 32]);
     let core_package_digest = Sha256Digest::from_bytes([0xb2; 32]);
     let target_digest = Sha256Digest::from_bytes([0xb3; 32]);
@@ -107,7 +144,7 @@ fn real_startup_send_reaches_source_derived_semantic_admission_and_mailbox_recei
     let application_file = sources
         .add(SourceInput {
             path: "app.wr".to_owned(),
-            text: ACTOR_SEND_SOURCE.to_owned(),
+            text: application_source.to_owned(),
             digest: Sha256Digest::from_bytes([0xb4; 32]),
         })
         .expect("actor send application source");
@@ -296,6 +333,49 @@ fn real_startup_send_reaches_source_derived_semantic_admission_and_mailbox_recei
         Some(semantic::SemanticStatement::Let(statement))
             if matches!(statement.operation, semantic::SemanticOperation::MailboxReceive { .. })
     ));
+    if recurring {
+        let operations = semantic.functions.iter().flat_map(|function| {
+            function
+                .body
+                .statements
+                .iter()
+                .filter_map(|statement| match statement {
+                    semantic::SemanticStatement::Let(statement) => Some(&statement.operation),
+                    _ => None,
+                })
+        });
+        let operations = operations.collect::<Vec<_>>();
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| matches!(
+                    operation,
+                    semantic::SemanticOperation::ActorReserve { .. }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| matches!(
+                    operation,
+                    semantic::SemanticOperation::ActorCommit { .. }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| matches!(
+                    operation,
+                    semantic::SemanticOperation::MailboxReceive { .. }
+                ))
+                .count(),
+            2
+        );
+    }
 
     let (semantic_wir, _) = semantic_output.into_parts();
     let flow_output = CanonicalFlowLowerer::new()
@@ -349,6 +429,36 @@ fn real_startup_send_reaches_source_derived_semantic_admission_and_mailbox_recei
             .map(|instruction| &instruction.operation),
         Some(flow::FlowOperation::MailboxReceive { .. })
     ));
+    if recurring {
+        let operations = flow
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .map(|instruction| &instruction.operation)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| matches!(operation, flow::FlowOperation::ActorReserve { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| matches!(operation, flow::FlowOperation::ActorCommit { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| matches!(operation, flow::FlowOperation::MailboxReceive { .. }))
+                .count(),
+            2
+        );
+    }
 
     let standard_flow_validation = flow::ValidationLimits::standard();
     let mut lower_work = 1_u64;
@@ -418,11 +528,18 @@ fn real_startup_send_reaches_source_derived_semantic_admission_and_mailbox_recei
         prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
             .expect("real actor send reaches sealed MachineWir");
     let machine = prepared.machine().wir().as_wir();
-    assert!(
+    let expected_schedule = if recurring {
+        MachineActivationSchedule::SchedulerFifo
+    } else {
+        MachineActivationSchedule::MailboxOnce
+    };
+    assert_eq!(
         machine
             .activations
             .iter()
-            .any(|activation| { activation.schedule == MachineActivationSchedule::MailboxOnce })
+            .filter(|activation| activation.schedule == expected_schedule)
+            .count(),
+        if recurring { 2 } else { 1 }
     );
     assert!(machine.functions.iter().any(|function| {
         function
@@ -433,6 +550,43 @@ fn real_startup_send_reaches_source_derived_semantic_admission_and_mailbox_recei
                 matches!(instruction.operation, MachineOperation::ActorReserve { .. })
             })
     }));
+    if recurring {
+        let operations = machine
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .map(|instruction| &instruction.operation)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| matches!(operation, MachineOperation::ActorReserve { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| matches!(operation, MachineOperation::ActorCommit { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| matches!(operation, MachineOperation::MailboxReceive { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|operation| matches!(operation, MachineOperation::MailboxDispatch { .. }))
+                .count(),
+            1
+        );
+    }
     assert!(machine.functions.iter().any(|function| {
         function
             .blocks
@@ -607,6 +761,31 @@ fn real_startup_send_reaches_source_derived_semantic_admission_and_mailbox_recei
             .expect_err("late actor-send cancellation cannot publish MachineWir");
         assert!(cancelled.is_cancelled());
         assert_eq!(cancelled_polls.get(), cancel_at);
+    }
+
+    if recurring {
+        let fifo = machine
+            .activations
+            .iter()
+            .enumerate()
+            .filter(|(_, activation)| {
+                activation.schedule == MachineActivationSchedule::SchedulerFifo
+            })
+            .map(|(index, activation)| (index, activation.caller))
+            .collect::<Vec<_>>();
+        assert_eq!(fifo.len(), 2);
+        let mut duplicated_fifo_caller = machine.clone();
+        duplicated_fifo_caller.activations[fifo[1].0].caller = fifo[0].1;
+        let errors = duplicated_fifo_caller
+            .validate_for_target(&target)
+            .expect_err("FIFO activation callers must cover each admitted turn exactly once");
+        assert!(errors.0.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidRecord {
+                kind: "actor mailbox message contract",
+                ..
+            }
+        )));
     }
 
     let machine_task = machine

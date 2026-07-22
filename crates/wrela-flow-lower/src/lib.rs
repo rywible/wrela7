@@ -1413,13 +1413,17 @@ fn validate_actor_source_function(
                                     && ty.linearity == semantic::Linearity::Strict
                             })
                             .ok_or(unsupported("one-way reservation type"))?;
-                        let caller_actor = match function.role {
-                            semantic::FunctionRole::TaskEntry(task) => input
-                                .tasks
-                                .get(task.0 as usize)
-                                .filter(|record| record.id == task)
-                                .and_then(|record| record.supervisor),
-                            _ => None,
+                        let (caller_actor, turn_producer) = match function.role {
+                            semantic::FunctionRole::TaskEntry(task) => (
+                                input
+                                    .tasks
+                                    .get(task.0 as usize)
+                                    .filter(|record| record.id == task)
+                                    .and_then(|record| record.supervisor),
+                                false,
+                            ),
+                            semantic::FunctionRole::ActorTurn(owner) => (Some(owner), true),
+                            _ => (None, false),
                         };
                         let target_matches =
                             input
@@ -1477,6 +1481,7 @@ fn validate_actor_source_function(
                                 && *source == statement.source
                         );
                         let cross_actor = input.actors.len() == 2
+                            && !turn_producer
                             && caller_actor == Some(semantic::ActorId(1))
                             && *actor == semantic::ActorId(0)
                             && matches!(
@@ -1683,7 +1688,15 @@ fn validate_actor_source_function(
             return Err(unsupported("actor source root terminator"));
         }
     }
-    let expects_send = one_way_effect != 0;
+    let expects_send = function.body.statements.iter().any(|statement| {
+        matches!(
+            statement,
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                operation: semantic::SemanticOperation::ActorReserve { .. },
+                ..
+            })
+        )
+    });
     let expects_receive = matches!(function.role, semantic::FunctionRole::ActorTurn(_))
         && input.functions.iter().any(|candidate| {
             candidate.body.statements.iter().any(|statement| {

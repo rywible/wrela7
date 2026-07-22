@@ -251,6 +251,47 @@ fn source_actor_send_admission_bounds_have_stable_codes_and_statement_spans() {
 }
 
 #[test]
+fn capacity_one_startup_to_turn_chain_is_admitted_non_reentrantly() {
+    let source = VALID_SEND_SOURCE
+        .replacen(
+            "pub async fn ping(mut self):\n        await checkpoint()",
+            "pub async fn first(mut self):\n        send self.second()\n        await checkpoint()\n\n    pub async fn second(mut self):\n        await checkpoint()",
+            1,
+        )
+        .replacen("send self.ping()", "send self.first()", 1);
+    let output = analyze(&source, AnalysisLimits::standard(), &never_cancelled)
+        .expect("bounded recurring actor chain analyzes");
+    assert!(
+        output.diagnostics().is_empty(),
+        "recurring actor diagnostics: {:?}",
+        output.diagnostics()
+    );
+    assert!(output.successful().is_some());
+}
+
+#[test]
+fn recurring_chain_rejects_non_capacity_one_and_cycles_stably() {
+    let source = VALID_SEND_SOURCE
+        .replacen(
+            "pub async fn ping(mut self):\n        await checkpoint()",
+            "pub async fn first(mut self):\n        send self.second()\n        await checkpoint()\n\n    pub async fn second(mut self):\n        await checkpoint()",
+            1,
+        )
+        .replacen("send self.ping()", "send self.first()", 1);
+    assert_source_diagnostic(
+        &source.replacen("mailbox=1", "mailbox=2", 1),
+        "semantic-actor-send-chain",
+        "send self.first()",
+    );
+    let cycle = source.replacen(
+        "    pub async fn second(mut self):\n        await checkpoint()",
+        "    pub async fn second(mut self):\n        send self.first()\n        await checkpoint()",
+        1,
+    );
+    assert_source_diagnostic(&cycle, "semantic-actor-send-chain", "send self.first()");
+}
+
+#[test]
 fn source_actor_send_shape_rejections_have_stable_codes_and_precise_owners() {
     let payload = VALID_SEND_SOURCE
         .replacen(

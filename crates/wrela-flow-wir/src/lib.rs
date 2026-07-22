@@ -3294,6 +3294,7 @@ fn validate_actor_message_contract(module: &FlowWir, errors: &mut ValidationCont
                                 .get(task.0 as usize)
                                 .filter(|record| record.id == task)
                                 .and_then(|record| record.supervisor),
+                            FunctionRole::ActorTurn(actor) => Some(actor),
                             _ => None,
                         };
                         let target = module.functions.get(method.0 as usize).filter(|target| {
@@ -3517,7 +3518,8 @@ fn validate_actor_message_contract(module: &FlowWir, errors: &mut ValidationCont
     }
 
     if (reserve_count == 0 && reservation_type_count != 0)
-        || (reserve_count != 0 && (reserve_count != 1 || reservation_type_count != 1))
+        || (reserve_count != 0
+            && (!(reserve_count == 1 || reserve_count == 2) || reservation_type_count != 1))
     {
         errors.push(ValidationError::InvalidRecord {
             kind: "actor reservation type set",

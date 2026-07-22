@@ -438,8 +438,9 @@ fn discover_actor_dispatch(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Option<FlowActorDispatch>, MachineLowerError> {
     let mut dispatch = None;
+    let mut continuation = None;
     let mut commit_count = 0_u8;
-    let mut receive = None;
+    let mut receives = try_vec(2, "actor mailbox receives", 2, is_cancelled)?;
 
     for function in &input.functions {
         check_cancelled(is_cancelled)?;
@@ -453,9 +454,6 @@ fn discover_actor_dispatch(
                         method,
                         proof,
                     } => {
-                        if dispatch.is_some() {
-                            return Err(unsupported("more than one actor message admission"));
-                        }
                         let [reservation] = instruction.results.as_slice() else {
                             return Err(unsupported(
                                 "an actor reservation without one strict-linear result",
@@ -492,6 +490,7 @@ fn discover_actor_dispatch(
                                 .get(task.0 as usize)
                                 .filter(|record| record.id == task)
                                 .and_then(|record| record.supervisor),
+                            flow::FunctionRole::ActorTurn(actor) => Some(actor),
                             _ => None,
                         };
                         let target = input.functions.get(method.0 as usize).filter(|target| {
@@ -578,12 +577,20 @@ fn discover_actor_dispatch(
                                 "an actor admission without exact target and capacity authority",
                             ));
                         }
-                        dispatch = Some(FlowActorDispatch {
+                        let record = FlowActorDispatch {
                             actor: *actor,
                             method: *method,
                             producer: function.id,
                             permit: *proof,
-                        });
+                        };
+                        if matches!(function.role, flow::FunctionRole::ActorTurn(owner) if owner == *actor)
+                        {
+                            if continuation.replace(record).is_some() {
+                                return Err(unsupported("more than one recurring actor admission"));
+                            }
+                        } else if dispatch.replace(record).is_some() {
+                            return Err(unsupported("more than one startup actor admission"));
+                        }
                     }
                     flow::FlowOperation::ActorCommit {
                         reservation,
@@ -608,8 +615,7 @@ fn discover_actor_dispatch(
                         }
                     }
                     flow::FlowOperation::MailboxReceive { actor, method }
-                        if receive.replace((*actor, *method)).is_some()
-                            || !instruction.results.is_empty()
+                        if !instruction.results.is_empty()
                             || block.id != function.entry
                             || index != 0
                             || function.id != *method
@@ -619,17 +625,34 @@ fn discover_actor_dispatch(
                             "a substituted or duplicate actor mailbox receive",
                         ));
                     }
-                    flow::FlowOperation::MailboxReceive { .. } => {}
+                    flow::FlowOperation::MailboxReceive { actor, method } => {
+                        if receives.contains(&(*actor, *method)) {
+                            return Err(unsupported(
+                                "a substituted or duplicate actor mailbox receive",
+                            ));
+                        }
+                        receives.push((*actor, *method));
+                    }
                     _ => {}
                 }
             }
         }
     }
 
-    match (dispatch, receive, commit_count) {
-        (None, None, 0) => Ok(None),
-        (Some(dispatch), Some((actor, method)), 1)
-            if (dispatch.actor, dispatch.method) == (actor, method) =>
+    match (dispatch, continuation, receives.as_slice(), commit_count) {
+        (None, None, [], 0) => Ok(None),
+        (Some(dispatch), None, [(actor, method)], 1)
+            if (dispatch.actor, dispatch.method) == (*actor, *method) =>
+        {
+            Ok(Some(dispatch))
+        }
+        (Some(dispatch), Some(next), receives, 2)
+            if dispatch.actor == next.actor
+                && dispatch.method == next.producer
+                && dispatch.method != next.method
+                && receives.len() == 2
+                && receives.contains(&(dispatch.actor, dispatch.method))
+                && receives.contains(&(next.actor, next.method)) =>
         {
             Ok(Some(dispatch))
         }
@@ -757,7 +780,7 @@ fn preflight(
         ));
     }
     let fatal_calls = count_checked_scalar_failures(input, is_cancelled)?
-        .checked_add(u64::from(flow_actor_dispatch.is_some()) * 2)
+        .checked_add(count_actor_mailbox_failure_sites(input, is_cancelled)?)
         .ok_or(MachineLowerError::ResourceLimit {
             resource: "MachineWir instructions",
             limit: request.limits.instructions,
@@ -985,21 +1008,8 @@ fn preflight(
         )?,
         request.limits.report_bytes,
     )?;
-    let mut startup_instruction_count = 0_usize;
-    for activation in &activations {
-        check_cancelled(is_cancelled)?;
-        if matches!(
-            activation.schedule,
-            MachineActivationSchedule::StartupOnce | MachineActivationSchedule::MailboxOnce
-        ) {
-            startup_instruction_count = startup_instruction_count.checked_add(1).ok_or(
-                MachineLowerError::ResourceLimit {
-                    resource: "MachineWir instructions",
-                    limit: request.limits.instructions,
-                },
-            )?;
-        }
-    }
+    let startup_instruction_count =
+        count_startup_dispatch_instructions(&activations, request.limits, is_cancelled)?;
 
     for function in &input.functions {
         check_cancelled(is_cancelled)?;
@@ -1230,8 +1240,11 @@ fn preflight(
                 .then_some(activation.caller)
         }),
         mailbox_turn: activations.iter().find_map(|activation| {
-            (activation.schedule == MachineActivationSchedule::MailboxOnce)
-                .then_some(activation.caller)
+            matches!(
+                activation.schedule,
+                MachineActivationSchedule::MailboxOnce | MachineActivationSchedule::SchedulerFifo
+            )
+            .then_some(activation.caller)
         }),
         actor_dispatch,
         activations,
@@ -1307,11 +1320,15 @@ fn lower_activation_subset(
                     flow::PlanOwner::Runtime,
                 ]
     };
-    if input.activations.len() != 2
+    let recurring_chain = input.activations.len() == 3
+        && actor.turn_functions.len() == 2
+        && actor.mailbox_capacity == 1
+        && dispatch.is_some();
+    if !(input.activations.len() == 2 || recurring_chain)
         || actor.id != flow::ActorId(0)
         || actor.mailbox_capacity == 0
         || actor.message_types.len() > 1
-        || actor.turn_functions.len() != 1
+        || !(actor.turn_functions.len() == 1 || recurring_chain)
         || actor.supervisor.is_some()
         || task.id != flow::TaskId(0)
         || task.slots != 1
@@ -1360,14 +1377,16 @@ fn lower_activation_subset(
             .ok_or(unsupported("an activation with an unknown cleanup proof"))?;
         let (owner, schedule) = match caller.role {
             flow::FunctionRole::ActorTurn(id)
-                if id == actor.id && actor.turn_functions.as_slice() == [caller.id] =>
+                if id == actor.id && actor.turn_functions.contains(&caller.id) =>
             {
                 (
                     MachineActivationOwner::Actor {
                         actor: id.0,
                         mailbox_capacity: actor.mailbox_capacity,
                     },
-                    if dispatch.is_some_and(|dispatch| {
+                    if recurring_chain {
+                        MachineActivationSchedule::SchedulerFifo
+                    } else if dispatch.is_some_and(|dispatch| {
                         dispatch.actor == id && dispatch.method == caller.id
                     }) {
                         MachineActivationSchedule::MailboxOnce
@@ -1412,6 +1431,50 @@ fn lower_activation_subset(
                             method,
                         } if receive_actor.0 == actor
                             && method == dispatch.method)),
+            (
+                MachineActivationOwner::Actor { actor, .. },
+                MachineActivationSchedule::SchedulerFifo,
+                Some(dispatch),
+            ) => {
+                let receive_ok = entry.instructions.first().is_some_and(|receive| {
+                    receive.results.is_empty()
+                        && matches!(
+                            receive.operation,
+                            flow::FlowOperation::MailboxReceive {
+                                actor: receive_actor,
+                                method,
+                            } if receive_actor.0 == actor && method == caller.id
+                        )
+                });
+                let middle = &entry.instructions[1..entry.instructions.len().saturating_sub(1)];
+                let continuation_ok = if caller.id == dispatch.method {
+                    matches!(middle, [reserve, commit]
+                    if matches!(
+                        (&reserve.operation, reserve.results.as_slice()),
+                        (
+                            flow::FlowOperation::ActorReserve {
+                                actor: reserve_actor,
+                                method,
+                                ..
+                            },
+                            [reservation],
+                        ) if *reserve_actor == dispatch.actor
+                            && *method != dispatch.method
+                            && commit.results.is_empty()
+                            && matches!(
+                                &commit.operation,
+                                flow::FlowOperation::ActorCommit {
+                                    reservation: committed,
+                                    arguments,
+                                } if committed == reservation && arguments.is_empty()
+                            )
+                            && reserve.source == commit.source
+                    ))
+                } else {
+                    middle.is_empty()
+                };
+                receive_ok && continuation_ok && entry.instructions.last() == Some(call)
+            }
             (
                 MachineActivationOwner::Actor { .. },
                 MachineActivationSchedule::DormantMailbox,
@@ -1634,7 +1697,9 @@ fn lower_activation_subset(
         .filter(|plan| {
             matches!(
                 plan.schedule,
-                MachineActivationSchedule::DormantMailbox | MachineActivationSchedule::MailboxOnce
+                MachineActivationSchedule::DormantMailbox
+                    | MachineActivationSchedule::MailboxOnce
+                    | MachineActivationSchedule::SchedulerFifo
             )
         })
         .count();
@@ -1642,7 +1707,7 @@ fn lower_activation_subset(
         .iter()
         .filter(|plan| plan.schedule == MachineActivationSchedule::StartupOnce)
         .count();
-    if actor_count != 1 || task_count != 1 {
+    if !(actor_count == 1 || (recurring_chain && actor_count == 2)) || task_count != 1 {
         return Err(unsupported(
             "one actor-turn and one startup-task activation",
         ));
@@ -2028,9 +2093,10 @@ fn lower_region_storage(
                 )
             }
             index if index == 1 + usize::from(has_actor_state) => {
-                let [turn] = actor.turn_functions.as_slice() else {
-                    return Err(unsupported("one actor turn-frame owner"));
-                };
+                let turn = actor
+                    .turn_functions
+                    .first()
+                    .ok_or(unsupported("one actor turn-frame owner"))?;
                 let function = input
                     .functions
                     .get(turn.0 as usize)
@@ -2486,22 +2552,8 @@ fn preflight_output_model_resources(
         check_cancelled(is_cancelled)?;
         add_payload(&mut payload, test.name.len(), payload_limit)?;
     }
-    let mut startup_instructions = 0_usize;
-    for activation in activations {
-        check_cancelled(is_cancelled)?;
-        if matches!(
-            activation.schedule,
-            MachineActivationSchedule::StartupOnce | MachineActivationSchedule::MailboxOnce
-        ) {
-            startup_instructions =
-                startup_instructions
-                    .checked_add(1)
-                    .ok_or(MachineLowerError::ResourceLimit {
-                        resource: "MachineWir model edges",
-                        limit: edge_limit,
-                    })?;
-        }
-    }
+    let startup_instructions =
+        count_startup_dispatch_instructions(activations, request.limits, is_cancelled)?;
 
     for function in &input.functions {
         check_cancelled(is_cancelled)?;
@@ -3296,6 +3348,73 @@ fn count_test_assertions(
             for instruction in &block.instructions {
                 check_cancelled(is_cancelled)?;
                 if matches!(instruction.operation, flow::FlowOperation::Assert { .. }) {
+                    count = count
+                        .checked_add(1)
+                        .ok_or(MachineLowerError::ResourceLimit {
+                            resource: "MachineWir instructions",
+                            limit: u64::MAX,
+                        })?;
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn count_startup_dispatch_instructions(
+    activations: &[MachineActivationPlan],
+    limits: MachineLoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<usize, MachineLowerError> {
+    let mut count = 0_usize;
+    let mut fifo_actor = None;
+    for activation in activations {
+        check_cancelled(is_cancelled)?;
+        let contributes = match activation.schedule {
+            MachineActivationSchedule::StartupOnce | MachineActivationSchedule::MailboxOnce => true,
+            MachineActivationSchedule::SchedulerFifo => {
+                let MachineActivationOwner::Actor { actor, .. } = activation.owner else {
+                    return Err(unsupported("a FIFO activation without actor ownership"));
+                };
+                if fifo_actor.is_none() {
+                    fifo_actor = Some(actor);
+                    true
+                } else if fifo_actor == Some(actor) {
+                    false
+                } else {
+                    return Err(unsupported("more than one per-core FIFO actor drain"));
+                }
+            }
+            MachineActivationSchedule::DormantMailbox => false,
+        };
+        if contributes {
+            count = count
+                .checked_add(1)
+                .ok_or(MachineLowerError::ResourceLimit {
+                    resource: "MachineWir instructions",
+                    limit: limits.instructions,
+                })?;
+        }
+    }
+    Ok(count)
+}
+
+fn count_actor_mailbox_failure_sites(
+    input: &flow::FlowWir,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<u64, MachineLowerError> {
+    let mut count = 0_u64;
+    for function in &input.functions {
+        check_cancelled(is_cancelled)?;
+        for block in &function.blocks {
+            check_cancelled(is_cancelled)?;
+            for instruction in &block.instructions {
+                check_cancelled(is_cancelled)?;
+                if matches!(
+                    instruction.operation,
+                    flow::FlowOperation::ActorReserve { .. }
+                        | flow::FlowOperation::MailboxReceive { .. }
+                ) {
                     count = count
                         .checked_add(1)
                         .ok_or(MachineLowerError::ResourceLimit {
@@ -6485,7 +6604,12 @@ fn lower_block(
         });
     }
     if let Some((dispatch, turn)) = mailbox_dispatch {
-        if dispatch.method != turn {
+        if dispatch.method != turn
+            && !plan.activations.iter().any(|activation| {
+                activation.schedule == MachineActivationSchedule::SchedulerFifo
+                    && activation.caller == turn
+            })
+        {
             return Err(unsupported("a substituted one-shot mailbox turn"));
         }
         instructions.push(MachineInstruction {
@@ -7028,17 +7152,27 @@ fn lower_operation(
             let dispatch = plan
                 .actor_dispatch
                 .filter(|dispatch| {
-                    dispatch.producer.0 == function.id.0
-                        && dispatch.actor == actor.0
-                        && dispatch.method.0 == method.0
-                        && dispatch.permit.0 == proof.0
+                    dispatch.actor == actor.0
+                        && ((dispatch.producer.0 == function.id.0
+                            && dispatch.method.0 == method.0
+                            && dispatch.permit.0 == proof.0)
+                            || matches!(
+                                function.role,
+                                flow::FunctionRole::ActorTurn(owner)
+                                    if owner.0 == dispatch.actor
+                                        && plan.activations.iter().any(|activation| {
+                                            activation.schedule
+                                                == MachineActivationSchedule::SchedulerFifo
+                                                && activation.caller.0 == function.id.0
+                                        })
+                            ))
                 })
                 .ok_or(unsupported("a substituted machine actor reservation"))?;
             MachineOperation::ActorReserve {
                 mailbox: dispatch.mailbox,
                 actor: dispatch.actor,
-                method: dispatch.method,
-                proof: dispatch.permit,
+                method: FunctionId(method.0),
+                proof: ProofId(proof.0),
                 failure: scalar_failure(ScalarFailureKind::ActorMailboxFull, function, instruction),
             }
         }
@@ -7049,13 +7183,34 @@ fn lower_operation(
             require_no_results(instruction)?;
             let dispatch = plan
                 .actor_dispatch
-                .filter(|dispatch| dispatch.producer.0 == function.id.0 && arguments.is_empty())
+                .filter(|dispatch| {
+                    arguments.is_empty()
+                        && (dispatch.producer.0 == function.id.0
+                            || matches!(
+                                function.role,
+                                flow::FunctionRole::ActorTurn(owner)
+                                    if owner.0 == dispatch.actor
+                            ))
+                })
                 .ok_or(unsupported("a substituted machine actor commit"))?;
+            let method = function
+                .blocks
+                .iter()
+                .flat_map(|block| block.instructions.iter())
+                .find_map(|candidate| match candidate.operation {
+                    flow::FlowOperation::ActorReserve { method, .. }
+                        if candidate.results.as_slice() == [*reservation] =>
+                    {
+                        Some(FunctionId(method.0))
+                    }
+                    _ => None,
+                })
+                .ok_or(unsupported("an actor commit without its exact reserve"))?;
             MachineOperation::ActorCommit {
                 reservation: map_value(*reservation, mapping)?,
                 mailbox: dispatch.mailbox,
                 actor: dispatch.actor,
-                method: dispatch.method,
+                method,
             }
         }
         flow::FlowOperation::MailboxReceive { actor, method } => {
@@ -7063,15 +7218,19 @@ fn lower_operation(
             let dispatch = plan
                 .actor_dispatch
                 .filter(|dispatch| {
-                    dispatch.method.0 == function.id.0
-                        && dispatch.actor == actor.0
-                        && dispatch.method.0 == method.0
+                    dispatch.actor == actor.0
+                        && function.id.0 == method.0
+                        && (dispatch.method.0 == method.0
+                            || plan.activations.iter().any(|activation| {
+                                activation.schedule == MachineActivationSchedule::SchedulerFifo
+                                    && activation.caller.0 == method.0
+                            }))
                 })
                 .ok_or(unsupported("a substituted machine mailbox receive"))?;
             MachineOperation::MailboxReceive {
                 mailbox: dispatch.mailbox,
                 actor: dispatch.actor,
-                method: dispatch.method,
+                method: FunctionId(method.0),
                 failure: scalar_failure(
                     ScalarFailureKind::ActorMailboxMismatch,
                     function,

@@ -1575,7 +1575,16 @@ fn flow_mapping_matches(
                         }
                     }
                 }
-                if has_message {
+                let recurring = match caller.role {
+                    flow::FunctionRole::ActorTurn(actor) => flow
+                        .actors
+                        .get(actor.0 as usize)
+                        .is_some_and(|record| record.turn_functions.len() == 2),
+                    _ => false,
+                };
+                if recurring && has_message {
+                    wrela_machine_wir::MachineActivationSchedule::SchedulerFifo
+                } else if has_message {
                     wrela_machine_wir::MachineActivationSchedule::MailboxOnce
                 } else {
                     wrela_machine_wir::MachineActivationSchedule::DormantMailbox

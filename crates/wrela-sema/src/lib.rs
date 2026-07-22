@@ -7010,16 +7010,20 @@ fn exact_actor_method_reference_matches(
     let Some(caller_record) = analysis.functions.get(caller.0 as usize) else {
         return false;
     };
-    let FunctionRole::TaskEntry(task) = caller_record.role else {
-        return false;
-    };
-    let Some(source_actor) = graph
-        .tasks
-        .get(task.0 as usize)
-        .filter(|record| record.id == task)
-        .and_then(|record| record.supervisor)
-    else {
-        return false;
+    let source_actor = match caller_record.role {
+        FunctionRole::TaskEntry(task) => {
+            let Some(actor) = graph
+                .tasks
+                .get(task.0 as usize)
+                .filter(|record| record.id == task)
+                .and_then(|record| record.supervisor)
+            else {
+                return false;
+            };
+            actor
+        }
+        FunctionRole::ActorTurn(actor) => actor,
+        _ => return false,
     };
     let Some(target_record) = analysis.functions.get(target.0 as usize) else {
         return false;
@@ -7174,16 +7178,20 @@ fn exact_actor_request_matches(
     let Some(producer) = analysis.functions.get(caller.0 as usize) else {
         return false;
     };
-    let FunctionRole::TaskEntry(task) = producer.role else {
-        return false;
-    };
-    let Some(source_actor) = graph
-        .tasks
-        .get(task.0 as usize)
-        .filter(|record| record.id == task)
-        .and_then(|record| record.supervisor)
-    else {
-        return false;
+    let source_actor = match producer.role {
+        FunctionRole::TaskEntry(task) => {
+            let Some(actor) = graph
+                .tasks
+                .get(task.0 as usize)
+                .filter(|record| record.id == task)
+                .and_then(|record| record.supervisor)
+            else {
+                return false;
+            };
+            actor
+        }
+        FunctionRole::ActorTurn(actor) => actor,
+        _ => return false,
     };
     if source_actor != actor
         && !(graph.actors.len() == 2 && source_actor == ActorId(1) && actor == ActorId(0))

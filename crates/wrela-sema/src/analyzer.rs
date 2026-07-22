@@ -21636,15 +21636,6 @@ fn resolve_self_actor_send(
         .get(caller.0 as usize)
         .filter(|function| function.id == caller)
         .ok_or(AnalysisFailure::RequestMismatch)?;
-    let FunctionRole::TaskEntry(task_id) = caller_record.role else {
-        return Err(actor_runtime_diagnostic(
-            Category::ACTOR,
-            call.source,
-            "semantic-actor-send-producer",
-            "one-way send is currently admitted only from a startup-once @task",
-            "move the send into a bare @task method so its burst bound is finite",
-        ));
-    };
     if caller_record
         .parameters
         .first()
@@ -21656,12 +21647,24 @@ fn resolve_self_actor_send(
         .graph
         .as_ref()
         .ok_or(AnalysisFailure::RequestMismatch)?;
-    let source_actor = graph
-        .tasks
-        .get(task_id.0 as usize)
-        .filter(|task| task.id == task_id)
-        .and_then(|task| task.supervisor)
-        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let source_actor = match caller_record.role {
+        FunctionRole::TaskEntry(task_id) => graph
+            .tasks
+            .get(task_id.0 as usize)
+            .filter(|task| task.id == task_id)
+            .and_then(|task| task.supervisor)
+            .ok_or(AnalysisFailure::RequestMismatch)?,
+        FunctionRole::ActorTurn(actor) => actor,
+        _ => {
+            return Err(actor_runtime_diagnostic(
+                Category::ACTOR,
+                call.source,
+                "semantic-actor-send-producer",
+                "one-way send requires a bounded startup task or an admitted non-reentrant actor turn",
+                "move the send into a bare @task, or publish one next turn from the current actor turn",
+            ));
+        }
+    };
     let source_actor_record = graph
         .actors
         .get(source_actor.0 as usize)
@@ -21746,6 +21749,17 @@ fn resolve_self_actor_send(
         .get(actor.0 as usize)
         .filter(|record| record.id == actor)
         .ok_or(AnalysisFailure::RequestMismatch)?;
+    if matches!(caller_record.role, FunctionRole::ActorTurn(_))
+        && (dependency_name.is_some() || source_actor != actor)
+    {
+        return Err(actor_runtime_diagnostic(
+            Category::ACTOR,
+            call.source,
+            "semantic-actor-send-producer",
+            "actor-turn sends may only publish to the same non-reentrant actor",
+            "publish the next message through self after the current turn receives its mailbox entry",
+        ));
+    }
     let mut method = None;
     for candidate in &actor_record.turn_functions {
         check_cancelled(is_cancelled)?;
@@ -21774,6 +21788,15 @@ fn resolve_self_actor_send(
             "name one public unit-message actor method",
         )
     })?;
+    if matches!(caller_record.role, FunctionRole::ActorTurn(_)) && method == caller {
+        return Err(actor_runtime_diagnostic(
+            Category::ACTOR,
+            call.source,
+            "semantic-actor-send-producer",
+            "an actor turn cannot republish itself in the bounded recurring subset",
+            "publish one distinct terminal turn so the capacity-one drain is acyclic",
+        ));
+    }
     let method_record = partial
         .functions
         .get(method.0 as usize)
@@ -21887,11 +21910,10 @@ fn prepare_actor_sends(
         .ok_or(AnalysisFailure::RequestMismatch)?
         .actors
         .len();
-    let mut admitted = Vec::new();
-    admitted
-        .try_reserve_exact(actor_count)
-        .map_err(|_| fact_resource(request, "actor send admission counts"))?;
-    admitted.resize(actor_count, 0u32);
+    let mut direct_edges = Vec::new();
+    direct_edges
+        .try_reserve_exact(3)
+        .map_err(|_| fact_resource(request, "actor send chain"))?;
     let mut attempted = Vec::new();
     attempted
         .try_reserve_exact(actor_count)
@@ -21915,45 +21937,16 @@ fn prepare_actor_sends(
                 any_send = true;
                 let resolved =
                     resolve_self_actor_send(request, partial, caller, expression, is_cancelled)?;
-                let count = admitted
-                    .get_mut(resolved.actor.0 as usize)
-                    .ok_or(AnalysisFailure::RequestMismatch)?;
-                *count = count
-                    .checked_add(1)
-                    .ok_or_else(|| fact_resource(request, "actor send admission count"))?;
-                let mailbox_capacity = partial
-                    .graph
-                    .as_ref()
-                    .and_then(|graph| graph.actors.get(resolved.actor.0 as usize))
-                    .map(|actor| actor.mailbox_capacity)
-                    .ok_or(AnalysisFailure::RequestMismatch)?;
-                if *count > mailbox_capacity {
-                    return Err(actor_runtime_diagnostic(
-                        Category::CAPACITY,
-                        statement.source,
-                        "semantic-actor-send-mailbox-over-bound",
-                        "startup one-way sends exceed the sealed mailbox capacity",
-                        "increase the explicit mailbox bound or reduce the startup send burst",
-                    ));
-                }
-                if *count > 1 {
+                if direct_edges.len() == 3 {
                     return Err(actor_runtime_diagnostic(
                         Category::ACTOR,
                         statement.source,
-                        "semantic-actor-send-single-message-bound",
-                        "the implemented FIFO dispatch subset admits one startup message per actor",
-                        "keep one startup send until recurring mailbox scheduling is implemented",
+                        "semantic-actor-send-chain",
+                        "one-way sends exceed the implemented bounded recurring chain",
+                        "use one startup send, or one startup-to-turn edge followed by one terminal turn",
                     ));
                 }
-                append_actor_send_permit(
-                    request,
-                    partial,
-                    caller,
-                    resolved,
-                    "one-way admission: ",
-                    "the startup-once producer contributes one message to an initially empty bounded mailbox before FIFO dispatch",
-                    is_cancelled,
-                )?;
+                direct_edges.push((caller, resolved, statement.source));
             }
 
             let program = request.hir.as_program();
@@ -21977,6 +21970,21 @@ fn prepare_actor_sends(
                 any_send = true;
                 let resolved =
                     resolve_self_actor_send(request, partial, caller, call, is_cancelled)?;
+                if !matches!(
+                    partial
+                        .functions
+                        .get(caller.0 as usize)
+                        .map(|record| record.role),
+                    Some(FunctionRole::TaskEntry(_))
+                ) {
+                    return Err(actor_runtime_diagnostic(
+                        Category::ACTOR,
+                        expression.source,
+                        "semantic-actor-try-send-recurring-pending",
+                        "nonblocking actor-turn admission is not implemented by the recurring drain",
+                        "use direct `send self.next()` for the bounded recurring unit-message chain",
+                    ));
+                }
                 let count = attempted
                     .get_mut(resolved.actor.0 as usize)
                     .ok_or(AnalysisFailure::RequestMismatch)?;
@@ -22004,8 +22012,125 @@ fn prepare_actor_sends(
             }
         }
     }
+    if !direct_edges.is_empty() {
+        validate_and_seal_direct_actor_send_chain(request, partial, &direct_edges, is_cancelled)?;
+    }
     if any_send {
         let _ = ensure_actor_reservation_type(request, partial)?;
+    }
+    Ok(())
+}
+
+fn validate_and_seal_direct_actor_send_chain(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    edges: &[(FunctionInstanceId, ResolvedActorSend, Span)],
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<()> {
+    check_cancelled(is_cancelled)?;
+    let role = |function: FunctionInstanceId| {
+        partial
+            .functions
+            .get(function.0 as usize)
+            .map(|record| record.role)
+    };
+    let capacity = |actor: ActorId| {
+        partial
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.actors.get(actor.0 as usize))
+            .map(|record| record.mailbox_capacity)
+    };
+    let mut startup_edges: Vec<&(FunctionInstanceId, ResolvedActorSend, Span)> = Vec::new();
+    startup_edges
+        .try_reserve_exact(edges.len())
+        .map_err(|_| fact_resource(request, "actor send startup edges"))?;
+    startup_edges.extend(
+        edges
+            .iter()
+            .filter(|(producer, _, _)| matches!(role(*producer), Some(FunctionRole::TaskEntry(_)))),
+    );
+    let single_startup = edges.len() == 1
+        && startup_edges.len() == 1
+        && capacity(edges[0].1.actor).is_some_and(|bound| bound >= 1);
+    let recurring = if edges.len() == 2 && startup_edges.len() == 1 {
+        let startup = startup_edges[0];
+        let turn = edges
+            .iter()
+            .find(|edge| !matches!(role(edge.0), Some(FunctionRole::TaskEntry(_))));
+        turn.is_some_and(|turn| {
+            let actor = startup.1.actor;
+            capacity(actor) == Some(1)
+                && turn.1.actor == actor
+                && matches!(role(turn.0), Some(FunctionRole::ActorTurn(owner)) if owner == actor)
+                && startup.1.method == turn.0
+                && turn.1.method != startup.1.method
+                && partial.graph.as_ref().is_some_and(|graph| {
+                    graph.actors.get(actor.0 as usize).is_some_and(|record| {
+                        record.turn_functions.len() == 2
+                            && record.turn_functions.contains(&startup.1.method)
+                            && record.turn_functions.contains(&turn.1.method)
+                    })
+                })
+        })
+    } else {
+        false
+    };
+    if !single_startup && !recurring {
+        let source = edges
+            .last()
+            .map(|edge| edge.2)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        if let Some(bound) = startup_edges
+            .first()
+            .and_then(|edge| capacity(edge.1.actor))
+        {
+            let startup_count = u32::try_from(startup_edges.len())
+                .map_err(|_| fact_resource(request, "actor send admission count"))?;
+            if startup_count > bound {
+                return Err(actor_runtime_diagnostic(
+                    Category::CAPACITY,
+                    source,
+                    "semantic-actor-send-mailbox-over-bound",
+                    "startup one-way sends exceed the sealed mailbox capacity",
+                    "increase the explicit mailbox bound or reduce the startup send burst",
+                ));
+            }
+        }
+        if startup_edges.len() > 1 {
+            return Err(actor_runtime_diagnostic(
+                Category::ACTOR,
+                source,
+                "semantic-actor-send-single-message-bound",
+                "the implemented drain admits one startup message per actor",
+                "keep one startup send; a recurring edge must be published by that first actor turn",
+            ));
+        }
+        return Err(actor_runtime_diagnostic(
+            Category::ACTOR,
+            source,
+            "semantic-actor-send-chain",
+            "one-way sends do not form an admitted fixed actor mailbox profile",
+            "use one startup send or an exact capacity-one startup-to-turn-to-terminal chain",
+        ));
+    }
+
+    for (producer, resolved, _) in edges {
+        check_cancelled(is_cancelled)?;
+        let explanation = if recurring {
+            "the startup publish and one turn-published successor form an acyclic capacity-one non-reentrant drain"
+        } else {
+            "the startup-once producer contributes one message to an initially empty bounded mailbox before FIFO dispatch"
+        };
+        append_actor_send_permit(
+            request,
+            partial,
+            *producer,
+            *resolved,
+            "one-way admission: ",
+            explanation,
+            is_cancelled,
+        )?;
     }
     Ok(())
 }

@@ -758,6 +758,10 @@ pub enum MachineActivationSchedule {
     /// The image entry invokes this actor turn once, immediately after the
     /// startup task has published its statically admitted mailbox message.
     MailboxOnce,
+    /// One per-core capacity-one drain owns all turns for this actor. The
+    /// image entry dispatches by sealed mailbox tag and never calls a turn
+    /// recursively from another turn.
+    SchedulerFifo,
     StartupOnce,
 }
 
@@ -2906,8 +2910,12 @@ fn validate_actor_message_contract(module: &MachineWir, errors: &mut ValidationC
     let mut commit_count = 0_u8;
     let mut receive_count = 0_u8;
     let mut dispatch_count = 0_u8;
-    let mut reserve = None;
-    let mut receive = None;
+    let Some(mut reserves) = errors.scratch(2) else {
+        return;
+    };
+    let Some(mut receives) = errors.scratch(2) else {
+        return;
+    };
     let mut dispatch = None;
 
     for function in &module.functions {
@@ -2935,7 +2943,11 @@ fn validate_actor_message_contract(module: &MachineWir, errors: &mut ValidationC
                         let result = instruction.results.first().copied();
                         let adjacent_commit = block.instructions.get(index.saturating_add(1));
                         let fixed = instruction.results.len() == 1
-                            && matches!(function.role, MachineFunctionRole::TaskEntry(_))
+                            && match function.role {
+                                MachineFunctionRole::TaskEntry(_) => true,
+                                MachineFunctionRole::ActorTurn(owner) => owner == *actor,
+                                _ => false,
+                            }
                             && source.is_some()
                             && failure.kind == ScalarFailureKind::ActorMailboxFull
                             && failure.flow_function == function.flow_function
@@ -2962,13 +2974,13 @@ fn validate_actor_message_contract(module: &MachineWir, errors: &mut ValidationC
                                     && *commit_method == *method
                                     && *commit_source == source
                             );
-                        if reserve.is_some() || !fixed {
+                        if reserves.len() >= 2 || !fixed {
                             errors.push(ValidationError::InvalidRecord {
                                 kind: "actor mailbox reserve contract",
                                 id: instruction.id.0,
                             });
                         } else if let (Some(reservation), Some(source)) = (result, source) {
-                            reserve = Some(ActorReserveRecord {
+                            reserves.push(ActorReserveRecord {
                                 function: function.id,
                                 instruction: instruction.id,
                                 reservation,
@@ -3031,13 +3043,13 @@ fn validate_actor_message_contract(module: &MachineWir, errors: &mut ValidationC
                             && failure.kind == ScalarFailureKind::ActorMailboxMismatch
                             && failure.flow_function == function.flow_function
                             && failure.flow_instruction == instruction.id.0;
-                        if receive.is_some() || !fixed {
+                        if receives.len() >= 2 || !fixed {
                             errors.push(ValidationError::InvalidRecord {
                                 kind: "actor mailbox receive contract",
                                 id: instruction.id.0,
                             });
                         } else {
-                            receive = Some(ActorReceiveRecord {
+                            receives.push(ActorReceiveRecord {
                                 function: function.id,
                                 instruction: instruction.id,
                                 mailbox: *mailbox,
@@ -3103,28 +3115,70 @@ fn validate_actor_message_contract(module: &MachineWir, errors: &mut ValidationC
         return;
     }
 
-    let chain = reserve.zip(receive).zip(dispatch);
-    let counts_match =
-        reserve_count == 1 && commit_count == 1 && receive_count == 1 && dispatch_count == 1;
-    let metadata_match = chain.is_some_and(|((reserve, receive), dispatch)| {
-        reserve.mailbox == receive.mailbox
-            && reserve.mailbox == dispatch.mailbox
-            && reserve.actor == receive.actor
-            && reserve.actor == dispatch.actor
-            && reserve.method == receive.method
-            && reserve.method == dispatch.method
-            && receive.function == reserve.method
-            && receive.instruction.0 == receive.failure.flow_instruction
-            && reserve.instruction.0 == reserve.failure.flow_instruction
-    });
-    if !counts_match || !metadata_match {
+    let single = matches!(
+        (reserves.as_slice(), receives.as_slice(), dispatch),
+        ([reserve], [receive], Some(dispatch))
+            if reserve_count == 1
+                && commit_count == 1
+                && receive_count == 1
+                && dispatch_count == 1
+                && reserve.mailbox == receive.mailbox
+                && reserve.mailbox == dispatch.mailbox
+                && reserve.actor == receive.actor
+                && reserve.actor == dispatch.actor
+                && reserve.method == receive.method
+                && reserve.method == dispatch.method
+                && receive.function == reserve.method
+                && receive.instruction.0 == receive.failure.flow_instruction
+                && reserve.instruction.0 == reserve.failure.flow_instruction
+    );
+    let recurring = matches!(
+        (reserves.as_slice(), dispatch),
+        ([left, right], Some(dispatch))
+            if reserve_count == 2
+                && commit_count == 2
+                && receive_count == 2
+                && dispatch_count == 1
+                && {
+                    let (startup, turn) = if matches!(
+                        module.functions.get(left.function.0 as usize).map(|function| function.role),
+                        Some(MachineFunctionRole::TaskEntry(_))
+                    ) { (left, right) } else { (right, left) };
+                    startup.actor == turn.actor
+                        && startup.mailbox == turn.mailbox
+                        && startup.mailbox == dispatch.mailbox
+                        && startup.actor == dispatch.actor
+                        && startup.method == dispatch.method
+                        && startup.method == turn.function
+                        && startup.method != turn.method
+                        && receives.iter().all(|receive| {
+                            receive.mailbox == startup.mailbox
+                                && receive.actor == startup.actor
+                                && receive.function == receive.method
+                                && receive.instruction.0 == receive.failure.flow_instruction
+                        })
+                        && receives.iter().any(|receive| receive.method == startup.method)
+                        && receives.iter().any(|receive| receive.method == turn.method)
+                        && left.instruction.0 == left.failure.flow_instruction
+                        && right.instruction.0 == right.failure.flow_instruction
+                }
+    );
+    if !single && !recurring {
         errors.push(ValidationError::InvalidRecord {
             kind: "actor mailbox message contract",
             id: 0,
         });
         return;
     }
-    let Some(((reserve, _receive), _dispatch)) = chain else {
+    let Some(reserve) = reserves.iter().find(|reserve| {
+        matches!(
+            module
+                .functions
+                .get(reserve.function.0 as usize)
+                .map(|function| function.role),
+            Some(MachineFunctionRole::TaskEntry(_))
+        )
+    }) else {
         return;
     };
 
@@ -3151,6 +3205,77 @@ fn validate_actor_message_contract(module: &MachineWir, errors: &mut ValidationC
             && storage.capacity_bytes == 16
             && storage.alignment == 8
     });
+    let mut all_reserves_match = storage_matches;
+    for candidate in &reserves {
+        if !errors.poll() {
+            return;
+        }
+        let proof_matches = storage
+            .and_then(|storage| {
+                module
+                    .proofs
+                    .get(candidate.proof.0 as usize)
+                    .map(|proof| (storage, proof))
+            })
+            .is_some_and(|(storage, proof)| {
+                candidate.mailbox == reserve.mailbox
+                    && candidate.actor == reserve.actor
+                    && proof.kind == BackendProofKind::CapacityBound
+                    && proof.source_proofs.as_slice() == [candidate.proof.0]
+                    && proof.depends_on.as_slice() == [storage.capacity_proof]
+                    && proof.bound == Some(1)
+                    && proof.sources.as_slice() == [candidate.source]
+                    && proof.source == Some(candidate.source)
+            });
+        let producer_matches = module
+            .functions
+            .get(candidate.function.0 as usize)
+            .is_some_and(|producer| producer.proofs.contains(&candidate.proof));
+        let target_matches = module
+            .functions
+            .get(candidate.method.0 as usize)
+            .is_some_and(|target| {
+                target.id == candidate.method
+                    && target.role == MachineFunctionRole::ActorTurn(candidate.actor)
+                    && target.parameters.is_empty()
+                    && module
+                        .types
+                        .get(target.result.0 as usize)
+                        .is_some_and(|ty| ty.kind == MachineTypeKind::Void)
+            });
+        let mut uses = 0_u8;
+        let mut escaped = false;
+        if let Some(producer) = module.functions.get(candidate.function.0 as usize) {
+            for block in &producer.blocks {
+                if !errors.poll() {
+                    return;
+                }
+                for instruction in &block.instructions {
+                    if !errors.poll() {
+                        return;
+                    }
+                    let expected_commit = matches!(
+                        instruction.operation,
+                        MachineOperation::ActorCommit { reservation, .. }
+                            if reservation == candidate.reservation
+                    );
+                    for_each_operation_value(&instruction.operation, |value| {
+                        if value == candidate.reservation {
+                            uses = uses.saturating_add(1);
+                            escaped |= !expected_commit;
+                        }
+                        true
+                    });
+                }
+                for_each_terminator_value(&block.terminator, |value| {
+                    escaped |= value == candidate.reservation;
+                    true
+                });
+            }
+        }
+        all_reserves_match &=
+            proof_matches && producer_matches && target_matches && uses == 1 && !escaped;
+    }
     let permit_matches = storage
         .and_then(|storage| {
             module
@@ -3189,19 +3314,38 @@ fn validate_actor_message_contract(module: &MachineWir, errors: &mut ValidationC
         });
     let mut actor_activation_count = 0_u8;
     let mut task_activation_count = 0_u8;
+    let recurring_methods = recurring.then(|| {
+        let continuation = reserves
+            .iter()
+            .find(|candidate| candidate.function != reserve.function)
+            .map(|candidate| candidate.method)
+            .unwrap_or(reserve.method);
+        (reserve.method, continuation)
+    });
+    let mut first_fifo = 0_u8;
+    let mut second_fifo = 0_u8;
+    let mut fifo_callers_match = true;
     for activation in &module.activations {
         if !errors.poll() {
             return;
         }
-        if activation.caller == reserve.method
-            && activation.schedule == MachineActivationSchedule::MailboxOnce
-            && activation.owner
-                == (MachineActivationOwner::Actor {
-                    actor: reserve.actor,
-                    mailbox_capacity: 1,
-                })
+        if matches!(activation.owner, MachineActivationOwner::Actor { actor, mailbox_capacity: 1 }
+                if actor == reserve.actor)
+            && ((single
+                && activation.caller == reserve.method
+                && activation.schedule == MachineActivationSchedule::MailboxOnce)
+                || (recurring && activation.schedule == MachineActivationSchedule::SchedulerFifo))
         {
             actor_activation_count = actor_activation_count.saturating_add(1);
+            if let Some((first, second)) = recurring_methods {
+                if activation.caller == first {
+                    first_fifo = first_fifo.saturating_add(1);
+                } else if activation.caller == second {
+                    second_fifo = second_fifo.saturating_add(1);
+                } else {
+                    fifo_callers_match = false;
+                }
+            }
         }
         if activation.caller == reserve.function
             && activation.schedule == MachineActivationSchedule::StartupOnce
@@ -3278,11 +3422,13 @@ fn validate_actor_message_contract(module: &MachineWir, errors: &mut ValidationC
             }
         }
     }
-    if !storage_matches
+    if !all_reserves_match
+        || !storage_matches
         || !permit_matches
         || !producer_has_permit
         || !target_matches
-        || actor_activation_count != 1
+        || actor_activation_count != if recurring { 2 } else { 1 }
+        || (recurring && (!fifo_callers_match || first_fifo != 1 || second_fifo != 1))
         || task_activation_count != 1
         || reservation_uses != 1
     {
@@ -3342,7 +3488,9 @@ fn validate_activations(module: &MachineWir, errors: &mut ValidationContext<'_>)
                     mailbox_capacity,
                 },
                 MachineFunctionRole::ActorTurn(role_actor),
-                MachineActivationSchedule::DormantMailbox | MachineActivationSchedule::MailboxOnce,
+                MachineActivationSchedule::DormantMailbox
+                | MachineActivationSchedule::MailboxOnce
+                | MachineActivationSchedule::SchedulerFifo,
             ) => actor == role_actor && mailbox_capacity != 0,
             (
                 MachineActivationOwner::Task {
@@ -3651,6 +3799,7 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                             activation.schedule,
                             MachineActivationSchedule::DormantMailbox
                                 | MachineActivationSchedule::MailboxOnce
+                                | MachineActivationSchedule::SchedulerFifo
                         ) && activation.owner
                             == (MachineActivationOwner::Actor {
                                 actor,
@@ -3697,6 +3846,7 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                             activation.schedule,
                             MachineActivationSchedule::DormantMailbox
                                 | MachineActivationSchedule::MailboxOnce
+                                | MachineActivationSchedule::SchedulerFifo
                         ) && activation.caller == function
                     })
             }
@@ -4020,6 +4170,7 @@ fn activation_schedule_matches(
     let mut calls = 0usize;
     let mut valid_startup = false;
     let mut valid_mailbox = false;
+    let mut valid_fifo = false;
     for function in &module.functions {
         if !errors.poll() {
             return false;
@@ -4037,6 +4188,18 @@ fn activation_schedule_matches(
                 let mailbox_dispatch = matches!(&instruction.operation,
                     MachineOperation::MailboxDispatch { method, .. }
                         if *method == activation.caller);
+                valid_fifo |= matches!(
+                    (&instruction.operation, activation.owner),
+                    (
+                        MachineOperation::MailboxDispatch { actor, .. },
+                        MachineActivationOwner::Actor { actor: owner, .. },
+                    ) if *actor == owner
+                        && function.id == module.image_entry
+                        && Some(block.id) == startup_success
+                        && index == 1
+                        && instruction.results.is_empty()
+                        && instruction.source.is_none()
+                );
                 if direct_call || mailbox_dispatch {
                     calls = calls.saturating_add(1);
                     valid_startup |= direct_call
@@ -4067,6 +4230,9 @@ fn activation_schedule_matches(
     match activation.schedule {
         MachineActivationSchedule::DormantMailbox => calls == 0,
         MachineActivationSchedule::MailboxOnce => calls == 1 && valid_mailbox,
+        MachineActivationSchedule::SchedulerFifo => {
+            calls == usize::from(valid_mailbox) && valid_fifo
+        }
         MachineActivationSchedule::StartupOnce => calls == 1 && valid_startup,
     }
 }

@@ -1708,6 +1708,7 @@ fn validate_actor_wait_contract(
         limits.model_edges,
     )?;
     admitted.resize(graph.actors.len(), 0_u32);
+    let mut direct_edges = try_vec(2, "one-way actor drain edges", limits.model_edges)?;
     for fact in &facts.expressions {
         check_cancelled(is_cancelled)?;
         if let sema::ExpressionResolution::ActorRequest {
@@ -1721,15 +1722,19 @@ fn validate_actor_wait_contract(
                 .get(fact.function.0 as usize)
                 .filter(|producer| producer.id == fact.function)
                 .ok_or_else(|| unsupported("one-way actor producer identity"))?;
-            let sema::FunctionRole::TaskEntry(task) = producer.role else {
-                return Err(unsupported("one-way sends outside startup-once tasks"));
+            let (owner, turn_producer) = match producer.role {
+                sema::FunctionRole::TaskEntry(task) => (
+                    graph
+                        .tasks
+                        .get(task.0 as usize)
+                        .filter(|record| record.id == task)
+                        .and_then(|record| record.supervisor)
+                        .ok_or_else(|| unsupported("one-way task actor ownership"))?,
+                    None,
+                ),
+                sema::FunctionRole::ActorTurn(owner) => (owner, Some(owner)),
+                _ => return Err(unsupported("one-way sends outside bounded actor producers")),
             };
-            let owner = graph
-                .tasks
-                .get(task.0 as usize)
-                .filter(|record| record.id == task)
-                .and_then(|record| record.supervisor)
-                .ok_or_else(|| unsupported("one-way task actor ownership"))?;
             let target = facts
                 .functions
                 .get(method.0 as usize)
@@ -1789,6 +1794,7 @@ fn validate_actor_wait_contract(
                 limit: limits.model_edges,
             })?;
             let cross_actor = graph.actors.len() == 2
+                && turn_producer.is_none()
                 && owner == sema::ActorId(1)
                 && actor == sema::ActorId(0)
                 && facts
@@ -1804,7 +1810,6 @@ fn validate_actor_wait_contract(
                         && proof.depends_on.is_empty()
                 });
             if (owner != actor && !cross_actor)
-                || *count != 1
                 || fact.effects.0 != sema::EffectSet::ACTOR
                 || fact.ownership_before != sema::OwnershipState::Owned
                 || fact.ownership_after != sema::OwnershipState::Taken
@@ -1814,6 +1819,10 @@ fn validate_actor_wait_contract(
             {
                 return Err(unsupported("noncanonical one-way actor admission"));
             }
+            if direct_edges.len() == 2 {
+                return Err(unsupported("one-way actor drain has more than two edges"));
+            }
+            direct_edges.push((fact.function, actor, method));
             continue;
         }
         let sema::ExpressionResolution::DirectCall {
@@ -1832,6 +1841,48 @@ fn validate_actor_wait_contract(
         {
             return Err(unsupported("async actor calls without an immediate await"));
         }
+    }
+    let direct_profile_matches = match direct_edges.as_slice() {
+        [(producer, actor, _)] => {
+            facts
+                .functions
+                .get(producer.0 as usize)
+                .is_some_and(|record| matches!(record.role, sema::FunctionRole::TaskEntry(_)))
+                && admitted.get(actor.0 as usize) == Some(&1)
+        }
+        [first, second] => {
+            let (startup, turn) = if facts
+                .functions
+                .get(first.0.0 as usize)
+                .is_some_and(|record| matches!(record.role, sema::FunctionRole::TaskEntry(_)))
+            {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            startup.1 == turn.1
+                && startup.2 == turn.0
+                && startup.2 != turn.2
+                && admitted.get(startup.1.0 as usize) == Some(&2)
+                && graph
+                    .actors
+                    .get(startup.1.0 as usize)
+                    .is_some_and(|record| {
+                        record.mailbox_capacity == 1
+                            && record.turn_functions.len() == 2
+                            && record.turn_functions.contains(&startup.2)
+                            && record.turn_functions.contains(&turn.2)
+                    })
+                && facts
+                    .functions
+                    .get(turn.0.0 as usize)
+                    .is_some_and(|record| record.role == sema::FunctionRole::ActorTurn(turn.1))
+        }
+        [] => true,
+        _ => false,
+    };
+    if !direct_profile_matches {
+        return Err(unsupported("noncanonical bounded actor drain profile"));
     }
     cancellable_sort_by(
         &mut edges,
@@ -8585,21 +8636,24 @@ impl SourceFunctionLowerer<'_> {
             .functions
             .get(method.0 as usize)
             .ok_or_else(|| self.fact_mismatch("one-way target function"))?;
-        let caller_task = match self.function.role {
-            sema::FunctionRole::TaskEntry(task) => task,
-            _ => return Err(self.fact_mismatch("one-way startup producer")),
-        };
         let graph = self
             .input
             .facts()
             .graph
             .as_ref()
             .ok_or_else(|| self.fact_mismatch("one-way actor graph"))?;
-        let owner = graph
-            .tasks
-            .get(caller_task.0 as usize)
-            .and_then(|task| task.supervisor)
-            .ok_or_else(|| self.fact_mismatch("one-way task owner"))?;
+        let (owner, turn_producer) = match self.function.role {
+            sema::FunctionRole::TaskEntry(task) => (
+                graph
+                    .tasks
+                    .get(task.0 as usize)
+                    .and_then(|task| task.supervisor)
+                    .ok_or_else(|| self.fact_mismatch("one-way task owner"))?,
+                false,
+            ),
+            sema::FunctionRole::ActorTurn(owner) => (owner, true),
+            _ => return Err(self.fact_mismatch("one-way bounded producer")),
+        };
         let permit_record = self
             .input
             .facts()
@@ -8614,6 +8668,7 @@ impl SourceFunctionLowerer<'_> {
             .find(|proof| proof.kind == sema::ProofKind::ActorAsIf)
             .map(|proof| proof.id);
         let cross_actor = graph.actors.len() == 2
+            && !turn_producer
             && owner == sema::ActorId(1)
             && actor == sema::ActorId(0)
             && wiring_proof.is_some()

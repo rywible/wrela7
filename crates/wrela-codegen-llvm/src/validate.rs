@@ -647,9 +647,24 @@ fn validate_actor_message_table(
             "the sealed unit-message mailbox admission and dispatch contract",
         )
     };
-    let mut reserve = None;
+    let mut reserves = Vec::new();
+    reserves
+        .try_reserve_exact(2)
+        .map_err(|_| CodegenError::ResourceLimit {
+            resource: "actor mailbox reserve records",
+            limit: 2,
+            actual: 2,
+        })?;
     let mut commit_count = 0_u8;
-    let mut receive = None;
+    let mut receives = Vec::new();
+    receives
+        .try_reserve_exact(2)
+        .map_err(|_| CodegenError::ResourceLimit {
+            resource: "actor mailbox receive records",
+            limit: 2,
+            actual: 2,
+        })?;
+    check_cancelled(is_cancelled)?;
     let mut dispatch = None;
 
     for (function_index, function) in machine.functions.iter().enumerate() {
@@ -670,8 +685,12 @@ fn validate_actor_message_table(
                             return Err(invalid());
                         };
                         let adjacent = block.instructions.get(instruction_index.saturating_add(1));
-                        if reserve.is_some()
-                            || !matches!(function.role, MachineFunctionRole::TaskEntry(_))
+                        if reserves.len() >= 2
+                            || !match function.role {
+                                MachineFunctionRole::TaskEntry(_) => true,
+                                MachineFunctionRole::ActorTurn(owner) => owner == *actor,
+                                _ => false,
+                            }
                             || instruction.source.is_none()
                             || failure.kind != ScalarFailureKind::ActorMailboxFull
                             || failure.flow_function != function.flow_function
@@ -692,7 +711,7 @@ fn validate_actor_message_table(
                         {
                             return Err(invalid());
                         }
-                        reserve = Some((
+                        reserves.push((
                             function.id,
                             *reservation,
                             *mailbox,
@@ -735,7 +754,7 @@ fn validate_actor_message_table(
                         method,
                         failure,
                     } => {
-                        if receive.is_some()
+                        if receives.len() >= 2
                             || !instruction.results.is_empty()
                             || block.id != function.entry
                             || instruction_index != 0
@@ -748,7 +767,7 @@ fn validate_actor_message_table(
                         {
                             return Err(invalid());
                         }
-                        receive = Some((*mailbox, *actor, *method));
+                        receives.push((*mailbox, *actor, *method));
                     }
                     MachineOperation::MailboxDispatch {
                         mailbox,
@@ -785,23 +804,50 @@ fn validate_actor_message_table(
     }
 
     let any_message =
-        reserve.is_some() || commit_count != 0 || receive.is_some() || dispatch.is_some();
+        !reserves.is_empty() || commit_count != 0 || !receives.is_empty() || dispatch.is_some();
     if !any_message {
         for (index, activation) in machine.activations.iter().enumerate() {
             check_periodically(index, is_cancelled)?;
-            if activation.schedule == MachineActivationSchedule::MailboxOnce {
+            if matches!(
+                activation.schedule,
+                MachineActivationSchedule::MailboxOnce | MachineActivationSchedule::SchedulerFifo
+            ) {
                 return Err(invalid());
             }
         }
         return Ok(());
     }
-    let Some((producer, _reservation, mailbox, actor, method, permit, source)) = reserve else {
+    let recurring = reserves.len() == 2 && receives.len() == 2 && commit_count == 2;
+    let Some(&(producer, _reservation, mailbox, actor, method, _permit, _source)) =
+        reserves.iter().find(|record| {
+            machine
+                .functions
+                .get(record.0.0 as usize)
+                .is_some_and(|function| matches!(function.role, MachineFunctionRole::TaskEntry(_)))
+        })
+    else {
         return Err(invalid());
     };
-    if commit_count != 1
-        || receive != Some((mailbox, actor, method))
-        || dispatch != Some((mailbox, actor, method))
-    {
+    let chain_matches = if recurring {
+        reserves
+            .iter()
+            .find(|record| record.0 != producer)
+            .is_some_and(|turn| {
+                turn.2 == mailbox
+                    && turn.3 == actor
+                    && turn.0 == method
+                    && turn.4 != method
+                    && receives.contains(&(mailbox, actor, method))
+                    && receives.contains(&(mailbox, actor, turn.4))
+                    && dispatch == Some((mailbox, actor, method))
+            })
+    } else {
+        reserves.len() == 1
+            && receives.as_slice() == [(mailbox, actor, method)]
+            && commit_count == 1
+            && dispatch == Some((mailbox, actor, method))
+    };
+    if !chain_matches {
         return Err(invalid());
     }
     let mut storage = None;
@@ -826,44 +872,72 @@ fn validate_actor_message_table(
     {
         return Err(invalid());
     }
-    let proof = machine.proofs.get(permit.0 as usize).ok_or_else(invalid)?;
-    if proof.kind != BackendProofKind::CapacityBound
-        || proof.source_proofs.as_slice() != [permit.0]
-        || proof.depends_on.as_slice() != [storage.capacity_proof]
-        || proof.bound != Some(1)
-        || source.is_none_or(|source| {
-            proof.sources.as_slice() != [source] || proof.source != Some(source)
-        })
+    for (_, _, reserve_mailbox, reserve_actor, target_method, reserve_permit, reserve_source) in
+        &reserves
     {
-        return Err(invalid());
-    }
-    let target = machine
-        .functions
-        .get(method.0 as usize)
-        .ok_or_else(invalid)?;
-    if target.id != method
-        || target.role != MachineFunctionRole::ActorTurn(actor)
-        || !target.parameters.is_empty()
-        || machine
-            .types
-            .get(target.result.0 as usize)
-            .is_none_or(|ty| ty.kind != MachineTypeKind::Void)
-    {
-        return Err(invalid());
+        let proof = machine
+            .proofs
+            .get(reserve_permit.0 as usize)
+            .ok_or_else(invalid)?;
+        let target = machine
+            .functions
+            .get(target_method.0 as usize)
+            .ok_or_else(invalid)?;
+        if *reserve_mailbox != mailbox
+            || *reserve_actor != actor
+            || proof.kind != BackendProofKind::CapacityBound
+            || proof.source_proofs.as_slice() != [reserve_permit.0]
+            || proof.depends_on.as_slice() != [storage.capacity_proof]
+            || proof.bound != Some(1)
+            || reserve_source.is_none_or(|source| {
+                proof.sources.as_slice() != [source] || proof.source != Some(source)
+            })
+            || target.id != *target_method
+            || target.role != MachineFunctionRole::ActorTurn(actor)
+            || !target.parameters.is_empty()
+            || machine
+                .types
+                .get(target.result.0 as usize)
+                .is_none_or(|ty| ty.kind != MachineTypeKind::Void)
+        {
+            return Err(invalid());
+        }
     }
     let mut actor_activation = 0_u8;
     let mut task_activation = 0_u8;
+    let recurring_methods = recurring.then(|| {
+        let continuation = reserves
+            .iter()
+            .find(|record| record.0 != producer)
+            .map(|record| record.4)
+            .unwrap_or(method);
+        (method, continuation)
+    });
+    let mut first_fifo = 0_u8;
+    let mut second_fifo = 0_u8;
+    let mut fifo_callers_match = true;
     for (index, activation) in machine.activations.iter().enumerate() {
         check_periodically(index, is_cancelled)?;
-        if activation.caller == method
-            && activation.schedule == MachineActivationSchedule::MailboxOnce
-            && activation.owner
-                == (MachineActivationOwner::Actor {
-                    actor,
-                    mailbox_capacity: 1,
-                })
+        if activation.owner
+            == (MachineActivationOwner::Actor {
+                actor,
+                mailbox_capacity: 1,
+            })
+            && ((recurring && activation.schedule == MachineActivationSchedule::SchedulerFifo)
+                || (!recurring
+                    && activation.caller == method
+                    && activation.schedule == MachineActivationSchedule::MailboxOnce))
         {
             actor_activation = actor_activation.saturating_add(1);
+            if let Some((first, second)) = recurring_methods {
+                if activation.caller == first {
+                    first_fifo = first_fifo.saturating_add(1);
+                } else if activation.caller == second {
+                    second_fifo = second_fifo.saturating_add(1);
+                } else {
+                    fifo_callers_match = false;
+                }
+            }
         }
         if activation.caller == producer
             && activation.schedule == MachineActivationSchedule::StartupOnce
@@ -882,7 +956,10 @@ fn validate_actor_message_table(
             task_activation = task_activation.saturating_add(1);
         }
     }
-    if actor_activation != 1 || task_activation != 1 {
+    if actor_activation != if recurring { 2 } else { 1 }
+        || task_activation != 1
+        || (recurring && (!fifo_callers_match || first_fifo != 1 || second_fifo != 1))
+    {
         return Err(invalid());
     }
     Ok(())
@@ -936,7 +1013,9 @@ fn validate_activation_table(
                     mailbox_capacity,
                 },
                 MachineFunctionRole::ActorTurn(role),
-                MachineActivationSchedule::DormantMailbox | MachineActivationSchedule::MailboxOnce,
+                MachineActivationSchedule::DormantMailbox
+                | MachineActivationSchedule::MailboxOnce
+                | MachineActivationSchedule::SchedulerFifo,
             ) => actor == role && mailbox_capacity != 0,
             (
                 MachineActivationOwner::Task {
@@ -1001,6 +1080,32 @@ fn validate_activation_table(
                             && matches!(receive.operation,
                                 MachineOperation::MailboxReceive { method, .. }
                                     if method == activation.caller))
+                }
+                MachineActivationSchedule::SchedulerFifo => {
+                    matches!(entry.instructions.first(), Some(receive)
+                        if receive.results.is_empty()
+                            && matches!(receive.operation,
+                                MachineOperation::MailboxReceive { method, .. }
+                                    if method == activation.caller))
+                        && (entry.instructions.len() == 2
+                            || matches!(entry.instructions.as_slice(), [_, reserve, commit, _]
+                                if matches!(
+                                    (&reserve.operation, reserve.results.as_slice()),
+                                    (
+                                        MachineOperation::ActorReserve { method, .. },
+                                        [reservation],
+                                    ) if *method != activation.caller
+                                        && commit.results.is_empty()
+                                        && matches!(
+                                            &commit.operation,
+                                            MachineOperation::ActorCommit {
+                                                reservation: committed,
+                                                method: commit_method,
+                                                ..
+                                            } if committed == reservation
+                                                && commit_method == method
+                                        )
+                                )))
                 }
                 MachineActivationSchedule::StartupOnce => {
                     entry.instructions.len() == 1
@@ -1335,6 +1440,14 @@ fn activation_codegen_schedule_matches(
     let mut calls = 0usize;
     let mut startup = false;
     let mut mailbox = false;
+    let mut fifo = false;
+    let caller_actor = machine
+        .functions
+        .get(caller.0 as usize)
+        .and_then(|function| match function.role {
+            MachineFunctionRole::ActorTurn(actor) => Some(actor),
+            _ => None,
+        });
     for (function_index, function) in machine.functions.iter().enumerate() {
         check_periodically(function_index, is_cancelled)?;
         for (block_index, block) in function.blocks.iter().enumerate() {
@@ -1345,6 +1458,16 @@ fn activation_codegen_schedule_matches(
                     MachineOperation::Call { function, .. } if *function == caller);
                 let mailbox_dispatch = matches!(&instruction.operation,
                     MachineOperation::MailboxDispatch { method, .. } if *method == caller);
+                fifo |= matches!(
+                    &instruction.operation,
+                    MachineOperation::MailboxDispatch { actor, .. }
+                        if Some(*actor) == caller_actor
+                            && function.id == machine.image_entry
+                            && Some(block.id) == startup_success
+                            && instruction_index == 1
+                            && instruction.results.is_empty()
+                            && instruction.source.is_none()
+                );
                 if direct_call || mailbox_dispatch {
                     calls = calls.saturating_add(1);
                     startup |= direct_call
@@ -1375,6 +1498,7 @@ fn activation_codegen_schedule_matches(
     Ok(match schedule {
         MachineActivationSchedule::DormantMailbox => calls == 0,
         MachineActivationSchedule::MailboxOnce => calls == 1 && mailbox,
+        MachineActivationSchedule::SchedulerFifo => calls == usize::from(mailbox) && fifo,
         MachineActivationSchedule::StartupOnce => calls == 1 && startup,
     })
 }

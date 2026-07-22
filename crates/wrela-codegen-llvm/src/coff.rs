@@ -1058,6 +1058,36 @@ fn operation_runtime_relocation(operation: &MachineOperation) -> Option<RuntimeR
     }
 }
 
+fn for_each_operation_internal_branch(
+    machine: &MachineWir,
+    operation: &MachineOperation,
+    is_cancelled: &dyn Fn() -> bool,
+    mut visit: impl FnMut(u32, InternalBranchKind) -> Result<(), CodegenError>,
+) -> Result<(), CodegenError> {
+    if let MachineOperation::MailboxDispatch { actor, method, .. } = operation {
+        let mut fifo = false;
+        for activation in &machine.activations {
+            check_cancelled(is_cancelled)?;
+            if activation.schedule == wrela_machine_wir::MachineActivationSchedule::SchedulerFifo
+                && matches!(
+                    activation.owner,
+                    wrela_machine_wir::MachineActivationOwner::Actor { actor: owner, .. }
+                        if owner == *actor
+                )
+            {
+                fifo = true;
+                visit(activation.caller.0, InternalBranchKind::Call)?;
+            }
+        }
+        if !fifo {
+            visit(method.0, InternalBranchKind::Call)?;
+        }
+    } else if let Some((callee, kind)) = operation_internal_branch(operation) {
+        visit(callee, kind)?;
+    }
+    Ok(())
+}
+
 fn required_internal_relocations(
     machine: &MachineWir,
     options: CodegenOptions,
@@ -1070,13 +1100,19 @@ fn required_internal_relocations(
             check_periodically(block_index, is_cancelled)?;
             for (instruction_index, instruction) in block.instructions.iter().enumerate() {
                 check_periodically(instruction_index, is_cancelled)?;
-                if operation_internal_branch(&instruction.operation).is_some() {
-                    count = count.checked_add(1).ok_or(CodegenError::ResourceLimit {
-                        resource: "internal call relocations",
-                        limit: options.maximum_instructions,
-                        actual: u64::MAX,
-                    })?;
-                }
+                for_each_operation_internal_branch(
+                    machine,
+                    &instruction.operation,
+                    is_cancelled,
+                    |_, _| {
+                        count = count.checked_add(1).ok_or(CodegenError::ResourceLimit {
+                            resource: "internal call relocations",
+                            limit: options.maximum_instructions,
+                            actual: u64::MAX,
+                        })?;
+                        Ok(())
+                    },
+                )?;
             }
             if matches!(block.terminator, MachineTerminator::TailCall { .. }) {
                 count = count.checked_add(1).ok_or(CodegenError::ResourceLimit {
@@ -1115,15 +1151,21 @@ fn required_internal_relocations(
             check_cancelled(is_cancelled)?;
             for instruction in &block.instructions {
                 check_cancelled(is_cancelled)?;
-                if let Some((callee, kind)) = operation_internal_branch(&instruction.operation) {
-                    raw.push(InternalRelocationCell {
-                        section,
-                        callee,
-                        kind,
-                        required: 1,
-                        observed: 0,
-                    });
-                }
+                for_each_operation_internal_branch(
+                    machine,
+                    &instruction.operation,
+                    is_cancelled,
+                    |callee, kind| {
+                        raw.push(InternalRelocationCell {
+                            section,
+                            callee,
+                            kind,
+                            required: 1,
+                            observed: 0,
+                        });
+                        Ok(())
+                    },
+                )?;
             }
             if let MachineTerminator::TailCall {
                 function: callee, ..
