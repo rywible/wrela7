@@ -1009,6 +1009,11 @@ fn validate_actor_source_type(
     input: &AnalyzedImage,
     ty: &sema::SemanticType,
 ) -> Result<(), LowerError> {
+    if matches!(ty.kind, sema::SemanticTypeKind::BoundedString { .. }) {
+        return Err(unsupported(
+            "semantic-bounded-string-lowering-pending (BoundedString has no SemanticWir storage, formatting operation, or ABI representation)",
+        ));
+    }
     if matches!(
         ty.kind,
         sema::SemanticTypeKind::StaticString { .. } | sema::SemanticTypeKind::StaticBytes { .. }
@@ -3034,6 +3039,11 @@ fn validate_supported_source_type(
     ty: &sema::SemanticType,
     facts: &sema::PartialAnalysis,
 ) -> Result<(), LowerError> {
+    if matches!(ty.kind, sema::SemanticTypeKind::BoundedString { .. }) {
+        return Err(unsupported(
+            "semantic-bounded-string-lowering-pending (BoundedString has no SemanticWir storage, formatting operation, or ABI representation)",
+        ));
+    }
     if matches!(
         ty.kind,
         sema::SemanticTypeKind::StaticString { .. } | sema::SemanticTypeKind::StaticBytes { .. }
@@ -21781,6 +21791,51 @@ pub fn boot() -> Image:
                 })
             ),
             "unexpected static lowering result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_bool_interpolation_stops_at_named_semantic_lowering_boundary() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+fn render_status():
+    rendered = f"ready={true}"
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    @task
+    async fn pulse(mut self):
+        render_status()
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#,
+        );
+        let result = CanonicalSemanticLowerer::new().lower(
+            LowerRequest {
+                input: image,
+                limits: LoweringLimits::standard(),
+            },
+            &|| false,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(LowerError::UnsupportedInput {
+                    feature: "semantic-bounded-string-lowering-pending (BoundedString has no SemanticWir storage, formatting operation, or ABI representation)"
+                })
+            ),
+            "unexpected bounded interpolation lowering result: {result:?}"
         );
     }
 

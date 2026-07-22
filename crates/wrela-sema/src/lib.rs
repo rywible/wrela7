@@ -364,6 +364,12 @@ pub enum SemanticTypeKind {
     StaticBytes {
         bytes: u64,
     },
+    /// Analysis-only owned destination for one exactly bounded interpolation.
+    /// `capacity` includes decoded literal UTF-8 bytes and the maximum encoded
+    /// width of every admitted formatted value.
+    BoundedString {
+        capacity: u64,
+    },
     Tuple(Vec<SemanticTypeId>),
     Array {
         element: SemanticTypeId,
@@ -796,6 +802,11 @@ pub enum ExpressionResolution {
         fields: Vec<DerivedEqualityField>,
         conjunctions: Vec<ValueId>,
     },
+    /// Exact source-order witness for an analysis-only bounded interpolation.
+    BoundedInterpolation {
+        capacity: u64,
+        parts: Vec<BoundedInterpolationPart>,
+    },
     /// One exact closed-enum tag test. The scrutinee remains a borrowed value;
     /// the expression result is the separately recorded boolean value.
     EnumTypeTest {
@@ -832,6 +843,18 @@ pub struct DerivedEqualityField {
     pub left: ValueId,
     pub right: ValueId,
     pub comparison: ValueId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedInterpolationPart {
+    Text {
+        value: String,
+        source: Span,
+    },
+    Bool {
+        expression: ExpressionId,
+        value: ValueId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2091,12 +2114,13 @@ fn validate_exact_source_facts(
     for ty in &analysis.types {
         check_analysis_cancelled(is_cancelled)?;
         let identity = match ty.kind {
-            SemanticTypeKind::StaticString { bytes } => Some((false, bytes)),
-            SemanticTypeKind::StaticBytes { bytes } => Some((true, bytes)),
+            SemanticTypeKind::StaticString { bytes } => Some((0_u8, bytes)),
+            SemanticTypeKind::StaticBytes { bytes } => Some((1_u8, bytes)),
+            SemanticTypeKind::BoundedString { capacity } => Some((2_u8, capacity)),
             _ => None,
         };
         if identity.is_some_and(|identity| !static_types.insert(identity)) {
-            return Err(invalid("compiler-minted static literal type is duplicated"));
+            return Err(invalid("compiler-minted data type is duplicated"));
         }
     }
     let mut definitions = Vec::new();
@@ -2514,6 +2538,18 @@ fn validate_exact_expression_local_values(
                 }
                 pending.push(*then_branch);
                 pending.push(*condition);
+            }
+            wrela_hir::ExpressionKind::Interpolate(parts) => {
+                let values = parts
+                    .iter()
+                    .filter(|part| matches!(part, wrela_hir::InterpolationPart::Value { .. }))
+                    .count();
+                reserve_validation_scratch(&mut pending, values, program.expressions.len() as u64)?;
+                for part in parts.iter().rev() {
+                    if let wrela_hir::InterpolationPart::Value { expression, .. } = part {
+                        pending.push(*expression);
+                    }
+                }
             }
             wrela_hir::ExpressionKind::Literal(_)
             | wrela_hir::ExpressionKind::Reference(_)
@@ -3709,6 +3745,22 @@ fn collect_source_body_closure(
                 pending_expressions.push(*then_branch);
                 pending_expressions.push(*condition);
             }
+            wrela_hir::ExpressionKind::Interpolate(parts) => {
+                let values = parts
+                    .iter()
+                    .filter(|part| matches!(part, wrela_hir::InterpolationPart::Value { .. }))
+                    .count();
+                reserve_validation_scratch(
+                    &mut pending_expressions,
+                    values,
+                    program.expressions.len() as u64,
+                )?;
+                for part in parts.iter().rev() {
+                    if let wrela_hir::InterpolationPart::Value { expression, .. } = part {
+                        pending_expressions.push(*expression);
+                    }
+                }
+            }
             _ => return Err(invalid()),
         }
     }
@@ -3814,6 +3866,21 @@ fn validate_exact_expression_fact(
             ExpressionResolution::Constant(constant),
             Some(_),
         ) if constant_matches_literal(analysis, fact.ty, literal, constant) => {}
+        (
+            wrela_hir::ExpressionKind::Interpolate(parts),
+            ExpressionResolution::BoundedInterpolation {
+                capacity,
+                parts: resolved,
+            },
+            Some(_),
+        ) if exact_bounded_interpolation_matches(
+            analysis,
+            function.id,
+            fact,
+            parts,
+            *capacity,
+            resolved,
+        ) => {}
         (
             wrela_hir::ExpressionKind::Range {
                 start,
@@ -8803,6 +8870,83 @@ fn constant_matches_literal(
     }
 }
 
+fn exact_bounded_interpolation_matches(
+    analysis: &PartialAnalysis,
+    function: FunctionInstanceId,
+    fact: &ExpressionFact,
+    source_parts: &[wrela_hir::InterpolationPart],
+    capacity: u64,
+    resolved_parts: &[BoundedInterpolationPart],
+) -> bool {
+    if source_parts.len() != resolved_parts.len()
+        || !analysis.types.get(fact.ty.0 as usize).is_some_and(|ty| {
+            matches!(ty.kind, SemanticTypeKind::BoundedString { capacity: bound } if bound == capacity)
+        })
+    {
+        return false;
+    }
+    let mut expected_capacity = 0_u64;
+    let mut value_count = 0_usize;
+    let mut effects = 0_u64;
+    for (source, resolved) in source_parts.iter().zip(resolved_parts) {
+        match (source, resolved) {
+            (
+                wrela_hir::InterpolationPart::Text {
+                    value: source_value,
+                    source: source_span,
+                },
+                BoundedInterpolationPart::Text {
+                    value,
+                    source: span,
+                },
+            ) if source_value == value && source_span == span => {
+                let Ok(bytes) = u64::try_from(source_value.len()) else {
+                    return false;
+                };
+                let Some(next) = expected_capacity.checked_add(bytes) else {
+                    return false;
+                };
+                expected_capacity = next;
+            }
+            (
+                wrela_hir::InterpolationPart::Value {
+                    expression,
+                    format: None,
+                    format_source: None,
+                },
+                BoundedInterpolationPart::Bool {
+                    expression: resolved_expression,
+                    value,
+                },
+            ) if expression == resolved_expression => {
+                let Some(child) = exact_child_expression(analysis, function, *expression) else {
+                    return false;
+                };
+                let resolved_value = match child.resolution {
+                    ExpressionResolution::Value(value) => Some(value),
+                    _ => child.result,
+                };
+                if resolved_value != Some(*value)
+                    || !analysis
+                        .types
+                        .get(child.ty.0 as usize)
+                        .is_some_and(|ty| matches!(ty.kind, SemanticTypeKind::Bool))
+                {
+                    return false;
+                }
+                let Some(next) = expected_capacity.checked_add(5) else {
+                    return false;
+                };
+                expected_capacity = next;
+                value_count = value_count.saturating_add(1);
+                effects |= child.effects.0;
+            }
+            _ => return false,
+        }
+    }
+    value_count > 0 && capacity == expected_capacity && fact.effects.0 == effects
+}
+
 #[allow(clippy::too_many_arguments)]
 fn exact_closed_literal_range_matches(
     analysis: &PartialAnalysis,
@@ -9180,6 +9324,13 @@ fn valid_semantic_type(ty: &SemanticType, analysis: &PartialAnalysis, graph: &Im
         | SemanticTypeKind::Character => true,
         SemanticTypeKind::StaticString { .. } | SemanticTypeKind::StaticBytes { .. } => {
             ty.linearity == Linearity::ExplicitCopy
+                && ty.size_upper_bound.is_none()
+                && ty.alignment_lower_bound == 1
+                && ty.source.is_none()
+        }
+        SemanticTypeKind::BoundedString { capacity } => {
+            *capacity >= 5
+                && ty.linearity == Linearity::ReclaimableLinear
                 && ty.size_upper_bound.is_none()
                 && ty.alignment_lower_bound == 1
                 && ty.source.is_none()
@@ -9637,6 +9788,19 @@ fn valid_expression_resolution(
                     )
                     && conjunctions.iter().all(|value| value_is_bool(*value))
             }),
+        ExpressionResolution::BoundedInterpolation { capacity, parts } => {
+            *capacity > 0
+                && !parts.is_empty()
+                && parts.iter().all(|part| match part {
+                    BoundedInterpolationPart::Text { .. } => true,
+                    BoundedInterpolationPart::Bool { value, .. } => analysis
+                        .values
+                        .get(value.0 as usize)
+                        .filter(|record| record.function == function)
+                        .and_then(|record| analysis.types.get(record.ty.0 as usize))
+                        .is_some_and(|ty| matches!(ty.kind, SemanticTypeKind::Bool)),
+                })
+        }
         ExpressionResolution::EnumTypeTest {
             enumeration,
             variant,
@@ -10445,6 +10609,7 @@ fn valid_expression_region(
             | ExpressionResolution::ProjectionCall { .. }
             | ExpressionResolution::OperatorCall { .. }
             | ExpressionResolution::DerivedEquality { .. }
+            | ExpressionResolution::BoundedInterpolation { .. }
             | ExpressionResolution::EnumTypeTest { .. }
             | ExpressionResolution::ActorRequest { .. }
             | ExpressionResolution::Closure { .. }
@@ -12583,6 +12748,7 @@ fn validate_fact_resources(
             | SemanticTypeKind::Character
             | SemanticTypeKind::StaticString { .. }
             | SemanticTypeKind::StaticBytes { .. }
+            | SemanticTypeKind::BoundedString { .. }
             | SemanticTypeKind::Array { .. }
             | SemanticTypeKind::Iso { .. }
             | SemanticTypeKind::Actor { .. }
@@ -12655,6 +12821,15 @@ fn validate_fact_resources(
             } => {
                 meter.edges(fields);
                 meter.edges(conjunctions);
+            }
+            ExpressionResolution::BoundedInterpolation { parts, .. } => {
+                meter.edges(parts);
+                for part in parts {
+                    check_analysis_cancelled(is_cancelled)?;
+                    if let BoundedInterpolationPart::Text { value, .. } = part {
+                        meter.text(value);
+                    }
+                }
             }
             ExpressionResolution::Error
             | ExpressionResolution::Value(_)

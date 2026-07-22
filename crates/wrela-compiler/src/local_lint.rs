@@ -330,6 +330,18 @@ impl CanonicalSemanticLinter {
                         )?;
                     }
                 }
+                ExpressionResolution::BoundedInterpolation { parts, .. } => {
+                    for part in parts {
+                        if let wrela_sema::BoundedInterpolationPart::Bool { value, .. } = part {
+                            mark_value(
+                                &mut value_state,
+                                *value,
+                                VALUE_STATE_USED,
+                                &self.unused_local,
+                            )?;
+                        }
+                    }
+                }
                 ExpressionResolution::Error
                 | ExpressionResolution::Constant(_)
                 | ExpressionResolution::Function(_)

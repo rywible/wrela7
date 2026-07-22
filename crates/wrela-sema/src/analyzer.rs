@@ -4971,28 +4971,7 @@ fn analyze_runtime_body(
                     .get(local.0 as usize)
                     .filter(|record| record.id == *local && record.body == body_id)
                     .ok_or(AnalysisFailure::RequestMismatch)?;
-                if request
-                    .hir
-                    .as_program()
-                    .expression(*value)
-                    .is_some_and(|expression| {
-                        matches!(expression.kind, ExpressionKind::Interpolate(_))
-                    })
-                {
-                    return Err(runtime_type_diagnostic(
-                        request,
-                        request
-                            .hir
-                            .as_program()
-                            .expression(*value)
-                            .map_or(local_record.source, |expression| expression.source),
-                        "semantic-static-interpolation-pending",
-                        "runtime string interpolation is not yet analyzed",
-                        "interpolation requires bounded formatting and an owned destination capacity contract",
-                        "use a plain static text or byte literal until bounded formatting lands",
-                    ));
-                }
-                let inferred_static_ty = if local_record.ty.is_none() {
+                let inferred_data_ty = if local_record.ty.is_none() {
                     match request
                         .hir
                         .as_program()
@@ -5008,6 +4987,21 @@ fn analyze_runtime_body(
                             &mut *aggregate_work,
                             is_cancelled,
                         )?),
+                        Some(ExpressionKind::Interpolate(parts)) => {
+                            let expression = request
+                                .hir
+                                .as_program()
+                                .expression(*value)
+                                .ok_or(AnalysisFailure::RequestMismatch)?;
+                            Some(ensure_bounded_interpolation_type(
+                                request,
+                                partial,
+                                parts,
+                                expression.source,
+                                &mut *aggregate_work,
+                                is_cancelled,
+                            )?)
+                        }
                         _ => return Err(AnalysisFailure::RequestMismatch.into()),
                     }
                 } else {
@@ -5038,7 +5032,64 @@ fn analyze_runtime_body(
                         "use an unannotated local binding and do not consume it until static-data lowering lands",
                     ));
                 }
-                if inferred_static_ty.is_some()
+                if local_record.ty.is_some()
+                    && request
+                        .hir
+                        .as_program()
+                        .expression(*value)
+                        .is_some_and(|expression| {
+                            matches!(expression.kind, ExpressionKind::Interpolate(_))
+                        })
+                {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        request
+                            .hir
+                            .as_program()
+                            .expression(*value)
+                            .map_or(local_record.source, |expression| expression.source),
+                        "semantic-bounded-interpolation-context-pending",
+                        "bounded interpolation cannot initialize an explicit runtime type",
+                        "this slice mints the exact BoundedString capacity only for an inferred local",
+                        "remove the annotation and leave the interpolation result unconsumed",
+                    ));
+                }
+                let inferred_is_bounded = inferred_data_ty.is_some_and(|ty| {
+                    partial.types.get(ty.0 as usize).is_some_and(|record| {
+                        matches!(record.kind, SemanticTypeKind::BoundedString { .. })
+                    })
+                });
+                if inferred_is_bounded
+                    && partial
+                        .functions
+                        .get(function.0 as usize)
+                        .is_some_and(|function| matches!(function.role, FunctionRole::Isr(_)))
+                {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        local_record.source,
+                        "semantic-bounded-interpolation-isr",
+                        "bounded interpolation is forbidden in an interrupt handler",
+                        "formatting work and destination storage are not admitted in ISR context",
+                        "compute the bounded string in ordinary synchronous code",
+                    ));
+                }
+                if inferred_is_bounded
+                    && partial
+                        .functions
+                        .get(function.0 as usize)
+                        .is_some_and(|function| function.color == FunctionColor::Async)
+                {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        local_record.source,
+                        "semantic-bounded-interpolation-persistence-pending",
+                        "bounded interpolation result would persist in an asynchronous frame",
+                        "this analysis slice has no BoundedString frame storage or ABI",
+                        "compute the bounded string in ordinary synchronous code",
+                    ));
+                }
+                if inferred_data_ty.is_some()
                     && partial
                         .functions
                         .get(function.0 as usize)
@@ -5117,7 +5168,7 @@ fn analyze_runtime_body(
                         ValueCategory::Value,
                     ),
                     None => (
-                        inferred_static_ty.ok_or(AnalysisFailure::RequestMismatch)?,
+                        inferred_data_ty.ok_or(AnalysisFailure::RequestMismatch)?,
                         ValueCategory::Value,
                     ),
                 };
@@ -5140,7 +5191,7 @@ fn analyze_runtime_body(
                     function,
                     *value,
                     RuntimeExpressionRequest {
-                        expected: if inferred_static_ty.is_some() {
+                        expected: if inferred_data_ty.is_some() {
                             None
                         } else {
                             Some(ty)
@@ -7728,18 +7779,29 @@ fn analyze_runtime_expression(
                     "initialize the local before this expression",
                 )
             })?;
-            if partial
+            let inferred_data_kind = partial
                 .values
                 .get(binding.value.0 as usize)
                 .and_then(|value| partial.types.get(value.ty.0 as usize))
-                .is_some_and(|ty| {
-                    matches!(
-                        ty.kind,
-                        SemanticTypeKind::StaticString { .. }
-                            | SemanticTypeKind::StaticBytes { .. }
-                    )
-                })
+                .map(|ty| &ty.kind);
+            if inferred_data_kind
+                .is_some_and(|kind| matches!(kind, SemanticTypeKind::BoundedString { .. }))
             {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    expression.source,
+                    "semantic-bounded-string-consumer-pending",
+                    "bounded interpolation result is consumed by an unsupported runtime context",
+                    "return, call, storage, capture, send, and discarded-expression consumers need a BoundedString ABI",
+                    "leave the inferred bounded string local unconsumed until lowering lands",
+                ));
+            }
+            if inferred_data_kind.is_some_and(|kind| {
+                matches!(
+                    kind,
+                    SemanticTypeKind::StaticString { .. } | SemanticTypeKind::StaticBytes { .. }
+                )
+            }) {
                 return Err(runtime_type_diagnostic(
                     request,
                     expression.source,
@@ -8002,16 +8064,213 @@ fn analyze_runtime_expression(
             state,
             is_cancelled,
         ),
-        ExpressionKind::Interpolate(_) => Err(runtime_type_diagnostic(
+        ExpressionKind::Interpolate(parts) => analyze_bounded_interpolation(
             request,
+            partial,
+            function,
+            expression_id,
             expression.source,
-            "semantic-static-interpolation-pending",
-            "runtime string interpolation is not yet analyzed",
-            "interpolation requires bounded formatting and an owned destination capacity contract",
-            "use a plain static text or byte literal until bounded formatting lands",
-        )),
+            parts,
+            expression_request,
+            state,
+            is_cancelled,
+        ),
         _ => Err(AnalysisFailure::RequestMismatch.into()),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_bounded_interpolation(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    expression: ExpressionId,
+    source: Span,
+    parts: &[wrela_hir::InterpolationPart],
+    expression_request: RuntimeExpressionRequest,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<RuntimeExpression> {
+    require_scalar_temporary_access(request, source, expression_request.access)?;
+    if expression_request.expected.is_some() {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-bounded-interpolation-context-pending",
+            "bounded interpolation cannot satisfy an explicit runtime type context",
+            "the exact BoundedString capacity is compiler-minted only for an inferred local",
+            "bind directly to an unannotated synchronous local",
+        ));
+    }
+    if expression_request.desired_result.is_none() {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-bounded-string-consumer-pending",
+            "bounded interpolation is consumed outside its admitted local binding",
+            "return, call, storage, capture, send, and discarded-expression consumers need a BoundedString ABI",
+            "bind to an unannotated synchronous local and leave the result unconsumed",
+        ));
+    }
+    if partial
+        .functions
+        .get(function.0 as usize)
+        .is_some_and(|function| matches!(function.role, FunctionRole::Isr(_)))
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-bounded-interpolation-isr",
+            "bounded interpolation is forbidden in an interrupt handler",
+            "formatting work and destination storage are not admitted in ISR context",
+            "compute the bounded string in ordinary synchronous code",
+        ));
+    }
+    let ty = ensure_bounded_interpolation_type(
+        request,
+        partial,
+        parts,
+        source,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    let bool_ty = ensure_primitive_type(
+        request,
+        partial,
+        PrimitiveSemanticType::Bool,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    let capacity = partial
+        .types
+        .get(ty.0 as usize)
+        .and_then(|record| match record.kind {
+            SemanticTypeKind::BoundedString { capacity } => Some(capacity),
+            _ => None,
+        })
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let mut resolved = Vec::new();
+    resolved
+        .try_reserve(parts.len())
+        .map_err(|_| fact_resource(request, "bounded interpolation parts"))?;
+    let mut effects = EffectSet(0);
+    for part in parts {
+        check_cancelled(is_cancelled)?;
+        match part {
+            wrela_hir::InterpolationPart::Text { value, source } => {
+                resolved.push(BoundedInterpolationPart::Text {
+                    value: copy_analysis_text(value, request.limits.fact_bytes, is_cancelled)?,
+                    source: *source,
+                });
+            }
+            wrela_hir::InterpolationPart::Value {
+                expression: child,
+                format: None,
+                format_source: None,
+            } => {
+                let child_record = request
+                    .hir
+                    .as_program()
+                    .expression(*child)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                if matches!(
+                    &child_record.kind,
+                    ExpressionKind::Literal(literal) if !matches!(literal, Literal::Boolean(_))
+                ) || known_runtime_expression_type(
+                    request,
+                    partial,
+                    state,
+                    *child,
+                    is_cancelled,
+                )?
+                .is_some_and(|known| known != bool_ty)
+                {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        child_record.source,
+                        "semantic-bounded-interpolation-value-type",
+                        "bounded interpolation value must have the core bool type",
+                        "this slice proves capacity with the canonical five-byte maximum for `false`",
+                        "interpolate a bool value without a format specifier",
+                    ));
+                }
+                let outcome = analyze_runtime_expression(
+                    request,
+                    partial,
+                    function,
+                    *child,
+                    RuntimeExpressionRequest {
+                        expected: Some(bool_ty),
+                        desired_result: None,
+                        access: AccessMode::Value,
+                    },
+                    state,
+                    is_cancelled,
+                )?;
+                if outcome.ty != bool_ty {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        child_record.source,
+                        "semantic-bounded-interpolation-value-type",
+                        "bounded interpolation value must have the core bool type",
+                        "this slice proves capacity with the canonical five-byte maximum for `false`",
+                        "interpolate a bool value without a format specifier",
+                    ));
+                }
+                let value = outcome
+                    .referenced
+                    .or(outcome.result)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                effects.0 |= outcome.effects.0;
+                resolved.push(BoundedInterpolationPart::Bool {
+                    expression: *child,
+                    value,
+                });
+            }
+            wrela_hir::InterpolationPart::Value { format_source, .. } => {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    format_source.unwrap_or(source),
+                    "semantic-bounded-interpolation-format-pending",
+                    "bounded boolean interpolation does not admit a format specifier",
+                    "the exact capacity proof currently uses canonical `true`/`false` spelling only",
+                    "remove the format specifier",
+                ));
+            }
+        }
+    }
+    let result = expression_result(
+        request,
+        partial,
+        function,
+        (expression, source),
+        ty,
+        expression_request.desired_result,
+        is_cancelled,
+    )?;
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression,
+            ty,
+            result: Some(result),
+            resolution: ExpressionResolution::BoundedInterpolation {
+                capacity,
+                parts: resolved,
+            },
+            effects,
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    Ok(RuntimeExpression {
+        ty,
+        result: Some(result),
+        referenced: None,
+        effects,
+    })
 }
 
 fn ensure_static_literal_type(
@@ -8056,6 +8315,90 @@ fn ensure_static_literal_type(
         id,
         kind,
         linearity: Linearity::ExplicitCopy,
+        size_upper_bound: None,
+        alignment_lower_bound: 1,
+        source: None,
+    });
+    Ok(id)
+}
+
+fn ensure_bounded_interpolation_type(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    parts: &[wrela_hir::InterpolationPart],
+    source: Span,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
+    check_cancelled(is_cancelled)?;
+    let mut capacity = 0_u64;
+    let mut value_count = 0_u64;
+    for part in parts {
+        check_cancelled(is_cancelled)?;
+        match part {
+            wrela_hir::InterpolationPart::Text { value, .. } => {
+                let bytes = u64::try_from(value.len())
+                    .map_err(|_| semantic_fact_bytes_resource(request))?;
+                capacity = capacity
+                    .checked_add(bytes)
+                    .ok_or_else(|| semantic_fact_bytes_resource(request))?;
+            }
+            wrela_hir::InterpolationPart::Value {
+                format,
+                format_source,
+                ..
+            } => {
+                if format.is_some() || format_source.is_some() {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        format_source.unwrap_or(source),
+                        "semantic-bounded-interpolation-format-pending",
+                        "bounded boolean interpolation does not admit a format specifier",
+                        "the exact capacity proof currently uses canonical `true`/`false` spelling only",
+                        "remove the format specifier",
+                    ));
+                }
+                capacity = capacity
+                    .checked_add(5)
+                    .ok_or_else(|| semantic_fact_bytes_resource(request))?;
+                value_count = value_count.saturating_add(1);
+            }
+        }
+        if capacity > request.limits.fact_bytes {
+            return Err(semantic_fact_bytes_resource(request).into());
+        }
+    }
+    if value_count == 0 {
+        return Err(runtime_type_diagnostic(
+            request,
+            source,
+            "semantic-bounded-interpolation-value-required",
+            "bounded interpolation requires at least one formatted boolean value",
+            "plain text already has the exact Static[Str] literal representation",
+            "use a plain string literal or interpolate a bool",
+        ));
+    }
+    let kind = SemanticTypeKind::BoundedString { capacity };
+    for existing in &partial.types {
+        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+        if existing.kind == kind {
+            return Ok(existing.id);
+        }
+    }
+    if partial.types.len() >= request.limits.types as usize {
+        return Err(fact_resource(request, "semantic types").into());
+    }
+    let id = SemanticTypeId(
+        u32::try_from(partial.types.len()).map_err(|_| fact_resource(request, "semantic types"))?,
+    );
+    partial
+        .types
+        .try_reserve(1)
+        .map_err(|_| fact_resource(request, "semantic types"))?;
+    partial.types.push(SemanticType {
+        id,
+        kind,
+        linearity: Linearity::ReclaimableLinear,
         size_upper_bound: None,
         alignment_lower_bound: 1,
         source: None,
@@ -23733,6 +24076,30 @@ fn inspect_actor_plans(
                 ));
             };
             if function.color == FunctionColor::Isr {
+                if let Some(interpolation) = function
+                    .body
+                    .and_then(|body| program.body(body))
+                    .and_then(|body| {
+                        body.statements.iter().find_map(|statement| {
+                            let StatementKind::Initialize { value, .. } =
+                                &program.statement(*statement)?.kind
+                            else {
+                                return None;
+                            };
+                            program.expression(*value).filter(|expression| {
+                                matches!(expression.kind, ExpressionKind::Interpolate(_))
+                            })
+                        })
+                    })
+                {
+                    return Err(actor_runtime_diagnostic(
+                        Category::HARDWARE,
+                        interpolation.source,
+                        "semantic-bounded-interpolation-isr",
+                        "bounded interpolation is forbidden in an interrupt handler",
+                        "formatting work and destination storage are not admitted in ISR context",
+                    ));
+                }
                 return Err(actor_runtime_diagnostic(
                     Category::HARDWARE,
                     member.source,
@@ -28692,6 +29059,225 @@ pub fn boot() -> Image:
     }
 
     #[test]
+    fn bounded_bool_interpolation_analyzes_in_an_unconsumed_sync_local() {
+        let source = static_literal_actor_source(
+            "    rendered = f\"ready={true}\"\n    second = f\"{false}/{true}\"",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("bounded bool interpolation analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "bounded bool interpolation must analyze: {:?}",
+            output.diagnostics()
+        );
+        let image = output
+            .successful()
+            .expect("sealed bounded interpolation image");
+        let facts = image.facts();
+        assert_eq!(
+            facts
+                .types
+                .iter()
+                .filter(|ty| matches!(ty.kind, SemanticTypeKind::BoundedString { capacity: 11 }))
+                .count(),
+            1,
+            "equal checked capacities intern one compiler-minted type"
+        );
+        let interpolations: Vec<_> = facts
+            .expressions
+            .iter()
+            .filter_map(|fact| match &fact.resolution {
+                ExpressionResolution::BoundedInterpolation { capacity, parts } => {
+                    Some((*capacity, parts))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(interpolations.len(), 2);
+        assert!(interpolations.iter().all(|(capacity, _)| *capacity == 11));
+        assert!(matches!(
+            interpolations[0].1.as_slice(),
+            [
+                BoundedInterpolationPart::Text { value, .. },
+                BoundedInterpolationPart::Bool { .. }
+            ] if value == "ready="
+        ));
+        assert!(matches!(
+            interpolations[1].1.as_slice(),
+            [
+                BoundedInterpolationPart::Bool { .. },
+                BoundedInterpolationPart::Text { value, .. },
+                BoundedInterpolationPart::Bool { .. }
+            ] if value == "/"
+        ));
+    }
+
+    #[test]
+    fn bounded_bool_interpolation_full_seal_rejects_witness_forgeries() {
+        let source = static_literal_actor_source(
+            "    rendered = f\"ready={true}\"\n    second = f\"other={false}\"",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let image = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("bounded interpolation analysis")
+            .successful()
+            .expect("sealed bounded interpolation image")
+            .clone();
+        let interpolation = image
+            .facts()
+            .expressions
+            .iter()
+            .position(|fact| {
+                matches!(
+                    fact.resolution,
+                    ExpressionResolution::BoundedInterpolation { .. }
+                )
+            })
+            .expect("bounded interpolation fact");
+        let bounded_type = image
+            .facts()
+            .types
+            .iter()
+            .position(|ty| matches!(ty.kind, SemanticTypeKind::BoundedString { capacity: 11 }))
+            .expect("bounded string type");
+        let alternate_bool = image
+            .facts()
+            .expressions
+            .iter()
+            .filter_map(|fact| match &fact.resolution {
+                ExpressionResolution::BoundedInterpolation { parts, .. } => {
+                    parts.iter().find_map(|part| match part {
+                        BoundedInterpolationPart::Bool { value, .. } => Some(*value),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .nth(1)
+            .expect("second bool interpolation witness");
+        let rejects = |mutate: &dyn Fn(&mut PartialAnalysis)| {
+            let (hir, mut facts) = image.clone().into_parts();
+            mutate(&mut facts);
+            assert!(facts.validate_for_seal(hir.as_ref(), &|| false).is_err());
+        };
+        rejects(&|facts| {
+            let ExpressionResolution::BoundedInterpolation { capacity, .. } =
+                &mut facts.expressions[interpolation].resolution
+            else {
+                panic!("bounded interpolation")
+            };
+            *capacity = capacity.saturating_add(1);
+        });
+        rejects(&|facts| {
+            let ExpressionResolution::BoundedInterpolation { parts, .. } =
+                &mut facts.expressions[interpolation].resolution
+            else {
+                panic!("bounded interpolation")
+            };
+            parts.swap(0, 1);
+        });
+        rejects(&|facts| {
+            let ExpressionResolution::BoundedInterpolation { parts, .. } =
+                &mut facts.expressions[interpolation].resolution
+            else {
+                panic!("bounded interpolation")
+            };
+            let BoundedInterpolationPart::Text { value, .. } = &mut parts[0] else {
+                panic!("interpolation text")
+            };
+            value.push('!');
+        });
+        rejects(&|facts| {
+            let ExpressionResolution::BoundedInterpolation { parts, .. } =
+                &mut facts.expressions[interpolation].resolution
+            else {
+                panic!("bounded interpolation")
+            };
+            let BoundedInterpolationPart::Bool { value, .. } = &mut parts[1] else {
+                panic!("interpolation bool")
+            };
+            *value = alternate_bool;
+        });
+        rejects(&|facts| {
+            facts.types[bounded_type].kind = SemanticTypeKind::BoundedString { capacity: 12 };
+        });
+        rejects(&|facts| {
+            let mut duplicate = facts.types[bounded_type].clone();
+            duplicate.id =
+                SemanticTypeId(u32::try_from(facts.types.len()).expect("bounded semantic types"));
+            facts.types.push(duplicate);
+        });
+        rejects(&|facts| {
+            facts.expressions[interpolation].effects = EffectSet(1);
+        });
+        rejects(&|facts| {
+            facts.expressions[interpolation].ownership_after = OwnershipState::Taken;
+        });
+    }
+
+    #[test]
+    fn bounded_bool_interpolation_type_budget_is_exact_and_cancels_at_the_last_poll() {
+        const EXACT_TYPES: u32 = 6;
+        let source = static_literal_actor_source("    rendered = f\"ready={true}\"");
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let mut exact = AnalysisLimits::standard();
+        exact.types = EXACT_TYPES;
+        let admitted = CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| false)
+            .expect("exact bounded interpolation type limit is admitted");
+        assert!(admitted.successful().is_some());
+        assert_eq!(admitted.partial().types.len(), EXACT_TYPES as usize);
+
+        let mut one_under = exact;
+        one_under.types = EXACT_TYPES - 1;
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, one_under),
+                &|| false,
+            ),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "semantic types",
+                limit,
+            }) if limit == AnalysisLimits::standard().fact_edges
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            })
+            .expect("count bounded interpolation cancellation polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, exact),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
     fn static_literal_full_seal_rejects_length_content_kind_value_type_and_duplicates() {
         let source = static_literal_actor_source("    text = \"hé\"\n    payload = b\"A\\x42\\0\"");
         let fixture = parsed_actor_fixture(&source);
@@ -28865,8 +29451,65 @@ pub fn boot() -> Image:
         );
         assert_eq!(
             diagnostic(static_literal_actor_source("    rendered = f\"value={1}\"")),
-            "semantic-static-interpolation-pending"
+            "semantic-bounded-interpolation-value-type"
         );
+    }
+
+    #[test]
+    fn bounded_bool_interpolation_tails_fail_closed_by_name() {
+        let diagnostic = |source: String| {
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("bounded interpolation rejection is recoverable");
+            assert!(output.successful().is_none());
+            output
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.as_deref())
+                .expect("named bounded interpolation rejection")
+                .to_owned()
+        };
+
+        assert_eq!(
+            diagnostic(static_literal_actor_source("    rendered = f\"value={1}\"")),
+            "semantic-bounded-interpolation-value-type"
+        );
+        assert_eq!(
+            diagnostic(static_literal_actor_source(
+                "    rendered = f\"value={true:x}\""
+            )),
+            "semantic-bounded-interpolation-format-pending"
+        );
+        assert_eq!(
+            diagnostic(static_literal_actor_source(
+                "    rendered = f\"ready={true}\"\n    rendered"
+            )),
+            "semantic-bounded-string-consumer-pending"
+        );
+        assert_eq!(
+            diagnostic(static_literal_actor_source(
+                "    rendered: String[..16] = f\"ready={true}\""
+            )),
+            "semantic-bounded-interpolation-context-pending"
+        );
+        let persistent_source = static_literal_actor_source("    pass").replace(
+            "        retain_literals()",
+            "        rendered = f\"ready={true}\"",
+        );
+        assert_eq!(
+            diagnostic(persistent_source),
+            "semantic-bounded-interpolation-persistence-pending"
+        );
+        let isr_source = BOUNDED_ACTOR_SOURCE.replace(
+            "    pub async fn ping(mut self):\n        await checkpoint()",
+            "    isr fn irq(mut self):\n        rendered = f\"ready={true}\"",
+        );
+        assert_eq!(diagnostic(isr_source), "semantic-bounded-interpolation-isr");
     }
 
     fn admission_actor_source(task_body: &str) -> String {
