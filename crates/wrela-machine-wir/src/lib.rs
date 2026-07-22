@@ -3870,7 +3870,8 @@ fn validate_activations(module: &MachineWir, errors: &mut ValidationContext<'_>)
                             .is_some_and(|source| proof.sources.as_slice() == [source])
                         && proof.source == proof.sources.first().copied()
                 });
-        let fixed_facts_match = activation.state == 0
+        let two_await = two_await_activation_shape_matches(module, caller, activation);
+        let fixed_facts_match = (activation.state == 0 || (two_await && activation.state == 1))
             && activation.frame_bytes != 0
             && activation.frame_bytes == activation.region_capacity_bytes
             && valid_alignment(activation.region_alignment)
@@ -3912,7 +3913,13 @@ fn validate_activations(module: &MachineWir, errors: &mut ValidationContext<'_>)
                 )
             })
         });
-        if activation_role != (count == 1 || reply_role) {
+        let two_await_role = count == 2
+            && module
+                .activations
+                .iter()
+                .filter(|activation| activation.caller == function.id)
+                .all(|activation| two_await_activation_shape_matches(module, function, activation));
+        if activation_role != (count == 1 || two_await_role || reply_role) {
             errors.push(ValidationError::InvalidRecord {
                 kind: "activation caller set",
                 id: function.id.0,
@@ -4472,6 +4479,7 @@ fn activation_call_shape_matches(
     activation: &MachineActivationPlan,
     errors: &mut ValidationContext<'_>,
 ) -> bool {
+    let two_await = two_await_activation_shape_matches(module, caller, activation);
     let mut matched = 0usize;
     let mut valid = true;
     for block in &caller.blocks {
@@ -4511,12 +4519,13 @@ fn activation_call_shape_matches(
                         if *block == activation.resume_block && arguments.is_empty()
                 )
                 && (block.id == caller.entry
+                    || two_await
                     || structured_scope_activation_shape_matches(
                         module, caller, block.id, activation, errors,
                     ));
         }
     }
-    let resume_matches = caller
+    let resume_matches = two_await || caller
         .blocks
         .get(activation.resume_block.0 as usize)
         .is_some_and(|resume| {
@@ -4525,6 +4534,62 @@ fn activation_call_shape_matches(
                 && matches!(&resume.terminator, MachineTerminator::Return(values) if values.is_empty())
         });
     matched == 1 && valid && resume_matches
+}
+
+fn two_await_activation_shape_matches(
+    module: &MachineWir,
+    caller: &MachineFunction,
+    activation: &MachineActivationPlan,
+) -> bool {
+    if module.activations.len() != 4 || activation.state > 1 {
+        return false;
+    }
+    let [entry, middle, terminal] = caller.blocks.as_slice() else {
+        return false;
+    };
+    let mut state_zero = None;
+    let mut state_one = None;
+    let mut caller_count = 0usize;
+    for candidate in &module.activations {
+        if candidate.caller != caller.id {
+            continue;
+        }
+        caller_count = caller_count.saturating_add(1);
+        if candidate.callee != activation.callee {
+            return false;
+        }
+        match candidate.state {
+            0 if state_zero.replace(candidate).is_none() => {}
+            1 if state_one.replace(candidate).is_none() => {}
+            _ => return false,
+        }
+    }
+    let (Some(state_zero), Some(state_one)) = (state_zero, state_one) else {
+        return false;
+    };
+    caller_count == 2
+        && caller.entry == entry.id
+        && entry.id == BlockId(0)
+        && middle.id == BlockId(1)
+        && terminal.id == BlockId(2)
+        && entry.parameters.is_empty()
+        && middle.parameters.is_empty()
+        && terminal.parameters.is_empty()
+        && matches!(entry.instructions.as_slice(), [call]
+            if call.id == state_zero.call_instruction)
+        && matches!(&entry.terminator,
+            MachineTerminator::Jump { block, arguments }
+                if *block == middle.id && arguments.is_empty())
+        && matches!(middle.instructions.as_slice(), [call]
+            if call.id == state_one.call_instruction)
+        && matches!(&middle.terminator,
+            MachineTerminator::Jump { block, arguments }
+                if *block == terminal.id && arguments.is_empty())
+        && terminal.instructions.is_empty()
+        && matches!(&terminal.terminator,
+            MachineTerminator::Return(values) if values.is_empty())
+        && state_zero.resume_block == middle.id
+        && state_one.resume_block == terminal.id
 }
 
 fn structured_scope_activation_shape_matches(

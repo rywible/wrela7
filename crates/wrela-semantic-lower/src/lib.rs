@@ -4536,14 +4536,6 @@ fn lower_actor_activations(
                                 "multiple async actor activation cleanup proofs",
                             ));
                         }
-                        if pending
-                            .last()
-                            .is_some_and(|prior: &PendingActivation| prior.caller == function.id)
-                        {
-                            return Err(unsupported(
-                                "multiple async helper activations in one actor function",
-                            ));
-                        }
                         push_pending_activation(
                             &mut pending,
                             PendingActivation {

@@ -1517,7 +1517,9 @@ fn lower_activation_subset(
         && dispatch.is_some_and(|dispatch| dispatch.reply.is_some())
         && actor.turn_functions.len() == 1
         && actor.mailbox_capacity == 1;
-    if !(input.activations.len() == 2 || recurring_chain || reply_profile)
+    let two_await_chain =
+        input.activations.len() == 4 && actor.turn_functions.len() == 1 && dispatch.is_none();
+    if !(input.activations.len() == 2 || two_await_chain || recurring_chain || reply_profile)
         || actor.id != flow::ActorId(0)
         || actor.mailbox_capacity == 0
         || actor.message_types.len() > 1
@@ -1789,11 +1791,46 @@ fn lower_activation_subset(
                 plan: call_plan,
             } if *function == plan.callee && arguments.is_empty() && *call_plan == plan.id
         );
+        let resume_result_matches = matches!(resume.parameters.as_slice(), [value]
+            if caller.values.get(value.0 as usize).is_some_and(|value| value.ty == result));
         let resume_matches = resume.id == resume_id
-            && resume.instructions.is_empty()
-            && matches!(&resume.terminator, flow::Terminator::Return(values) if values.is_empty())
-            && matches!(resume.parameters.as_slice(), [value]
-                if caller.values.get(value.0 as usize).is_some_and(|value| value.ty == result));
+            && resume_result_matches
+            && if two_await_chain && state == 0 {
+                matches!(
+                    (resume.instructions.as_slice(), &resume.terminator),
+                    ([next], flow::Terminator::Suspend {
+                        state: 1,
+                        activation,
+                        resume: final_block,
+                    }) if matches!(
+                        (&next.operation, next.results.as_slice()),
+                        (
+                            flow::FlowOperation::AsyncCall {
+                                function,
+                                arguments,
+                                plan: next_plan,
+                            },
+                            [next_activation],
+                        ) if *function == plan.callee
+                            && arguments.is_empty()
+                            && *next_activation == *activation
+                            && input.activations.get(next_plan.0 as usize).is_some_and(|next_plan| {
+                                next_plan.id.0 != plan.id.0
+                                    && next_plan.caller == plan.caller
+                                    && next_plan.callee == plan.callee
+                            })
+                            && caller.blocks.get(final_block.0 as usize).is_some_and(|block| {
+                                block.parameters.len() == 1
+                                    && block.instructions.is_empty()
+                                    && matches!(&block.terminator,
+                                        flow::Terminator::Return(values) if values.is_empty())
+                            })
+                    )
+                )
+            } else {
+                resume.instructions.is_empty()
+                    && matches!(&resume.terminator, flow::Terminator::Return(values) if values.is_empty())
+            };
         let unit_callee_matches = result_is_unit
             && callee.result_types.is_empty()
             && matches!(callee.blocks.as_slice(), [block]
@@ -1844,7 +1881,7 @@ fn lower_activation_subset(
             || plan.frame_bytes == 0
             || plan.maximum_live != 1
             || plan.cancellation != flow::ActivationCancellation::DropCalleeThenPropagate
-            || state != 0
+            || !(state == 0 || (two_await_chain && state == 1))
             || !message_shape
             || call.source != Some(plan.source)
             || caller.color != flow::FunctionColor::Async
@@ -1901,8 +1938,41 @@ fn lower_activation_subset(
         .iter()
         .filter(|plan| plan.schedule == MachineActivationSchedule::StartupOnce)
         .count();
+    let exact_two_await_states = two_await_chain
+        && output
+            .iter()
+            .filter(|plan| {
+                matches!(plan.owner, MachineActivationOwner::Actor { .. }) && plan.state == 0
+            })
+            .count()
+            == 1
+        && output
+            .iter()
+            .filter(|plan| {
+                matches!(plan.owner, MachineActivationOwner::Actor { .. }) && plan.state == 1
+            })
+            .count()
+            == 1
+        && output
+            .iter()
+            .filter(|plan| {
+                matches!(plan.owner, MachineActivationOwner::Task { .. }) && plan.state == 0
+            })
+            .count()
+            == 1
+        && output
+            .iter()
+            .filter(|plan| {
+                matches!(plan.owner, MachineActivationOwner::Task { .. }) && plan.state == 1
+            })
+            .count()
+            == 1;
     if !reply_profile
-        && (!(actor_count == 1 || (recurring_chain && actor_count == 2)) || task_count != 1)
+        && (!(actor_count == 1
+            || (recurring_chain && actor_count == 2)
+            || (two_await_chain && actor_count == 2))
+            || !(task_count == 1 || (two_await_chain && task_count == 2))
+            || (two_await_chain && !exact_two_await_states))
     {
         return Err(unsupported(
             "one actor-turn and one startup-task activation",
@@ -2078,6 +2148,51 @@ fn authenticated_activation_call_site<'a>(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<AuthenticatedActivationCallSite<'a>, MachineLowerError> {
     check_cancelled(is_cancelled)?;
+    if caller.blocks.len() == 3 {
+        let mut matched = None;
+        for block in &caller.blocks {
+            check_cancelled(is_cancelled)?;
+            let Some(call) = block.instructions.last() else {
+                continue;
+            };
+            let flow::FlowOperation::AsyncCall {
+                plan: call_plan, ..
+            } = call.operation
+            else {
+                continue;
+            };
+            if call_plan != plan.id {
+                continue;
+            }
+            let flow::Terminator::Suspend {
+                state,
+                activation,
+                resume,
+            } = block.terminator
+            else {
+                return Err(unsupported("an async call without its exact suspend edge"));
+            };
+            if matched.is_some() {
+                return Err(unsupported(
+                    "an activation plan used by multiple async calls",
+                ));
+            }
+            let resume_block = caller
+                .blocks
+                .get(resume.0 as usize)
+                .ok_or(unsupported("an async call with an unknown resume block"))?;
+            matched = Some(AuthenticatedActivationCallSite {
+                entry: block,
+                call,
+                resume: resume_block,
+                state,
+                activation,
+                resume_id: resume,
+                structured_scope: false,
+            });
+        }
+        return matched.ok_or(unsupported("an activation caller without its async call"));
+    }
     if let [entry, resume] = caller.blocks.as_slice() {
         let call = entry
             .instructions
@@ -4098,10 +4213,33 @@ fn count_startup_dispatch_instructions(
 ) -> Result<usize, MachineLowerError> {
     let mut count = 0_usize;
     let mut fifo_actor = None;
+    let mut startup_caller = None;
+    let mut mailbox_caller = None;
     for activation in activations {
         check_cancelled(is_cancelled)?;
         let contributes = match activation.schedule {
-            MachineActivationSchedule::StartupOnce | MachineActivationSchedule::MailboxOnce => true,
+            MachineActivationSchedule::StartupOnce => {
+                if startup_caller.is_none() {
+                    startup_caller = Some(activation.caller);
+                    true
+                } else if startup_caller == Some(activation.caller) {
+                    false
+                } else {
+                    return Err(unsupported("more than one startup activation caller"));
+                }
+            }
+            MachineActivationSchedule::MailboxOnce => {
+                if mailbox_caller.is_none() {
+                    mailbox_caller = Some(activation.caller);
+                    true
+                } else if mailbox_caller == Some(activation.caller) {
+                    false
+                } else {
+                    return Err(unsupported(
+                        "more than one single mailbox activation caller",
+                    ));
+                }
+            }
             MachineActivationSchedule::SchedulerFifo => {
                 let MachineActivationOwner::Actor { actor, .. } = activation.owner else {
                     return Err(unsupported("a FIFO activation without actor ownership"));

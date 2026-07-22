@@ -61,11 +61,13 @@ async fn checkpoint() -> u64:
 @service
 pub struct Worker:
     pub async fn ping(mut self):
-        value: u64 = await checkpoint()
+        first: u64 = await checkpoint()
+        second: u64 = await checkpoint()
 
     @task
     async fn pulse(mut self):
-        value: u64 = await checkpoint()
+        first: u64 = await checkpoint()
+        second: u64 = await checkpoint()
 
 @image
 pub fn boot() -> Image:
@@ -254,10 +256,10 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         .expect("one static task entry");
     assert_eq!(actor_turn.effects.0, (1 << 1) | (1 << 2));
     assert_eq!(task_entry.effects.0, (1 << 1) | (1 << 3));
-    assert_eq!(semantic.regions.len(), 5);
-    assert_eq!(semantic.activations.len(), 2);
-    assert_eq!(semantic.static_bytes, 128);
-    assert_eq!(semantic.peak_bytes, 128);
+    assert_eq!(semantic.regions.len(), 7);
+    assert_eq!(semantic.activations.len(), 4);
+    assert_eq!(semantic.static_bytes, 192);
+    assert_eq!(semantic.peak_bytes, 192);
     for (index, plan) in semantic.activations.iter().enumerate() {
         assert_eq!(plan.id.0, index as u32);
         assert_eq!(plan.region.0, 3 + index as u32);
@@ -322,8 +324,8 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         .iter()
         .find(|proof| proof.kind == semantic::ProofKind::ImageClosed)
         .expect("activation-aware semantic image closure");
-    assert_eq!(semantic_closed.bound, Some(128));
-    assert_eq!(semantic_closed.depends_on.len(), 3);
+    assert_eq!(semantic_closed.bound, Some(192));
+    assert_eq!(semantic_closed.depends_on.len(), 5);
     assert_eq!(
         &semantic_closed.depends_on[1..],
         semantic
@@ -351,14 +353,14 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
     let flow = baseline.wir().as_wir();
     assert_eq!(flow.actors.len(), 1);
     assert_eq!(flow.tasks.len(), 1);
-    assert_eq!(flow.regions.len(), 5);
-    assert_eq!(flow.activations.len(), 2);
+    assert_eq!(flow.regions.len(), 7);
+    assert_eq!(flow.activations.len(), 4);
     assert_eq!(flow.actors[0].id.0, 0);
     assert_eq!(flow.actors[0].mailbox_capacity, 2);
     assert_eq!(flow.tasks[0].id.0, 0);
     assert_eq!(flow.tasks[0].slots, 1);
-    assert_eq!(flow.static_bytes, 128);
-    assert_eq!(flow.peak_bytes, 128);
+    assert_eq!(flow.static_bytes, 192);
+    assert_eq!(flow.peak_bytes, 192);
     assert_eq!(
         flow.startup_order,
         [
@@ -493,71 +495,96 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         .collect::<Vec<_>>();
     assert_eq!(actor_functions.len(), 2);
     for function in actor_functions {
-        let plan = flow
+        let plans = flow
             .activations
             .iter()
-            .find(|plan| plan.caller == function.id)
-            .expect("one activation plan per actor entry function");
-        assert_eq!(plan.callee, helper.id);
-        assert_eq!(plan.region.0, 3 + plan.id.0);
-        assert_eq!(plan.frame_bytes, 16);
-        assert_eq!(plan.maximum_live, 1);
-        assert_eq!(
-            plan.cancellation,
-            flow::ActivationCancellation::DropCalleeThenPropagate
-        );
-        assert!(function.proofs.contains(&plan.capacity_proof));
-        let region = &flow.regions[plan.region.0 as usize];
-        assert_eq!(region.class, flow::RegionClass::TaskFrame);
-        assert_eq!(region.capacity_bytes, plan.frame_bytes);
-        assert_eq!(region.capacity_proof, plan.capacity_proof);
-        assert_eq!(region.source, plan.source);
+            .filter(|plan| plan.caller == function.id)
+            .collect::<Vec<_>>();
+        assert_eq!(plans.len(), 2, "two sequential activations per caller");
         let expected_owner = match function.role {
             flow::FunctionRole::ActorTurn(actor) => flow::PlanOwner::Actor(actor),
             flow::FunctionRole::TaskEntry(task) => flow::PlanOwner::Task(task),
             role => panic!("activation caller has unsupported Flow role {role:?}"),
         };
-        assert_eq!(region.owner, expected_owner);
-
-        let capacity = &flow.proofs[plan.capacity_proof.0 as usize];
-        assert_eq!(capacity.kind, flow::ProofKind::CapacityBound);
-        assert_eq!(capacity.bound, Some(1));
-        assert_eq!(capacity.sources.as_slice(), [plan.source]);
         let cleanup = helper
             .proofs
             .iter()
             .copied()
             .find(|proof| flow.proofs[proof.0 as usize].kind == flow::ProofKind::CleanupAcyclic)
             .expect("Flow activation callee cleanup proof");
-        assert_eq!(capacity.depends_on.as_slice(), [cleanup]);
+        for plan in &plans {
+            assert_eq!(plan.callee, helper.id);
+            assert_eq!(plan.region.0, 3 + plan.id.0);
+            assert_eq!(plan.frame_bytes, 16);
+            assert_eq!(plan.maximum_live, 1);
+            assert_eq!(
+                plan.cancellation,
+                flow::ActivationCancellation::DropCalleeThenPropagate
+            );
+            assert!(function.proofs.contains(&plan.capacity_proof));
+            let region = &flow.regions[plan.region.0 as usize];
+            assert_eq!(region.class, flow::RegionClass::TaskFrame);
+            assert_eq!(region.capacity_bytes, plan.frame_bytes);
+            assert_eq!(region.capacity_proof, plan.capacity_proof);
+            assert_eq!(region.source, plan.source);
+            assert_eq!(region.owner, expected_owner);
+            let capacity = &flow.proofs[plan.capacity_proof.0 as usize];
+            assert_eq!(capacity.kind, flow::ProofKind::CapacityBound);
+            assert_eq!(capacity.bound, Some(1));
+            assert_eq!(capacity.sources.as_slice(), [plan.source]);
+            assert_eq!(capacity.depends_on.as_slice(), [cleanup]);
+        }
 
         assert_eq!(function.values[1].ty, *helper_result);
         assert_eq!(function.values[2].ty, activation.id);
-        let [entry, resume] = function.blocks.as_slice() else {
-            panic!("one entry and one resume block per async actor function");
+        assert_eq!(function.values[3].ty, *helper_result);
+        assert_eq!(function.values[4].ty, activation.id);
+        let [entry, middle, resume] = function.blocks.as_slice() else {
+            panic!("one entry and two resume blocks per async actor function");
         };
-        let [call] = entry.instructions.as_slice() else {
-            panic!("one async call before suspension");
-        };
-        assert_eq!(call.results[0].0, 2);
-        assert!(matches!(
-            &call.operation,
-            flow::FlowOperation::AsyncCall {
-                function: callee,
-                arguments,
-                plan: activation_plan,
-            } if *callee == helper.id && arguments.is_empty() && *activation_plan == plan.id
-        ));
-        assert_eq!(
-            entry.terminator,
-            flow::Terminator::Suspend {
-                state: 0,
-                activation: flow::ValueId(2),
-                resume: flow::BlockId(1),
-            }
-        );
-        assert_eq!(resume.parameters.len(), 1);
-        assert_eq!(resume.parameters[0].0, 1);
+        for (state, block, plan, token, delivered, next) in [
+            (
+                0,
+                entry,
+                plans[0],
+                flow::ValueId(2),
+                flow::ValueId(1),
+                middle.id,
+            ),
+            (
+                1,
+                middle,
+                plans[1],
+                flow::ValueId(4),
+                flow::ValueId(3),
+                resume.id,
+            ),
+        ] {
+            let [call] = block.instructions.as_slice() else {
+                panic!("one async call before each suspension");
+            };
+            assert_eq!(call.results.as_slice(), [token]);
+            assert!(matches!(
+                &call.operation,
+                flow::FlowOperation::AsyncCall {
+                    function: callee,
+                    arguments,
+                    plan: activation_plan,
+                } if *callee == helper.id && arguments.is_empty() && *activation_plan == plan.id
+            ));
+            assert_eq!(
+                block.terminator,
+                flow::Terminator::Suspend {
+                    state,
+                    activation: token,
+                    resume: next,
+                }
+            );
+            assert_eq!(
+                function.blocks[next.0 as usize].parameters.as_slice(),
+                [delivered]
+            );
+        }
         assert_eq!(resume.terminator, flow::Terminator::Return(Vec::new()));
     }
     let flow_closed = flow
@@ -565,8 +592,8 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         .iter()
         .find(|proof| proof.kind == flow::ProofKind::ImageClosed)
         .expect("activation-aware Flow image closure");
-    assert_eq!(flow_closed.bound, Some(128));
-    assert_eq!(flow_closed.depends_on.len(), 3);
+    assert_eq!(flow_closed.bound, Some(192));
+    assert_eq!(flow_closed.depends_on.len(), 5);
     assert_eq!(
         &flow_closed.depends_on[1..],
         flow.activations
@@ -574,7 +601,7 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
             .map(|plan| plan.capacity_proof)
             .collect::<Vec<_>>()
     );
-    assert_eq!(baseline.report().async_states, 2);
+    assert_eq!(baseline.report().async_states, 4);
     let ownership = flow
         .proofs
         .iter()
@@ -591,7 +618,7 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         .iter()
         .find(|proof| proof.kind == flow::ProofKind::WaitGraphAcyclic)
         .expect("wait-graph proof");
-    assert_eq!(wait.bound, Some(2));
+    assert_eq!(wait.bound, Some(4));
     let supervision = flow
         .proofs
         .iter()
@@ -693,7 +720,8 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         source: argument_helper.source,
     });
     argument_helper.parameters.push(helper_parameter);
-    for plan in &argumented.activations {
+    let argumented_plans = argumented.activations.clone();
+    for plan in &argumented_plans {
         let caller = &mut argumented.functions[plan.caller.0 as usize];
         let argument = flow::ValueId(caller.values.len() as u32);
         caller.values.push(flow::Value {
@@ -702,23 +730,53 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
             source_name: None,
             source: Some(plan.source),
         });
-        let entry = &mut caller.blocks[caller.entry.0 as usize];
-        entry.instructions[0].id = flow::InstructionId(1);
-        let mut call = entry.instructions.remove(0);
+        let block = caller
+            .blocks
+            .iter_mut()
+            .find(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(instruction.operation,
+                        flow::FlowOperation::AsyncCall { plan: call_plan, .. }
+                            if call_plan == plan.id)
+                })
+            })
+            .expect("producer-shaped async call block");
+        let call_index = block
+            .instructions
+            .iter()
+            .position(|instruction| {
+                matches!(instruction.operation,
+                    flow::FlowOperation::AsyncCall { plan: call_plan, .. }
+                        if call_plan == plan.id)
+            })
+            .expect("producer-shaped async call index");
+        let mut call = block.instructions.remove(call_index);
         let flow::FlowOperation::AsyncCall { arguments, .. } = &mut call.operation else {
             panic!("producer-shaped async call");
         };
         arguments.push(argument);
-        entry.instructions.push(flow::Instruction {
-            id: flow::InstructionId(0),
-            results: vec![argument],
-            operation: flow::FlowOperation::Immediate(flow::Immediate::Integer {
-                bits: 64,
-                bytes_le: 7_u64.to_le_bytes().to_vec(),
-            }),
-            source: Some(plan.source),
-        });
-        entry.instructions.push(call);
+        block.instructions.insert(
+            call_index,
+            flow::Instruction {
+                id: call.id,
+                results: vec![argument],
+                operation: flow::FlowOperation::Immediate(flow::Immediate::Integer {
+                    bits: 64,
+                    bytes_le: 7_u64.to_le_bytes().to_vec(),
+                }),
+                source: Some(plan.source),
+            },
+        );
+        block.instructions.insert(call_index + 1, call);
+    }
+    for caller in &mut argumented.functions {
+        let mut instruction = 0_u32;
+        for block in &mut caller.blocks {
+            for operation in &mut block.instructions {
+                operation.id = flow::InstructionId(instruction);
+                instruction += 1;
+            }
+        }
     }
     prepare_forged_flow(argumented, "argumented async helper");
 
@@ -774,10 +832,10 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
     assert_eq!(optimized_supervision.bound, supervision.bound);
     let machine = prepared.machine().wir().as_wir();
     assert_eq!(machine.version, 15);
-    assert_eq!(machine.activations.len(), 2);
+    assert_eq!(machine.activations.len(), 4);
     assert_eq!(machine.region_storage.len(), flow.regions.len());
-    assert_eq!(machine.region_storage.len(), 5);
-    assert_eq!(machine.globals.len(), 5);
+    assert_eq!(machine.region_storage.len(), 7);
+    assert_eq!(machine.globals.len(), 7);
     let machine_closed = machine
         .proofs
         .iter()
@@ -895,7 +953,7 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         reserved_region_bytes += storage.capacity_bytes;
     }
     assert_eq!(reserved_region_bytes, flow.static_bytes);
-    assert_eq!(reserved_region_bytes, 128);
+    assert_eq!(reserved_region_bytes, 192);
     assert!(matches!(
         machine.region_storage[0].kind,
         MachineRegionStorageKind::ActorMailbox {
@@ -915,20 +973,45 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
             ..
         }
     ));
-    let actor_activation = machine
+    let mut actor_activations = machine
         .activations
         .iter()
-        .find(|activation| activation.schedule == MachineActivationSchedule::DormantMailbox)
-        .expect("compiled dormant actor-turn activation");
-    let task_activation = machine
+        .filter(|activation| activation.schedule == MachineActivationSchedule::DormantMailbox)
+        .collect::<Vec<_>>();
+    actor_activations.sort_by_key(|activation| activation.state);
+    assert_eq!(actor_activations.len(), 2);
+    let mut task_activations = machine
         .activations
         .iter()
-        .find(|activation| activation.schedule == MachineActivationSchedule::StartupOnce)
-        .expect("one startup task activation");
+        .filter(|activation| activation.schedule == MachineActivationSchedule::StartupOnce)
+        .collect::<Vec<_>>();
+    task_activations.sort_by_key(|activation| activation.state);
+    assert_eq!(task_activations.len(), 2);
+    let actor_activation = actor_activations[0];
+    let task_activation = task_activations[0];
     for (activation, flow_plan) in machine.activations.iter().zip(&flow.activations) {
         let flow_caller = &flow.functions[flow_plan.caller.0 as usize];
-        let flow_entry = &flow_caller.blocks[flow_caller.entry.0 as usize];
-        let flow_resume = &flow_caller.blocks[1];
+        let flow_call_block = flow_caller
+            .blocks
+            .iter()
+            .find(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(instruction.operation,
+                        flow::FlowOperation::AsyncCall { plan, .. } if plan == flow_plan.id)
+                })
+            })
+            .expect("activation call block");
+        let flow_call = flow_call_block
+            .instructions
+            .iter()
+            .find(|instruction| {
+                matches!(instruction.operation,
+                    flow::FlowOperation::AsyncCall { plan, .. } if plan == flow_plan.id)
+            })
+            .expect("activation call");
+        let flow::Terminator::Suspend { state, resume, .. } = flow_call_block.terminator else {
+            panic!("activation call suspends");
+        };
         let flow_region = &flow.regions[flow_plan.region.0 as usize];
         let flow_capacity = &flow.proofs[flow_plan.capacity_proof.0 as usize];
         let [flow_cleanup] = flow_capacity.depends_on.as_slice() else {
@@ -937,11 +1020,8 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         assert_eq!(activation.id.0, flow_plan.id.0);
         assert_eq!(activation.caller.0, flow_plan.caller.0);
         assert_eq!(activation.callee.0, flow_plan.callee.0);
-        assert_eq!(
-            activation.call_instruction.0,
-            flow_entry.instructions[0].id.0
-        );
-        assert_eq!(activation.resume_block.0, flow_resume.id.0);
+        assert_eq!(activation.call_instruction.0, flow_call.id.0);
+        assert_eq!(activation.resume_block.0, resume.0);
         assert_eq!(activation.region, flow_plan.region.0);
         assert_eq!(activation.frame_bytes, flow_plan.frame_bytes);
         assert_eq!(activation.region_capacity_bytes, flow_region.capacity_bytes);
@@ -958,7 +1038,7 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
             MachineActivationCancellation::DropCalleeThenPropagate
         );
         assert_eq!(activation.source, flow_plan.source);
-        assert_eq!(activation.state, 0);
+        assert_eq!(activation.state, state);
         let capacity = &machine.proofs[activation.capacity_proof.0 as usize];
         let cleanup = &machine.proofs[activation.cleanup_proof.0 as usize];
         assert_eq!(capacity.kind, BackendProofKind::CapacityBound);
@@ -1076,10 +1156,13 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         &helper_block.terminator,
         MachineTerminator::Return(values) if values.as_slice() == [*helper_final]
     ));
-    for activation in [actor_activation, task_activation] {
+    for activation in machine.activations.iter() {
         let caller = &machine.functions[activation.caller.0 as usize];
-        let entry = &caller.blocks[caller.entry.0 as usize];
-        let call = entry.instructions.last().expect("typed activation call");
+        let call_block = &caller.blocks[activation.state as usize];
+        let call = call_block
+            .instructions
+            .last()
+            .expect("typed activation call");
         let [delivered] = call.results.as_slice() else {
             panic!("typed activation call defines one delivered u64");
         };
@@ -1096,13 +1179,13 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
             } if *function == machine_helper.id && arguments.is_empty()
         ));
         assert!(matches!(
-            &entry.terminator,
+            &call_block.terminator,
             MachineTerminator::Jump { block, arguments }
                 if *block == activation.resume_block && arguments.is_empty()
         ));
         let resume = &caller.blocks[activation.resume_block.0 as usize];
         assert!(resume.parameters.is_empty());
-        assert!(resume.instructions.is_empty());
+        assert_eq!(resume.instructions.is_empty(), activation.state == 1);
     }
     let image = &machine.functions[machine.image_entry.0 as usize];
     let image_entry = &image.blocks[image.entry.0 as usize];
@@ -1213,13 +1296,13 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         .expect_err("omitted actor region storage must be rejected");
     assert!(omission_errors.0.contains(&ValidationError::InvalidRecord {
         kind: "region storage set",
-        id: 4,
+        id: 6,
     }));
 
     let mut substituted_storage = machine.clone();
-    let substituted_id = substituted_storage.region_storage[4].id;
-    substituted_storage.region_storage[4].capacity_proof =
-        substituted_storage.region_storage[3].capacity_proof;
+    let substituted_id = substituted_storage.region_storage[6].id;
+    substituted_storage.region_storage[6].capacity_proof =
+        substituted_storage.region_storage[5].capacity_proof;
     let substitution_errors = substituted_storage
         .validate_for_target(&target)
         .expect_err("substituted actor region capacity proof must be rejected");
@@ -1316,6 +1399,30 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
         .expect_err("cleanup/capacity proof substitution must be rejected");
     assert!(
         cleanup_errors
+            .0
+            .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
+    );
+
+    let task_second_activation = task_activations[1];
+    let mut duplicate_state = machine.clone();
+    duplicate_state.activations[task_second_activation.id.0 as usize].state = 0;
+    assert!(
+        duplicate_state
+            .validate_for_target(&target)
+            .expect_err("two-await task states must remain exactly zero then one")
+            .0
+            .contains(&ValidationError::InvalidActivationPlan(
+                task_second_activation.id
+            ))
+    );
+
+    let mut skipped_middle_resume = machine.clone();
+    skipped_middle_resume.activations[task_activation.id.0 as usize].resume_block =
+        task_second_activation.resume_block;
+    assert!(
+        skipped_middle_resume
+            .validate_for_target(&target)
+            .expect_err("the first await cannot skip the second activation block")
             .0
             .contains(&ValidationError::InvalidActivationPlan(task_activation.id))
     );
@@ -1604,7 +1711,7 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
     let mut exact = FlowLoweringLimits::standard();
     exact.blocks = baseline.report().blocks;
     exact.instructions = baseline.report().instructions;
-    exact.states_per_function = 1;
+    exact.states_per_function = 2;
     CanonicalFlowLowerer::new()
         .lower(
             FlowLowerRequest {
@@ -1614,6 +1721,22 @@ fn parsed_actor_source_delivers_exact_u64_computed_async_results_to_actor_and_ta
             &never_cancelled,
         )
         .expect("real actor source accepts exact Flow resource bounds");
+
+    let mut below_states = exact;
+    below_states.states_per_function = 1;
+    assert_eq!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic_wir.clone(),
+                limits: below_states,
+            },
+            &never_cancelled,
+        ),
+        Err(FlowLowerError::ResourceLimit {
+            resource: "FlowWir async states",
+            limit: 1,
+        })
+    );
 
     let mut over = exact;
     over.blocks -= 1;

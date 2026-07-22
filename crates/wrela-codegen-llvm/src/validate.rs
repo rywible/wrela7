@@ -1320,7 +1320,12 @@ fn validate_activation_table(
                         .source
                         .is_some_and(|source| proof.sources.as_slice() == [source])
             });
-        let entry = caller.blocks.get(caller.entry.0 as usize);
+        let two_await = two_await_activation_codegen_matches(machine, caller, activation);
+        let call_block = if two_await {
+            caller.blocks.get(activation.state as usize)
+        } else {
+            caller.blocks.get(caller.entry.0 as usize)
+        };
         let exact_u64_type = |ty: MachineTypeId| {
             machine.types.get(ty.0 as usize).is_some_and(|ty| {
                 ty.kind == MachineTypeKind::Integer { bits: 64 }
@@ -1328,8 +1333,8 @@ fn validate_activation_table(
                     && ty.alignment == 8
             })
         };
-        let call_matches = entry.is_some_and(|entry| {
-            let Some(instruction) = entry.instructions.last() else {
+        let call_matches = call_block.is_some_and(|call_block| {
+            let Some(instruction) = call_block.instructions.last() else {
                 return false;
             };
             let prefix_matches = match activation.schedule {
@@ -1340,23 +1345,23 @@ fn validate_activation_table(
                         MachineActivationOwner::Actor { actor, .. } => actor,
                         MachineActivationOwner::Task { .. } => return false,
                     },
-                    &entry.instructions[..entry.instructions.len().saturating_sub(1)],
+                    &call_block.instructions[..call_block.instructions.len().saturating_sub(1)],
                 ),
                 MachineActivationSchedule::MailboxOnce => {
-                    matches!(entry.instructions.as_slice(), [receive, _]
+                    matches!(call_block.instructions.as_slice(), [receive, _]
                         if receive.results.is_empty()
                             && matches!(receive.operation,
                                 MachineOperation::MailboxReceive { method, .. }
                                     if method == activation.caller))
                 }
                 MachineActivationSchedule::SchedulerFifo => {
-                    matches!(entry.instructions.first(), Some(receive)
+                    matches!(call_block.instructions.first(), Some(receive)
                         if receive.results.is_empty()
                             && matches!(receive.operation,
                                 MachineOperation::MailboxReceive { method, .. }
                                     if method == activation.caller))
-                        && (entry.instructions.len() == 2
-                            || matches!(entry.instructions.as_slice(), [_, reserve, commit, _]
+                        && (call_block.instructions.len() == 2
+                            || matches!(call_block.instructions.as_slice(), [_, reserve, commit, _]
                                 if matches!(
                                     (&reserve.operation, reserve.results.as_slice()),
                                     (
@@ -1376,8 +1381,8 @@ fn validate_activation_table(
                                 )))
                 }
                 MachineActivationSchedule::StartupOnce => {
-                    entry.instructions.len() == 1
-                        || matches!(entry.instructions.as_slice(), [capability, reserve, commit, _]
+                    call_block.instructions.len() == 1
+                        || matches!(call_block.instructions.as_slice(), [capability, reserve, commit, _]
                         if matches!(
                             (&capability.operation, capability.results.as_slice()),
                             (
@@ -1415,7 +1420,7 @@ fn validate_activation_table(
                                         && commit_mailbox == mailbox
                                         && commit_method == method)
                         ))
-                        || matches!(entry.instructions.as_slice(), [reserve, commit, _]
+                        || matches!(call_block.instructions.as_slice(), [reserve, commit, _]
                         if matches!(
                             (&reserve.operation, reserve.results.as_slice()),
                             (
@@ -1459,19 +1464,20 @@ fn validate_activation_table(
                         arguments,
                         convention: CallingConvention::Internal,
                     } if *function == activation.callee && arguments.is_empty())
-                && matches!(&entry.terminator,
+                && matches!(&call_block.terminator,
                     MachineTerminator::Jump { block, arguments }
                         if *block == activation.resume_block && arguments.is_empty())
         }) || structured_scope_activation_codegen_matches(machine, caller, activation);
-        let resume_matches = caller
-            .blocks
-            .get(activation.resume_block.0 as usize)
-            .is_some_and(|resume| {
-                resume.parameters.is_empty()
-                    && resume.instructions.is_empty()
-                    && matches!(&resume.terminator,
+        let resume_matches = two_await
+            || caller
+                .blocks
+                .get(activation.resume_block.0 as usize)
+                .is_some_and(|resume| {
+                    resume.parameters.is_empty()
+                        && resume.instructions.is_empty()
+                        && matches!(&resume.terminator,
                         MachineTerminator::Return(values) if values.is_empty())
-            });
+                });
         let unit_callee = machine
             .types
             .get(callee.result.0 as usize)
@@ -1496,7 +1502,7 @@ fn validate_activation_table(
         )?;
         if !owner_matches
             || !proof_matches
-            || activation.state != 0
+            || !(activation.state == 0 || (two_await && activation.state == 1))
             || activation.frame_bytes == 0
             || activation.frame_bytes != activation.region_capacity_bytes
             || activation.maximum_live != 1
@@ -1527,13 +1533,78 @@ fn validate_activation_table(
                 )
             })
         });
-        if activation_role != (caller_counts.get(index) == Some(&1) || reply_role) {
+        let two_await_role = caller_counts.get(index) == Some(&2)
+            && machine
+                .activations
+                .iter()
+                .filter(|activation| activation.caller == function.id)
+                .all(|activation| {
+                    two_await_activation_codegen_matches(machine, function, activation)
+                });
+        if activation_role != (caller_counts.get(index) == Some(&1) || two_await_role || reply_role)
+        {
             return Err(CodegenError::UnsupportedMachineContract(
                 "an activation function without exactly one plan",
             ));
         }
     }
     Ok(())
+}
+
+fn two_await_activation_codegen_matches(
+    machine: &wrela_machine_wir::MachineWir,
+    caller: &MachineFunction,
+    activation: &wrela_machine_wir::MachineActivationPlan,
+) -> bool {
+    if machine.activations.len() != 4 || activation.state > 1 {
+        return false;
+    }
+    let [entry, middle, terminal] = caller.blocks.as_slice() else {
+        return false;
+    };
+    let mut state_zero = None;
+    let mut state_one = None;
+    let mut caller_count = 0usize;
+    for candidate in &machine.activations {
+        if candidate.caller != caller.id {
+            continue;
+        }
+        caller_count = caller_count.saturating_add(1);
+        if candidate.callee != activation.callee {
+            return false;
+        }
+        match candidate.state {
+            0 if state_zero.replace(candidate).is_none() => {}
+            1 if state_one.replace(candidate).is_none() => {}
+            _ => return false,
+        }
+    }
+    let (Some(state_zero), Some(state_one)) = (state_zero, state_one) else {
+        return false;
+    };
+    caller_count == 2
+        && caller.entry == entry.id
+        && entry.id == BlockId(0)
+        && middle.id == BlockId(1)
+        && terminal.id == BlockId(2)
+        && entry.parameters.is_empty()
+        && middle.parameters.is_empty()
+        && terminal.parameters.is_empty()
+        && matches!(entry.instructions.as_slice(), [call]
+            if call.id == state_zero.call_instruction)
+        && matches!(&entry.terminator,
+            MachineTerminator::Jump { block, arguments }
+                if *block == middle.id && arguments.is_empty())
+        && matches!(middle.instructions.as_slice(), [call]
+            if call.id == state_one.call_instruction)
+        && matches!(&middle.terminator,
+            MachineTerminator::Jump { block, arguments }
+                if *block == terminal.id && arguments.is_empty())
+        && terminal.instructions.is_empty()
+        && matches!(&terminal.terminator,
+            MachineTerminator::Return(values) if values.is_empty())
+        && state_zero.resume_block == middle.id
+        && state_one.resume_block == terminal.id
 }
 
 fn structured_scope_activation_codegen_matches(
