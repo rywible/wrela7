@@ -786,6 +786,17 @@ pub enum ExpressionResolution {
         raw_result: ValueId,
         negate: bool,
     },
+    /// Compiler-derived structural equality for the exact one-field scalar
+    /// structure subset. The two field values are explicit authenticated
+    /// intermediates defined by this comparison expression.
+    DerivedEquality {
+        aggregate: SemanticTypeId,
+        field: u32,
+        left: ValueId,
+        right: ValueId,
+        left_field: ValueId,
+        right_field: ValueId,
+    },
     ActorRequest {
         actor: ActorId,
         method: FunctionInstanceId,
@@ -4189,6 +4200,40 @@ fn validate_exact_expression_fact(
                 operator,
                 right,
             },
+            ExpressionResolution::DerivedEquality {
+                aggregate,
+                field,
+                left: left_value,
+                right: right_value,
+                left_field,
+                right_field,
+            },
+            Some(_),
+        ) if exact_derived_equality_matches(
+            analysis,
+            program,
+            function.id,
+            *operator,
+            *left,
+            *right,
+            fact,
+            *aggregate,
+            *field,
+            *left_value,
+            *right_value,
+            *left_field,
+            *right_field,
+        ) =>
+        {
+            increment_definition(definitions, *left_field)?;
+            increment_definition(definitions, *right_field)?;
+        }
+        (
+            wrela_hir::ExpressionKind::Compare {
+                left,
+                operator,
+                right,
+            },
             ExpressionResolution::Value(value),
             Some(result),
         ) if *value == result
@@ -5669,6 +5714,104 @@ fn exact_scalar_comparison_matches(
         && bool_result
         && operator_matches
         && fact.effects.0 == left.effects.0 | right.effects.0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_derived_equality_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    function: FunctionInstanceId,
+    operator: wrela_hir::ComparisonOperator,
+    left_expression: ExpressionId,
+    right_expression: ExpressionId,
+    fact: &ExpressionFact,
+    aggregate: SemanticTypeId,
+    field: u32,
+    left: ValueId,
+    right: ValueId,
+    left_field: ValueId,
+    right_field: ValueId,
+) -> bool {
+    if !matches!(
+        operator,
+        wrela_hir::ComparisonOperator::Equal | wrela_hir::ComparisonOperator::NotEqual
+    ) || field != 0
+        || aggregate.0 as usize >= analysis.types.len()
+    {
+        return false;
+    }
+    let (Some(left_fact), Some(right_fact)) = (
+        exact_child_expression(analysis, function, left_expression),
+        exact_child_expression(analysis, function, right_expression),
+    ) else {
+        return false;
+    };
+    let resolved_value = |child: &ExpressionFact| match child.resolution {
+        ExpressionResolution::Value(value) => Some(value),
+        _ => child.result,
+    };
+    let (Some(left_result), Some(right_result)) =
+        (resolved_value(left_fact), resolved_value(right_fact))
+    else {
+        return false;
+    };
+    if left != left_result
+        || right != right_result
+        || left_fact.ty != aggregate
+        || right_fact.ty != aggregate
+        || fact.effects.0 != left_fact.effects.0 | right_fact.effects.0
+        || !matches!(
+            exact_scalar_type(analysis, fact.ty),
+            Some(ExactScalarType::Bool)
+        )
+    {
+        return false;
+    }
+    let Some(SemanticTypeKind::Structure {
+        declaration,
+        arguments,
+        fields,
+    }) = analysis
+        .types
+        .get(aggregate.0 as usize)
+        .map(|record| &record.kind)
+    else {
+        return false;
+    };
+    let [semantic_field] = fields.as_slice() else {
+        return false;
+    };
+    let source_matches = program
+        .declaration(*declaration)
+        .and_then(|record| match &record.kind {
+            wrela_hir::DeclarationKind::Structure(source) => Some(source),
+            _ => None,
+        })
+        .is_some_and(|source| {
+            source.generics.is_empty()
+                && source.fields.len() == 1
+                && source.deriving.iter().any(|name| name.as_str() == "Eq")
+        });
+    let fact_source = program
+        .expression(fact.expression)
+        .map(|record| record.source);
+    let value_matches = |value: ValueId| {
+        analysis.values.get(value.0 as usize).is_some_and(|record| {
+            record.function == function
+                && record.ty == semantic_field.ty
+                && record.category == ValueCategory::Value
+                && record.class == SemanticValueClass::FirstClass
+                && record.origin == SemanticValueOrigin::Expression(fact.expression)
+                && record.source == fact_source
+                && record.source_name.is_none()
+        })
+    };
+    arguments.is_empty()
+        && source_matches
+        && exact_scalar_type(analysis, semantic_field.ty).is_some()
+        && left_field != right_field
+        && value_matches(left_field)
+        && value_matches(right_field)
 }
 
 fn exact_scalar_cast_matches(
@@ -9337,6 +9480,32 @@ fn valid_expression_resolution(
                             )
                     })
         }
+        ExpressionResolution::DerivedEquality {
+            aggregate,
+            field,
+            left,
+            right,
+            left_field,
+            right_field,
+        } => analysis
+            .types
+            .get(aggregate.0 as usize)
+            .and_then(|record| match &record.kind {
+                SemanticTypeKind::Structure { fields, .. } => fields.get(*field as usize),
+                _ => None,
+            })
+            .is_some_and(|field| {
+                let value_has_type = |value: ValueId, ty: SemanticTypeId| {
+                    analysis
+                        .values
+                        .get(value.0 as usize)
+                        .is_some_and(|record| record.function == function && record.ty == ty)
+                };
+                value_has_type(*left, *aggregate)
+                    && value_has_type(*right, *aggregate)
+                    && value_has_type(*left_field, field.ty)
+                    && value_has_type(*right_field, field.ty)
+            }),
         ExpressionResolution::ActorRequest {
             actor,
             method,
@@ -10124,6 +10293,7 @@ fn valid_expression_region(
             | ExpressionResolution::ScopeCall { .. }
             | ExpressionResolution::ProjectionCall { .. }
             | ExpressionResolution::OperatorCall { .. }
+            | ExpressionResolution::DerivedEquality { .. }
             | ExpressionResolution::ActorRequest { .. }
             | ExpressionResolution::Closure { .. }
             | ExpressionResolution::Builtin(_) => fact.region.is_none(),
@@ -12192,6 +12362,7 @@ fn validate_fact_resources(
             | ExpressionResolution::ResultTry { .. }
             | ExpressionResolution::OptionTry { .. }
             | ExpressionResolution::ClosedRange { .. }
+            | ExpressionResolution::DerivedEquality { .. }
             | ExpressionResolution::ActorRequest { .. }
             | ExpressionResolution::Field { .. }
             | ExpressionResolution::Index { .. }

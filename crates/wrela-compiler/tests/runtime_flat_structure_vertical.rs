@@ -117,6 +117,37 @@ fn local_field_update_reaches_native():
     return
 "#;
 
+const DERIVED_EQ_SOURCE: &str = r#"module app.duration
+
+pub struct Point deriving(Eq):
+    pub value: u64
+
+pub fn make(value: u64) -> Point:
+    return Point(value=value)
+
+pub fn same(read left: Point, read right: Point) -> bool:
+    result: bool = left == right
+    left_after: u64 = left.value
+    right_after: u64 = right.value
+    return result
+
+pub fn different(read left: Point, read right: Point) -> bool:
+    return left != right
+"#;
+
+const DERIVED_EQ_TEST_SOURCE: &str = r#"module app.duration_test
+
+from app.duration import Point, different, make, same
+
+@test(runtime)
+fn derived_equality_reaches_native():
+    first: Point = make(1)
+    second: Point = make(1)
+    equal: bool = same(left=first, right=second)
+    unequal: bool = different(left=first, right=second)
+    return
+"#;
+
 const INITIALIZER_SOURCE: &str = r#"module app.duration
 
 pub struct Box:
@@ -2114,21 +2145,7 @@ fn unused():
 
 #[test]
 fn deriving_eq_is_accepted() {
-    let fixture = fixture(
-        r#"module app.duration
-pub struct Point deriving(Eq):
-    pub value: u64
-pub fn make(value: u64) -> Point:
-    return Point(value=value)
-"#,
-        r#"module app.duration_test
-from app.duration import Point, make
-@test(runtime)
-fn deriving_eq_parses():
-    first: Point = make(1)
-    return
-"#,
-    );
+    let fixture = fixture(DERIVED_EQ_SOURCE, DERIVED_EQ_TEST_SOURCE);
     let output = compile(&fixture, AnalysisLimits::standard(), &never_cancelled)
         .expect("deriving Eq analyzes");
     assert!(
@@ -2137,4 +2154,407 @@ fn deriving_eq_parses():
         output.diagnostics()
     );
     assert!(output.successful().is_some());
+}
+
+#[test]
+fn one_field_derived_eq_reaches_deterministic_native_coff() {
+    let fixture = fixture(DERIVED_EQ_SOURCE, DERIVED_EQ_TEST_SOURCE);
+    let analyzed = analyzed(&fixture);
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("derived equality lowers to SemanticWir");
+    let repeated_semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("repeat derived equality lowering");
+    assert_eq!(semantic.wir().as_wir(), repeated_semantic.wir().as_wir());
+
+    let mut semantic_projects = 0;
+    let mut semantic_equal = 0;
+    let mut semantic_not_equal = 0;
+    for statement in semantic
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .flat_map(|function| &function.body.statements)
+    {
+        let LoweredSemanticStatement::Let(statement) = statement else {
+            continue;
+        };
+        match statement.operation {
+            SemanticOperation::Project {
+                field: 0,
+                access: wrela_semantic_lower::SemanticAccessMode::Read,
+                ..
+            } => semantic_projects += 1,
+            SemanticOperation::Binary {
+                operator: wrela_semantic_lower::semantic_wir::BinaryOperator::Equal,
+                arithmetic: SemanticArithmeticMode::Checked,
+                ..
+            } => semantic_equal += 1,
+            SemanticOperation::Binary {
+                operator: wrela_semantic_lower::semantic_wir::BinaryOperator::NotEqual,
+                arithmetic: SemanticArithmeticMode::Checked,
+                ..
+            } => semantic_not_equal += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        semantic_projects, 6,
+        "two derived comparisons project both operands and the equality function performs two post-comparison reads"
+    );
+    assert_eq!((semantic_equal, semantic_not_equal), (1, 1));
+
+    let (semantic_wir, _) = semantic.into_parts();
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic_wir,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("derived equality lowers to FlowWir");
+    assert!(flow.diagnostics().is_empty());
+    let flow_model = flow.wir().as_wir();
+    let flow_projects = flow_model
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                FlowOperation::ExtractField { field: 0, .. }
+            )
+        })
+        .count();
+    let flow_equal = flow_model
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                FlowOperation::Binary {
+                    op: FlowBinaryOp::Equal,
+                    ..
+                }
+            )
+        })
+        .count();
+    let flow_not_equal = flow_model
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                FlowOperation::Binary {
+                    op: FlowBinaryOp::NotEqual,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(flow_projects, 6);
+    assert_eq!((flow_equal, flow_not_equal), (1, 1));
+
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("derived equality FlowWir canonical frame");
+    let decoded = CanonicalFlowWirCodec
+        .decode(
+            DecodeRequest {
+                bytes: encoded.bytes(),
+                limits: CodecLimits::standard(),
+                expected_build: Some(fixture.build.identity()),
+            },
+            &never_cancelled,
+        )
+        .expect("derived equality FlowWir decode");
+    assert_eq!(decoded, flow_wir);
+
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("derived equality reaches MachineWir");
+    let machine = prepared.machine().wir().as_wir();
+    let bitcasts = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                MachineOperation::Convert {
+                    op: ConversionOp::Bitcast,
+                    ..
+                }
+            )
+        })
+        .count();
+    let comparisons = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction.operation,
+                MachineOperation::IntegerCompare { .. }
+            )
+        })
+        .count();
+    assert!(
+        bitcasts >= 6,
+        "all six one-field projections must be materialized"
+    );
+    assert_eq!(comparisons, 2);
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("derived equality native object emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat derived equality native object emission");
+            assert_eq!(
+                first.bytes(),
+                second.bytes(),
+                "identical derived equality MachineWir must emit byte-identical ARM64 COFF"
+            );
+        }
+    }
+}
+
+#[test]
+fn derived_eq_rejects_unmarked_and_unsupported_shapes_by_name() {
+    let cases = [
+        (
+            r#"module app.duration
+pub struct Point:
+    pub value: u64
+pub fn make(value: u64) -> Point:
+    return Point(value=value)
+pub fn same(read left: Point, read right: Point) -> bool:
+    return left == right
+"#,
+            r#"module app.duration_test
+from app.duration import Point, make, same
+@test(runtime)
+fn unmarked_equality():
+    first: Point = make(1)
+    second: Point = make(1)
+    equal: bool = same(left=first, right=second)
+    return
+"#,
+            "semantic-derived-eq-required",
+        ),
+        (
+            r#"module app.duration
+pub struct Pair deriving(Eq):
+    pub left: u64
+    pub right: u64
+pub fn make(value: u64) -> Pair:
+    return Pair(left=value, right=value)
+pub fn same(read left: Pair, read right: Pair) -> bool:
+    return left == right
+"#,
+            r#"module app.duration_test
+from app.duration import Pair, make, same
+@test(runtime)
+fn wide_derived_equality():
+    first: Pair = make(1)
+    second: Pair = make(1)
+    equal: bool = same(left=first, right=second)
+    return
+"#,
+            "semantic-deriving-eq-shape-pending",
+        ),
+    ];
+    for (production, tests, expected_code) in cases {
+        let fixture = fixture(production, tests);
+        if fixture
+            .discovery_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_deref() == Some(expected_code))
+        {
+            continue;
+        }
+        let output = compile(&fixture, AnalysisLimits::standard(), &never_cancelled)
+            .expect("derived equality rejection remains bounded");
+        assert!(output.successful().is_none());
+        assert!(
+            output
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_deref() == Some(expected_code)),
+            "missing {expected_code}: {:?}",
+            output.diagnostics()
+        );
+    }
+}
+
+#[test]
+fn deriving_from_rejects_a_single_multifield_payload_variant() {
+    let fixture = fixture(
+        r#"module app.duration
+pub enum PairResult deriving(From):
+    Pair(u64, u64,)
+"#,
+        r#"module app.duration_test
+@test(runtime)
+fn unused():
+    return
+"#,
+    );
+    assert!(
+        fixture.discovery_diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.as_deref() == Some("semantic-deriving-from-shape")
+        }),
+        "{:?}",
+        fixture.discovery_diagnostics
+    );
+}
+
+#[test]
+fn derived_eq_full_seal_rejects_field_and_intermediate_forgeries() {
+    let analyzed = analyzed(&fixture(DERIVED_EQ_SOURCE, DERIVED_EQ_TEST_SOURCE));
+    let mut wrong_field = analyzed.facts().clone();
+    let resolution = wrong_field
+        .expressions
+        .iter_mut()
+        .find_map(|fact| match &mut fact.resolution {
+            wrela_sema::ExpressionResolution::DerivedEquality { field, .. } => Some(field),
+            _ => None,
+        })
+        .expect("derived equality fact");
+    *resolution = 1;
+    assert!(
+        wrong_field
+            .validate_for_seal(analyzed.hir(), &never_cancelled)
+            .is_err()
+    );
+
+    let mut aliased_intermediate = analyzed.facts().clone();
+    let (left_field, right_field) = aliased_intermediate
+        .expressions
+        .iter_mut()
+        .find_map(|fact| match &mut fact.resolution {
+            wrela_sema::ExpressionResolution::DerivedEquality {
+                left_field,
+                right_field,
+                ..
+            } => Some((*left_field, right_field)),
+            _ => None,
+        })
+        .expect("derived equality intermediates");
+    *right_field = left_field;
+    assert!(
+        aliased_intermediate
+            .validate_for_seal(analyzed.hir(), &never_cancelled)
+            .is_err()
+    );
+}
+
+#[test]
+fn derived_eq_lowering_has_exact_operation_bound_and_late_cancellation() {
+    let analyzed = analyzed(&fixture(DERIVED_EQ_SOURCE, DERIVED_EQ_TEST_SOURCE));
+    let baseline = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("baseline derived equality lowering");
+    let exact = baseline.report().operations;
+    assert!(exact > 1);
+    let mut exact_limits = SemanticLoweringLimits::standard();
+    exact_limits.operations = exact;
+    CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: exact_limits,
+            },
+            &never_cancelled,
+        )
+        .expect("exact derived equality operation bound is admitted");
+    let mut one_under = exact_limits;
+    one_under.operations = exact - 1;
+    assert!(matches!(
+        CanonicalSemanticLowerer::new().lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: one_under,
+            },
+            &never_cancelled,
+        ),
+        Err(SemanticLowerError::ResourceLimit {
+            resource: "SemanticWir operations",
+            limit,
+        }) if limit == exact - 1
+    ));
+
+    let polls = Cell::new(0_u32);
+    CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed.clone(),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            },
+        )
+        .expect("count derived equality cancellation polls");
+    let cancel_at = polls.get().saturating_sub(2);
+    let cancelled = Cell::new(0_u32);
+    assert!(matches!(
+        CanonicalSemanticLowerer::new().lower(
+            SemanticLowerRequest {
+                input: analyzed,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &|| {
+                let next = cancelled.get().saturating_add(1);
+                cancelled.set(next);
+                next >= cancel_at
+            },
+        ),
+        Err(SemanticLowerError::Cancelled)
+    ));
+    assert!(cancelled.get() >= cancel_at);
 }

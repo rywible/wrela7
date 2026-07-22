@@ -1257,20 +1257,25 @@ fn diagnose_deriving_clauses(
         if deriving.is_empty() {
             continue;
         }
-        let payload_carriers = match &declaration.kind {
-            DeclarationKind::Structure(aggregate) => aggregate.fields.len(),
-            DeclarationKind::Enumeration(enumeration) => enumeration
-                .variants
-                .iter()
-                .filter(|variant| !variant.fields.is_empty())
-                .count(),
-            _ => 0,
+        let valid_from_shape = match &declaration.kind {
+            DeclarationKind::Structure(aggregate) => aggregate.fields.len() == 1,
+            DeclarationKind::Enumeration(enumeration) => {
+                let mut payloads = enumeration
+                    .variants
+                    .iter()
+                    .filter(|variant| !variant.fields.is_empty());
+                payloads
+                    .next()
+                    .is_some_and(|variant| variant.fields.len() == 1)
+                    && payloads.next().is_none()
+            }
+            _ => false,
         };
         for name in deriving {
             match name.as_str() {
                 "Eq" | "Format" => {}
                 "From" => {
-                    if payload_carriers != 1 {
+                    if !valid_from_shape {
                         let mut diagnostic = Diagnostic::error(
                             Category::TYPE,
                             declaration.source,
@@ -9403,6 +9408,18 @@ fn analyze_scalar_binary(
         };
         known_left.or(known_right)
     };
+    let operand_access = if matches!(
+        binary.operator,
+        RuntimeBinaryOperator::Compare(
+            wrela_hir::ComparisonOperator::Equal | wrela_hir::ComparisonOperator::NotEqual
+        )
+    ) && operand_expected
+        .is_some_and(|ty| runtime_struct_declaration(partial, ty).is_some())
+    {
+        AccessMode::Read
+    } else {
+        AccessMode::Value
+    };
     let left = analyze_runtime_expression(
         request,
         partial,
@@ -9411,7 +9428,7 @@ fn analyze_scalar_binary(
         RuntimeExpressionRequest {
             expected: operand_expected,
             desired_result: None,
-            access: AccessMode::Value,
+            access: operand_access,
         },
         state,
         is_cancelled,
@@ -9424,7 +9441,7 @@ fn analyze_scalar_binary(
         RuntimeExpressionRequest {
             expected: Some(left.ty),
             desired_result: None,
-            access: AccessMode::Value,
+            access: operand_access,
         },
         state,
         is_cancelled,
@@ -9440,6 +9457,25 @@ fn analyze_scalar_binary(
         ));
     }
     if let Some(struct_declaration) = runtime_struct_declaration(partial, left.ty) {
+        if matches!(
+            binary.operator,
+            RuntimeBinaryOperator::Compare(
+                wrela_hir::ComparisonOperator::Equal | wrela_hir::ComparisonOperator::NotEqual
+            )
+        ) {
+            return analyze_derived_equality(
+                request,
+                partial,
+                function,
+                binary,
+                struct_declaration,
+                left,
+                right,
+                expression_request,
+                state,
+                is_cancelled,
+            );
+        }
         return analyze_operator_interface_binary(
             request,
             partial,
@@ -9550,6 +9586,167 @@ fn analyze_scalar_binary(
     )?;
     Ok(RuntimeExpression {
         ty: result_ty,
+        result: Some(result),
+        referenced: None,
+        effects,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_derived_equality(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    binary: RuntimeBinary,
+    declaration: DeclarationId,
+    left: RuntimeExpression,
+    right: RuntimeExpression,
+    expression_request: RuntimeExpressionRequest,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<RuntimeExpression> {
+    let declaration_record = request
+        .hir
+        .as_program()
+        .declaration(declaration)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let DeclarationKind::Structure(source) = &declaration_record.kind else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    if !source.deriving.iter().any(|name| name.as_str() == "Eq") {
+        return Err(runtime_type_diagnostic(
+            request,
+            binary.source,
+            "semantic-derived-eq-required",
+            "nominal structure equality requires `deriving(Eq)`",
+            "structure identity alone does not synthesize equality behavior",
+            "add `deriving(Eq)` to the structure declaration or compare a field explicitly",
+        ));
+    }
+    let (field_ty, exact_shape) = partial
+        .types
+        .get(left.ty.0 as usize)
+        .and_then(|record| match &record.kind {
+            SemanticTypeKind::Structure {
+                declaration: record_declaration,
+                arguments,
+                fields,
+            } => Some((
+                fields.first().map(|field| field.ty),
+                *record_declaration == declaration
+                    && arguments.is_empty()
+                    && fields.len() == 1
+                    && source.generics.is_empty()
+                    && source.fields.len() == 1,
+            )),
+            _ => None,
+        })
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let Some(field_ty) = field_ty.filter(|_| exact_shape) else {
+        return Err(runtime_type_diagnostic(
+            request,
+            binary.source,
+            "semantic-deriving-eq-shape-pending",
+            "derived equality is not implemented for this structure shape",
+            "the executable subset is one nongeneric field with a stored copy-scalar type",
+            "compare fields explicitly or use a one-field scalar structure",
+        ));
+    };
+    if runtime_scalar_type(partial, field_ty).is_none() {
+        return Err(runtime_type_diagnostic(
+            request,
+            binary.source,
+            "semantic-deriving-eq-shape-pending",
+            "derived equality field is outside the stored copy-scalar subset",
+            "nested nominal, view, and linear fields require recursive derived-method lowering",
+            "compare a supported scalar field explicitly",
+        ));
+    }
+    let bool_ty = ensure_primitive_type(
+        request,
+        partial,
+        PrimitiveSemanticType::Bool,
+        &mut *state.aggregate_work,
+        is_cancelled,
+    )?;
+    if expression_request
+        .expected
+        .is_some_and(|expected| expected != bool_ty)
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            binary.source,
+            "semantic-binary-result",
+            "derived equality result does not match its required context",
+            "`==` and `!=` always produce bool",
+            "use the comparison in a bool context",
+        ));
+    }
+    let left_value = left
+        .referenced
+        .or(left.result)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let right_value = right
+        .referenced
+        .or(right.result)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let left_field = append_semantic_value(
+        request,
+        partial,
+        function,
+        field_ty,
+        (
+            SemanticValueOrigin::Expression(binary.expression),
+            Some(binary.source),
+            None,
+        ),
+        is_cancelled,
+    )?;
+    let right_field = append_semantic_value(
+        request,
+        partial,
+        function,
+        field_ty,
+        (
+            SemanticValueOrigin::Expression(binary.expression),
+            Some(binary.source),
+            None,
+        ),
+        is_cancelled,
+    )?;
+    let result = expression_result(
+        request,
+        partial,
+        function,
+        (binary.expression, binary.source),
+        bool_ty,
+        expression_request.desired_result,
+        is_cancelled,
+    )?;
+    let effects = EffectSet(left.effects.0 | right.effects.0);
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression: binary.expression,
+            ty: bool_ty,
+            result: Some(result),
+            resolution: ExpressionResolution::DerivedEquality {
+                aggregate: left.ty,
+                field: 0,
+                left: left_value,
+                right: right_value,
+                left_field,
+                right_field,
+            },
+            effects,
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    Ok(RuntimeExpression {
+        ty: bool_ty,
         result: Some(result),
         referenced: None,
         effects,

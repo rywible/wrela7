@@ -344,6 +344,7 @@ impl CanonicalSemanticLinter {
                 | ExpressionResolution::ScopeCall { .. }
                 | ExpressionResolution::ProjectionCall { .. }
                 | ExpressionResolution::OperatorCall { .. }
+                | ExpressionResolution::DerivedEquality { .. }
                 | ExpressionResolution::ActorRequest { .. }
                 | ExpressionResolution::Field { .. }
                 | ExpressionResolution::Index { .. }

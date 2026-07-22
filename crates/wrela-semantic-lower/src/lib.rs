@@ -6385,6 +6385,23 @@ struct ProjectInput {
     effects: sema::EffectSet,
 }
 
+struct DerivedEqualityInput {
+    expression: wrela_hir::ExpressionId,
+    source: Span,
+    operator: wrela_hir::ComparisonOperator,
+    left_expression: wrela_hir::ExpressionId,
+    right_expression: wrela_hir::ExpressionId,
+    aggregate: sema::SemanticTypeId,
+    field: u32,
+    left: sema::ValueId,
+    right: sema::ValueId,
+    left_field: sema::ValueId,
+    right_field: sema::ValueId,
+    result_type: sema::SemanticTypeId,
+    result: sema::ValueId,
+    effects: sema::EffectSet,
+}
+
 struct ProjectionCallInput {
     expression: wrela_hir::ExpressionId,
     source: Span,
@@ -6566,6 +6583,7 @@ enum SourceExpressionPlan {
     InitializerAggregate(InitializerAggregateInput),
     EnumAggregate(EnumAggregateInput),
     Project(ProjectInput),
+    DerivedEquality(DerivedEqualityInput),
     ProjectionCall(ProjectionCallInput),
     ActorStateLoad(sema::ActorStateAccess),
     DirectCall(DirectCallInput),
@@ -9606,6 +9624,38 @@ impl SourceFunctionLowerer<'_> {
                         })
                     }
                     (
+                        wrela_hir::ExpressionKind::Compare {
+                            left,
+                            operator,
+                            right,
+                        },
+                        sema::ExpressionResolution::DerivedEquality {
+                            aggregate,
+                            field,
+                            left: left_value,
+                            right: right_value,
+                            left_field,
+                            right_field,
+                        },
+                    ) => SourceExpressionPlan::DerivedEquality(DerivedEqualityInput {
+                        expression: expression_id,
+                        source: expression.source,
+                        operator: *operator,
+                        left_expression: *left,
+                        right_expression: *right,
+                        aggregate: *aggregate,
+                        field: *field,
+                        left: *left_value,
+                        right: *right_value,
+                        left_field: *left_field,
+                        right_field: *right_field,
+                        result_type: fact.ty,
+                        result: fact
+                            .result
+                            .ok_or_else(|| self.fact_mismatch("derived equality result"))?,
+                        effects: fact.effects,
+                    }),
+                    (
                         wrela_hir::ExpressionKind::Binary {
                             operator,
                             left,
@@ -9994,6 +10044,9 @@ impl SourceFunctionLowerer<'_> {
             }
             SourceExpressionPlan::Project(project) => {
                 self.lower_flat_projection(project, statements)
+            }
+            SourceExpressionPlan::DerivedEquality(equality) => {
+                self.lower_derived_equality(equality, statements)
             }
             SourceExpressionPlan::ProjectionCall(project) => {
                 self.lower_projection_call(project, statements)
@@ -11693,6 +11746,137 @@ impl SourceFunctionLowerer<'_> {
                 access: wir::AccessMode::Read,
             },
             Some(project.source),
+        )?;
+        Ok(LoweredExpression::Value(result))
+    }
+
+    fn lower_derived_equality(
+        &mut self,
+        equality: DerivedEqualityInput,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<LoweredExpression, LowerError> {
+        let facts = self.input.facts();
+        let (declaration, field_ty) = match facts
+            .types
+            .get(equality.aggregate.0 as usize)
+            .map(|record| &record.kind)
+        {
+            Some(sema::SemanticTypeKind::Structure {
+                declaration,
+                arguments,
+                fields,
+            }) if arguments.is_empty() && fields.len() == 1 && equality.field == 0 => {
+                (*declaration, fields[0].ty)
+            }
+            _ => return Err(self.fact_mismatch("derived equality aggregate type")),
+        };
+        let source_structure = self
+            .input
+            .hir()
+            .as_program()
+            .declaration(declaration)
+            .and_then(|record| match &record.kind {
+                wrela_hir::DeclarationKind::Structure(structure) => Some(structure),
+                _ => None,
+            })
+            .ok_or_else(|| self.fact_mismatch("derived equality source structure"))?;
+        if !source_structure.generics.is_empty()
+            || source_structure.fields.len() != 1
+            || !source_structure
+                .deriving
+                .iter()
+                .any(|name| name.as_str() == "Eq")
+            || !source_type_matches_semantic(facts, &source_structure.fields[0].ty, field_ty)
+            || source_scalar_kind(facts, field_ty).is_none()
+            || source_scalar_kind(facts, equality.result_type) != Some(SourceScalarKind::Bool)
+        {
+            return Err(self.fact_mismatch("derived equality declared shape"));
+        }
+        let left_fact = self.expression_fact(equality.left_expression)?;
+        let right_fact = self.expression_fact(equality.right_expression)?;
+        let resolved_value = |fact: &sema::ExpressionFact| match fact.resolution {
+            sema::ExpressionResolution::Value(value) => Some(value),
+            _ => fact.result,
+        };
+        if left_fact.ty != equality.aggregate
+            || right_fact.ty != equality.aggregate
+            || resolved_value(left_fact) != Some(equality.left)
+            || resolved_value(right_fact) != Some(equality.right)
+            || equality.effects.0 != left_fact.effects.0 | right_fact.effects.0
+        {
+            return Err(self.fact_mismatch("derived equality operand facts"));
+        }
+        let operator = match equality.operator {
+            wrela_hir::ComparisonOperator::Equal => wir::BinaryOperator::Equal,
+            wrela_hir::ComparisonOperator::NotEqual => wir::BinaryOperator::NotEqual,
+            _ => return Err(self.fact_mismatch("derived equality operator")),
+        };
+        let LoweredExpression::Value(left) =
+            self.lower_expression(equality.left_expression, sema::AccessMode::Read, statements)?
+        else {
+            return Err(self.fact_mismatch("derived equality left value"));
+        };
+        let LoweredExpression::Value(right) = self.lower_expression(
+            equality.right_expression,
+            sema::AccessMode::Read,
+            statements,
+        )?
+        else {
+            return Err(self.fact_mismatch("derived equality right value"));
+        };
+        if self.value_map.get(equality.left)? != left
+            || self.value_map.get(equality.right)? != right
+        {
+            return Err(self.fact_mismatch("derived equality operand values"));
+        }
+        let left_field = self.lowered_expression_result(
+            equality.expression,
+            equality.left_field,
+            field_ty,
+            equality.source,
+        )?;
+        let right_field = self.lowered_expression_result(
+            equality.expression,
+            equality.right_field,
+            field_ty,
+            equality.source,
+        )?;
+        self.push_let(
+            statements,
+            left_field,
+            wir::SemanticOperation::Project {
+                base: left,
+                field: equality.field,
+                access: wir::AccessMode::Read,
+            },
+            Some(equality.source),
+        )?;
+        self.push_let(
+            statements,
+            right_field,
+            wir::SemanticOperation::Project {
+                base: right,
+                field: equality.field,
+                access: wir::AccessMode::Read,
+            },
+            Some(equality.source),
+        )?;
+        let result = self.lowered_expression_result(
+            equality.expression,
+            equality.result,
+            equality.result_type,
+            equality.source,
+        )?;
+        self.push_let(
+            statements,
+            result,
+            wir::SemanticOperation::Binary {
+                operator,
+                left: left_field,
+                right: right_field,
+                arithmetic: wir::ArithmeticMode::Checked,
+            },
+            Some(equality.source),
         )?;
         Ok(LoweredExpression::Value(result))
     }

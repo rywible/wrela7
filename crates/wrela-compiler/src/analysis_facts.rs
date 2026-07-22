@@ -1361,6 +1361,48 @@ fn supported_scalar_resolution(
                         expression.result == Some(*raw_result)
                     }
             }),
+        wrela_sema::ExpressionResolution::DerivedEquality {
+            aggregate,
+            field,
+            left,
+            right,
+            left_field,
+            right_field,
+        } => {
+            let semantic_field =
+                facts
+                    .types
+                    .get(aggregate.0 as usize)
+                    .and_then(|record| match &record.kind {
+                        SemanticTypeKind::Structure {
+                            arguments, fields, ..
+                        } if arguments.is_empty() && fields.len() == 1 && *field == 0 => {
+                            fields.first()
+                        }
+                        _ => None,
+                    });
+            semantic_field.is_some_and(|semantic_field| {
+                let value_has_type =
+                    |value: wrela_sema::ValueId, ty: wrela_sema::SemanticTypeId| {
+                        facts.values.get(value.0 as usize).is_some_and(|record| {
+                            record.function == expression.function && record.ty == ty
+                        })
+                    };
+                is_stored_runtime_scalar(facts, semantic_field.ty)
+                    && matches!(
+                        facts
+                            .types
+                            .get(expression.ty.0 as usize)
+                            .map(|record| &record.kind),
+                        Some(SemanticTypeKind::Bool)
+                    )
+                    && value_has_type(*left, *aggregate)
+                    && value_has_type(*right, *aggregate)
+                    && left_field != right_field
+                    && value_has_type(*left_field, semantic_field.ty)
+                    && value_has_type(*right_field, semantic_field.ty)
+            })
+        }
         wrela_sema::ExpressionResolution::Constructor { ty, variant: None } => {
             *ty == expression.ty && is_flat_runtime_structure(facts, *ty)
         }
