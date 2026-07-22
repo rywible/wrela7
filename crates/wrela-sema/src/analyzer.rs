@@ -3787,7 +3787,12 @@ fn inspect_runtime_expression_shape(
             .ok_or_else(|| RuntimeShapeFailure::Unsupported(fallback_span(program)))?;
         match &expression.kind {
             ExpressionKind::Literal(
-                Literal::Unit | Literal::Boolean(_) | Literal::Integer(_) | Literal::Float(_),
+                Literal::Unit
+                | Literal::Boolean(_)
+                | Literal::Integer(_)
+                | Literal::Float(_)
+                | Literal::String(_)
+                | Literal::Bytes(_),
             )
             | ExpressionKind::Reference(
                 Definition::Local(_)
@@ -3800,7 +3805,8 @@ fn inspect_runtime_expression_shape(
             // walk, exactly like the qualified `Reference(Variant(_))` case
             // above; its expected-type intersection happens later, in the
             // full runtime expression analyzer.
-            | ExpressionKind::DotName { .. } => {}
+            | ExpressionKind::DotName { .. }
+            | ExpressionKind::Interpolate(_) => {}
             ExpressionKind::Call { callee, arguments } => {
                 if let Some(ExpressionKind::Reference(Definition::Declaration(declaration))) =
                     program
@@ -4960,31 +4966,114 @@ fn analyze_runtime_body(
                     .get(local.0 as usize)
                     .filter(|record| record.id == *local && record.body == body_id)
                     .ok_or(AnalysisFailure::RequestMismatch)?;
-                let local_ty = local_record
-                    .ty
-                    .as_ref()
-                    .ok_or(AnalysisFailure::RequestMismatch)?;
-                if matches!(local_ty.kind, TypeExpressionKind::View { .. })
-                    && !request
+                if request
+                    .hir
+                    .as_program()
+                    .expression(*value)
+                    .is_some_and(|expression| {
+                        matches!(expression.kind, ExpressionKind::Interpolate(_))
+                    })
+                {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        request
+                            .hir
+                            .as_program()
+                            .expression(*value)
+                            .map_or(local_record.source, |expression| expression.source),
+                        "semantic-static-interpolation-pending",
+                        "runtime string interpolation is not yet analyzed",
+                        "interpolation requires bounded formatting and an owned destination capacity contract",
+                        "use a plain static text or byte literal until bounded formatting lands",
+                    ));
+                }
+                let inferred_static_ty = if local_record.ty.is_none() {
+                    match request
                         .hir
                         .as_program()
                         .expression(*value)
-                        .and_then(|expression| match &expression.kind {
-                            ExpressionKind::Call { callee, .. } => {
-                                request.hir.as_program().expression(*callee)
-                            }
-                            _ => None,
-                        })
-                        .and_then(|callee| match &callee.kind {
-                            ExpressionKind::Reference(Definition::Declaration(resolved)) => {
-                                request.hir.as_program().declaration(resolved.declaration)
-                            }
-                            _ => None,
-                        })
-                        .is_some_and(|declaration| {
-                            matches!(declaration.kind, DeclarationKind::Projection(_))
+                        .map(|expression| &expression.kind)
+                    {
+                        Some(ExpressionKind::Literal(
+                            literal @ (Literal::String(_) | Literal::Bytes(_)),
+                        )) => Some(ensure_static_literal_type(
+                            request,
+                            partial,
+                            literal,
+                            &mut *aggregate_work,
+                            is_cancelled,
+                        )?),
+                        _ => return Err(AnalysisFailure::RequestMismatch.into()),
+                    }
+                } else {
+                    None
+                };
+                if local_record.ty.is_some()
+                    && request
+                        .hir
+                        .as_program()
+                        .expression(*value)
+                        .is_some_and(|expression| {
+                            matches!(
+                                expression.kind,
+                                ExpressionKind::Literal(Literal::String(_) | Literal::Bytes(_))
+                            )
                         })
                 {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        request
+                            .hir
+                            .as_program()
+                            .expression(*value)
+                            .map_or(local_record.source, |expression| expression.source),
+                        "semantic-static-data-context-pending",
+                        "static literal cannot initialize an explicit runtime value context",
+                        "Static[Str] and Static[Bytes[N]] are compiler-minted literal types; no implicit owned String or Bytes conversion is defined",
+                        "use an unannotated local binding and do not consume it until static-data lowering lands",
+                    ));
+                }
+                if inferred_static_ty.is_some()
+                    && partial
+                        .functions
+                        .get(function.0 as usize)
+                        .is_some_and(|function| function.color == FunctionColor::Async)
+                {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        local_record.source,
+                        "semantic-static-data-persistence-pending",
+                        "static literal binding would persist in an asynchronous frame",
+                        "this analysis slice does not define the ABI or lifetime of a static-data handle across suspension",
+                        "keep the inferred static binding in a synchronous helper until static-data lowering lands",
+                    ));
+                }
+                if local_record.ty.as_ref().is_some_and(|local_ty| {
+                    matches!(local_ty.kind, TypeExpressionKind::View { .. })
+                }) && !request
+                    .hir
+                    .as_program()
+                    .expression(*value)
+                    .and_then(|expression| match &expression.kind {
+                        ExpressionKind::Call { callee, .. } => {
+                            request.hir.as_program().expression(*callee)
+                        }
+                        _ => None,
+                    })
+                    .and_then(|callee| match &callee.kind {
+                        ExpressionKind::Reference(Definition::Declaration(resolved)) => {
+                            request.hir.as_program().declaration(resolved.declaration)
+                        }
+                        _ => None,
+                    })
+                    .is_some_and(|declaration| {
+                        matches!(declaration.kind, DeclarationKind::Projection(_))
+                    })
+                {
+                    let local_ty = local_record
+                        .ty
+                        .as_ref()
+                        .ok_or(AnalysisFailure::RequestMismatch)?;
                     return Err(runtime_type_diagnostic(
                         request,
                         local_ty.source,
@@ -4994,8 +5083,8 @@ fn analyze_runtime_body(
                         "bind a free projection call directly or use an owned value type",
                     ));
                 }
-                let (ty, category) = match &local_ty.kind {
-                    TypeExpressionKind::View { mutable, target } => (
+                let (ty, category) = match local_record.ty.as_ref().map(|ty| &ty.kind) {
+                    Some(TypeExpressionKind::View { mutable, target }) => (
                         semantic_type_from_source(
                             request,
                             partial,
@@ -5009,14 +5098,21 @@ fn analyze_runtime_body(
                             ValueCategory::SharedView
                         },
                     ),
-                    _ => (
+                    Some(_) => (
                         semantic_type_from_source(
                             request,
                             partial,
-                            local_ty,
+                            local_record
+                                .ty
+                                .as_ref()
+                                .ok_or(AnalysisFailure::RequestMismatch)?,
                             &mut *aggregate_work,
                             is_cancelled,
                         )?,
+                        ValueCategory::Value,
+                    ),
+                    None => (
+                        inferred_static_ty.ok_or(AnalysisFailure::RequestMismatch)?,
                         ValueCategory::Value,
                     ),
                 };
@@ -5039,7 +5135,11 @@ fn analyze_runtime_body(
                     function,
                     *value,
                     RuntimeExpressionRequest {
-                        expected: Some(ty),
+                        expected: if inferred_static_ty.is_some() {
+                            None
+                        } else {
+                            Some(ty)
+                        },
                         desired_result: Some(value_id),
                         access: if category == ValueCategory::Value {
                             AccessMode::Value
@@ -5528,6 +5628,30 @@ fn analyze_runtime_body(
                 statement_effects = outcome.effects;
             }
             StatementKind::Send(expression) => {
+                if request
+                    .hir
+                    .as_program()
+                    .expression(*expression)
+                    .is_some_and(|expression| {
+                        matches!(
+                            expression.kind,
+                            ExpressionKind::Literal(Literal::String(_) | Literal::Bytes(_))
+                        )
+                    })
+                {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        request
+                            .hir
+                            .as_program()
+                            .expression(*expression)
+                            .map_or(statement.source, |expression| expression.source),
+                        "semantic-static-data-consumer-pending",
+                        "static literal cannot be sent as a runtime actor request",
+                        "actor transport has no authenticated Static[Str] or Static[Bytes[N]] ABI representation",
+                        "use a supported actor request call until static-data transport lowering lands",
+                    ));
+                }
                 let outcome = analyze_actor_send_expression(
                     request,
                     partial,
@@ -7160,6 +7284,67 @@ fn analyze_runtime_expression(
                     "bind the value to a local before requesting mutable or take access",
                 ));
             }
+            if matches!(literal, Literal::String(_) | Literal::Bytes(_)) {
+                if expression_request.expected.is_none()
+                    && expression_request.desired_result.is_none()
+                {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        expression.source,
+                        "semantic-static-data-consumer-pending",
+                        "static literal is used without an inferred local binding",
+                        "return, call, storage, capture, send, and discarded expression consumption need an authenticated static-data ABI",
+                        "bind the literal to an unannotated synchronous local and leave it unconsumed",
+                    ));
+                }
+                if expression_request.expected.is_some() {
+                    return Err(runtime_type_diagnostic(
+                        request,
+                        expression.source,
+                        "semantic-static-data-context-pending",
+                        "static literal cannot initialize an explicit runtime value context",
+                        "Static[Str] and Static[Bytes[N]] are compiler-minted literal types; no implicit owned String or Bytes conversion is defined",
+                        "use an unannotated local binding and do not consume it until static-data lowering lands",
+                    ));
+                }
+                let ty = ensure_static_literal_type(
+                    request,
+                    partial,
+                    literal,
+                    &mut *state.aggregate_work,
+                    is_cancelled,
+                )?;
+                let constant = copy_static_literal_constant(request, literal, is_cancelled)?;
+                let value = expression_result(
+                    request,
+                    partial,
+                    function,
+                    (expression_id, expression.source),
+                    ty,
+                    expression_request.desired_result,
+                    is_cancelled,
+                )?;
+                append_expression_fact(
+                    request,
+                    partial,
+                    RuntimeExpressionFact {
+                        function,
+                        expression: expression_id,
+                        ty,
+                        result: Some(value),
+                        resolution: ExpressionResolution::Constant(constant),
+                        effects: EffectSet(0),
+                        ownership_before: OwnershipState::Owned,
+                        ownership_after: OwnershipState::Owned,
+                    },
+                )?;
+                return Ok(RuntimeExpression {
+                    ty,
+                    result: Some(value),
+                    referenced: None,
+                    effects: EffectSet(0),
+                });
+            }
             let ty = match (expression_request.expected, literal) {
                 (Some(ty), _) => ty,
                 (None, Literal::Unit) => SemanticTypeId(0),
@@ -7254,6 +7439,27 @@ fn analyze_runtime_expression(
                     "initialize the local before this expression",
                 )
             })?;
+            if partial
+                .values
+                .get(binding.value.0 as usize)
+                .and_then(|value| partial.types.get(value.ty.0 as usize))
+                .is_some_and(|ty| {
+                    matches!(
+                        ty.kind,
+                        SemanticTypeKind::StaticString { .. }
+                            | SemanticTypeKind::StaticBytes { .. }
+                    )
+                })
+            {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    expression.source,
+                    "semantic-static-data-consumer-pending",
+                    "static literal value is consumed by an unsupported runtime context",
+                    "return, call, storage, capture, and general expression consumption need an authenticated static-data ABI",
+                    "leave the inferred static binding unconsumed until static-data lowering lands",
+                ));
+            }
             reference_operand(
                 request,
                 partial,
@@ -7507,7 +7713,93 @@ fn analyze_runtime_expression(
             state,
             is_cancelled,
         ),
+        ExpressionKind::Interpolate(_) => Err(runtime_type_diagnostic(
+            request,
+            expression.source,
+            "semantic-static-interpolation-pending",
+            "runtime string interpolation is not yet analyzed",
+            "interpolation requires bounded formatting and an owned destination capacity contract",
+            "use a plain static text or byte literal until bounded formatting lands",
+        )),
         _ => Err(AnalysisFailure::RequestMismatch.into()),
+    }
+}
+
+fn ensure_static_literal_type(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    literal: &Literal,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
+    check_cancelled(is_cancelled)?;
+    let bytes = match literal {
+        Literal::String(value) => u64::try_from(value.len()),
+        Literal::Bytes(value) => u64::try_from(value.len()),
+        _ => return Err(AnalysisFailure::RequestMismatch.into()),
+    }
+    .map_err(|_| semantic_fact_bytes_resource(request))?;
+    if bytes > request.limits.fact_bytes {
+        return Err(semantic_fact_bytes_resource(request).into());
+    }
+    let kind = match literal {
+        Literal::String(_) => SemanticTypeKind::StaticString { bytes },
+        Literal::Bytes(_) => SemanticTypeKind::StaticBytes { bytes },
+        _ => return Err(AnalysisFailure::RequestMismatch.into()),
+    };
+    for existing in &partial.types {
+        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+        if existing.kind == kind {
+            return Ok(existing.id);
+        }
+    }
+    if partial.types.len() >= request.limits.types as usize {
+        return Err(fact_resource(request, "semantic types").into());
+    }
+    let id = SemanticTypeId(
+        u32::try_from(partial.types.len()).map_err(|_| fact_resource(request, "semantic types"))?,
+    );
+    partial
+        .types
+        .try_reserve(1)
+        .map_err(|_| fact_resource(request, "semantic types"))?;
+    partial.types.push(SemanticType {
+        id,
+        kind,
+        linearity: Linearity::ExplicitCopy,
+        size_upper_bound: None,
+        alignment_lower_bound: 1,
+        source: None,
+    });
+    Ok(id)
+}
+
+fn copy_static_literal_constant(
+    request: &AnalysisRequest<'_>,
+    literal: &Literal,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<ConstantValue, AnalysisFailure> {
+    match literal {
+        Literal::String(value) => Ok(ConstantValue::String(copy_analysis_text(
+            value,
+            request.limits.fact_bytes,
+            is_cancelled,
+        )?)),
+        Literal::Bytes(value) => {
+            check_cancelled(is_cancelled)?;
+            if u64::try_from(value.len()).map_or(true, |bytes| bytes > request.limits.fact_bytes) {
+                return Err(semantic_fact_bytes_resource(request));
+            }
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(value.len())
+                .map_err(|_| semantic_fact_bytes_resource(request))?;
+            for chunk in value.chunks(COMPTIME_SOURCE_COPY_CHUNK_BYTES) {
+                check_cancelled(is_cancelled)?;
+                copy.extend_from_slice(chunk);
+            }
+            Ok(ConstantValue::Bytes(copy))
+        }
+        _ => Err(AnalysisFailure::RequestMismatch),
     }
 }
 
@@ -17757,6 +18049,13 @@ fn fact_resource(request: &AnalysisRequest<'_>, resource: &'static str) -> Analy
     }
 }
 
+fn semantic_fact_bytes_resource(request: &AnalysisRequest<'_>) -> AnalysisFailure {
+    AnalysisFailure::ResourceLimit {
+        resource: "semantic fact bytes",
+        limit: request.limits.fact_bytes,
+    }
+}
+
 fn bounded_test_fact(
     request: &AnalysisRequest<'_>,
     prefix: &str,
@@ -27314,6 +27613,266 @@ pub fn boot() -> Image:
     return img
 "#;
 
+    fn static_literal_actor_source(helper_body: &str) -> String {
+        format!(
+            r#"module app
+
+from core.image import Image, Target
+
+fn retain_literals():
+{helper_body}
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    @task
+    async fn pulse(mut self):
+        retain_literals()
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#
+        )
+    }
+
+    #[test]
+    fn inferred_static_text_and_bytes_literals_have_exact_deduplicated_types() {
+        let source = static_literal_actor_source(
+            "    first = \"hé\"\n    second = \"ok\"\n    same = \"yo\"\n    payload = b\"A\\x42\\0\"",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("static literal analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "inferred static literals must analyze: {:?}",
+            output.diagnostics()
+        );
+        let image = output.successful().expect("sealed static literal image");
+        let facts = image.facts();
+        let string_types: Vec<_> = facts
+            .types
+            .iter()
+            .filter(|ty| matches!(ty.kind, SemanticTypeKind::StaticString { .. }))
+            .collect();
+        assert_eq!(
+            string_types.len(),
+            2,
+            "equal UTF-8 byte lengths intern once"
+        );
+        assert!(
+            string_types
+                .iter()
+                .any(|ty| { matches!(ty.kind, SemanticTypeKind::StaticString { bytes: 3 }) })
+        );
+        assert!(
+            string_types
+                .iter()
+                .any(|ty| { matches!(ty.kind, SemanticTypeKind::StaticString { bytes: 2 }) })
+        );
+        assert!(
+            facts
+                .types
+                .iter()
+                .any(|ty| { matches!(ty.kind, SemanticTypeKind::StaticBytes { bytes: 3 }) })
+        );
+        assert!(facts.expressions.iter().any(|fact| {
+            matches!(&fact.resolution, ExpressionResolution::Constant(ConstantValue::String(value)) if value == "hé")
+        }));
+        assert!(facts.expressions.iter().any(|fact| {
+            matches!(&fact.resolution, ExpressionResolution::Constant(ConstantValue::Bytes(value)) if value == &[b'A', b'B', 0])
+        }));
+    }
+
+    #[test]
+    fn static_literal_full_seal_rejects_length_content_kind_value_type_and_duplicates() {
+        let source = static_literal_actor_source("    text = \"hé\"\n    payload = b\"A\\x42\\0\"");
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let image = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("static literal analysis")
+            .successful()
+            .expect("sealed static literal image")
+            .clone();
+        let text_type = image
+            .facts()
+            .types
+            .iter()
+            .position(|ty| matches!(ty.kind, SemanticTypeKind::StaticString { bytes: 3 }))
+            .expect("three-byte static text type");
+        let text_expression = image
+            .facts()
+            .expressions
+            .iter()
+            .position(|fact| {
+                matches!(&fact.resolution, ExpressionResolution::Constant(ConstantValue::String(value)) if value == "hé")
+            })
+            .expect("static text expression");
+
+        let rejects = |mutate: &dyn Fn(&mut PartialAnalysis)| {
+            let (hir, mut facts) = image.clone().into_parts();
+            mutate(&mut facts);
+            assert!(facts.validate_for_seal(hir.as_ref(), &|| false).is_err());
+        };
+        rejects(&|facts| {
+            facts.types[text_type].kind = SemanticTypeKind::StaticString { bytes: 4 };
+        });
+        rejects(&|facts| {
+            let ExpressionResolution::Constant(ConstantValue::String(value)) =
+                &mut facts.expressions[text_expression].resolution
+            else {
+                panic!("static text constant")
+            };
+            value.push('!');
+        });
+        rejects(&|facts| {
+            facts.types[text_type].kind = SemanticTypeKind::StaticBytes { bytes: 3 };
+        });
+        rejects(&|facts| {
+            let value = facts.expressions[text_expression]
+                .result
+                .expect("static expression result");
+            facts.values[value.0 as usize].ty = SemanticTypeId(0);
+        });
+        rejects(&|facts| {
+            let mut duplicate = facts.types[text_type].clone();
+            duplicate.id =
+                SemanticTypeId(u32::try_from(facts.types.len()).expect("bounded semantic types"));
+            facts.types.push(duplicate);
+        });
+    }
+
+    #[test]
+    fn static_literal_type_budget_is_exact_and_analysis_cancels_at_the_last_poll() {
+        const EXACT_TYPES: u32 = 7;
+        let source = static_literal_actor_source(
+            "    first = \"hé\"\n    second = \"ok\"\n    same = \"yo\"\n    payload = b\"A\\x42\\0\"",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let mut exact = AnalysisLimits::standard();
+        exact.types = EXACT_TYPES;
+        let admitted = CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| false)
+            .expect("exact static type limit is admitted");
+        assert!(admitted.successful().is_some());
+        assert_eq!(admitted.partial().types.len(), EXACT_TYPES as usize);
+
+        let mut one_under = exact;
+        one_under.types = EXACT_TYPES - 1;
+        let under = CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, one_under), &|| {
+                false
+            });
+        assert!(matches!(
+            under,
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "semantic types",
+                limit,
+            }) if limit == AnalysisLimits::standard().fact_edges
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            })
+            .expect("count static literal cancellation polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, exact),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn static_literal_consumers_and_interpolation_fail_closed_by_name() {
+        let diagnostic = |source: String| {
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("static literal rejection is recoverable");
+            assert!(output.successful().is_none());
+            output
+                .diagnostics()
+                .first()
+                .and_then(|diagnostic| diagnostic.code.clone())
+                .expect("named static literal diagnostic")
+        };
+
+        assert_eq!(
+            diagnostic(static_literal_actor_source("    text: String[..8] = \"x\"")),
+            "semantic-static-data-context-pending"
+        );
+        assert_eq!(
+            diagnostic(static_literal_actor_source("    text = \"x\"\n    text")),
+            "semantic-static-data-consumer-pending"
+        );
+        assert_eq!(
+            diagnostic(static_literal_actor_source("    return \"x\"")),
+            "semantic-static-data-context-pending"
+        );
+
+        let call_source = static_literal_actor_source("    sink(\"x\")").replace(
+            "fn retain_literals():",
+            "fn sink(value: u64):\n    pass\n\nfn retain_literals():",
+        );
+        assert_eq!(
+            diagnostic(call_source),
+            "semantic-static-data-context-pending"
+        );
+
+        let storage_source =
+            STATE_ACCESS_ACTOR_SOURCE.replace("self.value = 7", "self.value = \"x\"");
+        assert_eq!(
+            diagnostic(storage_source),
+            "semantic-static-data-context-pending"
+        );
+
+        let persistent_source = static_literal_actor_source("    pass").replace(
+            "        retain_literals()",
+            "        retained = \"x\"\n        retain_literals()",
+        );
+        assert_eq!(
+            diagnostic(persistent_source),
+            "semantic-static-data-persistence-pending"
+        );
+        assert_eq!(
+            diagnostic(static_literal_actor_source("    rendered = f\"value={1}\"")),
+            "semantic-static-interpolation-pending"
+        );
+    }
+
     fn admission_actor_source(task_body: &str) -> String {
         let task_tail = if task_body.contains("return ") {
             ""
@@ -32131,7 +32690,7 @@ fn projection_fixture():
         assert_eq!(output.diagnostics().len(), 1);
         assert_eq!(
             output.diagnostics()[0].code.as_deref(),
-            Some("semantic-runtime-test-body-not-supported")
+            Some("semantic-static-data-consumer-pending")
         );
         assert_eq!(output.diagnostics()[0].primary, span(0, 340, 342));
     }
@@ -32208,7 +32767,11 @@ fn projection_fixture():
             assert_eq!(output.diagnostics().len(), 1);
             assert_eq!(
                 output.diagnostics()[0].code.as_deref(),
-                Some("semantic-runtime-test-body-not-supported")
+                Some(if case == 3 {
+                    "semantic-static-data-consumer-pending"
+                } else {
+                    "semantic-runtime-test-body-not-supported"
+                })
             );
             assert_eq!(
                 output.diagnostics()[0].primary,

@@ -1010,6 +1010,14 @@ fn validate_actor_source_type(
     input: &AnalyzedImage,
     ty: &sema::SemanticType,
 ) -> Result<(), LowerError> {
+    if matches!(
+        ty.kind,
+        sema::SemanticTypeKind::StaticString { .. } | sema::SemanticTypeKind::StaticBytes { .. }
+    ) {
+        return Err(unsupported(
+            "semantic-static-data-lowering-pending (Static[Str] and Static[Bytes[N]] have no SemanticWir storage or ABI representation)",
+        ));
+    }
     let facts = input.facts();
     let scalar = match &ty.kind {
         sema::SemanticTypeKind::Unit | sema::SemanticTypeKind::Bool => true,
@@ -3027,6 +3035,14 @@ fn validate_supported_source_type(
     ty: &sema::SemanticType,
     facts: &sema::PartialAnalysis,
 ) -> Result<(), LowerError> {
+    if matches!(
+        ty.kind,
+        sema::SemanticTypeKind::StaticString { .. } | sema::SemanticTypeKind::StaticBytes { .. }
+    ) {
+        return Err(unsupported(
+            "semantic-static-data-lowering-pending (Static[Str] and Static[Bytes[N]] have no SemanticWir storage or ABI representation)",
+        ));
+    }
     let valid = match &ty.kind {
         sema::SemanticTypeKind::Unit | sema::SemanticTypeKind::Bool => {
             ty.linearity == sema::Linearity::ScalarCopy
@@ -20530,6 +20546,52 @@ pub fn boot() -> Image:
                 feature: "semantic-generic-structure-argument-lowering-pending (non-type or non-scalar specialization)"
             })
         ));
+    }
+
+    #[test]
+    fn inferred_static_literals_stop_at_named_semantic_lowering_boundary() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+fn retain_literals():
+    text = "hé"
+    payload = b"A\x42\0"
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    @task
+    async fn pulse(mut self):
+        retain_literals()
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#,
+        );
+        let result = CanonicalSemanticLowerer::new().lower(
+            LowerRequest {
+                input: image,
+                limits: LoweringLimits::standard(),
+            },
+            &|| false,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(LowerError::UnsupportedInput {
+                    feature: "semantic-static-data-lowering-pending (Static[Str] and Static[Bytes[N]] have no SemanticWir storage or ABI representation)"
+                })
+            ),
+            "unexpected static lowering result: {result:?}"
+        );
     }
 
     #[test]

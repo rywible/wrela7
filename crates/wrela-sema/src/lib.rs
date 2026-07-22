@@ -2047,6 +2047,18 @@ fn validate_exact_source_facts(
 ) -> Result<(), AnalysisFailure> {
     let invalid = |message: &str| AnalysisFailure::InternalInvariant(message.to_owned());
     let program = hir.as_program();
+    let mut static_types = std::collections::BTreeSet::new();
+    for ty in &analysis.types {
+        check_analysis_cancelled(is_cancelled)?;
+        let identity = match ty.kind {
+            SemanticTypeKind::StaticString { bytes } => Some((false, bytes)),
+            SemanticTypeKind::StaticBytes { bytes } => Some((true, bytes)),
+            _ => None,
+        };
+        if identity.is_some_and(|identity| !static_types.insert(identity)) {
+            return Err(invalid("compiler-minted static literal type is duplicated"));
+        }
+    }
     let mut definitions = Vec::new();
     definitions
         .try_reserve_exact(analysis.values.len())
@@ -3533,7 +3545,9 @@ fn collect_source_body_closure(
                 wrela_hir::Literal::Unit
                 | wrela_hir::Literal::Boolean(_)
                 | wrela_hir::Literal::Integer(_)
-                | wrela_hir::Literal::Float(_),
+                | wrela_hir::Literal::Float(_)
+                | wrela_hir::Literal::String(_)
+                | wrela_hir::Literal::Bytes(_),
             )
             | wrela_hir::ExpressionKind::Reference(
                 wrela_hir::Definition::Local(_)
@@ -8185,6 +8199,16 @@ fn constant_matches_literal(
             .and_then(|source| source.parse::<f64>().ok())
             .filter(|source| source.is_finite())
             .is_some_and(|source| source.to_bits() == *value),
+        (
+            wrela_hir::Literal::String(source),
+            ConstantValue::String(value),
+            SemanticTypeKind::StaticString { bytes },
+        ) => source == value && u64::try_from(source.len()) == Ok(*bytes),
+        (
+            wrela_hir::Literal::Bytes(source),
+            ConstantValue::Bytes(value),
+            SemanticTypeKind::StaticBytes { bytes },
+        ) => source == value && u64::try_from(source.len()) == Ok(*bytes),
         _ => false,
     }
 }
@@ -8563,9 +8587,13 @@ fn valid_semantic_type(ty: &SemanticType, analysis: &PartialAnalysis, graph: &Im
         SemanticTypeKind::Never
         | SemanticTypeKind::Unit
         | SemanticTypeKind::Bool
-        | SemanticTypeKind::Character
-        | SemanticTypeKind::StaticString { .. }
-        | SemanticTypeKind::StaticBytes { .. } => true,
+        | SemanticTypeKind::Character => true,
+        SemanticTypeKind::StaticString { .. } | SemanticTypeKind::StaticBytes { .. } => {
+            ty.linearity == Linearity::ExplicitCopy
+                && ty.size_upper_bound.is_none()
+                && ty.alignment_lower_bound == 1
+                && ty.source.is_none()
+        }
         SemanticTypeKind::Integer {
             bits,
             pointer_sized,
