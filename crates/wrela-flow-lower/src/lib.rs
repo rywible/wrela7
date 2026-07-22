@@ -180,6 +180,7 @@ impl FlowLowerer for CanonicalFlowLowerer {
     ) -> Result<LowerOutput, LowerError> {
         check_cancelled(is_cancelled)?;
         request.limits.validate()?;
+        validate_bounded_text_boundary(request.input.as_wir(), is_cancelled)?;
         preflight_input(request.input.as_wir(), request.limits, is_cancelled)?;
         let supported = supported_input(request.input.as_wir(), request.limits, is_cancelled)?;
         let wir = match supported {
@@ -197,6 +198,29 @@ impl FlowLowerer for CanonicalFlowLowerer {
         check_cancelled(is_cancelled)?;
         seal(&request, wir, report, Vec::new(), is_cancelled)
     }
+}
+
+fn validate_bounded_text_boundary(
+    input: &semantic::SemanticWir,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), LowerError> {
+    for ty in &input.types {
+        check_cancelled(is_cancelled)?;
+        if matches!(ty.kind, semantic::TypeKind::BoundedString { .. }) {
+            return Err(unsupported(
+                "flow-bounded-string-lowering-pending (runtime storage and formatting ABI)",
+            ));
+        }
+    }
+    for ty in &input.types {
+        check_cancelled(is_cancelled)?;
+        if matches!(ty.kind, semantic::TypeKind::StaticString { .. }) {
+            return Err(unsupported(
+                "flow-static-string-lowering-pending (runtime static-data handle ABI)",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Failure to produce a sealed FlowWir value.
@@ -2175,7 +2199,9 @@ fn supported_generated_tests<'a>(
                 }
                 previous_frame_length = Some(*length);
             }
-            semantic::TypeKind::Tuple(_)
+            semantic::TypeKind::StaticString { .. }
+            | semantic::TypeKind::BoundedString { .. }
+            | semantic::TypeKind::Tuple(_)
             | semantic::TypeKind::Iso { .. }
             | semantic::TypeKind::ActorHandle { .. }
             | semantic::TypeKind::Reservation
@@ -3905,6 +3931,8 @@ fn preflight_input(
                 limits.payload_bytes,
             )?,
             semantic::TypeKind::Primitive(_)
+            | semantic::TypeKind::StaticString { .. }
+            | semantic::TypeKind::BoundedString { .. }
             | semantic::TypeKind::Array { .. }
             | semantic::TypeKind::Iso { .. }
             | semantic::TypeKind::ActorHandle { .. }
@@ -4037,6 +4065,27 @@ fn preflight_input(
                                 "semantic model edges",
                                 limits.model_edges,
                             )?,
+                            semantic::SemanticOperation::FormatBoundedString { parts, .. } => {
+                                add_bounded(
+                                    &mut edges,
+                                    parts.len(),
+                                    "semantic model edges",
+                                    limits.model_edges,
+                                )?;
+                                for part in parts {
+                                    if let semantic::BoundedStringPart::Text {
+                                        value: text, ..
+                                    } = part
+                                    {
+                                        add_bounded(
+                                            &mut payload,
+                                            text.len(),
+                                            "semantic payload bytes",
+                                            limits.payload_bytes,
+                                        )?;
+                                    }
+                                }
+                            }
                             semantic::SemanticOperation::ActorCommit { arguments, .. }
                             | semantic::SemanticOperation::SpawnTask { arguments, .. } => {
                                 add_bounded(
@@ -4511,7 +4560,9 @@ fn lower_generated_type(
                 result: flow::TypeId(function.result.0),
             }
         }
-        semantic::TypeKind::Tuple(_)
+        semantic::TypeKind::StaticString { .. }
+        | semantic::TypeKind::BoundedString { .. }
+        | semantic::TypeKind::Tuple(_)
         | semantic::TypeKind::Iso { .. }
         | semantic::TypeKind::ActorHandle { .. }
         | semantic::TypeKind::Reservation
@@ -7035,6 +7086,7 @@ fn lower_generated_operation(
             | semantic::Constant::Aggregate(_)
             | semantic::Constant::Zeroed(_),
         )
+        | semantic::SemanticOperation::FormatBoundedString { .. }
         | semantic::SemanticOperation::ActorStateLoad { .. }
         | semantic::SemanticOperation::ActorStateStore { .. }
         | semantic::SemanticOperation::Project { .. }
@@ -9085,6 +9137,31 @@ mod contract_tests {
             !supported_source_value_type(&module, semantic::TypeId(3)),
             "crafted nested aggregate fields must not enter the flat scalar lowering subset"
         );
+    }
+
+    #[test]
+    fn bounded_string_retains_named_runtime_storage_boundary() {
+        let mut module = fixture().into_wir();
+        module.types.push(semantic::TypeRecord {
+            id: semantic::TypeId(1),
+            source_name: "BoundedString".to_owned(),
+            kind: semantic::TypeKind::BoundedString { capacity: 11 },
+            linearity: semantic::Linearity::Reclaimable,
+            source: None,
+        });
+        let validated = module.validate().expect("valid bounded semantic identity");
+        assert!(matches!(
+            CanonicalFlowLowerer::new().lower(
+                LowerRequest {
+                    input: validated,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
+            Err(LowerError::UnsupportedInput {
+                feature: "flow-bounded-string-lowering-pending (runtime storage and formatting ABI)"
+            })
+        ));
     }
 
     #[test]

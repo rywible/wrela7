@@ -291,7 +291,7 @@ fn supported_input<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedInput<'a>, LowerError> {
-    validate_bounded_string_lowering_boundary(input.facts())?;
+    validate_static_bytes_lowering_boundary(input.facts())?;
     validate_async_outcome_lowering_boundary(input.facts())?;
     validate_admission_result_lowering_boundary(input.facts())?;
     validate_generic_function_lowering_boundary(input)?;
@@ -316,16 +316,16 @@ fn supported_input<'a>(
     }
 }
 
-fn validate_bounded_string_lowering_boundary(
+fn validate_static_bytes_lowering_boundary(
     facts: &sema::PartialAnalysis,
 ) -> Result<(), LowerError> {
     if facts
         .types
         .iter()
-        .any(|ty| matches!(ty.kind, sema::SemanticTypeKind::BoundedString { .. }))
+        .any(|ty| matches!(ty.kind, sema::SemanticTypeKind::StaticBytes { .. }))
     {
         Err(unsupported(
-            "semantic-bounded-string-lowering-pending (BoundedString has no SemanticWir storage, formatting operation, or ABI representation)",
+            "semantic-static-data-lowering-pending (Static[Bytes[N]] has no SemanticWir representation or ABI)",
         ))
     } else {
         Ok(())
@@ -1026,22 +1026,39 @@ fn validate_actor_source_type(
     input: &AnalyzedImage,
     ty: &sema::SemanticType,
 ) -> Result<(), LowerError> {
-    if matches!(ty.kind, sema::SemanticTypeKind::BoundedString { .. }) {
+    if matches!(ty.kind, sema::SemanticTypeKind::StaticBytes { .. }) {
         return Err(unsupported(
-            "semantic-bounded-string-lowering-pending (BoundedString has no SemanticWir storage, formatting operation, or ABI representation)",
-        ));
-    }
-    if matches!(
-        ty.kind,
-        sema::SemanticTypeKind::StaticString { .. } | sema::SemanticTypeKind::StaticBytes { .. }
-    ) {
-        return Err(unsupported(
-            "semantic-static-data-lowering-pending (Static[Str] and Static[Bytes[N]] have no SemanticWir storage or ABI representation)",
+            "semantic-static-data-lowering-pending (Static[Bytes[N]] has no SemanticWir representation or ABI)",
         ));
     }
     let facts = input.facts();
     let scalar = match &ty.kind {
-        sema::SemanticTypeKind::Unit | sema::SemanticTypeKind::Bool => true,
+        sema::SemanticTypeKind::StaticString { .. } => {
+            if ty.linearity != sema::Linearity::ExplicitCopy
+                || ty.size_upper_bound.is_some()
+                || ty.alignment_lower_bound != 1
+                || ty.source.is_some()
+            {
+                return Err(unsupported("noncanonical compiler-minted Static[Str] type"));
+            }
+            return Ok(());
+        }
+        sema::SemanticTypeKind::BoundedString { capacity } => {
+            if *capacity == 0
+                || ty.linearity != sema::Linearity::ReclaimableLinear
+                || ty.size_upper_bound.is_some()
+                || ty.alignment_lower_bound != 1
+                || ty.source.is_some()
+            {
+                return Err(unsupported(
+                    "noncanonical compiler-minted BoundedString type",
+                ));
+            }
+            return Ok(());
+        }
+        sema::SemanticTypeKind::Unit
+        | sema::SemanticTypeKind::Bool
+        | sema::SemanticTypeKind::Character => true,
         sema::SemanticTypeKind::Integer {
             bits,
             pointer_sized,
@@ -3056,23 +3073,28 @@ fn validate_supported_source_type(
     ty: &sema::SemanticType,
     facts: &sema::PartialAnalysis,
 ) -> Result<(), LowerError> {
-    if matches!(ty.kind, sema::SemanticTypeKind::BoundedString { .. }) {
+    if matches!(ty.kind, sema::SemanticTypeKind::StaticBytes { .. }) {
         return Err(unsupported(
-            "semantic-bounded-string-lowering-pending (BoundedString has no SemanticWir storage, formatting operation, or ABI representation)",
-        ));
-    }
-    if matches!(
-        ty.kind,
-        sema::SemanticTypeKind::StaticString { .. } | sema::SemanticTypeKind::StaticBytes { .. }
-    ) {
-        return Err(unsupported(
-            "semantic-static-data-lowering-pending (Static[Str] and Static[Bytes[N]] have no SemanticWir storage or ABI representation)",
+            "semantic-static-data-lowering-pending (Static[Bytes[N]] has no SemanticWir representation or ABI)",
         ));
     }
     let valid = match &ty.kind {
-        sema::SemanticTypeKind::Unit | sema::SemanticTypeKind::Bool => {
-            ty.linearity == sema::Linearity::ScalarCopy
+        sema::SemanticTypeKind::StaticString { .. } => {
+            ty.linearity == sema::Linearity::ExplicitCopy
+                && ty.size_upper_bound.is_none()
+                && ty.alignment_lower_bound == 1
+                && ty.source.is_none()
         }
+        sema::SemanticTypeKind::BoundedString { capacity } => {
+            *capacity > 0
+                && ty.linearity == sema::Linearity::ReclaimableLinear
+                && ty.size_upper_bound.is_none()
+                && ty.alignment_lower_bound == 1
+                && ty.source.is_none()
+        }
+        sema::SemanticTypeKind::Unit
+        | sema::SemanticTypeKind::Bool
+        | sema::SemanticTypeKind::Character => ty.linearity == sema::Linearity::ScalarCopy,
         sema::SemanticTypeKind::Integer {
             bits,
             pointer_sized,
@@ -4076,6 +4098,20 @@ fn lower_actor_types(
             sema::SemanticTypeKind::Bool => (
                 copy_text("bool", limits.payload_bytes)?,
                 wir::TypeKind::Primitive(wir::PrimitiveType::Bool),
+            ),
+            sema::SemanticTypeKind::Character => (
+                copy_text("char", limits.payload_bytes)?,
+                wir::TypeKind::Primitive(wir::PrimitiveType::Char),
+            ),
+            sema::SemanticTypeKind::StaticString { bytes } => (
+                copy_text("Static[Str]", limits.payload_bytes)?,
+                wir::TypeKind::StaticString { bytes: *bytes },
+            ),
+            sema::SemanticTypeKind::BoundedString { capacity } => (
+                copy_text("BoundedString", limits.payload_bytes)?,
+                wir::TypeKind::BoundedString {
+                    capacity: *capacity,
+                },
             ),
             sema::SemanticTypeKind::Integer {
                 signed,
@@ -5227,6 +5263,18 @@ fn lower_source_types(
             sema::SemanticTypeKind::Bool => {
                 ("bool", wir::TypeKind::Primitive(wir::PrimitiveType::Bool))
             }
+            sema::SemanticTypeKind::Character => {
+                ("char", wir::TypeKind::Primitive(wir::PrimitiveType::Char))
+            }
+            sema::SemanticTypeKind::StaticString { bytes } => {
+                ("Static[Str]", wir::TypeKind::StaticString { bytes: *bytes })
+            }
+            sema::SemanticTypeKind::BoundedString { capacity } => (
+                "BoundedString",
+                wir::TypeKind::BoundedString {
+                    capacity: *capacity,
+                },
+            ),
             sema::SemanticTypeKind::Integer {
                 signed,
                 bits,
@@ -6525,6 +6573,16 @@ struct ScalarConvertInput {
     effects: sema::EffectSet,
 }
 
+struct BoundedInterpolationInput {
+    expression: wrela_hir::ExpressionId,
+    source: Span,
+    ty: sema::SemanticTypeId,
+    capacity: u64,
+    parts: Vec<sema::BoundedInterpolationPart>,
+    result: sema::ValueId,
+    effects: sema::EffectSet,
+}
+
 struct ResultTryInput {
     expression: wrela_hir::ExpressionId,
     source: Span,
@@ -6677,6 +6735,7 @@ enum SourceExpressionPlan {
     Unary(ScalarUnaryInput),
     Binary(ScalarBinaryInput),
     Convert(ScalarConvertInput),
+    BoundedInterpolation(BoundedInterpolationInput),
     ResultTry(ResultTryInput),
     OptionTry(OptionTryInput),
     EnumTypeTest(EnumTypeTestInput),
@@ -10042,6 +10101,34 @@ impl SourceFunctionLowerer<'_> {
                         })
                     }
                     (
+                        wrela_hir::ExpressionKind::Interpolate(source_parts),
+                        sema::ExpressionResolution::BoundedInterpolation { capacity, parts },
+                    ) => {
+                        if source_parts.len() != parts.len() {
+                            return Err(self.fact_mismatch("bounded interpolation part count"));
+                        }
+                        let mut copied_parts = try_vec(
+                            parts.len(),
+                            "SemanticWir bounded interpolation parts",
+                            self.limits.model_edges,
+                        )?;
+                        for part in parts {
+                            check_cancelled(self.is_cancelled)?;
+                            copied_parts.push(part.clone());
+                        }
+                        SourceExpressionPlan::BoundedInterpolation(BoundedInterpolationInput {
+                            expression: expression_id,
+                            source: expression.source,
+                            ty: fact.ty,
+                            capacity: *capacity,
+                            parts: copied_parts,
+                            result: fact.result.ok_or_else(|| {
+                                self.fact_mismatch("bounded interpolation result")
+                            })?,
+                            effects: fact.effects,
+                        })
+                    }
+                    (
                         wrela_hir::ExpressionKind::Try(operand),
                         sema::ExpressionResolution::ResultTry {
                             result_type,
@@ -10418,6 +10505,9 @@ impl SourceFunctionLowerer<'_> {
             }
             SourceExpressionPlan::Convert(convert) => {
                 self.lower_scalar_convert(convert, source, statements)
+            }
+            SourceExpressionPlan::BoundedInterpolation(interpolation) => {
+                self.lower_bounded_interpolation(interpolation, statements)
             }
             SourceExpressionPlan::ResultTry(result_try) => {
                 self.lower_result_try(result_try, statements)
@@ -11026,6 +11116,291 @@ impl SourceFunctionLowerer<'_> {
                 checked: true,
             },
             Some(source),
+        )?;
+        Ok(LoweredExpression::Value(result))
+    }
+
+    fn lower_bounded_interpolation(
+        &mut self,
+        interpolation: BoundedInterpolationInput,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<LoweredExpression, LowerError> {
+        let source_parts = self
+            .input
+            .hir()
+            .as_program()
+            .expression(interpolation.expression)
+            .and_then(|expression| match &expression.kind {
+                wrela_hir::ExpressionKind::Interpolate(parts) => Some(parts.as_slice()),
+                _ => None,
+            })
+            .ok_or_else(|| self.fact_mismatch("bounded interpolation source"))?;
+        let expected_capacity = self
+            .input
+            .facts()
+            .types
+            .get(interpolation.ty.0 as usize)
+            .and_then(|record| match record.kind {
+                sema::SemanticTypeKind::BoundedString { capacity }
+                    if capacity == interpolation.capacity =>
+                {
+                    Some(capacity)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| self.fact_mismatch("bounded interpolation type"))?;
+        if source_parts.len() != interpolation.parts.len() {
+            return Err(self.fact_mismatch("bounded interpolation source part count"));
+        }
+        let mut lowered = try_vec(
+            interpolation.parts.len(),
+            "SemanticWir bounded interpolation parts",
+            self.limits.model_edges,
+        )?;
+        let mut capacity = 0_u64;
+        let mut value_count = 0_u64;
+        let mut effects = 0_u64;
+        for (source_part, witness) in source_parts.iter().zip(&interpolation.parts) {
+            check_cancelled(self.is_cancelled)?;
+            let (part, width, child_effects) = match (source_part, witness) {
+                (
+                    wrela_hir::InterpolationPart::Text {
+                        value: source_value,
+                        source: source_span,
+                    },
+                    sema::BoundedInterpolationPart::Text { value, source },
+                ) if source_value == value && source_span == source => (
+                    wir::BoundedStringPart::Text {
+                        value: copy_text(value, self.limits.payload_bytes)?,
+                        source: *source,
+                    },
+                    u64::try_from(value.len()).map_err(|_| LowerError::ResourceLimit {
+                        resource: "SemanticWir bounded interpolation payload",
+                        limit: self.limits.payload_bytes,
+                    })?,
+                    0,
+                ),
+                (
+                    wrela_hir::InterpolationPart::Value {
+                        expression,
+                        format: None,
+                        format_source: None,
+                    },
+                    sema::BoundedInterpolationPart::Bool {
+                        expression: witnessed_expression,
+                        value,
+                    },
+                ) if expression == witnessed_expression => {
+                    let child = self.expression_fact(*expression)?;
+                    if !matches!(
+                        self.input
+                            .facts()
+                            .types
+                            .get(child.ty.0 as usize)
+                            .map(|ty| &ty.kind),
+                        Some(sema::SemanticTypeKind::Bool)
+                    ) || semantic_expression_value(child) != Some(*value)
+                    {
+                        return Err(self.fact_mismatch("bounded bool interpolation type"));
+                    }
+                    let child_effects = child.effects.0;
+                    let child_source = self
+                        .input
+                        .hir()
+                        .as_program()
+                        .expression(*expression)
+                        .map(|expression| expression.source)
+                        .ok_or_else(|| self.fact_mismatch("bounded bool interpolation source"))?;
+                    let LoweredExpression::Value(lowered_value) =
+                        self.lower_expression(*expression, sema::AccessMode::Value, statements)?
+                    else {
+                        return Err(self.fact_mismatch("bounded bool interpolation value"));
+                    };
+                    value_count = value_count.saturating_add(1);
+                    (
+                        wir::BoundedStringPart::Bool {
+                            value: lowered_value,
+                            source: child_source,
+                        },
+                        5,
+                        child_effects,
+                    )
+                }
+                (
+                    wrela_hir::InterpolationPart::Value {
+                        expression,
+                        format: None,
+                        format_source: None,
+                    },
+                    sema::BoundedInterpolationPart::Character {
+                        expression: witnessed_expression,
+                        value,
+                    },
+                ) if expression == witnessed_expression => {
+                    let child = self.expression_fact(*expression)?;
+                    if !matches!(
+                        self.input
+                            .facts()
+                            .types
+                            .get(child.ty.0 as usize)
+                            .map(|ty| &ty.kind),
+                        Some(sema::SemanticTypeKind::Character)
+                    ) || semantic_expression_value(child) != Some(*value)
+                    {
+                        return Err(self.fact_mismatch("bounded character interpolation type"));
+                    }
+                    let child_effects = child.effects.0;
+                    let child_source = self
+                        .input
+                        .hir()
+                        .as_program()
+                        .expression(*expression)
+                        .map(|expression| expression.source)
+                        .ok_or_else(|| {
+                            self.fact_mismatch("bounded character interpolation source")
+                        })?;
+                    let LoweredExpression::Value(lowered_value) =
+                        self.lower_expression(*expression, sema::AccessMode::Value, statements)?
+                    else {
+                        return Err(self.fact_mismatch("bounded character interpolation value"));
+                    };
+                    value_count = value_count.saturating_add(1);
+                    (
+                        wir::BoundedStringPart::Character {
+                            value: lowered_value,
+                            source: child_source,
+                        },
+                        4,
+                        child_effects,
+                    )
+                }
+                (
+                    wrela_hir::InterpolationPart::Value {
+                        expression,
+                        format: None,
+                        format_source: None,
+                    },
+                    sema::BoundedInterpolationPart::Integer {
+                        expression: witnessed_expression,
+                        value,
+                        ty,
+                        maximum_bytes,
+                    },
+                ) if expression == witnessed_expression => {
+                    let child = self.expression_fact(*expression)?;
+                    if child.ty != *ty
+                        || bounded_interpolation_semantic_width(self.input.facts(), *ty)
+                            != Some(*maximum_bytes)
+                        || semantic_expression_value(child) != Some(*value)
+                    {
+                        return Err(self.fact_mismatch("bounded integer interpolation type"));
+                    }
+                    let child_effects = child.effects.0;
+                    let child_source = self
+                        .input
+                        .hir()
+                        .as_program()
+                        .expression(*expression)
+                        .map(|expression| expression.source)
+                        .ok_or_else(|| {
+                            self.fact_mismatch("bounded integer interpolation source")
+                        })?;
+                    let LoweredExpression::Value(lowered_value) =
+                        self.lower_expression(*expression, sema::AccessMode::Value, statements)?
+                    else {
+                        return Err(self.fact_mismatch("bounded integer interpolation value"));
+                    };
+                    value_count = value_count.saturating_add(1);
+                    (
+                        wir::BoundedStringPart::Integer {
+                            value: lowered_value,
+                            maximum_bytes: *maximum_bytes,
+                            source: child_source,
+                        },
+                        *maximum_bytes,
+                        child_effects,
+                    )
+                }
+                (
+                    wrela_hir::InterpolationPart::Value {
+                        expression,
+                        format: None,
+                        format_source: None,
+                    },
+                    sema::BoundedInterpolationPart::StaticString {
+                        expression: witnessed_expression,
+                        value,
+                        ty,
+                    },
+                ) if expression == witnessed_expression => {
+                    let child = self.expression_fact(*expression)?;
+                    let bytes = self
+                        .input
+                        .facts()
+                        .types
+                        .get(ty.0 as usize)
+                        .and_then(|record| match record.kind {
+                            sema::SemanticTypeKind::StaticString { bytes } if child.ty == *ty => {
+                                Some(bytes)
+                            }
+                            _ => None,
+                        })
+                        .ok_or_else(|| self.fact_mismatch("bounded static interpolation extent"))?;
+                    if semantic_expression_value(child) != Some(*value) {
+                        return Err(self.fact_mismatch("bounded static interpolation witness"));
+                    }
+                    let child_effects = child.effects.0;
+                    let child_source = self
+                        .input
+                        .hir()
+                        .as_program()
+                        .expression(*expression)
+                        .map(|expression| expression.source)
+                        .ok_or_else(|| self.fact_mismatch("bounded static interpolation source"))?;
+                    let LoweredExpression::Value(lowered_value) =
+                        self.lower_expression(*expression, sema::AccessMode::Value, statements)?
+                    else {
+                        return Err(self.fact_mismatch("bounded static interpolation value"));
+                    };
+                    value_count = value_count.saturating_add(1);
+                    (
+                        wir::BoundedStringPart::StaticString {
+                            value: lowered_value,
+                            bytes,
+                            source: child_source,
+                        },
+                        bytes,
+                        child_effects,
+                    )
+                }
+                _ => return Err(self.fact_mismatch("bounded interpolation source order")),
+            };
+            capacity = capacity
+                .checked_add(width)
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "SemanticWir bounded interpolation capacity",
+                    limit: self.limits.payload_bytes,
+                })?;
+            effects |= child_effects;
+            lowered.push(part);
+        }
+        if value_count == 0 || capacity != expected_capacity || effects != interpolation.effects.0 {
+            return Err(self.fact_mismatch("bounded interpolation aggregate witness"));
+        }
+        let result = self.lowered_expression_result(
+            interpolation.expression,
+            interpolation.result,
+            interpolation.ty,
+            interpolation.source,
+        )?;
+        self.push_let(
+            statements,
+            result,
+            wir::SemanticOperation::FormatBoundedString {
+                ty: wir::TypeId(interpolation.ty.0),
+                parts: lowered,
+            },
+            Some(interpolation.source),
         )?;
         Ok(LoweredExpression::Value(result))
     }
@@ -13656,7 +14031,51 @@ fn lower_constant(constant: &sema::ConstantValue) -> Result<wir::Constant, Lower
         }),
         sema::ConstantValue::Float32(bits) => Ok(wir::Constant::Float32(*bits)),
         sema::ConstantValue::Float64(bits) => Ok(wir::Constant::Float64(*bits)),
+        sema::ConstantValue::Character(value) => Ok(wir::Constant::Char(*value)),
+        sema::ConstantValue::String(value) => Ok(wir::Constant::String(value.clone())),
         _ => Err(unsupported("non-scalar source constants")),
+    }
+}
+
+fn bounded_interpolation_semantic_width(
+    facts: &sema::PartialAnalysis,
+    ty: sema::SemanticTypeId,
+) -> Option<u64> {
+    let decimal_digits = |mut value: u128| {
+        let mut digits = 1_u64;
+        while value >= 10 {
+            value /= 10;
+            digits = digits.saturating_add(1);
+        }
+        digits
+    };
+    match facts.types.get(ty.0 as usize).map(|record| &record.kind)? {
+        sema::SemanticTypeKind::Integer {
+            signed,
+            bits,
+            pointer_sized,
+        } => {
+            if *pointer_sized && *bits != 64 || !matches!(*bits, 8 | 16 | 32 | 64 | 128) {
+                return None;
+            }
+            if *signed {
+                Some(1 + decimal_digits((1_u128 << (*bits - 1)) - 1))
+            } else {
+                Some(decimal_digits(if *bits == 128 {
+                    u128::MAX
+                } else {
+                    (1_u128 << *bits) - 1
+                }))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn semantic_expression_value(fact: &sema::ExpressionFact) -> Option<sema::ValueId> {
+    match fact.resolution {
+        sema::ExpressionResolution::Value(value) => Some(value),
+        _ => fact.result,
     }
 }
 
@@ -13776,6 +14195,16 @@ fn constant_matches_literal(
             .and_then(|source| source.parse::<f64>().ok())
             .filter(|source| source.is_finite())
             .is_some_and(|source| source.to_bits() == *value),
+        (
+            wrela_hir::Literal::Character(source),
+            sema::ConstantValue::Character(value),
+            sema::SemanticTypeKind::Character,
+        ) => source == value,
+        (
+            wrela_hir::Literal::String(source),
+            sema::ConstantValue::String(value),
+            sema::SemanticTypeKind::StaticString { bytes },
+        ) => source == value && u64::try_from(source.len()) == Ok(*bytes),
         _ => false,
     }
 }
@@ -15295,6 +15724,8 @@ fn measure_model_resources(
             TypeKind::Function(function) => meter.edges(&function.parameters),
             TypeKind::OpaqueTarget { name } => meter.text(name),
             TypeKind::Primitive(_)
+            | TypeKind::StaticString { .. }
+            | TypeKind::BoundedString { .. }
             | TypeKind::Array { .. }
             | TypeKind::Iso { .. }
             | TypeKind::ActorHandle { .. }
@@ -15336,6 +15767,14 @@ fn measure_model_resources(
                         match &statement.operation {
                             SemanticOperation::Constant(value) => constants.push((value, 1)),
                             SemanticOperation::Aggregate { fields, .. } => meter.edges(fields),
+                            SemanticOperation::FormatBoundedString { parts, .. } => {
+                                meter.edges(parts);
+                                for part in parts {
+                                    if let wir::BoundedStringPart::Text { value, .. } = part {
+                                        meter.text(value);
+                                    }
+                                }
+                            }
                             SemanticOperation::Call { arguments, .. }
                             | SemanticOperation::ActorCommit { arguments, .. }
                             | SemanticOperation::SpawnTask { arguments, .. } => {
@@ -15941,6 +16380,14 @@ fn actor_type_kind_matches(
     Ok(match (left, right) {
         (wir::TypeKind::Primitive(left), wir::TypeKind::Primitive(right)) => left == right,
         (
+            wir::TypeKind::StaticString { bytes: left },
+            wir::TypeKind::StaticString { bytes: right },
+        ) => left == right,
+        (
+            wir::TypeKind::BoundedString { capacity: left },
+            wir::TypeKind::BoundedString { capacity: right },
+        ) => left == right,
+        (
             wir::TypeKind::Array {
                 element: left_element,
                 length: left_length,
@@ -16269,6 +16716,19 @@ fn actor_operations_match(
                 && cancellable_slices_equal(left_fields, right_fields, is_cancelled)?
         }
         (
+            wir::SemanticOperation::FormatBoundedString {
+                ty: left_ty,
+                parts: left_parts,
+            },
+            wir::SemanticOperation::FormatBoundedString {
+                ty: right_ty,
+                parts: right_parts,
+            },
+        ) => {
+            *left_ty == *right_ty
+                && bounded_string_parts_match(left_parts, right_parts, is_cancelled)?
+        }
+        (
             wir::SemanticOperation::InsertField {
                 aggregate: left_aggregate,
                 field: left_field,
@@ -16500,6 +16960,88 @@ fn actor_constants_match(
         (wir::Constant::Zeroed(left), wir::Constant::Zeroed(right)) => left == right,
         _ => false,
     })
+}
+
+fn bounded_string_parts_match(
+    left: &[wir::BoundedStringPart],
+    right: &[wir::BoundedStringPart],
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, LowerError> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left.iter().zip(right) {
+        check_cancelled(is_cancelled)?;
+        let matches = match (left, right) {
+            (
+                wir::BoundedStringPart::Text {
+                    value: left,
+                    source: left_source,
+                },
+                wir::BoundedStringPart::Text {
+                    value: right,
+                    source: right_source,
+                },
+            ) => left_source == right_source && text_matches(left, right, is_cancelled)?,
+            (
+                wir::BoundedStringPart::Bool {
+                    value: left,
+                    source: left_source,
+                },
+                wir::BoundedStringPart::Bool {
+                    value: right,
+                    source: right_source,
+                },
+            )
+            | (
+                wir::BoundedStringPart::Character {
+                    value: left,
+                    source: left_source,
+                },
+                wir::BoundedStringPart::Character {
+                    value: right,
+                    source: right_source,
+                },
+            ) => left == right && left_source == right_source,
+            (
+                wir::BoundedStringPart::Integer {
+                    value: left_value,
+                    maximum_bytes: left_bytes,
+                    source: left_source,
+                },
+                wir::BoundedStringPart::Integer {
+                    value: right_value,
+                    maximum_bytes: right_bytes,
+                    source: right_source,
+                },
+            ) => {
+                left_value == right_value
+                    && left_bytes == right_bytes
+                    && left_source == right_source
+            }
+            (
+                wir::BoundedStringPart::StaticString {
+                    value: left_value,
+                    bytes: left_bytes,
+                    source: left_source,
+                },
+                wir::BoundedStringPart::StaticString {
+                    value: right_value,
+                    bytes: right_bytes,
+                    source: right_source,
+                },
+            ) => {
+                left_value == right_value
+                    && left_bytes == right_bytes
+                    && left_source == right_source
+            }
+            _ => false,
+        };
+        if !matches {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn semantic_graph_matches(
@@ -22202,7 +22744,7 @@ pub fn boot() -> Image:
             matches!(
                 result,
                 Err(LowerError::UnsupportedInput {
-                    feature: "semantic-static-data-lowering-pending (Static[Str] and Static[Bytes[N]] have no SemanticWir storage or ABI representation)"
+                    feature: "semantic-static-data-lowering-pending (Static[Bytes[N]] has no SemanticWir representation or ABI)"
                 })
             ),
             "unexpected static lowering result: {result:?}"
@@ -22210,7 +22752,7 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn bounded_primitive_interpolation_stops_at_named_semantic_lowering_boundary() {
+    fn bounded_integer_interpolation_lowers_to_exact_semantic_parts() {
         let image = analyze_parsed_actor_source(
             r#"module app
 
@@ -22237,26 +22779,31 @@ pub fn boot() -> Image:
     return img
 "#,
         );
-        let result = CanonicalSemanticLowerer::new().lower(
-            LowerRequest {
-                input: image,
-                limits: LoweringLimits::standard(),
-            },
-            &|| false,
-        );
-        assert!(
-            matches!(
-                result,
-                Err(LowerError::UnsupportedInput {
-                    feature: "semantic-bounded-string-lowering-pending (BoundedString has no SemanticWir storage, formatting operation, or ABI representation)"
-                })
-            ),
-            "unexpected bounded interpolation lowering result: {result:?}"
-        );
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("bounded integer interpolation reaches SemanticWir");
+        assert!(output.wir().as_wir().functions.iter().any(|function| {
+            function.body.statements.iter().any(|statement| {
+                matches!(statement,
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::FormatBoundedString { ty, parts }, ..
+                }) if matches!(output.wir().as_wir().types[ty.0 as usize].kind,
+                    wir::TypeKind::BoundedString { capacity: 13 })
+                    && matches!(parts.as_slice(), [wir::BoundedStringPart::Text { value: text, .. },
+                        wir::BoundedStringPart::Integer { maximum_bytes: 4, .. }]
+                        if text == "attempts="))
+            })
+        }));
     }
 
     #[test]
-    fn bounded_character_interpolation_stops_at_named_semantic_lowering_boundary() {
+    fn bounded_character_interpolation_lowers_to_exact_semantic_parts() {
         let image = analyze_parsed_actor_source(
             r#"module app
 
@@ -22282,26 +22829,32 @@ pub fn boot() -> Image:
     return img
 "#,
         );
-        let result = CanonicalSemanticLowerer::new().lower(
-            LowerRequest {
-                input: image,
-                limits: LoweringLimits::standard(),
-            },
-            &|| false,
-        );
-        assert!(
-            matches!(
-                result,
-                Err(LowerError::UnsupportedInput {
-                    feature: "semantic-bounded-string-lowering-pending (BoundedString has no SemanticWir storage, formatting operation, or ABI representation)"
-                })
-            ),
-            "unexpected bounded character interpolation lowering result: {result:?}"
-        );
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("bounded character interpolation reaches SemanticWir");
+        assert!(output.wir().as_wir().functions.iter().any(|function| {
+            function.body.statements.iter().any(|statement| {
+                matches!(statement,
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::FormatBoundedString { ty, parts }, ..
+                }) if matches!(output.wir().as_wir().types[ty.0 as usize].kind,
+                    wir::TypeKind::BoundedString { capacity: 10 })
+                    && matches!(parts.as_slice(), [wir::BoundedStringPart::Text { value: text, .. },
+                        wir::BoundedStringPart::Character { .. }] if text == "glyph="))
+            })
+        }));
     }
 
     #[test]
-    fn bounded_static_text_interpolation_stops_at_named_semantic_lowering_boundary() {
+    fn bounded_static_text_interpolation_lowers_to_exact_semantic_parts() {
+        const EXACT_OPERATIONS: u64 = 5;
+        const EXACT_MODEL_EDGES: u64 = 193;
         let image = analyze_parsed_actor_source(
             r#"module app
 
@@ -22328,22 +22881,142 @@ pub fn boot() -> Image:
     return img
 "#,
         );
-        let result = CanonicalSemanticLowerer::new().lower(
-            LowerRequest {
-                input: image,
-                limits: LoweringLimits::standard(),
-            },
-            &|| false,
-        );
-        assert!(
-            matches!(
-                result,
-                Err(LowerError::UnsupportedInput {
-                    feature: "semantic-bounded-string-lowering-pending (BoundedString has no SemanticWir storage, formatting operation, or ABI representation)"
-                })
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("bounded static-text interpolation reaches SemanticWir");
+        let model = output.wir().as_wir();
+        assert!(model.functions.iter().any(|function| {
+            function.body.statements.iter().any(|statement| {
+                matches!(statement,
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::FormatBoundedString { ty, parts }, ..
+                }) if matches!(model.types[ty.0 as usize].kind,
+                    wir::TypeKind::BoundedString { capacity: 11 })
+                    && matches!(parts.as_slice(), [wir::BoundedStringPart::Text { value: text, .. },
+                        wir::BoundedStringPart::StaticString { bytes: 5, .. }]
+                        if text == "state="))
+            })
+        }));
+        let (input_edges, input_payload) =
+            preflight_input(image.facts(), LoweringLimits::standard(), &|| false)
+                .expect("measure bounded interpolation input");
+        let meter = measure_model_resources(model.into(), LoweringLimits::standard(), &|| false)
+            .expect("measure bounded interpolation SemanticWir");
+        assert_eq!(output.report().operations, EXACT_OPERATIONS);
+        assert_eq!(input_edges.max(meter.edges), EXACT_MODEL_EDGES);
+        assert!(input_payload <= LoweringLimits::standard().payload_bytes);
+        assert!(meter.payload_bytes <= LoweringLimits::standard().payload_bytes);
+
+        let mut exact = LoweringLimits::standard();
+        exact.operations = EXACT_OPERATIONS;
+        exact.model_edges = EXACT_MODEL_EDGES;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact bounded interpolation limits");
+
+        let mut one_operation_under = exact;
+        one_operation_under.operations = EXACT_OPERATIONS - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_operation_under,
+                },
+                &|| false,
             ),
-            "unexpected bounded static text interpolation lowering result: {result:?}"
-        );
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == EXACT_OPERATIONS - 1
+        ));
+
+        let mut one_edge_under = exact;
+        one_edge_under.model_edges = EXACT_MODEL_EDGES - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_edge_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit { limit, .. }) if limit == EXACT_MODEL_EDGES - 1
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("measure bounded interpolation cancellation polls");
+        let final_poll = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+
+        let mut forged = model.clone();
+        let parts =
+            forged
+                .functions
+                .iter_mut()
+                .find_map(|function| {
+                    function.body.statements.iter_mut().find_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::FormatBoundedString { parts, .. },
+                    ..
+                }) => Some(parts),
+                _ => None,
+            })
+                })
+                .expect("bounded interpolation operation");
+        let wir::BoundedStringPart::Text { value, .. } = &mut parts[0] else {
+            panic!("bounded interpolation text")
+        };
+        *value = "State=".to_owned();
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                forged,
+                output.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
+        ));
     }
 
     #[test]

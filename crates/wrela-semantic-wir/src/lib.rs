@@ -96,6 +96,16 @@ pub enum Linearity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeKind {
     Primitive(PrimitiveType),
+    /// Compiler-minted immutable UTF-8 handle with an authenticated exact
+    /// byte extent. This is a semantic identity, not a runtime ABI layout.
+    StaticString {
+        bytes: u64,
+    },
+    /// Compiler-minted owned result of one bounded interpolation. Capacity is
+    /// semantic proof data; no storage layout is implied at this tier.
+    BoundedString {
+        capacity: u64,
+    },
     Tuple(Vec<TypeId>),
     Array {
         element: TypeId,
@@ -325,6 +335,12 @@ pub enum SemanticOperation {
         ty: TypeId,
         fields: Vec<ValueId>,
     },
+    /// Construct one compiler-minted bounded string from exact source-order
+    /// parts. Flow lowering must choose storage and an ABI before execution.
+    FormatBoundedString {
+        ty: TypeId,
+        parts: Vec<BoundedStringPart>,
+    },
     /// Produce a fresh aggregate value by replacing one exact struct field.
     InsertField {
         aggregate: ValueId,
@@ -534,6 +550,32 @@ pub enum SemanticOperation {
     },
     TestFinish {
         outcome: ValueId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedStringPart {
+    Text {
+        value: String,
+        source: Span,
+    },
+    Bool {
+        value: ValueId,
+        source: Span,
+    },
+    Character {
+        value: ValueId,
+        source: Span,
+    },
+    Integer {
+        value: ValueId,
+        maximum_bytes: u64,
+        source: Span,
+    },
+    StaticString {
+        value: ValueId,
+        bytes: u64,
+        source: Span,
     },
 }
 
@@ -1185,6 +1227,8 @@ fn validate_model_resources(
             TypeKind::Function(function) => meter.edge_slice(&function.parameters)?,
             TypeKind::OpaqueTarget { name } => meter.text(name)?,
             TypeKind::Primitive(_)
+            | TypeKind::StaticString { .. }
+            | TypeKind::BoundedString { .. }
             | TypeKind::Array { .. }
             | TypeKind::Iso { .. }
             | TypeKind::ActorHandle { .. }
@@ -1239,6 +1283,14 @@ fn validate_model_resources(
                             )?,
                             SemanticOperation::Aggregate { fields, .. } => {
                                 meter.edge_slice(fields)?
+                            }
+                            SemanticOperation::FormatBoundedString { parts, .. } => {
+                                meter.edge_slice(parts)?;
+                                for part in parts {
+                                    if let BoundedStringPart::Text { value, .. } = part {
+                                        meter.text(value)?;
+                                    }
+                                }
                             }
                             SemanticOperation::ConstructEnum { .. } => {}
                             SemanticOperation::Call { arguments, .. }
@@ -2238,6 +2290,29 @@ fn validate_type(module: &SemanticWir, ty: &TypeRecord, errors: &mut ValidationE
     }
     match &ty.kind {
         TypeKind::Primitive(_) | TypeKind::OpaqueTarget { .. } => {}
+        TypeKind::StaticString { .. } => {
+            if ty.source_name != "Static[Str]"
+                || ty.linearity != Linearity::ExplicitCopy
+                || ty.source.is_some()
+            {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "static string type",
+                    id: ty.id.0,
+                });
+            }
+        }
+        TypeKind::BoundedString { capacity } => {
+            if *capacity == 0
+                || ty.source_name != "BoundedString"
+                || ty.linearity != Linearity::Reclaimable
+                || ty.source.is_some()
+            {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "bounded string type",
+                    id: ty.id.0,
+                });
+            }
+        }
         TypeKind::Tuple(types) => {
             for ty in types {
                 use_type!(*ty);
@@ -3506,7 +3581,24 @@ fn validate_operation(
         };
     }
     match operation {
-        SemanticOperation::Constant(constant) => validate_constant(module, constant, errors),
+        SemanticOperation::Constant(constant) => {
+            validate_constant(module, constant, errors);
+            if let Constant::String(value) = constant {
+                let valid = matches!(results, [result]
+                if function.values.get(result.0 as usize).is_some_and(|result| {
+                    module.types.get(result.ty.0 as usize).is_some_and(|ty| {
+                        matches!(ty.kind, TypeKind::StaticString { bytes }
+                            if u64::try_from(value.len()) == Ok(bytes))
+                    })
+                }));
+                if !valid {
+                    errors.push(ValidationError::InvalidRecord {
+                        kind: "static string constant",
+                        id: results.first().map_or(u32::MAX, |result| result.0),
+                    });
+                }
+            }
+        }
         SemanticOperation::Unary { operand, .. } => value!(*operand),
         SemanticOperation::Binary { left, right, .. } => {
             value!(*left);
@@ -3524,6 +3616,103 @@ fn validate_operation(
             require_id("aggregate type", ty.0, module.types.len(), errors);
             for field in fields {
                 value!(*field);
+            }
+        }
+        SemanticOperation::FormatBoundedString { ty, parts } => {
+            require_id("bounded string type", ty.0, module.types.len(), errors);
+            let expected_capacity = module
+                .types
+                .get(ty.0 as usize)
+                .and_then(|record| match record.kind {
+                    TypeKind::BoundedString { capacity } => Some(capacity),
+                    _ => None,
+                });
+            let mut capacity = Some(0_u64);
+            let mut value_parts = 0_u64;
+            let mut previous_source = None;
+            for part in parts {
+                if errors.poll() {
+                    return;
+                }
+                let (source, width) = match part {
+                    BoundedStringPart::Text { value, source } => {
+                        (*source, u64::try_from(value.len()).ok())
+                    }
+                    BoundedStringPart::Bool { value, source } => {
+                        value!(*value);
+                        value_parts = value_parts.saturating_add(1);
+                        let width = function.values.get(value.0 as usize).and_then(|value| {
+                            module.types.get(value.ty.0 as usize).and_then(|ty| {
+                                (ty.kind == TypeKind::Primitive(PrimitiveType::Bool)).then_some(5)
+                            })
+                        });
+                        (*source, width)
+                    }
+                    BoundedStringPart::Character { value, source } => {
+                        value!(*value);
+                        value_parts = value_parts.saturating_add(1);
+                        let width = function.values.get(value.0 as usize).and_then(|value| {
+                            module.types.get(value.ty.0 as usize).and_then(|ty| {
+                                (ty.kind == TypeKind::Primitive(PrimitiveType::Char)).then_some(4)
+                            })
+                        });
+                        (*source, width)
+                    }
+                    BoundedStringPart::Integer {
+                        value,
+                        maximum_bytes,
+                        source,
+                    } => {
+                        value!(*value);
+                        value_parts = value_parts.saturating_add(1);
+                        let width = function.values.get(value.0 as usize).and_then(|value| {
+                            module.types.get(value.ty.0 as usize).and_then(|ty| {
+                                bounded_integer_maximum(&ty.kind)
+                                    .filter(|expected| expected == maximum_bytes)
+                            })
+                        });
+                        (*source, width)
+                    }
+                    BoundedStringPart::StaticString {
+                        value,
+                        bytes,
+                        source,
+                    } => {
+                        value!(*value);
+                        value_parts = value_parts.saturating_add(1);
+                        let width = function.values.get(value.0 as usize).and_then(|value| {
+                            module.types.get(value.ty.0 as usize).and_then(|ty| {
+                                matches!(ty.kind, TypeKind::StaticString { bytes: extent }
+                                    if extent == *bytes)
+                                .then_some(*bytes)
+                            })
+                        });
+                        (*source, width)
+                    }
+                };
+                let ordered = valid_span(module, source)
+                    && previous_source.is_none_or(|previous: Span| {
+                        previous.file == source.file && previous.range.end <= source.range.start
+                    });
+                if !ordered {
+                    capacity = None;
+                }
+                previous_source = Some(source);
+                capacity =
+                    capacity.and_then(|total| width.and_then(|width| total.checked_add(width)));
+            }
+            let valid_result = matches!(results, [result]
+                if function.values.get(result.0 as usize).is_some_and(|result| result.ty == *ty));
+            if parts.is_empty()
+                || value_parts == 0
+                || expected_capacity.is_none()
+                || capacity != expected_capacity
+                || !valid_result
+            {
+                errors.push(ValidationError::InvalidRecord {
+                    kind: "bounded string construction",
+                    id: results.first().map_or(u32::MAX, |result| result.0),
+                });
             }
         }
         SemanticOperation::InsertField {
@@ -4023,6 +4212,60 @@ fn validate_operation(
     }
 }
 
+fn bounded_integer_maximum(kind: &TypeKind) -> Option<u64> {
+    let decimal_digits = |mut value: u128| {
+        let mut digits = 1_u64;
+        while value >= 10 {
+            value /= 10;
+            digits = digits.saturating_add(1);
+        }
+        digits
+    };
+    match kind {
+        TypeKind::Primitive(
+            PrimitiveType::U8
+            | PrimitiveType::U16
+            | PrimitiveType::U32
+            | PrimitiveType::U64
+            | PrimitiveType::U128
+            | PrimitiveType::Usize,
+        ) => {
+            let bits = match kind {
+                TypeKind::Primitive(PrimitiveType::U8) => 8,
+                TypeKind::Primitive(PrimitiveType::U16) => 16,
+                TypeKind::Primitive(PrimitiveType::U32) => 32,
+                TypeKind::Primitive(PrimitiveType::U64 | PrimitiveType::Usize) => 64,
+                TypeKind::Primitive(PrimitiveType::U128) => 128,
+                _ => return None,
+            };
+            Some(decimal_digits(if bits == 128 {
+                u128::MAX
+            } else {
+                (1_u128 << bits) - 1
+            }))
+        }
+        TypeKind::Primitive(
+            PrimitiveType::I8
+            | PrimitiveType::I16
+            | PrimitiveType::I32
+            | PrimitiveType::I64
+            | PrimitiveType::I128
+            | PrimitiveType::Isize,
+        ) => {
+            let bits = match kind {
+                TypeKind::Primitive(PrimitiveType::I8) => 8,
+                TypeKind::Primitive(PrimitiveType::I16) => 16,
+                TypeKind::Primitive(PrimitiveType::I32) => 32,
+                TypeKind::Primitive(PrimitiveType::I64 | PrimitiveType::Isize) => 64,
+                TypeKind::Primitive(PrimitiveType::I128) => 128,
+                _ => return None,
+            };
+            Some(1 + decimal_digits((1_u128 << (bits - 1)) - 1))
+        }
+        _ => None,
+    }
+}
+
 fn valid_actor_state_operation(
     module: &SemanticWir,
     function: &SemanticFunction,
@@ -4493,6 +4736,100 @@ mod tests {
         }
     }
 
+    fn bounded_string_fixture() -> SemanticWir {
+        let mut module = fixture();
+        module.types.extend([
+            TypeRecord {
+                id: TypeId(1),
+                source_name: "bool".to_owned(),
+                kind: TypeKind::Primitive(PrimitiveType::Bool),
+                linearity: Linearity::CopyScalar,
+                source: None,
+            },
+            TypeRecord {
+                id: TypeId(2),
+                source_name: "Static[Str]".to_owned(),
+                kind: TypeKind::StaticString { bytes: 2 },
+                linearity: Linearity::ExplicitCopy,
+                source: None,
+            },
+            TypeRecord {
+                id: TypeId(3),
+                source_name: "BoundedString".to_owned(),
+                kind: TypeKind::BoundedString { capacity: 10 },
+                linearity: Linearity::Reclaimable,
+                source: None,
+            },
+        ]);
+        let source = |start, end| Span {
+            file: FileId(0),
+            range: TextRange { start, end },
+        };
+        let mut function = source_function(1, 3);
+        function.values = vec![
+            SemanticValue {
+                id: ValueId(0),
+                ty: TypeId(2),
+                origin: Some(source(1, 3)),
+                name: Some("label".to_owned()),
+            },
+            SemanticValue {
+                id: ValueId(1),
+                ty: TypeId(1),
+                origin: Some(source(4, 5)),
+                name: Some("ready".to_owned()),
+            },
+            SemanticValue {
+                id: ValueId(2),
+                ty: TypeId(3),
+                origin: Some(source(10, 15)),
+                name: Some("rendered".to_owned()),
+            },
+        ];
+        function.body.statements = vec![
+            SemanticStatement::Let(LetStatement {
+                results: vec![ValueId(0)],
+                operation: SemanticOperation::Constant(Constant::String("ok".to_owned())),
+                source: Some(source(1, 3)),
+            }),
+            SemanticStatement::Let(LetStatement {
+                results: vec![ValueId(1)],
+                operation: SemanticOperation::Constant(Constant::Bool(true)),
+                source: Some(source(4, 5)),
+            }),
+            SemanticStatement::Let(LetStatement {
+                results: vec![ValueId(2)],
+                operation: SemanticOperation::FormatBoundedString {
+                    ty: TypeId(3),
+                    parts: vec![
+                        BoundedStringPart::Text {
+                            value: "x=".to_owned(),
+                            source: source(10, 12),
+                        },
+                        BoundedStringPart::Bool {
+                            value: ValueId(1),
+                            source: source(12, 13),
+                        },
+                        BoundedStringPart::Text {
+                            value: "/".to_owned(),
+                            source: source(13, 14),
+                        },
+                        BoundedStringPart::StaticString {
+                            value: ValueId(0),
+                            bytes: 2,
+                            source: source(14, 15),
+                        },
+                    ],
+                },
+                source: Some(source(10, 15)),
+            }),
+            SemanticStatement::Return(Vec::new()),
+        ];
+        module.functions.push(function);
+        module.source_summary.monomorphized_instantiations = 2;
+        module
+    }
+
     fn insert_field_fixture() -> SemanticWir {
         let mut module = fixture();
         module.types.push(TypeRecord {
@@ -4570,6 +4907,82 @@ mod tests {
         });
         module.source_summary.monomorphized_instantiations = 2;
         module
+    }
+
+    #[test]
+    fn bounded_string_construction_authenticates_parts_extents_capacity_and_result() {
+        bounded_string_fixture()
+            .validate()
+            .expect("canonical bounded string construction");
+
+        let mut empty_static = bounded_string_fixture();
+        empty_static.types[2].kind = TypeKind::StaticString { bytes: 0 };
+        empty_static.types[3].kind = TypeKind::BoundedString { capacity: 8 };
+        let SemanticStatement::Let(LetStatement {
+            operation: SemanticOperation::Constant(Constant::String(value)),
+            ..
+        }) = &mut empty_static.functions[1].body.statements[0]
+        else {
+            panic!("static string constant")
+        };
+        value.clear();
+        let SemanticStatement::Let(LetStatement {
+            operation: SemanticOperation::FormatBoundedString { parts, .. },
+            ..
+        }) = &mut empty_static.functions[1].body.statements[2]
+        else {
+            panic!("bounded string operation")
+        };
+        let BoundedStringPart::StaticString { bytes, .. } = &mut parts[3] else {
+            panic!("static string part")
+        };
+        *bytes = 0;
+        empty_static
+            .validate()
+            .expect("empty Static[Str] retains exact zero extent");
+
+        let mutate_operation =
+            |module: &mut SemanticWir,
+             mutate: &dyn Fn(&mut TypeId, &mut Vec<BoundedStringPart>)| {
+                let SemanticStatement::Let(LetStatement {
+                    operation: SemanticOperation::FormatBoundedString { ty, parts },
+                    ..
+                }) = &mut module.functions[1].body.statements[2]
+                else {
+                    panic!("bounded string operation")
+                };
+                mutate(ty, parts);
+            };
+
+        let mut forged_capacity = bounded_string_fixture();
+        forged_capacity.types[3].kind = TypeKind::BoundedString { capacity: 11 };
+        assert!(forged_capacity.validate().is_err());
+
+        let mut forged_extent = bounded_string_fixture();
+        mutate_operation(&mut forged_extent, &|_, parts| {
+            let BoundedStringPart::StaticString { bytes, .. } = &mut parts[3] else {
+                panic!("static string part")
+            };
+            *bytes = 3;
+        });
+        assert!(forged_extent.validate().is_err());
+
+        let mut reordered = bounded_string_fixture();
+        mutate_operation(&mut reordered, &|_, parts| parts.swap(0, 1));
+        assert!(reordered.validate().is_err());
+
+        let mut wrong_result = bounded_string_fixture();
+        wrong_result.functions[1].values[2].ty = TypeId(1);
+        assert!(wrong_result.validate().is_err());
+
+        let mut wrong_value_kind = bounded_string_fixture();
+        mutate_operation(&mut wrong_value_kind, &|_, parts| {
+            let BoundedStringPart::Bool { value, .. } = &mut parts[1] else {
+                panic!("bool part")
+            };
+            *value = ValueId(0);
+        });
+        assert!(wrong_value_kind.validate().is_err());
     }
 
     #[test]
