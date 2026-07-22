@@ -648,6 +648,7 @@ pub enum EphemeralKind {
     View,
     ProjectionCarrier,
     AdmissionResult,
+    AsyncOutcome,
     OwnershipConditionedActorCallOutcome,
 }
 
@@ -1733,6 +1734,8 @@ impl PartialAnalysis {
             }
             if matches!(&ty.kind, SemanticTypeKind::Enumeration { arguments, .. } if !arguments.is_empty())
                 && !exact_generic_enum_type_matches(self, hir.as_program(), ty)
+                && !exact_core_async_exit_type_matches(self, hir.as_program(), ty)
+                && !exact_core_async_result_type_matches(self, hir.as_program(), ty)
             {
                 return Err(invalid(
                     "semantic enumeration type differs from its exact HIR specialization",
@@ -4261,7 +4264,7 @@ fn validate_exact_expression_fact(
             },
             ExpressionResolution::Builtin(IntrinsicOperation::Await),
             Some(_),
-        ) if exact_await_operand_matches(analysis, function.id, *operand, fact) => {}
+        ) if exact_await_operand_matches(analysis, program, function.id, *operand, fact) => {}
         (
             wrela_hir::ExpressionKind::Try(operand),
             ExpressionResolution::ResultTry {
@@ -5830,6 +5833,202 @@ fn exact_generic_enum_type_matches(
     semantic.size_upper_bound == Some(size) && semantic.alignment_lower_bound == alignment
 }
 
+fn exact_core_async_exit_declarations(
+    program: &wrela_hir::Program,
+) -> Option<(DeclarationId, [DeclarationId; 3])> {
+    let core_package = program
+        .packages
+        .package(program.packages.root())?
+        .dependencies
+        .iter()
+        .find(|dependency| dependency.alias.as_str() == "core")?
+        .package;
+    let mut outcome = None;
+    let mut causes = [None, None, None];
+    for declaration in &program.declarations {
+        let module = program.modules.get(declaration.module.0 as usize)?;
+        if module.package != core_package || module.path.dotted() != "actor" {
+            continue;
+        }
+        let slot = match declaration.name.as_ref().map(wrela_hir::Name::as_str) {
+            Some("AsyncExit") => &mut outcome,
+            Some("Cancelled") => &mut causes[0],
+            Some("DeadlineRejected") => &mut causes[1],
+            Some("DeadlineExceeded") => &mut causes[2],
+            _ => continue,
+        };
+        if slot.replace(declaration.id).is_some() {
+            return None;
+        }
+    }
+    Some((outcome?, [causes[0]?, causes[1]?, causes[2]?]))
+}
+
+fn exact_core_async_exit_type_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    semantic: &SemanticType,
+) -> bool {
+    let Some((outcome_id, cause_ids)) = exact_core_async_exit_declarations(program) else {
+        return false;
+    };
+    let exact_cause_source = |id| {
+        program.declaration(id).is_some_and(|record| {
+            record.visibility == wrela_hir::Visibility::Public
+                && matches!(&record.kind, wrela_hir::DeclarationKind::Structure(aggregate)
+                    if aggregate.generics.is_empty()
+                        && aggregate.implements.is_empty()
+                        && aggregate.fields.is_empty()
+                        && aggregate.members.is_empty()
+                        && !aggregate.linear
+                        && !aggregate.copy
+                        && aggregate.deriving.is_empty())
+        })
+    };
+    if !cause_ids.iter().copied().all(exact_cause_source) {
+        return false;
+    }
+    let Some(source) = program.declaration(outcome_id) else {
+        return false;
+    };
+    let wrela_hir::DeclarationKind::Enumeration(enumeration) = &source.kind else {
+        return false;
+    };
+    let [generic] = enumeration.generics.as_slice() else {
+        return false;
+    };
+    let Some(parameter) = program.generic_parameter(*generic) else {
+        return false;
+    };
+    let exact_source_field = |variant: &wrela_hir::EnumVariant,
+                              name: &str,
+                              expected_generic: bool,
+                              expected_cause: DeclarationId| {
+        variant.name.as_str() == name
+            && matches!(variant.fields.as_slice(), [field]
+            if field.name.is_none()
+                && if expected_generic {
+                    matches!(&field.ty.kind, wrela_hir::TypeExpressionKind::Named {
+                        definition: wrela_hir::Definition::Generic(candidate),
+                        arguments,
+                    } if *candidate == *generic && arguments.is_empty())
+                } else {
+                    matches!(&field.ty.kind, wrela_hir::TypeExpressionKind::Named {
+                        definition: wrela_hir::Definition::Declaration(candidate),
+                        arguments,
+                    } if candidate.declaration == expected_cause && arguments.is_empty())
+                })
+    };
+    let exact_source = source.visibility == wrela_hir::Visibility::Public
+        && parameter.owner == outcome_id
+        && matches!(
+            parameter.kind,
+            wrela_hir::GenericParameterKind::Type { bound: None }
+        )
+        && enumeration.members.is_empty()
+        && enumeration.deriving.is_empty()
+        && matches!(enumeration.variants.as_slice(), [operation, cancelled, rejected, exceeded]
+            if exact_source_field(operation, "Operation", true, cause_ids[0])
+                && exact_source_field(cancelled, "Cancelled", false, cause_ids[0])
+                && exact_source_field(rejected, "DeadlineRejected", false, cause_ids[1])
+                && exact_source_field(exceeded, "DeadlineExceeded", false, cause_ids[2]));
+    if !exact_source {
+        return false;
+    }
+    let SemanticTypeKind::Enumeration {
+        declaration,
+        arguments,
+        variants,
+    } = &semantic.kind
+    else {
+        return false;
+    };
+    let [SemanticArgument::Type(error)] = arguments.as_slice() else {
+        return false;
+    };
+    let cause_type = |declaration| {
+        let mut matches = analysis.types.iter().filter(|ty| {
+            ty.kind
+                == (SemanticTypeKind::Structure {
+                    declaration,
+                    arguments: Vec::new(),
+                    fields: Vec::new(),
+                })
+                && ty.linearity == Linearity::ExplicitCopy
+                && ty.size_upper_bound == Some(0)
+                && ty.alignment_lower_bound == 1
+                && ty.source == program.declaration(declaration).map(|record| record.source)
+        });
+        let id = matches.next().map(|ty| ty.id)?;
+        matches.next().is_none().then_some(id)
+    };
+    let Some(cause_types) = cause_type(cause_ids[0])
+        .zip(cause_type(cause_ids[1]))
+        .zip(cause_type(cause_ids[2]))
+        .map(|((left, middle), right)| [left, middle, right])
+    else {
+        return false;
+    };
+    *declaration == outcome_id
+        && exact_stored_copy_scalar_layout(analysis, *error) == Some((8, 8))
+        && semantic.linearity == Linearity::ExplicitCopy
+        && semantic.size_upper_bound == Some(16)
+        && semantic.alignment_lower_bound == 8
+        && semantic.source == Some(source.source)
+        && matches!(variants.as_slice(), [operation, cancelled, rejected, exceeded]
+            if operation.name == "Operation"
+                && matches!(operation.fields.as_slice(), [field]
+                    if field.name.is_empty() && field.public && field.ty == *error)
+                && cancelled.name == "Cancelled"
+                && matches!(cancelled.fields.as_slice(), [field]
+                    if field.name.is_empty() && field.public && field.ty == cause_types[0])
+                && rejected.name == "DeadlineRejected"
+                && matches!(rejected.fields.as_slice(), [field]
+                    if field.name.is_empty() && field.public && field.ty == cause_types[1])
+                && exceeded.name == "DeadlineExceeded"
+                && matches!(exceeded.fields.as_slice(), [field]
+                    if field.name.is_empty() && field.public && field.ty == cause_types[2]))
+}
+
+fn exact_core_async_result_type_matches(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    semantic: &SemanticType,
+) -> bool {
+    let SemanticTypeKind::Enumeration {
+        declaration,
+        arguments,
+        variants,
+    } = &semantic.kind
+    else {
+        return false;
+    };
+    let [SemanticArgument::Type(ok), SemanticArgument::Type(err)] = arguments.as_slice() else {
+        return false;
+    };
+    exact_core_result_declaration_matches(program, *declaration)
+        && exact_stored_copy_scalar_layout(analysis, *ok) == Some((8, 8))
+        && analysis.types.get(err.0 as usize).is_some_and(|ty| {
+            exact_core_async_exit_type_matches(analysis, program, ty)
+                && matches!(&ty.kind, SemanticTypeKind::Enumeration { arguments, .. }
+                    if arguments.as_slice() == [SemanticArgument::Type(*ok)])
+        })
+        && semantic.linearity == Linearity::ExplicitCopy
+        && semantic.size_upper_bound == Some(24)
+        && semantic.alignment_lower_bound == 8
+        && semantic.source
+            == program
+                .declaration(*declaration)
+                .map(|record| record.source)
+        && matches!(variants.as_slice(), [ok_variant, err_variant]
+            if ok_variant.name == "Ok"
+                && matches!(ok_variant.fields.as_slice(), [field]
+                    if field.name.is_empty() && field.public && field.ty == *ok)
+                && err_variant.name == "Err"
+                && matches!(err_variant.fields.as_slice(), [field]
+                    if field.name.is_empty() && field.public && field.ty == *err))
+}
+
 fn exact_stored_copy_scalar_layout(
     analysis: &PartialAnalysis,
     ty: SemanticTypeId,
@@ -5982,6 +6181,7 @@ fn exact_pointer_integer_kind(kind: &SemanticTypeKind, expected_signed: bool) ->
 
 fn exact_await_operand_matches(
     analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
     function: FunctionInstanceId,
     operand: ExpressionId,
     await_fact: &ExpressionFact,
@@ -5994,26 +6194,235 @@ fn exact_await_operand_matches(
         .ok()
         .and_then(|index| analysis.expressions.get(index))
         .is_some_and(|operand| {
-            operand.ty == await_fact.ty
-                && operand.result.is_some()
+            operand.result.is_some()
                 && await_fact.effects == EffectSet(operand.effects.0 | EffectSet::SUSPEND)
                 && await_fact.ownership_before == OwnershipState::Owned
                 && await_fact.ownership_after == OwnershipState::Owned
                 && match operand.resolution {
                     ExpressionResolution::DirectCall {
                         function: target, ..
+                    } => {
+                        analysis
+                            .functions
+                            .get(target.0 as usize)
+                            .is_some_and(|target| {
+                                target.color == FunctionColor::Async
+                                    && target.result == operand.ty
+                                    && if exact_declared_fallible_u64_result(
+                                        analysis,
+                                        program,
+                                        target.result,
+                                    ) {
+                                        analysis.types.get(await_fact.ty.0 as usize).is_some_and(
+                                            |ty| {
+                                                exact_core_async_result_type_matches(
+                                                    analysis, program, ty,
+                                                )
+                                            },
+                                        ) && await_fact.result.is_some_and(|result| {
+                                            analysis.values.get(result.0 as usize).is_some_and(
+                                                |value| {
+                                                    value.class
+                                                        == SemanticValueClass::Ephemeral(
+                                                            EphemeralKind::AsyncOutcome,
+                                                        )
+                                                },
+                                            )
+                                        }) && exact_async_outcome_hir_use(
+                                            program,
+                                            await_fact.expression,
+                                        )
+                                    } else {
+                                        operand.ty == await_fact.ty
+                                    }
+                            })
                     }
-                    | ExpressionResolution::ActorRequest {
+                    ExpressionResolution::ActorRequest {
                         method: target,
                         reply: Some(_),
                         ..
-                    } => analysis
-                        .functions
-                        .get(target.0 as usize)
-                        .is_some_and(|target| target.color == FunctionColor::Async),
+                    } => {
+                        operand.ty == await_fact.ty
+                            && analysis
+                                .functions
+                                .get(target.0 as usize)
+                                .is_some_and(|target| target.color == FunctionColor::Async)
+                    }
                     _ => false,
                 }
         })
+}
+
+fn exact_declared_fallible_u64_result(
+    analysis: &PartialAnalysis,
+    program: &wrela_hir::Program,
+    ty: SemanticTypeId,
+) -> bool {
+    analysis.types.get(ty.0 as usize).is_some_and(|record| {
+        matches!(&record.kind, SemanticTypeKind::Enumeration {
+            declaration,
+            arguments,
+            variants,
+        } if exact_core_result_declaration_matches(program, *declaration)
+            && matches!(arguments.as_slice(), [SemanticArgument::Type(ok), SemanticArgument::Type(err)]
+                if ok == err && exact_stored_copy_scalar_layout(analysis, *ok) == Some((8, 8)))
+            && matches!(variants.as_slice(), [ok, err]
+                if ok.name == "Ok" && err.name == "Err"
+                    && matches!((ok.fields.as_slice(), err.fields.as_slice()), ([ok], [err])
+                        if ok.ty == err.ty)))
+    })
+}
+
+fn exact_async_outcome_hir_use(program: &wrela_hir::Program, expression: ExpressionId) -> bool {
+    let matches = program
+        .statements
+        .iter()
+        .filter(|statement| {
+            matches!(statement.kind, wrela_hir::StatementKind::Match { scrutinee, .. }
+            if scrutinee == expression)
+        })
+        .count();
+    let tests = program
+        .expressions
+        .iter()
+        .filter(|parent| {
+            matches!(parent.kind, wrela_hir::ExpressionKind::IsPattern { value, .. }
+            if value == expression)
+        })
+        .count();
+    matches + tests == 1
+        && (tests == 1 || exact_async_outcome_nested_match_hir(program, expression))
+        && !program.expressions.iter().any(|parent| {
+            matches!(parent.kind, wrela_hir::ExpressionKind::Try(operand) if operand == expression)
+        })
+}
+
+fn exact_async_outcome_nested_match_hir(
+    program: &wrela_hir::Program,
+    expression: ExpressionId,
+) -> bool {
+    let mut outer = program
+        .statements
+        .iter()
+        .filter_map(|statement| match &statement.kind {
+            wrela_hir::StatementKind::Match { scrutinee, arms } if *scrutinee == expression => {
+                Some(arms)
+            }
+            _ => None,
+        });
+    let Some(arms) = outer.next() else {
+        return false;
+    };
+    if outer.next().is_some() || arms.len() != 2 {
+        return false;
+    }
+    let mut ok_seen = false;
+    let mut err = None;
+    for arm in arms {
+        if arm.guard.is_some() {
+            return false;
+        }
+        let Some((candidate, arguments)) = exact_async_constructor_pattern(program, arm.pattern)
+        else {
+            return false;
+        };
+        if program
+            .declaration(candidate.enumeration.declaration)
+            .and_then(|declaration| declaration.name.as_ref())
+            .map(wrela_hir::Name::as_str)
+            != Some("Result")
+            || arguments.len() != 1
+        {
+            return false;
+        }
+        match candidate.variant {
+            0 if !ok_seen => ok_seen = true,
+            1 if err.is_none() => {
+                let Some(binding) = exact_async_constructor_binding(program, &arguments[0]) else {
+                    return false;
+                };
+                err = Some((binding, arm.body));
+            }
+            _ => return false,
+        }
+    }
+    let Some((binding, body)) = err else {
+        return false;
+    };
+    let Some(body) = program.body(body) else {
+        return false;
+    };
+    let [statement] = body.statements.as_slice() else {
+        return false;
+    };
+    let Some(wrela_hir::StatementKind::Match { scrutinee, arms }) = program
+        .statement(*statement)
+        .map(|statement| &statement.kind)
+    else {
+        return false;
+    };
+    if !program.expression(*scrutinee).is_some_and(|expression| {
+        expression.kind
+            == wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(binding))
+    }) || arms.len() != 4
+    {
+        return false;
+    }
+    arms.iter().enumerate().all(|(index, arm)| {
+        if arm.guard.is_some() {
+            return false;
+        }
+        exact_async_constructor_pattern(program, arm.pattern).is_some_and(
+            |(candidate, arguments)| {
+                candidate.variant as usize == index
+                    && arguments.len() == 1
+                    && program
+                        .declaration(candidate.enumeration.declaration)
+                        .and_then(|declaration| declaration.name.as_ref())
+                        .map(wrela_hir::Name::as_str)
+                        == Some("AsyncExit")
+            },
+        )
+    })
+}
+
+fn exact_async_constructor_pattern(
+    program: &wrela_hir::Program,
+    pattern: wrela_hir::PatternId,
+) -> Option<(&wrela_hir::ResolvedVariant, &[wrela_hir::PatternArgument])> {
+    let pattern = program.patterns.get(pattern.0 as usize)?;
+    let [alternative] = pattern.alternatives.as_slice() else {
+        return None;
+    };
+    let wrela_hir::PrimaryPattern::Constructor {
+        candidates,
+        arguments,
+        ..
+    } = &alternative.kind
+    else {
+        return None;
+    };
+    let [candidate] = candidates.as_slice() else {
+        return None;
+    };
+    Some((candidate, arguments))
+}
+
+fn exact_async_constructor_binding(
+    program: &wrela_hir::Program,
+    argument: &wrela_hir::PatternArgument,
+) -> Option<wrela_hir::LocalId> {
+    if argument.take {
+        return None;
+    }
+    let pattern = program.patterns.get(argument.pattern.0 as usize)?;
+    let [alternative] = pattern.alternatives.as_slice() else {
+        return None;
+    };
+    match alternative.kind {
+        wrela_hir::PrimaryPattern::Bind(local) => Some(local),
+        _ => None,
+    }
 }
 
 fn exact_expression_ownership_matches(
@@ -10207,6 +10616,20 @@ fn valid_semantic_value_class(value: &SemanticValue, analysis: &PartialAnalysis)
                     fact.resolution,
                     ExpressionResolution::Builtin(IntrinsicOperation::ActorTrySend { .. })
                 )
+        })
+    ) || matches!(
+        (value.category, value.class, value.origin),
+        (
+            ValueCategory::Value,
+            SemanticValueClass::Ephemeral(EphemeralKind::AsyncOutcome),
+            SemanticValueOrigin::Expression(expression),
+        ) if analysis.expressions.iter().any(|fact| {
+            fact.function == value.function
+                && fact.expression == expression
+                && fact.ty == value.ty
+                && fact.category == ValueCategory::Value
+                && fact.result == Some(value.id)
+                && fact.resolution == ExpressionResolution::Builtin(IntrinsicOperation::Await)
         })
     )
 }

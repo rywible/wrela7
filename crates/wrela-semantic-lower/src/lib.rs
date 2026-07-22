@@ -290,6 +290,7 @@ fn supported_input<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedInput<'a>, LowerError> {
+    validate_async_outcome_lowering_boundary(input.facts())?;
     validate_admission_result_lowering_boundary(input.facts())?;
     validate_generic_function_lowering_boundary(input)?;
     validate_method_call_lowering_boundary(input.facts())?;
@@ -310,6 +311,20 @@ fn supported_input<'a>(
             supported_generated_tests(input, limits, is_cancelled)
                 .map(SupportedInput::GeneratedTests)
         }
+    }
+}
+
+fn validate_async_outcome_lowering_boundary(
+    facts: &sema::PartialAnalysis,
+) -> Result<(), LowerError> {
+    if facts.values.iter().any(|value| {
+        value.class == sema::SemanticValueClass::Ephemeral(sema::EphemeralKind::AsyncOutcome)
+    }) {
+        Err(unsupported(
+            "semantic-async-outcome-lowering-pending (structured async exit delivery)",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -15578,6 +15593,9 @@ mod contract_tests {
     const STANDARD_LIBRARY_COMPONENT_DIGEST: Sha256Digest = Sha256Digest::from_bytes([0x22; 32]);
     const TARGET_DIGEST: Sha256Digest = Sha256Digest::from_bytes([3; 32]);
     const PARSED_CORE_IMAGE_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
+    const PARSED_CORE_ACTOR_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/actor.wr");
+    const PARSED_CORE_RESULT_SOURCE: &str =
+        include_str!("../../../std/wrela-core-0.1/src/result.wr");
     const PARSED_CORE_TIME_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/time.wr");
     const PARSED_CORE_OPS_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/ops.wr");
     const PARSED_STDLIB_TIME_RUNTIME_SOURCE: &str =
@@ -15698,6 +15716,13 @@ pub fn boot() -> Image:
     fn analyze_parsed_actor_source(application_source: &str) -> wrela_sema::AnalyzedImage {
         let base = fixture();
         let mut sources = SourceDatabase::default();
+        let actor_file = sources
+            .add(SourceInput {
+                path: "actor.wr".to_owned(),
+                text: PARSED_CORE_ACTOR_SOURCE.to_owned(),
+                digest: Sha256Digest::from_bytes([0xc0; 32]),
+            })
+            .expect("core actor source");
         let application_file = sources
             .add(SourceInput {
                 path: "app.wr".to_owned(),
@@ -15712,11 +15737,18 @@ pub fn boot() -> Image:
                 digest: Sha256Digest::from_bytes([0xc1; 32]),
             })
             .expect("core image source");
+        let result_file = sources
+            .add(SourceInput {
+                path: "result.wr".to_owned(),
+                text: PARSED_CORE_RESULT_SOURCE.to_owned(),
+                digest: Sha256Digest::from_bytes([0xc2; 32]),
+            })
+            .expect("core result source");
         let mut parsed_files = Vec::new();
         parsed_files
-            .try_reserve_exact(2)
-            .expect("two parsed actor files");
-        for file in [application_file, core_file] {
+            .try_reserve_exact(4)
+            .expect("four parsed actor files");
+        for file in [actor_file, application_file, core_file, result_file] {
             let output = WrelaSyntaxParser::new()
                 .parse(
                     ParseRequest {
@@ -15758,10 +15790,24 @@ pub fn boot() -> Image:
         packages
             .add_module(
                 core,
+                ModulePath::new(["actor".to_owned()]).expect("core actor module path"),
+                actor_file,
+            )
+            .expect("core actor module");
+        packages
+            .add_module(
+                core,
                 ModulePath::new(["image".to_owned()]).expect("core module path"),
                 core_file,
             )
             .expect("core module");
+        packages
+            .add_module(
+                core,
+                ModulePath::new(["result".to_owned()]).expect("core result module path"),
+                result_file,
+            )
+            .expect("core result module");
         let changes = HirChangeSet {
             previous_source_graph: None,
             changed_files: Vec::new(),
@@ -21434,6 +21480,57 @@ pub fn boot() -> Image:
             validate_admission_result_lowering_boundary(&facts),
             Err(LowerError::UnsupportedInput {
                 feature: "semantic-admission-result-lowering-pending (try-send outcome dispatch)"
+            })
+        ));
+    }
+
+    #[test]
+    fn fallible_async_outcome_stops_at_named_semantic_lowering_boundary() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.actor import AsyncExit
+from core.image import Image, Target
+from core.result import Result
+
+async fn checkpoint() -> Result[u64, u64]:
+    return Result.Ok(7)
+
+@service
+pub struct Worker:
+    @task
+    async fn consume(mut self):
+        match await checkpoint():
+            case Result.Ok(value):
+                pass
+            case Result.Err(outcome):
+                match outcome:
+                    case AsyncExit.Operation(error):
+                        pass
+                    case AsyncExit.Cancelled(_):
+                        pass
+                    case AsyncExit.DeadlineRejected(_):
+                        pass
+                    case AsyncExit.DeadlineExceeded(_):
+                        pass
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#,
+        );
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-async-outcome-lowering-pending (structured async exit delivery)"
             })
         ));
     }

@@ -7996,6 +7996,9 @@ fn ephemeral_question_diagnostic(
         EphemeralKind::AdmissionResult => {
             "postfix question is not a permitted consumer for ephemeral AdmissionResult"
         }
+        EphemeralKind::AsyncOutcome => {
+            "postfix question is not a permitted consumer for a structured async outcome"
+        }
         EphemeralKind::OwnershipConditionedActorCallOutcome => {
             "postfix question is not a permitted consumer for this ownership-conditioned outcome"
         }
@@ -8140,6 +8143,145 @@ fn exact_admission_result_use(
         }
     }
     Ok(usage.unwrap_or(EphemeralUse::DirectBinding))
+}
+
+fn exact_async_outcome_use(
+    request: &AnalysisRequest<'_>,
+    expression: ExpressionId,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<EphemeralUse, AnalysisFailure> {
+    let usage = exact_admission_result_use(request, expression, is_cancelled)?;
+    if usage == EphemeralUse::PatternMatch
+        && !exact_async_outcome_nested_match(request.hir.as_program(), expression)
+    {
+        return Ok(EphemeralUse::DirectBinding);
+    }
+    Ok(usage)
+}
+
+fn exact_async_outcome_nested_match(
+    program: &wrela_hir::Program,
+    expression: ExpressionId,
+) -> bool {
+    let mut matches = program
+        .statements
+        .iter()
+        .filter_map(|statement| match &statement.kind {
+            StatementKind::Match { scrutinee, arms } if *scrutinee == expression => Some(arms),
+            _ => None,
+        });
+    let Some(arms) = matches.next() else {
+        return false;
+    };
+    if matches.next().is_some() || arms.len() != 2 {
+        return false;
+    }
+    let mut ok_seen = false;
+    let mut err_binding = None;
+    let mut err_body = None;
+    for arm in arms {
+        if arm.guard.is_some() {
+            return false;
+        }
+        let Some((candidate, arguments)) = exact_constructor_pattern(program, arm.pattern) else {
+            return false;
+        };
+        let Some(declaration) = program.declaration(candidate.enumeration.declaration) else {
+            return false;
+        };
+        if declaration.name.as_ref().map(wrela_hir::Name::as_str) != Some("Result") {
+            return false;
+        }
+        match candidate.variant {
+            0 if !ok_seen && arguments.len() == 1 => ok_seen = true,
+            1 if err_binding.is_none() && arguments.len() == 1 => {
+                let Some(local) = constructor_pattern_binding(program, &arguments[0]) else {
+                    return false;
+                };
+                err_binding = Some(local);
+                err_body = Some(arm.body);
+            }
+            _ => return false,
+        }
+    }
+    let (Some(binding), Some(body)) = (err_binding, err_body) else {
+        return false;
+    };
+    let Some(body) = program.body(body) else {
+        return false;
+    };
+    let [statement] = body.statements.as_slice() else {
+        return false;
+    };
+    let Some(StatementKind::Match { scrutinee, arms }) = program
+        .statement(*statement)
+        .map(|statement| &statement.kind)
+    else {
+        return false;
+    };
+    if !program.expression(*scrutinee).is_some_and(|expression| {
+        expression.kind == ExpressionKind::Reference(Definition::Local(binding))
+    }) || arms.len() != 4
+    {
+        return false;
+    }
+    for (expected_variant, arm) in arms.iter().enumerate() {
+        if arm.guard.is_some() {
+            return false;
+        }
+        let Some((candidate, arguments)) = exact_constructor_pattern(program, arm.pattern) else {
+            return false;
+        };
+        let Some(declaration) = program.declaration(candidate.enumeration.declaration) else {
+            return false;
+        };
+        if declaration.name.as_ref().map(wrela_hir::Name::as_str) != Some("AsyncExit")
+            || candidate.variant as usize != expected_variant
+            || arguments.len() != 1
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn exact_constructor_pattern(
+    program: &wrela_hir::Program,
+    pattern: wrela_hir::PatternId,
+) -> Option<(&wrela_hir::ResolvedVariant, &[wrela_hir::PatternArgument])> {
+    let pattern = program.patterns.get(pattern.0 as usize)?;
+    let [alternative] = pattern.alternatives.as_slice() else {
+        return None;
+    };
+    let wrela_hir::PrimaryPattern::Constructor {
+        candidates,
+        arguments,
+        ..
+    } = &alternative.kind
+    else {
+        return None;
+    };
+    let [candidate] = candidates.as_slice() else {
+        return None;
+    };
+    Some((candidate, arguments))
+}
+
+fn constructor_pattern_binding(
+    program: &wrela_hir::Program,
+    argument: &wrela_hir::PatternArgument,
+) -> Option<LocalId> {
+    if argument.take {
+        return None;
+    }
+    let pattern = program.patterns.get(argument.pattern.0 as usize)?;
+    let [alternative] = pattern.alternatives.as_slice() else {
+        return None;
+    };
+    match alternative.kind {
+        wrela_hir::PrimaryPattern::Bind(local) => Some(local),
+        _ => None,
+    }
 }
 
 fn analyze_actor_send_expression(
@@ -9099,7 +9241,7 @@ fn analyze_await_expression(
             _ => None,
         })
         .is_some_and(|base| matches!(base.kind, ExpressionKind::Field { .. }));
-    let awaited = if actor_dependency_call {
+    let mut awaited = if actor_dependency_call {
         let resolved = resolve_self_actor_send(
             request,
             partial,
@@ -9158,7 +9300,7 @@ fn analyze_await_expression(
             function,
             await_expression.operand,
             RuntimeExpressionRequest {
-                expected: expression_request.expected,
+                expected: None,
                 desired_result: None,
                 access: AccessMode::Value,
             },
@@ -9166,7 +9308,7 @@ fn analyze_await_expression(
             is_cancelled,
         )?
     };
-    let target_is_async = partial
+    let target = partial
         .expressions
         .iter()
         .find(|fact| fact.function == function && fact.expression == await_expression.operand)
@@ -9177,9 +9319,13 @@ fn analyze_await_expression(
             | ExpressionResolution::ActorRequest { method: target, .. } => Some(target),
             _ => None,
         })
-        .and_then(|target| partial.functions.get(target.0 as usize))
-        .is_some_and(|target| target.color == FunctionColor::Async);
-    if !target_is_async {
+        .and_then(|target| {
+            partial
+                .functions
+                .get(target.0 as usize)
+                .map(|record| (target, record))
+        });
+    if target.is_none_or(|(_, target)| target.color != FunctionColor::Async) {
         let mut diagnostic = Diagnostic::error(
             Category::ASYNC,
             await_expression.source,
@@ -9192,6 +9338,130 @@ fn analyze_await_expression(
         );
         return Err(RuntimeFailure::Diagnostic(Box::new(diagnostic)));
     }
+    let direct_fallible =
+        if actor_dependency_call {
+            None
+        } else {
+            target.and_then(|(_, target)| {
+                let record = partial.types.get(target.result.0 as usize)?;
+                let SemanticTypeKind::Enumeration {
+                    declaration,
+                    arguments,
+                    variants,
+                } = &record.kind
+                else {
+                    return None;
+                };
+                let declaration_record = request.hir.as_program().declaration(*declaration)?;
+                let resolved = wrela_hir::ResolvedDeclaration {
+                    package: request.standard_library_package,
+                    module: declaration_record.module,
+                    declaration: *declaration,
+                };
+                is_exact_core_result_declaration(request, &resolved, declaration_record)
+                    .then_some((*declaration, arguments.clone(), variants.clone()))
+            })
+        };
+    let mut structured_async_outcome = false;
+    if let Some((result_declaration, arguments, variants)) = direct_fallible {
+        let u64_ty = ensure_primitive_type(
+            request,
+            partial,
+            PrimitiveSemanticType::Integer {
+                signed: false,
+                bits: 64,
+                pointer_sized: false,
+            },
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )?;
+        let exact_declared = matches!(arguments.as_slice(),
+                [SemanticArgument::Type(ok), SemanticArgument::Type(err)]
+                    if *ok == u64_ty && *err == u64_ty)
+            && matches!(variants.as_slice(), [ok, err]
+                if ok.name == "Ok"
+                    && err.name == "Err"
+                    && matches!((ok.fields.as_slice(), err.fields.as_slice()), ([ok], [err])
+                        if ok.ty == u64_ty && err.ty == u64_ty));
+        if !exact_declared {
+            return Err(runtime_type_diagnostic(
+                request,
+                await_expression.source,
+                "semantic-async-outcome-type-pending",
+                "fallible async activation result is outside the bounded structured outcome specialization",
+                "this increment accepts exactly direct non-actor async Result[u64, u64]",
+                "use Result[u64, u64] until wider AsyncExit specialization lands",
+            ));
+        }
+        let usage = exact_async_outcome_use(request, await_expression.expression, is_cancelled)?;
+        match usage {
+            EphemeralUse::Question => {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    await_expression.source,
+                    "semantic-async-outcome-question-pending",
+                    "postfix question cannot yet propagate a structured async outcome",
+                    "AsyncExit conversion and abnormal cleanup are not implemented by this analysis slice",
+                    "consume the await directly with exhaustive match or an is-pattern",
+                ));
+            }
+            EphemeralUse::PatternMatch | EphemeralUse::TypeTest => {}
+            EphemeralUse::DirectBinding | EphemeralUse::ImmediateRead => {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    await_expression.source,
+                    "semantic-async-outcome-consumer-pending",
+                    "structured async outcome is not consumed by an admitted immediate form",
+                    "this bounded slice permits only an exhaustive nested match or direct is-pattern",
+                    "consume the awaited Result directly with nested match or is",
+                ));
+            }
+        }
+        let async_exit = ensure_core_async_exit_type(
+            request,
+            partial,
+            u64_ty,
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )?;
+        let effective = ensure_core_result_type_from_semantic_arguments(
+            request,
+            partial,
+            result_declaration,
+            u64_ty,
+            async_exit,
+            &mut *state.aggregate_work,
+            is_cancelled,
+        )?;
+        if expression_request
+            .expected
+            .is_some_and(|expected| expected != effective)
+        {
+            return Err(runtime_type_diagnostic(
+                request,
+                await_expression.source,
+                "semantic-async-outcome-consumer-pending",
+                "structured async outcome cannot be stored in its declared Result type",
+                "await widens the declared operation error to AsyncExit at the suspension boundary",
+                "consume the effective outcome immediately with nested match or is",
+            ));
+        }
+        awaited.ty = effective;
+        structured_async_outcome = true;
+    }
+    if expression_request
+        .expected
+        .is_some_and(|expected| expected != awaited.ty)
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            await_expression.source,
+            "semantic-await-result-type",
+            "awaited activation result does not match its required context",
+            "await preserves the declared result for ordinary activations and widens fallible errors to the structured outcome taxonomy",
+            "change the destination type or consume the structured outcome immediately",
+        ));
+    }
     let result = expression_result(
         request,
         partial,
@@ -9201,6 +9471,13 @@ fn analyze_await_expression(
         expression_request.desired_result,
         is_cancelled,
     )?;
+    if structured_async_outcome {
+        partial
+            .values
+            .get_mut(result.0 as usize)
+            .ok_or(AnalysisFailure::RequestMismatch)?
+            .class = SemanticValueClass::Ephemeral(EphemeralKind::AsyncOutcome);
+    }
     let effects = EffectSet(awaited.effects.0 | EffectSet::SUSPEND);
     append_expression_fact(
         request,
@@ -12214,6 +12491,16 @@ fn analyze_closed_enum_constructor(
     let DeclarationKind::Enumeration(enumeration) = &declaration.kind else {
         return Err(AnalysisFailure::RequestMismatch.into());
     };
+    if is_exact_core_async_exit_declaration(request, &resolved.enumeration, declaration) {
+        return Err(runtime_type_diagnostic(
+            request,
+            call.source,
+            "semantic-core-outcome-construction-forbidden",
+            "source code cannot construct a sealed core AsyncExit cause",
+            "structured cancellation, deadline, and operation exits are minted only by the compiler/runtime await boundary",
+            "consume the AsyncExit value delivered by await instead of constructing one",
+        ));
+    }
     let ty = if enumeration.generics.is_empty() {
         ensure_closed_scalar_enum_type(
             request,
@@ -15472,6 +15759,52 @@ fn semantic_type_from_source(
                         &mut *aggregate_work,
                         is_cancelled,
                     )
+                } else if is_exact_core_async_exit_declaration(request, resolved, declaration) {
+                    let [argument] = arguments.as_slice() else {
+                        return Err(runtime_type_diagnostic(
+                            request,
+                            source.source,
+                            "semantic-async-outcome-type-pending",
+                            "core AsyncExit requires exactly one supported operation-error type",
+                            "this bounded outcome slice specializes only AsyncExit[u64]",
+                            "use AsyncExit[u64] at this analysis boundary",
+                        ));
+                    };
+                    let error = core_result_scalar_argument(
+                        request,
+                        partial,
+                        argument,
+                        aggregate_work,
+                        is_cancelled,
+                    )?;
+                    let u64_ty = ensure_primitive_type(
+                        request,
+                        partial,
+                        PrimitiveSemanticType::Integer {
+                            signed: false,
+                            bits: 64,
+                            pointer_sized: false,
+                        },
+                        aggregate_work,
+                        is_cancelled,
+                    )?;
+                    if error != u64_ty {
+                        return Err(runtime_type_diagnostic(
+                            request,
+                            argument.source,
+                            "semantic-async-outcome-type-pending",
+                            "core AsyncExit operation error is outside the bounded specialization",
+                            "this increment authenticates exactly AsyncExit[u64]",
+                            "use u64 until wider async outcome specialization lands",
+                        ));
+                    }
+                    ensure_core_async_exit_type(
+                        request,
+                        partial,
+                        error,
+                        aggregate_work,
+                        is_cancelled,
+                    )
                 } else {
                     ensure_closed_scalar_enum_type_from_source_arguments(
                         request,
@@ -15758,6 +16091,376 @@ fn is_exact_core_result_declaration(
                     } if *candidate == generic && arguments.is_empty()))
         };
     exact_variant(ok, "Ok", *ok_generic) && exact_variant(err, "Err", *err_generic)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CoreAsyncExitDeclarations {
+    outcome: DeclarationId,
+    cancelled: DeclarationId,
+    deadline_rejected: DeclarationId,
+    deadline_exceeded: DeclarationId,
+}
+
+fn core_async_exit_declarations(
+    request: &AnalysisRequest<'_>,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<CoreAsyncExitDeclarations> {
+    let program = request.hir.as_program();
+    let mut outcome = None;
+    let mut cancelled = None;
+    let mut deadline_rejected = None;
+    let mut deadline_exceeded = None;
+    for declaration in &program.declarations {
+        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+        let Some(module) = program.modules.get(declaration.module.0 as usize) else {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        };
+        if module.package != request.standard_library_package || module.path.dotted() != "actor" {
+            continue;
+        }
+        let slot = match declaration.name.as_ref().map(wrela_hir::Name::as_str) {
+            Some("AsyncExit") => &mut outcome,
+            Some("Cancelled") => &mut cancelled,
+            Some("DeadlineRejected") => &mut deadline_rejected,
+            Some("DeadlineExceeded") => &mut deadline_exceeded,
+            _ => continue,
+        };
+        if slot.replace(declaration.id).is_some() {
+            return Err(runtime_type_diagnostic(
+                request,
+                declaration.source,
+                "semantic-async-outcome-core-shape",
+                "core.actor structured async outcome declarations are ambiguous",
+                "the compiler authenticates one exact declaration for AsyncExit and each sealed cause",
+                "restore the checked-in core.actor outcome taxonomy",
+            ));
+        }
+    }
+    let declarations = CoreAsyncExitDeclarations {
+        outcome: outcome.ok_or_else(|| async_outcome_core_shape_diagnostic(request))?,
+        cancelled: cancelled.ok_or_else(|| async_outcome_core_shape_diagnostic(request))?,
+        deadline_rejected: deadline_rejected
+            .ok_or_else(|| async_outcome_core_shape_diagnostic(request))?,
+        deadline_exceeded: deadline_exceeded
+            .ok_or_else(|| async_outcome_core_shape_diagnostic(request))?,
+    };
+    if !exact_core_async_exit_source_shape(request, declarations) {
+        return Err(async_outcome_core_shape_diagnostic(request));
+    }
+    Ok(declarations)
+}
+
+fn async_outcome_core_shape_diagnostic(request: &AnalysisRequest<'_>) -> RuntimeFailure {
+    runtime_type_diagnostic(
+        request,
+        fallback_span(request.hir.as_program()),
+        "semantic-async-outcome-core-shape",
+        "core.actor structured async outcome differs from its sealed declaration contract",
+        "visibility, ownership, generic identity, variant order, and cause payload identity are compiler-authenticated",
+        "restore the exact public Cancelled, DeadlineRejected, DeadlineExceeded, and AsyncExit declarations",
+    )
+}
+
+fn exact_core_async_exit_source_shape(
+    request: &AnalysisRequest<'_>,
+    declarations: CoreAsyncExitDeclarations,
+) -> bool {
+    let program = request.hir.as_program();
+    let exact_cause = |id: DeclarationId| {
+        program.declaration(id).is_some_and(|record| {
+            record.visibility == wrela_hir::Visibility::Public
+                && matches!(&record.kind, DeclarationKind::Structure(aggregate)
+                    if aggregate.generics.is_empty()
+                        && aggregate.implements.is_empty()
+                        && aggregate.fields.is_empty()
+                        && aggregate.members.is_empty()
+                        && !aggregate.linear
+                        && !aggregate.copy
+                        && aggregate.deriving.is_empty())
+        })
+    };
+    if !exact_cause(declarations.cancelled)
+        || !exact_cause(declarations.deadline_rejected)
+        || !exact_cause(declarations.deadline_exceeded)
+    {
+        return false;
+    }
+    let Some(record) = program.declaration(declarations.outcome) else {
+        return false;
+    };
+    let DeclarationKind::Enumeration(enumeration) = &record.kind else {
+        return false;
+    };
+    let [generic] = enumeration.generics.as_slice() else {
+        return false;
+    };
+    let exact_generic = program
+        .generic_parameter(*generic)
+        .is_some_and(|parameter| {
+            parameter.owner == declarations.outcome
+                && matches!(
+                    parameter.kind,
+                    wrela_hir::GenericParameterKind::Type { bound: None }
+                )
+        });
+    let exact_payload =
+        |variant: &wrela_hir::EnumVariant,
+         name: &str,
+         expected: Result<wrela_hir::GenericParameterId, DeclarationId>| {
+            variant.name.as_str() == name
+                && matches!(variant.fields.as_slice(), [field]
+                if field.name.is_none()
+                    && match (&field.ty.kind, expected) {
+                        (TypeExpressionKind::Named {
+                            definition: Definition::Generic(actual),
+                            arguments,
+                        }, Ok(expected)) => *actual == expected && arguments.is_empty(),
+                        (TypeExpressionKind::Named {
+                            definition: Definition::Declaration(actual),
+                            arguments,
+                        }, Err(expected)) => actual.package == request.standard_library_package
+                            && actual.declaration == expected
+                            && arguments.is_empty(),
+                        _ => false,
+                    })
+        };
+    record.visibility == wrela_hir::Visibility::Public
+        && exact_generic
+        && enumeration.members.is_empty()
+        && enumeration.deriving.is_empty()
+        && matches!(enumeration.variants.as_slice(), [operation, cancelled, rejected, exceeded]
+            if exact_payload(operation, "Operation", Ok(*generic))
+                && exact_payload(cancelled, "Cancelled", Err(declarations.cancelled))
+                && exact_payload(rejected, "DeadlineRejected", Err(declarations.deadline_rejected))
+                && exact_payload(exceeded, "DeadlineExceeded", Err(declarations.deadline_exceeded)))
+}
+
+fn is_exact_core_async_exit_declaration(
+    request: &AnalysisRequest<'_>,
+    resolved: &wrela_hir::ResolvedDeclaration,
+    record: &wrela_hir::Declaration,
+) -> bool {
+    resolved.package == request.standard_library_package
+        && record.visibility == wrela_hir::Visibility::Public
+        && record.name.as_ref().map(wrela_hir::Name::as_str) == Some("AsyncExit")
+        && request
+            .hir
+            .as_program()
+            .modules
+            .get(resolved.module.0 as usize)
+            .is_some_and(|module| module.path.dotted() == "actor")
+}
+
+fn ensure_core_async_exit_type(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    error: SemanticTypeId,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
+    let declarations = core_async_exit_declarations(request, aggregate_work, is_cancelled)?;
+    let mut causes = Vec::new();
+    causes
+        .try_reserve_exact(3)
+        .map_err(|_| fact_resource(request, "structured async exit cause types"))?;
+    for declaration in [
+        declarations.cancelled,
+        declarations.deadline_rejected,
+        declarations.deadline_exceeded,
+    ] {
+        let mut existing = None;
+        for ty in &partial.types {
+            charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+            if matches!(&ty.kind, SemanticTypeKind::Structure { declaration: candidate, arguments, fields }
+                if *candidate == declaration && arguments.is_empty() && fields.is_empty())
+            {
+                existing = Some(ty.id);
+                break;
+            }
+        }
+        if let Some(existing) = existing {
+            causes.push(existing);
+            continue;
+        }
+        if partial.types.len() >= request.limits.types as usize {
+            return Err(fact_resource(request, "semantic types").into());
+        }
+        let id = SemanticTypeId(
+            u32::try_from(partial.types.len())
+                .map_err(|_| fact_resource(request, "semantic types"))?,
+        );
+        let source = request
+            .hir
+            .as_program()
+            .declaration(declaration)
+            .map(|record| record.source)
+            .ok_or(AnalysisFailure::RequestMismatch)?;
+        partial
+            .types
+            .try_reserve(1)
+            .map_err(|_| fact_resource(request, "semantic types"))?;
+        partial.types.push(SemanticType {
+            id,
+            kind: SemanticTypeKind::Structure {
+                declaration,
+                arguments: Vec::new(),
+                fields: Vec::new(),
+            },
+            linearity: Linearity::ExplicitCopy,
+            size_upper_bound: Some(0),
+            alignment_lower_bound: 1,
+            source: Some(source),
+        });
+        causes.push(id);
+    }
+    let arguments = [SemanticArgument::Type(error)];
+    for ty in &partial.types {
+        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+        if matches!(&ty.kind, SemanticTypeKind::Enumeration { declaration, arguments: candidate, .. }
+            if *declaration == declarations.outcome && candidate.as_slice() == arguments)
+        {
+            return Ok(ty.id);
+        }
+    }
+    if partial.types.len() >= request.limits.types as usize {
+        return Err(fact_resource(request, "semantic types").into());
+    }
+    let id = SemanticTypeId(
+        u32::try_from(partial.types.len()).map_err(|_| fact_resource(request, "semantic types"))?,
+    );
+    let variants = [
+        ("Operation", error),
+        ("Cancelled", causes[0]),
+        ("DeadlineRejected", causes[1]),
+        ("DeadlineExceeded", causes[2]),
+    ]
+    .into_iter()
+    .map(|(name, ty)| SemanticVariant {
+        name: name.to_owned(),
+        fields: vec![SemanticField {
+            name: String::new(),
+            ty,
+            public: true,
+        }],
+    })
+    .collect();
+    let source = request
+        .hir
+        .as_program()
+        .declaration(declarations.outcome)
+        .map(|record| record.source)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    partial
+        .types
+        .try_reserve(1)
+        .map_err(|_| fact_resource(request, "semantic types"))?;
+    partial.types.push(SemanticType {
+        id,
+        kind: SemanticTypeKind::Enumeration {
+            declaration: declarations.outcome,
+            arguments: arguments.to_vec(),
+            variants,
+        },
+        linearity: Linearity::ExplicitCopy,
+        size_upper_bound: Some(16),
+        alignment_lower_bound: 8,
+        source: Some(source),
+    });
+    Ok(id)
+}
+
+fn ensure_core_result_type_from_semantic_arguments(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    declaration: DeclarationId,
+    ok: SemanticTypeId,
+    err: SemanticTypeId,
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
+    let record = request
+        .hir
+        .as_program()
+        .declaration(declaration)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let resolved = wrela_hir::ResolvedDeclaration {
+        package: request.standard_library_package,
+        module: record.module,
+        declaration,
+    };
+    if !is_exact_core_result_declaration(request, &resolved, record) {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    let arguments = [SemanticArgument::Type(ok), SemanticArgument::Type(err)];
+    for ty in &partial.types {
+        charge_runtime_aggregate_lookup(request, aggregate_work, is_cancelled)?;
+        if matches!(&ty.kind, SemanticTypeKind::Enumeration { declaration: candidate, arguments: actual, .. }
+            if *candidate == declaration && actual.as_slice() == arguments)
+        {
+            return Ok(ty.id);
+        }
+    }
+    let ok_layout = partial
+        .types
+        .get(ok.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let err_layout = partial
+        .types
+        .get(err.0 as usize)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let alignment = ok_layout
+        .alignment_lower_bound
+        .max(err_layout.alignment_lower_bound)
+        .max(1);
+    let payload_size = ok_layout
+        .size_upper_bound
+        .zip(err_layout.size_upper_bound)
+        .map(|(left, right)| left.max(right))
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let mask = u64::from(alignment) - 1;
+    let offset = 1_u64
+        .checked_add(mask)
+        .map(|value| value & !mask)
+        .ok_or_else(|| fact_resource(request, "structured async Result layout"))?;
+    let size = offset
+        .checked_add(payload_size)
+        .and_then(|value| value.checked_add(mask))
+        .map(|value| value & !mask)
+        .ok_or_else(|| fact_resource(request, "structured async Result layout"))?;
+    if partial.types.len() >= request.limits.types as usize {
+        return Err(fact_resource(request, "semantic types").into());
+    }
+    let id = SemanticTypeId(
+        u32::try_from(partial.types.len()).map_err(|_| fact_resource(request, "semantic types"))?,
+    );
+    partial
+        .types
+        .try_reserve(1)
+        .map_err(|_| fact_resource(request, "semantic types"))?;
+    partial.types.push(SemanticType {
+        id,
+        kind: SemanticTypeKind::Enumeration {
+            declaration,
+            arguments: arguments.to_vec(),
+            variants: [("Ok", ok), ("Err", err)]
+                .into_iter()
+                .map(|(name, ty)| SemanticVariant {
+                    name: name.to_owned(),
+                    fields: vec![SemanticField {
+                        name: String::new(),
+                        ty,
+                        public: true,
+                    }],
+                })
+                .collect(),
+        },
+        linearity: Linearity::ExplicitCopy,
+        size_upper_bound: Some(size),
+        alignment_lower_bound: alignment,
+        source: Some(record.source),
+    });
+    Ok(id)
 }
 
 fn ensure_core_admission_result_type(
@@ -24672,6 +25375,8 @@ mod tests {
 
     const PARSED_CORE_IMAGE_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
     const PARSED_CORE_ACTOR_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/actor.wr");
+    const PARSED_CORE_RESULT_SOURCE: &str =
+        include_str!("../../../std/wrela-core-0.1/src/result.wr");
     const PARSED_COMPTIME_IMAGE_SOURCE: &str = "module app.image\n\nfrom core.image import Image, Target\n\n@image\npub fn boot() -> Image:\n    return Image(name=\"bootstrap\", target=Target.aarch64_qemu_virt_uefi)\n";
     const PARSED_COMPTIME_MATH_SOURCE: &str = "module app.math\n\npub fn add(left: u32, right: u32) -> u32:\n    return left + right\n\npub fn leaf(value: u32) -> u32:\n    return add(left=value, right=1)\n\npub fn middle(value: u32) -> u32:\n    return leaf(value)\n";
     const PARSED_COMPTIME_TEST_SOURCE: &str = "module app.math_test\n\nfrom app.math import add, middle\n\n@test\nfn imported_scalars_work():\n    caller: u32 = 40\n    nested: u32 = middle(caller)\n    caller = add(left=caller, right=2)\n    valid: bool = nested == 41 and not false\n    if valid:\n        comptime assert caller == 42, \"caller local was not preserved\"\n    else:\n        comptime assert false, \"nested scalar call failed\"\n";
@@ -24750,13 +25455,30 @@ pub struct Packet:
                 digest: Sha256Digest::from_bytes([0xc1; 32]),
             })
             .expect("core image source");
+        let result_file = include_actor
+            .then(|| {
+                sources.add(SourceInput {
+                    path: "result.wr".to_owned(),
+                    text: PARSED_CORE_RESULT_SOURCE.to_owned(),
+                    digest: Sha256Digest::from_bytes([0xc3; 32]),
+                })
+            })
+            .transpose()
+            .expect("core result source");
         let mut parsed_files = Vec::new();
         parsed_files
-            .try_reserve_exact(2 + usize::from(actor_file.is_some()))
+            .try_reserve_exact(
+                2 + usize::from(actor_file.is_some()) + usize::from(result_file.is_some()),
+            )
             .expect("bounded parsed actor files");
-        for file in [actor_file, Some(application_file), Some(core_file)]
-            .into_iter()
-            .flatten()
+        for file in [
+            actor_file,
+            Some(application_file),
+            Some(core_file),
+            result_file,
+        ]
+        .into_iter()
+        .flatten()
         {
             let (parsed, diagnostics) = WrelaSyntaxParser::new()
                 .parse(
@@ -24804,6 +25526,15 @@ pub struct Packet:
                     actor_file,
                 )
                 .expect("core actor module");
+        }
+        if let Some(result_file) = result_file {
+            graph
+                .add_module(
+                    core,
+                    ModulePath::new(["result".to_owned()]).expect("core result module path"),
+                    result_file,
+                )
+                .expect("core result module");
         }
         graph
             .add_module(
@@ -26515,6 +27246,47 @@ pub fn boot() -> Image:
         )
     }
 
+    fn fallible_async_actor_source(task_body: &str) -> String {
+        format!(
+            r#"module app
+
+from core.actor import AsyncExit
+from core.image import Image, Target
+from core.result import Result
+
+async fn checkpoint() -> Result[u64, u64]:
+    return Result.Ok(7)
+
+@service
+pub struct Worker:
+    @task
+    async fn consume(mut self):
+{task_body}
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#
+        )
+    }
+
+    const FALLIBLE_ASYNC_NESTED_MATCH: &str = r#"        match await checkpoint():
+            case Result.Ok(value):
+                pass
+            case Result.Err(outcome):
+                match outcome:
+                    case AsyncExit.Operation(error):
+                        pass
+                    case AsyncExit.Cancelled(_):
+                        pass
+                    case AsyncExit.DeadlineRejected(_):
+                        pass
+                    case AsyncExit.DeadlineExceeded(_):
+                        pass
+"#;
+
     const ACTOR_REPLY_SOURCE: &str = r#"module app
 
 from core.image import Image, Target
@@ -26850,6 +27622,374 @@ pub fn boot() -> Image:
                 .validate_for_seal(image.hir(), &|| false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn fallible_direct_async_await_produces_authenticated_async_exit_for_nested_match() {
+        let source = fallible_async_actor_source(FALLIBLE_ASYNC_NESTED_MATCH);
+        let fixture = parsed_actor_admission_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("fallible async analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "authenticated AsyncExit match must analyze: {:?}",
+            output.diagnostics()
+        );
+        let image = output.successful().expect("sealed fallible async image");
+        let facts = image.facts();
+        let await_fact = facts
+            .expressions
+            .iter()
+            .find(|fact| {
+                fact.resolution == ExpressionResolution::Builtin(IntrinsicOperation::Await)
+                    && matches!(
+                        facts
+                            .values
+                            .get(fact.result.expect("await result").0 as usize),
+                        Some(SemanticValue {
+                            class: SemanticValueClass::Ephemeral(EphemeralKind::AsyncOutcome),
+                            ..
+                        })
+                    )
+            })
+            .expect("fallible await fact");
+        let SemanticTypeKind::Enumeration {
+            variants: result_variants,
+            ..
+        } = &facts.types[await_fact.ty.0 as usize].kind
+        else {
+            panic!("effective await Result type");
+        };
+        let async_exit = result_variants[1].fields[0].ty;
+        assert!(matches!(
+            &facts.types[async_exit.0 as usize].kind,
+            SemanticTypeKind::Enumeration { arguments, variants, .. }
+                if arguments.as_slice() == [SemanticArgument::Type(result_variants[0].fields[0].ty)]
+                    && variants.iter().map(|variant| variant.name.as_str()).eq([
+                        "Operation",
+                        "Cancelled",
+                        "DeadlineRejected",
+                        "DeadlineExceeded",
+                    ])
+        ));
+    }
+
+    #[test]
+    fn fallible_direct_async_outcome_supports_direct_is() {
+        for pattern in ["Result.Ok(_)", "Result.Err(_)"] {
+            let source = fallible_async_actor_source(&format!(
+                "        selected: bool = await checkpoint() is {pattern}\n"
+            ));
+            let fixture = parsed_actor_admission_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("fallible async is analysis");
+            assert!(
+                output.diagnostics().is_empty(),
+                "direct {pattern} test must analyze: {:?}",
+                output.diagnostics()
+            );
+            assert!(output.successful().is_some());
+        }
+    }
+
+    #[test]
+    fn async_exit_core_shape_is_authenticated_exactly() {
+        let source = fallible_async_actor_source(FALLIBLE_ASYNC_NESTED_MATCH);
+        let mut fixture = parsed_actor_admission_fixture(&source);
+        let mut program = fixture.fixture.hir.as_ref().clone().into_program();
+        let outcome = program
+            .declarations
+            .iter_mut()
+            .find(|declaration| declaration.name.as_ref().map(Name::as_str) == Some("AsyncExit"))
+            .expect("core AsyncExit declaration");
+        outcome.visibility = Visibility::Private;
+        fixture.fixture.hir =
+            Arc::new(program.validate().expect("structurally valid core forgery"));
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("core shape rejection");
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-async-outcome-core-shape")
+        );
+        assert!(output.successful().is_none());
+    }
+
+    #[test]
+    fn async_exit_source_construction_is_forbidden_by_name() {
+        let source = fallible_async_actor_source(
+            "        forged: AsyncExit[u64] = AsyncExit.Operation(1)\n",
+        );
+        let fixture = parsed_actor_admission_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("source construction rejection");
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-core-outcome-construction-forbidden")
+        );
+    }
+
+    #[test]
+    fn async_exit_consumer_tails_fail_closed_by_name() {
+        for (body, code) in [
+            (
+                "        await checkpoint()\n",
+                "semantic-async-outcome-consumer-pending",
+            ),
+            (
+                "        stored: Result[u64, u64] = await checkpoint()\n",
+                "semantic-async-outcome-consumer-pending",
+            ),
+            (
+                "        propagated: u64 = (await checkpoint())?\n",
+                "semantic-async-outcome-question-pending",
+            ),
+        ] {
+            let source = fallible_async_actor_source(body);
+            let fixture = parsed_actor_admission_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("async outcome tail rejection");
+            assert_eq!(
+                output.diagnostics()[0].code.as_deref(),
+                Some(code),
+                "{body}: {:?}",
+                output.diagnostics()
+            );
+        }
+
+        let unsupported = fallible_async_actor_source(FALLIBLE_ASYNC_NESTED_MATCH)
+            .replace("Result[u64, u64]", "Result[u8, u8]");
+        let fixture = parsed_actor_admission_fixture(&unsupported);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("async outcome type rejection");
+        assert_eq!(
+            output.diagnostics()[0].code.as_deref(),
+            Some("semantic-async-outcome-type-pending")
+        );
+    }
+
+    #[test]
+    fn async_exit_effective_type_forgeries_fail_full_seal() {
+        let source = fallible_async_actor_source(FALLIBLE_ASYNC_NESTED_MATCH);
+        let fixture = parsed_actor_admission_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("fallible async analysis");
+        let image = output.successful().expect("sealed fallible async image");
+        let facts = image.facts();
+        let await_index = facts
+            .expressions
+            .iter()
+            .position(|fact| {
+                fact.resolution == ExpressionResolution::Builtin(IntrinsicOperation::Await)
+                    && fact.result.is_some_and(|value| {
+                        facts.values[value.0 as usize].class
+                            == SemanticValueClass::Ephemeral(EphemeralKind::AsyncOutcome)
+                    })
+            })
+            .expect("structured await fact");
+        let await_fact = &facts.expressions[await_index];
+        let await_result = await_fact.result.expect("structured await value");
+        let operand = image
+            .hir()
+            .as_program()
+            .expression(await_fact.expression)
+            .and_then(|expression| match expression.kind {
+                ExpressionKind::Unary {
+                    operator: wrela_hir::UnaryOperator::Await,
+                    operand,
+                } => Some(operand),
+                _ => None,
+            })
+            .expect("await operand");
+        let declared = facts
+            .expressions
+            .iter()
+            .find(|fact| fact.function == await_fact.function && fact.expression == operand)
+            .map(|fact| fact.ty)
+            .expect("declared async result");
+        let effective = await_fact.ty;
+        let async_exit = match &facts.types[effective.0 as usize].kind {
+            SemanticTypeKind::Enumeration { variants, .. } => variants[1].fields[0].ty,
+            _ => panic!("effective Result"),
+        };
+
+        let mut forged_await = facts.clone();
+        forged_await.expressions[await_index].ty = declared;
+        forged_await.values[await_result.0 as usize].ty = declared;
+        forged_await
+            .validate_partial_structure()
+            .expect("declared-type substitution remains prefix-valid");
+        assert!(
+            forged_await
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut forged_outer_payload = facts.clone();
+        let SemanticTypeKind::Enumeration { variants, .. } =
+            &mut forged_outer_payload.types[effective.0 as usize].kind
+        else {
+            unreachable!();
+        };
+        variants[1].fields[0].ty = variants[0].fields[0].ty;
+        forged_outer_payload
+            .validate_partial_structure()
+            .expect("outer payload substitution remains prefix-valid");
+        assert!(
+            forged_outer_payload
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut forged_variant_order = facts.clone();
+        let SemanticTypeKind::Enumeration { variants, .. } =
+            &mut forged_variant_order.types[async_exit.0 as usize].kind
+        else {
+            unreachable!();
+        };
+        variants.swap(1, 2);
+        forged_variant_order
+            .validate_partial_structure()
+            .expect("variant reorder remains prefix-valid");
+        assert!(
+            forged_variant_order
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let cause_types = match &facts.types[async_exit.0 as usize].kind {
+            SemanticTypeKind::Enumeration { variants, .. } => {
+                [variants[1].fields[0].ty, variants[2].fields[0].ty]
+            }
+            _ => unreachable!(),
+        };
+        let mut forged_cause = facts.clone();
+        let SemanticTypeKind::Structure { declaration, .. } =
+            &mut forged_cause.types[cause_types[0].0 as usize].kind
+        else {
+            unreachable!();
+        };
+        *declaration = match facts.types[cause_types[1].0 as usize].kind {
+            SemanticTypeKind::Structure { declaration, .. } => declaration,
+            _ => unreachable!(),
+        };
+        forged_cause
+            .validate_partial_structure()
+            .expect("cause identity substitution remains prefix-valid");
+        assert!(
+            forged_cause
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut forged_program = image.hir().clone().into_program();
+        forged_program
+            .declarations
+            .iter_mut()
+            .find(|declaration| {
+                declaration.name.as_ref().map(Name::as_str) == Some("DeadlineExceeded")
+            })
+            .expect("deadline cause")
+            .visibility = Visibility::Private;
+        let forged_hir = forged_program.validate().expect("valid visibility forgery");
+        assert!(facts.validate_for_seal(&forged_hir, &|| false).is_err());
+    }
+
+    #[test]
+    fn async_exit_analysis_has_exact_type_limit_and_late_cancellation() {
+        let source = fallible_async_actor_source(FALLIBLE_ASYNC_NESTED_MATCH);
+        let fixture = parsed_actor_admission_fixture(&source);
+        let changes = no_changes();
+        let baseline_polls = Cell::new(0_u64);
+        let baseline = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| {
+                    baseline_polls.set(baseline_polls.get() + 1);
+                    false
+                },
+            )
+            .expect("baseline fallible async analysis");
+        let exact_types =
+            u32::try_from(baseline.partial().types.len()).expect("bounded type count");
+        assert!(exact_types > 1);
+
+        let mut exact_limits = AnalysisLimits::standard();
+        exact_limits.types = exact_types;
+        let exact = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, exact_limits),
+                &|| false,
+            )
+            .expect("exact type budget");
+        assert!(exact.successful().is_some());
+
+        let mut one_under_limits = AnalysisLimits::standard();
+        one_under_limits.types = exact_types - 1;
+        let one_under = CanonicalSemanticAnalyzer::new().analyze(
+            parsed_actor_request(&fixture, &changes, one_under_limits),
+            &|| false,
+        );
+        assert!(
+            matches!(
+                one_under,
+                Err(AnalysisFailure::ResourceLimit {
+                    resource: "semantic types",
+                    limit,
+                }) if limit == AnalysisLimits::standard().fact_edges
+            ),
+            "unexpected one-under result: {one_under:?}"
+        );
+
+        let last_poll = baseline_polls.get();
+        assert!(last_poll > 0);
+        let cancellation_polls = Cell::new(0_u64);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| {
+                    let next = cancellation_polls.get() + 1;
+                    cancellation_polls.set(next);
+                    next == last_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(cancellation_polls.get(), last_poll);
     }
 
     #[test]
@@ -36902,6 +38042,10 @@ fn view_question_is_forbidden():
             ),
             (
                 EphemeralKind::AdmissionResult,
+                [true, true, true, false, false],
+            ),
+            (
+                EphemeralKind::AsyncOutcome,
                 [true, true, true, false, false],
             ),
             (

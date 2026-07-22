@@ -1662,7 +1662,7 @@ mod tests {
         .expect("canonical core package content digest");
         assert_eq!(
             core_digest.to_hex(),
-            "24074c71215b7242b1f8ac979c48a36e85cbb1c2df6eab5971d1e4a90a29c432"
+            "50db9ecc66b9d69954e1785e5835e3b09ffa3272838e5350545d02676857e474"
         );
         let application_digest = package_content_digest(
             &application_canonical,

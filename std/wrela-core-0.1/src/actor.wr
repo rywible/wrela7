@@ -1,5 +1,20 @@
 module actor
 
+pub struct Cancelled:
+    pass
+
+pub struct DeadlineRejected:
+    pass
+
+pub struct DeadlineExceeded:
+    pass
+
+pub enum AsyncExit[E]:
+    Operation(E,)
+    Cancelled(Cancelled,)
+    DeadlineRejected(DeadlineRejected,)
+    DeadlineExceeded(DeadlineExceeded,)
+
 pub enum AdmissionError:
     Full
     Restarting
