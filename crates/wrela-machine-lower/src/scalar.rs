@@ -5229,8 +5229,9 @@ fn authenticated_flat_structure_builder_call(
 /// Authenticate the first ordinary owned-aggregate function boundary without
 /// widening the general aggregate ABI. The callee is deliberately exact: one
 /// source function, one two-field flat-copy receiver, and either one scalar
-/// projection or one scalar passthrough argument. Every adjacent aggregate
-/// parameter/result shape remains behind the named function-boundary diagnostic.
+/// projection, one scalar passthrough argument, or one checked `u64` addition
+/// of the two. Every adjacent aggregate parameter/result shape remains behind
+/// the named function-boundary diagnostic.
 fn authenticated_flat_structure_reader(
     input: &flow::FlowWir,
     function: &flow::FlowFunction,
@@ -5284,6 +5285,38 @@ fn authenticated_flat_structure_reader(
                     .get(passthrough.0 as usize)
                     .is_some_and(|value| value.ty == *result_ty)
                 && flow_scalar_type(input, *result_ty).is_ok()
+        }
+        ([receiver, argument], [projection, addition], flow::Terminator::Return(returned)) => {
+            matches!(
+                (projection.results.as_slice(), &projection.operation),
+                ([projected], flow::FlowOperation::ExtractField { aggregate, field })
+                    if *receiver == *parameter
+                        && *aggregate == *parameter
+                        && fields.get(*field as usize).copied() == Some(*result_ty)
+                        && function.values.get(projected.0 as usize)
+                            .is_some_and(|value| value.ty == *result_ty)
+                        && matches!(
+                            (addition.results.as_slice(), &addition.operation),
+                            ([sum], flow::FlowOperation::Binary {
+                                op: flow::BinaryOp::AddChecked,
+                                left,
+                                right,
+                            }) if *left == *projected
+                                && *right == *argument
+                                && returned.as_slice() == [*sum]
+                                && function.values.get(sum.0 as usize)
+                                    .is_some_and(|value| value.ty == *result_ty)
+                        )
+                        && projection.source.is_some()
+                        && addition.source.is_some()
+            ) && function.values.len() == 4
+                && input.types.get(result_ty.0 as usize).is_some_and(|ty| {
+                    ty.kind
+                        == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                            bits: 64,
+                            signed: false,
+                        })
+                })
         }
         _ => false,
     };

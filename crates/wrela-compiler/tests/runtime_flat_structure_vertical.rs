@@ -394,6 +394,34 @@ fn generic_interface_argument_reaches_native():
     return
 "#;
 
+const GENERIC_INTERFACE_COMBINE_SOURCE: &str = r#"module app.duration
+
+pub interface Combine[T]:
+    fn combine(read self, value: T) -> T
+
+pub struct Cell:
+    pub tag: u32
+    pub value: u64
+
+impl Combine[u64] for Cell:
+    fn combine(read self, value: u64) -> u64:
+        return self.value + value
+
+pub fn call_interface_combine() -> u64:
+    cell: Cell = Cell(tag=1, value=2)
+    return cell.combine(40)
+"#;
+
+const GENERIC_INTERFACE_COMBINE_TEST_SOURCE: &str = r#"module app.duration_test
+
+from app.duration import call_interface_combine
+
+@test(runtime)
+fn generic_interface_combine_reaches_native():
+    observed: u64 = call_interface_combine()
+    return
+"#;
+
 const SCALAR_VIEW_SOURCE: &str = r#"module app.duration
 
 pub struct Packet:
@@ -2214,6 +2242,114 @@ fn generic_interface_argument_reaches_flow_machine_and_deterministic_coff() {
         Ok(first) => {
             let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
                 .expect("repeat generic-interface argument native emission");
+            assert_eq!(first.bytes(), second.bytes());
+        }
+    }
+}
+
+#[test]
+fn generic_interface_checked_combine_reaches_flow_machine_and_deterministic_coff() {
+    let fixture = fixture(
+        GENERIC_INTERFACE_COMBINE_SOURCE,
+        GENERIC_INTERFACE_COMBINE_TEST_SOURCE,
+    );
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed(&fixture),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("generic-interface checked combine lowers to SemanticWir");
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.into_parts().0,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("generic-interface checked combine lowers to FlowWir");
+    let flow_wir = flow.into_parts().0;
+    let mut forged_flow = flow_wir.as_wir().clone();
+    let combine = forged_flow
+        .functions
+        .iter_mut()
+        .find(|function| {
+            function.parameters.len() == 2
+                && matches!(
+                    function.blocks.as_slice(),
+                    [block] if matches!(
+                        block.instructions.as_slice(),
+                        [projection, addition]
+                            if matches!(projection.operation, FlowOperation::ExtractField { .. })
+                                && matches!(addition.operation,
+                                    FlowOperation::Binary {
+                                        op: FlowBinaryOp::AddChecked,
+                                        ..
+                                    })
+                    )
+                )
+        })
+        .expect("exact FlowWir aggregate checked-combine function");
+    let projected = combine.blocks[0].instructions[0].results[0];
+    let FlowOperation::Binary { right, .. } = &mut combine.blocks[0].instructions[1].operation
+    else {
+        panic!("checked-combine FlowWir operation")
+    };
+    *right = projected;
+    let forged_flow = forged_flow
+        .validate()
+        .expect("checked-combine operand substitution remains structurally valid FlowWir");
+    let forged_encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &forged_flow,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("forged checked-combine FlowWir canonical frame");
+    let forged_error = prepare_canonical_frame_for_codegen(
+        forged_encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect_err("Machine lowering must reauthenticate checked-combine operands");
+    assert_eq!(
+        forged_error.machine_lower_error(),
+        Some(&MachineLowerError::UnsupportedInput {
+            feature: "machine-flat-structure-operation-lowering-pending",
+        })
+    );
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("generic-interface checked combine FlowWir canonical frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("generic-interface checked combine reaches MachineWir");
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("generic-interface checked combine native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat generic-interface checked combine native emission");
             assert_eq!(first.bytes(), second.bytes());
         }
     }

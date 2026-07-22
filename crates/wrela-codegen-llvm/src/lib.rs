@@ -1502,6 +1502,101 @@ mod contract_tests {
         (validated, target)
     }
 
+    fn ordinary_aggregate_checked_combine_machine_fixture() -> (ValidatedMachineWir, TargetPackage)
+    {
+        let (validated, target) = ordinary_aggregate_passthrough_machine_fixture();
+        let mut machine = validated.into_wir();
+        machine.name = "ordinary-aggregate-checked-combine".to_owned();
+        machine.types[4].kind = MachineTypeKind::Struct {
+            fields: vec![
+                wrela_machine_wir::MachineField {
+                    ty: MachineTypeId(2),
+                    offset: 0,
+                },
+                wrela_machine_wir::MachineField {
+                    ty: MachineTypeId(2),
+                    offset: 8,
+                },
+            ],
+            packed: false,
+        };
+        machine.types[4].size = 16;
+        machine.types[4].alignment = 8;
+        let reader = &mut machine.functions[1];
+        let source = reader.source.expect("aggregate combine source");
+        reader.result = MachineTypeId(2);
+        reader.values[1].ty = MachineTypeId(2);
+        reader.values.extend([
+            MachineValue {
+                id: ValueId(2),
+                ty: MachineTypeId(2),
+                source_name: Some("projected".to_owned()),
+            },
+            MachineValue {
+                id: ValueId(3),
+                ty: MachineTypeId(2),
+                source_name: Some("sum".to_owned()),
+            },
+        ]);
+        reader.blocks[0].instructions = vec![
+            MachineInstruction {
+                id: InstructionId(0),
+                results: vec![ValueId(2)],
+                operation: MachineOperation::ExtractField {
+                    aggregate: ValueId(0),
+                    field: 1,
+                },
+                source: Some(source),
+            },
+            MachineInstruction {
+                id: InstructionId(1),
+                results: vec![ValueId(3)],
+                operation: MachineOperation::CheckedInteger {
+                    op: CheckedIntegerOp::Add,
+                    signedness: IntegerSignedness::Unsigned,
+                    left: ValueId(2),
+                    right: ValueId(1),
+                    failure: ScalarFailureProvenance {
+                        kind: ScalarFailureKind::Arithmetic,
+                        flow_function: reader.flow_function,
+                        flow_instruction: 1,
+                    },
+                },
+                source: Some(source),
+            },
+        ];
+        reader.blocks[0].terminator = MachineTerminator::Return(vec![ValueId(3)]);
+        let caller = &mut machine.functions[2];
+        caller.result = MachineTypeId(2);
+        for index in [0_usize, 1, 3] {
+            caller.values[index].ty = MachineTypeId(2);
+        }
+        for instruction in &mut caller.blocks[0].instructions[..2] {
+            let MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le }) =
+                &mut instruction.operation
+            else {
+                panic!("aggregate checked-combine integer fixture")
+            };
+            *ty = MachineTypeId(2);
+            bytes_le.resize(8, 0);
+        }
+        let mut intrinsics = machine.runtime.intrinsics.clone();
+        intrinsics.push(RuntimeIntrinsic::Fatal);
+        machine.runtime = RuntimeRequirements::new(intrinsics);
+        machine.symbols.push(Symbol {
+            id: SymbolId(
+                u32::try_from(machine.symbols.len()).expect("small checked-combine symbol table"),
+            ),
+            name: RuntimeIntrinsic::Fatal.symbol_name().to_owned(),
+            visibility: SymbolVisibility::Runtime,
+            definition: SymbolDefinition::ExternalRuntime(RuntimeIntrinsic::Fatal),
+        });
+        let validated = machine
+            .validate_for_target(&target)
+            .expect("valid ordinary aggregate checked-combine MachineWir fixture");
+        (validated, target)
+    }
+
     fn ordinary_aggregate_builder_machine_fixture() -> (ValidatedMachineWir, TargetPackage) {
         let (validated, target) = ordinary_aggregate_reader_machine_fixture();
         let mut machine = validated.into_wir();
@@ -4684,6 +4779,48 @@ mod contract_tests {
         let forged = forged
             .validate_for_target(&target)
             .expect("extra passthrough computation remains structurally valid");
+        assert_eq!(
+            super::preflight(
+                &CodegenRequest {
+                    module: &forged,
+                    target: target.backend(),
+                    options: CodegenOptions::standard(),
+                },
+                &|| false,
+            ),
+            Err(CodegenError::UnsupportedMachineContract(
+                "void or non-scalar function parameter",
+            ))
+        );
+    }
+
+    #[test]
+    fn ordinary_two_field_checked_combine_is_reauthenticated_and_forgery_fails_closed() {
+        let (machine, target) = ordinary_aggregate_checked_combine_machine_fixture();
+        let request = CodegenRequest {
+            module: &machine,
+            target: target.backend(),
+            options: CodegenOptions::standard(),
+        };
+        super::preflight(&request, &|| false)
+            .expect("exact aggregate receiver checked combine passes codegen preflight");
+        let first = super::ir::render_module(&request, &|| false)
+            .expect("aggregate receiver checked combine renders to bounded LLVM IR");
+        let second = super::ir::render_module(&request, &|| false)
+            .expect("aggregate receiver checked combine rerenders deterministically");
+        assert_eq!(first, second);
+
+        let mut forged = machine.into_wir();
+        let reader = &mut forged.functions[1];
+        let MachineOperation::CheckedInteger { right, .. } =
+            &mut reader.blocks[0].instructions[1].operation
+        else {
+            panic!("checked-combine fixture operation")
+        };
+        *right = ValueId(2);
+        let forged = forged
+            .validate_for_target(&target)
+            .expect("operand substitution remains structurally valid MachineWir");
         assert_eq!(
             super::preflight(
                 &CodegenRequest {

@@ -2890,8 +2890,9 @@ fn supported_struct_layout(types: &[wrela_machine_wir::MachineType], id: Machine
 
 /// Independently authenticate the narrow ordinary aggregate ABI admitted by
 /// machine lowering. Codegen does not trust source/Flow validation: it proves
-/// again that the callee is exactly a scalar-field reader or scalar passthrough
-/// over one owned, two-field flat structure.
+/// again that the callee is exactly a scalar-field reader, scalar passthrough,
+/// or checked `u64` field-plus-argument computation over one owned, two-field
+/// flat structure.
 fn authenticated_flat_structure_reader_call(
     machine: &wrela_machine_wir::MachineWir,
     caller: &MachineFunction,
@@ -2966,6 +2967,40 @@ fn authenticated_flat_structure_reader_state(
                 && callee.values.len() == 2
                 && value_type(machine, callee, *passthrough) == Some(callee.result)
                 && is_basic_scalar(machine, callee.result)
+        }
+        ([receiver, argument], [projection, addition], MachineTerminator::Return(returned)) => {
+            matches!(
+                (projection.results.as_slice(), &projection.operation),
+                ([projected], MachineOperation::ExtractField { aggregate, field })
+                    if *receiver == parameter
+                        && *aggregate == parameter
+                        && fields.get(*field as usize).map(|field| field.ty)
+                            == Some(callee.result)
+                        && value_type(machine, callee, *projected) == Some(callee.result)
+                        && matches!(
+                            (addition.results.as_slice(), &addition.operation),
+                            ([sum], MachineOperation::CheckedInteger {
+                                op: wrela_machine_wir::CheckedIntegerOp::Add,
+                                signedness: wrela_machine_wir::IntegerSignedness::Unsigned,
+                                left,
+                                right,
+                                failure,
+                            }) if *left == *projected
+                                && *right == *argument
+                                && returned.as_slice() == [*sum]
+                                && value_type(machine, callee, *sum) == Some(callee.result)
+                                && failure.kind
+                                    == wrela_machine_wir::ScalarFailureKind::Arithmetic
+                                && failure.flow_function == callee.flow_function
+                                && failure.flow_instruction == addition.id.0
+                        )
+                        && projection.source.is_some()
+                        && addition.source.is_some()
+            ) && callee.values.len() == 4
+                && machine
+                    .types
+                    .get(callee.result.0 as usize)
+                    .is_some_and(|ty| ty.kind == MachineTypeKind::Integer { bits: 64 })
         }
         _ => false,
     };
