@@ -332,13 +332,17 @@ impl CanonicalSemanticLinter {
                 }
                 ExpressionResolution::BoundedInterpolation { parts, .. } => {
                     for part in parts {
-                        if let wrela_sema::BoundedInterpolationPart::Bool { value, .. } = part {
-                            mark_value(
-                                &mut value_state,
-                                *value,
-                                VALUE_STATE_USED,
-                                &self.unused_local,
-                            )?;
+                        match part {
+                            wrela_sema::BoundedInterpolationPart::Bool { value, .. }
+                            | wrela_sema::BoundedInterpolationPart::Integer { value, .. } => {
+                                mark_value(
+                                    &mut value_state,
+                                    *value,
+                                    VALUE_STATE_USED,
+                                    &self.unused_local,
+                                )?;
+                            }
+                            wrela_sema::BoundedInterpolationPart::Text { .. } => {}
                         }
                     }
                 }

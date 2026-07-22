@@ -21795,14 +21795,15 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn bounded_bool_interpolation_stops_at_named_semantic_lowering_boundary() {
+    fn bounded_primitive_interpolation_stops_at_named_semantic_lowering_boundary() {
         let image = analyze_parsed_actor_source(
             r#"module app
 
 from core.image import Image, Target
 
 fn render_status():
-    rendered = f"ready={true}"
+    attempts: i8 = 1
+    rendered = f"attempts={attempts}"
 
 async fn checkpoint():
     pass

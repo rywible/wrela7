@@ -4998,6 +4998,8 @@ fn analyze_runtime_body(
                                 partial,
                                 parts,
                                 expression.source,
+                                &*locals,
+                                &*parameters,
                                 &mut *aggregate_work,
                                 is_cancelled,
                             )?)
@@ -8131,13 +8133,8 @@ fn analyze_bounded_interpolation(
         partial,
         parts,
         source,
-        &mut *state.aggregate_work,
-        is_cancelled,
-    )?;
-    let bool_ty = ensure_primitive_type(
-        request,
-        partial,
-        PrimitiveSemanticType::Bool,
+        &*state.locals,
+        &*state.parameters,
         &mut *state.aggregate_work,
         is_cancelled,
     )?;
@@ -8173,48 +8170,36 @@ fn analyze_bounded_interpolation(
                     .as_program()
                     .expression(*child)
                     .ok_or(AnalysisFailure::RequestMismatch)?;
-                if matches!(
-                    &child_record.kind,
-                    ExpressionKind::Literal(literal) if !matches!(literal, Literal::Boolean(_))
-                ) || known_runtime_expression_type(
+                let (value_ty, maximum_bytes) = bounded_interpolation_value_type(
                     request,
                     partial,
-                    state,
                     *child,
+                    &*state.locals,
+                    &*state.parameters,
+                    &mut *state.aggregate_work,
                     is_cancelled,
-                )?
-                .is_some_and(|known| known != bool_ty)
-                {
-                    return Err(runtime_type_diagnostic(
-                        request,
-                        child_record.source,
-                        "semantic-bounded-interpolation-value-type",
-                        "bounded interpolation value must have the core bool type",
-                        "this slice proves capacity with the canonical five-byte maximum for `false`",
-                        "interpolate a bool value without a format specifier",
-                    ));
-                }
+                )?;
                 let outcome = analyze_runtime_expression(
                     request,
                     partial,
                     function,
                     *child,
                     RuntimeExpressionRequest {
-                        expected: Some(bool_ty),
+                        expected: Some(value_ty),
                         desired_result: None,
                         access: AccessMode::Value,
                     },
                     state,
                     is_cancelled,
                 )?;
-                if outcome.ty != bool_ty {
+                if outcome.ty != value_ty {
                     return Err(runtime_type_diagnostic(
                         request,
                         child_record.source,
                         "semantic-bounded-interpolation-value-type",
-                        "bounded interpolation value must have the core bool type",
-                        "this slice proves capacity with the canonical five-byte maximum for `false`",
-                        "interpolate a bool value without a format specifier",
+                        "bounded interpolation value is not an admitted primitive",
+                        "this slice proves exact capacity only for core bool and primitive integer values",
+                        "interpolate a bool or primitive integer without a format specifier",
                     ));
                 }
                 let value = outcome
@@ -8222,18 +8207,32 @@ fn analyze_bounded_interpolation(
                     .or(outcome.result)
                     .ok_or(AnalysisFailure::RequestMismatch)?;
                 effects.0 |= outcome.effects.0;
-                resolved.push(BoundedInterpolationPart::Bool {
-                    expression: *child,
-                    value,
-                });
+                let value_kind = partial
+                    .types
+                    .get(value_ty.0 as usize)
+                    .map(|ty| &ty.kind)
+                    .ok_or(AnalysisFailure::RequestMismatch)?;
+                if matches!(value_kind, SemanticTypeKind::Bool) {
+                    resolved.push(BoundedInterpolationPart::Bool {
+                        expression: *child,
+                        value,
+                    });
+                } else {
+                    resolved.push(BoundedInterpolationPart::Integer {
+                        expression: *child,
+                        value,
+                        ty: value_ty,
+                        maximum_bytes,
+                    });
+                }
             }
             wrela_hir::InterpolationPart::Value { format_source, .. } => {
                 return Err(runtime_type_diagnostic(
                     request,
                     format_source.unwrap_or(source),
                     "semantic-bounded-interpolation-format-pending",
-                    "bounded boolean interpolation does not admit a format specifier",
-                    "the exact capacity proof currently uses canonical `true`/`false` spelling only",
+                    "bounded primitive interpolation does not admit a format specifier",
+                    "the exact capacity proof currently uses canonical boolean and decimal integer spelling only",
                     "remove the format specifier",
                 ));
             }
@@ -8322,11 +8321,14 @@ fn ensure_static_literal_type(
     Ok(id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ensure_bounded_interpolation_type(
     request: &AnalysisRequest<'_>,
     partial: &mut PartialAnalysis,
     parts: &[wrela_hir::InterpolationPart],
     source: Span,
+    locals: &[Option<RuntimeBinding>],
+    parameters: &[Option<RuntimeBinding>],
     aggregate_work: &mut RuntimeAggregateWork,
     is_cancelled: &dyn Fn() -> bool,
 ) -> RuntimeResult<SemanticTypeId> {
@@ -8344,6 +8346,7 @@ fn ensure_bounded_interpolation_type(
                     .ok_or_else(|| semantic_fact_bytes_resource(request))?;
             }
             wrela_hir::InterpolationPart::Value {
+                expression,
                 format,
                 format_source,
                 ..
@@ -8353,13 +8356,22 @@ fn ensure_bounded_interpolation_type(
                         request,
                         format_source.unwrap_or(source),
                         "semantic-bounded-interpolation-format-pending",
-                        "bounded boolean interpolation does not admit a format specifier",
-                        "the exact capacity proof currently uses canonical `true`/`false` spelling only",
+                        "bounded primitive interpolation does not admit a format specifier",
+                        "the exact capacity proof currently uses canonical boolean and decimal integer spelling only",
                         "remove the format specifier",
                     ));
                 }
+                let (_, maximum_bytes) = bounded_interpolation_value_type(
+                    request,
+                    partial,
+                    *expression,
+                    locals,
+                    parameters,
+                    &mut *aggregate_work,
+                    is_cancelled,
+                )?;
                 capacity = capacity
-                    .checked_add(5)
+                    .checked_add(maximum_bytes)
                     .ok_or_else(|| semantic_fact_bytes_resource(request))?;
                 value_count = value_count.saturating_add(1);
             }
@@ -8373,9 +8385,9 @@ fn ensure_bounded_interpolation_type(
             request,
             source,
             "semantic-bounded-interpolation-value-required",
-            "bounded interpolation requires at least one formatted boolean value",
+            "bounded interpolation requires at least one formatted primitive value",
             "plain text already has the exact Static[Str] literal representation",
-            "use a plain string literal or interpolate a bool",
+            "use a plain string literal or interpolate a bool or primitive integer",
         ));
     }
     let kind = SemanticTypeKind::BoundedString { capacity };
@@ -8404,6 +8416,132 @@ fn ensure_bounded_interpolation_type(
         source: None,
     });
     Ok(id)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_interpolation_value_type(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    expression: ExpressionId,
+    locals: &[Option<RuntimeBinding>],
+    parameters: &[Option<RuntimeBinding>],
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<(SemanticTypeId, u64)> {
+    check_cancelled(is_cancelled)?;
+    let expression_record = request
+        .hir
+        .as_program()
+        .expression(expression)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if matches!(
+        expression_record.kind,
+        ExpressionKind::Literal(
+            Literal::Unit
+                | Literal::Float(_)
+                | Literal::Character(_)
+                | Literal::String(_)
+                | Literal::Bytes(_)
+        )
+    ) {
+        return Err(runtime_type_diagnostic(
+            request,
+            expression_record.source,
+            "semantic-bounded-interpolation-value-type",
+            "bounded interpolation value is not an admitted primitive",
+            "this slice proves exact capacity only for core bool and primitive integer values",
+            "interpolate a bool or primitive integer without a format specifier",
+        ));
+    }
+    let known = match &expression_record.kind {
+        ExpressionKind::Literal(Literal::Boolean(_))
+        | ExpressionKind::Compare { .. }
+        | ExpressionKind::IsPattern { .. }
+        | ExpressionKind::Unary {
+            operator: wrela_hir::UnaryOperator::BoolNot,
+            ..
+        }
+        | ExpressionKind::Binary {
+            operator: wrela_hir::BinaryOperator::LogicalAnd | wrela_hir::BinaryOperator::LogicalOr,
+            ..
+        } => Some(ensure_primitive_type(
+            request,
+            partial,
+            PrimitiveSemanticType::Bool,
+            &mut *aggregate_work,
+            is_cancelled,
+        )?),
+        ExpressionKind::Literal(Literal::Integer(_)) => Some(ensure_primitive_type(
+            request,
+            partial,
+            PrimitiveSemanticType::Integer {
+                signed: true,
+                bits: 64,
+                pointer_sized: false,
+            },
+            &mut *aggregate_work,
+            is_cancelled,
+        )?),
+        ExpressionKind::Unary {
+            operator: wrela_hir::UnaryOperator::Negate,
+            operand,
+        } if request
+            .hir
+            .as_program()
+            .expression(*operand)
+            .is_some_and(|operand| {
+                matches!(operand.kind, ExpressionKind::Literal(Literal::Integer(_)))
+            }) =>
+        {
+            Some(ensure_primitive_type(
+                request,
+                partial,
+                PrimitiveSemanticType::Integer {
+                    signed: true,
+                    bits: 64,
+                    pointer_sized: false,
+                },
+                &mut *aggregate_work,
+                is_cancelled,
+            )?)
+        }
+        ExpressionKind::Reference(Definition::Local(local)) => locals
+            .get(local.0 as usize)
+            .and_then(|binding| *binding)
+            .and_then(|binding| partial.values.get(binding.value.0 as usize))
+            .map(|value| value.ty),
+        ExpressionKind::Reference(Definition::Parameter(parameter)) => parameters
+            .get(parameter.0 as usize)
+            .and_then(|binding| *binding)
+            .and_then(|binding| partial.values.get(binding.value.0 as usize))
+            .map(|value| value.ty),
+        _ => None,
+    };
+    let Some(ty) = known else {
+        return Err(runtime_type_diagnostic(
+            request,
+            expression_record.source,
+            "semantic-bounded-interpolation-expression-pending",
+            "bounded interpolation expression is outside the admitted primitive subset",
+            "this analysis increment accepts boolean expressions, primitive literals, and direct primitive bindings",
+            "bind the value to a bool or primitive integer local before interpolating it",
+        ));
+    };
+    let maximum_bytes = partial
+        .types
+        .get(ty.0 as usize)
+        .and_then(|ty| bounded_interpolation_maximum_bytes(&ty.kind))
+        .ok_or_else(|| {
+            runtime_type_diagnostic(
+                request,
+                expression_record.source,
+                "semantic-bounded-interpolation-value-type",
+                "bounded interpolation value is not an admitted primitive",
+                "this slice proves exact capacity only for core bool and primitive integer values",
+                "interpolate a bool or primitive integer without a format specifier",
+            )
+        })?;
+    Ok((ty, maximum_bytes))
 }
 
 fn copy_static_literal_constant(
@@ -29119,6 +29257,129 @@ pub fn boot() -> Image:
     }
 
     #[test]
+    fn bounded_integer_interpolation_uses_exact_primitive_decimal_widths() {
+        let source = static_literal_actor_source(
+            "    unsigned8: u8 = 1\n    unsigned16: u16 = 1\n    unsigned32: u32 = 1\n    unsigned64: u64 = 1\n    unsigned128: u128 = 1\n    unsigned_size: usize = 1\n    signed8: i8 = 1\n    signed16: i16 = 1\n    signed32: i32 = 1\n    signed64: i64 = 1\n    signed128: i128 = 1\n    signed_size: isize = 1\n    first = f\"{unsigned8}\"\n    second = f\"{unsigned16}\"\n    third = f\"{unsigned32}\"\n    fourth = f\"{unsigned64}\"\n    fifth = f\"{unsigned128}\"\n    sixth = f\"{unsigned_size}\"\n    seventh = f\"{signed8}\"\n    eighth = f\"{signed16}\"\n    ninth = f\"{signed32}\"\n    tenth = f\"{signed64}\"\n    eleventh = f\"{signed128}\"\n    twelfth = f\"{signed_size}\"\n    defaulted = f\"value={1}\"\n    negative_defaulted = f\"{-1}\"",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("bounded integer interpolation analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "bounded integer interpolation must analyze: {:?}",
+            output.diagnostics()
+        );
+        let image = output
+            .successful()
+            .expect("sealed bounded integer interpolation image");
+        let capacities: Vec<_> = image
+            .facts()
+            .expressions
+            .iter()
+            .filter_map(|fact| match &fact.resolution {
+                ExpressionResolution::BoundedInterpolation { capacity, .. } => Some(*capacity),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            capacities,
+            [3, 5, 10, 20, 39, 20, 4, 6, 11, 20, 40, 20, 26, 20]
+        );
+        assert_eq!(
+            image
+                .facts()
+                .types
+                .iter()
+                .filter(|ty| matches!(ty.kind, SemanticTypeKind::BoundedString { capacity: 20 }))
+                .count(),
+            1,
+            "equal integer decimal capacities intern one compiler-minted type"
+        );
+    }
+
+    #[test]
+    fn bounded_integer_interpolation_full_seal_rejects_type_width_and_value_forgery() {
+        let source = static_literal_actor_source(
+            "    first_value: i8 = 1\n    second_value: i8 = 2\n    unsigned_value: u8 = 3\n    first = f\"{first_value}\"\n    second = f\"{second_value}\"\n    unsigned = f\"{unsigned_value}\"",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let image = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("bounded integer interpolation analysis")
+            .successful()
+            .expect("sealed bounded integer interpolation image")
+            .clone();
+        let interpolations: Vec<_> = image
+            .facts()
+            .expressions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, fact)| match &fact.resolution {
+                ExpressionResolution::BoundedInterpolation { parts, .. } => {
+                    parts.iter().find_map(|part| match part {
+                        BoundedInterpolationPart::Integer { value, ty, .. } => {
+                            Some((index, *value, *ty))
+                        }
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(interpolations.len(), 3);
+        let (first, _, _) = interpolations[0];
+        let alternate_same_type = interpolations[1].1;
+        let unsigned_ty = interpolations[2].2;
+        let rejects = |mutate: &dyn Fn(&mut PartialAnalysis)| {
+            let (hir, mut facts) = image.clone().into_parts();
+            mutate(&mut facts);
+            assert!(facts.validate_for_seal(hir.as_ref(), &|| false).is_err());
+        };
+        rejects(&|facts| {
+            let ExpressionResolution::BoundedInterpolation { parts, .. } =
+                &mut facts.expressions[first].resolution
+            else {
+                panic!("bounded integer interpolation")
+            };
+            let BoundedInterpolationPart::Integer { value, .. } = &mut parts[0] else {
+                panic!("integer witness")
+            };
+            *value = alternate_same_type;
+        });
+        rejects(&|facts| {
+            let ExpressionResolution::BoundedInterpolation { parts, .. } =
+                &mut facts.expressions[first].resolution
+            else {
+                panic!("bounded integer interpolation")
+            };
+            let BoundedInterpolationPart::Integer { ty, .. } = &mut parts[0] else {
+                panic!("integer witness")
+            };
+            *ty = unsigned_ty;
+        });
+        rejects(&|facts| {
+            let ExpressionResolution::BoundedInterpolation { parts, .. } =
+                &mut facts.expressions[first].resolution
+            else {
+                panic!("bounded integer interpolation")
+            };
+            let BoundedInterpolationPart::Integer { maximum_bytes, .. } = &mut parts[0] else {
+                panic!("integer witness")
+            };
+            *maximum_bytes = maximum_bytes.saturating_sub(1);
+        });
+    }
+
+    #[test]
     fn bounded_bool_interpolation_full_seal_rejects_witness_forgeries() {
         let source = static_literal_actor_source(
             "    rendered = f\"ready={true}\"\n    second = f\"other={false}\"",
@@ -29210,6 +29471,27 @@ pub fn boot() -> Image:
             *value = alternate_bool;
         });
         rejects(&|facts| {
+            let (expression, value) = match &facts.expressions[interpolation].resolution {
+                ExpressionResolution::BoundedInterpolation { parts, .. } => match parts[1] {
+                    BoundedInterpolationPart::Bool { expression, value } => (expression, value),
+                    _ => panic!("interpolation bool"),
+                },
+                _ => panic!("bounded interpolation"),
+            };
+            let ty = facts.values[value.0 as usize].ty;
+            let ExpressionResolution::BoundedInterpolation { parts, .. } =
+                &mut facts.expressions[interpolation].resolution
+            else {
+                panic!("bounded interpolation")
+            };
+            parts[1] = BoundedInterpolationPart::Integer {
+                expression,
+                value,
+                ty,
+                maximum_bytes: 5,
+            };
+        });
+        rejects(&|facts| {
             facts.types[bounded_type].kind = SemanticTypeKind::BoundedString { capacity: 12 };
         });
         rejects(&|facts| {
@@ -29260,6 +29542,58 @@ pub fn boot() -> Image:
                 false
             })
             .expect("count bounded interpolation cancellation polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, exact),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn bounded_integer_interpolation_type_budget_is_exact_and_cancels_at_the_last_poll() {
+        const EXACT_TYPES: u32 = 6;
+        let source =
+            static_literal_actor_source("    value: i8 = 1\n    rendered = f\"value={value}\"");
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let mut exact = AnalysisLimits::standard();
+        exact.types = EXACT_TYPES;
+        let admitted = CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| false)
+            .expect("exact bounded integer interpolation type limit is admitted");
+        assert!(admitted.successful().is_some());
+        assert_eq!(admitted.partial().types.len(), EXACT_TYPES as usize);
+
+        let mut one_under = exact;
+        one_under.types = EXACT_TYPES - 1;
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, one_under),
+                &|| false,
+            ),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "semantic types",
+                limit,
+            }) if limit == AnalysisLimits::standard().fact_edges
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticAnalyzer::new()
+            .analyze(parsed_actor_request(&fixture, &changes, exact), &|| {
+                polls.set(polls.get().saturating_add(1));
+                false
+            })
+            .expect("count bounded integer interpolation cancellation polls");
         let final_poll = polls.get();
         assert!(final_poll > 3);
         polls.set(0);
@@ -29450,13 +29784,15 @@ pub fn boot() -> Image:
             "semantic-static-data-persistence-pending"
         );
         assert_eq!(
-            diagnostic(static_literal_actor_source("    rendered = f\"value={1}\"")),
+            diagnostic(static_literal_actor_source(
+                "    rendered = f\"value={1.0}\""
+            )),
             "semantic-bounded-interpolation-value-type"
         );
     }
 
     #[test]
-    fn bounded_bool_interpolation_tails_fail_closed_by_name() {
+    fn bounded_primitive_interpolation_tails_fail_closed_by_name() {
         let diagnostic = |source: String| {
             let fixture = parsed_actor_fixture(&source);
             let changes = no_changes();
@@ -29476,8 +29812,16 @@ pub fn boot() -> Image:
         };
 
         assert_eq!(
-            diagnostic(static_literal_actor_source("    rendered = f\"value={1}\"")),
+            diagnostic(static_literal_actor_source(
+                "    rendered = f\"value={1.0}\""
+            )),
             "semantic-bounded-interpolation-value-type"
+        );
+        assert_eq!(
+            diagnostic(static_literal_actor_source(
+                "    rendered = f\"value={1 + 2}\""
+            )),
+            "semantic-bounded-interpolation-expression-pending"
         );
         assert_eq!(
             diagnostic(static_literal_actor_source(

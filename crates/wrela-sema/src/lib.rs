@@ -851,10 +851,41 @@ pub enum BoundedInterpolationPart {
         value: String,
         source: Span,
     },
+    Integer {
+        expression: ExpressionId,
+        value: ValueId,
+        ty: SemanticTypeId,
+        maximum_bytes: u64,
+    },
     Bool {
         expression: ExpressionId,
         value: ValueId,
     },
+}
+
+fn bounded_interpolation_maximum_bytes(kind: &SemanticTypeKind) -> Option<u64> {
+    let decimal_digits = |mut value: u128| {
+        let mut digits = 1_u64;
+        while value >= 10 {
+            value /= 10;
+            digits = digits.saturating_add(1);
+        }
+        digits
+    };
+    match kind {
+        SemanticTypeKind::Bool => Some(5),
+        SemanticTypeKind::Integer { signed, bits, .. } if (1..=128).contains(bits) => {
+            let magnitude = if *signed {
+                1_u128 << u32::from(bits - 1)
+            } else if *bits == 128 {
+                u128::MAX
+            } else {
+                (1_u128 << u32::from(*bits)) - 1
+            };
+            Some(decimal_digits(magnitude) + u64::from(*signed))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8941,6 +8972,53 @@ fn exact_bounded_interpolation_matches(
                 value_count = value_count.saturating_add(1);
                 effects |= child.effects.0;
             }
+            (
+                wrela_hir::InterpolationPart::Value {
+                    expression,
+                    format: None,
+                    format_source: None,
+                },
+                BoundedInterpolationPart::Integer {
+                    expression: resolved_expression,
+                    value,
+                    ty,
+                    maximum_bytes,
+                },
+            ) if expression == resolved_expression => {
+                let Some(child) = exact_child_expression(analysis, function, *expression) else {
+                    return false;
+                };
+                let resolved_value = match child.resolution {
+                    ExpressionResolution::Value(value) => Some(value),
+                    _ => child.result,
+                };
+                if resolved_value != Some(*value)
+                    || child.ty != *ty
+                    || analysis
+                        .values
+                        .get(value.0 as usize)
+                        .is_none_or(|record| record.function != function || record.ty != *ty)
+                {
+                    return false;
+                }
+                let Some(expected_maximum) = analysis
+                    .types
+                    .get(ty.0 as usize)
+                    .filter(|ty| matches!(ty.kind, SemanticTypeKind::Integer { .. }))
+                    .and_then(|ty| bounded_interpolation_maximum_bytes(&ty.kind))
+                else {
+                    return false;
+                };
+                if expected_maximum != *maximum_bytes {
+                    return false;
+                }
+                let Some(next) = expected_capacity.checked_add(expected_maximum) else {
+                    return false;
+                };
+                expected_capacity = next;
+                value_count = value_count.saturating_add(1);
+                effects |= child.effects.0;
+            }
             _ => return false,
         }
     }
@@ -9329,7 +9407,7 @@ fn valid_semantic_type(ty: &SemanticType, analysis: &PartialAnalysis, graph: &Im
                 && ty.source.is_none()
         }
         SemanticTypeKind::BoundedString { capacity } => {
-            *capacity >= 5
+            *capacity > 0
                 && ty.linearity == Linearity::ReclaimableLinear
                 && ty.size_upper_bound.is_none()
                 && ty.alignment_lower_bound == 1
@@ -9793,6 +9871,21 @@ fn valid_expression_resolution(
                 && !parts.is_empty()
                 && parts.iter().all(|part| match part {
                     BoundedInterpolationPart::Text { .. } => true,
+                    BoundedInterpolationPart::Integer {
+                        value,
+                        ty,
+                        maximum_bytes,
+                        ..
+                    } => {
+                        analysis
+                            .values
+                            .get(value.0 as usize)
+                            .filter(|record| record.function == function && record.ty == *ty)
+                            .and_then(|_| analysis.types.get(ty.0 as usize))
+                            .filter(|ty| matches!(ty.kind, SemanticTypeKind::Integer { .. }))
+                            .and_then(|ty| bounded_interpolation_maximum_bytes(&ty.kind))
+                            == Some(*maximum_bytes)
+                    }
                     BoundedInterpolationPart::Bool { value, .. } => analysis
                         .values
                         .get(value.0 as usize)
