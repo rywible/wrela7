@@ -13,7 +13,7 @@ use wrela_source::Span;
 
 pub use wrela_test_model::TestPlanLimits;
 
-pub const FLOW_WIR_VERSION: u32 = 18;
+pub const FLOW_WIR_VERSION: u32 = 19;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 14;
 
@@ -57,6 +57,12 @@ pub enum FlowTypeKind {
     /// Compiler-minted immutable UTF-8 value with an authenticated exact byte
     /// extent. This retains semantic identity without choosing a target ABI.
     StaticString {
+        bytes: u64,
+    },
+    /// Compiler-minted immutable byte sequence with an authenticated exact
+    /// extent. This retains semantic identity without choosing target storage
+    /// or a consumer ABI.
+    StaticBytes {
         bytes: u64,
     },
     /// Compiler-minted owned UTF-8 value with runtime occupancy bounded by the
@@ -1190,6 +1196,7 @@ fn validate_model_resources(
             FlowTypeKind::Unit
             | FlowTypeKind::Scalar(_)
             | FlowTypeKind::StaticString { .. }
+            | FlowTypeKind::StaticBytes { .. }
             | FlowTypeKind::BoundedString { .. }
             | FlowTypeKind::Array { .. }
             | FlowTypeKind::Activation { .. }
@@ -5183,6 +5190,19 @@ fn exact_fixed_flat_enum_profile(module: &FlowWir, variants: &[Vec<TypeId>]) -> 
         || (scalar(*left) && flat_nominal_enum_payload(module, *right))
 }
 
+fn canonical_static_bytes_name(name: Option<&str>, bytes: u64) -> bool {
+    let Some(extent) = name
+        .and_then(|name| name.strip_prefix("Static[Bytes["))
+        .and_then(|name| name.strip_suffix("]]"))
+    else {
+        return false;
+    };
+    !extent.is_empty()
+        && (extent == "0" || !extent.starts_with('0'))
+        && extent.bytes().all(|byte| byte.is_ascii_digit())
+        && extent.parse::<u64>() == Ok(bytes)
+}
+
 fn validate_type(module: &FlowWir, ty: &FlowType, errors: &mut ValidationContext<'_>) {
     macro_rules! use_type {
         ($id:expr) => {
@@ -5236,6 +5256,7 @@ fn validate_type(module: &FlowWir, ty: &FlowType, errors: &mut ValidationContext
         FlowTypeKind::Unit
         | FlowTypeKind::Scalar(_)
         | FlowTypeKind::StaticString { .. }
+        | FlowTypeKind::StaticBytes { .. }
         | FlowTypeKind::BoundedString { .. }
         | FlowTypeKind::Reservation
         | FlowTypeKind::OpaqueTarget { .. } => {}
@@ -5263,6 +5284,16 @@ fn validate_type(module: &FlowWir, ty: &FlowType, errors: &mut ValidationContext
     if !canonical_text {
         errors.push(ValidationError::InvalidRecord {
             kind: "bounded text type",
+            id: ty.id.0,
+        });
+    }
+    if matches!(ty.kind, FlowTypeKind::StaticBytes { bytes }
+        if !ty.copyable
+            || ty.strict_linear
+            || !canonical_static_bytes_name(ty.name.as_deref(), bytes))
+    {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "static bytes type",
             id: ty.id.0,
         });
     }
@@ -5437,13 +5468,23 @@ fn validate_operation(
                     [result] => function
                         .values
                         .get(result.0 as usize)
-                        .and_then(|value| module.types.get(value.ty.0 as usize))
-                        .is_none_or(|record| match record.kind {
-                            FlowTypeKind::StaticString { bytes: extent } => {
-                                usize::try_from(extent).ok() == Some(bytes.len())
-                            }
-                            _ => true,
-                        }),
+                        .map(|value| {
+                            module
+                                .types
+                                .get(value.ty.0 as usize)
+                                .is_none_or(|record| match record.kind {
+                                    FlowTypeKind::StaticString { bytes: extent } => {
+                                        usize::try_from(extent).ok() == Some(bytes.len())
+                                    }
+                                    FlowTypeKind::StaticBytes { bytes: extent } => {
+                                        usize::try_from(extent).ok() == Some(bytes.len())
+                                            && instruction.source.is_some()
+                                            && value.source == instruction.source
+                                    }
+                                    _ => true,
+                                })
+                        })
+                        .unwrap_or(true),
                     _ => true,
                 },
                 Immediate::Character(_) => matches!(instruction.results.as_slice(), [result]
@@ -5456,7 +5497,7 @@ fn validate_operation(
             };
             if !exact_text_or_character {
                 errors.push(ValidationError::InvalidRecord {
-                    kind: "bounded text immediate",
+                    kind: "static data immediate",
                     id: instruction.id.0,
                 });
             }
@@ -6578,6 +6619,90 @@ mod tests {
             },
         ];
         module
+    }
+
+    fn static_bytes_fixture() -> FlowWir {
+        let mut module = fixture();
+        let source = Span {
+            file: FileId(0),
+            range: TextRange { start: 21, end: 34 },
+        };
+        module.types.push(FlowType {
+            id: TypeId(1),
+            kind: FlowTypeKind::StaticBytes { bytes: 3 },
+            name: Some("Static[Bytes[3]]".to_owned()),
+            copyable: true,
+            strict_linear: false,
+        });
+        module.functions[0].values = vec![Value {
+            id: ValueId(0),
+            ty: TypeId(1),
+            source_name: Some("packet".to_owned()),
+            source: Some(source),
+        }];
+        module.functions[0].blocks[0].instructions = vec![Instruction {
+            id: InstructionId(0),
+            results: vec![ValueId(0)],
+            operation: FlowOperation::Immediate(Immediate::Bytes(vec![0, 0x7f, 0xff])),
+            source: Some(source),
+        }];
+        module
+    }
+
+    #[test]
+    fn static_bytes_authenticates_exact_extent_type_and_source() {
+        static_bytes_fixture()
+            .validate()
+            .expect("exact static bytes FlowWir");
+
+        for mutation in 0..5 {
+            let mut forged = static_bytes_fixture();
+            match mutation {
+                0 => forged.types[1].kind = FlowTypeKind::StaticBytes { bytes: 4 },
+                1 => forged.functions[0].values[0].source = None,
+                2 => forged.functions[0].blocks[0].instructions[0].source = None,
+                3 => forged.types[1].name = Some("Static[Bytes[03]]".to_owned()),
+                4 => forged.types[1].copyable = false,
+                _ => unreachable!(),
+            }
+            let errors = forged.validate().expect_err("forged static bytes").0;
+            assert!(errors.iter().any(|error| {
+                matches!(
+                    (mutation, error),
+                    (
+                        0..=2,
+                        ValidationError::InvalidRecord {
+                            kind: "static data immediate",
+                            id: 0,
+                        },
+                    ) | (
+                        3..=4,
+                        ValidationError::InvalidRecord {
+                            kind: "static bytes type",
+                            id: 1,
+                        },
+                    )
+                )
+            }));
+        }
+
+        let calls = Cell::new(0_u64);
+        static_bytes_fixture()
+            .validate_with_limits(ValidationLimits::standard(), &|| {
+                calls.set(calls.get() + 1);
+                false
+            })
+            .expect("static bytes validation baseline");
+        let final_poll = calls.get();
+        calls.set(0);
+        assert_eq!(
+            static_bytes_fixture().validate_with_limits(ValidationLimits::standard(), &|| {
+                let next = calls.get() + 1;
+                calls.set(next);
+                next >= final_poll
+            }),
+            Err(ValidationFailure::Cancelled)
+        );
     }
 
     #[test]

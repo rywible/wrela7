@@ -464,14 +464,18 @@ it. It injects phase implementations and bounded host capabilities, while
   bounds, and the HIR declaration/file bounds used to validate provenance.
 - SemanticWir v14 retains exact SSA aggregate field replacement as `InsertField`.
   Validation joins the prior aggregate's struct type, selected field, inserted
-  value type, and single result of the unchanged aggregate type; FlowWir v18
+  value type, and single result of the unchanged aggregate type; FlowWir v19
   preserves the same operation and independently repeats that join.
 - SemanticWir v14 retains compiler-minted plain byte literals as
   `StaticBytes { bytes }` plus an exact decoded `Constant::Bytes`. Validation
   authenticates the canonical `Static[Bytes[N]]` identity, explicit-copy
   linearity, decoded extent, byte-constant result type, and resource bounds.
-  Flow lowering rejects the type by name at `flow-static-bytes-lowering-pending`
-  until a runtime storage and consumer ABI is specified.
+  FlowWir v19 retains that exact type identity, decoded byte immediate, and
+  value/instruction source identity; independent validation joins extent,
+  result type, canonical name, and source, while the canonical codec and
+  optimizer preserve the model. Machine lowering rejects the type by name at
+  `machine-static-bytes-lowering-pending` until runtime storage and a consumer
+  ABI are specified.
 - SemanticWir v14 retains the exact privileged fallible-await profile as
   distinct `AsyncExit` and ephemeral `AsyncOutcome` types plus
   `AwaitAsyncOutcome` and `AsyncOutcomeAuthenticated` proof authority. The
@@ -489,7 +493,7 @@ it. It injects phase implementations and bounded host capabilities, while
 - MachineWir v19 also retains the exact inline, nonempty, homogeneous
   boolean/default-`i64` fixed-array iteration profile. `MakeArray` authenticates
   the source-ordered element vector and `ExtractIndex` carries the exact
-  `CapacityBound` from FlowWir v18. Validation joins the array extent, generated
+  `CapacityBound` from FlowWir v19. Validation joins the array extent, generated
   unsigned-64 index, proof bound, result element type, and function proof set;
   the LLVM consumer repeats that join before emitting target-laid-out array
   storage plus one proved dynamic element access. Empty, heterogeneous,
@@ -506,7 +510,7 @@ it. It injects phase implementations and bounded host capabilities, while
   validation rejects nominal, tag, logical-type, or storage substitution. LLVM
   independently rechecks the profile and uses a zero-initialized aligned local
   slot to copy the exact logical payload bits into the physical union value.
-  FlowWir v18 and MachineWir v19 additionally admit exact per-tag projection
+  FlowWir v19 and MachineWir v19 additionally admit exact per-tag projection
   for two unary variants with distinct primitive-scalar payloads. `EnumPayload`
   carries `Some(tag)` for that profile, while the canonical uniform-payload
   representation retains `None`; validators join the tag to the logical result
@@ -618,7 +622,7 @@ it. It injects phase implementations and bounded host capabilities, while
   single-slot task entry, and `DropCalleeThenPropagate` cancellation. General
   path-sensitive activations, concurrent task slots, actor methods, and runtime
   scheduling remain outside this bounded schema vertical.
-- FlowWir v18 carries one explicit cooperative-scheduler ownership plan for
+- FlowWir v19 carries one explicit cooperative-scheduler ownership plan for
   every actor image admitted by the current single-core target profile. Core
   zero must own every dense actor and task ID exactly once and in canonical
   order; images without actors or tasks must carry no scheduler plan. Flow
@@ -632,17 +636,17 @@ it. It injects phase implementations and bounded host capabilities, while
 - Every region records its closed class, owner, byte capacity, alignment,
   exact `CapacityBound` proof, and source span. Validation joins those fields
   rather than allowing report or Machine consumers to infer region provenance.
-- FlowWir v18 adds one exact actor-state `Promote` marker. Validation requires
+- FlowWir v19 adds one exact actor-state `Promote` marker. Validation requires
   an unsigned 64-bit value, the owning actor's canonical eight-byte `.state`
   image region, a source-identical eight-byte `RegionBound` proof listed on the
   turn function, and no result. This is proof/lifetime authority; the following
   store remains the concrete runtime action.
-- FlowWir v18 also appends `ActorReplyRequest` and `ActorReplyResolve` while
+- FlowWir v19 also appends `ActorReplyRequest` and `ActorReplyResolve` while
   retaining the exact actor, target, permit, reply proof, `u64` outcome, and
   request/result identity. Validation requires one request and one resolve,
   exactly one incoming typed-reply edge to the target, and the same sorted
   target-type/capacity proof dependency authenticated by SemanticWir.
-- FlowWir v18 retains compiler-minted `StaticString { bytes }` and
+- FlowWir v19 retains compiler-minted `StaticString { bytes }` and
   `BoundedString { capacity }` identities plus source-ordered
   `FormatBoundedString` parts without selecting storage. Validation
   independently authenticates static extents, aggregate capacity, part kind,
@@ -902,7 +906,7 @@ it. It injects phase implementations and bounded host capabilities, while
   image entry alone receives the exact AArch64 UEFI two-pointer/`EFI_STATUS`
   boundary and an implicit `EFI_SUCCESS` value for a unit return.
 - For the canonical actor-state direct write, lowering authenticates the
-  FlowWir v18 promotion proof, owning `.state` region, value, source, and exact
+  FlowWir v19 promotion proof, owning `.state` region, value, source, and exact
   marker→address→store adjacency. The marker has no MachineWir operation and
   is excluded consistently from output, reservation, and exact instruction
   accounting; the address/store remains the concrete writable-global action.
@@ -1142,7 +1146,7 @@ it. It injects phase implementations and bounded host capabilities, while
 - That schema is the only accepted report shape. Its tag rejects stale or
   mismatched artifacts at the trust boundary; there is no legacy reader,
   migration, adapter, or fallback contract. Its embedded interface facts must
-  be exactly SemanticWir 14, FlowWir 18, Flow wire 18, MachineWir 19, and runtime
+  be exactly SemanticWir 14, FlowWir 19, Flow wire 19, MachineWir 19, and runtime
   ABI 2; nonzero stale or future values are rejected rather than tolerated.
 - Schema v10 also projects sealed actor, task, reportable region, and async
   activation plans into

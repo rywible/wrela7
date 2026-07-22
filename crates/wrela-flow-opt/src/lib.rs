@@ -1448,6 +1448,7 @@ fn scan_model(
             FlowTypeKind::Unit
             | FlowTypeKind::Scalar(_)
             | FlowTypeKind::StaticString { .. }
+            | FlowTypeKind::StaticBytes { .. }
             | FlowTypeKind::BoundedString { .. }
             | FlowTypeKind::Array { .. }
             | FlowTypeKind::Activation { .. }
@@ -3582,7 +3583,7 @@ mod contract_tests {
         model.name = "m".repeat(CANCELLABLE_COMPARISON_CHUNK_BYTES * 3 + 1);
         let model = model
             .validate()
-            .expect("valid long-prefix FlowWir v18 model");
+            .expect("valid long-prefix FlowWir v19 model");
         let equal = model.clone();
 
         let all_polls = Cell::new(0_u32);
@@ -3621,7 +3622,7 @@ mod contract_tests {
         substituted.name.push('n');
         let substituted = substituted
             .validate()
-            .expect("valid same-length substituted FlowWir v18 model");
+            .expect("valid same-length substituted FlowWir v19 model");
         let mut work = WorkMeter::new(OptimizationLimits::standard().work, &|| false);
         assert!(
             !flow_wir_equal(model.as_wir(), substituted.as_wir(), &mut work)
@@ -3639,7 +3640,7 @@ mod contract_tests {
         group.name = "g".repeat(CANCELLABLE_COMPARISON_CHUNK_BYTES * 2 + 1);
         let model = model
             .validate()
-            .expect("valid FlowWir v18 compiled-group fixture");
+            .expect("valid FlowWir v19 compiled-group fixture");
         let group = model
             .as_wir()
             .compiled_test_group

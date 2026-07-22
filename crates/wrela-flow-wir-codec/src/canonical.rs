@@ -711,6 +711,10 @@ impl<'a> Writer<'a> {
                 self.u8(17)?;
                 self.u64(*capacity)
             }
+            FlowTypeKind::StaticBytes { bytes } => {
+                self.u8(18)?;
+                self.u64(*bytes)
+            }
         }
     }
 
@@ -2014,6 +2018,7 @@ impl<'a> Reader<'a> {
             17 => Ok(FlowTypeKind::BoundedString {
                 capacity: self.u64()?,
             }),
+            18 => Ok(FlowTypeKind::StaticBytes { bytes: self.u64()? }),
             tag => Err(invalid_tag("FlowTypeKind", tag)),
         }
     }
@@ -3287,7 +3292,7 @@ mod tests {
         harness_name.clone_from(&name);
         model
             .validate()
-            .expect("valid long-prefix FlowWir v18 fixture")
+            .expect("valid long-prefix FlowWir v19 fixture")
     }
 
     struct SubstitutingCodec<'a> {
@@ -3526,6 +3531,56 @@ mod tests {
             &|| false,
         )
         .expect("decode bounded-string FlowWir");
+        assert_eq!(decoded, model);
+    }
+
+    #[test]
+    fn static_bytes_identity_and_content_roundtrip_canonically() {
+        let mut model = fixture().into_wir();
+        let source = Span {
+            file: wrela_source::FileId(0),
+            range: wrela_source::TextRange { start: 3, end: 16 },
+        };
+        model.types.push(FlowType {
+            id: TypeId(1),
+            kind: FlowTypeKind::StaticBytes { bytes: 3 },
+            name: Some("Static[Bytes[3]]".to_owned()),
+            copyable: true,
+            strict_linear: false,
+        });
+        model.functions[0].values = vec![Value {
+            id: ValueId(0),
+            ty: TypeId(1),
+            source_name: Some("packet".to_owned()),
+            source: Some(source),
+        }];
+        model.functions[0].blocks[0].instructions = vec![Instruction {
+            id: InstructionId(0),
+            results: vec![ValueId(0)],
+            operation: FlowOperation::Immediate(Immediate::Bytes(vec![0, 0x7f, 0xff])),
+            source: Some(source),
+        }];
+        let model = model.validate().expect("valid static-bytes FlowWir");
+        let codec = CanonicalFlowWirCodec;
+        let encoded = encode_and_verify(
+            &codec,
+            EncodeRequest {
+                wir: &model,
+                limits: CodecLimits::standard(),
+            },
+            &|| false,
+        )
+        .expect("encode static-bytes FlowWir");
+        let decoded = decode_and_verify(
+            &codec,
+            DecodeRequest {
+                bytes: encoded.bytes(),
+                limits: CodecLimits::standard(),
+                expected_build: Some(&model.as_wir().build),
+            },
+            &|| false,
+        )
+        .expect("decode static-bytes FlowWir");
         assert_eq!(decoded, model);
     }
 
@@ -4805,7 +4860,7 @@ mod tests {
                 &|| false,
             ),
             Err(CodecError::NonCanonical(
-                "codec output differs from the canonical FlowWir v18 encoding"
+                "codec output differs from the canonical FlowWir v19 encoding"
             ))
         ));
     }

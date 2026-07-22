@@ -543,7 +543,7 @@ fn supported_actor_image<'a>(
                 if ty.linearity == semantic::Linearity::ExplicitCopy && ty.source.is_none() => {}
             semantic::TypeKind::StaticBytes { .. } => {
                 return Err(unsupported(
-                    "flow-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
+                    "flow-static-bytes-lowering-pending (async/actor byte values)",
                 ));
             }
             semantic::TypeKind::BoundedString { capacity }
@@ -2330,10 +2330,14 @@ fn supported_generated_tests<'a>(
                     return Err(unsupported("generated test static string types"));
                 }
             }
-            semantic::TypeKind::StaticBytes { .. } => {
-                return Err(unsupported(
-                    "flow-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
-                ));
+            semantic::TypeKind::StaticBytes { bytes } => {
+                if saw_frame
+                    || ty.linearity != semantic::Linearity::ExplicitCopy
+                    || ty.source.is_some()
+                    || *bytes > limits.payload_bytes
+                {
+                    return Err(unsupported("generated test static bytes types"));
+                }
             }
             semantic::TypeKind::BoundedString { capacity } => {
                 if saw_frame
@@ -2580,6 +2584,7 @@ fn supported_local_value_type(input: &semantic::SemanticWir, ty: semantic::TypeI
                 record.kind,
                 semantic::TypeKind::Primitive(semantic::PrimitiveType::Char)
                     | semantic::TypeKind::StaticString { .. }
+                    | semantic::TypeKind::StaticBytes { .. }
                     | semantic::TypeKind::BoundedString { .. }
             )
     })
@@ -3073,6 +3078,10 @@ fn validate_scalar_source_function(
                                             semantic::TypeKind::StaticString { bytes },
                                             semantic::Constant::String(text),
                                         ) => usize::try_from(*bytes).ok() == Some(text.len()),
+                                        (
+                                            semantic::TypeKind::StaticBytes { bytes },
+                                            semantic::Constant::Bytes(value),
+                                        ) => usize::try_from(*bytes).ok() == Some(value.len()),
                                         _ => false,
                                     }
                                 })
@@ -4850,10 +4859,8 @@ fn lower_generated_type(
         semantic::TypeKind::StaticString { bytes } => {
             flow::FlowTypeKind::StaticString { bytes: *bytes }
         }
-        semantic::TypeKind::StaticBytes { .. } => {
-            return Err(unsupported(
-                "flow-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
-            ));
+        semantic::TypeKind::StaticBytes { bytes } => {
+            flow::FlowTypeKind::StaticBytes { bytes: *bytes }
         }
         semantic::TypeKind::BoundedString { capacity } => flow::FlowTypeKind::BoundedString {
             capacity: *capacity,
@@ -4960,7 +4967,7 @@ fn lower_actor_type(
         }
         semantic::TypeKind::StaticBytes { .. } => {
             return Err(unsupported(
-                "flow-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
+                "flow-static-bytes-lowering-pending (async/actor byte values)",
             ));
         }
         semantic::TypeKind::BoundedString { capacity } => flow::FlowTypeKind::BoundedString {
@@ -7938,6 +7945,7 @@ fn validate_model_resources(
             FlowTypeKind::Unit
             | FlowTypeKind::Scalar(_)
             | FlowTypeKind::StaticString { .. }
+            | FlowTypeKind::StaticBytes { .. }
             | FlowTypeKind::BoundedString { .. }
             | FlowTypeKind::Array { .. }
             | FlowTypeKind::Activation { .. }
@@ -8605,6 +8613,10 @@ fn actor_flow_type_kind_matches(
         (
             flow::FlowTypeKind::StaticString { bytes: expected },
             flow::FlowTypeKind::StaticString { bytes: output },
+        ) => expected == output,
+        (
+            flow::FlowTypeKind::StaticBytes { bytes: expected },
+            flow::FlowTypeKind::StaticBytes { bytes: output },
         ) => expected == output,
         (
             flow::FlowTypeKind::BoundedString { capacity: expected },
@@ -10165,8 +10177,164 @@ mod contract_tests {
             .expect("valid producer-shaped stateless actor SemanticWir")
     }
 
+    fn static_bytes_generated_fixture() -> semantic::ValidatedSemanticWir {
+        let mut module = scalar_generated_fixture().into_wir();
+        for ty in &mut module.types[4..] {
+            ty.id.0 += 1;
+            if let semantic::TypeKind::Array { element, .. } = &mut ty.kind {
+                element.0 += 1;
+            }
+        }
+        for function in &mut module.functions {
+            if function.result.0 >= 4 {
+                function.result.0 += 1;
+            }
+            for value in &mut function.values {
+                if value.ty.0 >= 4 {
+                    value.ty.0 += 1;
+                }
+            }
+        }
+        let literal_source = span(0, 92, 104);
+        module.types.insert(
+            4,
+            semantic::TypeRecord {
+                id: semantic::TypeId(4),
+                source_name: "Static[Bytes[3]]".to_owned(),
+                kind: semantic::TypeKind::StaticBytes { bytes: 3 },
+                linearity: semantic::Linearity::ExplicitCopy,
+                source: None,
+            },
+        );
+        module.functions[0].values.push(semantic::SemanticValue {
+            id: semantic::ValueId(4),
+            ty: semantic::TypeId(4),
+            origin: Some(literal_source),
+            name: Some("packet".to_owned()),
+        });
+        module.functions[0].body.statements.insert(
+            0,
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                results: vec![semantic::ValueId(4)],
+                operation: semantic::SemanticOperation::Constant(semantic::Constant::Bytes(vec![
+                    0, 0x7f, 0xff,
+                ])),
+                source: Some(literal_source),
+            }),
+        );
+        module
+            .validate()
+            .expect("canonical synchronous static bytes identity")
+    }
+
     #[test]
-    fn static_bytes_identity_stops_at_named_flow_abi_boundary() {
+    fn static_bytes_identity_reaches_exact_flow_boundary_and_limits() {
+        let input = static_bytes_generated_fixture();
+        let literal_source = span(0, 92, 104);
+        let output = CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("exact static bytes FlowWir lowering");
+        let wir = output.wir().as_wir();
+        assert!(matches!(
+            wir.types.get(4),
+            Some(flow::FlowType {
+                id: flow::TypeId(4),
+                kind: flow::FlowTypeKind::StaticBytes { bytes: 3 },
+                name: Some(name),
+                copyable: true,
+                strict_linear: false,
+            }) if name == "Static[Bytes[3]]"
+        ));
+        assert!(matches!(
+            wir.functions[0].blocks[0].instructions.first(),
+            Some(flow::Instruction {
+                results,
+                operation: flow::FlowOperation::Immediate(flow::Immediate::Bytes(bytes)),
+                source: Some(source),
+                ..
+            }) if results.as_slice() == [flow::ValueId(4)]
+                && bytes == &[0, 0x7f, 0xff]
+                && *source == literal_source
+        ));
+        let mut same_length_forgery = wir.clone();
+        let flow::FlowOperation::Immediate(flow::Immediate::Bytes(bytes)) =
+            &mut same_length_forgery.functions[0].blocks[0].instructions[0].operation
+        else {
+            panic!("static bytes instruction")
+        };
+        bytes[1] ^= 0x55;
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: input.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                same_length_forgery,
+                output.report().clone(),
+                Vec::new(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_))
+        ));
+
+        let operation =
+            semantic::SemanticOperation::Constant(semantic::Constant::Bytes(vec![0, 0x7f, 0xff]));
+        let mut exact = LoweringLimits::standard();
+        exact.payload_bytes = 3;
+        assert!(matches!(
+            super::lower_generated_operation(input.as_wir(), &operation, exact, &|| false),
+            Ok(flow::FlowOperation::Immediate(flow::Immediate::Bytes(bytes)))
+                if bytes == [0, 0x7f, 0xff]
+        ));
+        let mut one_under = exact;
+        one_under.payload_bytes = 2;
+        assert!(matches!(
+            super::lower_generated_operation(input.as_wir(), &operation, one_under, &|| false),
+            Err(LowerError::ResourceLimit {
+                resource: "FlowWir payload bytes",
+                limit: 2,
+            })
+        ));
+
+        let calls = Cell::new(0_u64);
+        CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    calls.set(calls.get() + 1);
+                    false
+                },
+            )
+            .expect("static bytes cancellation baseline");
+        let final_poll = calls.get();
+        calls.set(0);
+        assert!(matches!(
+            CanonicalFlowLowerer::new().lower(
+                LowerRequest {
+                    input,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    let next = calls.get() + 1;
+                    calls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn static_bytes_actor_values_stay_named_fail_closed() {
         let mut module = actor_fixture().into_wir();
         module.types.push(semantic::TypeRecord {
             id: semantic::TypeId(5),
@@ -10175,7 +10343,9 @@ mod contract_tests {
             linearity: semantic::Linearity::ExplicitCopy,
             source: None,
         });
-        let input = module.validate().expect("canonical static bytes identity");
+        let input = module
+            .validate()
+            .expect("canonical actor static bytes type");
         assert!(matches!(
             CanonicalFlowLowerer::new().lower(
                 LowerRequest {
@@ -10185,7 +10355,7 @@ mod contract_tests {
                 &|| false,
             ),
             Err(LowerError::UnsupportedInput {
-                feature: "flow-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
+                feature: "flow-static-bytes-lowering-pending (async/actor byte values)",
             })
         ));
     }

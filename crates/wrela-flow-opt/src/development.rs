@@ -3325,6 +3325,53 @@ mod scalar_semantics_tests {
     }
 
     #[test]
+    fn static_bytes_identity_is_not_dead_code_eliminated() {
+        let mut types = types();
+        types.push(FlowType {
+            id: TypeId(7),
+            kind: FlowTypeKind::StaticBytes { bytes: 3 },
+            name: Some("Static[Bytes[3]]".to_owned()),
+            copyable: true,
+            strict_linear: false,
+        });
+        let source = wrela_source::Span {
+            file: wrela_source::FileId(0),
+            range: wrela_source::TextRange { start: 1, end: 14 },
+        };
+        let function = FlowFunction {
+            id: FunctionId(0),
+            name: "bytes".to_owned(),
+            origin: FunctionOrigin::SourceSemantic {
+                semantic_function: 0,
+            },
+            role: FunctionRole::Ordinary,
+            color: FunctionColor::Sync,
+            parameters: Vec::new(),
+            result_types: Vec::new(),
+            values: vec![Value {
+                id: ValueId(0),
+                ty: TypeId(7),
+                source_name: Some("packet".to_owned()),
+                source: Some(source),
+            }],
+            blocks: Vec::new(),
+            entry: BlockId(0),
+            stack_bound: 0,
+            frame_bound: 0,
+            proofs: Vec::new(),
+            source: None,
+        };
+        let instruction = Instruction {
+            id: InstructionId(0),
+            results: vec![ValueId(0)],
+            operation: FlowOperation::Immediate(Immediate::Bytes(vec![0, 0x7f, 0xff])),
+            source: Some(source),
+        };
+
+        assert!(!removable_when_dead(&instruction, &function, &types));
+    }
+
+    #[test]
     fn floating_nan_comparisons_and_integer_encodings_are_exact() {
         let types = types();
         let nan = ScalarConstant::Float32(f32::NAN.to_bits());

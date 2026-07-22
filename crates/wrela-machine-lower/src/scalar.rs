@@ -836,6 +836,15 @@ fn discover_actor_dispatch(
             }
         }
     }
+    if input
+        .types
+        .iter()
+        .any(|ty| matches!(ty.kind, flow::FlowTypeKind::StaticBytes { .. }))
+    {
+        return Err(unsupported(
+            "machine-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
+        ));
+    }
     if input.types.iter().any(|ty| {
         matches!(
             ty.kind,
@@ -3872,6 +3881,9 @@ fn require_supported_type(
         | flow::FlowTypeKind::StaticString { .. }
         | flow::FlowTypeKind::BoundedString { .. } => Err(unsupported(
             "machine-bounded-string-lowering-pending (runtime storage and formatting ABI)",
+        )),
+        flow::FlowTypeKind::StaticBytes { .. } => Err(unsupported(
+            "machine-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
         )),
     }
 }
@@ -10946,6 +10958,23 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn static_bytes_identity_stops_at_named_machine_abi_boundary() {
+        let ty = flow::FlowType {
+            id: flow::TypeId(0),
+            kind: flow::FlowTypeKind::StaticBytes { bytes: 3 },
+            name: Some("Static[Bytes[3]]".to_owned()),
+            copyable: true,
+            strict_linear: false,
+        };
+        assert_eq!(
+            require_supported_type(&[], &ty, false, false),
+            Err(MachineLowerError::UnsupportedInput {
+                feature: "machine-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
+            })
+        );
     }
 
     #[test]
