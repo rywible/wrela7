@@ -232,12 +232,17 @@ and physical placement. Cores are a property of the image graph — assigned
 at build time like pools, mailboxes, and IRQ vectors — not a runtime
 scheduling concern.
 
-- The image manifest assigns every actor to exactly one core. Unassigned
-  actors default to core 0. A target package that offers cores > 1 makes
-  the placement table meaningful; revision 0.1's advertised profile remains
+- Every actor has exactly one build-time core assignment. Explicit image
+  placement is an override; otherwise the compiler infers placement from the
+  sealed whole-image resource facts described in chapter 04 §15.1. The inferred
+  table is deterministic, is published in the image report, and becomes part
+  of the build identity. A one-core target therefore infers core 0 for every
+  actor. A target package that offers cores > 1 makes the inferred and explicit
+  placement table meaningful; revision 0.1's advertised profile remains
   single-core.
 - There is no actor migration and no work stealing. Load imbalance is a
-  build-time report and a manifest change.
+  build-time report. An explicit manifest assignment can override one inferred
+  assignment without disabling inference for the rest of the image.
 - Each core runs the cooperative scheduler of chapter 04. Same-core actor
   edges keep chapter 04 semantics and as-if fast paths. Cross-core edges
   are the same typed logical message channels, lowered to compiler-generated

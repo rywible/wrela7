@@ -56,7 +56,8 @@ when an early proposal and a later review disagreed.
 | Doc comments | `##` documentation comments attach to the following declaration and feed tooling. |
 | Lockfiles | Dropped from revision 0.1: with exactly one acquirable package (the toolchain `core` component), a lock pins no choice. Returns with real third-party acquisition. |
 | Service concurrency | Non-reentrancy stays unconditional. Concurrent I/O uses the service slot idiom (bounded in-flight `SlotMap` + sealed `slot.resolve(take receipt)`); sharding remains available. Reentrancy is not a service-tier exception. |
-| Multicore | Normative static placement: each actor assigned to one core by the image manifest; per-core cooperative schedulers; cross-core edges lower to generated bounded SPSC rings; IRQ/DMA affinity to the driver core; admission-order record/replay. Advertised 0.1 runtime remains single-core. |
+| Multicore | Normative static placement: each actor has one build-time core assignment, inferred unless explicitly overridden by the image manifest; per-core cooperative schedulers; cross-core edges lower to generated bounded SPSC rings; IRQ/DMA affinity to the driver core; admission-order record/replay. Advertised 0.1 runtime remains single-core. |
+| Placement inference | Closed-world placement is inferred by a deterministic report-fact bin pack; explicit per-actor manifest assignments are fixed overrides, not an all-or-nothing mode. The final table, provenance, and per-core totals are build identity. This follows the `@no_promote` pattern: infer and report by default, make selected expectations explicit when the image requires them. |
 | Unary labels | A function whose only non-receiver parameter defaults to positional-only (label opt-in); multi-parameter and bool-heavy APIs stay label-required. |
 
 ## Why actors are in revision 0.1

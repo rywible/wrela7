@@ -129,16 +129,24 @@ kinds are introduced.
 
 ### 5.1 Placement model
 
-- The image manifest assigns every actor to exactly one core at build time.
-  Placement is manifest configuration (an `@image` build fact), not a
-  language concept, on the same footing as profiles and pool sizing.
-- Unassigned actors default to core 0. Revision 0.1's advertised target
-  remains single-core; a target package that offers cores > 1 makes the
-  placement table meaningful.
+- Every actor receives exactly one core assignment at build time. Placement is
+  an `@image` build fact, not a language concept, on the same footing as
+  profiles and pool sizing. A manifest assignment fixes that actor's core;
+  all other actors are placed by the deterministic inference in chapter 04
+  §15.1.
+- The inference uses the sealed report facts for maximum uninterrupted work
+  and total reserved actor/mailbox/frame/pool bytes. After applying explicit
+  assignments, it orders remaining actors by descending work, descending
+  bytes, then canonical actor identity, and assigns each to the eligible core
+  with the lexicographically smallest resulting `(work, bytes)` totals (lower
+  core index breaks ties). Revision 0.1's single-core target consequently
+  infers core 0 for every unassigned actor; a target package with cores > 1
+  makes the bin pack meaningful.
 - There is **no actor migration and no work stealing**. Load imbalance is a
-  build-time report (the image report already itemizes mailbox depths,
-  budgets, and turn costs) and a one-line manifest change — the same
-  philosophy as `@no_promote` and promotion reporting.
+  build-time report. The report records inferred-versus-explicit provenance,
+  every actor's input totals, the final table, and per-core totals. An explicit
+  assignment overrides one result without disabling inference for the other
+  actors — the same philosophy as `@no_promote` and promotion reporting.
 
 ### 5.2 Execution model
 

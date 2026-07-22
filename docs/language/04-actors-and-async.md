@@ -914,8 +914,9 @@ placement model in [Foundations](01-foundations.md) §8.1:
 - mailbox payloads copy or move `iso` values — the only cross-core transfer
   forms;
 - device vectors have exclusive owners on the driver's core;
-- each actor is assigned to exactly one core by the image manifest (default
-  core 0); there is no migration and no work stealing;
+- each actor receives exactly one build-time core assignment, inferred from
+  sealed whole-image facts unless the image manifest explicitly overrides that
+  actor; there is no migration and no work stealing;
 - same-core edges keep this chapter's semantics and as-if fast paths;
   cross-core edges lower to compiler-generated bounded SPSC rings with
   sealed publication/acquire ordering;
@@ -926,3 +927,34 @@ placement model in [Foundations](01-foundations.md) §8.1:
 
 A full multicore runtime is not a revision 0.1 product claim. Application
 APIs MUST NOT change when a target package exposes cores > 1.
+
+### 15.1 Deterministic inferred placement
+
+Placement inference is a closed-world build transformation, not runtime load
+balancing. The compiler MUST place every actor not explicitly assigned by the
+image manifest using only authenticated whole-image facts that are also
+available to the image report:
+
+- the target's core count and per-core reserved-capacity limits;
+- actor-owned image bytes, mailbox bytes, maximum live activation-frame bytes,
+  and statically reserved pool bytes; and
+- the proved maximum uninterrupted work of the actor's turn closure.
+
+Explicit assignments are fixed first and consume their core's capacity. The
+remaining actors are sorted by descending maximum uninterrupted work, then
+descending total reserved bytes, then ascending canonical actor identity. In
+that order, each actor is assigned to the core whose resulting pair
+`(total maximum uninterrupted work, total reserved bytes)` is lexicographically
+smallest; the lower core index breaks an exact tie. A candidate core that would
+exceed a target-owned hard capacity is ineligible. If no core is eligible, the
+build fails with a placement diagnostic naming the actor, the constraining
+fact, and every candidate core's remaining capacity.
+
+The compiler MUST publish, for every actor, whether its assignment was inferred
+or explicit, the input fact totals used by the inference, and the resulting
+per-core totals. These facts and the final table are sealed into the build
+identity. Repeating a build with the same inputs therefore produces the same
+placement; changing an explicit assignment affects only the fixed input to the
+same deterministic inference. The image may require explicit placement for a
+named actor, just as `@no_promote` turns an otherwise reportable inference into
+a checked contract, but may not request migration or work stealing.
