@@ -1259,6 +1259,236 @@ fn exact_bounded_u64_codegen_callee(
             MachineTerminator::Return(values) if values.as_slice() == [final_sum])
 }
 
+fn operation_only_async_outcome_codegen_matches(
+    machine: &wrela_machine_wir::MachineWir,
+    caller: &MachineFunction,
+    callee: &MachineFunction,
+    activation: &wrela_machine_wir::MachineActivationPlan,
+) -> bool {
+    if machine.activations.as_slice() != [activation.clone()]
+        || activation.id.0 != 0
+        || activation.state != 0
+        || activation.caller != caller.id
+        || activation.callee != callee.id
+        || activation.schedule != MachineActivationSchedule::StartupOnce
+        || !matches!(
+            activation.owner,
+            MachineActivationOwner::Task {
+                task: 0,
+                slots: 1,
+                supervisor: Some(0)
+            }
+        )
+        || !exact_operation_only_async_outcome_enum(machine, callee.result)
+        || !matches!(machine.schedulers.as_slice(), [scheduler]
+            if scheduler.core == 0
+                && scheduler.actors.as_slice() == [0]
+                && scheduler.tasks.as_slice() == [0])
+        || !matches!(machine.region_storage.as_slice(), [mailbox, task, frame]
+        if mailbox.kind == (MachineRegionStorageKind::ActorMailbox {
+                actor: 0,
+                mailbox_capacity: 1,
+            })
+            && task.kind == (MachineRegionStorageKind::TaskEntryFrame {
+                task: 0,
+                function: caller.id,
+                slots: 1,
+            })
+            && frame.kind == (MachineRegionStorageKind::ActivationFrame {
+                activation: activation.id,
+            }))
+    {
+        return false;
+    }
+    let [entry, resume, merge, ok_arm, err_arm, otherwise] = caller.blocks.as_slice() else {
+        return false;
+    };
+    let [call] = entry.instructions.as_slice() else {
+        return false;
+    };
+    let [delivered] = call.results.as_slice() else {
+        return false;
+    };
+    let [tag] = resume.instructions.as_slice() else {
+        return false;
+    };
+    let [tag_value] = tag.results.as_slice() else {
+        return false;
+    };
+    let [selected] = merge.parameters.as_slice() else {
+        return false;
+    };
+    let arm_matches = |block: &wrela_machine_wir::MachineBlock, expected: u8| {
+        let [instruction] = block.instructions.as_slice() else {
+            return false;
+        };
+        let [result] = instruction.results.as_slice() else {
+            return false;
+        };
+        matches!(&instruction.operation,
+        MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le })
+            if bytes_le.as_slice() == [expected]
+                && machine.types.get(ty.0 as usize).is_some_and(|record| {
+                    record.source_name.as_deref() == Some("bool")
+                        && record.kind == (MachineTypeKind::Integer { bits: 8 })
+                }))
+            && instruction.source == tag.source
+            && matches!(&block.terminator,
+                MachineTerminator::Jump { block, arguments }
+                    if *block == merge.id && arguments.as_slice() == [*result])
+    };
+    let consumer = caller.role == MachineFunctionRole::TaskEntry(0)
+        && caller.convention == CallingConvention::Internal
+        && caller.entry == entry.id
+        && caller.parameters.is_empty()
+        && machine
+            .types
+            .get(caller.result.0 as usize)
+            .is_some_and(|ty| ty.kind == MachineTypeKind::Void)
+        && call.id == activation.call_instruction
+        && call.source == Some(activation.source)
+        && caller
+            .values
+            .get(delivered.0 as usize)
+            .is_some_and(|value| value.ty == callee.result)
+        && matches!(&call.operation,
+            MachineOperation::Call {
+                function,
+                arguments,
+                convention: CallingConvention::Internal,
+            } if *function == callee.id && arguments.is_empty())
+        && matches!(&entry.terminator,
+            MachineTerminator::Jump { block, arguments }
+                if *block == resume.id && arguments.is_empty())
+        && activation.resume_block == resume.id
+        && resume.parameters.is_empty()
+        && matches!(tag.operation, MachineOperation::EnumTag { value } if value == *delivered)
+        && caller
+            .values
+            .get(tag_value.0 as usize)
+            .is_some_and(|value| {
+                machine.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                    ty.source_name.as_deref() == Some("__wrela_async_outcome_tag")
+                        && ty.kind == (MachineTypeKind::Integer { bits: 8 })
+                })
+            })
+        && matches!(&resume.terminator,
+            MachineTerminator::Switch { value, cases, default, default_arguments }
+                if *value == *tag_value
+                    && matches!(cases.as_slice(), [(0, zero, zero_arguments), (1, one, one_arguments)]
+                        if *zero == ok_arm.id && zero_arguments.is_empty()
+                            && *one == err_arm.id && one_arguments.is_empty())
+                    && *default == otherwise.id
+                    && default_arguments.is_empty())
+        && merge.instructions.is_empty()
+        && matches!(&merge.terminator, MachineTerminator::Return(values) if values.is_empty())
+        && caller.values.get(selected.0 as usize).is_some_and(|value| {
+            machine.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                ty.source_name.as_deref() == Some("bool")
+                    && ty.kind == (MachineTypeKind::Integer { bits: 8 })
+            })
+        })
+        && arm_matches(ok_arm, 0)
+        && arm_matches(err_arm, 1)
+        && otherwise.instructions.is_empty()
+        && matches!(otherwise.terminator, MachineTerminator::Unreachable);
+
+    let [callee_block] = callee.blocks.as_slice() else {
+        return false;
+    };
+    let [immediate, make] = callee_block.instructions.as_slice() else {
+        return false;
+    };
+    let ([literal], [constructed]) = (immediate.results.as_slice(), make.results.as_slice()) else {
+        return false;
+    };
+    let producer = callee.role == MachineFunctionRole::Ordinary
+        && callee.convention == CallingConvention::Internal
+        && callee.parameters.is_empty()
+        && callee.entry == callee_block.id
+        && matches!(&immediate.operation,
+            MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le })
+                if bytes_le.len() == 8
+                    && machine.types.get(ty.0 as usize).is_some_and(|record| {
+                        record.source_name.as_deref() == Some("u64")
+                            && record.kind == (MachineTypeKind::Integer { bits: 64 })
+                    })
+                    && callee.values.get(literal.0 as usize)
+                        .is_some_and(|value| value.ty == *ty))
+        && matches!(&make.operation,
+            MachineOperation::MakeEnum { ty, variant: 0, payload: Some(payload) }
+                if *ty == callee.result && *payload == *literal)
+        && callee
+            .values
+            .get(constructed.0 as usize)
+            .is_some_and(|value| value.ty == callee.result)
+        && matches!(&callee_block.terminator,
+            MachineTerminator::Return(values) if values.as_slice() == [*constructed]);
+    consumer && producer
+}
+
+fn operation_only_async_outcome_authority_matches(
+    machine: &wrela_machine_wir::MachineWir,
+    caller: &MachineFunction,
+    callee: &MachineFunction,
+    activation: &wrela_machine_wir::MachineActivationPlan,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, CodegenError> {
+    let expected_call = caller
+        .blocks
+        .get(caller.entry.0 as usize)
+        .and_then(|block| block.instructions.first());
+    let mut callee_calls = 0_u64;
+    let mut call_census_matches = expected_call.is_some();
+    let mut work = 0_usize;
+    for function in &machine.functions {
+        check_periodically(work, is_cancelled)?;
+        work = work.saturating_add(1);
+        for block in &function.blocks {
+            check_periodically(work, is_cancelled)?;
+            work = work.saturating_add(1);
+            for instruction in &block.instructions {
+                check_periodically(work, is_cancelled)?;
+                work = work.saturating_add(1);
+                if !matches!(
+                    instruction.operation,
+                    MachineOperation::Call { function, .. } if function == callee.id
+                ) {
+                    continue;
+                }
+                callee_calls = callee_calls.saturating_add(1);
+                call_census_matches &= function.id == caller.id
+                    && block.id == caller.entry
+                    && instruction.id == activation.call_instruction
+                    && expected_call.is_some_and(|expected| expected.id == instruction.id);
+            }
+        }
+    }
+    check_cancelled(is_cancelled)?;
+
+    let mut matched = false;
+    for (index, proof) in machine.proofs.iter().enumerate() {
+        check_periodically(index, is_cancelled)?;
+        if proof.statement != "FlowWir proof: direct fallible await widens to AsyncExit[u64]" {
+            continue;
+        }
+        if matched
+            || proof.kind != BackendProofKind::TypeChecked
+            || proof.bound != Some(1)
+            || proof.depends_on.as_slice()
+                != [wrela_machine_wir::ProofId(0), wrela_machine_wir::ProofId(1)]
+            || proof.sources.len() != 1
+            || proof.source != proof.sources.first().copied()
+            || !caller.proofs.contains(&proof.id)
+        {
+            return Ok(false);
+        }
+        matched = true;
+    }
+    check_cancelled(is_cancelled)?;
+    Ok(matched && call_census_matches && callee_calls == 1)
+}
+
 fn validate_activation_table(
     request: &CodegenRequest<'_>,
     is_cancelled: &dyn Fn() -> bool,
@@ -1353,6 +1583,15 @@ fn validate_activation_table(
                         .source
                         .is_some_and(|source| proof.sources.as_slice() == [source])
             });
+        let operation_only_async =
+            operation_only_async_outcome_codegen_matches(machine, caller, callee, activation)
+                && operation_only_async_outcome_authority_matches(
+                    machine,
+                    caller,
+                    callee,
+                    activation,
+                    is_cancelled,
+                )?;
         let two_await = two_await_activation_codegen_matches(machine, caller, activation);
         let call_block = if two_await {
             caller.blocks.get(activation.state as usize)
@@ -1366,7 +1605,7 @@ fn validate_activation_table(
                     && ty.alignment == 8
             })
         };
-        let call_matches = call_block.is_some_and(|call_block| {
+        let call_matches = operation_only_async || call_block.is_some_and(|call_block| {
             let Some(instruction) = call_block.instructions.last() else {
                 return false;
             };
@@ -1512,7 +1751,8 @@ fn validate_activation_table(
                     MachineTerminator::Jump { block, arguments }
                         if *block == activation.resume_block && arguments.is_empty())
         }) || structured_scope_activation_codegen_matches(machine, caller, activation);
-        let resume_matches = two_await
+        let resume_matches = operation_only_async
+            || two_await
             || caller
                 .blocks
                 .get(activation.resume_block.0 as usize)
@@ -1533,9 +1773,10 @@ fn validate_activation_table(
                     && matches!(&block.terminator,
                         MachineTerminator::Return(values) if values.is_empty()));
         let u64_callee = exact_bounded_u64_codegen_callee(machine, callee);
-        let callee_matches = callee.role == MachineFunctionRole::Ordinary
-            && callee.convention == CallingConvention::Internal
-            && (unit_callee || u64_callee);
+        let callee_matches = operation_only_async
+            || (callee.role == MachineFunctionRole::Ordinary
+                && callee.convention == CallingConvention::Internal
+                && (unit_callee || u64_callee));
         let schedule_matches = activation_codegen_schedule_matches(
             machine,
             activation.caller,
@@ -3542,6 +3783,61 @@ fn supported_runtime_fixed_array(
         && ty.alignment <= machine.layout.maximum_object_alignment
 }
 
+fn exact_operation_only_async_outcome_enum(
+    machine: &wrela_machine_wir::MachineWir,
+    id: MachineTypeId,
+) -> bool {
+    let Some(record) = machine.types.get(id.0 as usize) else {
+        return false;
+    };
+    let MachineTypeKind::TaggedEnum {
+        variant_payloads,
+        storage: Some(_),
+        ..
+    } = &record.kind
+    else {
+        return false;
+    };
+    let exact_u64 = |id: MachineTypeId| {
+        machine.types.get(id.0 as usize).is_some_and(|ty| {
+            ty.source_name.as_deref() == Some("u64")
+                && ty.kind == (MachineTypeKind::Integer { bits: 64 })
+                && ty.size == 8
+                && ty.alignment == 8
+        })
+    };
+    let exact_cause = |id: MachineTypeId, name: &str| {
+        machine.types.get(id.0 as usize).is_some_and(|ty| {
+            ty.source_name.as_deref() == Some(name)
+                && ty.kind == MachineTypeKind::Void
+                && ty.size == 0
+                && ty.alignment == 1
+        })
+    };
+    match (record.source_name.as_deref(), variant_payloads.as_slice()) {
+        (Some("AsyncExit"), [Some(value), Some(cancelled), Some(rejected), Some(exceeded)]) => {
+            exact_u64(*value)
+                && exact_cause(*cancelled, "Cancelled")
+                && exact_cause(*rejected, "DeadlineRejected")
+                && exact_cause(*exceeded, "DeadlineExceeded")
+                && cancelled != rejected
+                && cancelled != exceeded
+                && rejected != exceeded
+        }
+        (Some("Result"), [Some(value), Some(exit)]) => {
+            exact_u64(*value)
+                && machine
+                    .types
+                    .get(exit.0 as usize)
+                    .is_some_and(|exit_record| {
+                        exit_record.source_name.as_deref() == Some("AsyncExit")
+                            && exact_operation_only_async_outcome_enum(machine, *exit)
+                    })
+        }
+        _ => false,
+    }
+}
+
 fn supported_enum_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeId) -> bool {
     let Some(ty) = machine.types.get(id.0 as usize) else {
         return false;
@@ -3568,6 +3864,7 @@ fn supported_enum_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeI
     if !common {
         return false;
     }
+    let operation_only_async = exact_operation_only_async_outcome_enum(machine, id);
     let mut logical_payload = None;
     let mut heterogeneous = false;
     let mut maximum_size = 0_u64;
@@ -3590,6 +3887,10 @@ fn supported_enum_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeI
             && supported_struct_layout(&machine.types, *logical)
         {
             nominal_count = nominal_count.saturating_add(1);
+        } else if operation_only_async {
+            // The sealed operation-only outcome is the one recursive nominal
+            // payload profile admitted here. Its nested `AsyncExit` has
+            // already been independently authenticated above.
         } else {
             return false;
         }
@@ -3600,8 +3901,9 @@ fn supported_enum_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeI
                 return false;
             };
             if payload.is_some()
-                || variant_payloads.len() != 2
-                || !((nominal_count == 1 && scalar_count == 1)
+                || (!operation_only_async && variant_payloads.len() != 2)
+                || !(operation_only_async
+                    || (nominal_count == 1 && scalar_count == 1)
                     || (nominal_count == 0 && scalar_count == 2))
                 || storage.alignment != maximum_alignment.max(1)
                 || !storage.alignment.is_power_of_two()

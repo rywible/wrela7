@@ -1367,9 +1367,7 @@ fn lower_supported(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(MachineWir, MachineLoweringReport), MachineLowerError> {
     if has_pending_async_outcome_delivery(request.input.wir().as_wir(), is_cancelled)? {
-        return Err(unsupported(
-            "machine-async-outcome-lowering-pending (scheduler cancellation and deadline delivery)",
-        ));
+        scalar::require_operation_only_async_outcome(request.input.wir().as_wir(), is_cancelled)?;
     }
     require_exact_core_zero_scheduler_ownership(request.input.wir().as_wir(), is_cancelled)?;
     if let Ok(minimum) = supported_minimum(request.input) {

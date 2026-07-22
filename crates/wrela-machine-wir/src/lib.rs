@@ -2827,6 +2827,58 @@ fn validate_target_and_layout(
     }
 }
 
+fn exact_operation_only_async_outcome_enum(module: &MachineWir, id: MachineTypeId) -> bool {
+    let Some(record) = module.types.get(id.0 as usize) else {
+        return false;
+    };
+    let MachineTypeKind::TaggedEnum {
+        variant_payloads,
+        storage: Some(_),
+        ..
+    } = &record.kind
+    else {
+        return false;
+    };
+    let exact_u64 = |id: MachineTypeId| {
+        module.types.get(id.0 as usize).is_some_and(|ty| {
+            ty.source_name.as_deref() == Some("u64")
+                && ty.kind == (MachineTypeKind::Integer { bits: 64 })
+                && ty.size == 8
+                && ty.alignment == 8
+        })
+    };
+    let exact_cause = |id: MachineTypeId, name: &str| {
+        module.types.get(id.0 as usize).is_some_and(|ty| {
+            ty.source_name.as_deref() == Some(name)
+                && ty.kind == MachineTypeKind::Void
+                && ty.size == 0
+                && ty.alignment == 1
+        })
+    };
+    match (record.source_name.as_deref(), variant_payloads.as_slice()) {
+        (Some("AsyncExit"), [Some(value), Some(cancelled), Some(rejected), Some(exceeded)]) => {
+            exact_u64(*value)
+                && exact_cause(*cancelled, "Cancelled")
+                && exact_cause(*rejected, "DeadlineRejected")
+                && exact_cause(*exceeded, "DeadlineExceeded")
+                && cancelled != rejected
+                && cancelled != exceeded
+                && rejected != exceeded
+        }
+        (Some("Result"), [Some(value), Some(exit)]) => {
+            exact_u64(*value)
+                && module
+                    .types
+                    .get(exit.0 as usize)
+                    .is_some_and(|exit_record| {
+                        exit_record.source_name.as_deref() == Some("AsyncExit")
+                            && exact_operation_only_async_outcome_enum(module, *exit)
+                    })
+        }
+        _ => false,
+    }
+}
+
 fn validate_type(module: &MachineWir, ty: &MachineType, errors: &mut ValidationContext<'_>) {
     if !valid_alignment(ty.alignment)
         || ty.alignment > module.layout.maximum_object_alignment
@@ -3052,7 +3104,11 @@ fn validate_type(module: &MachineWir, ty: &MachineType, errors: &mut ValidationC
                         (Some(logical), Some(physical), None) => {
                             logical == *physical && payload_valid
                         }
-                        (None, None, Some(_)) => exact_heterogeneous_profile && storage_valid,
+                        (None, None, Some(_)) => {
+                            (exact_heterogeneous_profile
+                                || exact_operation_only_async_outcome_enum(module, ty.id))
+                                && storage_valid
+                        }
                         _ => false,
                     }
             } else {
@@ -4359,9 +4415,13 @@ fn validate_activations(module: &MachineWir, errors: &mut ValidationContext<'_>)
             && activation.capacity_bound == u64::from(activation.maximum_live)
             && activation.source.range.start <= activation.source.range.end;
 
-        let call_shape_matches =
-            activation_call_shape_matches(module, caller, callee, activation, errors);
-        let callee_shape_matches = immediate_activation_callee_matches(module, callee);
+        let operation_only_async = operation_only_async_outcome_activation_matches(
+            module, caller, callee, activation, errors,
+        );
+        let call_shape_matches = operation_only_async
+            || activation_call_shape_matches(module, caller, callee, activation, errors);
+        let callee_shape_matches =
+            operation_only_async || immediate_activation_callee_matches(module, callee);
         let schedule_matches = activation_schedule_matches(module, activation, errors);
         if !owner_matches
             || !proof_matches
@@ -4534,6 +4594,14 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                 }
             ) && activation.schedule == MachineActivationSchedule::StartupOnce
         });
+    let operation_only_async = matches!(module.activations.as_slice(), [activation]
+    if module.functions.get(activation.caller.0 as usize).zip(
+        module.functions.get(activation.callee.0 as usize)
+    ).is_some_and(|(caller, callee)| {
+        operation_only_async_outcome_activation_matches(
+            module, caller, callee, activation, errors,
+        )
+    }));
     let actor_state_count = module
         .region_storage
         .iter()
@@ -4543,7 +4611,13 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
     let expected = module
         .activations
         .len()
-        .checked_add(if cross_actor { 4 } else { 3 })
+        .checked_add(if operation_only_async {
+            2
+        } else if cross_actor {
+            4
+        } else {
+            3
+        })
         .and_then(|count| count.checked_add(usize::from(has_actor_state)));
     if expected != Some(module.region_storage.len()) {
         errors.push(ValidationError::InvalidRecord {
@@ -4738,6 +4812,7 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                                 mailbox_capacity,
                             })
                     }) || (cross_actor && actor == 1 && mailbox_capacity == 1)
+                        || (operation_only_async && actor == 0 && mailbox_capacity == 1)
                         || (reply_profile && matches!(actor, 0 | 1) && mailbox_capacity == 1))
             }
             MachineRegionStorageKind::ActorState { actor } => {
@@ -4802,7 +4877,14 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
                 slots,
             } => {
                 task_frame_count = task_frame_count.saturating_add(1);
-                storage.id.0 == (if cross_actor { 3 } else { 2 }) + u32::from(has_actor_state)
+                storage.id.0
+                    == (if operation_only_async {
+                        1
+                    } else if cross_actor {
+                        3
+                    } else {
+                        2
+                    }) + u32::from(has_actor_state)
                     && slots == 1
                     && storage.capacity_units == u64::from(slots)
                     && storage.bytes_per_unit == storage.capacity_bytes
@@ -4868,7 +4950,7 @@ fn validate_region_storage(module: &MachineWir, errors: &mut ValidationContext<'
     if mailbox_count != if cross_actor { 2 } else { 1 }
         || state_count != u8::from(has_actor_state)
         || actor_state_count > 1
-        || actor_frame_count != 1
+        || actor_frame_count != u8::from(!operation_only_async)
         || task_frame_count != 1
     {
         errors.push(ValidationError::InvalidRecord {
@@ -5112,6 +5194,207 @@ fn activation_call_shape_matches(
                 && matches!(&resume.terminator, MachineTerminator::Return(values) if values.is_empty())
         });
     matched == 1 && valid && resume_matches
+}
+
+fn operation_only_async_outcome_activation_matches(
+    module: &MachineWir,
+    caller: &MachineFunction,
+    callee: &MachineFunction,
+    activation: &MachineActivationPlan,
+    errors: &mut ValidationContext<'_>,
+) -> bool {
+    if module.activations.len() != 1
+        || activation.id != MachineActivationId(0)
+        || activation.caller != caller.id
+        || activation.callee != callee.id
+        || activation.state != 0
+        || activation.schedule != MachineActivationSchedule::StartupOnce
+        || !matches!(
+            activation.owner,
+            MachineActivationOwner::Task {
+                task: 0,
+                slots: 1,
+                supervisor: Some(0)
+            }
+        )
+        || !exact_operation_only_async_outcome_enum(module, callee.result)
+    {
+        return false;
+    }
+    let [entry, resume, merge, ok_arm, err_arm, otherwise] = caller.blocks.as_slice() else {
+        return false;
+    };
+    let [call] = entry.instructions.as_slice() else {
+        return false;
+    };
+    let [delivered] = call.results.as_slice() else {
+        return false;
+    };
+    let [tag] = resume.instructions.as_slice() else {
+        return false;
+    };
+    let [tag_value] = tag.results.as_slice() else {
+        return false;
+    };
+    let [selected] = merge.parameters.as_slice() else {
+        return false;
+    };
+    let arm_matches = |block: &MachineBlock, expected: bool| {
+        let [instruction] = block.instructions.as_slice() else {
+            return false;
+        };
+        let [result] = instruction.results.as_slice() else {
+            return false;
+        };
+        matches!(&instruction.operation,
+        MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le })
+            if bytes_le.as_slice() == [u8::from(expected)]
+                && module.types.get(ty.0 as usize).is_some_and(|record| {
+                    record.source_name.as_deref() == Some("bool")
+                        && record.kind == (MachineTypeKind::Integer { bits: 8 })
+                }))
+            && instruction.source == tag.source
+            && matches!(&block.terminator,
+                MachineTerminator::Jump { block, arguments }
+                    if *block == merge.id && arguments.as_slice() == [*result])
+    };
+    let consumer = caller.role == MachineFunctionRole::TaskEntry(0)
+        && caller.convention == CallingConvention::Internal
+        && caller.entry == entry.id
+        && caller.parameters.is_empty()
+        && module
+            .types
+            .get(caller.result.0 as usize)
+            .is_some_and(|ty| ty.kind == MachineTypeKind::Void)
+        && call.id == activation.call_instruction
+        && call.source == Some(activation.source)
+        && caller
+            .values
+            .get(delivered.0 as usize)
+            .is_some_and(|value| value.ty == callee.result)
+        && matches!(&call.operation,
+            MachineOperation::Call {
+                function,
+                arguments,
+                convention: CallingConvention::Internal,
+            } if *function == callee.id && arguments.is_empty())
+        && matches!(&entry.terminator,
+            MachineTerminator::Jump { block, arguments }
+                if *block == resume.id && arguments.is_empty())
+        && activation.resume_block == resume.id
+        && resume.parameters.is_empty()
+        && matches!(tag.operation, MachineOperation::EnumTag { value } if value == *delivered)
+        && caller
+            .values
+            .get(tag_value.0 as usize)
+            .is_some_and(|value| {
+                module.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                    ty.source_name.as_deref() == Some("__wrela_async_outcome_tag")
+                        && ty.kind == (MachineTypeKind::Integer { bits: 8 })
+                })
+            })
+        && matches!(&resume.terminator,
+            MachineTerminator::Switch { value, cases, default, default_arguments }
+                if *value == *tag_value
+                    && matches!(cases.as_slice(), [(0, zero, zero_arguments), (1, one, one_arguments)]
+                        if *zero == ok_arm.id && zero_arguments.is_empty()
+                            && *one == err_arm.id && one_arguments.is_empty())
+                    && *default == otherwise.id
+                    && default_arguments.is_empty())
+        && merge.instructions.is_empty()
+        && matches!(&merge.terminator, MachineTerminator::Return(values) if values.is_empty())
+        && caller.values.get(selected.0 as usize).is_some_and(|value| {
+            module.types.get(value.ty.0 as usize).is_some_and(|ty| {
+                ty.kind == (MachineTypeKind::Integer { bits: 8 })
+                    && ty.source_name.as_deref() == Some("bool")
+            })
+        })
+        && arm_matches(ok_arm, false)
+        && arm_matches(err_arm, true)
+        && otherwise.instructions.is_empty()
+        && matches!(otherwise.terminator, MachineTerminator::Unreachable);
+
+    let [callee_block] = callee.blocks.as_slice() else {
+        return false;
+    };
+    let [immediate, make] = callee_block.instructions.as_slice() else {
+        return false;
+    };
+    let ([literal], [constructed]) = (immediate.results.as_slice(), make.results.as_slice()) else {
+        return false;
+    };
+    let producer = callee.role == MachineFunctionRole::Ordinary
+        && callee.convention == CallingConvention::Internal
+        && callee.parameters.is_empty()
+        && callee.entry == callee_block.id
+        && matches!(&immediate.operation,
+            MachineOperation::Immediate(MachineImmediate::Integer { ty, bytes_le })
+                if bytes_le.len() == 8
+                    && module.types.get(ty.0 as usize).is_some_and(|record| {
+                        record.source_name.as_deref() == Some("u64")
+                            && record.kind == (MachineTypeKind::Integer { bits: 64 })
+                    })
+                    && callee.values.get(literal.0 as usize)
+                        .is_some_and(|value| value.ty == *ty))
+        && matches!(&make.operation,
+            MachineOperation::MakeEnum { ty, variant: 0, payload: Some(payload) }
+                if *ty == callee.result && *payload == *literal)
+        && callee
+            .values
+            .get(constructed.0 as usize)
+            .is_some_and(|value| value.ty == callee.result)
+        && matches!(&callee_block.terminator,
+            MachineTerminator::Return(values) if values.as_slice() == [*constructed]);
+
+    let mut callee_calls = 0_u64;
+    let mut call_census_matches = true;
+    for function in &module.functions {
+        if !errors.poll() {
+            return false;
+        }
+        for block in &function.blocks {
+            if !errors.poll() {
+                return false;
+            }
+            for instruction in &block.instructions {
+                if !errors.poll() {
+                    return false;
+                }
+                if !matches!(
+                    instruction.operation,
+                    MachineOperation::Call { function, .. } if function == callee.id
+                ) {
+                    continue;
+                }
+                callee_calls = callee_calls.saturating_add(1);
+                call_census_matches &=
+                    function.id == caller.id && block.id == entry.id && instruction.id == call.id;
+            }
+        }
+    }
+    call_census_matches &= callee_calls == 1;
+
+    let mut authority_matches = false;
+    for proof in &module.proofs {
+        if !errors.poll() {
+            return false;
+        }
+        if proof.statement != "FlowWir proof: direct fallible await widens to AsyncExit[u64]" {
+            continue;
+        }
+        if authority_matches
+            || proof.kind != BackendProofKind::TypeChecked
+            || proof.bound != Some(1)
+            || proof.depends_on.as_slice() != [ProofId(0), ProofId(1)]
+            || proof.sources.len() != 1
+            || proof.source != proof.sources.first().copied()
+            || !caller.proofs.contains(&proof.id)
+        {
+            return false;
+        }
+        authority_matches = true;
+    }
+    consumer && producer && call_census_matches && authority_matches
 }
 
 fn two_await_activation_shape_matches(

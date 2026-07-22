@@ -1,8 +1,15 @@
 #![forbid(unsafe_code)]
 
+use std::cell::Cell;
 use std::sync::Arc;
 
-use wrela_backend::{MachineLowerError, flow_wir as flow, prepare_canonical_frame_for_codegen};
+use wrela_backend::{
+    BackendContentHasher, BackendPreparationOptions, BackendPreparationServices,
+    CanonicalBackendContentHasher, CanonicalFlowOptimizer, CanonicalMachineLowerer, CodegenError,
+    MachineLowerError, MachineLoweringLimits, OptimizationLimits, OptimizationProfile,
+    emit_prepared_object, flow_wir as flow, llvm_backend_available, machine_wir as machine,
+    prepare_canonical_frame_for_codegen, prepare_for_codegen,
+};
 use wrela_build_model::{
     BuildConfiguration, BuildIdentity, BuildProfile, LanguageRevision, Sha256Digest,
     TargetIdentity, seal_build_configuration,
@@ -365,7 +372,7 @@ fn authenticated_async_exit_reaches_exact_flow_suspend_and_match_protocol() {
     assert_eq!(
         machine_error.machine_lower_error(),
         Some(&MachineLowerError::UnsupportedInput {
-            feature: "machine-async-outcome-lowering-pending (scheduler cancellation and deadline delivery)",
+            feature: "machine-async-outcome-consumer-pending (nested AsyncExit match)",
         })
     );
     let mut proof_subject_forgery = lowered.wir().as_wir().clone();
@@ -393,7 +400,7 @@ fn authenticated_async_exit_reaches_exact_flow_suspend_and_match_protocol() {
     assert_eq!(
         forged_machine_error.machine_lower_error(),
         Some(&MachineLowerError::UnsupportedInput {
-            feature: "machine-async-outcome-lowering-pending (scheduler cancellation and deadline delivery)",
+            feature: "machine-async-outcome-consumer-pending (nested AsyncExit match)",
         })
     );
 
@@ -533,6 +540,331 @@ fn authenticated_async_exit_direct_is_uses_the_same_flow_delivery_profile() {
             .blocks
             .iter()
             .any(|block| { matches!(block.terminator, flow::Terminator::Switch { .. }) })
+    );
+}
+
+#[test]
+fn operation_only_async_outcome_direct_is_reaches_machine_and_native_coff() {
+    let fixture = compile_semantic(DIRECT_IS_SOURCE);
+    let lowered = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: fixture.semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("direct is consumes the authenticated outcome in FlowWir");
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: lowered.wir(),
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("authenticated direct-is FlowWir encodes canonically");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("operation-only direct-is reaches MachineWir");
+    let machine = prepared.machine().wir().as_wir();
+    assert!(machine.types.iter().any(|ty| {
+        ty.source_name.as_deref() == Some("AsyncExit")
+            && matches!(
+                ty.kind,
+                machine::MachineTypeKind::TaggedEnum { variants: 4, .. }
+            )
+    }));
+    assert!(machine.types.iter().any(|ty| {
+        ty.source_name.as_deref() == Some("Result")
+            && matches!(
+                ty.kind,
+                machine::MachineTypeKind::TaggedEnum { variants: 2, .. }
+            )
+    }));
+    assert_eq!(
+        machine
+            .functions
+            .iter()
+            .filter(|function| {
+                matches!(
+                    function.origin,
+                    machine::MachineFunctionOrigin::SourceSemantic { .. }
+                )
+            })
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(
+                instruction.operation,
+                machine::MachineOperation::Call { .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        machine
+            .functions
+            .iter()
+            .filter(|function| {
+                matches!(
+                    function.origin,
+                    machine::MachineFunctionOrigin::SourceSemantic { .. }
+                )
+            })
+            .flat_map(|function| &function.blocks)
+            .filter(|block| matches!(block.terminator, machine::MachineTerminator::Switch { .. }))
+            .count(),
+        1
+    );
+    let mut duplicate_call_forgery = machine.clone();
+    let activation = duplicate_call_forgery
+        .activations
+        .first()
+        .expect("Machine async outcome activation")
+        .clone();
+    let mut duplicate_call = duplicate_call_forgery
+        .functions
+        .get(activation.caller.0 as usize)
+        .and_then(|caller| caller.blocks.get(caller.entry.0 as usize))
+        .and_then(|entry| entry.instructions.first())
+        .expect("Machine async outcome delivery call")
+        .clone();
+    let callee = duplicate_call_forgery
+        .functions
+        .get_mut(activation.callee.0 as usize)
+        .expect("Machine async outcome producer");
+    let duplicate_result = machine::ValueId(callee.values.len() as u32);
+    duplicate_call.id = machine::InstructionId(
+        callee
+            .blocks
+            .iter()
+            .map(|block| block.instructions.len() as u32)
+            .sum(),
+    );
+    duplicate_call.results = vec![duplicate_result];
+    callee.values.push(machine::MachineValue {
+        id: duplicate_result,
+        ty: callee.result,
+        source_name: Some("forged_duplicate_async_outcome".to_owned()),
+    });
+    callee
+        .blocks
+        .first_mut()
+        .expect("Machine async outcome producer entry")
+        .instructions
+        .push(duplicate_call);
+    assert!(
+        duplicate_call_forgery
+            .validate_for_target(&fixture.target)
+            .is_err(),
+        "MachineWir validation independently rejects a second call targeting the sealed async producer"
+    );
+    let mut proof_forgery = machine.clone();
+    proof_forgery
+        .proofs
+        .iter_mut()
+        .find(|proof| {
+            proof.statement == "FlowWir proof: direct fallible await widens to AsyncExit[u64]"
+        })
+        .expect("MachineWir async outcome authority")
+        .statement = "FlowWir proof: lookalike async outcome authority".to_owned();
+    assert!(
+        proof_forgery.validate_for_target(&fixture.target).is_err(),
+        "MachineWir validation independently rejects proof substitution"
+    );
+    let mut truth_forgery = machine.clone();
+    let bool_ty = truth_forgery
+        .types
+        .iter()
+        .find(|record| record.source_name.as_deref() == Some("bool"))
+        .expect("Machine bool type")
+        .id;
+    let caller = truth_forgery
+        .functions
+        .iter_mut()
+        .find(|function| matches!(function.role, machine::MachineFunctionRole::TaskEntry(0)))
+        .expect("Machine direct-is caller");
+    let bytes = caller
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.operation {
+            machine::MachineOperation::Immediate(machine::MachineImmediate::Integer {
+                ty,
+                bytes_le,
+            }) if bytes_le.as_slice() == [0] && *ty == bool_ty => Some(bytes_le),
+            _ => None,
+        })
+        .expect("false Machine direct-is arm");
+    bytes[0] = 1;
+    assert!(
+        truth_forgery.validate_for_target(&fixture.target).is_err(),
+        "MachineWir validation independently rejects a nondiscriminating truth vector"
+    );
+    let codec = CanonicalFlowWirCodec;
+    let hasher = CanonicalBackendContentHasher::new();
+    let optimizer = CanonicalFlowOptimizer::new();
+    let machine_lowerer = CanonicalMachineLowerer::new();
+    let expected_digest = hasher
+        .sha256(encoded.bytes(), &never_cancelled)
+        .expect("authenticated direct-is frame digest");
+    let optimization = OptimizationProfile::from_build_policy(
+        &fixture.build.profile.optimization,
+        fixture.build.identity.compiler,
+    )
+    .expect("direct-is optimization profile");
+    let prepare_with = |machine_limits: MachineLoweringLimits, is_cancelled: &dyn Fn() -> bool| {
+        prepare_for_codegen(
+            BackendPreparationServices {
+                codec: &codec,
+                hasher: &hasher,
+                optimizer: &optimizer,
+                machine_lowerer: &machine_lowerer,
+            },
+            encoded.bytes(),
+            expected_digest,
+            &fixture.target,
+            &fixture.build,
+            BackendPreparationOptions {
+                codec_limits: CodecLimits::standard(),
+                optimization: optimization.clone(),
+                optimization_limits: OptimizationLimits::standard(),
+                machine_limits,
+            },
+            is_cancelled,
+        )
+    };
+    let repeated = prepare_with(MachineLoweringLimits::standard(), &never_cancelled)
+        .expect("repeat direct-is MachineWir preparation");
+    assert_eq!(repeated.machine().wir().as_wir(), machine);
+    let instruction_count = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .map(|block| block.instructions.len() as u64)
+        .sum::<u64>();
+    let mut exact = MachineLoweringLimits::standard();
+    exact.instructions = instruction_count;
+    exact = exact.with_aligned_validation();
+    let exact_prepared = prepare_with(exact, &never_cancelled)
+        .expect("exact operation-only direct-is MachineWir instruction ceiling");
+    assert_eq!(exact_prepared.machine().wir().as_wir(), machine);
+    let mut one_under = exact;
+    one_under.instructions = instruction_count - 1;
+    one_under = one_under.with_aligned_validation();
+    let one_under = prepare_with(one_under, &never_cancelled)
+        .expect_err("one fewer direct-is MachineWir instruction must fail");
+    assert_eq!(
+        one_under.machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir instructions",
+            limit: instruction_count - 1,
+        })
+    );
+    let polls = Cell::new(0_u64);
+    prepare_with(MachineLoweringLimits::standard(), &|| {
+        polls.set(polls.get().saturating_add(1));
+        false
+    })
+    .expect("count direct-is MachineWir cancellation polls");
+    let final_poll = polls.get();
+    assert!(final_poll > 2);
+    let cancelled_polls = Cell::new(0_u64);
+    let cancellation = prepare_with(MachineLoweringLimits::standard(), &|| {
+        let next = cancelled_polls.get().saturating_add(1);
+        cancelled_polls.set(next);
+        next >= final_poll
+    })
+    .expect_err("final direct-is MachineWir cancellation poll must propagate");
+    assert!(cancellation.is_cancelled());
+    assert_eq!(cancelled_polls.get(), final_poll);
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("operation-only direct-is native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat operation-only direct-is native emission");
+            assert_eq!(first.bytes(), second.bytes());
+        }
+    }
+}
+
+#[test]
+fn async_outcome_machine_authentication_rejects_structurally_valid_forgeries() {
+    let fixture = compile_semantic(DIRECT_IS_SOURCE);
+    let lowered = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: fixture.semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("direct-is FlowWir fixture");
+    let reject = |forged: flow::FlowWir, expected: &'static str| {
+        let validated = forged
+            .validate()
+            .expect("forgery remains structurally valid FlowWir");
+        let encoded = encode_and_verify(
+            &CanonicalFlowWirCodec,
+            EncodeRequest {
+                wir: &validated,
+                limits: CodecLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("structurally valid forgery encodes canonically");
+        let error = prepare_canonical_frame_for_codegen(
+            encoded.bytes(),
+            &fixture.target,
+            &fixture.build,
+            &never_cancelled,
+        )
+        .expect_err("forged async outcome authority must fail closed");
+        assert_eq!(
+            error.machine_lower_error(),
+            Some(&MachineLowerError::UnsupportedInput { feature: expected })
+        );
+    };
+
+    let mut proof = lowered.wir().as_wir().clone();
+    proof
+        .proofs
+        .iter_mut()
+        .find(|proof| proof.subject == "direct fallible await widens to AsyncExit[u64]")
+        .expect("async outcome authority")
+        .subject = "lookalike async outcome authority".to_owned();
+    reject(
+        proof,
+        "machine-async-outcome-authentication (proof authority)",
+    );
+
+    let mut truth = lowered.wir().as_wir().clone();
+    let caller = truth
+        .functions
+        .iter_mut()
+        .find(|function| matches!(function.role, flow::FunctionRole::TaskEntry(_)))
+        .expect("direct-is caller");
+    let value = caller
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.operation {
+            flow::FlowOperation::Immediate(flow::Immediate::Bool(value)) if !*value => Some(value),
+            _ => None,
+        })
+        .expect("false direct-is arm");
+    *value = true;
+    reject(
+        truth,
+        "machine-async-outcome-consumer-pending (nested AsyncExit match)",
     );
 }
 

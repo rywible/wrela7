@@ -114,6 +114,474 @@ struct ScalarPlan {
     startup_task: Option<FunctionId>,
     mailbox_turn: Option<FunctionId>,
     actor_dispatch: Option<ActorDispatchPlan>,
+    async_outcome: Option<AsyncOutcomeDirectIsProfile>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AsyncOutcomeDirectIsProfile {
+    exit: flow::TypeId,
+    outcome: flow::TypeId,
+    caller: flow::FunctionId,
+    callee: flow::FunctionId,
+    activation: flow::ActivationId,
+}
+
+pub(super) fn require_operation_only_async_outcome(
+    input: &flow::FlowWir,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), MachineLowerError> {
+    authenticate_operation_only_async_outcome(input, is_cancelled).map(|_| ())
+}
+
+fn authenticate_operation_only_async_outcome(
+    input: &flow::FlowWir,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<AsyncOutcomeDirectIsProfile, MachineLowerError> {
+    check_cancelled(is_cancelled)?;
+    let mut outcome_graph = None;
+    for outcome in &input.types {
+        check_cancelled(is_cancelled)?;
+        let flow::FlowTypeKind::Enum { variants } = &outcome.kind else {
+            continue;
+        };
+        let [ok, err] = variants.as_slice() else {
+            continue;
+        };
+        let ([value], [exit]) = (ok.as_slice(), err.as_slice()) else {
+            continue;
+        };
+        let Some(exit_record) = input.types.get(exit.0 as usize) else {
+            continue;
+        };
+        if outcome.name.as_deref() != Some("Result")
+            || exit_record.name.as_deref() != Some("AsyncExit")
+        {
+            continue;
+        }
+        let flow::FlowTypeKind::Enum {
+            variants: exit_variants,
+        } = &exit_record.kind
+        else {
+            continue;
+        };
+        let [operation, cancelled, rejected, exceeded] = exit_variants.as_slice() else {
+            continue;
+        };
+        let ([operation], [cancelled], [rejected], [exceeded]) = (
+            operation.as_slice(),
+            cancelled.as_slice(),
+            rejected.as_slice(),
+            exceeded.as_slice(),
+        ) else {
+            continue;
+        };
+        let exact_u64 = input.types.get(value.0 as usize).is_some_and(|record| {
+            record.id == *value
+                && record.name.as_deref() == Some("u64")
+                && record.copyable
+                && !record.strict_linear
+                && record.kind
+                    == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                        signed: false,
+                        bits: 64,
+                    })
+        });
+        let exact_cause = |id: flow::TypeId, name: &str| {
+            input.types.get(id.0 as usize).is_some_and(|record| {
+                record.id == id
+                    && record.name.as_deref() == Some(name)
+                    && record.copyable
+                    && !record.strict_linear
+                    && matches!(&record.kind, flow::FlowTypeKind::Struct { fields } if fields.is_empty())
+            })
+        };
+        let exact = input
+            .types
+            .get(outcome.id.0 as usize)
+            .is_some_and(|candidate| candidate.id == outcome.id)
+            && exit_record.id == *exit
+            && outcome.copyable
+            && !outcome.strict_linear
+            && exit_record.copyable
+            && !exit_record.strict_linear
+            && *operation == *value
+            && exact_u64
+            && exact_cause(*cancelled, "Cancelled")
+            && exact_cause(*rejected, "DeadlineRejected")
+            && exact_cause(*exceeded, "DeadlineExceeded")
+            && cancelled != rejected
+            && cancelled != exceeded
+            && rejected != exceeded;
+        if !exact || outcome_graph.replace((*value, *exit, outcome.id)).is_some() {
+            return Err(unsupported(
+                "machine-async-outcome-authentication (exact nominal type graph)",
+            ));
+        }
+    }
+    let Some((value, exit, outcome)) = outcome_graph else {
+        return Err(unsupported(
+            "machine-async-outcome-authentication (exact nominal type graph)",
+        ));
+    };
+
+    let mut tag = None;
+    let mut activation_type = None;
+    for record in &input.types {
+        check_cancelled(is_cancelled)?;
+        if record.name.as_deref() == Some("__wrela_async_outcome_tag")
+            && record.copyable
+            && !record.strict_linear
+            && record.kind
+                == flow::FlowTypeKind::Scalar(flow::ScalarType::Integer {
+                    signed: false,
+                    bits: 8,
+                })
+            && tag.replace(record.id).is_some()
+        {
+            return Err(unsupported(
+                "machine-async-outcome-authentication (canonical tag type)",
+            ));
+        }
+        if record.kind == (flow::FlowTypeKind::Activation { result: outcome })
+            && record.name.as_deref() == Some(format!("__wrela_activation_{}", outcome.0).as_str())
+            && !record.copyable
+            && record.strict_linear
+            && activation_type.replace(record.id).is_some()
+        {
+            return Err(unsupported(
+                "machine-async-outcome-authentication (activation type)",
+            ));
+        }
+    }
+    let tag = tag.ok_or(unsupported(
+        "machine-async-outcome-authentication (canonical tag type)",
+    ))?;
+    let activation_type = activation_type.ok_or(unsupported(
+        "machine-async-outcome-authentication (activation type)",
+    ))?;
+
+    let [activation] = input.activations.as_slice() else {
+        return Err(unsupported(
+            "machine-async-outcome-authentication (single activation)",
+        ));
+    };
+    let caller = input
+        .functions
+        .get(activation.caller.0 as usize)
+        .ok_or(unsupported("machine-async-outcome-authentication (caller)"))?;
+    let callee = input
+        .functions
+        .get(activation.callee.0 as usize)
+        .ok_or(unsupported("machine-async-outcome-authentication (callee)"))?;
+    let [actor] = input.actors.as_slice() else {
+        return Err(unsupported(
+            "machine-async-outcome-authentication (single actor)",
+        ));
+    };
+    let [task] = input.tasks.as_slice() else {
+        return Err(unsupported(
+            "machine-async-outcome-authentication (single task)",
+        ));
+    };
+    let [scheduler] = input.schedulers.as_slice() else {
+        return Err(unsupported(
+            "machine-async-outcome-authentication (core-zero scheduler)",
+        ));
+    };
+    if actor.id != flow::ActorId(0)
+        || actor.mailbox_capacity != 1
+        || !actor.message_types.is_empty()
+        || !actor.turn_functions.is_empty()
+        || actor.supervisor.is_some()
+        || task.id != flow::TaskId(0)
+        || task.entry != caller.id
+        || task.slots != 1
+        || task.supervisor != Some(actor.id)
+        || scheduler.core != 0
+        || scheduler.actors.as_slice() != [actor.id]
+        || scheduler.tasks.as_slice() != [task.id]
+        || input.startup_order.as_slice()
+            != [
+                flow::PlanOwner::Runtime,
+                flow::PlanOwner::Actor(actor.id),
+                flow::PlanOwner::Task(task.id),
+            ]
+        || input.shutdown_order.as_slice()
+            != [
+                flow::PlanOwner::Task(task.id),
+                flow::PlanOwner::Actor(actor.id),
+                flow::PlanOwner::Runtime,
+            ]
+    {
+        return Err(unsupported(
+            "machine-async-outcome-authentication (core-zero scheduler)",
+        ));
+    }
+
+    let ([self_value], [], [entry, resume, merge, ok_arm, err_arm, otherwise]) = (
+        caller.parameters.as_slice(),
+        caller.result_types.as_slice(),
+        caller.blocks.as_slice(),
+    ) else {
+        return Err(unsupported(
+            "machine-async-outcome-consumer-pending (nested AsyncExit match)",
+        ));
+    };
+    let (
+        [call],
+        flow::Terminator::Suspend {
+            state,
+            activation: token,
+            resume: resume_id,
+        },
+    ) = (entry.instructions.as_slice(), &entry.terminator)
+    else {
+        return Err(unsupported(
+            "machine-async-outcome-authentication (call and suspend)",
+        ));
+    };
+    let (
+        [token_result],
+        flow::FlowOperation::AsyncCall {
+            function,
+            arguments,
+            plan,
+        },
+    ) = (call.results.as_slice(), &call.operation)
+    else {
+        return Err(unsupported(
+            "machine-async-outcome-authentication (call and suspend)",
+        ));
+    };
+    let (
+        [delivered],
+        [tag_instruction],
+        flow::Terminator::Switch {
+            value: switched,
+            cases,
+            default,
+            default_arguments,
+        },
+    ) = (
+        resume.parameters.as_slice(),
+        resume.instructions.as_slice(),
+        &resume.terminator,
+    )
+    else {
+        return Err(unsupported(
+            "machine-async-outcome-consumer-pending (nested AsyncExit match)",
+        ));
+    };
+    let ([tag_result], flow::FlowOperation::EnumTag { value: tagged }) = (
+        tag_instruction.results.as_slice(),
+        &tag_instruction.operation,
+    ) else {
+        return Err(unsupported(
+            "machine-async-outcome-authentication (direct-is tag)",
+        ));
+    };
+    let ([selected], [], flow::Terminator::Return(returned)) = (
+        merge.parameters.as_slice(),
+        merge.instructions.as_slice(),
+        &merge.terminator,
+    ) else {
+        return Err(unsupported(
+            "machine-async-outcome-consumer-pending (non-immediate direct is)",
+        ));
+    };
+    let arm_matches = |block: &flow::Block, expected: bool| {
+        let [instruction] = block.instructions.as_slice() else {
+            return false;
+        };
+        let ([result], flow::FlowOperation::Immediate(flow::Immediate::Bool(actual))) =
+            (instruction.results.as_slice(), &instruction.operation)
+        else {
+            return false;
+        };
+        matches!(&block.terminator,
+            flow::Terminator::Jump { target, arguments }
+                if *target == merge.id && arguments.as_slice() == [*result])
+            && *actual == expected
+            && instruction.source == tag_instruction.source
+    };
+    let exact_consumer = caller.id == activation.caller
+        && matches!(caller.origin, flow::FunctionOrigin::SourceSemantic { semantic_function }
+            if semantic_function == caller.id.0)
+        && caller.role == flow::FunctionRole::TaskEntry(task.id)
+        && caller.color == flow::FunctionColor::Async
+        && caller.entry == entry.id
+        && entry.id == flow::BlockId(0)
+        && resume.id == *resume_id
+        && merge.id == flow::BlockId(2)
+        && caller.values.get(self_value.0 as usize).is_some_and(|record| {
+            input.types.get(record.ty.0 as usize).is_some_and(|ty| {
+                ty.name.as_deref() == Some("Worker")
+                    && !ty.copyable
+                    && !ty.strict_linear
+                    && matches!(&ty.kind, flow::FlowTypeKind::Struct { fields } if fields.is_empty())
+            })
+        })
+        && caller.values.get(token_result.0 as usize).is_some_and(|record| record.ty == activation_type)
+        && *state == 0
+        && *token == *token_result
+        && *function == callee.id
+        && arguments.is_empty()
+        && *plan == activation.id
+        && call.source == Some(activation.source)
+        && caller.values.get(delivered.0 as usize).is_some_and(|record| record.ty == outcome)
+        && *tagged == *delivered
+        && caller.values.get(tag_result.0 as usize).is_some_and(|record| record.ty == tag)
+        && *switched == *tag_result
+        && matches!(cases.as_slice(), [zero, one]
+            if zero.value == 0 && zero.target == ok_arm.id && zero.arguments.is_empty()
+                && one.value == 1 && one.target == err_arm.id && one.arguments.is_empty())
+        && *default == otherwise.id
+        && default_arguments.is_empty()
+        && matches!(otherwise.terminator, flow::Terminator::Unreachable)
+        && otherwise.instructions.is_empty()
+        && arm_matches(ok_arm, false)
+        && arm_matches(err_arm, true)
+        && caller.values.get(selected.0 as usize).is_some_and(|record| {
+            input.types.get(record.ty.0 as usize).is_some_and(|ty| {
+                ty.kind == flow::FlowTypeKind::Scalar(flow::ScalarType::Bool)
+            })
+        })
+        && returned.is_empty();
+    if !exact_consumer {
+        return Err(unsupported(
+            "machine-async-outcome-consumer-pending (nested AsyncExit match)",
+        ));
+    }
+
+    let ([], [callee_result], [callee_block]) = (
+        callee.parameters.as_slice(),
+        callee.result_types.as_slice(),
+        callee.blocks.as_slice(),
+    ) else {
+        return Err(unsupported(
+            "machine-async-outcome-lowering-pending (scheduler cancellation and deadline delivery)",
+        ));
+    };
+    let ([immediate, make], flow::Terminator::Return(callee_returned)) = (
+        callee_block.instructions.as_slice(),
+        &callee_block.terminator,
+    ) else {
+        return Err(unsupported(
+            "machine-async-outcome-lowering-pending (scheduler cancellation and deadline delivery)",
+        ));
+    };
+    let ([literal], flow::FlowOperation::Immediate(flow::Immediate::Integer { bits, bytes_le })) =
+        (immediate.results.as_slice(), &immediate.operation)
+    else {
+        return Err(unsupported(
+            "machine-async-outcome-lowering-pending (scheduler cancellation and deadline delivery)",
+        ));
+    };
+    let (
+        [constructed],
+        flow::FlowOperation::MakeEnum {
+            ty,
+            variant,
+            payload,
+        },
+    ) = (make.results.as_slice(), &make.operation)
+    else {
+        return Err(unsupported(
+            "machine-async-outcome-lowering-pending (scheduler cancellation and deadline delivery)",
+        ));
+    };
+    if callee.id != activation.callee
+        || !matches!(callee.origin, flow::FunctionOrigin::SourceSemantic { semantic_function }
+            if semantic_function == callee.id.0)
+        || callee.role != flow::FunctionRole::Ordinary
+        || callee.color != flow::FunctionColor::Async
+        || *callee_result != outcome
+        || callee.entry != callee_block.id
+        || callee_block.id != flow::BlockId(0)
+        || *bits != 64
+        || bytes_le.len() != 8
+        || callee
+            .values
+            .get(literal.0 as usize)
+            .is_none_or(|record| record.ty != value)
+        || *ty != outcome
+        || *variant != 0
+        || *payload != Some(*literal)
+        || callee
+            .values
+            .get(constructed.0 as usize)
+            .is_none_or(|record| record.ty != outcome)
+        || callee_returned.as_slice() != [*constructed]
+        || immediate.source.is_none()
+        || make.source.is_none()
+    {
+        return Err(unsupported(
+            "machine-async-outcome-lowering-pending (scheduler cancellation and deadline delivery)",
+        ));
+    }
+
+    let mut authority = None;
+    let authority_source = resume.source.ok_or(unsupported(
+        "machine-async-outcome-authentication (authority source)",
+    ))?;
+    for proof in &input.proofs {
+        check_cancelled(is_cancelled)?;
+        if proof.subject == "direct fallible await widens to AsyncExit[u64]"
+            && (proof.kind != flow::ProofKind::TypeChecked
+                || proof.bound != Some(1)
+                || proof.sources.as_slice() != [authority_source]
+                || proof.depends_on.as_slice() != [flow::ProofId(0), flow::ProofId(1)]
+                || authority.replace(proof.id).is_some())
+        {
+            return Err(unsupported(
+                "machine-async-outcome-authentication (proof authority)",
+            ));
+        }
+    }
+    let authority = authority.ok_or(unsupported(
+        "machine-async-outcome-authentication (proof authority)",
+    ))?;
+    let capacity = input
+        .proofs
+        .get(activation.capacity_proof.0 as usize)
+        .ok_or(unsupported(
+            "machine-async-outcome-authentication (activation capacity)",
+        ))?;
+    let region = input
+        .regions
+        .get(activation.region.0 as usize)
+        .ok_or(unsupported(
+            "machine-async-outcome-authentication (activation region)",
+        ))?;
+    if !caller.proofs.contains(&authority)
+        || activation.id != flow::ActivationId(0)
+        || activation.maximum_live != 1
+        || activation.frame_bytes != 16
+        || activation.cancellation != flow::ActivationCancellation::DropCalleeThenPropagate
+        || capacity.kind != flow::ProofKind::CapacityBound
+        || capacity.subject != "statically admitted async helper activation"
+        || capacity.bound != Some(1)
+        || capacity.sources.as_slice() != [activation.source]
+        || capacity.depends_on.len() != 1
+        || region.id != activation.region
+        || region.owner != flow::PlanOwner::Task(task.id)
+        || region.class != flow::RegionClass::TaskFrame
+        || region.capacity_bytes != activation.frame_bytes
+        || region.capacity_proof != activation.capacity_proof
+        || region.source != activation.source
+    {
+        return Err(unsupported(
+            "machine-async-outcome-authentication (activation and proof)",
+        ));
+    }
+
+    Ok(AsyncOutcomeDirectIsProfile {
+        exit,
+        outcome,
+        caller: caller.id,
+        callee: callee.id,
+        activation: activation.id,
+    })
 }
 
 impl ScalarPlan {
@@ -147,6 +615,7 @@ struct OutputModelPreflight<'a> {
     image_enter_calls: u64,
     fatal_calls: u64,
     test_assert_calls: u64,
+    async_outcome: Option<&'a AsyncOutcomeDirectIsProfile>,
 }
 
 #[derive(Clone, Copy)]
@@ -940,10 +1409,19 @@ fn preflight(
     if input.functions.is_empty() {
         return Err(unsupported("an empty FlowWir function table"));
     }
+    let mut has_async_outcome = false;
+    for record in &input.types {
+        check_cancelled(is_cancelled)?;
+        has_async_outcome |= record.name.as_deref() == Some("AsyncExit");
+    }
+    let async_outcome = has_async_outcome
+        .then(|| authenticate_operation_only_async_outcome(input, is_cancelled))
+        .transpose()?;
     let flow_actor_dispatch = discover_actor_dispatch(input, is_cancelled)?;
     let activations = lower_activation_subset(
         input,
         flow_actor_dispatch.as_ref(),
+        async_outcome.as_ref(),
         request.limits,
         is_cancelled,
     )?;
@@ -1180,6 +1658,7 @@ fn preflight(
             ty,
             activation_subset,
             flow_actor_dispatch.is_some(),
+            async_outcome.as_ref(),
         )?;
     }
     validate_static_string_profile(input, is_cancelled)?;
@@ -1404,6 +1883,7 @@ fn preflight(
                     instruction,
                     &test_payload_index,
                     &activations,
+                    async_outcome.as_ref(),
                     is_cancelled,
                 )?;
             }
@@ -1420,6 +1900,7 @@ fn preflight(
             image_enter_calls,
             fatal_calls,
             test_assert_calls,
+            async_outcome: async_outcome.as_ref(),
         },
         is_cancelled,
     )?;
@@ -1500,16 +1981,111 @@ fn preflight(
             .then_some(activation.caller)
         }),
         actor_dispatch,
+        async_outcome,
         activations,
     })
+}
+
+fn lower_operation_only_async_outcome_activation(
+    input: &flow::FlowWir,
+    profile: &AsyncOutcomeDirectIsProfile,
+    limits: MachineLoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<MachineActivationPlan>, MachineLowerError> {
+    check_cancelled(is_cancelled)?;
+    let activation = input
+        .activations
+        .get(profile.activation.0 as usize)
+        .ok_or(unsupported(
+            "machine-async-outcome-authentication (activation plan)",
+        ))?;
+    let caller = input
+        .functions
+        .get(profile.caller.0 as usize)
+        .ok_or(unsupported("machine-async-outcome-authentication (caller)"))?;
+    let entry = caller
+        .blocks
+        .get(caller.entry.0 as usize)
+        .ok_or(unsupported(
+            "machine-async-outcome-authentication (caller entry)",
+        ))?;
+    let [call] = entry.instructions.as_slice() else {
+        return Err(unsupported(
+            "machine-async-outcome-authentication (single call)",
+        ));
+    };
+    let flow::Terminator::Suspend { state, resume, .. } = entry.terminator else {
+        return Err(unsupported(
+            "machine-async-outcome-authentication (single suspend)",
+        ));
+    };
+    let region = input
+        .regions
+        .get(activation.region.0 as usize)
+        .ok_or(unsupported(
+            "machine-async-outcome-authentication (activation region)",
+        ))?;
+    let capacity = input
+        .proofs
+        .get(activation.capacity_proof.0 as usize)
+        .ok_or(unsupported(
+            "machine-async-outcome-authentication (activation capacity)",
+        ))?;
+    let [cleanup] = capacity.depends_on.as_slice() else {
+        return Err(unsupported(
+            "machine-async-outcome-authentication (cleanup proof)",
+        ));
+    };
+    let mut output = try_vec(
+        1,
+        "MachineWir activations",
+        limits.model_edges,
+        is_cancelled,
+    )?;
+    output.push(MachineActivationPlan {
+        id: MachineActivationId(activation.id.0),
+        owner: MachineActivationOwner::Task {
+            task: 0,
+            slots: 1,
+            supervisor: Some(0),
+        },
+        schedule: MachineActivationSchedule::StartupOnce,
+        caller: FunctionId(profile.caller.0),
+        callee: FunctionId(profile.callee.0),
+        call_instruction: lowered_instruction_id(
+            input,
+            caller,
+            call.id,
+            limits.instructions,
+            is_cancelled,
+        )?,
+        state,
+        resume_block: BlockId(resume.0),
+        region: activation.region.0,
+        region_capacity_bytes: region.capacity_bytes,
+        region_alignment: u32::try_from(region.alignment)
+            .map_err(|_| unsupported("machine-async-outcome-authentication (region alignment)"))?,
+        frame_bytes: activation.frame_bytes,
+        maximum_live: activation.maximum_live,
+        cancellation: MachineActivationCancellation::DropCalleeThenPropagate,
+        capacity_proof: ProofId(activation.capacity_proof.0),
+        capacity_bound: capacity.bound.unwrap_or(0),
+        cleanup_proof: ProofId(cleanup.0),
+        source: activation.source,
+    });
+    Ok(output)
 }
 
 fn lower_activation_subset(
     input: &flow::FlowWir,
     dispatch: Option<&FlowActorDispatch>,
+    async_outcome: Option<&AsyncOutcomeDirectIsProfile>,
     limits: MachineLoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<MachineActivationPlan>, MachineLowerError> {
+    if let Some(profile) = async_outcome {
+        return lower_operation_only_async_outcome_activation(input, profile, limits, is_cancelled);
+    }
     let has_surface = !input.actors.is_empty()
         || !input.tasks.is_empty()
         || !input.regions.is_empty()
@@ -2054,7 +2630,14 @@ fn lower_activation_subset(
 
 #[cfg(test)]
 pub(super) fn test_lower_activation_subset(input: &flow::FlowWir) -> Result<(), MachineLowerError> {
-    lower_activation_subset(input, None, MachineLoweringLimits::standard(), &|| false).map(drop)
+    lower_activation_subset(
+        input,
+        None,
+        None,
+        MachineLoweringLimits::standard(),
+        &|| false,
+    )
+    .map(drop)
 }
 
 fn flow_type_is_exact_u64(input: &flow::FlowWir, ty: flow::TypeId) -> bool {
@@ -2237,6 +2820,7 @@ fn typed_activation_resume_value(
     function: &flow::FlowFunction,
     activations: &[MachineActivationPlan],
     activation: MachineActivationId,
+    async_outcome: Option<flow::TypeId>,
 ) -> Result<Option<flow::ValueId>, MachineLowerError> {
     let Some(plan) = activations
         .iter()
@@ -2252,7 +2836,7 @@ fn typed_activation_resume_value(
         return Ok(None);
     };
     let ty = flow_value_type(function, *value)?;
-    Ok(flow_type_is_exact_u64(input, ty).then_some(*value))
+    Ok((flow_type_is_exact_u64(input, ty) || async_outcome == Some(ty)).then_some(*value))
 }
 
 struct AuthenticatedActivationCallSite<'a> {
@@ -2935,7 +3519,13 @@ fn lower_region_storage(
     } else {
         false
     };
-    let static_region_count = (if app.is_some() { 4 } else { 3 }) + usize::from(has_actor_state);
+    let static_region_count = if actor.turn_functions.is_empty() {
+        2
+    } else if app.is_some() {
+        4
+    } else {
+        3
+    } + usize::from(has_actor_state);
     let expected_regions = activations.len().checked_add(static_region_count).ok_or(
         MachineLowerError::ResourceLimit {
             resource: "MachineWir region storage",
@@ -3044,7 +3634,10 @@ fn lower_region_storage(
                     ".state",
                 )
             }
-            index if index == 1 + usize::from(has_actor_state) => {
+            index
+                if !actor.turn_functions.is_empty()
+                    && index == 1 + usize::from(has_actor_state) =>
+            {
                 let turn = actor
                     .turn_functions
                     .first()
@@ -3306,6 +3899,7 @@ fn preflight_output_model_resources(
         image_enter_calls,
         fatal_calls,
         test_assert_calls,
+        async_outcome,
     } = preflight;
     let edge_limit = request.limits.model_edges;
     let payload_limit = request.limits.payload_bytes;
@@ -3592,7 +4186,13 @@ fn preflight_output_model_resources(
                     activation.caller.0 == function.id.0 && activation.resume_block.0 == block.id.0
                 })
                 .map(|activation| {
-                    typed_activation_resume_value(input, function, activations, activation.id)
+                    typed_activation_resume_value(
+                        input,
+                        function,
+                        activations,
+                        activation.id,
+                        async_outcome.map(|profile| profile.outcome),
+                    )
                 })
                 .transpose()?
                 .flatten()
@@ -3639,6 +4239,7 @@ fn preflight_output_model_resources(
                             function,
                             activations,
                             MachineActivationId(plan.0),
+                            async_outcome.map(|profile| profile.outcome),
                         )?
                         .is_some(),
                     ),
@@ -3837,6 +4438,7 @@ fn require_supported_type(
     ty: &flow::FlowType,
     activation_subset: bool,
     actor_dispatch: bool,
+    async_outcome: Option<&AsyncOutcomeDirectIsProfile>,
 ) -> Result<(), MachineLowerError> {
     match ty.kind {
         flow::FlowTypeKind::Unit
@@ -3868,7 +4470,9 @@ fn require_supported_type(
             if is_all_unit_closed_enum(types, ty.id)
                 || closed_scalar_enum_payload(types, ty.id).is_some()
                 || is_exact_fixed_flat_enum(types, ty.id)
-                || is_exact_heterogeneous_scalar_enum(types, ty.id) =>
+                || is_exact_heterogeneous_scalar_enum(types, ty.id)
+                || async_outcome
+                    .is_some_and(|profile| ty.id == profile.exit || ty.id == profile.outcome) =>
         {
             Ok(())
         }
@@ -6864,6 +7468,7 @@ fn validate_supported_operation(
     instruction: &flow::Instruction,
     test_payload_index: &TestPayloadIndex,
     activations: &[MachineActivationPlan],
+    async_outcome: Option<&AsyncOutcomeDirectIsProfile>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), MachineLowerError> {
     if erases_unit_definition(input, function, instruction)? {
@@ -7030,6 +7635,7 @@ fn validate_supported_operation(
                 && !is_all_unit_closed_enum(&input.types, *ty)
                 && !is_exact_fixed_flat_enum(&input.types, *ty)
                 && !is_exact_heterogeneous_scalar_enum(&input.types, *ty)
+                && async_outcome.is_none_or(|profile| *ty != profile.outcome)
             {
                 return Err(unsupported("a noncanonical enum construction"));
             }
@@ -7063,7 +7669,8 @@ fn validate_supported_operation(
             if (!is_all_unit_closed_enum(&input.types, enum_ty)
                 && closed_scalar_enum_payload(&input.types, enum_ty).is_none()
                 && !is_exact_fixed_flat_enum(&input.types, enum_ty)
-                && !is_exact_heterogeneous_scalar_enum(&input.types, enum_ty))
+                && !is_exact_heterogeneous_scalar_enum(&input.types, enum_ty)
+                && async_outcome.is_none_or(|profile| enum_ty != profile.outcome))
                 || Some(flow_value_type(function, result)?) != canonical_u8_type(&input.types)
             {
                 return Err(unsupported("an enum tag projection with mismatched types"));
@@ -7546,6 +8153,9 @@ fn lower_types(
                         )
                     } else if is_exact_fixed_flat_enum(&input.types, ty.id)
                         || is_exact_heterogeneous_scalar_enum(&input.types, ty.id)
+                        || plan.async_outcome.is_some_and(|profile| {
+                            ty.id == profile.exit || ty.id == profile.outcome
+                        })
                     {
                         let mut maximum_size = 0_u64;
                         let mut maximum_alignment = 1_u32;
@@ -7555,12 +8165,16 @@ fn lower_types(
                             let record = input.types.get(flow_id.0 as usize).ok_or(unsupported(
                                 "an enum with an unknown logical payload type",
                             ))?;
-                            let (_, size, alignment) =
-                                if flat_native_struct_fields(&input.types, flow_id).is_some() {
-                                    lower_native_struct_type(input, flow_id, limits, is_cancelled)?
-                                } else {
-                                    lower_type_kind(&record.kind, limits, is_cancelled)?
-                                };
+                            let (_, size, alignment) = if plan
+                                .async_outcome
+                                .is_some_and(|profile| flow_id == profile.exit)
+                            {
+                                (MachineTypeKind::Void, 16, 8)
+                            } else if flat_native_struct_fields(&input.types, flow_id).is_some() {
+                                lower_native_struct_type(input, flow_id, limits, is_cancelled)?
+                            } else {
+                                lower_type_kind(&record.kind, limits, is_cancelled)?
+                            };
                             maximum_size = maximum_size.max(size);
                             maximum_alignment = maximum_alignment.max(alignment);
                         }
@@ -9139,7 +9753,13 @@ fn lower_block(
             activation.caller.0 == function.id.0 && activation.resume_block.0 == block.id.0
         })
         .map(|activation| {
-            typed_activation_resume_value(input, function, &plan.activations, activation.id)
+            typed_activation_resume_value(
+                input,
+                function,
+                &plan.activations,
+                activation.id,
+                plan.async_outcome.map(|profile| profile.outcome),
+            )
         })
         .transpose()?
         .flatten();
@@ -9310,6 +9930,7 @@ fn lower_block(
                         function,
                         &plan.activations,
                         MachineActivationId(activation.0),
+                        plan.async_outcome.map(|profile| profile.outcome),
                     )?;
                     let mut results = try_vec(
                         usize::from(resumed.is_some()),
@@ -11558,7 +12179,7 @@ mod tests {
             strict_linear: true,
         };
         assert_eq!(
-            require_supported_type(&[], &activation, false, false),
+            require_supported_type(&[], &activation, false, false, None),
             Err(MachineLowerError::UnsupportedInput {
                 feature: "async activation values without an exact scheduler/runtime lowering",
             })
@@ -11631,7 +12252,7 @@ mod tests {
                 strict_linear: false,
             };
             assert_eq!(
-                require_supported_type(&[], &ty, false, false),
+                require_supported_type(&[], &ty, false, false, None),
                 Err(MachineLowerError::UnsupportedInput {
                     feature: "machine-bounded-string-lowering-pending (runtime storage and formatting ABI)",
                 })
@@ -11668,7 +12289,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                require_supported_type(&[], &adjacent, false, false),
+                require_supported_type(&[], &adjacent, false, false, None),
                 Err(MachineLowerError::UnsupportedInput {
                     feature: "machine-static-bytes-lowering-pending (runtime byte storage and consumer ABI)",
                 })
@@ -11701,6 +12322,7 @@ mod tests {
                 &static_bytes,
                 false,
                 false,
+                None,
             ),
             Ok(())
         );
@@ -11734,7 +12356,8 @@ mod tests {
                 &[u8_type.clone(), static_string.clone()],
                 &static_string,
                 false,
-                false
+                false,
+                None,
             ),
             Ok(())
         );
@@ -11767,7 +12390,8 @@ mod tests {
                     &[u8_type.clone(), adjacent.clone()],
                     &adjacent,
                     false,
-                    false
+                    false,
+                    None,
                 ),
                 Err(MachineLowerError::UnsupportedInput {
                     feature: "machine-bounded-string-lowering-pending (runtime storage and formatting ABI)",

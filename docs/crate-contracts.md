@@ -512,9 +512,18 @@ it. It injects phase implementations and bounded host capabilities, while
   helper Flow result ABI plus its matching activation result. FlowWir/model+wire
   v19 validates and canonically preserves the resulting closed enums, `Suspend`
   delivery, outcome resume parameter, and explicit tag/payload projections and
-  switches. Machine lowering fails closed
-  at `machine-async-outcome-lowering-pending (scheduler cancellation and
-  deadline delivery)`; no runtime delivery ABI is claimed.
+  switches. One narrower operation-only direct-`is` consumer now reaches
+  MachineWir v21 and native COFF without a runtime ABI change: Machine lowering,
+  Machine validation, and LLVM each authenticate the nominal `AsyncExit[u64]`
+  graph, the direct `Ok(u64)` helper, activation call/result substitution,
+  exact false/true tag switch, proof authority, three-region ownership, and the
+  sole core-zero scheduler. The known operation value is replayed as the
+  existing internal call and tagged enum; no `Cancelled`, `DeadlineRejected`,
+  or `DeadlineExceeded` value is synthesized. Exhaustive nested outcome/exit
+  matching rejects as `machine-async-outcome-consumer-pending (nested AsyncExit
+  match)`, while any profile requiring runtime cause delivery retains
+  `machine-async-outcome-lowering-pending (scheduler cancellation and deadline
+  delivery)`.
 - SemanticWir v15 retains the bounded inline fixed-array statement-pattern
   profile as an exact `Aggregate`, proof-bearing positional `Index`
   operations, scalar equality/boolean conjunctions, and source-ordered nested
@@ -999,6 +1008,17 @@ it. It injects phase implementations and bounded host capabilities, while
   result-for-parameter substitution before allocation. Argumented, computed,
   non-`u64`, structured typed, multistate, parking/wake, and cancellation-
   execution tails reject as `machine-async-result-delivery-pending`.
+- The operation-only structured-outcome exception is distinct from that scalar
+  result profile. It admits exactly one nullary async helper that directly
+  constructs outer `Result.Ok(u64)`, one root suspension, and one immediate
+  `is Result.Err(_)` consumer. The mapped internal call defines the nominal
+  outcome resume value; MachineWir v21 retains nested opaque enum storage and
+  the exact tag switch while the activation token/resume parameter are erased.
+  Machine validation and LLVM independently replay the complete nominal,
+  callee, activation, truth-vector, proof, region, and core-zero scheduler
+  census. Exact proof/truth substitutions fail independently, and no runtime
+  cancellation/deadline cause or actor reply slot participates. Nested matching
+  and any runtime-delivered cause remain at their named boundaries.
 - Generated test harnesses receive a measured read-only global for every
   canonical protocol frame. MachineWir uses explicit global-address values and
   exact `TestEmit(address, length)` / nonreturning `TestFinish(outcome)` runtime
