@@ -521,7 +521,7 @@ fn supported_actor_image<'a>(
     }
 
     let mut scope_uses = try_vec(input.scopes.len(), "actor scope uses", limits.model_edges)?;
-    scope_uses.resize(input.scopes.len(), 0_u8);
+    scope_uses.resize(input.scopes.len(), 0_u64);
     for function in &input.functions {
         check_cancelled(is_cancelled)?;
         if function.id == entry.id {
@@ -529,7 +529,7 @@ fn supported_actor_image<'a>(
         }
         validate_actor_source_function(input, function, &mut scope_uses, limits, is_cancelled)?;
     }
-    if scope_uses.iter().any(|uses| *uses != 1) {
+    if scope_uses.contains(&0) {
         return Err(unsupported("actor scope activation census"));
     }
     Ok(ActorImageSemantic { input })
@@ -946,7 +946,7 @@ fn validate_actor_plan_contract(
 fn validate_actor_source_function(
     input: &semantic::SemanticWir,
     function: &semantic::SemanticFunction,
-    scope_uses: &mut [u8],
+    scope_uses: &mut [u64],
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), LowerError> {
@@ -1050,17 +1050,17 @@ fn validate_actor_source_function(
     let mut actor_capabilities = 0_u32;
     let mut actor_reserves = 0_u32;
     let mut mailbox_receives = 0_u32;
-    let mut active_scopes: Vec<semantic::ScopeId> = try_vec(
+    let root_active_scopes: Vec<semantic::ScopeId> = try_vec(
         input.scopes.len(),
         "actor active scope stack",
         limits.model_edges,
     )?;
-    let mut scope_states = try_vec(
+    let mut root_scope_states = try_vec(
         input.scopes.len(),
         "actor scope state map",
         limits.model_edges,
     )?;
-    scope_states.resize(input.scopes.len(), None::<(semantic::ValueId, bool)>);
+    root_scope_states.resize(input.scopes.len(), None::<(semantic::ValueId, bool)>);
     let mut scope_children = try_vec(
         input.scopes.len(),
         "actor scope cleanup edges",
@@ -1071,12 +1071,28 @@ fn validate_actor_source_function(
     }
     let mut saw_scope_marker = false;
     let mut regions = try_vec(1, "actor source region validation", limits.model_edges)?;
-    regions.push((&function.body, true, 1_u32));
-    while let Some((region, is_root, depth)) = regions.pop() {
+    regions.push((
+        &function.body,
+        true,
+        1_u32,
+        root_active_scopes,
+        root_scope_states,
+    ));
+    while let Some((region, is_root, depth, mut active_scopes, mut scope_states)) = regions.pop() {
         check_cancelled(is_cancelled)?;
         if depth > limits.region_depth || (!is_root && !region.parameters.is_empty()) {
             return Err(unsupported("actor source region parameters or depth"));
         }
+        let entry_active_scopes = copy_bounded(
+            &active_scopes,
+            "actor branch active scope snapshot",
+            limits.model_edges,
+        )?;
+        let entry_scope_states = copy_bounded(
+            &scope_states,
+            "actor branch scope state snapshot",
+            limits.model_edges,
+        )?;
         let mut terminated = false;
         for (index, statement) in region.statements.iter().enumerate() {
             check_cancelled(is_cancelled)?;
@@ -1216,7 +1232,7 @@ fn validate_actor_source_function(
                             .get_mut(scope.0 as usize)
                             .ok_or(unsupported("actor committed scope identity"))?;
                         if !statement.results.is_empty()
-                            || !is_root
+                            || !is_root && !entry_active_scopes.contains(scope)
                             || active_scopes.last() != Some(scope)
                             || !matches!(slot, Some((state, false)) if state == value)
                         {
@@ -1229,7 +1245,7 @@ fn validate_actor_source_function(
                             .get_mut(scope.0 as usize)
                             .ok_or(unsupported("actor exited scope identity"))?;
                         if !statement.results.is_empty()
-                            || !is_root
+                            || !is_root && !entry_active_scopes.contains(scope)
                             || active_scopes.last() != Some(scope)
                             || !matches!(slot, Some((_, true)))
                         {
@@ -1244,6 +1260,12 @@ fn validate_actor_source_function(
                             resource: "actor scope uses",
                             limit: limits.model_edges,
                         })?;
+                        if *uses > limits.model_edges {
+                            return Err(LowerError::ResourceLimit {
+                                resource: "actor scope uses",
+                                limit: limits.model_edges,
+                            });
+                        }
                     }
                     semantic::SemanticOperation::Assert { condition, failure } => {
                         if !statement.results.is_empty()
@@ -1644,20 +1666,42 @@ fn validate_actor_source_function(
                         resource: "actor source region depth",
                         limit: u64::from(limits.region_depth),
                     })?;
+                    let else_scopes = copy_bounded(
+                        &active_scopes,
+                        "actor branch active scope snapshot",
+                        limits.model_edges,
+                    )?;
+                    let else_states = copy_bounded(
+                        &scope_states,
+                        "actor branch scope state snapshot",
+                        limits.model_edges,
+                    )?;
+                    let then_scopes = copy_bounded(
+                        &active_scopes,
+                        "actor branch active scope snapshot",
+                        limits.model_edges,
+                    )?;
+                    let then_states = copy_bounded(
+                        &scope_states,
+                        "actor branch scope state snapshot",
+                        limits.model_edges,
+                    )?;
                     push_bounded(
                         &mut regions,
-                        (else_region, false, next),
+                        (else_region, false, next, else_scopes, else_states),
                         "actor source region validation",
                         limits.model_edges,
                     )?;
                     push_bounded(
                         &mut regions,
-                        (then_region, false, next),
+                        (then_region, false, next, then_scopes, then_states),
                         "actor source region validation",
                         limits.model_edges,
                     )?;
                 }
-                semantic::SemanticStatement::Return(values) if is_root => {
+                semantic::SemanticStatement::Return(values)
+                    if is_root || !entry_active_scopes.is_empty() =>
+                {
                     let result_matches = if semantic_type_is(
                         input,
                         function.result,
@@ -1671,7 +1715,10 @@ fn validate_actor_source_function(
                                 if scalar_value_type(function, *value) == Some(function.result)
                         )
                     };
-                    if !result_matches || index + 1 != region.statements.len() {
+                    if !result_matches
+                        || index + 1 != region.statements.len()
+                        || !active_scopes.is_empty()
+                    {
                         return Err(unsupported("actor source return"));
                     }
                     terminated = true;
@@ -1689,6 +1736,12 @@ fn validate_actor_source_function(
         }
         if is_root && !terminated {
             return Err(unsupported("actor source root terminator"));
+        }
+        if !terminated
+            && (!polled_slices_equal(&active_scopes, &entry_active_scopes, is_cancelled)?
+                || !polled_slices_equal(&scope_states, &entry_scope_states, is_cancelled)?)
+        {
+            return Err(unsupported("actor branch scope state drift"));
         }
     }
     let expects_send = function.body.statements.iter().any(|statement| {
@@ -1722,11 +1775,6 @@ fn validate_actor_source_function(
         || mailbox_receives != u32::from(expects_receive)
     {
         return Err(unsupported("one-way actor operation census"));
-    }
-    if !active_scopes.is_empty() {
-        return Err(unsupported(
-            "flow-with-abnormal-cleanup-lowering-pending (scope leaves function active)",
-        ));
     }
     if saw_scope_marker {
         for (plan, children) in input.scopes.iter().zip(&scope_children) {
@@ -5139,6 +5187,7 @@ struct RegionWork<'a> {
     block: flow::BlockId,
     exit: RegionExit,
     depth: u32,
+    scope_states: Vec<Option<(flow::ValueId, bool)>>,
 }
 
 fn semantic_region_definitely_terminates(
@@ -5268,6 +5317,12 @@ fn lower_generated_function(
     }
     let mut pending_blocks = try_vec(1, "FlowWir blocks", limits.blocks)?;
     let entry = allocate_pending_block(&mut pending_blocks, function.source, limits)?;
+    let mut scope_states = try_vec(
+        input.scopes.len(),
+        "FlowWir active scope states",
+        limits.model_edges,
+    )?;
+    scope_states.resize(input.scopes.len(), None::<(flow::ValueId, bool)>);
     let mut work = try_vec(1, "scalar region work", limits.model_edges)?;
     work.push(RegionWork {
         region: &function.body,
@@ -5275,14 +5330,9 @@ fn lower_generated_function(
         block: entry,
         exit: RegionExit::Root,
         depth: 1,
+        scope_states,
     });
     let mut next_async_state = 0_u32;
-    let mut scope_states = try_vec(
-        input.scopes.len(),
-        "FlowWir active scope states",
-        limits.model_edges,
-    )?;
-    scope_states.resize(input.scopes.len(), None::<(flow::ValueId, bool)>);
     while let Some(mut item) = work.pop() {
         check_cancelled(is_cancelled)?;
         if item.depth > limits.region_depth {
@@ -5299,7 +5349,8 @@ fn lower_generated_function(
                     if let semantic::SemanticOperation::EnterScope { scope, state } =
                         &statement.operation
                     {
-                        let slot = scope_states
+                        let slot = item
+                            .scope_states
                             .get_mut(scope.0 as usize)
                             .ok_or(unsupported("FlowWir entered scope identity"))?;
                         if slot.replace((flow::ValueId(state.0), false)).is_some() {
@@ -5311,7 +5362,8 @@ fn lower_generated_function(
                     if let semantic::SemanticOperation::CommitScope { scope, value } =
                         &statement.operation
                     {
-                        let slot = scope_states
+                        let slot = item
+                            .scope_states
                             .get_mut(scope.0 as usize)
                             .ok_or(unsupported("FlowWir committed scope identity"))?;
                         if !matches!(slot, Some((state, false)) if *state == flow::ValueId(value.0))
@@ -5328,7 +5380,8 @@ fn lower_generated_function(
                             .get(scope.0 as usize)
                             .filter(|plan| plan.id == *scope)
                             .ok_or(unsupported("FlowWir exited scope identity"))?;
-                        let state = scope_states
+                        let state = item
+                            .scope_states
                             .get_mut(scope.0 as usize)
                             .and_then(Option::take)
                             .filter(|(_, committed)| *committed)
@@ -5578,6 +5631,21 @@ fn lower_generated_function(
                             else_block,
                             else_arguments: Vec::new(),
                         });
+                    let continuation_scope_states = copy_bounded(
+                        &item.scope_states,
+                        "FlowWir branch scope states",
+                        limits.model_edges,
+                    )?;
+                    let then_scope_states = copy_bounded(
+                        &item.scope_states,
+                        "FlowWir branch scope states",
+                        limits.model_edges,
+                    )?;
+                    let else_scope_states = copy_bounded(
+                        &item.scope_states,
+                        "FlowWir branch scope states",
+                        limits.model_edges,
+                    )?;
                     if !terminal_branches {
                         push_bounded(
                             &mut work,
@@ -5587,6 +5655,7 @@ fn lower_generated_function(
                                 block: merge_block,
                                 exit: item.exit,
                                 depth: item.depth,
+                                scope_states: continuation_scope_states,
                             },
                             "scalar region work",
                             limits.model_edges,
@@ -5615,6 +5684,7 @@ fn lower_generated_function(
                             block: else_block,
                             exit: branch_exit,
                             depth: next_depth,
+                            scope_states: else_scope_states,
                         },
                         "scalar region work",
                         limits.model_edges,
@@ -5627,6 +5697,7 @@ fn lower_generated_function(
                             block: then_block,
                             exit: branch_exit,
                             depth: next_depth,
+                            scope_states: then_scope_states,
                         },
                         "scalar region work",
                         limits.model_edges,
@@ -5764,6 +5835,11 @@ fn lower_generated_function(
                                 block: merge,
                                 exit: item.exit,
                                 depth: item.depth,
+                                scope_states: copy_bounded(
+                                    &item.scope_states,
+                                    "FlowWir match scope states",
+                                    limits.model_edges,
+                                )?,
                             },
                             "scalar region work",
                             limits.model_edges,
@@ -5845,6 +5921,11 @@ fn lower_generated_function(
                             block,
                             exit: merge_block.map_or(RegionExit::Root, RegionExit::Yield),
                             depth: next_depth,
+                            scope_states: copy_bounded(
+                                &item.scope_states,
+                                "FlowWir match scope states",
+                                limits.model_edges,
+                            )?,
                         });
                     }
                     let default = if let Some(default) = default {
@@ -5913,6 +5994,11 @@ fn lower_generated_function(
                             block: exit,
                             exit: item.exit,
                             depth: item.depth,
+                            scope_states: copy_bounded(
+                                &item.scope_states,
+                                "FlowWir loop scope states",
+                                limits.model_edges,
+                            )?,
                         },
                         "scalar region work",
                         limits.model_edges,
@@ -5925,6 +6011,11 @@ fn lower_generated_function(
                             block: header,
                             exit: RegionExit::Loop { header, exit },
                             depth: next_depth,
+                            scope_states: copy_bounded(
+                                &item.scope_states,
+                                "FlowWir loop scope states",
+                                limits.model_edges,
+                            )?,
                         },
                         "scalar region work",
                         limits.model_edges,
@@ -5968,6 +6059,9 @@ fn lower_generated_function(
                     break;
                 }
                 semantic::SemanticStatement::Return(values) => {
+                    if item.scope_states.iter().any(Option::is_some) {
+                        return Err(unsupported("FlowWir function returns with an active scope"));
+                    }
                     let mut lowered =
                         try_vec(values.len(), "FlowWir return values", limits.model_edges)?;
                     lowered.extend(values.iter().map(|value| flow::ValueId(value.0)));
@@ -6059,9 +6153,6 @@ fn lower_generated_function(
                 .ok_or(unsupported("generated test terminator"))?,
             source: pending.source,
         });
-    }
-    if scope_states.iter().any(Option::is_some) {
-        return Err(unsupported("FlowWir function returns with an active scope"));
     }
     let origin = match function.origin {
         semantic::FunctionOrigin::Source => flow::FunctionOrigin::SourceSemantic {
@@ -6572,6 +6663,16 @@ fn try_vec<T>(capacity: usize, resource: &'static str, limit: u64) -> Result<Vec
     Ok(output)
 }
 
+fn copy_bounded<T: Copy>(
+    source: &[T],
+    resource: &'static str,
+    limit: u64,
+) -> Result<Vec<T>, LowerError> {
+    let mut copied = try_vec(source.len(), resource, limit)?;
+    copied.extend_from_slice(source);
+    Ok(copied)
+}
+
 fn push_bounded<T>(
     output: &mut Vec<T>,
     value: T,
@@ -6743,6 +6844,8 @@ fn validate_model_resources(
     use wrela_flow_wir::{FlowOperation, FlowTypeKind, Immediate, Terminator};
 
     let mut meter = ResourceMeter::default();
+    let mut block_count = 0_u64;
+    let mut instruction_count = 0_u64;
     meter.text(&wir.name);
     meter.text(wir.build.target.as_str());
     for count in [
@@ -6813,6 +6916,23 @@ fn validate_model_resources(
     }
     for function in &wir.functions {
         check_cancelled(is_cancelled)?;
+        block_count = block_count
+            .checked_add(u64::try_from(function.blocks.len()).map_err(|_| {
+                LowerError::ResourceLimit {
+                    resource: "FlowWir blocks",
+                    limit: limits.blocks,
+                }
+            })?)
+            .ok_or(LowerError::ResourceLimit {
+                resource: "FlowWir blocks",
+                limit: limits.blocks,
+            })?;
+        if block_count > limits.blocks {
+            return Err(LowerError::ResourceLimit {
+                resource: "FlowWir blocks",
+                limit: limits.blocks,
+            });
+        }
         meter.text(&function.name);
         meter.edges(&function.parameters);
         meter.edges(&function.result_types);
@@ -6826,6 +6946,23 @@ fn validate_model_resources(
         }
         for block in &function.blocks {
             check_cancelled(is_cancelled)?;
+            instruction_count = instruction_count
+                .checked_add(u64::try_from(block.instructions.len()).map_err(|_| {
+                    LowerError::ResourceLimit {
+                        resource: "FlowWir instructions",
+                        limit: limits.instructions,
+                    }
+                })?)
+                .ok_or(LowerError::ResourceLimit {
+                    resource: "FlowWir instructions",
+                    limit: limits.instructions,
+                })?;
+            if instruction_count > limits.instructions {
+                return Err(LowerError::ResourceLimit {
+                    resource: "FlowWir instructions",
+                    limit: limits.instructions,
+                });
+            }
             meter.edges(&block.parameters);
             meter.edges(&block.instructions);
             for instruction in &block.instructions {
@@ -8846,6 +8983,66 @@ mod contract_tests {
             .expect("valid pass-only normal scope SemanticWir")
     }
 
+    fn structured_return_actor_scope_fixture() -> semantic::ValidatedSemanticWir {
+        let mut module = actor_scope_fixture().into_wir();
+        let scope_source = module.scopes[0].source;
+        module.types.push(semantic::TypeRecord {
+            id: semantic::TypeId(6),
+            source_name: "bool".to_owned(),
+            kind: semantic::TypeKind::Primitive(semantic::PrimitiveType::Bool),
+            linearity: semantic::Linearity::CopyScalar,
+            source: Some(scope_source),
+        });
+        let turn = &mut module.functions[1];
+        turn.values.push(semantic::SemanticValue {
+            id: semantic::ValueId(5),
+            ty: semantic::TypeId(6),
+            origin: Some(scope_source),
+            name: None,
+        });
+        let enter = turn
+            .body
+            .statements
+            .iter()
+            .position(|statement| {
+                matches!(
+                    statement,
+                    semantic::SemanticStatement::Let(semantic::LetStatement {
+                        operation: semantic::SemanticOperation::EnterScope { .. },
+                        ..
+                    })
+                )
+            })
+            .expect("scope enter");
+        let tail = turn.body.statements.split_off(enter + 1);
+        assert_eq!(tail.len(), 3);
+        turn.body.statements.extend([
+            semantic::SemanticStatement::Let(semantic::LetStatement {
+                results: vec![semantic::ValueId(5)],
+                operation: semantic::SemanticOperation::Constant(semantic::Constant::Bool(true)),
+                source: Some(scope_source),
+            }),
+            semantic::SemanticStatement::If {
+                condition: semantic::ValueId(5),
+                then_region: semantic::SemanticRegion {
+                    parameters: Vec::new(),
+                    statements: tail.clone(),
+                },
+                else_region: semantic::SemanticRegion {
+                    parameters: Vec::new(),
+                    statements: Vec::new(),
+                },
+                results: Vec::new(),
+                source: Some(scope_source),
+            },
+        ]);
+        turn.body.statements.extend(tail);
+        turn.uninterrupted_bound = Some(12);
+        module
+            .validate()
+            .expect("valid structured-return scope SemanticWir")
+    }
+
     fn nested_actor_scope_fixture() -> semantic::ValidatedSemanticWir {
         let mut module = actor_scope_fixture().into_wir();
         let outer_source = span(0, 61, 69);
@@ -10719,6 +10916,173 @@ mod contract_tests {
         call.results = vec![flow::ValueId(4)];
         assert!(matches!(
             seal(&request, erased_cleanup, report, diagnostics, &|| false),
+            Err(LowerError::InvalidOutput(_)) | Err(LowerError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn structured_scope_return_lowers_cleanup_on_both_cfg_paths() {
+        let input = structured_return_actor_scope_fixture();
+        let output = CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("structured return scope should reach FlowWir");
+        let wir = output.wir().as_wir();
+        let turn = &wir.functions[1];
+        let cleanup = wir
+            .functions
+            .iter()
+            .find(|function| {
+                matches!(
+                    function.origin,
+                    flow::FunctionOrigin::GeneratedCleanup { .. }
+                )
+            })
+            .expect("cleanup helper");
+        let cleanup_id = cleanup.id;
+        let cleanup_calls = turn
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| {
+                matches!(
+                    instruction.operation,
+                    flow::FlowOperation::Call { function, .. } if function == cleanup_id
+                )
+            })
+            .count();
+        let returns = turn
+            .blocks
+            .iter()
+            .filter(|block| matches!(block.terminator, flow::Terminator::Return(ref values) if values.is_empty()))
+            .count();
+        assert_eq!((cleanup_calls, returns), (2, 2));
+        assert_eq!(output.report().cleanup_edges, 2);
+        assert_eq!(
+            (output.report().blocks, output.report().instructions),
+            (9, 8)
+        );
+
+        let mut exact = LoweringLimits::standard();
+        exact.blocks = 9;
+        exact.instructions = 11;
+        CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact structured cleanup bounds");
+        let mut one_under_blocks = exact;
+        one_under_blocks.blocks = 8;
+        let one_under_blocks_error = CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: one_under_blocks,
+                },
+                &|| false,
+            )
+            .expect_err("one-under structured cleanup block bound");
+        assert!(
+            matches!(
+                one_under_blocks_error,
+                LowerError::ResourceLimit {
+                    resource: "FlowWir blocks",
+                    limit: 8,
+                }
+            ),
+            "{one_under_blocks_error:?}"
+        );
+        let mut one_under = exact;
+        one_under.instructions -= 1;
+        let one_under_error = CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            )
+            .expect_err("one-under structured cleanup instruction bound");
+        assert!(
+            matches!(
+                one_under_error,
+                LowerError::ResourceLimit {
+                    resource: "FlowWir instructions",
+                    limit,
+                } if limit == one_under.instructions
+            ),
+            "{one_under_error:?}"
+        );
+
+        let polls = Cell::new(0_u64);
+        CanonicalFlowLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            )
+            .expect("count structured cleanup cancellation polls");
+        let cancel_at = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalFlowLowerer::new().lower(
+                LowerRequest {
+                    input: input.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next == cancel_at
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), cancel_at);
+
+        let (validated, report, diagnostics) = output.into_parts();
+        let mut missing_branch_cleanup = validated.into_wir();
+        let turn = &mut missing_branch_cleanup.functions[1];
+        let branch_call = turn
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction.operation,
+                    flow::FlowOperation::Call { function, .. } if function == cleanup_id
+                )
+            })
+            .expect("branch cleanup call");
+        branch_call.operation = flow::FlowOperation::Copy {
+            value: flow::ValueId(4),
+        };
+        branch_call.results = vec![flow::ValueId(4)];
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input,
+                    limits: exact,
+                },
+                missing_branch_cleanup,
+                report,
+                diagnostics,
+                &|| false,
+            ),
             Err(LowerError::InvalidOutput(_)) | Err(LowerError::InvalidReport(_))
         ));
     }

@@ -840,7 +840,9 @@ fn validate_scope_normal_body(
                     branches,
                     else_body,
                 } => {
-                    pending.extend(branches.iter().map(|(_, body)| (*body, false)));
+                    let structured_return =
+                        direct_cleanup_path && branches.len() == 1 && else_body.is_none();
+                    pending.extend(branches.iter().map(|(_, body)| (*body, structured_return)));
                     pending.extend(else_body.map(|body| (body, false)));
                 }
                 wrela_hir::StatementKind::Match { arms, .. } => {
@@ -7081,31 +7083,33 @@ impl SourceFunctionLowerer<'_> {
                         lowered_body.statements.last(),
                         Some(wir::SemanticStatement::Return(_))
                     );
-                    let return_statement = if direct_return {
-                        lowered_body.statements.pop()
-                    } else {
-                        None
-                    };
+                    self.insert_scope_cleanup_before_returns(
+                        &mut lowered_body,
+                        activation,
+                        state,
+                        statement_source,
+                        depth + 1,
+                        true,
+                    )?;
                     for nested in lowered_body.statements.drain(..) {
                         self.push_statement(&mut statements, nested)?;
                     }
-                    self.push_effect(
-                        &mut statements,
-                        wir::SemanticOperation::CommitScope {
-                            scope: activation.scope,
-                            value: state,
-                        },
-                        Some(statement_source),
-                    )?;
-                    self.push_effect(
-                        &mut statements,
-                        wir::SemanticOperation::ExitScope {
-                            scope: activation.scope,
-                        },
-                        Some(statement_source),
-                    )?;
-                    if let Some(return_statement) = return_statement {
-                        self.push_statement(&mut statements, return_statement)?;
+                    if !direct_return {
+                        self.push_effect(
+                            &mut statements,
+                            wir::SemanticOperation::CommitScope {
+                                scope: activation.scope,
+                                value: state,
+                            },
+                            Some(statement_source),
+                        )?;
+                        self.push_effect(
+                            &mut statements,
+                            wir::SemanticOperation::ExitScope {
+                                scope: activation.scope,
+                            },
+                            Some(statement_source),
+                        )?;
                     }
                     returned = direct_return;
                     if let Some(local) = binding {
@@ -7863,6 +7867,119 @@ impl SourceFunctionLowerer<'_> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn insert_scope_cleanup_before_returns(
+        &mut self,
+        region: &mut wir::SemanticRegion,
+        activation: ScopeActivationLowering,
+        state: wir::ValueId,
+        source: Span,
+        depth: u32,
+        allow_returns: bool,
+    ) -> Result<(), LowerError> {
+        check_cancelled(self.is_cancelled)?;
+        if depth > self.limits.structured_region_depth {
+            return Err(LowerError::ResourceLimit {
+                resource: "SemanticWir structured region depth",
+                limit: u64::from(self.limits.structured_region_depth),
+            });
+        }
+        let capacity = region
+            .statements
+            .len()
+            .checked_mul(3)
+            .ok_or(LowerError::ResourceLimit {
+                resource: "SemanticWir scope cleanup expansion",
+                limit: self.limits.model_edges,
+            })?;
+        let mut rewritten = try_vec(
+            capacity,
+            "SemanticWir scope cleanup expansion",
+            self.limits.model_edges,
+        )?;
+        for mut statement in std::mem::take(&mut region.statements) {
+            check_cancelled(self.is_cancelled)?;
+            match &mut statement {
+                wir::SemanticStatement::Return(_) if allow_returns => {
+                    self.push_effect(
+                        &mut rewritten,
+                        wir::SemanticOperation::CommitScope {
+                            scope: activation.scope,
+                            value: state,
+                        },
+                        Some(source),
+                    )?;
+                    self.push_effect(
+                        &mut rewritten,
+                        wir::SemanticOperation::ExitScope {
+                            scope: activation.scope,
+                        },
+                        Some(source),
+                    )?;
+                }
+                wir::SemanticStatement::Return(_) => {
+                    return Err(unsupported(
+                        "semantic-with-structured-return-cleanup-lowering-pending",
+                    ));
+                }
+                wir::SemanticStatement::If {
+                    then_region,
+                    else_region,
+                    ..
+                } => {
+                    let next = depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                        resource: "SemanticWir structured region depth",
+                        limit: u64::from(self.limits.structured_region_depth),
+                    })?;
+                    self.insert_scope_cleanup_before_returns(
+                        then_region,
+                        activation,
+                        state,
+                        source,
+                        next,
+                        allow_returns,
+                    )?;
+                    self.insert_scope_cleanup_before_returns(
+                        else_region,
+                        activation,
+                        state,
+                        source,
+                        next,
+                        false,
+                    )?;
+                }
+                wir::SemanticStatement::Match { arms, .. } => {
+                    let next = depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                        resource: "SemanticWir structured region depth",
+                        limit: u64::from(self.limits.structured_region_depth),
+                    })?;
+                    for arm in arms {
+                        self.insert_scope_cleanup_before_returns(
+                            &mut arm.body,
+                            activation,
+                            state,
+                            source,
+                            next,
+                            false,
+                        )?;
+                    }
+                }
+                wir::SemanticStatement::Loop { body, .. } => {
+                    let next = depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                        resource: "SemanticWir structured region depth",
+                        limit: u64::from(self.limits.structured_region_depth),
+                    })?;
+                    self.insert_scope_cleanup_before_returns(
+                        body, activation, state, source, next, false,
+                    )?;
+                }
+                _ => {}
+            }
+            rewritten.push(statement);
+        }
+        region.statements = rewritten;
         Ok(())
     }
 
@@ -20389,10 +20506,11 @@ pub fn boot() -> Image:
             "        with irqs_masked() as mask:\n            pass\n        await checkpoint()",
             "        with irqs_masked() as outer:\n            with irqs_masked() as inner:\n                return",
         );
+        let image = analyze_parsed_actor_source(&source);
         let lowered = CanonicalSemanticLowerer::new()
             .lower(
                 LowerRequest {
-                    input: analyze_parsed_actor_source(&source),
+                    input: image.clone(),
                     limits: LoweringLimits::standard(),
                 },
                 &|| false,
@@ -20443,10 +20561,183 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn structured_scope_return_remains_named_fail_closed() {
+    fn structured_scope_return_cleans_return_and_fallthrough_paths() {
+        fn cleanup_counts(region: &wir::SemanticRegion) -> (usize, usize, usize) {
+            let mut counts = (0, 0, 0);
+            for statement in &region.statements {
+                match statement {
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::CommitScope { .. },
+                        ..
+                    }) => counts.0 += 1,
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::ExitScope { .. },
+                        ..
+                    }) => counts.1 += 1,
+                    wir::SemanticStatement::Return(_) => counts.2 += 1,
+                    wir::SemanticStatement::If {
+                        then_region,
+                        else_region,
+                        ..
+                    } => {
+                        let nested = cleanup_counts(then_region);
+                        counts.0 += nested.0;
+                        counts.1 += nested.1;
+                        counts.2 += nested.2;
+                        let nested = cleanup_counts(else_region);
+                        counts.0 += nested.0;
+                        counts.1 += nested.1;
+                        counts.2 += nested.2;
+                    }
+                    wir::SemanticStatement::Match { arms, .. } => {
+                        for arm in arms {
+                            let nested = cleanup_counts(&arm.body);
+                            counts.0 += nested.0;
+                            counts.1 += nested.1;
+                            counts.2 += nested.2;
+                        }
+                    }
+                    wir::SemanticStatement::Loop { body, .. } => {
+                        let nested = cleanup_counts(body);
+                        counts.0 += nested.0;
+                        counts.1 += nested.1;
+                        counts.2 += nested.2;
+                    }
+                    _ => {}
+                }
+            }
+            counts
+        }
+
         let source = PASS_ONLY_SCOPE_ACTOR_SOURCE.replace(
             "        with irqs_masked() as mask:\n            pass\n        await checkpoint()",
             "        with irqs_masked() as mask:\n            if true:\n                return",
+        );
+        let image = analyze_parsed_actor_source(&source);
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("structured return cleanup");
+        let turn = lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .expect("actor turn");
+        assert_eq!(cleanup_counts(&turn.body), (2, 2, 2));
+        let mut exact = LoweringLimits::standard();
+        assert_eq!(lowered.report().operations, 8);
+        exact.operations = 8;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact structured cleanup operation bound");
+        let mut one_under = exact;
+        one_under.operations -= 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == one_under.operations
+        ));
+
+        let polls = Cell::new(0_u64);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            )
+            .expect("count structured cleanup cancellation polls");
+        let cancel_at = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next == cancel_at
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), cancel_at);
+
+        let mut forged = lowered.wir().as_wir().clone();
+        let turn = forged
+            .functions
+            .iter_mut()
+            .find(|function| matches!(function.role, wir::FunctionRole::ActorTurn(_)))
+            .expect("actor turn");
+        let then_region = turn
+            .body
+            .statements
+            .iter_mut()
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::If { then_region, .. } => Some(then_region),
+                _ => None,
+            })
+            .expect("structured scope branch");
+        let exit = then_region
+            .statements
+            .iter()
+            .position(|statement| {
+                matches!(
+                    statement,
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::ExitScope { .. },
+                        ..
+                    })
+                )
+            })
+            .expect("branch exit marker");
+        then_region.statements.remove(exit);
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                forged,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidOutput(_)) | Err(LowerError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn if_else_structured_return_keeps_named_cleanup_boundary() {
+        let source = PASS_ONLY_SCOPE_ACTOR_SOURCE.replace(
+            "        with irqs_masked() as mask:\n            pass\n        await checkpoint()",
+            "        with irqs_masked() as mask:\n            if true:\n                return\n            else:\n                return",
         );
         assert!(matches!(
             CanonicalSemanticLowerer::new().lower(
@@ -20457,7 +20748,42 @@ pub fn boot() -> Image:
                 &|| false,
             ),
             Err(LowerError::UnsupportedInput {
-                feature: "semantic-with-structured-return-cleanup-lowering-pending",
+                feature: "semantic-with-structured-return-cleanup-lowering-pending"
+            })
+        ));
+    }
+
+    #[test]
+    fn nested_structured_scope_return_has_exact_depth_boundary() {
+        let source = PASS_ONLY_SCOPE_ACTOR_SOURCE.replace(
+            "        with irqs_masked() as mask:\n            pass\n        await checkpoint()",
+            "        with irqs_masked() as mask:\n            if true:\n                if true:\n                    return",
+        );
+        let image = analyze_parsed_actor_source(&source);
+        let mut exact = LoweringLimits::standard();
+        exact.structured_region_depth = 4;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact nested structured cleanup depth");
+        let mut one_under = exact;
+        one_under.structured_region_depth = 3;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir structured region depth",
+                limit: 3,
             })
         ));
     }
