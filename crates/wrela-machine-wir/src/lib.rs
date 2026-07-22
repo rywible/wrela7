@@ -7175,6 +7175,48 @@ fn assertion_global_matches(module: &MachineWir, id: GlobalId, text: &str) -> bo
             .is_some_and(|padding| padding.iter().all(|byte| *byte == 0))
 }
 
+fn enum_payload_scalar_type(module: &MachineWir, id: MachineTypeId) -> bool {
+    module.types.get(id.0 as usize).is_some_and(|record| {
+        matches!(
+            record.kind,
+            MachineTypeKind::Integer {
+                bits: 1 | 8 | 16 | 32 | 64 | 128
+            } | MachineTypeKind::Float32
+                | MachineTypeKind::Float64
+        )
+    })
+}
+
+fn flat_nominal_enum_payload_type(module: &MachineWir, id: MachineTypeId) -> bool {
+    module.types.get(id.0 as usize).is_some_and(|record| {
+        record.source_name.is_some()
+            && matches!(&record.kind, MachineTypeKind::Struct {
+                fields,
+                packed: false,
+            } if !fields.is_empty()
+                && fields.iter().all(|field| enum_payload_scalar_type(module, field.ty)))
+    })
+}
+
+fn variant_specific_enum_payload_profile(
+    module: &MachineWir,
+    payloads: &[Option<MachineTypeId>],
+    storage: Option<MachineEnumStorage>,
+) -> bool {
+    let [Some(left), Some(right)] = payloads else {
+        return false;
+    };
+    if left == right || storage.is_none() {
+        return false;
+    }
+    let left_scalar = enum_payload_scalar_type(module, *left);
+    let right_scalar = enum_payload_scalar_type(module, *right);
+    let scalar_count = u8::from(left_scalar) + u8::from(right_scalar);
+    let nominal_count = u8::from(flat_nominal_enum_payload_type(module, *left))
+        + u8::from(flat_nominal_enum_payload_type(module, *right));
+    scalar_count == 2 || (scalar_count == 1 && nominal_count == 1)
+}
+
 fn validate_operation_types(
     module: &MachineWir,
     function: &MachineFunction,
@@ -7457,20 +7499,11 @@ fn validate_operation_types(
                             ..
                         } => match variant {
                             Some(variant)
-                                if storage.is_some()
-                                    && variant_payloads.len() == 2
-                                    && matches!(variant_payloads.as_slice(), [Some(left), Some(right)] if left != right)
-                                    && variant_payloads.iter().flatten().all(|payload| {
-                                        module.types.get(payload.0 as usize).is_some_and(|ty| {
-                                            matches!(
-                                                ty.kind,
-                                                MachineTypeKind::Integer {
-                                                    bits: 1 | 8 | 16 | 32 | 64 | 128,
-                                                } | MachineTypeKind::Float32
-                                                    | MachineTypeKind::Float64
-                                            )
-                                        })
-                                    }) =>
+                                if variant_specific_enum_payload_profile(
+                                    module,
+                                    variant_payloads,
+                                    *storage,
+                                ) =>
                             {
                                 variant_payloads
                                     .get(usize::from(*variant))
@@ -9860,7 +9893,7 @@ mod tests {
     }
 
     #[test]
-    fn heterogeneous_enum_authenticates_nominal_payload_storage_and_constructor() {
+    fn heterogeneous_enum_authenticates_nominal_payload_storage_construction_and_projection() {
         let (mut module, target) = closed_enum_fixture(2);
         module.types.push(MachineType {
             id: MachineTypeId(5),
@@ -9885,19 +9918,32 @@ mod tests {
             variants: 2,
             variant_payloads: vec![Some(MachineTypeId(5)), Some(MachineTypeId(3))],
         };
-        let mut forged_nominal_projection = module.clone();
-        forged_nominal_projection.functions[1].values[3].ty = MachineTypeId(5);
+        let mut nominal_projection = module.clone();
+        nominal_projection.functions[1].values[3].ty = MachineTypeId(5);
+        let MachineOperation::EnumPayload { variant, .. } =
+            &mut nominal_projection.functions[1].blocks[0].instructions[2].operation
+        else {
+            unreachable!();
+        };
+        *variant = Some(0);
+        nominal_projection.functions[1].blocks[0].terminator =
+            MachineTerminator::Return(vec![ValueId(0)]);
+        nominal_projection
+            .clone()
+            .validate_for_target(&target)
+            .expect("variant-authenticated nominal payload projection");
+
+        let mut forged_nominal_projection = nominal_projection;
         let MachineOperation::EnumPayload { variant, .. } =
             &mut forged_nominal_projection.functions[1].blocks[0].instructions[2].operation
         else {
             unreachable!();
         };
-        *variant = Some(0);
+        *variant = Some(1);
         assert!(
             forged_nominal_projection
                 .validate_for_target(&target)
-                .is_err(),
-            "nominal heterogeneous projection remains fail closed"
+                .is_err()
         );
         module.functions[1].blocks[0].instructions.remove(2);
         module.functions[1].values.remove(3);

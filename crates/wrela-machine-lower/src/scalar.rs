@@ -5652,6 +5652,35 @@ fn validate_native_struct_locality(
     validate_native_struct_locality_contract(types, None, function, is_cancelled)
 }
 
+fn exact_fixed_flat_enum_payload_projection(
+    types: &[flow::FlowType],
+    function: &flow::FlowFunction,
+    instruction: &flow::Instruction,
+) -> bool {
+    let (
+        [result],
+        flow::FlowOperation::EnumPayload {
+            value,
+            variant: Some(variant),
+        },
+    ) = (instruction.results.as_slice(), &instruction.operation)
+    else {
+        return false;
+    };
+    let Ok(enum_ty) = flow_value_type(function, *value) else {
+        return false;
+    };
+    is_exact_fixed_flat_enum(types, enum_ty)
+        && types.get(enum_ty.0 as usize).is_some_and(|record| {
+            matches!(&record.kind, flow::FlowTypeKind::Enum { variants }
+            if variants.get(usize::from(*variant)).is_some_and(|fields| {
+                matches!(fields.as_slice(), [expected]
+                    if flow_value_type(function, *result).ok() == Some(*expected)
+                        && flat_native_struct_fields(types, *expected).is_some())
+            }))
+        })
+}
+
 fn validate_native_struct_locality_contract(
     types: &[flow::FlowType],
     input: Option<&flow::FlowWir>,
@@ -5710,6 +5739,7 @@ fn validate_native_struct_locality_contract(
                         | flow::FlowOperation::Move { .. }
                         | flow::FlowOperation::Copy { .. }
                 )
+                && !exact_fixed_flat_enum_payload_projection(types, function, instruction)
                 && !input
                     .map(|input| {
                         authenticated_flat_structure_builder_call(
@@ -6890,15 +6920,20 @@ fn validate_supported_operation(
             let enum_ty = flow_value_type(function, *value)?;
             let expected = match variant {
                 None => closed_scalar_enum_payload(&input.types, enum_ty),
-                Some(variant) if is_exact_heterogeneous_scalar_enum(&input.types, enum_ty) => input
-                    .types
-                    .get(enum_ty.0 as usize)
-                    .and_then(|record| match &record.kind {
-                        flow::FlowTypeKind::Enum { variants } => variants
-                            .get(usize::from(*variant))
-                            .and_then(|fields| fields.as_slice().first().copied()),
-                        _ => None,
-                    }),
+                Some(variant)
+                    if is_exact_heterogeneous_scalar_enum(&input.types, enum_ty)
+                        || is_exact_fixed_flat_enum(&input.types, enum_ty) =>
+                {
+                    input
+                        .types
+                        .get(enum_ty.0 as usize)
+                        .and_then(|record| match &record.kind {
+                            flow::FlowTypeKind::Enum { variants } => variants
+                                .get(usize::from(*variant))
+                                .and_then(|fields| fields.as_slice().first().copied()),
+                            _ => None,
+                        })
+                }
                 Some(_) => None,
             };
             if expected != Some(flow_value_type(function, result)?) {

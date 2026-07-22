@@ -261,7 +261,7 @@ pub enum FlowOperation {
     EnumTag {
         value: ValueId,
     },
-    /// Read one authenticated scalar payload from an enum value.
+    /// Read one authenticated payload from an enum value.
     ///
     /// `variant` is required when the enum's variants have distinct payload
     /// types. It stays absent for the canonical uniform-payload representation,
@@ -5645,7 +5645,8 @@ fn validate_operation(
                         FlowTypeKind::Enum { variants } => match variant {
                             None => canonical_enum_payload(module, variants),
                             Some(variant)
-                                if exact_heterogeneous_scalar_enum_profile(module, variants) =>
+                                if exact_heterogeneous_scalar_enum_profile(module, variants)
+                                    || exact_fixed_flat_enum_profile(module, variants) =>
                             {
                                 variants
                                     .get(usize::from(*variant))
@@ -7266,6 +7267,12 @@ mod tests {
                     source_name: Some("envelope".to_owned()),
                     source: Some(source),
                 },
+                Value {
+                    id: ValueId(3),
+                    ty: TypeId(2),
+                    source_name: Some("projected-detail".to_owned()),
+                    source: Some(source),
+                },
             ],
             blocks: vec![Block {
                 id: BlockId(0),
@@ -7290,6 +7297,15 @@ mod tests {
                         },
                         source: Some(source),
                     },
+                    Instruction {
+                        id: InstructionId(2),
+                        results: vec![ValueId(3)],
+                        operation: FlowOperation::EnumPayload {
+                            value: ValueId(2),
+                            variant: Some(0),
+                        },
+                        source: Some(source),
+                    },
                 ],
                 terminator: Terminator::Return(vec![ValueId(2)]),
                 source: Some(source),
@@ -7307,7 +7323,16 @@ mod tests {
         module
             .clone()
             .validate()
-            .expect("exact fixed flat payload and construction are canonical");
+            .expect("exact fixed flat payload construction and projection are canonical");
+
+        let mut wrong_projection_variant = module.clone();
+        let FlowOperation::EnumPayload { variant, .. } =
+            &mut wrong_projection_variant.functions[1].blocks[0].instructions[2].operation
+        else {
+            unreachable!();
+        };
+        *variant = Some(1);
+        assert!(wrong_projection_variant.validate().is_err());
 
         let mut wrong_variant_payload = module.clone();
         let FlowOperation::MakeEnum {

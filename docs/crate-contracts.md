@@ -546,7 +546,7 @@ it. It injects phase implementations and bounded host capabilities, while
   broader stored/dynamic, taking, mutable, suspended, and function-boundary arrays stay
   fail-closed; pattern guards, alternatives, negative literals, nesting, and
   `take` remain named semantic boundaries.
-- MachineWir v20 records one exact optional logical payload type per enum tag.
+- MachineWir v21 records one exact optional logical payload type per enum tag.
   Uniform scalar enums retain that scalar as the physical shared-slot type;
   all-unit enums retain neither a slot nor logical payloads and remain exactly
   one tag byte. The first heterogeneous profile is deliberately narrower: two
@@ -557,13 +557,14 @@ it. It injects phase implementations and bounded host capabilities, while
   validation rejects nominal, tag, logical-type, or storage substitution. LLVM
   independently rechecks the profile and uses a zero-initialized aligned local
   slot to copy the exact logical payload bits into the physical union value.
-  FlowWir v19 and MachineWir v20 additionally admit exact per-tag projection
-  for two unary variants with distinct primitive-scalar payloads. `EnumPayload`
-  carries `Some(tag)` for that profile, while the canonical uniform-payload
+  FlowWir v19 and MachineWir v21 additionally admit exact per-tag projection
+  for two unary variants with distinct primitive-scalar payloads or for the
+  same fixed-flat-plus-distinct-scalar profile. `EnumPayload` carries
+  `Some(tag)` for both profiles, while the canonical uniform-payload
   representation retains `None`; validators join the tag to the logical result
-  type, and LLVM loads that exact type back from the aligned physical slot.
-  Heterogeneous nominal payload projection, broader nominal payload sets, and
-  non-flat/nested payloads remain named fail-closed.
+  type, and LLVM loads that exact scalar or flat nominal type back from the
+  aligned physical slot. Broader nominal payload sets and non-flat/nested
+  payloads remain named fail-closed.
 - The current schema retains the exact compiled `FullImageTestGroup`, including its
   plan identity, generated-harness function keys or declared-image/scenario
   binding, descriptors, seed, and execution policy. Validation joins generated

@@ -2434,11 +2434,7 @@ fn validate_operation(
                             if storage.is_some()
                                 && variant_payloads.len() == 2
                                 && matches!(variant_payloads.as_slice(), [Some(left), Some(right)] if left != right)
-                                && variant_payloads.iter().flatten().all(|payload| {
-                                    machine.types.get(payload.0 as usize).is_some_and(|ty| {
-                                        supported_scalar_type(&ty.kind, ty.size, ty.alignment)
-                                    })
-                                }) =>
+                                && supported_enum_type(machine, enum_ty) =>
                         {
                             variant_payloads
                                 .get(usize::from(*variant))

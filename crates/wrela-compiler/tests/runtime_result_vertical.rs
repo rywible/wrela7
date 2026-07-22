@@ -22,7 +22,7 @@ use wrela_build_model::{
     TargetIdentity, seal_build_configuration,
 };
 use wrela_flow_lower::{
-    CanonicalFlowLowerer, FlowLowerer, FlowOperation, FlowTypeKind,
+    CanonicalFlowLowerer, FlowLowerer, FlowOperation, FlowTypeKind, LowerError as FlowLowerError,
     LowerRequest as FlowLowerRequest, LoweringLimits as FlowLoweringLimits, Terminator,
 };
 use wrela_flow_wir_codec::{
@@ -1170,6 +1170,326 @@ fn fixed_flat_generic_enum_runtime():
         Ok(first) => {
             let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
                 .expect("repeat fixed flat generic enum native emission");
+            assert_eq!(first.bytes(), second.bytes());
+            let digest = HASHER.sha256(first.bytes());
+            assert_eq!(digest, HASHER.sha256(second.bytes()));
+            inspect_native_object(first.bytes(), digest);
+        }
+    }
+}
+
+#[test]
+fn fixed_flat_generic_enum_payload_match_reaches_flow_machine_and_deterministic_native_coff() {
+    let fixture = source_fixture_for(
+        r#"module runtime_result.image
+
+from core.image import Image, Target
+
+pub struct Detail:
+    pub word: u8
+
+pub enum Envelope[T]:
+    detail(Detail)
+    value(T)
+
+@image
+pub fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn fixed_flat_generic_enum_match_runtime():
+    detail: Envelope[u8] = Envelope.detail(Detail(7))
+    observed: u8 = unwrap(detail)
+    return
+
+fn unwrap(input: Envelope[u8]) -> u8:
+    match input:
+        case Envelope.detail(payload):
+            return payload.word
+        case Envelope.value(value):
+            return value
+"#,
+    );
+    let image = analyze_selected(&fixture, "fixed_flat_generic_enum_match_runtime");
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: image,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("fixed flat generic enum match SemanticWir")
+        .into_parts()
+        .0;
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("fixed flat generic enum match reaches FlowWir");
+    let flow_instruction_count = flow.report().instructions;
+    let flow_model = flow.wir().as_wir();
+    let detail = flow_model
+        .types
+        .iter()
+        .find(|ty| ty.name.as_deref() == Some("Detail"))
+        .expect("matched fixed Detail FlowWir type");
+    let envelope = flow_model
+        .types
+        .iter()
+        .find(|ty| ty.name.as_deref() == Some("Envelope"))
+        .expect("matched Envelope FlowWir type");
+    let u8_ty = flow_model
+        .types
+        .iter()
+        .find(|ty| ty.name.as_deref() == Some("u8"))
+        .expect("canonical u8 FlowWir type");
+    assert!(matches!(&envelope.kind, FlowTypeKind::Enum { variants }
+        if variants.as_slice() == [vec![detail.id], vec![u8_ty.id]]));
+    let projections = flow_model
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.operation {
+            FlowOperation::EnumPayload { variant, .. } => Some(variant),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(projections, [Some(0), Some(1)]);
+    assert!(
+        flow_model
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| matches!(
+                instruction.operation,
+                FlowOperation::ExtractField { field: 0, .. }
+            ))
+    );
+
+    let mut forged_flow = flow_model.clone();
+    let projected = forged_flow
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.operation {
+            FlowOperation::EnumPayload {
+                variant: Some(variant),
+                ..
+            } if *variant == 0 => Some(variant),
+            _ => None,
+        })
+        .expect("fixed nominal payload projection");
+    *projected = 1;
+    assert!(forged_flow.validate().is_err());
+
+    let mut exact_flow = FlowLoweringLimits::standard();
+    exact_flow.instructions = flow_instruction_count;
+    CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: exact_flow,
+            },
+            &never_cancelled,
+        )
+        .expect("fixed flat match accepts exact FlowWir instruction ceiling");
+    let mut one_under_flow = exact_flow;
+    one_under_flow.instructions = flow_instruction_count - 1;
+    assert!(matches!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: one_under_flow,
+            },
+            &never_cancelled,
+        ),
+        Err(FlowLowerError::ResourceLimit {
+            resource: "FlowWir instructions",
+            limit,
+        }) if limit == flow_instruction_count - 1
+    ));
+    let flow_polls = Cell::new(0_u64);
+    CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: exact_flow,
+            },
+            &|| {
+                flow_polls.set(flow_polls.get().saturating_add(1));
+                false
+            },
+        )
+        .expect("count fixed flat match Flow lowering polls");
+    let final_flow_poll = flow_polls.get();
+    assert!(final_flow_poll > 3);
+    flow_polls.set(0);
+    assert!(matches!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: exact_flow,
+            },
+            &|| {
+                let next = flow_polls.get().saturating_add(1);
+                flow_polls.set(next);
+                next >= final_flow_poll
+            },
+        ),
+        Err(FlowLowerError::Cancelled)
+    ));
+    assert_eq!(flow_polls.get(), final_flow_poll);
+
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("fixed flat match FlowWir v19 frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("fixed flat match MachineWir preparation");
+    let machine = prepared.machine().wir().as_wir();
+    let detail = machine
+        .types
+        .iter()
+        .find(|ty| ty.source_name.as_deref() == Some("Detail"))
+        .expect("matched Detail MachineWir type");
+    let machine_projections = machine
+        .functions
+        .iter()
+        .flat_map(|function| {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .filter_map(|instruction| match instruction.operation {
+                    MachineOperation::EnumPayload { variant, .. } => Some((
+                        variant,
+                        function.values[instruction.results[0].0 as usize].ty,
+                    )),
+                    _ => None,
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(machine_projections.len(), 2);
+    assert_eq!(machine_projections[0].0, Some(0));
+    assert_eq!(machine_projections[1].0, Some(1));
+    assert_eq!(machine_projections[0].1, detail.id);
+
+    let mut forged_machine = machine.clone();
+    let projected = forged_machine
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.operation {
+            MachineOperation::EnumPayload {
+                variant: Some(variant),
+                ..
+            } if *variant == 0 => Some(variant),
+            _ => None,
+        })
+        .expect("fixed nominal MachineWir payload projection");
+    *projected = 1;
+    assert!(forged_machine.validate_for_target(&fixture.target).is_err());
+
+    let codec = CanonicalFlowWirCodec;
+    let hasher = CanonicalBackendContentHasher::new();
+    let optimizer = CanonicalFlowOptimizer::new();
+    let machine_lowerer = CanonicalMachineLowerer::new();
+    let expected_digest = hasher
+        .sha256(encoded.bytes(), &never_cancelled)
+        .expect("fixed flat match frame digest");
+    let optimization = OptimizationProfile::from_build_policy(
+        &fixture.build.profile.optimization,
+        fixture.build.identity.compiler,
+    )
+    .expect("fixed flat match optimization profile");
+    let prepare_with = |machine_limits: MachineLoweringLimits, is_cancelled: &dyn Fn() -> bool| {
+        prepare_for_codegen(
+            BackendPreparationServices {
+                codec: &codec,
+                hasher: &hasher,
+                optimizer: &optimizer,
+                machine_lowerer: &machine_lowerer,
+            },
+            encoded.bytes(),
+            expected_digest,
+            &fixture.target,
+            &fixture.build,
+            BackendPreparationOptions {
+                codec_limits: CodecLimits::standard(),
+                optimization: optimization.clone(),
+                optimization_limits: OptimizationLimits::standard(),
+                machine_limits,
+            },
+            is_cancelled,
+        )
+    };
+    let instruction_count = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .map(|block| block.instructions.len() as u64)
+        .sum::<u64>();
+    let mut exact_machine = MachineLoweringLimits::standard();
+    exact_machine.instructions = instruction_count;
+    prepare_with(exact_machine, &never_cancelled)
+        .expect("fixed flat match accepts exact MachineWir instruction ceiling");
+    let mut one_under_machine = exact_machine;
+    one_under_machine.instructions = instruction_count - 1;
+    let one_under = prepare_with(one_under_machine, &never_cancelled)
+        .expect_err("one fewer fixed-flat-match MachineWir instruction must fail");
+    assert_eq!(
+        one_under.machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir instructions",
+            limit: instruction_count - 1,
+        })
+    );
+    let machine_polls = Cell::new(0_u64);
+    prepare_with(MachineLoweringLimits::standard(), &|| {
+        machine_polls.set(machine_polls.get().saturating_add(1));
+        false
+    })
+    .expect("count fixed flat match MachineWir polls");
+    let cancellation_at = machine_polls.get().saturating_sub(2);
+    assert!(cancellation_at > 3);
+    let cancelled_polls = Cell::new(0_u64);
+    let cancellation = prepare_with(MachineLoweringLimits::standard(), &|| {
+        let next = cancelled_polls.get().saturating_add(1);
+        cancelled_polls.set(next);
+        next >= cancellation_at
+    })
+    .expect_err("late fixed flat match MachineWir cancellation must propagate");
+    assert!(cancellation.is_cancelled());
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("fixed flat match native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat fixed flat match native emission");
             assert_eq!(first.bytes(), second.bytes());
             let digest = HASHER.sha256(first.bytes());
             assert_eq!(digest, HASHER.sha256(second.bytes()));
