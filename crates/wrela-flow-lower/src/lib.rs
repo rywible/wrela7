@@ -3122,10 +3122,32 @@ fn validate_scalar_source_function(
                                 !std::mem::replace(slot, true) && bindings_match
                             }
                             None => {
+                                let bindings_match = match arm.bindings.as_slice() {
+                                    [] => true,
+                                    [binding] => {
+                                        let binding_ty = scalar_value_type(function, *binding);
+                                        let mut remaining = 0usize;
+                                        let shared = variants.iter().enumerate().all(
+                                            |(variant_index, variant)| {
+                                                if arms.iter().any(|candidate| {
+                                                    candidate.variant
+                                                        == u32::try_from(variant_index).ok()
+                                                }) {
+                                                    true
+                                                } else {
+                                                    remaining = remaining.saturating_add(1);
+                                                    matches!(variant.fields.as_slice(), [field] if binding_ty == Some(field.ty))
+                                                }
+                                            },
+                                        );
+                                        remaining > 0 && shared
+                                    }
+                                    _ => false,
+                                };
                                 terminal
                                     && arm_index + 1 == arms.len()
                                     && !std::mem::replace(&mut wildcard, true)
-                                    && arm.bindings.is_empty()
+                                    && bindings_match
                             }
                         };
                         if !canonical || arm.guard.is_some() {
@@ -6203,7 +6225,55 @@ fn lower_generated_function(
                                     arguments,
                                 });
                             }
-                            None if arm.bindings.is_empty() && results.is_empty() => {
+                            None if results.is_empty() => {
+                                match arm.bindings.as_slice() {
+                                    [] => {}
+                                    [binding] => {
+                                        let binding_ty = function
+                                            .values
+                                            .get(binding.0 as usize)
+                                            .map(|value| value.ty)
+                                            .ok_or_else(|| {
+                                                unsupported("enum match wildcard binding type")
+                                            })?;
+                                        let mut remaining = 0usize;
+                                        let shared = variants.iter().enumerate().all(
+                                            |(variant_index, variant)| {
+                                                if cases.iter().any(|case| {
+                                                    case.value
+                                                        == u128::try_from(variant_index)
+                                                            .unwrap_or(u128::MAX)
+                                                }) {
+                                                    true
+                                                } else {
+                                                    remaining = remaining.saturating_add(1);
+                                                    matches!(variant.fields.as_slice(), [field] if field.ty == binding_ty)
+                                                }
+                                            },
+                                        );
+                                        if remaining == 0 || !shared {
+                                            return Err(unsupported(
+                                                "enum match wildcard binding coverage",
+                                            ));
+                                        }
+                                        push_bounded(
+                                            &mut pending_block_mut(&mut pending_blocks, block)?
+                                                .instructions,
+                                            PendingInstruction {
+                                                results: vec![flow::ValueId(binding.0)],
+                                                operation: flow::FlowOperation::EnumPayload {
+                                                    value: flow::ValueId(scrutinee.0),
+                                                },
+                                                source: *source,
+                                            },
+                                            "FlowWir instructions",
+                                            limits.instructions,
+                                        )?;
+                                    }
+                                    _ => {
+                                        return Err(unsupported("enum match wildcard binding"));
+                                    }
+                                }
                                 if default.replace(block).is_some() {
                                     return Err(unsupported("enum match wildcard uniqueness"));
                                 }

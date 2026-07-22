@@ -8090,6 +8090,10 @@ impl SourceFunctionLowerer<'_> {
                                 self.limits.model_edges,
                             )?;
                             coverage.resize(variant_count, false);
+                            let mut shared_binding: Option<(
+                                wrela_hir::LocalId,
+                                sema::SemanticTypeId,
+                            )> = None;
                             for alternative in &pattern.alternatives {
                                 check_cancelled(self.is_cancelled)?;
                                 let wrela_hir::PrimaryPattern::Constructor {
@@ -8127,10 +8131,44 @@ impl SourceFunctionLowerer<'_> {
                                         self.fact_mismatch("unit match alternative exact coverage")
                                     );
                                 }
-                                if !semantic_variant.fields.is_empty() || !arguments.is_empty() {
-                                    return Err(unsupported(
-                                        "semantic-match-alternative-payload-lowering-pending",
-                                    ));
+                                match (semantic_variant.fields.as_slice(), arguments.as_slice()) {
+                                    ([], []) if shared_binding.is_none() => {}
+                                    ([field], [argument]) if !argument.take => {
+                                        let payload_pattern = self
+                                            .input
+                                            .hir()
+                                            .as_program()
+                                            .patterns
+                                            .get(argument.pattern.0 as usize)
+                                            .ok_or_else(|| {
+                                                self.fact_mismatch("alternative payload pattern")
+                                            })?;
+                                        let [payload_alternative] =
+                                            payload_pattern.alternatives.as_slice()
+                                        else {
+                                            return Err(self.fact_mismatch(
+                                                "alternative payload alternatives",
+                                            ));
+                                        };
+                                        let wrela_hir::PrimaryPattern::Bind(local) =
+                                            payload_alternative.kind
+                                        else {
+                                            return Err(
+                                                self.fact_mismatch("alternative payload binding")
+                                            );
+                                        };
+                                        if shared_binding.is_some_and(|(existing, ty)| {
+                                            existing != local || ty != field.ty
+                                        }) {
+                                            return Err(self.fact_mismatch(
+                                                "alternative shared payload identity",
+                                            ));
+                                        }
+                                        shared_binding = Some((local, field.ty));
+                                    }
+                                    _ => {
+                                        return Err(self.fact_mismatch("alternative payload shape"));
+                                    }
                                 }
                                 *covered = true;
                             }
@@ -8146,8 +8184,67 @@ impl SourceFunctionLowerer<'_> {
                                 ));
                             }
                             let mut arm_state = local_state.copy(self.limits)?;
+                            let binding = if let Some((local, payload_ty)) = shared_binding {
+                                let mut matching = statement_definitions
+                                    .iter()
+                                    .filter(|definition| definition.local == local);
+                                let definition = matching.next().ok_or_else(|| {
+                                    self.fact_mismatch("alternative match binding definition")
+                                })?;
+                                if matching.next().is_some()
+                                    || used_values.contains(&definition.value)
+                                {
+                                    return Err(self.fact_mismatch(
+                                        "unique alternative match binding definition",
+                                    ));
+                                }
+                                let local_record = self
+                                    .input
+                                    .hir()
+                                    .as_program()
+                                    .locals
+                                    .get(local.0 as usize)
+                                    .filter(|record| record.id == local && record.body == arm.body)
+                                    .ok_or_else(|| {
+                                        self.fact_mismatch(
+                                            "alternative match binding local ownership",
+                                        )
+                                    })?;
+                                self.input
+                                    .facts()
+                                    .values
+                                    .get(definition.value.0 as usize)
+                                    .filter(|record| {
+                                        record.function == self.function.id
+                                            && record.ty == payload_ty
+                                            && record.origin
+                                                == sema::SemanticValueOrigin::Local(local)
+                                            && record.source == Some(local_record.source)
+                                            && record.source_name.as_deref()
+                                                == Some(local_record.name.as_str())
+                                    })
+                                    .ok_or_else(|| {
+                                        self.fact_mismatch(
+                                            "alternative match binding value provenance",
+                                        )
+                                    })?;
+                                used_values.push(definition.value);
+                                used_definitions += 1;
+                                if arm_state.get(local).is_some() {
+                                    return Err(self.fact_mismatch(
+                                        "alternative match binding shadows live local",
+                                    ));
+                                }
+                                arm_state.set(local, definition.value)?;
+                                Some(self.value_map.get(definition.value)?)
+                            } else {
+                                None
+                            };
                             let mut body = self.lower_body(arm.body, depth + 1, &mut arm_state)?;
-                            body.parameters = Vec::new();
+                            body.parameters = binding
+                                .map(|binding| one_value_vec(binding, self.limits.model_edges))
+                                .transpose()?
+                                .unwrap_or_default();
                             let returns = self.body_definitely_returns(arm.body)?;
                             if !returns {
                                 all_return = false;
@@ -8539,11 +8636,11 @@ impl SourceFunctionLowerer<'_> {
                     if pending_arms.iter().any(Option::is_some) {
                         return Err(self.fact_mismatch("unfolded match arm"));
                     }
-                    if let Some((mut body, _source)) = wildcard_arm {
-                        body.parameters = Vec::new();
+                    if let Some((body, _source)) = wildcard_arm {
+                        let bindings = body.parameters.clone();
                         lowered_arms.push(wir::SemanticMatchArm {
                             variant: None,
-                            bindings: Vec::new(),
+                            bindings,
                             guard: None,
                             body,
                         });
@@ -22065,7 +22162,7 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn shared_payload_pattern_alternative_stops_at_named_lowering_boundary() {
+    fn shared_payload_pattern_alternative_lowers_one_canonical_body() {
         let image = analyze_parsed_actor_source(
             r#"module app
 
@@ -22100,22 +22197,118 @@ pub fn boot() -> Image:
     return img
 "#,
         );
-        let result = CanonicalSemanticLowerer::new().lower(
-            LowerRequest {
-                input: image,
-                limits: LoweringLimits::standard(),
-            },
-            &|| false,
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("shared-payload alternatives should lower");
+        let arms = lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Match { arms, .. } if arms.len() == 2 => Some(arms),
+                _ => None,
+            })
+            .expect("one explicit complement and one shared-payload default arm");
+        assert_eq!(
+            arms.iter().map(|arm| arm.variant).collect::<Vec<_>>(),
+            vec![Some(2), None]
         );
-        assert!(
-            matches!(
-                result,
-                Err(LowerError::UnsupportedInput {
-                    feature: "semantic-match-alternative-payload-lowering-pending"
-                })
+        assert!(arms[0].bindings.is_empty());
+        assert_eq!(arms[1].bindings.len(), 1);
+        assert_eq!(arms[1].body.parameters, arms[1].bindings);
+
+        let exact_operations = lowered.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact shared-payload alternative operation limit");
+        let mut one_under = LoweringLimits::standard();
+        one_under.operations = exact_operations - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
             ),
-            "unexpected shared-payload alternative lowering result: {result:?}"
-        );
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == exact_operations - 1
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("count shared-payload alternative cancellation polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+
+        let mut forged = lowered.wir().as_wir().clone();
+        let forged_default = forged
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Match { arms, .. } if arms.len() == 2 => arms.last_mut(),
+                _ => None,
+            })
+            .expect("forged shared-payload default");
+        forged_default.bindings.clear();
+        forged_default.body.parameters.clear();
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                forged,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_)) | Err(LowerError::InvalidOutput(_))
+        ));
     }
 
     #[test]

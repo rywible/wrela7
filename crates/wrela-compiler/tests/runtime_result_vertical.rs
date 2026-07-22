@@ -1346,6 +1346,165 @@ fn match_second() -> u64:
 }
 
 #[test]
+fn shared_payload_pattern_alternative_reaches_flow_machine_and_deterministic_native_coff() {
+    let fixture = source_fixture_for(
+        r#"module runtime_result.image
+
+from core.image import Image, Target
+
+pub enum Signal[T]:
+    low(T)
+    high(T)
+    idle
+
+@image
+pub fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn shared_payload_alternative_runtime():
+    read_signal()
+    return
+
+fn read_signal() -> u64:
+    signal: Signal[u64] = Signal.high(7)
+    match signal:
+        case Signal.low(code) | Signal.high(code):
+            return code
+        case Signal.idle:
+            return 0
+"#,
+    );
+    let image = analyze_selected(&fixture, "shared_payload_alternative_runtime");
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: image,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("shared-payload alternative SemanticWir")
+        .into_parts()
+        .0;
+    let match_function = semantic
+        .as_wir()
+        .functions
+        .iter()
+        .find(|function| function.name.ends_with("read_signal"))
+        .expect("shared-payload source function");
+    let alternative_arms = match_function
+        .body
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            wrela_semantic_lower::semantic_wir::SemanticStatement::Match { arms, .. }
+                if arms.len() == 2 =>
+            {
+                Some(arms)
+            }
+            _ => None,
+        })
+        .expect("one explicit complement plus one shared-payload default");
+    assert_eq!(
+        alternative_arms
+            .iter()
+            .map(|arm| arm.variant)
+            .collect::<Vec<_>>(),
+        [Some(2), None]
+    );
+    assert!(alternative_arms[0].bindings.is_empty());
+    assert_eq!(alternative_arms[1].bindings.len(), 1);
+    assert_eq!(
+        alternative_arms[1].body.parameters,
+        alternative_arms[1].bindings
+    );
+
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("shared-payload alternative FlowWir");
+    let flow_match_function = flow
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .find(|function| function.name.ends_with("read_signal"))
+        .expect("shared-payload FlowWir function");
+    assert_eq!(
+        flow_match_function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(
+                instruction.operation,
+                FlowOperation::EnumPayload { .. }
+            ))
+            .count(),
+        1
+    );
+    let flow_match_function_id = flow_match_function.id.0;
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("shared-payload canonical FlowWir frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("shared-payload MachineWir preparation");
+    let machine_match_function = prepared
+        .machine()
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .find(|function| function.flow_function == flow_match_function_id)
+        .expect("shared-payload MachineWir function");
+    assert_eq!(
+        machine_match_function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(
+                instruction.operation,
+                MachineOperation::EnumPayload { .. }
+            ))
+            .count(),
+        1
+    );
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("shared-payload alternative native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat shared-payload alternative native emission");
+            assert_eq!(first.bytes(), second.bytes());
+            let digest = HASHER.sha256(first.bytes());
+            assert_eq!(digest, HASHER.sha256(second.bytes()));
+            inspect_native_object(first.bytes(), digest);
+        }
+    }
+}
+
+#[test]
 fn runtime_result_specializes_u64_payload_with_deterministic_machine_layout() {
     let mut source = APPLICATION_SOURCE.to_owned();
     source.push_str(
