@@ -334,7 +334,8 @@ impl CanonicalSemanticLinter {
                     for part in parts {
                         match part {
                             wrela_sema::BoundedInterpolationPart::Bool { value, .. }
-                            | wrela_sema::BoundedInterpolationPart::Integer { value, .. } => {
+                            | wrela_sema::BoundedInterpolationPart::Integer { value, .. }
+                            | wrela_sema::BoundedInterpolationPart::Character { value, .. } => {
                                 mark_value(
                                     &mut value_state,
                                     *value,

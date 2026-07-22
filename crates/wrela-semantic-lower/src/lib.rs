@@ -291,6 +291,7 @@ fn supported_input<'a>(
     limits: LoweringLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedInput<'a>, LowerError> {
+    validate_bounded_string_lowering_boundary(input.facts())?;
     validate_async_outcome_lowering_boundary(input.facts())?;
     validate_admission_result_lowering_boundary(input.facts())?;
     validate_generic_function_lowering_boundary(input)?;
@@ -312,6 +313,22 @@ fn supported_input<'a>(
             supported_generated_tests(input, limits, is_cancelled)
                 .map(SupportedInput::GeneratedTests)
         }
+    }
+}
+
+fn validate_bounded_string_lowering_boundary(
+    facts: &sema::PartialAnalysis,
+) -> Result<(), LowerError> {
+    if facts
+        .types
+        .iter()
+        .any(|ty| matches!(ty.kind, sema::SemanticTypeKind::BoundedString { .. }))
+    {
+        Err(unsupported(
+            "semantic-bounded-string-lowering-pending (BoundedString has no SemanticWir storage, formatting operation, or ABI representation)",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -21837,6 +21854,51 @@ pub fn boot() -> Image:
                 })
             ),
             "unexpected bounded interpolation lowering result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_character_interpolation_stops_at_named_semantic_lowering_boundary() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+fn render_status():
+    rendered = f"glyph={'x'}"
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    @task
+    async fn pulse(mut self):
+        render_status()
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=1)
+    return img
+"#,
+        );
+        let result = CanonicalSemanticLowerer::new().lower(
+            LowerRequest {
+                input: image,
+                limits: LoweringLimits::standard(),
+            },
+            &|| false,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(LowerError::UnsupportedInput {
+                    feature: "semantic-bounded-string-lowering-pending (BoundedString has no SemanticWir storage, formatting operation, or ABI representation)"
+                })
+            ),
+            "unexpected bounded character interpolation lowering result: {result:?}"
         );
     }
 

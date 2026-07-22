@@ -857,6 +857,10 @@ pub enum BoundedInterpolationPart {
         ty: SemanticTypeId,
         maximum_bytes: u64,
     },
+    Character {
+        expression: ExpressionId,
+        value: ValueId,
+    },
     Bool {
         expression: ExpressionId,
         value: ValueId,
@@ -874,6 +878,7 @@ fn bounded_interpolation_maximum_bytes(kind: &SemanticTypeKind) -> Option<u64> {
     };
     match kind {
         SemanticTypeKind::Bool => Some(5),
+        SemanticTypeKind::Character => Some(4),
         SemanticTypeKind::Integer { signed, bits, .. } if (1..=128).contains(bits) => {
             let magnitude = if *signed {
                 1_u128 << u32::from(bits - 1)
@@ -3653,6 +3658,7 @@ fn collect_source_body_closure(
                 | wrela_hir::Literal::Boolean(_)
                 | wrela_hir::Literal::Integer(_)
                 | wrela_hir::Literal::Float(_)
+                | wrela_hir::Literal::Character(_)
                 | wrela_hir::Literal::String(_)
                 | wrela_hir::Literal::Bytes(_),
             )
@@ -8888,6 +8894,11 @@ fn constant_matches_literal(
             .filter(|source| source.is_finite())
             .is_some_and(|source| source.to_bits() == *value),
         (
+            wrela_hir::Literal::Character(source),
+            ConstantValue::Character(value),
+            SemanticTypeKind::Character,
+        ) => source == value,
+        (
             wrela_hir::Literal::String(source),
             ConstantValue::String(value),
             SemanticTypeKind::StaticString { bytes },
@@ -8966,6 +8977,41 @@ fn exact_bounded_interpolation_matches(
                     return false;
                 }
                 let Some(next) = expected_capacity.checked_add(5) else {
+                    return false;
+                };
+                expected_capacity = next;
+                value_count = value_count.saturating_add(1);
+                effects |= child.effects.0;
+            }
+            (
+                wrela_hir::InterpolationPart::Value {
+                    expression,
+                    format: None,
+                    format_source: None,
+                },
+                BoundedInterpolationPart::Character {
+                    expression: resolved_expression,
+                    value,
+                },
+            ) if expression == resolved_expression => {
+                let Some(child) = exact_child_expression(analysis, function, *expression) else {
+                    return false;
+                };
+                let resolved_value = match child.resolution {
+                    ExpressionResolution::Value(value) => Some(value),
+                    _ => child.result,
+                };
+                if resolved_value != Some(*value)
+                    || !analysis
+                        .values
+                        .get(value.0 as usize)
+                        .filter(|record| record.function == function && record.ty == child.ty)
+                        .and_then(|_| analysis.types.get(child.ty.0 as usize))
+                        .is_some_and(|ty| matches!(ty.kind, SemanticTypeKind::Character))
+                {
+                    return false;
+                }
+                let Some(next) = expected_capacity.checked_add(4) else {
                     return false;
                 };
                 expected_capacity = next;
@@ -9892,6 +9938,12 @@ fn valid_expression_resolution(
                         .filter(|record| record.function == function)
                         .and_then(|record| analysis.types.get(record.ty.0 as usize))
                         .is_some_and(|ty| matches!(ty.kind, SemanticTypeKind::Bool)),
+                    BoundedInterpolationPart::Character { value, .. } => analysis
+                        .values
+                        .get(value.0 as usize)
+                        .filter(|record| record.function == function)
+                        .and_then(|record| analysis.types.get(record.ty.0 as usize))
+                        .is_some_and(|ty| matches!(ty.kind, SemanticTypeKind::Character)),
                 })
         }
         ExpressionResolution::EnumTypeTest {
