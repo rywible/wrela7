@@ -102,10 +102,19 @@ exhaustiveness coverage and the full sealer replays the alternatives from HIR
 (`runtime_adt_match_unit_alternatives_contribute_exact_exhaustive_coverage`).
 Duplicate alternatives, guarded alternatives, and payload-bearing alternatives
 remain named fail-closed (`runtime_adt_match_alternative_tails_fail_closed_by_name`).
-Semantic lowering stops explicitly at
-`semantic-match-alternatives-lowering-pending`
-(`unit_pattern_alternatives_stop_at_named_semantic_lowering_boundary`); no
-executable or payload-binding alternative support is claimed.
+One unguarded unit-alternative group now lowers canonically as the default arm
+after exact explicit arms cover its complement; the body is lowered once, so
+no SSA definitions are duplicated. Exact operation N/N-1, late cancellation,
+and default/complement forgery rejection are pinned by
+`one_unit_pattern_alternative_group_lowers_as_exact_complement_default`. A
+terminal scalar match with observably distinct return values reaches exact
+FlowWir/MachineWir switching and repeat byte-identical native COFF
+(`unit_pattern_alternative_group_reaches_flow_machine_and_deterministic_native_coff`).
+Multiple alternative groups, coexistence with a source wildcard, guarded
+fallback overlap, and payload-binding alternatives remain named fail-closed
+(`multiple_pattern_alternative_groups_stay_named_fail_closed`,
+`pattern_alternative_default_composition_tails_fail_closed_by_name`); broader
+executable alternatives are not claimed.
 
 B1a.2 retention-boundary evidence additionally includes
 `lexical_projection_loop_liveness_remains_named_and_fail_closed`,

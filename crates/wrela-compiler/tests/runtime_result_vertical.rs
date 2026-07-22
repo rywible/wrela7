@@ -1209,6 +1209,143 @@ fn match_second() -> u64:
 }
 
 #[test]
+fn unit_pattern_alternative_group_reaches_flow_machine_and_deterministic_native_coff() {
+    let fixture = source_fixture_for(
+        r#"module runtime_result.image
+
+from core.image import Image, Target
+
+pub enum Marker[T]:
+    first
+    second
+    third
+
+@image
+pub fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn unit_pattern_alternative_runtime():
+    match_second()
+    return
+
+fn match_second() -> u64:
+    value: Marker[u64] = Marker.second
+    match value:
+        case Marker.first | Marker.second:
+            return 1
+        case Marker.third:
+            return 2
+"#,
+    );
+    let image = analyze_selected(&fixture, "unit_pattern_alternative_runtime");
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: image,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("unit alternative SemanticWir")
+        .into_parts()
+        .0;
+    let match_function = semantic
+        .as_wir()
+        .functions
+        .iter()
+        .find(|function| function.name.ends_with("match_second"))
+        .expect("exact alternative source function");
+    let alternative_arms = match_function
+        .body
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            wrela_semantic_lower::semantic_wir::SemanticStatement::Match { arms, .. }
+                if arms.len() == 2 =>
+            {
+                Some(arms)
+            }
+            _ => None,
+        })
+        .expect("one explicit complement plus one exact default");
+    assert_eq!(
+        alternative_arms
+            .iter()
+            .map(|arm| arm.variant)
+            .collect::<Vec<_>>(),
+        [Some(2), None]
+    );
+
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("unit alternative FlowWir");
+    let flow_match_function = flow
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .find(|function| function.name.ends_with("match_second"))
+        .expect("exact alternative FlowWir function");
+    assert!(flow_match_function.blocks.iter().any(|block| {
+        matches!(&block.terminator, Terminator::Switch { cases, .. }
+                if matches!(cases.as_slice(), [case] if case.value == 2))
+    }));
+    let flow_match_function_id = flow_match_function.id.0;
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("unit alternative canonical FlowWir frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("unit alternative MachineWir preparation");
+    let machine_match_function = prepared
+        .machine()
+        .wir()
+        .as_wir()
+        .functions
+        .iter()
+        .find(|function| function.flow_function == flow_match_function_id)
+        .expect("exact alternative MachineWir function");
+    assert!(machine_match_function.blocks.iter().any(|block| {
+        matches!(&block.terminator, MachineTerminator::Switch { cases, .. }
+            if matches!(cases.as_slice(), [(value, _, _)] if *value == 2))
+    }));
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("unit alternative native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat unit alternative native emission");
+            assert_eq!(first.bytes(), second.bytes());
+            let digest = HASHER.sha256(first.bytes());
+            assert_eq!(digest, HASHER.sha256(second.bytes()));
+            inspect_native_object(first.bytes(), digest);
+        }
+    }
+}
+
+#[test]
 fn runtime_result_specializes_u64_payload_with_deterministic_machine_layout() {
     let mut source = APPLICATION_SOURCE.to_owned();
     source.push_str(

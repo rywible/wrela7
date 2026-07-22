@@ -8032,6 +8032,7 @@ impl SourceFunctionLowerer<'_> {
                         self.limits.model_edges,
                     )?;
                     let mut wildcard_arm: Option<(wir::SemanticRegion, Span)> = None;
+                    let mut alternative_default_coverage: Option<Vec<bool>> = None;
                     let mut used_definitions = 0usize;
                     let mut seen_variants = try_vec(
                         variant_count,
@@ -8055,14 +8056,98 @@ impl SourceFunctionLowerer<'_> {
                             .get(arm.pattern.0 as usize)
                             .ok_or_else(|| self.fact_mismatch("match constructor pattern"))?;
                         if pattern.alternatives.len() > 1 {
-                            return Err(unsupported(
-                                "semantic-match-alternatives-lowering-pending",
-                            ));
+                            if arm.guard.is_some() {
+                                return Err(
+                                    self.fact_mismatch("unit match alternative analysis contract")
+                                );
+                            }
+                            if wildcard_arm.is_some() || alternative_default_coverage.is_some() {
+                                return Err(unsupported(
+                                    "semantic-match-multiple-alternative-groups-lowering-pending",
+                                ));
+                            }
+                            let mut coverage = try_vec(
+                                variant_count,
+                                "SemanticWir alternative default coverage",
+                                self.limits.model_edges,
+                            )?;
+                            coverage.resize(variant_count, false);
+                            for alternative in &pattern.alternatives {
+                                check_cancelled(self.is_cancelled)?;
+                                let wrela_hir::PrimaryPattern::Constructor {
+                                    candidates,
+                                    arguments,
+                                    ..
+                                } = &alternative.kind
+                                else {
+                                    return Err(
+                                        self.fact_mismatch("unit match alternative constructor")
+                                    );
+                                };
+                                let [candidate] = candidates.as_slice() else {
+                                    return Err(
+                                        self.fact_mismatch("unit match alternative identity")
+                                    );
+                                };
+                                let semantic_variant = semantic_variants
+                                    .get(candidate.variant as usize)
+                                    .ok_or_else(|| {
+                                        self.fact_mismatch("unit match alternative range")
+                                    })?;
+                                let covered =
+                                    coverage.get_mut(candidate.variant as usize).ok_or_else(
+                                        || self.fact_mismatch("unit match alternative range"),
+                                    )?;
+                                if candidate.enumeration.declaration != declaration
+                                    || !semantic_variant.fields.is_empty()
+                                    || !arguments.is_empty()
+                                    || *covered
+                                    || seen_variants
+                                        .get(candidate.variant as usize)
+                                        .copied()
+                                        .unwrap_or(false)
+                                {
+                                    return Err(
+                                        self.fact_mismatch("unit match alternative exact coverage")
+                                    );
+                                }
+                                *covered = true;
+                            }
+                            if pending_arms.iter().flatten().any(|pending| {
+                                pending.guard.is_some()
+                                    && coverage
+                                        .get(pending.variant as usize)
+                                        .copied()
+                                        .unwrap_or(false)
+                            }) {
+                                return Err(unsupported(
+                                    "semantic-match-alternative-guard-fallback-lowering-pending",
+                                ));
+                            }
+                            let mut arm_state = local_state.copy(self.limits)?;
+                            let mut body = self.lower_body(arm.body, depth + 1, &mut arm_state)?;
+                            body.parameters = Vec::new();
+                            let returns = self.body_definitely_returns(arm.body)?;
+                            if !returns {
+                                all_return = false;
+                                self.push_statement(
+                                    &mut body.statements,
+                                    wir::SemanticStatement::Yield(Vec::new()),
+                                )?;
+                            }
+                            wildcard_arm = Some((body, statement_source));
+                            alternative_default_coverage = Some(coverage);
+                            continue;
                         }
                         let [alternative] = pattern.alternatives.as_slice() else {
                             return Err(self.fact_mismatch("match pattern alternatives"));
                         };
                         if matches!(alternative.kind, wrela_hir::PrimaryPattern::Wildcard) {
+                            if alternative_default_coverage.is_some() {
+                                return Err(unsupported(
+                                    "semantic-match-alternative-wildcard-lowering-pending",
+                                ));
+                            }
                             if arm.guard.is_some() {
                                 return Err(self.fact_mismatch("guarded wildcard match arm"));
                             }
@@ -8120,6 +8205,23 @@ impl SourceFunctionLowerer<'_> {
                             .ok_or_else(|| self.fact_mismatch("match variant range"))?;
                         if *covered {
                             return Err(self.fact_mismatch("duplicate match variant"));
+                        }
+                        if alternative_default_coverage
+                            .as_ref()
+                            .is_some_and(|coverage| {
+                                coverage
+                                    .get(candidate.variant as usize)
+                                    .copied()
+                                    .unwrap_or(false)
+                            })
+                        {
+                            if arm.guard.is_some() {
+                                return Err(unsupported(
+                                    "semantic-match-alternative-guard-fallback-lowering-pending",
+                                ));
+                            }
+                            return Err(self
+                                .fact_mismatch("explicit match arm overlaps alternative default"));
                         }
                         if arm.guard.is_none() {
                             *covered = true;
@@ -8264,7 +8366,14 @@ impl SourceFunctionLowerer<'_> {
                     if used_definitions != statement_definitions.len() {
                         return Err(self.fact_mismatch("extra match definitions"));
                     }
-                    if seen_variants.iter().any(|seen| !seen) {
+                    if seen_variants.iter().enumerate().any(|(variant, seen)| {
+                        !seen
+                            && !alternative_default_coverage
+                                .as_ref()
+                                .is_some_and(|coverage| {
+                                    coverage.get(variant).copied().unwrap_or(false)
+                                })
+                    }) {
                         return Err(self.fact_mismatch("missing match variant"));
                     }
                     let mut lowered_arms = try_vec(
@@ -21477,7 +21586,7 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn unit_pattern_alternatives_stop_at_named_semantic_lowering_boundary() {
+    fn one_unit_pattern_alternative_group_lowers_as_exact_complement_default() {
         let image = analyze_parsed_actor_source(
             r#"module app
 
@@ -21509,6 +21618,161 @@ pub fn boot() -> Image:
     return img
 "#,
         );
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("pass-only unit alternatives should lower");
+        let alternative_match = lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Match { arms, .. } if arms.len() == 2 => Some(arms),
+                _ => None,
+            })
+            .expect("one explicit complement and one default arm");
+        assert_eq!(
+            alternative_match
+                .iter()
+                .map(|arm| arm.variant)
+                .collect::<Vec<_>>(),
+            vec![Some(2), None]
+        );
+        assert!(alternative_match.iter().all(|arm| {
+            arm.bindings.is_empty()
+                && arm.body.parameters.is_empty()
+                && matches!(
+                    arm.body.statements.as_slice(),
+                    [wir::SemanticStatement::Yield(values)] if values.is_empty()
+                )
+        }));
+
+        let exact_operations = lowered.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact unit-alternative operation limit");
+        let mut one_under = LoweringLimits::standard();
+        one_under.operations = exact_operations - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == exact_operations - 1
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("count unit-alternative cancellation polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+
+        let mut forged = lowered.wir().as_wir().clone();
+        let forged_default = forged
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Match { arms, .. } if arms.len() == 2 => arms.last_mut(),
+                _ => None,
+            })
+            .expect("forged alternative default");
+        forged_default.variant = Some(0);
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                forged,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_)) | Err(LowerError::InvalidOutput(_))
+        ));
+    }
+
+    #[test]
+    fn multiple_pattern_alternative_groups_stay_named_fail_closed() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub enum Mode[T]:
+    cold
+    warm
+    hot
+    mild
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        mode: Mode[u64] = Mode.warm
+        match mode:
+            case Mode.cold | Mode.warm:
+                pass
+            case Mode.hot | Mode.mild:
+                pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
         let result = CanonicalSemanticLowerer::new().lower(
             LowerRequest {
                 input: image,
@@ -21520,11 +21784,97 @@ pub fn boot() -> Image:
             matches!(
                 result,
                 Err(LowerError::UnsupportedInput {
-                    feature: "semantic-match-alternatives-lowering-pending"
+                    feature: "semantic-match-multiple-alternative-groups-lowering-pending"
                 })
             ),
-            "unexpected alternative lowering result: {result:?}"
+            "unexpected multiple-group alternative lowering result: {result:?}"
         );
+    }
+
+    #[test]
+    fn pattern_alternative_default_composition_tails_fail_closed_by_name() {
+        let cases = [
+            (
+                r#"module app
+
+from core.image import Image, Target
+
+pub enum Mode[T]:
+    cold
+    warm
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        mode: Mode[u64] = Mode.warm
+        match mode:
+            case Mode.cold if true:
+                pass
+            case Mode.cold | Mode.warm:
+                pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+                "semantic-match-alternative-guard-fallback-lowering-pending",
+            ),
+            (
+                r#"module app
+
+from core.image import Image, Target
+
+pub enum Mode[T]:
+    cold
+    warm
+    hot
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        mode: Mode[u64] = Mode.warm
+        match mode:
+            case Mode.cold | Mode.warm:
+                pass
+            case _:
+                pass
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+                "semantic-match-alternative-wildcard-lowering-pending",
+            ),
+        ];
+        for (source, expected) in cases {
+            let image = analyze_parsed_actor_source(source);
+            let result = CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(LowerError::UnsupportedInput { feature }) if feature == expected
+                ),
+                "unexpected alternative composition result: {result:?}"
+            );
+        }
     }
 
     #[test]
