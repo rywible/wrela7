@@ -19,7 +19,7 @@ use wrela_target::{InterruptDomain, TargetError, TargetPackage};
 use wrela_test_model::{GuestTestOutcome, TestEvent, TestEventKind, TestId};
 use wrela_test_protocol::{CanonicalTestEventCodec, ProtocolLimits, TestEventCodec};
 
-pub const MACHINE_WIR_VERSION: u32 = 13;
+pub const MACHINE_WIR_VERSION: u32 = 14;
 pub const REGION_STORAGE_SECTION_PREFIX: &str = ".data$wrela$region$";
 pub const REGION_STORAGE_SYMBOL_PREFIX: &str = "__wrela_region_storage_";
 
@@ -84,10 +84,11 @@ pub enum MachineTypeKind {
         fields: Vec<MachineField>,
         packed: bool,
     },
-    /// Closed enum represented canonically as `{u8 tag, payload}`.
+    /// Closed enum represented canonically as `{u8 tag}` for an all-unit
+    /// shape or `{u8 tag, payload}` when any variant carries a payload.
     TaggedEnum {
         tag: MachineTypeId,
-        payload: MachineTypeId,
+        payload: Option<MachineTypeId>,
         variants: u16,
         /// One exact payload-presence bit per discriminant, in tag order.
         payload_variants: Vec<bool>,
@@ -738,7 +739,7 @@ pub struct MachineFunction {
     pub source: Option<Span>,
 }
 
-/// The only scheduler ownership admitted by MachineWir v13. An actor turn is
+/// The only scheduler ownership admitted by MachineWir v14. An actor turn is
 /// compiled but remains dormant until a real mailbox admission operation
 /// exists; a single-slot static task is invoked exactly once during startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -810,7 +811,7 @@ pub enum MachineRegionStorageKind {
         actor: u32,
         mailbox_capacity: u32,
     },
-    /// Canonical, actor-owned persistent state cell. MachineWir v13 admits
+    /// Canonical, actor-owned persistent state cell. MachineWir v14 admits
     /// exactly one zero-initialized `u64` cell for a stateful actor; richer
     /// state layouts remain outside this closed representation.
     ActorState {
@@ -1249,9 +1250,11 @@ fn model_resource_usage(
         match &ty.kind {
             MachineTypeKind::Struct { fields, .. } => meter.edge_slice(fields)?,
             MachineTypeKind::TaggedEnum {
-                payload_variants, ..
+                payload,
+                payload_variants,
+                ..
             } => {
-                meter.edges(2)?;
+                meter.edges(1 + u64::from(payload.is_some()))?;
                 meter.edge_slice(payload_variants)?;
             }
             MachineTypeKind::Function { parameters, .. } => meter.edge_slice(parameters)?,
@@ -2520,50 +2523,60 @@ fn validate_type(module: &MachineWir, ty: &MachineType, errors: &mut ValidationC
             payload_variants,
         } => {
             require_id("tagged enum tag type", tag.0, module.types.len(), errors);
-            require_id(
-                "tagged enum payload type",
-                payload.0,
-                module.types.len(),
-                errors,
-            );
+            if let Some(payload) = payload {
+                require_id(
+                    "tagged enum payload type",
+                    payload.0,
+                    module.types.len(),
+                    errors,
+                );
+            }
             let tag_valid = module.types.get(tag.0 as usize).is_some_and(|tag| {
                 tag.kind == MachineTypeKind::Integer { bits: 8 }
                     && tag.size == 1
                     && tag.alignment == 1
             });
-            let payload_valid = module.types.get(payload.0 as usize).is_some_and(|payload| {
-                let expected = match payload.kind {
-                    MachineTypeKind::Integer {
-                        bits: 8 | 16 | 32 | 64 | 128,
-                    } => {
-                        let MachineTypeKind::Integer { bits } = payload.kind else {
-                            unreachable!();
-                        };
-                        let bytes = u64::from(bits / 8);
-                        Some((bytes, u32::try_from(bytes.min(16)).unwrap_or(0)))
-                    }
-                    MachineTypeKind::Float32 => Some((4, 4)),
-                    MachineTypeKind::Float64 => Some((8, 8)),
-                    _ => None,
-                };
-                expected == Some((payload.size, payload.alignment))
+            let payload_valid = payload.is_some_and(|payload| {
+                module.types.get(payload.0 as usize).is_some_and(|payload| {
+                    let expected = match payload.kind {
+                        MachineTypeKind::Integer {
+                            bits: 8 | 16 | 32 | 64 | 128,
+                        } => {
+                            let MachineTypeKind::Integer { bits } = payload.kind else {
+                                unreachable!();
+                            };
+                            let bytes = u64::from(bits / 8);
+                            Some((bytes, u32::try_from(bytes.min(16)).unwrap_or(0)))
+                        }
+                        MachineTypeKind::Float32 => Some((4, 4)),
+                        MachineTypeKind::Float64 => Some((8, 8)),
+                        _ => None,
+                    };
+                    expected == Some((payload.size, payload.alignment))
+                })
             });
-            let layout_valid = module.types.get(payload.0 as usize).is_some_and(|payload| {
-                let alignment = payload.alignment.max(1);
-                let offset = (1_u64 + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
-                offset
-                    .checked_add(payload.size)
-                    .map(|size| (size + u64::from(alignment) - 1) & !(u64::from(alignment) - 1))
-                    == Some(ty.size)
-                    && ty.alignment == alignment
+            let layout_valid = payload.is_some_and(|payload| {
+                module.types.get(payload.0 as usize).is_some_and(|payload| {
+                    let alignment = payload.alignment.max(1);
+                    let offset = (1_u64 + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
+                    offset
+                        .checked_add(payload.size)
+                        .map(|size| (size + u64::from(alignment) - 1) & !(u64::from(alignment) - 1))
+                        == Some(ty.size)
+                        && ty.alignment == alignment
+                })
             });
+            let has_payload = payload_variants.iter().any(|present| *present);
+            let representation_valid = if has_payload {
+                payload.is_some() && payload_valid && layout_valid
+            } else {
+                payload.is_none() && ty.size == 1 && ty.alignment == 1
+            };
             if *variants == 0
                 || *variants > 256
                 || usize::from(*variants) != payload_variants.len()
-                || !payload_variants.iter().any(|present| *present)
                 || !tag_valid
-                || !payload_valid
-                || !layout_valid
+                || !representation_valid
             {
                 errors.push(ValidationError::InvalidRecord {
                     kind: "tagged enum type",
@@ -5902,7 +5915,11 @@ fn validate_operation_types(
                     } if u16::from(*variant) < *variants
                         && payload_variants.get(usize::from(*variant)).copied()
                             == Some(payload.is_some())
-                        && payload.is_none_or(|payload| value_ty(payload) == Some(*expected)))
+                            && match payload {
+                                None => true,
+                                Some(payload) => expected
+                                    .is_some_and(|expected| value_ty(*payload) == Some(expected)),
+                            })
                 })
         }
         MachineOperation::EnumTag { value } => {
@@ -5920,7 +5937,11 @@ fn validate_operation_types(
                 && value_ty(*value)
                     .and_then(|ty| module.types.get(ty.0 as usize))
                     .and_then(|record| match &record.kind {
-                        MachineTypeKind::TaggedEnum { payload, .. } => Some(*payload),
+                        MachineTypeKind::TaggedEnum {
+                            payload: Some(payload),
+                            payload_variants,
+                            ..
+                        } if payload_variants.iter().any(|present| *present) => Some(*payload),
                         _ => None,
                     })
                     .is_some_and(|expected| result_ty(0) == Some(expected))
@@ -6900,7 +6921,7 @@ fn function_requires_simd(
             }
             MachineTypeKind::TaggedEnum { tag, payload, .. } => {
                 if !errors.scratch_push(&mut pending, *tag)
-                    || !errors.scratch_push(&mut pending, *payload)
+                    || payload.is_some_and(|payload| !errors.scratch_push(&mut pending, payload))
                 {
                     return false;
                 }
@@ -7472,7 +7493,7 @@ mod tests {
             id: MachineTypeId(4),
             kind: MachineTypeKind::TaggedEnum {
                 tag: MachineTypeId(3),
-                payload: MachineTypeId(3),
+                payload: Some(MachineTypeId(3)),
                 variants,
                 payload_variants: vec![true; usize::from(variants)],
             },
@@ -8067,6 +8088,107 @@ mod tests {
         };
         *payload = None;
         assert!(mixed_arity.validate_for_target(&target).is_err());
+
+        let (mut all_unit, target) = closed_enum_fixture(2);
+        all_unit.types[4].size = 1;
+        all_unit.types[4].alignment = 1;
+        let MachineTypeKind::TaggedEnum {
+            payload,
+            payload_variants,
+            ..
+        } = &mut all_unit.types[4].kind
+        else {
+            unreachable!();
+        };
+        *payload = None;
+        payload_variants.fill(false);
+        let MachineOperation::MakeEnum { payload, .. } =
+            &mut all_unit.functions[1].blocks[0].instructions[0].operation
+        else {
+            unreachable!();
+        };
+        *payload = None;
+        all_unit.functions[1].blocks[0].instructions.remove(2);
+        all_unit.functions[1].values.remove(3);
+        all_unit.functions[1].blocks[0].terminator = MachineTerminator::Return(vec![ValueId(2)]);
+        all_unit
+            .clone()
+            .validate_for_target(&target)
+            .expect("all-unit enum has a one-byte tag-only representation");
+
+        let (exact, usage) = exact_validation_policy(&all_unit);
+        all_unit
+            .clone()
+            .validate_with_limits(&target, exact, &|| false)
+            .expect("exact all-unit validation bound");
+        let one_under = ValidationLimits {
+            model_edges: usage.model_edges - 1,
+            ..exact
+        };
+        assert_eq!(
+            all_unit
+                .clone()
+                .validate_with_limits(&target, one_under, &|| false),
+            Err(ValidationFailure::ResourceLimit {
+                resource: "model edges",
+                limit: usage.model_edges - 1,
+            })
+        );
+        let polls = Cell::new(0_u64);
+        all_unit
+            .clone()
+            .validate_with_limits(&target, exact, &|| {
+                polls.set(polls.get() + 1);
+                false
+            })
+            .expect("measure all-unit cancellation polls");
+        let cancellation_at = polls.get() - 1;
+        let polls = Cell::new(0_u64);
+        assert_eq!(
+            all_unit.clone().validate_with_limits(&target, exact, &|| {
+                let next = polls.get() + 1;
+                polls.set(next);
+                next >= cancellation_at
+            }),
+            Err(ValidationFailure::Cancelled)
+        );
+
+        let mut forged_type_payload = all_unit.clone();
+        let MachineTypeKind::TaggedEnum { payload, .. } = &mut forged_type_payload.types[4].kind
+        else {
+            unreachable!();
+        };
+        *payload = Some(MachineTypeId(3));
+        assert!(forged_type_payload.validate_for_target(&target).is_err());
+
+        let mut forged_constructor_payload = all_unit.clone();
+        let MachineOperation::MakeEnum { payload, .. } =
+            &mut forged_constructor_payload.functions[1].blocks[0].instructions[0].operation
+        else {
+            unreachable!();
+        };
+        *payload = Some(ValueId(0));
+        assert!(
+            forged_constructor_payload
+                .validate_for_target(&target)
+                .is_err()
+        );
+
+        let mut forged_projection = all_unit;
+        forged_projection.functions[1].values.push(MachineValue {
+            id: ValueId(3),
+            ty: MachineTypeId(3),
+            source_name: Some("forged-projected".to_owned()),
+        });
+        forged_projection.functions[1].blocks[0]
+            .instructions
+            .push(MachineInstruction {
+                id: InstructionId(2),
+                results: vec![ValueId(3)],
+                operation: MachineOperation::EnumPayload { value: ValueId(1) },
+                source: None,
+            });
+        assert!(forged_projection.validate_for_target(&target).is_err());
     }
 
     #[test]
@@ -8366,8 +8488,8 @@ mod tests {
     }
 
     #[test]
-    fn actor_state_schema_revision_accepts_only_exact_machine_wir_v13() {
-        assert_eq!(MACHINE_WIR_VERSION, 13);
+    fn tag_only_enum_schema_revision_accepts_only_exact_machine_wir_v14() {
+        assert_eq!(MACHINE_WIR_VERSION, 14);
         assert_eq!(
             CheckedIntegerOp::ShiftLeft.invalid_shift_count_fatal_code(),
             Some(RuntimeFatalCode::InvalidShiftCount)
@@ -8390,12 +8512,12 @@ mod tests {
         );
         assert_eq!(CheckedIntegerOp::Add.invalid_shift_count_fatal_code(), None);
         let (module, target) = fixture();
-        for rejected in [12, 14] {
+        for rejected in [13, 15] {
             let mut changed = module.clone();
             changed.version = rejected;
             let errors = changed
                 .validate_for_target(&target)
-                .expect_err("only exact-current MachineWir v13 is accepted");
+                .expect_err("only exact-current MachineWir v14 is accepted");
             assert!(
                 errors
                     .0

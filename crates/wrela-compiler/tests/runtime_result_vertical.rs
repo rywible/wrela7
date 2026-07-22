@@ -721,7 +721,7 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
         )
         .expect("runtime-result MachineWir preparation");
         let machine = prepared.machine().wir().as_wir();
-        assert_eq!(machine.version, 13);
+        assert_eq!(machine.version, 14);
         assert!(
             machine
                 .types
@@ -915,6 +915,165 @@ fn match_value() -> u64:
 }
 
 #[test]
+fn all_unit_generic_enum_reaches_exact_flow_machine_and_native_coff() {
+    let fixture = source_fixture_for(
+        r#"module runtime_result.image
+
+from core.image import Image, Target
+
+pub enum Marker[T]:
+    first
+    second
+
+@image
+pub fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn all_unit_generic_enum_runtime():
+    match_first()
+    match_second()
+    return
+
+fn match_first() -> u64:
+    value: Marker[u64] = Marker.first
+    match value:
+        case Marker.first:
+            return 1
+        case Marker.second:
+            return 2
+
+fn match_second() -> u64:
+    value: Marker[u64] = Marker.second
+    match value:
+        case Marker.first:
+            return 1
+        case Marker.second:
+            return 2
+"#,
+    );
+    let image = analyze_selected(&fixture, "all_unit_generic_enum_runtime");
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: image,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("all-unit generic enum SemanticWir")
+        .into_parts()
+        .0;
+    assert!(semantic.as_wir().types.iter().any(|ty| {
+        matches!(&ty.kind, SemanticTypeKind::Enum { variants }
+            if matches!(variants.as_slice(), [first, second]
+                if first.name == "first" && first.fields.is_empty()
+                    && second.name == "second" && second.fields.is_empty()))
+    }));
+
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("all-unit generic enum FlowWir");
+    let flow_model = flow.wir().as_wir();
+    let flow_enum_constructors = flow_model
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.operation {
+            FlowOperation::MakeEnum {
+                variant, payload, ..
+            } => Some((*variant, payload.is_some())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(flow_enum_constructors, [(0, false), (1, false)]);
+    assert!(
+        !flow_model
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| matches!(instruction.operation, FlowOperation::EnumPayload { .. }))
+    );
+
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("all-unit generic enum FlowWir v12 frame");
+    assert_eq!(encoded.header().wire_version, 12);
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("all-unit generic enum MachineWir preparation");
+    let machine = prepared.machine().wir().as_wir();
+    assert_eq!(machine.version, 14);
+    assert!(machine.types.iter().any(|ty| {
+        matches!(&ty.kind, MachineTypeKind::TaggedEnum {
+            payload: None,
+            variants: 2,
+            payload_variants,
+            ..
+        } if payload_variants.as_slice() == [false, false] && ty.size == 1 && ty.alignment == 1)
+    }));
+    let machine_enum_constructors = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.operation {
+            MachineOperation::MakeEnum {
+                variant, payload, ..
+            } => Some((*variant, payload.is_some())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(machine_enum_constructors, [(0, false), (1, false)]);
+    assert!(
+        !machine
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| matches!(
+                instruction.operation,
+                MachineOperation::EnumPayload { .. }
+            ))
+    );
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("all-unit generic enum native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat all-unit generic enum native emission");
+            assert_eq!(first.bytes(), second.bytes());
+            let digest = HASHER.sha256(first.bytes());
+            assert_eq!(digest, HASHER.sha256(second.bytes()));
+            inspect_native_object(first.bytes(), digest);
+        }
+    }
+}
+
+#[test]
 fn runtime_result_specializes_u64_payload_with_deterministic_machine_layout() {
     let mut source = APPLICATION_SOURCE.to_owned();
     source.push_str(
@@ -1008,6 +1167,7 @@ fn result_u64_match_returns_payload():
         machine.types[tag.0 as usize].kind,
         MachineTypeKind::Integer { bits: 8 }
     );
+    let payload = payload.expect("payload-bearing Result machine type");
     assert_eq!(
         machine.types[payload.0 as usize].kind,
         MachineTypeKind::Integer { bits: 64 }
@@ -1314,7 +1474,7 @@ fn checked_in_runtime_result_try_reaches_exact_early_return_switch() {
         )
         .expect("runtime-result Try MachineWir preparation");
         let machine = prepared.machine().wir().as_wir();
-        assert_eq!(machine.version, 13);
+        assert_eq!(machine.version, 14);
         let machine_propagation = machine
             .functions
             .iter()

@@ -4639,6 +4639,13 @@ fn canonical_enum_payload(module: &FlowWir, variants: &[Vec<TypeId>]) -> Option<
     })
 }
 
+fn canonical_enum_shape(module: &FlowWir, variants: &[Vec<TypeId>]) -> bool {
+    !variants.is_empty()
+        && variants.len() <= 256
+        && (variants.iter().all(Vec::is_empty)
+            || canonical_enum_payload(module, variants).is_some())
+}
+
 fn validate_type(module: &FlowWir, ty: &FlowType, errors: &mut ValidationContext<'_>) {
     macro_rules! use_type {
         ($id:expr) => {
@@ -4658,11 +4665,8 @@ fn validate_type(module: &FlowWir, ty: &FlowType, errors: &mut ValidationContext
             for id in variants.iter().flatten() {
                 use_type!(*id);
             }
-            let canonical = !variants.is_empty()
-                && variants.len() <= 256
-                && ty.copyable
-                && !ty.strict_linear
-                && canonical_enum_payload(module, variants).is_some();
+            let canonical =
+                ty.copyable && !ty.strict_linear && canonical_enum_shape(module, variants);
             if !canonical {
                 errors.push(ValidationError::InvalidRecord {
                     kind: "closed enum type",
@@ -4843,7 +4847,7 @@ fn validate_operation(
             let valid_enum = function.values.get(value.0 as usize).is_some_and(|value| {
                 module.types.get(value.ty.0 as usize).is_some_and(|record| {
                     matches!(&record.kind, FlowTypeKind::Enum { variants }
-                        if canonical_enum_payload(module, variants).is_some())
+                        if canonical_enum_shape(module, variants))
                 })
             });
             let valid_result = matches!(instruction.results.as_slice(), [result]
@@ -5889,6 +5893,53 @@ mod tests {
         };
         *payload = None;
         assert!(mixed_arity.validate().is_err());
+
+        let mut all_unit = closed_enum_fixture(2);
+        let FlowTypeKind::Enum { variants } = &mut all_unit.types[2].kind else {
+            unreachable!();
+        };
+        for variant in variants {
+            variant.clear();
+        }
+        let FlowOperation::MakeEnum { payload, .. } =
+            &mut all_unit.functions[1].blocks[0].instructions[0].operation
+        else {
+            unreachable!();
+        };
+        *payload = None;
+        all_unit.functions[1].blocks[0].instructions.remove(2);
+        all_unit.functions[1].values.remove(3);
+        all_unit.functions[1].blocks[0].terminator = Terminator::Return(vec![ValueId(2)]);
+        all_unit
+            .clone()
+            .validate()
+            .expect("all-unit enum has a tag-only FlowWir representation");
+
+        let mut forged_payload = all_unit.clone();
+        let FlowOperation::MakeEnum { payload, .. } =
+            &mut forged_payload.functions[1].blocks[0].instructions[0].operation
+        else {
+            unreachable!();
+        };
+        *payload = Some(ValueId(0));
+        assert!(forged_payload.validate().is_err());
+
+        let mut forged_projection = all_unit;
+        forged_projection.functions[1].values.push(Value {
+            id: ValueId(3),
+            ty: TypeId(1),
+            source_name: Some("forged-projected".to_owned()),
+            source: None,
+        });
+        forged_projection.functions[1].blocks[0]
+            .instructions
+            .push(Instruction {
+                id: InstructionId(2),
+                results: vec![ValueId(3)],
+                operation: FlowOperation::EnumPayload { value: ValueId(1) },
+                source: None,
+            });
+        assert!(forged_projection.validate().is_err());
     }
 
     #[test]

@@ -17,12 +17,12 @@ pub use decode::decode_image_report_json;
 /// allocation identities, final-region join, and bounded proof join exact. The
 /// decoder gates on this exact value, so every older representation is rejected
 /// as [`ReportError::UnsupportedSchema`].
-pub const REPORT_SCHEMA_VERSION: u32 = 13;
+pub const REPORT_SCHEMA_VERSION: u32 = 14;
 
 const CURRENT_SEMANTIC_WIR_VERSION: u32 = 11;
 const CURRENT_FLOW_WIR_VERSION: u32 = 12;
 const CURRENT_FLOW_WIR_WIRE_VERSION: u32 = 12;
-const CURRENT_MACHINE_WIR_VERSION: u32 = 13;
+const CURRENT_MACHINE_WIR_VERSION: u32 = 14;
 const CURRENT_RUNTIME_ABI_VERSION: u32 = 2;
 
 /// One finite capacity or memory fact established by the build.
@@ -3518,7 +3518,7 @@ mod tests {
                 semantic_wir_version: 11,
                 flow_wir_version: 12,
                 flow_wir_wire_version: 12,
-                machine_wir_version: 13,
+                machine_wir_version: 14,
                 runtime_abi_version: 2,
                 optimization_pipeline_name: "fixture".to_owned(),
                 optimization_pipeline_revision: 1,
@@ -3913,7 +3913,7 @@ mod tests {
         };
         let sealed = seal_analysis_facts(request, facts.clone(), &|| false)
             .expect("exact actor/task/region graph limit");
-        assert_eq!(super::REPORT_SCHEMA_VERSION, 13);
+        assert_eq!(super::REPORT_SCHEMA_VERSION, 14);
         assert_eq!(sealed.as_facts().image_nodes.len(), 8);
         assert_eq!(sealed.as_facts().region_capacity_evidence.len(), 5);
         assert_eq!(sealed.as_facts().activation_frame_evidence.len(), 2);
@@ -3935,7 +3935,7 @@ mod tests {
             BackendFactLimits::standard(),
             &|| false,
         )
-        .expect("schema-v13 activation report");
+        .expect("schema-v14 activation report");
         let json = report.to_json();
         assert!(json.contains("\"activation_frame_evidence\":[{"));
         assert!(json.contains("\"kind\":\"actor-activation-frame-region\""));
@@ -3949,7 +3949,7 @@ mod tests {
                 u64::try_from(json.len()).expect("bounded activation report bytes"),
                 &|| false,
             )
-            .expect("decode exact schema-v13 activation evidence"),
+            .expect("decode exact schema-v14 activation evidence"),
             report
         );
         let corrupt_cancellation = json.replacen(
@@ -4553,7 +4553,7 @@ mod tests {
         let digest = Sha256Digest::from_bytes([0x67; 32]);
         let minimum = assemble(digest, AnalysisFacts::default(), backend(digest))
             .expect("minimum one-block DIR64 relocation evidence");
-        assert_eq!(minimum.schema(), 13);
+        assert_eq!(minimum.schema(), 14);
         assert_eq!(minimum.backend().relocation_directory_bytes, 12);
         assert_eq!(minimum.backend().base_relocation_blocks, 1);
         assert_eq!(minimum.backend().base_relocation_dir64_count, 1);
@@ -4715,8 +4715,8 @@ mod tests {
             |versions| versions.flow_wir_version = 13,
             |versions| versions.flow_wir_wire_version = 11,
             |versions| versions.flow_wir_wire_version = 13,
-            |versions| versions.machine_wir_version = 12,
-            |versions| versions.machine_wir_version = 14,
+            |versions| versions.machine_wir_version = 13,
+            |versions| versions.machine_wir_version = 15,
             |versions| versions.runtime_abi_version = 1,
             |versions| versions.runtime_abi_version = 3,
         ];
@@ -5010,7 +5010,7 @@ mod tests {
         ];
         let digest_build = build(digest);
         let report = assemble(digest, facts, backend(digest)).expect("assemble region report");
-        assert_eq!(report.schema(), 13);
+        assert_eq!(report.schema(), 14);
         // Canonicalization sorted both vectors by their derived total order.
         assert_eq!(
             report

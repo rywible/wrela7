@@ -2171,25 +2171,32 @@ fn supported_enum_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeI
     let Some(tag_ty) = machine.types.get(tag.0 as usize) else {
         return false;
     };
-    let Some(payload_ty) = machine.types.get(payload.0 as usize) else {
-        return false;
-    };
-    let alignment = payload_ty.alignment.max(1);
-    let payload_offset = (1_u64 + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
-    let size = payload_offset
-        .checked_add(payload_ty.size)
-        .map(|size| (size + u64::from(alignment) - 1) & !(u64::from(alignment) - 1));
-    *variants != 0
+    let common = *variants != 0
         && *variants <= 256
         && usize::from(*variants) == payload_variants.len()
-        && payload_variants.iter().any(|present| *present)
         && tag_ty.kind == MachineTypeKind::Integer { bits: 8 }
         && tag_ty.size == 1
-        && tag_ty.alignment == 1
-        && !matches!(payload_ty.kind, MachineTypeKind::Void)
-        && supported_scalar_type(&payload_ty.kind, payload_ty.size, payload_ty.alignment)
-        && ty.alignment == alignment
-        && size == Some(ty.size)
+        && tag_ty.alignment == 1;
+    if !common {
+        return false;
+    }
+    if payload_variants.iter().any(|present| *present) {
+        let Some(payload_ty) = payload.and_then(|payload| machine.types.get(payload.0 as usize))
+        else {
+            return false;
+        };
+        let alignment = payload_ty.alignment.max(1);
+        let payload_offset = (1_u64 + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
+        let size = payload_offset
+            .checked_add(payload_ty.size)
+            .map(|size| (size + u64::from(alignment) - 1) & !(u64::from(alignment) - 1));
+        !matches!(payload_ty.kind, MachineTypeKind::Void)
+            && supported_scalar_type(&payload_ty.kind, payload_ty.size, payload_ty.alignment)
+            && ty.alignment == alignment
+            && size == Some(ty.size)
+    } else {
+        payload.is_none() && ty.size == 1 && ty.alignment == 1
+    }
 }
 
 fn supported_struct_type(machine: &wrela_machine_wir::MachineWir, id: MachineTypeId) -> bool {

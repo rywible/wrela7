@@ -17,7 +17,7 @@ use crate::{
     seal_analysis_facts,
 };
 
-/// Decode and authenticate one canonical schema-v13 image report.
+/// Decode and authenticate one canonical schema-v14 image report.
 ///
 /// The caller supplies the build identity expected at this trust boundary and
 /// all resource ceilings. The decoded facts are resealed through the same
@@ -1638,7 +1638,7 @@ mod tests {
                 semantic_wir_version: 11,
                 flow_wir_version: 12,
                 flow_wir_wire_version: 12,
-                machine_wir_version: 13,
+                machine_wir_version: 14,
                 runtime_abi_version: 2,
                 optimization_pipeline_name: "development-v1".to_owned(),
                 optimization_pipeline_revision: 8,
@@ -1833,15 +1833,15 @@ mod tests {
     #[test]
     fn schema_scalar_enum_and_json_structure_mutations_fail_closed() {
         let json = full_report(ActorLoweringKind::Queued, OptimizationAction::Retained).to_json();
-        let schema = json.replacen("\"schema\":13", "\"schema\":14", 1);
+        let schema = json.replacen("\"schema\":14", "\"schema\":15", 1);
         assert_eq!(
             decode(schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(14))
+            Err(ReportError::UnsupportedSchema(15))
         );
-        let stale_schema = json.replacen("\"schema\":13", "\"schema\":12", 1);
+        let stale_schema = json.replacen("\"schema\":14", "\"schema\":13", 1);
         assert_eq!(
             decode(stale_schema.as_bytes()),
-            Err(ReportError::UnsupportedSchema(12))
+            Err(ReportError::UnsupportedSchema(13))
         );
 
         let oversized_u32 = json.replacen(

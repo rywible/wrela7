@@ -1882,7 +1882,7 @@ fn supported_generated_tests<'a>(
                         limits.model_edges,
                     )?;
                 }
-                if canonical_semantic_enum_payload(input, variants).is_none() {
+                if !canonical_semantic_enum_shape(input, variants) {
                     return Err(unsupported("generated test enum payload type"));
                 }
             }
@@ -2117,7 +2117,7 @@ fn supported_source_value_type(input: &semantic::SemanticWir, ty: semantic::Type
                 && record.source.is_some()
                 && !variants.is_empty()
                 && variants.len() <= 256
-                && canonical_semantic_enum_payload(input, variants).is_some()
+                && canonical_semantic_enum_shape(input, variants)
         }
         _ => false,
     }
@@ -2143,6 +2143,15 @@ fn canonical_semantic_enum_payload(
         }
     }
     payload
+}
+
+fn canonical_semantic_enum_shape(
+    input: &semantic::SemanticWir,
+    variants: &[semantic::VariantType],
+) -> bool {
+    !variants.is_empty()
+        && (variants.iter().all(|variant| variant.fields.is_empty())
+            || canonical_semantic_enum_payload(input, variants).is_some())
 }
 
 fn integer_primitive(primitive: semantic::PrimitiveType) -> Option<(bool, u8)> {
@@ -5641,7 +5650,7 @@ fn lower_generated_function(
                         .get(enum_ty.0 as usize)
                         .and_then(|record| match &record.kind {
                             semantic::TypeKind::Enum { variants }
-                                if canonical_semantic_enum_payload(input, variants).is_some() =>
+                                if canonical_semantic_enum_shape(input, variants) =>
                             {
                                 Some(variants.as_slice())
                             }

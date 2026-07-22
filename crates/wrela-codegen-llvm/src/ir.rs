@@ -3417,8 +3417,10 @@ fn render_type(
         MachineTypeKind::TaggedEnum { tag, payload, .. } => {
             ir.push("{ ")?;
             render_type(ir, machine, *tag)?;
-            ir.push(", ")?;
-            render_type(ir, machine, *payload)?;
+            if let Some(payload) = payload {
+                ir.push(", ")?;
+                render_type(ir, machine, *payload)?;
+            }
             ir.push(" }")
         }
         MachineTypeKind::Struct {

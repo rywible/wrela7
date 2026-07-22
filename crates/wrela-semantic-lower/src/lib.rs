@@ -2364,11 +2364,6 @@ fn validate_supported_source_type(
             arguments,
             variants,
         } => {
-            if !arguments.is_empty() && variants.iter().all(|variant| variant.fields.is_empty()) {
-                return Err(unsupported(
-                    "semantic-generic-enum-all-unit-lowering-pending (no authenticated shared payload type)",
-                ));
-            }
             // This recognizes the older all-unary copy-scalar shape for its
             // nongeneric heterogeneous-payload guard below. The final shape
             // check separately admits unit variants only on a generic
@@ -19729,7 +19724,7 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn all_unit_generic_enum_keeps_named_shared_payload_boundary() {
+    fn all_unit_generic_enum_specialization_lowers_exactly() {
         let image = analyze_parsed_actor_source(
             r#"module app
 
@@ -19745,7 +19740,18 @@ async fn checkpoint():
 @service
 pub struct Worker:
     pub async fn ping(mut self):
-        value: Marker[u64] = Marker.first
+        first: Marker[u64] = Marker.first
+        second: Marker[u64] = Marker.second
+        match first:
+            case Marker.first:
+                pass
+            case Marker.second:
+                pass
+        match second:
+            case Marker.first:
+                pass
+            case Marker.second:
+                pass
         await checkpoint()
 
 @image
@@ -19755,18 +19761,135 @@ pub fn boot() -> Image:
     return img
 "#,
         );
-        assert!(matches!(
-            CanonicalSemanticLowerer::new().lower(
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
                 LowerRequest {
-                    input: image,
+                    input: image.clone(),
                     limits: LoweringLimits::standard(),
                 },
                 &|| false,
-            ),
-            Err(LowerError::UnsupportedInput {
-                feature: "semantic-generic-enum-all-unit-lowering-pending (no authenticated shared payload type)"
+            )
+            .expect("all-unit generic enum specialization should lower");
+        let wir = lowered.wir().as_wir();
+        let marker = wir
+            .types
+            .iter()
+            .find(|ty| ty.source_name == "Marker")
+            .expect("lowered Marker specialization");
+        assert!(matches!(&marker.kind, wir::TypeKind::Enum { variants }
+            if matches!(variants.as_slice(), [first, second]
+                if first.name == "first" && first.fields.is_empty()
+                    && second.name == "second" && second.fields.is_empty())));
+        let constructors = wir
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation:
+                        wir::SemanticOperation::ConstructEnum {
+                            variant, payload, ..
+                        },
+                    ..
+                }) => Some((*variant, payload.is_some())),
+                _ => None,
             })
+            .collect::<Vec<_>>();
+        assert_eq!(constructors, [(0, false), (1, false)]);
+        assert!(wir.functions.iter().all(|function| {
+            function
+                .body
+                .statements
+                .iter()
+                .filter_map(|statement| match statement {
+                    wir::SemanticStatement::Match { arms, .. } => Some(arms),
+                    _ => None,
+                })
+                .all(|arms| arms.iter().all(|arm| arm.bindings.is_empty()))
+        }));
+
+        let exact_operations = lowered.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact all-unit enum operation limit");
+        let mut one_under = exact;
+        one_under.operations = exact_operations - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == exact_operations - 1
         ));
+
+        let polls = Cell::new(0_u64);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            )
+            .expect("measure all-unit enum cancellation polls");
+        let cancellation_at = polls.get();
+        let polls = Cell::new(0_u64);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next == cancellation_at
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), cancellation_at);
+
+        let mut forged = wir.clone();
+        let forged_marker = forged
+            .types
+            .iter_mut()
+            .find(|ty| ty.source_name == "Marker")
+            .expect("forged Marker specialization");
+        let wir::TypeKind::Enum { variants } = &mut forged_marker.kind else {
+            panic!("Marker must remain an enum")
+        };
+        variants.swap(0, 1);
+        let forged_result = seal(
+            &LowerRequest {
+                input: image,
+                limits: LoweringLimits::standard(),
+            },
+            forged,
+            lowered.report().clone(),
+            &|| false,
+        );
+        assert!(
+            matches!(forged_result, Err(LowerError::InvalidReport(_))),
+            "{forged_result:?}"
+        );
     }
 
     #[test]

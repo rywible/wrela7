@@ -2890,7 +2890,10 @@ fn require_supported_type(
         flow::FlowTypeKind::Struct { .. } if flat_native_struct_fields(types, ty.id).is_some() => {
             Ok(())
         }
-        flow::FlowTypeKind::Enum { .. } if closed_scalar_enum_payload(types, ty.id).is_some() => {
+        flow::FlowTypeKind::Enum { .. }
+            if is_all_unit_closed_enum(types, ty.id)
+                || closed_scalar_enum_payload(types, ty.id).is_some() =>
+        {
             Ok(())
         }
         flow::FlowTypeKind::Activation { .. } => Err(unsupported(
@@ -2999,6 +3002,14 @@ fn closed_scalar_enum_payload(types: &[flow::FlowType], ty: flow::TypeId) -> Opt
         )
     )
     .then_some(payload)
+}
+
+fn is_all_unit_closed_enum(types: &[flow::FlowType], ty: flow::TypeId) -> bool {
+    matches!(types.get(ty.0 as usize).map(|ty| &ty.kind),
+        Some(flow::FlowTypeKind::Enum { variants })
+            if !variants.is_empty()
+                && variants.len() <= 256
+                && variants.iter().all(Vec::is_empty))
 }
 
 fn canonical_u8_type(types: &[flow::FlowType]) -> Option<flow::TypeId> {
@@ -4849,8 +4860,10 @@ fn validate_supported_operation(
             payload,
         } => {
             let result = require_single_result(instruction)?;
-            let payload_ty = closed_scalar_enum_payload(&input.types, *ty)
-                .ok_or(unsupported("a noncanonical enum construction"))?;
+            let payload_ty = closed_scalar_enum_payload(&input.types, *ty);
+            if payload_ty.is_none() && !is_all_unit_closed_enum(&input.types, *ty) {
+                return Err(unsupported("a noncanonical enum construction"));
+            }
             let variant_fields = input
                 .types
                 .get(ty.0 as usize)
@@ -4866,7 +4879,8 @@ fn validate_supported_operation(
             let payload_matches = match (variant_fields, payload) {
                 ([], None) => true,
                 ([expected], Some(payload)) => {
-                    *expected == payload_ty && flow_value_type(function, *payload)? == payload_ty
+                    Some(*expected) == payload_ty
+                        && Some(flow_value_type(function, *payload)?) == payload_ty
                 }
                 _ => false,
             };
@@ -4880,7 +4894,8 @@ fn validate_supported_operation(
         flow::FlowOperation::EnumTag { value } => {
             let result = require_single_result(instruction)?;
             let enum_ty = flow_value_type(function, *value)?;
-            if closed_scalar_enum_payload(&input.types, enum_ty).is_none()
+            if (!is_all_unit_closed_enum(&input.types, enum_ty)
+                && closed_scalar_enum_payload(&input.types, enum_ty).is_none())
                 || Some(flow_value_type(function, result)?) != canonical_u8_type(&input.types)
             {
                 return Err(unsupported("an enum tag projection with mismatched types"));
@@ -5172,28 +5187,9 @@ fn lower_types(
                 }
             }
             flow::FlowTypeKind::Enum { .. } => {
-                let payload = closed_scalar_enum_payload(&input.types, ty.id)
-                    .ok_or(unsupported("a noncanonical closed enum type"))?;
                 let tag = canonical_u8_type(&input.types).ok_or(unsupported(
                     "a closed enum without the canonical u8 tag type",
                 ))?;
-                let payload_kind = &input
-                    .types
-                    .get(payload.0 as usize)
-                    .ok_or(unsupported("an enum with an unknown payload type"))?
-                    .kind;
-                let (_, payload_size, payload_alignment) =
-                    lower_type_kind(payload_kind, limits, is_cancelled)?;
-                let alignment = payload_alignment.max(1);
-                let payload_offset =
-                    (1_u64 + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
-                let unaligned_size = payload_offset.checked_add(payload_size).ok_or(
-                    MachineLowerError::LayoutOverflow {
-                        subject: "closed enum representation".to_owned(),
-                    },
-                )?;
-                let size =
-                    (unaligned_size + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
                 let (variant_count, payload_variants) = match &ty.kind {
                     flow::FlowTypeKind::Enum { variants } => {
                         let count = u16::try_from(variants.len())
@@ -5208,7 +5204,7 @@ fn lower_types(
                             check_cancelled(is_cancelled)?;
                             match variant.as_slice() {
                                 [] => presence.push(false),
-                                [candidate] if *candidate == payload => presence.push(true),
+                                [_] => presence.push(true),
                                 _ => return Err(unsupported("a noncanonical enum variant shape")),
                             }
                         }
@@ -5216,10 +5212,35 @@ fn lower_types(
                     }
                     _ => return Err(unsupported("a non-enum tagged representation")),
                 };
+                let payload = closed_scalar_enum_payload(&input.types, ty.id);
+                let (size, alignment) = if let Some(payload) = payload {
+                    let payload_kind = &input
+                        .types
+                        .get(payload.0 as usize)
+                        .ok_or(unsupported("an enum with an unknown payload type"))?
+                        .kind;
+                    let (_, payload_size, payload_alignment) =
+                        lower_type_kind(payload_kind, limits, is_cancelled)?;
+                    let alignment = payload_alignment.max(1);
+                    let payload_offset =
+                        (1_u64 + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
+                    let unaligned_size = payload_offset.checked_add(payload_size).ok_or(
+                        MachineLowerError::LayoutOverflow {
+                            subject: "closed enum representation".to_owned(),
+                        },
+                    )?;
+                    let size =
+                        (unaligned_size + u64::from(alignment) - 1) & !(u64::from(alignment) - 1);
+                    (size, alignment)
+                } else if is_all_unit_closed_enum(&input.types, ty.id) {
+                    (1, 1)
+                } else {
+                    return Err(unsupported("a noncanonical closed enum type"));
+                };
                 (
                     MachineTypeKind::TaggedEnum {
                         tag: MachineTypeId(tag.0),
-                        payload: MachineTypeId(payload.0),
+                        payload: payload.map(|payload| MachineTypeId(payload.0)),
                         variants: variant_count,
                         payload_variants,
                     },

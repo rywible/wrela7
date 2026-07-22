@@ -466,13 +466,20 @@ it. It injects phase implementations and bounded host capabilities, while
   Validation joins the prior aggregate's struct type, selected field, inserted
   value type, and single result of the unchanged aggregate type; FlowWir v12
   preserves the same operation and independently repeats that join.
-- MachineWir v13 retains same-block nongeneric flat values with two or more
+- MachineWir v14 retains same-block nongeneric flat values with two or more
   primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
   `InsertField`, and `ExtractField` carry exact SSA joins through independent
   validation, equality, and resource metering; LLVM renders them with
   first-class `insertvalue`/`extractvalue`. One-field `u64` structs retain the
   established erased bitcast representation. Aggregate function/block
   boundaries, packed/empty/non-flat structs, and nested aggregates fail closed.
+- MachineWir v14 also makes a closed enum's shared payload type optional. An
+  all-unit enum must have no payload type, an all-false per-tag presence map,
+  size/alignment `1/1`, payload-free constructors, and no payload projection;
+  any payload-bearing enum must retain the canonical scalar payload type and at
+  least one true presence bit. LLVM renders the former as `{ i8 }` and the
+  latter as `{ i8, payload }`, so tag-only generic enum values never acquire a
+  synthetic payload byte.
 - The current schema retains the exact compiled `FullImageTestGroup`, including its
   plan identity, generated-harness function keys or declared-image/scenario
   binding, descriptors, seed, and execution policy. Validation joins generated
