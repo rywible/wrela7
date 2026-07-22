@@ -1706,7 +1706,7 @@ fn validate_actor_source_type(
             return Ok(());
         }
         sema::SemanticTypeKind::Structure { .. } | sema::SemanticTypeKind::Enumeration { .. } => {
-            return validate_supported_source_type(ty, facts);
+            return validate_supported_source_type(ty, facts, Some(input.hir().as_program()));
         }
         sema::SemanticTypeKind::Array { element, length } => {
             let element = facts.types.get(element.0 as usize).ok_or_else(|| {
@@ -3113,7 +3113,7 @@ fn supported_generated_tests<'a>(
     require_unit_type(unit)?;
     for ty in &facts.types {
         check_cancelled(is_cancelled)?;
-        validate_supported_source_type(ty, facts)?;
+        validate_supported_source_type(ty, facts, Some(input.hir().as_program()))?;
     }
     let group = facts
         .compiled_test_group
@@ -3677,6 +3677,7 @@ fn source_nominal_structure_matches(
 fn validate_supported_source_type(
     ty: &sema::SemanticType,
     facts: &sema::PartialAnalysis,
+    program: Option<&wrela_hir::Program>,
 ) -> Result<(), LowerError> {
     let valid = match &ty.kind {
         sema::SemanticTypeKind::StaticString { .. } => {
@@ -3811,12 +3812,22 @@ fn validate_supported_source_type(
             // specializations may now retain one fixed flat-structure payload,
             // so the guard intentionally applies on both sides of the generic
             // argument boundary.
-            if variants.iter().any(|variant| {
-                matches!(variant.fields.as_slice(), [field]
+            let exact_nongeneric_flat_plus_scalar = exact_nongeneric_flat_plus_scalar_enum_profile(
+                facts,
+                program,
+                *declaration,
+                ty.source,
+                arguments,
+                variants,
+            );
+            if !exact_nongeneric_flat_plus_scalar
+                && variants.iter().any(|variant| {
+                    matches!(variant.fields.as_slice(), [field]
                     if arguments.is_empty() && !is_stored_copy_scalar(facts, field.ty)
                         || !arguments.is_empty()
                             && !supported_runtime_enum_payload(facts, field.ty))
-            }) {
+                })
+            {
                 return Err(unsupported(
                     "semantic-enum-nominal-payload-lowering-pending (flat-struct or nongeneric-enum nominal enum payloads)",
                 ));
@@ -3833,7 +3844,8 @@ fn validate_supported_source_type(
                         || matches!(variant.fields.as_slice(), [field]
                         if field.name.is_empty()
                             && field.public
-                            && (if arguments.is_empty() {
+                            && (if arguments.is_empty()
+                                && !exact_nongeneric_flat_plus_scalar {
                                 is_stored_copy_scalar(facts, field.ty)
                             } else {
                                 supported_runtime_enum_payload(facts, field.ty)
@@ -3910,6 +3922,96 @@ fn supported_runtime_enum_payload(facts: &sema::PartialAnalysis, ty: sema::Seman
         }
         _ => false,
     }
+}
+
+/// Exact nongeneric nominal-payload lowering boundary. The public source enum
+/// must contain exactly two positional unary variants: one nonempty,
+/// nongeneric ExplicitCopy flat structure and one primitive stored-copy scalar.
+/// All other nominal and nested payload profiles remain fail-closed.
+fn exact_nongeneric_flat_plus_scalar_enum_profile(
+    facts: &sema::PartialAnalysis,
+    program: Option<&wrela_hir::Program>,
+    declaration: wrela_hir::DeclarationId,
+    source: Option<Span>,
+    arguments: &[sema::SemanticArgument],
+    variants: &[sema::SemanticVariant],
+) -> bool {
+    if !arguments.is_empty() {
+        return false;
+    }
+    let Some(source_declaration) = program.and_then(|program| program.declaration(declaration))
+    else {
+        return false;
+    };
+    let wrela_hir::DeclarationKind::Enumeration(source_enum) = &source_declaration.kind else {
+        return false;
+    };
+    let [left, right] = variants else {
+        return false;
+    };
+    let ([left], [right]) = (left.fields.as_slice(), right.fields.as_slice()) else {
+        return false;
+    };
+    source == Some(source_declaration.source)
+        && source_declaration.visibility == wrela_hir::Visibility::Public
+        && source_enum.generics.is_empty()
+        && source_enum.variants.len() == 2
+        && left.name.is_empty()
+        && right.name.is_empty()
+        && left.public
+        && right.public
+        && left.ty != right.ty
+        && ((exact_nongeneric_flat_enum_payload(facts, program, left.ty)
+            && is_stored_copy_scalar(facts, right.ty))
+            || (is_stored_copy_scalar(facts, left.ty)
+                && exact_nongeneric_flat_enum_payload(facts, program, right.ty)))
+}
+
+fn exact_nongeneric_flat_enum_payload(
+    facts: &sema::PartialAnalysis,
+    program: Option<&wrela_hir::Program>,
+    ty: sema::SemanticTypeId,
+) -> bool {
+    let Some(payload) = facts.types.get(ty.0 as usize) else {
+        return false;
+    };
+    let sema::SemanticTypeKind::Structure {
+        declaration,
+        arguments,
+        fields,
+    } = &payload.kind
+    else {
+        return false;
+    };
+    let source_matches = program
+        .and_then(|program| program.declaration(*declaration))
+        .is_some_and(|source| {
+            let wrela_hir::DeclarationKind::Structure(structure) = &source.kind else {
+                return false;
+            };
+            source.visibility == wrela_hir::Visibility::Public
+                && payload.source == Some(source.source)
+                && structure.generics.is_empty()
+                && structure.fields.len() == fields.len()
+                && structure.fields.iter().zip(fields).all(|(source, field)| {
+                    source.visibility == wrela_hir::Visibility::Public
+                        && source.name.as_str() == field.name
+                        && field.public
+                        && source.attributes.is_empty()
+                        && source.default.is_none()
+                        && source_type_matches_semantic(facts, &source.ty, field.ty)
+                })
+        });
+    arguments.is_empty()
+        && source_matches
+        && payload.linearity == sema::Linearity::ExplicitCopy
+        && !fields.is_empty()
+        && fields.iter().all(|field| {
+            !field.name.is_empty() && field.public && is_stored_copy_scalar(facts, field.ty)
+        })
+        && canonical_flat_structure_layout(facts, fields).is_some_and(|(size, alignment)| {
+            payload.size_upper_bound == Some(size) && payload.alignment_lower_bound == alignment
+        })
 }
 
 fn canonical_tagged_enum_layout(
@@ -6417,7 +6519,7 @@ fn canonical_flat_structure_layout(
     Some((size, alignment))
 }
 
-fn generic_enum_source_payload_matches(
+fn runtime_enum_source_payload_matches(
     facts: &sema::PartialAnalysis,
     source_enum: &wrela_hir::EnumDeclaration,
     arguments: &[sema::SemanticArgument],
@@ -6483,16 +6585,14 @@ fn lower_runtime_enum_variant_fields(
                                     if *payload == field.ty)
                             })
                     })
-            } else if specialized_generic_enum {
-                generic_enum_source_payload_matches(
+            } else {
+                runtime_enum_source_payload_matches(
                     facts,
                     source_enum,
                     arguments,
                     &source_field.ty,
                     field.ty,
                 )
-            } else {
-                source_type_matches_semantic(facts, &source_field.ty, field.ty)
             };
             if source_field.name.is_some()
                 || !field.name.is_empty()
@@ -25047,7 +25147,7 @@ pub fn boot() -> Image:
             source: Some(span(0, 0, 1)),
         };
         assert!(matches!(
-            validate_supported_source_type(&specialization, &facts),
+            validate_supported_source_type(&specialization, &facts, None),
             Err(LowerError::UnsupportedInput {
                 feature: "semantic-generic-structure-argument-lowering-pending (non-type or non-scalar specialization)"
             })
@@ -25164,6 +25264,265 @@ pub fn boot() -> Image:
         );
         assert!(matches!(
             result,
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-enum-nominal-payload-lowering-pending (flat-struct or nongeneric-enum nominal enum payloads)"
+            })
+        ));
+    }
+
+    #[test]
+    fn exact_nongeneric_flat_plus_scalar_payload_reaches_semantic_wir() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+pub struct Detail:
+    pub word: u8
+
+pub enum Envelope:
+    detail(Detail)
+    value(u16)
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        detail: Envelope = .detail(Detail(7))
+        value: Envelope = .value(9)
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let output = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("exact nongeneric flat-plus-scalar enum reaches SemanticWir");
+        let model = output.wir().as_wir();
+        let envelope = model
+            .types
+            .iter()
+            .find(|ty| ty.source_name == "Envelope")
+            .expect("lowered Envelope");
+        assert!(matches!(&envelope.kind, wir::TypeKind::Enum { variants }
+            if matches!(variants.as_slice(), [detail, value]
+                if matches!(detail.fields.as_slice(), [field]
+                    if matches!(model.types[field.ty.0 as usize].kind,
+                        wir::TypeKind::Struct { .. }))
+                    && value.fields.len() == 1)));
+    }
+
+    #[test]
+    fn adjacent_nongeneric_nominal_enum_profiles_remain_fail_closed() {
+        let cases = [
+            r#"module app
+from core.image import Image, Target
+struct Detail:
+    pub word: u8
+pub enum Envelope:
+    detail(Detail)
+    value(u8)
+async fn checkpoint():
+    pass
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        detail: Envelope = .detail(Detail(7))
+        await checkpoint()
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+            r#"module app
+from core.image import Image, Target
+pub struct Detail:
+    word: u8
+pub enum Envelope:
+    detail(Detail)
+    value(u8)
+async fn checkpoint():
+    pass
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        detail: Envelope = .detail(Detail(7))
+        await checkpoint()
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+            r#"module app
+from core.image import Image, Target
+pub struct Detail:
+    pub word: u8
+pub struct Other:
+    pub word: u8
+pub enum Envelope:
+    detail(Detail)
+    other(Other)
+async fn checkpoint():
+    pass
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        detail: Envelope = .detail(Detail(7))
+        await checkpoint()
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+            r#"module app
+from core.image import Image, Target
+pub struct Detail:
+    pub word: u8
+pub enum Envelope:
+    idle
+    detail(Detail)
+async fn checkpoint():
+    pass
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        detail: Envelope = .detail(Detail(7))
+        await checkpoint()
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+            r#"module app
+from core.image import Image, Target
+pub struct Detail:
+    pub word: u8
+pub enum Envelope:
+    detail(Detail)
+    first(u8)
+    second(u16)
+async fn checkpoint():
+    pass
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        detail: Envelope = .detail(Detail(7))
+        await checkpoint()
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+            r#"module app
+from core.image import Image, Target
+pub enum Inner:
+    value(u8)
+pub enum Envelope:
+    nested(Inner)
+    value(u8)
+async fn checkpoint():
+    pass
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        nested: Envelope = .nested(Inner.value(7))
+        await checkpoint()
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        ];
+        for source in cases {
+            let image = analyze_parsed_actor_source(source);
+            assert!(matches!(
+                CanonicalSemanticLowerer::new().lower(
+                    LowerRequest {
+                        input: image,
+                        limits: LoweringLimits::standard(),
+                    },
+                    &|| false,
+                ),
+                Err(LowerError::UnsupportedInput {
+                    feature: "semantic-enum-nominal-payload-lowering-pending (flat-struct or nongeneric-enum nominal enum payloads)"
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn generic_structure_cannot_cross_nongeneric_nominal_enum_profile() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+from core.image import Image, Target
+pub struct Detail:
+    pub word: u8
+pub enum Envelope:
+    detail(Detail)
+    value(u8)
+async fn checkpoint():
+    pass
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        detail: Envelope = .detail(Detail(7))
+        await checkpoint()
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        let mut facts = image.facts().clone();
+        let scalar = facts
+            .types
+            .iter()
+            .find(|ty| matches!(ty.kind, sema::SemanticTypeKind::Integer { bits: 8, .. }))
+            .expect("u8 semantic type")
+            .id;
+        let detail = facts
+            .types
+            .iter_mut()
+            .find(|ty| {
+                matches!(&ty.kind, sema::SemanticTypeKind::Structure { fields, .. }
+                if fields.len() == 1)
+            })
+            .expect("Detail semantic type");
+        let sema::SemanticTypeKind::Structure { arguments, .. } = &mut detail.kind else {
+            unreachable!()
+        };
+        arguments.push(sema::SemanticArgument::Type(scalar));
+        let detail_id = detail.id;
+        let envelope = facts
+            .types
+            .iter()
+            .find(|ty| {
+                matches!(&ty.kind, sema::SemanticTypeKind::Enumeration { variants, .. }
+                if variants.iter().any(|variant| matches!(variant.fields.as_slice(), [field]
+                    if field.ty == detail_id)))
+            })
+            .expect("Envelope semantic type");
+        assert!(matches!(
+            validate_supported_source_type(envelope, &facts, Some(image.hir().as_program())),
             Err(LowerError::UnsupportedInput {
                 feature: "semantic-enum-nominal-payload-lowering-pending (flat-struct or nongeneric-enum nominal enum payloads)"
             })

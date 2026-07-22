@@ -570,7 +570,14 @@ it. It injects phase implementations and bounded host capabilities, while
   representation retains `None`; validators join the tag to the logical result
   type, and LLVM loads that exact scalar or flat nominal type back from the
   aligned physical slot. Broader nominal payload sets and non-flat/nested
-  payloads remain named fail-closed.
+  payloads remain named fail-closed. Semantic lowering now admits that same
+  fixed-flat-plus-scalar shape for a nongeneric source enum only when the HIR
+  enum, flat-structure declaration, and every flat field are public and
+  nongeneric, the structure is nonempty `ExplicitCopy`, and every field is an
+  exactly matched primitive stored-copy scalar. Source declaration, payload,
+  constructor tag, and match-binding nominal substitutions are rejected before
+  the already-structural FlowWir/MachineWir representation is reused; no schema
+  or wire version changes for this source-level extension.
 - The current schema retains the exact compiled `FullImageTestGroup`, including its
   plan identity, generated-harness function keys or declared-image/scenario
   binding, descriptors, seed, and execution policy. Validation joins generated

@@ -45,9 +45,9 @@ use wrela_sema::{
     SemanticAnalyzer, SemanticArgument, SemanticTypeKind as SemaTypeKind, TestDiscoverySelection,
 };
 use wrela_semantic_lower::{
-    CanonicalSemanticLowerer, LowerRequest as SemanticLowerRequest,
-    LoweringLimits as SemanticLoweringLimits, SemanticLowerer, SemanticOperation, SemanticTypeKind,
-    semantic_wir::SEMANTIC_WIR_VERSION,
+    CanonicalSemanticLowerer, LowerError as SemanticLowerError,
+    LowerRequest as SemanticLowerRequest, LoweringLimits as SemanticLoweringLimits,
+    SemanticLowerer, SemanticOperation, SemanticTypeKind, semantic_wir::SEMANTIC_WIR_VERSION,
 };
 use wrela_source::{FileId, SourceDatabase, SourceInput};
 use wrela_syntax::{ParseLimits, ParseRequest, SyntaxParser, WrelaSyntaxParser};
@@ -1490,6 +1490,587 @@ fn unwrap(input: Envelope[u8]) -> u8:
         Ok(first) => {
             let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
                 .expect("repeat fixed flat match native emission");
+            assert_eq!(first.bytes(), second.bytes());
+            let digest = HASHER.sha256(first.bytes());
+            assert_eq!(digest, HASHER.sha256(second.bytes()));
+            inspect_native_object(first.bytes(), digest);
+        }
+    }
+}
+
+#[test]
+fn nongeneric_flat_plus_scalar_enum_match_reaches_sealed_deterministic_native_coff() {
+    let fixture = source_fixture_for(
+        r#"module runtime_result.image
+
+from core.image import Image, Target
+
+pub struct Detail:
+    pub word: u8
+
+pub struct Alternate:
+    pub word: u8
+
+pub enum Envelope:
+    detail(Detail)
+    value(u8)
+
+@image
+pub fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn nongeneric_flat_plus_scalar_enum_runtime():
+    alternate: Alternate = Alternate(8)
+    first: u8 = unwrap(Envelope.detail(Detail(7)))
+    second: u8 = unwrap(Envelope.value(9))
+    return
+
+fn unwrap(input: Envelope) -> u8:
+    match input:
+        case Envelope.detail(payload):
+            return payload.word
+        case Envelope.value(value):
+            return value
+"#,
+    );
+    let image = analyze_selected(&fixture, "nongeneric_flat_plus_scalar_enum_runtime");
+    let program = fixture.hir.as_program();
+    let declaration_named = |name: &str| {
+        program
+            .declarations
+            .iter()
+            .find(|declaration| {
+                declaration
+                    .name
+                    .as_ref()
+                    .is_some_and(|item| item.as_str() == name)
+            })
+            .map(|declaration| declaration.id)
+            .unwrap_or_else(|| panic!("missing {name} declaration"))
+    };
+    let detail_declaration = declaration_named("Detail");
+    let alternate_declaration = declaration_named("Alternate");
+    let envelope_declaration = declaration_named("Envelope");
+    let detail_type = image
+        .facts()
+        .types
+        .iter()
+        .find(|ty| {
+            matches!(&ty.kind, SemaTypeKind::Structure { declaration, arguments, .. }
+            if *declaration == detail_declaration && arguments.is_empty())
+        })
+        .expect("nominal Detail semantic type")
+        .id;
+    let alternate_type = image
+        .facts()
+        .types
+        .iter()
+        .find(|ty| {
+            matches!(&ty.kind, SemaTypeKind::Structure { declaration, arguments, .. }
+            if *declaration == alternate_declaration && arguments.is_empty())
+        })
+        .expect("nominal Alternate semantic type")
+        .id;
+    let envelope_type = image
+        .facts()
+        .types
+        .iter()
+        .find(|ty| {
+            matches!(&ty.kind, SemaTypeKind::Enumeration { declaration, arguments, variants }
+            if *declaration == envelope_declaration
+                && arguments.is_empty()
+                && matches!(variants.as_slice(), [detail, value]
+                    if matches!(detail.fields.as_slice(), [field] if field.ty == detail_type)
+                        && value.fields.len() == 1))
+        })
+        .expect("nominal Envelope semantic type")
+        .id;
+
+    let mut substituted_nominal = image.facts().clone();
+    let declaration = substituted_nominal
+        .types
+        .iter_mut()
+        .find_map(|ty| match &mut ty.kind {
+            SemaTypeKind::Structure { declaration, .. } if *declaration == detail_declaration => {
+                Some(declaration)
+            }
+            _ => None,
+        })
+        .expect("Detail source declaration witness");
+    *declaration = alternate_declaration;
+    assert!(
+        substituted_nominal
+            .validate_for_seal(image.hir(), &never_cancelled)
+            .is_err(),
+        "a structurally identical nominal declaration substitution must break the full seal"
+    );
+
+    let mut substituted_constructor_payload = image.facts().clone();
+    let payload_type = substituted_constructor_payload
+        .expressions
+        .iter_mut()
+        .find_map(|fact| match &mut fact.resolution {
+            wrela_sema::ExpressionResolution::Constructor { ty, variant: None }
+                if *ty == detail_type =>
+            {
+                Some(ty)
+            }
+            _ => None,
+        })
+        .expect("Detail constructor payload witness");
+    *payload_type = alternate_type;
+    assert!(
+        substituted_constructor_payload
+            .validate_for_seal(image.hir(), &never_cancelled)
+            .is_err(),
+        "a structurally identical constructor payload substitution must break the full seal"
+    );
+
+    let mut substituted_constructor = image.facts().clone();
+    let constructor_variant = substituted_constructor
+        .expressions
+        .iter_mut()
+        .find_map(|fact| match &mut fact.resolution {
+            wrela_sema::ExpressionResolution::Constructor {
+                ty,
+                variant: Some(variant),
+            } if *ty == envelope_type && *variant == 0 => Some(variant),
+            _ => None,
+        })
+        .expect("Envelope.detail constructor witness");
+    *constructor_variant = 1;
+    assert!(
+        substituted_constructor
+            .validate_for_seal(image.hir(), &never_cancelled)
+            .is_err(),
+        "an enum constructor tag substitution must break the full seal"
+    );
+
+    let mut substituted_binding = image.facts().clone();
+    let binding_type = substituted_binding
+        .values
+        .iter_mut()
+        .find(|value| value.source_name.as_deref() == Some("payload") && value.ty == detail_type)
+        .map(|value| &mut value.ty)
+        .expect("nominal match payload binding");
+    *binding_type = alternate_type;
+    assert!(
+        substituted_binding
+            .validate_for_seal(image.hir(), &never_cancelled)
+            .is_err(),
+        "a nominally substituted match binding must break the full seal"
+    );
+
+    let semantic_polls = Cell::new(0_u64);
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: image.clone(),
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &|| {
+                semantic_polls.set(semantic_polls.get().saturating_add(1));
+                false
+            },
+        )
+        .expect("nongeneric flat-plus-scalar enum SemanticWir");
+    let semantic_operation_count = semantic.report().operations;
+    let semantic_model = semantic.wir().as_wir();
+    let detail = semantic_model
+        .types
+        .get(detail_type.0 as usize)
+        .expect("Detail SemanticWir type");
+    let envelope = semantic_model
+        .types
+        .get(envelope_type.0 as usize)
+        .expect("Envelope SemanticWir type");
+    assert!(matches!(detail.kind, SemanticTypeKind::Struct { .. }));
+    assert!(matches!(&envelope.kind, SemanticTypeKind::Enum { variants }
+        if matches!(variants.as_slice(), [detail, value]
+            if detail.name == "detail"
+                && matches!(detail.fields.as_slice(), [field]
+                    if field.name.is_empty()
+                        && field.ty.0 == detail_type.0
+                        && field.public)
+                && value.name == "value"
+                && value.fields.len() == 1)));
+    let constructors = semantic_model
+        .functions
+        .iter()
+        .flat_map(|function| &function.body.statements)
+        .filter_map(|statement| match statement {
+            wrela_semantic_lower::semantic_wir::SemanticStatement::Let(statement) => {
+                match statement.operation {
+                    SemanticOperation::ConstructEnum {
+                        ty,
+                        variant,
+                        payload,
+                    } if ty.0 == envelope_type.0 => Some((variant, payload.is_some())),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(constructors, [(0, true), (1, true)]);
+    let (match_function, match_arms) = semantic_model
+        .functions
+        .iter()
+        .find_map(|function| {
+            function
+                .body
+                .statements
+                .iter()
+                .find_map(|statement| match statement {
+                    wrela_semantic_lower::semantic_wir::SemanticStatement::Match {
+                        arms, ..
+                    } if arms.len() == 2 => Some((function, arms)),
+                    _ => None,
+                })
+        })
+        .expect("exhaustive nominal enum match");
+    assert_eq!(match_arms[0].variant, Some(0));
+    assert_eq!(match_arms[1].variant, Some(1));
+    assert_eq!(match_arms[0].bindings.len(), 1);
+    assert_eq!(
+        match_function.values[match_arms[0].bindings[0].0 as usize]
+            .ty
+            .0,
+        detail_type.0
+    );
+
+    let mut exact_semantic = SemanticLoweringLimits::standard();
+    exact_semantic.operations = semantic_operation_count;
+    CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: image.clone(),
+                limits: exact_semantic,
+            },
+            &never_cancelled,
+        )
+        .expect("exact nongeneric enum SemanticWir operation ceiling");
+    let mut one_under_semantic = exact_semantic;
+    one_under_semantic.operations = semantic_operation_count - 1;
+    assert!(matches!(
+        CanonicalSemanticLowerer::new().lower(
+            SemanticLowerRequest {
+                input: image.clone(),
+                limits: one_under_semantic,
+            },
+            &never_cancelled,
+        ),
+        Err(SemanticLowerError::ResourceLimit {
+            resource: "SemanticWir operations",
+            limit,
+        }) if limit == semantic_operation_count - 1
+    ));
+    let semantic_cancel_at = semantic_polls.get().saturating_sub(2);
+    assert!(semantic_cancel_at > 3);
+    let cancelled_semantic_polls = Cell::new(0_u64);
+    assert!(matches!(
+        CanonicalSemanticLowerer::new().lower(
+            SemanticLowerRequest {
+                input: image,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &|| {
+                let next = cancelled_semantic_polls.get().saturating_add(1);
+                cancelled_semantic_polls.set(next);
+                next >= semantic_cancel_at
+            },
+        ),
+        Err(SemanticLowerError::Cancelled)
+    ));
+
+    let semantic = semantic.into_parts().0;
+    let flow_polls = Cell::new(0_u64);
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: FlowLoweringLimits::standard(),
+            },
+            &|| {
+                flow_polls.set(flow_polls.get().saturating_add(1));
+                false
+            },
+        )
+        .expect("nongeneric flat-plus-scalar enum FlowWir");
+    let flow_instruction_count = flow.report().instructions;
+    let flow_model = flow.wir().as_wir();
+    let detail = flow_model
+        .types
+        .iter()
+        .find(|ty| ty.name.as_deref() == Some("Detail"))
+        .expect("Detail FlowWir type");
+    let envelope = flow_model
+        .types
+        .iter()
+        .find(|ty| ty.name.as_deref() == Some("Envelope"))
+        .expect("Envelope FlowWir type");
+    let u8_ty = flow_model
+        .types
+        .iter()
+        .find(|ty| ty.name.as_deref() == Some("u8"))
+        .expect("u8 FlowWir type");
+    assert!(matches!(&envelope.kind, FlowTypeKind::Enum { variants }
+        if variants.as_slice() == [vec![detail.id], vec![u8_ty.id]]));
+    let projections = flow_model
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.operation {
+            FlowOperation::EnumPayload { variant, .. } => Some(variant),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(projections, [Some(0), Some(1)]);
+
+    let mut forged_flow = flow_model.clone();
+    let projected = forged_flow
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.operation {
+            FlowOperation::EnumPayload {
+                variant: Some(variant),
+                ..
+            } if *variant == 0 => Some(variant),
+            _ => None,
+        })
+        .expect("nominal FlowWir payload projection");
+    *projected = 1;
+    assert!(forged_flow.validate().is_err());
+
+    let mut exact_flow = FlowLoweringLimits::standard();
+    exact_flow.instructions = flow_instruction_count;
+    CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: exact_flow,
+            },
+            &never_cancelled,
+        )
+        .expect("exact nongeneric enum FlowWir instruction ceiling");
+    let mut one_under_flow = exact_flow;
+    one_under_flow.instructions = flow_instruction_count - 1;
+    assert!(matches!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic.clone(),
+                limits: one_under_flow,
+            },
+            &never_cancelled,
+        ),
+        Err(FlowLowerError::ResourceLimit {
+            resource: "FlowWir instructions",
+            limit,
+        }) if limit == flow_instruction_count - 1
+    ));
+    let flow_cancel_at = flow_polls.get().saturating_sub(1);
+    assert!(flow_cancel_at > 3);
+    let cancelled_flow_polls = Cell::new(0_u64);
+    assert!(matches!(
+        CanonicalFlowLowerer::new().lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &|| {
+                let next = cancelled_flow_polls.get().saturating_add(1);
+                cancelled_flow_polls.set(next);
+                next >= flow_cancel_at
+            },
+        ),
+        Err(FlowLowerError::Cancelled)
+    ));
+
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("nongeneric flat-plus-scalar enum FlowWir v19 frame");
+    let decoded = decode_and_verify(
+        &CanonicalFlowWirCodec,
+        DecodeRequest {
+            bytes: encoded.bytes(),
+            limits: CodecLimits::standard(),
+            expected_build: Some(&flow_wir.as_wir().build),
+        },
+        &never_cancelled,
+    )
+    .expect("nongeneric enum FlowWir v19 round trip");
+    assert_eq!(decoded.as_wir(), flow_wir.as_wir());
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("nongeneric enum MachineWir preparation");
+    let machine = prepared.machine().wir().as_wir();
+    let detail = machine
+        .types
+        .iter()
+        .find(|ty| ty.source_name.as_deref() == Some("Detail"))
+        .expect("Detail MachineWir type");
+    let envelope = machine
+        .types
+        .iter()
+        .find(|ty| ty.source_name.as_deref() == Some("Envelope"))
+        .expect("Envelope MachineWir type");
+    assert!(matches!(&envelope.kind, MachineTypeKind::TaggedEnum {
+        storage: Some(storage),
+        variant_payloads,
+        ..
+    } if storage.size > 0
+        && variant_payloads.as_slice() == [Some(detail.id), Some(MachineTypeId(1))]));
+    let machine_projections = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.operation {
+            MachineOperation::EnumPayload { variant, .. } => Some(variant),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(machine_projections, [Some(0), Some(1)]);
+
+    let mut forged_machine_tag = machine.clone();
+    let projected = forged_machine_tag
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.operation {
+            MachineOperation::EnumPayload {
+                variant: Some(variant),
+                ..
+            } if *variant == 0 => Some(variant),
+            _ => None,
+        })
+        .expect("nominal MachineWir payload projection");
+    *projected = 1;
+    assert!(
+        forged_machine_tag
+            .validate_for_target(&fixture.target)
+            .is_err()
+    );
+
+    let mut forged_machine_storage = machine.clone();
+    let storage = forged_machine_storage
+        .types
+        .iter_mut()
+        .find(|ty| ty.source_name.as_deref() == Some("Envelope"))
+        .and_then(|ty| match &mut ty.kind {
+            MachineTypeKind::TaggedEnum {
+                storage: Some(storage),
+                variant_payloads,
+                ..
+            } if variant_payloads.len() == 2 && variant_payloads.iter().all(Option::is_some) => {
+                Some(storage)
+            }
+            _ => None,
+        })
+        .expect("heterogeneous enum shared storage");
+    storage.size = storage.size.saturating_add(1);
+    assert!(
+        forged_machine_storage
+            .validate_for_target(&fixture.target)
+            .is_err()
+    );
+
+    let codec = CanonicalFlowWirCodec;
+    let hasher = CanonicalBackendContentHasher::new();
+    let optimizer = CanonicalFlowOptimizer::new();
+    let machine_lowerer = CanonicalMachineLowerer::new();
+    let expected_digest = hasher
+        .sha256(encoded.bytes(), &never_cancelled)
+        .expect("nongeneric enum frame digest");
+    let optimization = OptimizationProfile::from_build_policy(
+        &fixture.build.profile.optimization,
+        fixture.build.identity.compiler,
+    )
+    .expect("nongeneric enum optimization profile");
+    let prepare_with = |machine_limits: MachineLoweringLimits, is_cancelled: &dyn Fn() -> bool| {
+        prepare_for_codegen(
+            BackendPreparationServices {
+                codec: &codec,
+                hasher: &hasher,
+                optimizer: &optimizer,
+                machine_lowerer: &machine_lowerer,
+            },
+            encoded.bytes(),
+            expected_digest,
+            &fixture.target,
+            &fixture.build,
+            BackendPreparationOptions {
+                codec_limits: CodecLimits::standard(),
+                optimization: optimization.clone(),
+                optimization_limits: OptimizationLimits::standard(),
+                machine_limits,
+            },
+            is_cancelled,
+        )
+    };
+    let instruction_count = machine
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .map(|block| block.instructions.len() as u64)
+        .sum::<u64>();
+    let mut exact_machine = MachineLoweringLimits::standard();
+    exact_machine.instructions = instruction_count;
+    prepare_with(exact_machine, &never_cancelled)
+        .expect("exact nongeneric enum MachineWir instruction ceiling");
+    let mut one_under_machine = exact_machine;
+    one_under_machine.instructions = instruction_count - 1;
+    let one_under = prepare_with(one_under_machine, &never_cancelled)
+        .expect_err("one fewer nongeneric enum MachineWir instruction must fail");
+    assert_eq!(
+        one_under.machine_lower_error(),
+        Some(&MachineLowerError::ResourceLimit {
+            resource: "MachineWir instructions",
+            limit: instruction_count - 1,
+        })
+    );
+    let machine_polls = Cell::new(0_u64);
+    prepare_with(MachineLoweringLimits::standard(), &|| {
+        machine_polls.set(machine_polls.get().saturating_add(1));
+        false
+    })
+    .expect("count nongeneric enum MachineWir cancellation polls");
+    let machine_cancel_at = machine_polls.get().saturating_sub(2);
+    assert!(machine_cancel_at > 3);
+    let cancelled_machine_polls = Cell::new(0_u64);
+    let cancellation = prepare_with(MachineLoweringLimits::standard(), &|| {
+        let next = cancelled_machine_polls.get().saturating_add(1);
+        cancelled_machine_polls.set(next);
+        next >= machine_cancel_at
+    })
+    .expect_err("late nongeneric enum MachineWir cancellation must propagate");
+    assert!(cancellation.is_cancelled());
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("nongeneric enum native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat nongeneric enum native emission");
             assert_eq!(first.bytes(), second.bytes());
             let digest = HASHER.sha256(first.bytes());
             assert_eq!(digest, HASHER.sha256(second.bytes()));

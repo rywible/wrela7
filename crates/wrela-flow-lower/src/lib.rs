@@ -1408,7 +1408,7 @@ fn reject_unadmitted_nominal_enum_payload(
         let semantic::TypeKind::Enum { variants } = &ty.kind else {
             continue;
         };
-        if exact_fixed_flat_generic_enum_profile(input, variants) {
+        if exact_fixed_flat_enum_profile(input, variants) {
             continue;
         }
         for field in variants.iter().flat_map(|variant| &variant.fields) {
@@ -3651,7 +3651,7 @@ fn canonical_semantic_enum_shape(
     !variants.is_empty()
         && (variants.iter().all(|variant| variant.fields.is_empty())
             || canonical_semantic_enum_payload(input, variants).is_some()
-            || exact_fixed_flat_generic_enum_profile(input, variants)
+            || exact_fixed_flat_enum_profile(input, variants)
             || exact_heterogeneous_scalar_enum_profile(input, record, variants))
 }
 
@@ -3696,7 +3696,7 @@ fn flat_nominal_enum_payload(input: &semantic::SemanticWir, ty: semantic::TypeId
 /// nongeneric flat structure beside one substituted primitive scalar. FlowWir
 /// can retain both nominal type identities without choosing a machine union
 /// representation; every broader heterogeneous or nested shape stays closed.
-fn exact_fixed_flat_generic_enum_profile(
+fn exact_fixed_flat_enum_profile(
     input: &semantic::SemanticWir,
     variants: &[semantic::VariantType],
 ) -> bool {
