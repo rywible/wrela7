@@ -372,6 +372,9 @@ impl<'a, 'diag> Scanner<'a, 'diag> {
                 'f' if self.remaining().starts_with("f\"") => {
                     self.scan_interpolated()?;
                 }
+                '"' if self.remaining().starts_with("\"\"\"") => {
+                    self.scan_reserved_triple_quoted()?;
+                }
                 '\"' => self.scan_quoted(TokenKind::StringLiteral, 0, false, false)?,
                 '\'' => self.scan_character_literal()?,
                 '0'..='9' => self.scan_number()?,
@@ -1155,6 +1158,7 @@ impl<'a, 'diag> Scanner<'a, 'diag> {
                 self.scan_quoted(TokenKind::ByteStringLiteral, 1, true, false)
             }
             'f' if self.remaining().starts_with("f\"") => self.scan_interpolated(),
+            '"' if self.remaining().starts_with("\"\"\"") => self.scan_reserved_triple_quoted(),
             '"' => self.scan_quoted(TokenKind::StringLiteral, 0, false, false),
             '\'' => self.scan_character_literal(),
             '0'..='9' => self.scan_number(),
@@ -1170,6 +1174,30 @@ impl<'a, 'diag> Scanner<'a, 'diag> {
 
     fn scan_character_literal(&mut self) -> Result<(), ParseFailure> {
         self.scan_quoted(TokenKind::CharacterLiteral, 0, false, false)
+    }
+
+    fn scan_reserved_triple_quoted(&mut self) -> Result<(), ParseFailure> {
+        let start = self.position;
+        self.diagnostics.error(
+            "syntax-reserved-multiline-string",
+            start,
+            start + 3,
+            "triple-quoted strings are reserved and are not legal in revision 0.1".to_owned(),
+        )?;
+        self.position += 3;
+        while self.position < self.text.len() {
+            self.cancellation.work()?;
+            if self.remaining().starts_with("\"\"\"") {
+                self.position += 3;
+                break;
+            }
+            let character = self.current_char()?;
+            if matches!(character, '\n' | '\r') {
+                break;
+            }
+            self.position += character.len_utf8();
+        }
+        self.push_physical(TokenKind::StringLiteral, start, self.position, None, true)
     }
 
     fn scan_quoted(
@@ -8716,6 +8744,25 @@ mod tests {
         ] {
             assert!(codes.contains(&expected), "missing {expected}: {codes:?}");
         }
+    }
+
+    #[test]
+    fn triple_quoted_string_is_one_exact_reserved_syntax_error() {
+        let text = "module x\nfn f():\n    value = \"\"\"future\"\"\"\n";
+        let output = parse_with_limits(text, ParseLimits::standard()).expect("recoverable parse");
+        assert!(output.parsed().recovery_complete());
+        let reserved = output
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code.as_deref() == Some("syntax-reserved-multiline-string")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output.diagnostics().len(), 1);
+        assert_eq!(reserved.len(), 1, "diagnostics: {:?}", output.diagnostics());
+        let start = text.find("\"\"\"").expect("triple quote offset");
+        assert_eq!(reserved[0].primary.range.start, start as u32);
+        assert_eq!(reserved[0].primary.range.end, (start + 3) as u32);
     }
 
     #[test]
