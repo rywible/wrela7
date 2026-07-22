@@ -6481,6 +6481,18 @@ struct OptionTryInput {
     effects: sema::EffectSet,
 }
 
+struct EnumTypeTestInput {
+    expression: wrela_hir::ExpressionId,
+    source: Span,
+    value: wrela_hir::ExpressionId,
+    negated: bool,
+    enumeration: sema::SemanticTypeId,
+    variant: u32,
+    scrutinee: sema::ValueId,
+    result: sema::ValueId,
+    effects: sema::EffectSet,
+}
+
 enum SourceStatementPlan {
     Pass,
     Initialize {
@@ -6594,6 +6606,7 @@ enum SourceExpressionPlan {
     Convert(ScalarConvertInput),
     ResultTry(ResultTryInput),
     OptionTry(OptionTryInput),
+    EnumTypeTest(EnumTypeTestInput),
     InlineIf(InlineIfInput),
     Await {
         expression: wrela_hir::ExpressionId,
@@ -9939,11 +9952,25 @@ impl SourceFunctionLowerer<'_> {
                         })
                     }
                     (
-                        wrela_hir::ExpressionKind::IsPattern { .. },
-                        sema::ExpressionResolution::EnumTypeTest { .. },
-                    ) => {
-                        return Err(unsupported("semantic-runtime-is-lowering-pending"));
-                    }
+                        wrela_hir::ExpressionKind::IsPattern { value, negated, .. },
+                        sema::ExpressionResolution::EnumTypeTest {
+                            enumeration,
+                            variant,
+                            scrutinee,
+                        },
+                    ) => SourceExpressionPlan::EnumTypeTest(EnumTypeTestInput {
+                        expression: expression_id,
+                        source: expression.source,
+                        value: *value,
+                        negated: *negated,
+                        enumeration: *enumeration,
+                        variant: *variant,
+                        scrutinee: *scrutinee,
+                        result: fact
+                            .result
+                            .ok_or_else(|| self.fact_mismatch("enum type-test result"))?,
+                        effects: fact.effects,
+                    }),
                     _ => {
                         return Err(unsupported(
                             "ordinary source expressions outside scalar bodies",
@@ -10216,6 +10243,9 @@ impl SourceFunctionLowerer<'_> {
             }
             SourceExpressionPlan::OptionTry(option_try) => {
                 self.lower_option_try(option_try, statements)
+            }
+            SourceExpressionPlan::EnumTypeTest(type_test) => {
+                self.lower_enum_type_test(type_test, statements)
             }
             SourceExpressionPlan::InlineIf(inline_if) => {
                 self.lower_inline_if(inline_if, source, statements)
@@ -11165,6 +11195,122 @@ impl SourceFunctionLowerer<'_> {
                 arms,
                 results: one_value_vec(result, self.limits.model_edges)?,
                 source: Some(option_try.source),
+            },
+        )?;
+        Ok(LoweredExpression::Value(result))
+    }
+
+    fn lower_enum_type_test(
+        &mut self,
+        type_test: EnumTypeTestInput,
+        statements: &mut Vec<wir::SemanticStatement>,
+    ) -> Result<LoweredExpression, LowerError> {
+        let bool_ty = self.expression_fact(type_test.expression)?.ty;
+        if !self
+            .input
+            .facts()
+            .types
+            .get(bool_ty.0 as usize)
+            .is_some_and(|ty| matches!(ty.kind, sema::SemanticTypeKind::Bool))
+        {
+            return Err(self.fact_mismatch("enum type-test boolean type"));
+        }
+        let value_fact = self.expression_fact(type_test.value)?;
+        if value_fact.ty != type_test.enumeration
+            || value_fact.effects != type_test.effects
+            || !(value_fact.result == Some(type_test.scrutinee)
+                || matches!(
+                    value_fact.resolution,
+                    sema::ExpressionResolution::Value(value) if value == type_test.scrutinee
+                ))
+        {
+            return Err(self.fact_mismatch("enum type-test scrutinee fact"));
+        }
+        let variant_count = {
+            let variants = self
+                .input
+                .facts()
+                .types
+                .get(type_test.enumeration.0 as usize)
+                .and_then(|record| match &record.kind {
+                    sema::SemanticTypeKind::Enumeration {
+                        arguments,
+                        variants,
+                        ..
+                    } if supported_runtime_enum_type_arguments(arguments)
+                        && variants.get(type_test.variant as usize).is_some() =>
+                    {
+                        Some(variants)
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| self.fact_mismatch("enum type-test closed enumeration"))?;
+            for variant in variants {
+                check_cancelled(self.is_cancelled)?;
+                if variant.fields.len() > 1 {
+                    return Err(self.fact_mismatch("enum type-test variant payload shape"));
+                }
+            }
+            variants.len()
+        };
+        let expected_scrutinee = self.value_map.get(type_test.scrutinee)?;
+        let LoweredExpression::Value(scrutinee) =
+            self.lower_expression(type_test.value, sema::AccessMode::Read, statements)?
+        else {
+            return Err(self.fact_mismatch("enum type-test scrutinee value"));
+        };
+        if scrutinee != expected_scrutinee {
+            return Err(self.fact_mismatch("enum type-test scrutinee identity"));
+        }
+        let result = self.lowered_expression_result(
+            type_test.expression,
+            type_test.result,
+            bool_ty,
+            type_test.source,
+        )?;
+        let mut arms = try_vec(
+            variant_count,
+            "enum type-test match arms",
+            self.limits.model_edges,
+        )?;
+        for index in 0..variant_count {
+            check_cancelled(self.is_cancelled)?;
+            let arm_value = self.allocate_synthetic_value(bool_ty, type_test.source)?;
+            let mut arm_statements =
+                try_vec(2, "enum type-test arm body", self.limits.model_edges)?;
+            let matches = u32::try_from(index)
+                .map(|variant| variant == type_test.variant)
+                .map_err(|_| self.fact_mismatch("enum type-test variant index"))?;
+            self.push_let(
+                &mut arm_statements,
+                arm_value,
+                wir::SemanticOperation::Constant(wir::Constant::Bool(matches ^ type_test.negated)),
+                Some(type_test.source),
+            )?;
+            self.push_statement(
+                &mut arm_statements,
+                wir::SemanticStatement::Yield(one_value_vec(arm_value, self.limits.model_edges)?),
+            )?;
+            arms.push(wir::SemanticMatchArm {
+                variant: Some(
+                    u32::try_from(index)
+                        .map_err(|_| self.fact_mismatch("enum type-test variant index"))?,
+                ),
+                bindings: Vec::new(),
+                guard: None,
+                body: wir::SemanticRegion {
+                    parameters: Vec::new(),
+                    statements: arm_statements,
+                },
+            });
+        }
+        self.push_statement(
+            statements,
+            wir::SemanticStatement::Match {
+                scrutinee,
+                arms,
+                results: one_value_vec(result, self.limits.model_edges)?,
+                source: Some(type_test.source),
             },
         )?;
         Ok(LoweredExpression::Value(result))
@@ -22318,7 +22464,7 @@ pub fn boot() -> Image:
     }
 
     #[test]
-    fn authenticated_enum_type_test_stops_at_named_lowering_boundary() {
+    fn authenticated_enum_type_test_lowers_to_canonical_boolean_match() {
         let image = analyze_parsed_actor_source(
             r#"module app
 
@@ -22345,22 +22491,147 @@ pub fn boot() -> Image:
     return img
 "#,
         );
-        let result = CanonicalSemanticLowerer::new().lower(
-            LowerRequest {
-                input: image,
-                limits: LoweringLimits::standard(),
-            },
-            &|| false,
-        );
-        assert!(
-            matches!(
-                result,
-                Err(LowerError::UnsupportedInput {
-                    feature: "semantic-runtime-is-lowering-pending"
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("authenticated enum type test should lower");
+        let arms = lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .flat_map(|function| &function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Match { arms, results, .. } if results.len() == 1 => {
+                    Some(arms)
+                }
+                _ => None,
+            })
+            .expect("one result-bearing enum type-test match");
+        assert_eq!(arms.len(), 2);
+        assert!(arms.iter().all(|arm| arm.bindings.is_empty()
+            && arm.body.parameters.is_empty()
+            && arm.guard.is_none()));
+        assert_eq!(
+            arms.iter()
+                .filter_map(|arm| match arm.body.statements.as_slice() {
+                    [
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            operation: wir::SemanticOperation::Constant(wir::Constant::Bool(value)),
+                            ..
+                        }),
+                        wir::SemanticStatement::Yield(_),
+                    ] => Some(*value),
+                    _ => None,
                 })
-            ),
-            "unexpected enum type-test lowering result: {result:?}"
+                .collect::<Vec<_>>(),
+            [false, true]
         );
+
+        let exact_operations = lowered.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact enum type-test operation limit");
+        let mut one_under = exact;
+        one_under.operations = exact_operations - 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == exact_operations - 1
+        ));
+
+        let polls = Cell::new(0_u32);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("measure enum type-test cancellation polls");
+        let final_poll = polls.get();
+        assert!(final_poll > 3);
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next >= final_poll
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+
+        let mut forged = lowered.wir().as_wir().clone();
+        let forged_constant = forged
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.body.statements)
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Match { arms, results, .. } if results.len() == 1 => arms
+                    .iter_mut()
+                    .flat_map(|arm| &mut arm.body.statements)
+                    .find_map(|statement| match statement {
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            operation: wir::SemanticOperation::Constant(wir::Constant::Bool(true)),
+                            ..
+                        }) => Some(statement),
+                        _ => None,
+                    }),
+                _ => None,
+            })
+            .expect("selected enum type-test truth arm");
+        let wir::SemanticStatement::Let(wir::LetStatement {
+            operation: wir::SemanticOperation::Constant(wir::Constant::Bool(value)),
+            ..
+        }) = forged_constant
+        else {
+            unreachable!("selected only a boolean constant")
+        };
+        *value = false;
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                forged,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidReport(_)) | Err(LowerError::InvalidOutput(_))
+        ));
     }
 
     #[test]

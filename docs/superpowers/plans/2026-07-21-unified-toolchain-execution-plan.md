@@ -237,9 +237,15 @@ full sealer rejects their overlapping exclusive intervals.
 A3 `is` analysis now records an exact `EnumTypeTest` identity instead of a
 generic boolean-value resolution. The fact authenticates enum type, variant,
 and borrowed scrutinee; full sealing rejects valid-tag substitution
-(`runtime_adt_is_tests_unit_variant_without_binding`). Execution remains
-deliberately fail-closed at `semantic-runtime-is-lowering-pending`
-(`authenticated_enum_type_test_stops_at_named_lowering_boundary`).
+(`runtime_adt_is_tests_unit_variant_without_binding`). Semantic lowering now
+reauthenticates that identity and emits an exhaustive tag-only boolean match;
+exact N/N-1 resources, late cancellation, and truth-arm forgery rejection are
+pinned by `authenticated_enum_type_test_lowers_to_canonical_boolean_match`.
+Flow rejects nondiscriminating truth patterns, and positive plus negated tests
+reach exactly one EnumTag, zero EnumPayload, one switch, and repeat
+byte-identical native COFF apiece in
+`enum_type_tests_reach_tag_only_flow_machine_and_native_coff`. Contextual
+payload bindings remain outside this executable slice.
 
 **Sequencing note (2026-07-21):** T0.1 (ADT type resolution) is complete. T0.2
 was producer-gated until B1a supplied the first real ephemeral value. The

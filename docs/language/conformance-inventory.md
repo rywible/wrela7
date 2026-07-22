@@ -125,9 +125,18 @@ index, and borrowed scrutinee value are sealed independently of the boolean
 result. `runtime_adt_is_tests_unit_variant_without_binding` proves that changing
 the fact to another valid variant is rejected by full sealing; payload-wildcard
 analysis remains covered by `runtime_adt_is_tests_payload_variant_with_wildcard`.
-Semantic lowering fails closed by name at `semantic-runtime-is-lowering-pending`
-(`authenticated_enum_type_test_stops_at_named_lowering_boundary`); native tag
-testing and success-dominated payload bindings are not claimed.
+`authenticated_enum_type_test_lowers_to_canonical_boolean_match` independently
+reauthenticates those facts, pins exact SemanticWir operation N/N-1 and late
+cancellation, rejects a selected-truth-arm forgery, and lowers both unit and
+payload variants to an exhaustive boolean-result match without payload reads.
+Flow accepts only the exact discriminating truth pattern and rejects a
+nondiscriminating forgery
+(`enum_type_test_protocol_rejects_nondiscriminating_truth_arms`). Positive and
+negated tests reach exactly one tag read and no payload read apiece through
+FlowWir, MachineWir, and repeat byte-identical native COFF
+(`enum_type_tests_reach_tag_only_flow_machine_and_native_coff`). Contextual
+payload bindings introduced by an `is` pattern remain analysis-only and are not
+claimed executable.
 
 B1a.2 retention-boundary evidence additionally includes
 `continuation_anchored_bounded_while_keeps_view_live_exactly`,

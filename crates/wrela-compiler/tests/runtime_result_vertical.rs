@@ -939,6 +939,189 @@ fn match_value() -> u64:
 }
 
 #[test]
+fn enum_type_tests_reach_tag_only_flow_machine_and_native_coff() {
+    let fixture = source_fixture_for(
+        r#"module runtime_result.image
+
+from core.image import Image, Target
+
+pub enum Status[T]:
+    idle
+    active(T)
+
+@image
+pub fn boot() -> Image:
+    return Image(name="runtime-result", target=Target.aarch64_qemu_virt_uefi)
+
+@test(runtime)
+fn enum_type_test_runtime():
+    state: Status[u64] = Status.active(7)
+    assert is_active(state), "active tag"
+    assert is_not_idle(state), "negated idle tag"
+    return
+
+fn is_active(value: Status[u64]) -> bool:
+    return value is Status.active(_)
+
+fn is_not_idle(value: Status[u64]) -> bool:
+    return value is not Status.idle
+"#,
+    );
+    let image = analyze_selected(&fixture, "enum_type_test_runtime");
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: image,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("enum type-test SemanticWir")
+        .into_parts()
+        .0;
+    let type_test_matches = semantic
+        .as_wir()
+        .functions
+        .iter()
+        .filter(|function| {
+            function.name.ends_with("is_active") || function.name.ends_with("is_not_idle")
+        })
+        .flat_map(|function| &function.body.statements)
+        .filter_map(|statement| match statement {
+            wrela_semantic_lower::semantic_wir::SemanticStatement::Match {
+                arms, results, ..
+            } if results.len() == 1 => Some(arms),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(type_test_matches.len(), 2);
+    assert!(type_test_matches.iter().all(|arms| {
+        arms.len() == 2
+            && arms.iter().all(|arm| {
+                arm.bindings.is_empty()
+                    && arm.body.parameters.is_empty()
+                    && matches!(arm.body.statements.as_slice(), [
+                        wrela_semantic_lower::semantic_wir::SemanticStatement::Let(statement),
+                        wrela_semantic_lower::semantic_wir::SemanticStatement::Yield(values),
+                    ] if matches!(statement.operation, SemanticOperation::Constant(
+                        wrela_semantic_lower::semantic_wir::Constant::Bool(_)
+                    )) && values == &statement.results)
+            })
+    }));
+
+    let flow = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("enum type-test FlowWir");
+    let flow_model = flow.wir().as_wir();
+    let source_operations = flow_model
+        .functions
+        .iter()
+        .filter(|function| {
+            matches!(
+                function.origin,
+                wrela_backend::flow_wir::FunctionOrigin::SourceSemantic { .. }
+            )
+        })
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .map(|instruction| &instruction.operation)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        source_operations
+            .iter()
+            .filter(|operation| matches!(operation, FlowOperation::EnumTag { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        source_operations
+            .iter()
+            .filter(|operation| matches!(operation, FlowOperation::EnumPayload { .. }))
+            .count(),
+        0
+    );
+    assert_eq!(
+        flow_model
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .filter(|block| matches!(block.terminator, Terminator::Switch { .. }))
+            .count(),
+        2
+    );
+
+    let (flow_wir, _, _) = flow.into_parts();
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: &flow_wir,
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("enum type-test canonical FlowWir frame");
+    let prepared = prepare_canonical_frame_for_codegen(
+        encoded.bytes(),
+        &fixture.target,
+        &fixture.build,
+        &never_cancelled,
+    )
+    .expect("enum type-test MachineWir preparation");
+    let machine = prepared.machine().wir().as_wir();
+    let mut tags = 0usize;
+    let mut payloads = 0usize;
+    let mut switches = 0usize;
+    for function in &machine.functions {
+        if !matches!(
+            function.origin,
+            MachineFunctionOrigin::SourceSemantic { .. }
+        ) {
+            continue;
+        }
+        for block in &function.blocks {
+            tags += block
+                .instructions
+                .iter()
+                .filter(|instruction| {
+                    matches!(instruction.operation, MachineOperation::EnumTag { .. })
+                })
+                .count();
+            payloads += block
+                .instructions
+                .iter()
+                .filter(|instruction| {
+                    matches!(instruction.operation, MachineOperation::EnumPayload { .. })
+                })
+                .count();
+            switches += usize::from(matches!(block.terminator, MachineTerminator::Switch { .. }));
+        }
+    }
+    assert_eq!((tags, payloads, switches), (2, 0, 2));
+
+    match emit_prepared_object(&prepared, &fixture.target, &never_cancelled) {
+        Err(CodegenError::BackendNotBuilt) if !llvm_backend_available() => {}
+        Err(error) => panic!("enum type-test native emission failed: {error}"),
+        Ok(_) if !llvm_backend_available() => {
+            panic!("native object emitted while LLVM reports unavailable")
+        }
+        Ok(first) => {
+            let second = emit_prepared_object(&prepared, &fixture.target, &never_cancelled)
+                .expect("repeat enum type-test native emission");
+            assert_eq!(first.bytes(), second.bytes());
+            let digest = HASHER.sha256(first.bytes());
+            assert_eq!(digest, HASHER.sha256(second.bytes()));
+            inspect_native_object(first.bytes(), digest);
+        }
+    }
+}
+
+#[test]
 fn core_option_scalar_question_reaches_deterministic_native_coff() {
     let fixture = source_fixture_for_option(
         r#"module runtime_result.image

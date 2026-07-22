@@ -3074,6 +3074,12 @@ fn validate_scalar_source_function(
                         return Err(unsupported("terminal closed enum match contract"));
                     };
                     let variant_count = variants.len();
+                    let exact_type_test = !terminal
+                        && enum_ty.is_some_and(|enum_ty| {
+                            exact_enum_type_test_match_protocol(
+                                input, function, enum_ty, arms, results,
+                            )
+                        });
                     if (terminal
                         && (arms.is_empty()
                             || !matches!(contract, ScalarRegionContract::Root)
@@ -3086,7 +3092,7 @@ fn validate_scalar_source_function(
                                     input, function, enum_ty, arms, results,
                                 ) && !exact_option_try_match_protocol(
                                     input, function, enum_ty, arms, results,
-                                )
+                                ) && !exact_type_test
                             }))
                     {
                         return Err(unsupported("terminal closed enum match contract"));
@@ -3113,12 +3119,15 @@ fn validate_scalar_source_function(
                                     .get(variant as usize)
                                     .map(|variant| variant.fields.as_slice())
                                     .ok_or_else(|| unsupported("enum match variant type"))?;
-                                let bindings_match = expected_fields.len() == arm.bindings.len()
+                                let bindings_match = (expected_fields.len() == arm.bindings.len()
                                     && expected_fields.iter().zip(&arm.bindings).all(
                                         |(field, binding)| {
                                             scalar_value_type(function, *binding) == Some(field.ty)
                                         },
-                                    );
+                                    ))
+                                    || (exact_type_test
+                                        && arm.bindings.is_empty()
+                                        && expected_fields.len() <= 1);
                                 !std::mem::replace(slot, true) && bindings_match
                             }
                             None => {
@@ -3439,6 +3448,62 @@ fn exact_option_try_match_protocol(
         } if ty == enum_type.id
     ) && returned.as_slice() == [*propagated_value]
         && scalar_value_type(function, *propagated_value) == Some(enum_type.id)
+}
+
+fn exact_enum_type_test_match_protocol(
+    input: &semantic::SemanticWir,
+    function: &semantic::SemanticFunction,
+    enum_type: &semantic::TypeRecord,
+    arms: &[semantic::SemanticMatchArm],
+    results: &[semantic::ValueId],
+) -> bool {
+    let semantic::TypeKind::Enum { variants } = &enum_type.kind else {
+        return false;
+    };
+    let [result] = results else {
+        return false;
+    };
+    if variants.is_empty()
+        || arms.len() != variants.len()
+        || scalar_value_type(function, *result)
+            .is_none_or(|ty| !semantic_type_is(input, ty, semantic::PrimitiveType::Bool))
+    {
+        return false;
+    }
+    let mut true_arms = 0usize;
+    for (index, (variant, arm)) in variants.iter().zip(arms).enumerate() {
+        if variant.fields.len() > 1
+            || arm.variant != u32::try_from(index).ok()
+            || !arm.bindings.is_empty()
+            || !arm.body.parameters.is_empty()
+            || arm.guard.is_some()
+        {
+            return false;
+        }
+        let [
+            semantic::SemanticStatement::Let(constant),
+            semantic::SemanticStatement::Yield(yielded),
+        ] = arm.body.statements.as_slice()
+        else {
+            return false;
+        };
+        let [constant_value] = constant.results.as_slice() else {
+            return false;
+        };
+        let semantic::SemanticOperation::Constant(semantic::Constant::Bool(value)) =
+            constant.operation
+        else {
+            return false;
+        };
+        if yielded.as_slice() != [*constant_value]
+            || scalar_value_type(function, *constant_value)
+                .is_none_or(|ty| !semantic_type_is(input, ty, semantic::PrimitiveType::Bool))
+        {
+            return false;
+        }
+        true_arms = true_arms.saturating_add(usize::from(value));
+    }
+    true_arms == 1 || true_arms.saturating_add(1) == arms.len()
 }
 
 fn validate_generated_harness(
@@ -6036,18 +6101,20 @@ fn lower_generated_function(
                         .get(scrutinee.0 as usize)
                         .map(|value| value.ty)
                         .ok_or_else(|| unsupported("enum match scrutinee value"))?;
-                    let variants = input
+                    let enum_type = input
                         .types
                         .get(enum_ty.0 as usize)
-                        .and_then(|record| match &record.kind {
-                            semantic::TypeKind::Enum { variants }
-                                if canonical_semantic_enum_shape(input, variants) =>
-                            {
-                                Some(variants.as_slice())
-                            }
-                            _ => None,
-                        })
                         .ok_or_else(|| unsupported("enum match scrutinee type"))?;
+                    let semantic::TypeKind::Enum { variants } = &enum_type.kind else {
+                        return Err(unsupported("enum match scrutinee type"));
+                    };
+                    if !canonical_semantic_enum_shape(input, variants) {
+                        return Err(unsupported("enum match scrutinee type"));
+                    }
+                    let variants = variants.as_slice();
+                    let exact_type_test = exact_enum_type_test_match_protocol(
+                        input, function, enum_type, arms, results,
+                    );
                     if arms.is_empty() || arms.len() > variants.len() {
                         return Err(unsupported("enum match exhaustiveness"));
                     }
@@ -6076,9 +6143,10 @@ fn lower_generated_function(
                         "FlowWir values",
                         limits.model_edges,
                     )?;
-                    let shared_payload = if variants
-                        .iter()
-                        .all(|variant| matches!(variant.fields.as_slice(), [_]))
+                    let shared_payload = if arms.iter().any(|arm| !arm.bindings.is_empty())
+                        && variants
+                            .iter()
+                            .all(|variant| matches!(variant.fields.as_slice(), [_]))
                     {
                         let payload_ty = canonical_semantic_enum_payload(input, variants)
                             .ok_or_else(|| unsupported("enum match canonical payload type"))?;
@@ -6183,6 +6251,7 @@ fn lower_generated_function(
                                 let mut arguments =
                                     try_vec(1, "FlowWir enum case arguments", limits.model_edges)?;
                                 match (variant_fields, arm.bindings.as_slice()) {
+                                    ([], []) | ([_], []) if exact_type_test => {}
                                     ([], []) => {}
                                     ([field], [binding])
                                         if function
@@ -8685,9 +8754,9 @@ mod contract_tests {
 
     use super::{
         CanonicalFlowLowerer, FlowLowerer, LowerError, LowerRequest, LoweringLimits,
-        LoweringReport, actor_flow_program_matches, lower_proof_kind,
-        measure_actor_flow_output_resources, preflight_input, seal, supported_actor_image,
-        supported_source_value_type,
+        LoweringReport, actor_flow_program_matches, exact_enum_type_test_match_protocol,
+        lower_proof_kind, measure_actor_flow_output_resources, preflight_input, seal,
+        supported_actor_image, supported_source_value_type,
     };
     use wrela_build_model::{BuildIdentity, LanguageRevision, Sha256Digest, TargetIdentity};
     use wrela_flow_wir as flow;
@@ -14760,6 +14829,75 @@ mod contract_tests {
             Err(LowerError::UnsupportedInput {
                 feature: "synchronous loop uninterrupted-work proof"
             })
+        ));
+    }
+
+    #[test]
+    fn enum_type_test_protocol_rejects_nondiscriminating_truth_arms() {
+        let input = scalar_generated_fixture().into_wir();
+        let enum_type = semantic::TypeRecord {
+            id: semantic::TypeId(8),
+            source_name: "Status".to_owned(),
+            kind: semantic::TypeKind::Enum {
+                variants: vec![
+                    semantic::VariantType {
+                        name: "idle".to_owned(),
+                        fields: Vec::new(),
+                    },
+                    semantic::VariantType {
+                        name: "active".to_owned(),
+                        fields: vec![semantic::FieldType {
+                            name: String::new(),
+                            ty: semantic::TypeId(2),
+                            public: true,
+                        }],
+                    },
+                ],
+            },
+            linearity: semantic::Linearity::ExplicitCopy,
+            source: Some(span(0, 350, 380)),
+        };
+        let mut function = input.functions[1].clone();
+        function.values = vec![
+            scalar_source_value(0, 8, "state", span(0, 351, 356)),
+            scalar_source_value(1, 1, "idle_test", span(0, 357, 358)),
+            scalar_source_value(2, 1, "active_test", span(0, 359, 360)),
+            scalar_source_value(3, 1, "result", span(0, 351, 380)),
+        ];
+        let arm = |variant, value, truth| semantic::SemanticMatchArm {
+            variant: Some(variant),
+            bindings: Vec::new(),
+            guard: None,
+            body: semantic::SemanticRegion {
+                parameters: Vec::new(),
+                statements: vec![
+                    semantic::SemanticStatement::Let(semantic::LetStatement {
+                        results: vec![semantic::ValueId(value)],
+                        operation: semantic::SemanticOperation::Constant(semantic::Constant::Bool(
+                            truth,
+                        )),
+                        source: Some(span(0, 351, 380)),
+                    }),
+                    semantic::SemanticStatement::Yield(vec![semantic::ValueId(value)]),
+                ],
+            },
+        };
+        let mut arms = vec![arm(0, 1, false), arm(1, 2, true)];
+        let results = [semantic::ValueId(3)];
+        assert!(exact_enum_type_test_match_protocol(
+            &input, &function, &enum_type, &arms, &results,
+        ));
+
+        let semantic::SemanticStatement::Let(semantic::LetStatement {
+            operation: semantic::SemanticOperation::Constant(semantic::Constant::Bool(value)),
+            ..
+        }) = &mut arms[0].body.statements[0]
+        else {
+            panic!("fixture truth arm")
+        };
+        *value = true;
+        assert!(!exact_enum_type_test_match_protocol(
+            &input, &function, &enum_type, &arms, &results,
         ));
     }
 
