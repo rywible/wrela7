@@ -13,8 +13,8 @@ use std::sync::Arc;
 use wrela_build_model::{BuildIdentity, Sha256Digest, ValidatedBuildConfiguration};
 use wrela_diagnostics::{Diagnostic, WithDiagnostics};
 use wrela_hir::{
-    BodyId, DeclarationId, DeclarationKind, Definition, ExpressionId, FunctionColor, StatementId,
-    TypeExpression, TypeExpressionKind, ValidatedProgram,
+    BodyId, DeclarationId, DeclarationKind, Definition, ExpressionId, FunctionColor, LocalId,
+    StatementId, TypeExpression, TypeExpressionKind, ValidatedProgram,
 };
 use wrela_package::PackageId;
 use wrela_source::Span;
@@ -753,6 +753,10 @@ pub enum ExpressionResolution {
         elements: Vec<ValueId>,
         maximum_iterations: u64,
         bounds: ProofId,
+        /// Absent for an inline consumer. Present only for the bounded stored
+        /// form: one immutable local initialized by this expression and one
+        /// later direct `for` reference in the same synchronous body.
+        storage: Option<ClosedArrayStorage>,
     },
     DirectCall {
         function: FunctionInstanceId,
@@ -862,6 +866,13 @@ pub enum ExpressionResolution {
         bounds: ProofId,
     },
     Builtin(IntrinsicOperation),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosedArrayStorage {
+    pub local: LocalId,
+    pub value: ValueId,
+    pub iterable: ExpressionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3097,16 +3108,11 @@ fn validate_exact_body_local_value_flow(
                     locals,
                     is_cancelled,
                 )?;
-                let iterable_effects = exact_child_expression(analysis, function.id, *iterable)
-                    .filter(|fact| {
-                        matches!(
-                            fact.resolution,
-                            ExpressionResolution::ClosedRange { .. }
-                                | ExpressionResolution::ClosedArray { .. }
-                        )
-                    })
-                    .ok_or_else(|| invalid("for iterable fact is not a closed iterator"))?
-                    .effects;
+                let iterable_fact = exact_child_expression(analysis, function.id, *iterable)
+                    .ok_or_else(|| invalid("for iterable fact is not a closed iterator"))?;
+                exact_closed_for_element_type(analysis, function.id, *iterable, iterable_fact)
+                    .ok_or_else(|| invalid("for iterable fact is not a closed iterator"))?;
+                let iterable_effects = iterable_fact.effects;
                 let [definition] = fact.definitions.as_slice() else {
                     return Err(invalid("for local-value binding is missing"));
                 };
@@ -4041,7 +4047,7 @@ fn validate_exact_expression_fact(
         (
             wrela_hir::ExpressionKind::Array(source_elements),
             resolution @ ExpressionResolution::ClosedArray { .. },
-            None,
+            _,
         ) if exact_closed_fixed_array_matches(
             analysis,
             program,
@@ -8135,18 +8141,9 @@ fn validate_exact_statement_fact(
             let iterable_fact = exact_child_expression(analysis, function.id, *iterable)
                 .filter(|fact| fact.result.is_none())
                 .ok_or_else(|| invalid("for iterable is not an exact closed iterator"))?;
-            let element_ty = match iterable_fact.resolution {
-                ExpressionResolution::ClosedRange { .. } => iterable_fact.ty,
-                ExpressionResolution::ClosedArray { .. } => analysis
-                    .types
-                    .get(iterable_fact.ty.0 as usize)
-                    .and_then(|record| match record.kind {
-                        SemanticTypeKind::Array { element, .. } => Some(element),
-                        _ => None,
-                    })
-                    .ok_or_else(|| invalid("fixed-array iterator has no exact element type"))?,
-                _ => return Err(invalid("for iterable is not an exact closed iterator")),
-            };
+            let element_ty =
+                exact_closed_for_element_type(analysis, function.id, *iterable, iterable_fact)
+                    .ok_or_else(|| invalid("for iterable is not an exact closed iterator"))?;
             let local_record = program
                 .locals
                 .get(binding.0 as usize)
@@ -9738,6 +9735,55 @@ fn exact_closed_literal_range_matches(
         && range.effects == EffectSet(start_fact.effects.0 | end_fact.effects.0)
 }
 
+fn exact_closed_for_element_type(
+    analysis: &PartialAnalysis,
+    function: FunctionInstanceId,
+    iterable: ExpressionId,
+    iterable_fact: &ExpressionFact,
+) -> Option<SemanticTypeId> {
+    if iterable_fact.function != function || iterable_fact.result.is_some() {
+        return None;
+    }
+    match iterable_fact.resolution {
+        ExpressionResolution::ClosedRange { .. } => Some(iterable_fact.ty),
+        ExpressionResolution::ClosedArray { storage: None, .. } => analysis
+            .types
+            .get(iterable_fact.ty.0 as usize)
+            .and_then(|record| match record.kind {
+                SemanticTypeKind::Array { element, .. } => Some(element),
+                _ => None,
+            }),
+        ExpressionResolution::Value(value) => analysis.expressions.iter().find_map(|fact| {
+            if fact.function != function || fact.result != Some(value) {
+                return None;
+            }
+            let ExpressionResolution::ClosedArray {
+                storage:
+                    Some(ClosedArrayStorage {
+                        value: stored,
+                        iterable: stored_iterable,
+                        ..
+                    }),
+                ..
+            } = fact.resolution
+            else {
+                return None;
+            };
+            if stored != value || stored_iterable != iterable || fact.ty != iterable_fact.ty {
+                return None;
+            }
+            analysis
+                .types
+                .get(fact.ty.0 as usize)
+                .and_then(|record| match record.kind {
+                    SemanticTypeKind::Array { element, .. } => Some(element),
+                    _ => None,
+                })
+        }),
+        _ => None,
+    }
+}
+
 fn exact_closed_fixed_array_matches(
     analysis: &PartialAnalysis,
     program: &wrela_hir::Program,
@@ -9750,6 +9796,7 @@ fn exact_closed_fixed_array_matches(
         elements,
         maximum_iterations,
         bounds,
+        storage,
     } = resolution
     else {
         return false;
@@ -9757,11 +9804,7 @@ fn exact_closed_fixed_array_matches(
     let Ok(length) = u64::try_from(source_elements.len()) else {
         return false;
     };
-    if length == 0
-        || *maximum_iterations != length
-        || source_elements.len() != elements.len()
-        || array.result.is_some()
-    {
+    if length == 0 || *maximum_iterations != length || source_elements.len() != elements.len() {
         return false;
     }
     let Some(source) = program
@@ -9777,43 +9820,176 @@ fn exact_closed_fixed_array_matches(
     else {
         return false;
     };
-    let iteration_uses = program
-        .statements
-        .iter()
-        .filter(|statement| {
-            matches!(
-                statement.kind,
-                wrela_hir::StatementKind::For { iterable, .. } if iterable == array.expression
+    let (subject, explanation, second_source) = match storage {
+        None => {
+            if array.result.is_some() {
+                return false;
+            }
+            let iteration_uses = program
+                .statements
+                .iter()
+                .filter(|statement| {
+                    matches!(
+                        statement.kind,
+                        wrela_hir::StatementKind::For { iterable, .. }
+                            if iterable == array.expression
+                    )
+                })
+                .count();
+            let match_uses = program
+                .statements
+                .iter()
+                .filter(|statement| {
+                    matches!(
+                        statement.kind,
+                        wrela_hir::StatementKind::Match { scrutinee, .. }
+                            if scrutinee == array.expression
+                    )
+                })
+                .count();
+            match (iteration_uses, match_uses) {
+                (1, 0) => (
+                    "inline fixed-array iteration",
+                    "every generated index is strictly below the exact inline array length",
+                    None,
+                ),
+                (0, 1) => (
+                    "inline fixed-array pattern match",
+                    "every array-pattern position is authenticated against the exact inline array length",
+                    None,
+                ),
+                _ => return false,
+            }
+        }
+        Some(storage) => {
+            if array.result != Some(storage.value) {
+                return false;
+            }
+            let Some(value) = analysis
+                .values
+                .get(storage.value.0 as usize)
+                .filter(|value| {
+                    value.function == function
+                        && value.ty == array.ty
+                        && value.origin == SemanticValueOrigin::Local(storage.local)
+                        && value.category == ValueCategory::Value
+                        && value.class == SemanticValueClass::FirstClass
+                })
+            else {
+                return false;
+            };
+            let Some(local) = program
+                .locals
+                .get(storage.local.0 as usize)
+                .filter(|local| {
+                    local.id == storage.local
+                        && local.ty.is_none()
+                        && value.source == Some(local.source)
+                        && value.source_name.as_deref() == Some(local.name.as_str())
+                })
+            else {
+                return false;
+            };
+            let Some(initialization) = program.statements.iter().find(|statement| {
+                statement.body == local.body
+                    && matches!(
+                        statement.kind,
+                        wrela_hir::StatementKind::Initialize {
+                            local: initialized,
+                            value,
+                        } if initialized == storage.local && value == array.expression
+                    )
+            }) else {
+                return false;
+            };
+            let Some(iterable) = program.expression(storage.iterable).filter(|expression| {
+                expression.kind
+                    == wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(
+                        storage.local,
+                    ))
+                    && expression.owner == wrela_hir::ExpressionOwner::Body(local.body)
+            }) else {
+                return false;
+            };
+            let references = program
+                .expressions
+                .iter()
+                .filter(|expression| {
+                    expression.kind
+                        == wrela_hir::ExpressionKind::Reference(wrela_hir::Definition::Local(
+                            storage.local,
+                        ))
+                })
+                .count();
+            let Some(iteration) = program.statements.iter().find(|statement| {
+                statement.body == local.body
+                    && matches!(
+                        statement.kind,
+                        wrela_hir::StatementKind::For {
+                            take_binding: false,
+                            take_iterable: false,
+                            iterable: candidate,
+                            ..
+                        } if candidate == storage.iterable
+                    )
+            }) else {
+                return false;
+            };
+            let Some(body) = program.body(local.body) else {
+                return false;
+            };
+            let initializer_index = body
+                .statements
+                .iter()
+                .position(|statement| *statement == initialization.id);
+            let iteration_index = body
+                .statements
+                .iter()
+                .position(|statement| *statement == iteration.id);
+            if references != 1
+                || initializer_index
+                    .zip(iteration_index)
+                    .is_none_or(|(init, use_)| init >= use_)
+                || program.statements.iter().any(|statement| {
+                    matches!(
+                        &statement.kind,
+                        wrela_hir::StatementKind::Assign { targets, .. }
+                            if targets.iter().any(|target| {
+                                target.root
+                                    == wrela_hir::Definition::Local(storage.local)
+                            })
+                    )
+                })
+            {
+                return false;
+            }
+            let Some(iterable_fact) = exact_child_expression(analysis, function, storage.iterable)
+            else {
+                return false;
+            };
+            if iterable_fact.ty != array.ty
+                || iterable_fact.result.is_some()
+                || iterable_fact.resolution != ExpressionResolution::Value(storage.value)
+                || iterable_fact.effects != EffectSet(0)
+                || iterable_fact.ownership_before != OwnershipState::Owned
+                || iterable_fact.ownership_after != OwnershipState::Owned
+            {
+                return false;
+            }
+            (
+                "stored fixed-array iteration",
+                "the immutable local retains the initializer's exact extent and every generated index is strictly below it",
+                Some(iterable.source),
             )
-        })
-        .count();
-    let match_uses = program
-        .statements
-        .iter()
-        .filter(|statement| {
-            matches!(
-                statement.kind,
-                wrela_hir::StatementKind::Match { scrutinee, .. }
-                    if scrutinee == array.expression
-            )
-        })
-        .count();
-    let exact_use = match (iteration_uses, match_uses) {
-        (1, 0) => Some((
-            "inline fixed-array iteration",
-            "every generated index is strictly below the exact inline array length",
-        )),
-        (0, 1) => Some((
-            "inline fixed-array pattern match",
-            "every array-pattern position is authenticated against the exact inline array length",
-        )),
-        _ => None,
+        }
     };
     if proof.kind != ProofKind::CapacityBound
-        || exact_use.is_none_or(|(subject, explanation)| {
-            proof.subject != subject || proof.explanation.as_slice() != [explanation]
-        })
-        || proof.sources.as_slice() != [source]
+        || proof.subject != subject
+        || proof.explanation.as_slice() != [explanation]
+        || match second_source {
+            Some(iterable) => proof.sources.as_slice() != [source, iterable],
+            None => proof.sources.as_slice() != [source],
+        }
         || !proof.depends_on.is_empty()
         || proof.bound != Some(length)
     {
@@ -10537,6 +10713,7 @@ fn valid_expression_resolution(
             elements,
             maximum_iterations,
             bounds,
+            storage: _,
         } => elements
             .first()
             .and_then(|first| analysis.values.get(first.0 as usize))

@@ -8,7 +8,7 @@ use crate::comptime_check::{
 use wrela_diagnostics::{Category, Diagnostic, Severity};
 use wrela_hir::{
     AssignmentOperator, BodyId, Builtin, DeclarationKind, Definition, ExpressionId, ExpressionKind,
-    FunctionColor, Literal, LocalId, StatementId, StatementKind, TypeExpression,
+    ExpressionOwner, FunctionColor, Literal, LocalId, StatementId, StatementKind, TypeExpression,
     TypeExpressionKind,
 };
 use wrela_test_model::{
@@ -5026,6 +5026,20 @@ fn analyze_runtime_body(
                                 is_cancelled,
                             )?)
                         }
+                        Some(ExpressionKind::Array(elements)) => {
+                            Some(ensure_stored_fixed_array_initializer_type(
+                                request,
+                                partial,
+                                function,
+                                statement_id,
+                                body_id,
+                                *local,
+                                *value,
+                                elements,
+                                &mut *aggregate_work,
+                                is_cancelled,
+                            )?)
+                        }
                         _ => return Err(AnalysisFailure::RequestMismatch.into()),
                     }
                 } else {
@@ -6524,6 +6538,7 @@ fn analyze_closed_range_for(
                         elements,
                         maximum_iterations,
                         bounds,
+                        storage: None,
                     },
                     effects,
                     ownership_before: OwnershipState::Owned,
@@ -6531,6 +6546,123 @@ fn analyze_closed_range_for(
                 },
             )?;
             (element_ty, effects)
+        }
+        ExpressionKind::Reference(Definition::Local(local)) => {
+            if take_binding || take_iterable {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    statement_record.source,
+                    "semantic-for-stored-array-take-pending",
+                    "stored fixed-array iteration does not admit take syntax",
+                    "this slice reads copy-scalar elements from one immutable owned local without consuming its storage",
+                    "remove both take markers",
+                ));
+            }
+            let binding = locals
+                .get(local.0 as usize)
+                .copied()
+                .flatten()
+                .filter(|binding| {
+                    binding.state == OwnershipState::Owned
+                        && binding.authority == RuntimeAuthority::Own
+                        && binding.origin == RuntimeBindingOrigin::Local(*local)
+                })
+                .ok_or_else(|| {
+                    runtime_type_diagnostic(
+                        request,
+                        iterable_record.source,
+                        "semantic-for-stored-array-unavailable",
+                        "stored fixed-array local is not a live immutable owned value",
+                        "iteration requires the exact value produced by its single initializer",
+                        "iterate before any move, reassignment, or mutation",
+                    )
+                })?;
+            let array_ty = partial
+                .values
+                .get(binding.value.0 as usize)
+                .filter(|value| value.function == function)
+                .map(|value| value.ty)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            let element_ty = partial
+                .types
+                .get(array_ty.0 as usize)
+                .and_then(|record| match record.kind {
+                    SemanticTypeKind::Array { element, length }
+                        if length > 0 && record.linearity == Linearity::ExplicitCopy =>
+                    {
+                        Some(element)
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    runtime_type_diagnostic(
+                        request,
+                        iterable_record.source,
+                        "semantic-for-iteration-target",
+                        "for-loop local is not an admitted stored fixed array",
+                        "only a source-authenticated immutable boolean/default-i64 array initializer carries the stored iteration witness",
+                        "initialize one inferred local from a supported fixed-array literal",
+                    )
+                })?;
+            let authentic = partial.expressions.iter().any(|fact| {
+                fact.function == function
+                    && fact.ty == array_ty
+                    && fact.result == Some(binding.value)
+                    && matches!(
+                        fact.resolution,
+                        ExpressionResolution::ClosedArray {
+                            storage: Some(ClosedArrayStorage {
+                                local: stored_local,
+                                value,
+                                iterable: stored_iterable,
+                            }),
+                            ..
+                        } if stored_local == *local
+                            && value == binding.value
+                            && stored_iterable == iterable
+                    )
+            });
+            if !authentic {
+                return Err(AnalysisFailure::RequestMismatch.into());
+            }
+            let _index_ty = ensure_primitive_type(
+                request,
+                partial,
+                PrimitiveSemanticType::Integer {
+                    signed: false,
+                    bits: 64,
+                    pointer_sized: false,
+                },
+                aggregate_work,
+                is_cancelled,
+            )?;
+            let _condition_ty = ensure_primitive_type(
+                request,
+                partial,
+                PrimitiveSemanticType::Bool,
+                aggregate_work,
+                is_cancelled,
+            )?;
+            let slot = locals
+                .get_mut(local.0 as usize)
+                .ok_or(AnalysisFailure::RequestMismatch)?;
+            let outcome = reference_operand(
+                request,
+                partial,
+                (function, iterable),
+                binding,
+                RuntimeExpressionRequest {
+                    expected: Some(array_ty),
+                    desired_result: None,
+                    access: AccessMode::Read,
+                },
+                slot,
+                is_cancelled,
+            )?;
+            if outcome.result.is_some() || outcome.referenced != Some(binding.value) {
+                return Err(AnalysisFailure::RequestMismatch.into());
+            }
+            (element_ty, outcome.effects)
         }
         _ => {
             return Err(runtime_type_diagnostic(
@@ -7283,6 +7415,7 @@ fn analyze_closed_fixed_array_match(
                 elements,
                 maximum_iterations: length,
                 bounds,
+                storage: None,
             },
             effects,
             ownership_before: OwnershipState::Owned,
@@ -8448,6 +8581,16 @@ fn analyze_runtime_expression(
                 effects: EffectSet(0),
             })
         }
+        ExpressionKind::Array(elements) => analyze_stored_fixed_array_expression(
+            request,
+            partial,
+            function,
+            expression_id,
+            elements,
+            expression_request,
+            state,
+            is_cancelled,
+        ),
         ExpressionKind::Reference(Definition::Local(local)) => {
             let slot = state
                 .locals
@@ -20344,6 +20487,388 @@ fn ensure_closed_fixed_array_type(
         source: None,
     });
     Ok(id)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StoredFixedArrayShape {
+    local: LocalId,
+    iterable: ExpressionId,
+    element_is_bool: bool,
+    length: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_stored_fixed_array_expression(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    expression: ExpressionId,
+    elements: &[ExpressionId],
+    expression_request: RuntimeExpressionRequest,
+    state: &mut RuntimeState<'_>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<RuntimeExpression> {
+    if expression_request.access != AccessMode::Value {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    let value = expression_request
+        .desired_result
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let value_record = partial
+        .values
+        .get(value.0 as usize)
+        .filter(|record| record.function == function)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let expected = expression_request.expected.unwrap_or(value_record.ty);
+    if expected != value_record.ty {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    let SemanticValueOrigin::Local(local) = value_record.origin else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    let program = request.hir.as_program();
+    let expression_record = program
+        .expression(expression)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let ExpressionOwner::Body(body) = expression_record.owner else {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    };
+    let initialization = containing_statement_for_expression(program, expression_record)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let shape = stored_fixed_array_shape(
+        request,
+        partial,
+        function,
+        initialization,
+        body,
+        local,
+        expression,
+        elements,
+        is_cancelled,
+    )?;
+    let element_ty = partial
+        .types
+        .get(expected.0 as usize)
+        .and_then(|record| match record.kind {
+            SemanticTypeKind::Array { element, length }
+                if length == shape.length
+                    && record.linearity == Linearity::ExplicitCopy
+                    && partial
+                        .types
+                        .get(element.0 as usize)
+                        .is_some_and(|element_record| {
+                            element_record.linearity == Linearity::ScalarCopy
+                                && matches!(
+                                    (&element_record.kind, shape.element_is_bool),
+                                    (SemanticTypeKind::Bool, true)
+                                        | (
+                                            SemanticTypeKind::Integer {
+                                                signed: true,
+                                                bits: 64,
+                                                pointer_sized: false,
+                                            },
+                                            false
+                                        )
+                                )
+                        }) =>
+            {
+                Some(element)
+            }
+            _ => None,
+        })
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let mut semantic_elements = Vec::new();
+    semantic_elements
+        .try_reserve_exact(elements.len())
+        .map_err(|_| fact_resource(request, "stored fixed-array elements"))?;
+    let mut effects = EffectSet(0);
+    for source_element in elements {
+        check_cancelled(is_cancelled)?;
+        let outcome = analyze_runtime_expression(
+            request,
+            partial,
+            function,
+            *source_element,
+            RuntimeExpressionRequest {
+                expected: Some(element_ty),
+                desired_result: None,
+                access: AccessMode::Value,
+            },
+            state,
+            is_cancelled,
+        )?;
+        semantic_elements.push(outcome.result.ok_or(AnalysisFailure::RequestMismatch)?);
+        effects.0 |= outcome.effects.0;
+    }
+    let iterable_source = program
+        .expression(shape.iterable)
+        .map(|record| record.source)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let bounds = append_capacity_proof(
+        request,
+        partial,
+        "stored fixed-array iteration".to_owned(),
+        vec![expression_record.source, iterable_source],
+        shape.length,
+        "the immutable local retains the initializer's exact extent and every generated index is strictly below it",
+    )?;
+    append_expression_fact(
+        request,
+        partial,
+        RuntimeExpressionFact {
+            function,
+            expression,
+            ty: expected,
+            result: Some(value),
+            resolution: ExpressionResolution::ClosedArray {
+                elements: semantic_elements,
+                maximum_iterations: shape.length,
+                bounds,
+                storage: Some(ClosedArrayStorage {
+                    local: shape.local,
+                    value,
+                    iterable: shape.iterable,
+                }),
+            },
+            effects,
+            ownership_before: OwnershipState::Owned,
+            ownership_after: OwnershipState::Owned,
+        },
+    )?;
+    Ok(RuntimeExpression {
+        ty: expected,
+        result: Some(value),
+        referenced: None,
+        effects,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_stored_fixed_array_initializer_type(
+    request: &AnalysisRequest<'_>,
+    partial: &mut PartialAnalysis,
+    function: FunctionInstanceId,
+    initialization: StatementId,
+    body: BodyId,
+    local: LocalId,
+    array: ExpressionId,
+    elements: &[ExpressionId],
+    aggregate_work: &mut RuntimeAggregateWork,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<SemanticTypeId> {
+    let shape = stored_fixed_array_shape(
+        request,
+        partial,
+        function,
+        initialization,
+        body,
+        local,
+        array,
+        elements,
+        is_cancelled,
+    )?;
+    let element = ensure_primitive_type(
+        request,
+        partial,
+        if shape.element_is_bool {
+            PrimitiveSemanticType::Bool
+        } else {
+            PrimitiveSemanticType::Integer {
+                signed: true,
+                bits: 64,
+                pointer_sized: false,
+            }
+        },
+        aggregate_work,
+        is_cancelled,
+    )?;
+    Ok(ensure_closed_fixed_array_type(
+        request,
+        partial,
+        element,
+        shape.length,
+        aggregate_work,
+        is_cancelled,
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stored_fixed_array_shape(
+    request: &AnalysisRequest<'_>,
+    partial: &PartialAnalysis,
+    function: FunctionInstanceId,
+    initialization: StatementId,
+    body: BodyId,
+    local: LocalId,
+    array: ExpressionId,
+    elements: &[ExpressionId],
+    is_cancelled: &dyn Fn() -> bool,
+) -> RuntimeResult<StoredFixedArrayShape> {
+    let program = request.hir.as_program();
+    let initialization_record = program
+        .statement(initialization)
+        .filter(|statement| {
+            statement.body == body
+                && matches!(
+                    statement.kind,
+                    StatementKind::Initialize {
+                        local: initialized,
+                        value,
+                    } if initialized == local && value == array
+                )
+        })
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let local_record = program
+        .locals
+        .get(local.0 as usize)
+        .filter(|record| record.id == local && record.body == body && record.ty.is_none())
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if partial
+        .functions
+        .get(function.0 as usize)
+        .is_none_or(|record| record.color != FunctionColor::Sync)
+    {
+        return Err(runtime_type_diagnostic(
+            request,
+            local_record.source,
+            "semantic-for-stored-array-async-pending",
+            "stored fixed-array iteration is not admitted in an asynchronous frame",
+            "this bounded slice keeps the owned array local entirely inside one synchronous runtime body",
+            "move the array initialization and loop into a synchronous helper",
+        ));
+    }
+    let Some(first) = elements.first().copied() else {
+        return Err(runtime_type_diagnostic(
+            request,
+            initialization_record.source,
+            "semantic-for-stored-array-empty-type-pending",
+            "empty stored fixed-array iteration has no inferred element type",
+            "the inferred local has no explicit array element annotation",
+            "use a nonempty homogeneous boolean or default-i64 literal array",
+        ));
+    };
+    let length = u64::try_from(elements.len())
+        .map_err(|_| fact_resource(request, "stored fixed-array elements"))?;
+    if length > request.limits.fact_edges {
+        return Err(fact_resource(request, "stored fixed-array elements").into());
+    }
+    let first_is_bool = program.expression(first).is_some_and(|element| {
+        matches!(element.kind, ExpressionKind::Literal(Literal::Boolean(_)))
+    });
+    for element in elements {
+        check_cancelled(is_cancelled)?;
+        let Some(record) = program.expression(*element) else {
+            return Err(AnalysisFailure::RequestMismatch.into());
+        };
+        match record.kind {
+            ExpressionKind::Literal(Literal::Boolean(_)) if first_is_bool => {}
+            ExpressionKind::Literal(Literal::Integer(_)) if !first_is_bool => {}
+            ExpressionKind::Literal(Literal::Boolean(_) | Literal::Integer(_)) => {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    record.source,
+                    "semantic-for-stored-array-element-type",
+                    "stored fixed-array elements do not have one inferred scalar type",
+                    "boolean and default-i64 literals cannot share one owned array type",
+                    "use only booleans or only nonnegative integer literals",
+                ));
+            }
+            _ => {
+                return Err(runtime_type_diagnostic(
+                    request,
+                    record.source,
+                    "semantic-for-stored-array-element-shape",
+                    "stored fixed-array element is not an admitted scalar literal",
+                    "this slice authenticates one source-ordered array of boolean or default-i64 literals",
+                    "use direct boolean or nonnegative integer literals",
+                ));
+            }
+        }
+    }
+    if program.statements.iter().any(|statement| {
+        matches!(
+            &statement.kind,
+            StatementKind::Assign { targets, .. }
+                if targets.iter().any(|target| target.root == Definition::Local(local))
+        )
+    }) {
+        return Err(runtime_type_diagnostic(
+            request,
+            local_record.source,
+            "semantic-for-stored-array-reassigned",
+            "stored fixed-array local is reassigned or mutated",
+            "the exact element sequence and extent are sealed at its single initializer",
+            "keep the array local immutable through its one loop",
+        ));
+    }
+    let mut references = Vec::new();
+    for expression in &program.expressions {
+        check_cancelled(is_cancelled)?;
+        if expression.kind == ExpressionKind::Reference(Definition::Local(local)) {
+            references
+                .try_reserve_exact(1)
+                .map_err(|_| fact_resource(request, "stored fixed-array references"))?;
+            references.push(expression);
+        }
+    }
+    let [iterable_record] = references.as_slice() else {
+        let code = if references.is_empty() {
+            "semantic-for-stored-array-use-pending"
+        } else {
+            "semantic-for-stored-array-multiple-uses-pending"
+        };
+        return Err(runtime_type_diagnostic(
+            request,
+            local_record.source,
+            code,
+            "stored fixed-array local does not have one exact iteration use",
+            "the bounded contract admits exactly one later direct non-taking for-loop reference and no other read, capture, call, return, match, or nested use",
+            "consume the immutable local once as `for item in local`",
+        ));
+    };
+    let iterable = iterable_record.id;
+    let Some(for_statement) = containing_statement_for_expression(program, iterable_record)
+        .and_then(|statement| program.statement(statement))
+        .filter(|statement| {
+            statement.body == body
+                && matches!(
+                    statement.kind,
+                    StatementKind::For {
+                        iterable: candidate,
+                        ..
+                    } if candidate == iterable
+                )
+        })
+    else {
+        return Err(runtime_type_diagnostic(
+            request,
+            iterable_record.source,
+            "semantic-for-stored-array-use-pending",
+            "stored fixed-array local is used outside its one direct for-loop target",
+            "call, return, capture, match, nested-body, and general expression consumers are not part of the stored-array ABI",
+            "use the local directly as the target of one later for loop",
+        ));
+    };
+    let containing = program.body(body).ok_or(AnalysisFailure::RequestMismatch)?;
+    let initializer_index = containing
+        .statements
+        .iter()
+        .position(|candidate| *candidate == initialization)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    let for_index = containing
+        .statements
+        .iter()
+        .position(|candidate| *candidate == for_statement.id)
+        .ok_or(AnalysisFailure::RequestMismatch)?;
+    if initializer_index >= for_index {
+        return Err(AnalysisFailure::RequestMismatch.into());
+    }
+    Ok(StoredFixedArrayShape {
+        local,
+        iterable,
+        element_is_bool: first_is_bool,
+        length,
+    })
 }
 
 fn primitive_from_builtin(
@@ -39394,6 +39919,7 @@ fn projection_fixture():
             ref elements,
             maximum_iterations,
             bounds,
+            ..
         } = array.resolution
         else {
             unreachable!()
@@ -39515,6 +40041,420 @@ fn projection_fixture():
     }
 
     #[test]
+    fn stored_fixed_array_for_loop_preserves_exact_local_and_iterable_provenance() {
+        let source = dot_variant_actor_source(
+            "fn consume_values():\n    values = [1, 2, 3]\n    for item in values:\n        observed: i64 = item\n        pass\n\nasync fn checkpoint():\n    consume_values()\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("stored fixed-array analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "the stored fixed-array loop must analyze cleanly: {:?}",
+            output.diagnostics()
+        );
+        let image = output
+            .successful()
+            .expect("sealed stored fixed-array image");
+        let array = image
+            .facts()
+            .expressions
+            .iter()
+            .find(|fact| {
+                matches!(
+                    fact.resolution,
+                    ExpressionResolution::ClosedArray {
+                        storage: Some(_),
+                        ..
+                    }
+                )
+            })
+            .expect("stored fixed-array initializer fact");
+        let ExpressionResolution::ClosedArray {
+            ref elements,
+            maximum_iterations,
+            bounds,
+            storage: Some(storage),
+        } = array.resolution
+        else {
+            unreachable!()
+        };
+        assert_eq!(elements.len(), 3);
+        assert_eq!(maximum_iterations, 3);
+        assert_eq!(array.result, Some(storage.value));
+        let stored_value = &image.facts().values[storage.value.0 as usize];
+        assert_eq!(
+            stored_value.origin,
+            SemanticValueOrigin::Local(storage.local)
+        );
+        assert_eq!(stored_value.source_name.as_deref(), Some("values"));
+        let iterable = image
+            .facts()
+            .expressions
+            .iter()
+            .find(|fact| fact.expression == storage.iterable)
+            .expect("stored fixed-array iterable reference fact");
+        assert_eq!(iterable.result, None);
+        assert_eq!(iterable.ty, array.ty);
+        assert_eq!(
+            iterable.resolution,
+            ExpressionResolution::Value(storage.value)
+        );
+        let for_statement = image
+            .facts()
+            .statements
+            .iter()
+            .find(|fact| {
+                image
+                    .hir()
+                    .as_program()
+                    .statement(fact.statement)
+                    .is_some_and(|statement| {
+                        matches!(
+                            statement.kind,
+                            StatementKind::For { iterable, .. }
+                                if iterable == storage.iterable
+                        )
+                    })
+            })
+            .expect("stored fixed-array for statement");
+        let [loop_definition] = for_statement.definitions.as_slice() else {
+            panic!("one exact stored-array loop binding")
+        };
+        let loop_value = &image.facts().values[loop_definition.value.0 as usize];
+        assert_eq!(
+            loop_value.origin,
+            SemanticValueOrigin::Local(loop_definition.local)
+        );
+        assert_eq!(loop_value.source_name.as_deref(), Some("item"));
+        let proof = &image.facts().proofs[bounds.0 as usize];
+        assert_eq!(proof.kind, ProofKind::CapacityBound);
+        assert_eq!(proof.subject, "stored fixed-array iteration");
+        assert_eq!(proof.sources.len(), 2);
+        assert_eq!(proof.bound, Some(3));
+        let stored_iterable = storage.iterable;
+        let stored_value_id = storage.value;
+        let first_element = elements[0];
+
+        let mut wrong_local = image.facts().clone();
+        let ExpressionResolution::ClosedArray {
+            storage: Some(forged_storage),
+            ..
+        } = &mut wrong_local
+            .expressions
+            .iter_mut()
+            .find(|fact| fact.expression == array.expression)
+            .expect("mutable stored array")
+            .resolution
+        else {
+            unreachable!()
+        };
+        forged_storage.local = image
+            .hir()
+            .as_program()
+            .locals
+            .iter()
+            .find(|local| local.name.as_str() == "item")
+            .expect("loop binding local")
+            .id;
+        assert!(
+            wrong_local
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut wrong_value = image.facts().clone();
+        let ExpressionResolution::ClosedArray {
+            storage: Some(forged_storage),
+            ..
+        } = &mut wrong_value
+            .expressions
+            .iter_mut()
+            .find(|fact| fact.expression == array.expression)
+            .expect("mutable stored array")
+            .resolution
+        else {
+            unreachable!()
+        };
+        forged_storage.value = first_element;
+        assert!(
+            wrong_value
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut wrong_iterable = image.facts().clone();
+        let ExpressionResolution::ClosedArray {
+            storage: Some(forged_storage),
+            ..
+        } = &mut wrong_iterable
+            .expressions
+            .iter_mut()
+            .find(|fact| fact.expression == array.expression)
+            .expect("mutable stored array")
+            .resolution
+        else {
+            unreachable!()
+        };
+        forged_storage.iterable = array.expression;
+        assert!(
+            wrong_iterable
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut wrong_order = image.facts().clone();
+        let ExpressionResolution::ClosedArray { elements, .. } = &mut wrong_order
+            .expressions
+            .iter_mut()
+            .find(|fact| fact.expression == array.expression)
+            .expect("mutable stored array")
+            .resolution
+        else {
+            unreachable!()
+        };
+        elements.swap(0, 1);
+        assert!(
+            wrong_order
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut wrong_extent = image.facts().clone();
+        let ExpressionResolution::ClosedArray {
+            maximum_iterations, ..
+        } = &mut wrong_extent
+            .expressions
+            .iter_mut()
+            .find(|fact| fact.expression == array.expression)
+            .expect("mutable stored array")
+            .resolution
+        else {
+            unreachable!()
+        };
+        *maximum_iterations = 2;
+        assert!(
+            wrong_extent
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut wrong_type = image.facts().clone();
+        let SemanticTypeKind::Array { length, .. } =
+            &mut wrong_type.types[array.ty.0 as usize].kind
+        else {
+            unreachable!()
+        };
+        *length = 2;
+        assert!(
+            wrong_type
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut wrong_proof = image.facts().clone();
+        wrong_proof.proofs[bounds.0 as usize].sources.swap(0, 1);
+        assert!(
+            wrong_proof
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut wrong_reference = image.facts().clone();
+        wrong_reference
+            .expressions
+            .iter_mut()
+            .find(|fact| fact.expression == stored_iterable)
+            .expect("mutable iterable fact")
+            .resolution = ExpressionResolution::Value(first_element);
+        assert!(
+            wrong_reference
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let mut wrong_binding = image.facts().clone();
+        wrong_binding
+            .statements
+            .iter_mut()
+            .find(|fact| fact.statement == for_statement.statement)
+            .expect("mutable stored-array for statement")
+            .definitions[0]
+            .value = stored_value_id;
+        assert!(
+            wrong_binding
+                .validate_for_seal(image.hir(), &|| false)
+                .is_err()
+        );
+
+        let exact_expressions = u32::try_from(image.facts().expressions.len())
+            .expect("stored-array expression fact count");
+        let exact_values =
+            u32::try_from(image.facts().values.len()).expect("stored-array value count");
+        let mut exact_limits = AnalysisLimits::standard();
+        exact_limits.expression_facts = exact_expressions;
+        exact_limits.values = exact_values;
+        assert!(
+            CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, exact_limits),
+                    &|| false,
+                )
+                .expect("exact stored-array fact and value limits")
+                .successful()
+                .is_some()
+        );
+        let mut one_fewer_fact = exact_limits;
+        one_fewer_fact.expression_facts -= 1;
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, one_fewer_fact),
+                &|| false,
+            ),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "expression facts",
+                ..
+            })
+        ));
+        let mut one_fewer_value = exact_limits;
+        one_fewer_value.values -= 1;
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, one_fewer_value),
+                &|| false,
+            ),
+            Err(AnalysisFailure::ResourceLimit {
+                resource: "semantic values",
+                ..
+            })
+        ));
+
+        let polls = Cell::new(0_u32);
+        let counted = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, exact_limits),
+                &|| {
+                    polls.set(polls.get().saturating_add(1));
+                    false
+                },
+            )
+            .expect("count stored fixed-array analysis polls");
+        assert!(counted.successful().is_some());
+        let final_poll = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticAnalyzer::new().analyze(
+                parsed_actor_request(&fixture, &changes, exact_limits),
+                &|| {
+                    let next = polls.get().saturating_add(1);
+                    polls.set(next);
+                    next == final_poll
+                },
+            ),
+            Err(AnalysisFailure::Cancelled)
+        ));
+        assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn stored_boolean_fixed_array_iteration_preserves_element_type() {
+        let source = dot_variant_actor_source(
+            "fn consume_flags():\n    flags = [true, false, true]\n    for flag in flags:\n        observed: bool = flag\n        pass\n\nasync fn checkpoint():\n    consume_flags()\n\n",
+        );
+        let fixture = parsed_actor_fixture(&source);
+        let changes = no_changes();
+        let output = CanonicalSemanticAnalyzer::new()
+            .analyze(
+                parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                &|| false,
+            )
+            .expect("stored boolean fixed-array analysis");
+        assert!(
+            output.diagnostics().is_empty(),
+            "{:?}",
+            output.diagnostics()
+        );
+        let image = output.successful().expect("sealed stored boolean array");
+        let flag = image
+            .facts()
+            .values
+            .iter()
+            .find(|value| value.source_name.as_deref() == Some("flag"))
+            .expect("boolean loop binding");
+        assert!(matches!(
+            image.facts().types[flag.ty.0 as usize].kind,
+            SemanticTypeKind::Bool
+        ));
+    }
+
+    #[test]
+    fn stored_fixed_array_for_tails_fail_closed_by_name() {
+        for (body, code) in [
+            (
+                "async fn checkpoint():\n    values = [1, 2]\n    for item in values:\n        pass\n\n",
+                "semantic-for-stored-array-async-pending",
+            ),
+            (
+                "fn consume_values():\n    values = []\n    for item in values:\n        pass\n\nasync fn checkpoint():\n    consume_values()\n\n",
+                "semantic-for-stored-array-empty-type-pending",
+            ),
+            (
+                "fn consume_values():\n    values = [1, true]\n    for item in values:\n        pass\n\nasync fn checkpoint():\n    consume_values()\n\n",
+                "semantic-for-stored-array-element-type",
+            ),
+            (
+                "fn consume_values():\n    values = [\"text\"]\n    for item in values:\n        pass\n\nasync fn checkpoint():\n    consume_values()\n\n",
+                "semantic-for-stored-array-element-shape",
+            ),
+            (
+                "fn consume_values():\n    values = [1, 2]\n    values = [3, 4]\n    for item in values:\n        pass\n\nasync fn checkpoint():\n    consume_values()\n\n",
+                "semantic-for-stored-array-reassigned",
+            ),
+            (
+                "fn consume_values():\n    values = [1, 2]\n    for first in values:\n        pass\n    for second in values:\n        pass\n\nasync fn checkpoint():\n    consume_values()\n\n",
+                "semantic-for-stored-array-multiple-uses-pending",
+            ),
+            (
+                "fn consume_values():\n    values = [1, 2]\n    match values:\n        case _:\n            pass\n\nasync fn checkpoint():\n    consume_values()\n\n",
+                "semantic-for-stored-array-use-pending",
+            ),
+            (
+                "fn consume_values():\n    values = [1, 2]\n    for take item in take values:\n        pass\n\nasync fn checkpoint():\n    consume_values()\n\n",
+                "semantic-for-stored-array-take-pending",
+            ),
+            (
+                "fn consume_values():\n    values = [true, false]\n    if true:\n        for item in values:\n            pass\n\nasync fn checkpoint():\n    consume_values()\n\n",
+                "semantic-for-stored-array-use-pending",
+            ),
+        ] {
+            let source = dot_variant_actor_source(body);
+            let fixture = parsed_actor_fixture(&source);
+            let changes = no_changes();
+            let output = CanonicalSemanticAnalyzer::new()
+                .analyze(
+                    parsed_actor_request(&fixture, &changes, AnalysisLimits::standard()),
+                    &|| false,
+                )
+                .expect("stored fixed-array tail is a diagnostic");
+            assert_eq!(
+                output
+                    .diagnostics()
+                    .first()
+                    .and_then(|diagnostic| diagnostic.code.as_deref()),
+                Some(code),
+                "{body}: {:?}",
+                output.diagnostics()
+            );
+            assert!(output.successful().is_none());
+        }
+    }
+
+    #[test]
     fn closed_fixed_array_match_analyzes_exact_arity_literals_and_bindings() {
         let source = dot_variant_actor_source(
             "async fn checkpoint():\n    match [1, 2]:\n        case [1, second]:\n            pass\n        case [_, _]:\n            pass\n\n",
@@ -39557,6 +40497,7 @@ fn projection_fixture():
             ref elements,
             maximum_iterations,
             bounds,
+            ..
         } = array.resolution
         else {
             unreachable!()

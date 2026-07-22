@@ -330,6 +330,7 @@ fn supported_input<'a>(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<SupportedInput<'a>, LowerError> {
     validate_admission_result_lowering_boundary(input.facts())?;
+    validate_stored_fixed_array_lowering_boundary(input.facts())?;
     validate_generic_function_lowering_boundary(input)?;
     validate_method_call_lowering_boundary(input.facts())?;
     match input.facts().root {
@@ -351,6 +352,26 @@ fn supported_input<'a>(
             supported_generated_tests(input, limits, is_cancelled)
                 .map(SupportedInput::GeneratedTests)
         }
+    }
+}
+
+fn validate_stored_fixed_array_lowering_boundary(
+    facts: &sema::PartialAnalysis,
+) -> Result<(), LowerError> {
+    if facts.expressions.iter().any(|fact| {
+        matches!(
+            fact.resolution,
+            sema::ExpressionResolution::ClosedArray {
+                storage: Some(_),
+                ..
+            }
+        )
+    }) {
+        Err(unsupported(
+            "semantic-for-stored-array-lowering-pending (owned local array storage and indexed iteration)",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -9675,6 +9696,7 @@ impl SourceFunctionLowerer<'_> {
                     elements,
                     maximum_iterations,
                     bounds,
+                    storage: None,
                 } => (elements, *maximum_iterations, *bounds),
                 _ => return Err(self.fact_mismatch("fixed-array match semantic resolution")),
             };
@@ -10151,6 +10173,7 @@ impl SourceFunctionLowerer<'_> {
                     elements,
                     maximum_iterations,
                     bounds,
+                    storage: None,
                 } => (elements, *maximum_iterations, *bounds),
                 _ => return Err(self.fact_mismatch("closed fixed-array semantic resolution")),
             };
@@ -28461,6 +28484,49 @@ pub fn boot() -> Image:
             Err(LowerError::Cancelled)
         ));
         assert_eq!(polls.get(), final_poll);
+    }
+
+    #[test]
+    fn stored_fixed_array_iteration_stops_at_named_semantic_lowering_boundary() {
+        let image = analyze_parsed_actor_source(
+            r#"module app
+
+from core.image import Image, Target
+
+fn consume_values():
+    values = [1, 2, 3]
+    for item in values:
+        observed: i64 = item
+        pass
+
+async fn checkpoint():
+    pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        consume_values()
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="actor-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#,
+        );
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            ),
+            Err(LowerError::UnsupportedInput {
+                feature: "semantic-for-stored-array-lowering-pending (owned local array storage and indexed iteration)"
+            })
+        ));
     }
 
     #[test]
