@@ -4385,6 +4385,7 @@ fn lower_minimum(
         pools: Vec::new(),
         regions: Vec::new(),
         activations: Vec::new(),
+        schedulers: Vec::new(),
         proofs,
         checkpoints: Vec::new(),
         tests: Vec::new(),
@@ -4879,6 +4880,11 @@ fn measure_actor_flow_output_resources(
     {
         meter.add_edges(count);
     }
+    if !input.actors.is_empty() || !input.tasks.is_empty() {
+        meter.add_edges(1);
+        meter.add_edges(input.actors.len());
+        meter.add_edges(input.tasks.len());
+    }
 
     for ty in &input.types {
         check_cancelled(is_cancelled)?;
@@ -5335,6 +5341,7 @@ fn lower_actor_image(
 
     let startup_order = lower_owners(&input.startup_order, limits.model_edges, is_cancelled)?;
     let shutdown_order = lower_owners(&input.shutdown_order, limits.model_edges, is_cancelled)?;
+    let schedulers = lower_default_scheduler_ownership(&actors, &tasks, limits, is_cancelled)?;
     check_cancelled(is_cancelled)?;
     Ok(FlowWir {
         version: flow::FLOW_WIR_VERSION,
@@ -5363,6 +5370,7 @@ fn lower_actor_image(
         pools: Vec::new(),
         regions,
         activations,
+        schedulers,
         proofs,
         checkpoints: Vec::new(),
         tests: Vec::new(),
@@ -5373,6 +5381,42 @@ fn lower_actor_image(
         static_bytes: input.static_bytes,
         peak_bytes: input.peak_bytes,
     })
+}
+
+fn lower_default_scheduler_ownership(
+    actors: &[flow::ActorPlan],
+    tasks: &[flow::TaskPlan],
+    limits: LoweringLimits,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<flow::SchedulerPlan>, LowerError> {
+    if actors.is_empty() && tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut actor_ids = try_vec(
+        actors.len(),
+        "FlowWir scheduler actor ownership",
+        limits.model_edges,
+    )?;
+    for actor in actors {
+        check_cancelled(is_cancelled)?;
+        actor_ids.push(actor.id);
+    }
+    let mut task_ids = try_vec(
+        tasks.len(),
+        "FlowWir scheduler task ownership",
+        limits.model_edges,
+    )?;
+    for task in tasks {
+        check_cancelled(is_cancelled)?;
+        task_ids.push(task.id);
+    }
+    let mut schedulers = try_vec(1, "FlowWir scheduler plans", limits.model_edges)?;
+    schedulers.push(flow::SchedulerPlan {
+        core: 0,
+        actors: actor_ids,
+        tasks: task_ids,
+    });
+    Ok(schedulers)
 }
 
 fn lower_owner(owner: semantic::ImageOwner) -> flow::PlanOwner {
@@ -5486,6 +5530,7 @@ fn lower_generated_tests(
         pools: Vec::new(),
         regions: Vec::new(),
         activations: Vec::new(),
+        schedulers: Vec::new(),
         proofs,
         checkpoints: Vec::new(),
         tests,
@@ -12153,6 +12198,14 @@ mod contract_tests {
         assert_eq!(wir.tasks[0].priority, 1);
         assert_eq!(wir.tasks[0].frame_bytes_bound, 16);
         assert_eq!(wir.tasks[0].supervisor, Some(flow::ActorId(0)));
+        assert_eq!(
+            wir.schedulers,
+            [flow::SchedulerPlan {
+                core: 0,
+                actors: vec![flow::ActorId(0)],
+                tasks: vec![flow::TaskId(0)],
+            }]
+        );
         for (source, lowered) in expected.regions.iter().zip(&wir.regions) {
             assert_eq!(lowered.id.0, source.id.0);
             assert_eq!(lowered.name, source.name);
@@ -12581,6 +12634,22 @@ mod contract_tests {
                     limits: LoweringLimits::standard(),
                 },
                 substituted,
+                report.clone(),
+                diagnostics.clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidOutput(_))
+        ));
+
+        let mut substituted_scheduler = baseline.clone();
+        substituted_scheduler.schedulers[0].core = 1;
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: input.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                substituted_scheduler,
                 report.clone(),
                 diagnostics.clone(),
                 &|| false,

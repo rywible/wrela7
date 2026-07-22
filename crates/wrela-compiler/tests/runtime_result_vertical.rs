@@ -672,7 +672,7 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
             .expect("runtime-result FlowWir");
         assert!(flow.diagnostics().is_empty());
         let flow_model = flow.wir().as_wir();
-        assert_eq!(flow_model.version, 14);
+        assert_eq!(flow_model.version, 15);
         assert!(
             flow_model.types.iter().any(
                 |ty| matches!(&ty.kind, FlowTypeKind::Enum { variants } if variants.len() == 2)
@@ -735,8 +735,8 @@ fn checked_in_runtime_result_reaches_exact_enum_machine_and_optional_native_coff
             },
             &never_cancelled,
         )
-        .expect("runtime-result FlowWir v14 frame");
-        assert_eq!(encoded.header().wire_version, 14);
+        .expect("runtime-result FlowWir v15 frame");
+        assert_eq!(encoded.header().wire_version, 15);
         let prepared = prepare_canonical_frame_for_codegen(
             encoded.bytes(),
             &fixture.target,
@@ -891,7 +891,7 @@ fn match_value() -> u64:
         },
         &never_cancelled,
     )
-    .expect("mixed-arity generic enum FlowWir v14 frame");
+    .expect("mixed-arity generic enum FlowWir v15 frame");
     let prepared = prepare_canonical_frame_for_codegen(
         encoded.bytes(),
         &fixture.target,
@@ -1330,8 +1330,8 @@ fn match_second() -> u64:
         },
         &never_cancelled,
     )
-    .expect("all-unit generic enum FlowWir v14 frame");
-    assert_eq!(encoded.header().wire_version, 14);
+    .expect("all-unit generic enum FlowWir v15 frame");
+    assert_eq!(encoded.header().wire_version, 15);
     let prepared = prepare_canonical_frame_for_codegen(
         encoded.bytes(),
         &fixture.target,
@@ -2020,7 +2020,7 @@ fn checked_in_runtime_result_try_reaches_exact_early_return_switch() {
             )
             .expect("runtime-result Try FlowWir");
         assert!(flow.diagnostics().is_empty());
-        assert_eq!(flow.wir().as_wir().version, 14);
+        assert_eq!(flow.wir().as_wir().version, 15);
         let flow_propagation = flow
             .wir()
             .as_wir()
@@ -2078,8 +2078,8 @@ fn checked_in_runtime_result_try_reaches_exact_early_return_switch() {
             },
             &never_cancelled,
         )
-        .expect("runtime-result Try FlowWir v14 frame");
-        assert_eq!(encoded.header().wire_version, 14);
+        .expect("runtime-result Try FlowWir v15 frame");
+        assert_eq!(encoded.header().wire_version, 15);
         let prepared = prepare_canonical_frame_for_codegen(
             encoded.bytes(),
             &fixture.target,

@@ -3102,8 +3102,8 @@ mod tests {
         ActivationCancellation, ActivationId, ActivationPlan, ActorId, ActorPlan, Block, BlockId,
         FLOW_WIR_VERSION, FlowFunction, FlowOperation, FlowType, FlowTypeKind, FlowWir,
         FunctionColor, FunctionId, FunctionOrigin, FunctionRole, Instruction, InstructionId,
-        PlanOwner, Proof, ProofId, ProofKind, RegionClass, RegionId, RegionPlan, SourceSummary,
-        TaskId, TaskPlan, Terminator, TypeId, Value, ValueId,
+        PlanOwner, Proof, ProofId, ProofKind, RegionClass, RegionId, RegionPlan, SchedulerPlan,
+        SourceSummary, TaskId, TaskPlan, Terminator, TypeId, Value, ValueId,
     };
     use wrela_image_report::{
         ActivationCancellationFact, ActivationFrameEvidenceFact, AnalysisFactLimits,
@@ -3383,6 +3383,11 @@ mod tests {
                 },
             ],
             activations: Vec::new(),
+            schedulers: vec![SchedulerPlan {
+                core: 0,
+                actors: vec![ActorId(0), ActorId(1)],
+                tasks: vec![TaskId(0)],
+            }],
             proofs: vec![
                 Proof {
                     id: ProofId(0),
@@ -3726,6 +3731,11 @@ mod tests {
                 capacity_proof: ProofId(8),
                 source,
             }],
+            schedulers: vec![SchedulerPlan {
+                core: 0,
+                actors: vec![ActorId(0)],
+                tasks: Vec::new(),
+            }],
             proofs: vec![
                 Proof {
                     id: ProofId(0),
@@ -3892,6 +3902,7 @@ mod tests {
             frame_bytes_bound: 8,
             supervisor: Some(ActorId(0)),
         }];
+        flow.schedulers[0].tasks = vec![TaskId(0)];
         flow.regions = vec![
             RegionPlan {
                 id: RegionId(0),

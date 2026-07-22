@@ -237,6 +237,7 @@ fn canonical_wir(build: BuildIdentity) -> Vec<u8> {
         pools: Vec::new(),
         regions: Vec::new(),
         activations: Vec::new(),
+        schedulers: Vec::new(),
         proofs: vec![
             proof(
                 0,

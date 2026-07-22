@@ -13,7 +13,7 @@ use wrela_source::Span;
 
 pub use wrela_test_model::TestPlanLimits;
 
-pub const FLOW_WIR_VERSION: u32 = 14;
+pub const FLOW_WIR_VERSION: u32 = 15;
 pub const ASSERTION_EXPRESSION_BYTES_MAX: usize = 4096;
 pub const SUPPORTED_SEMANTIC_WIR_VERSION: u32 = 12;
 
@@ -670,6 +670,17 @@ pub struct ActivationPlan {
     pub source: Span,
 }
 
+/// Exact ownership of the actor and task plans assigned to one cooperative
+/// scheduler core. The current target profile admits only core zero; carrying
+/// the partition explicitly prevents later lowering from reconstructing or
+/// silently globalizing scheduler ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerPlan {
+    pub core: u32,
+    pub actors: Vec<ActorId>,
+    pub tasks: Vec<TaskId>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RegionClass {
     Image,
@@ -799,6 +810,7 @@ pub struct FlowWir {
     pub pools: Vec<PoolPlan>,
     pub regions: Vec<RegionPlan>,
     pub activations: Vec<ActivationPlan>,
+    pub schedulers: Vec<SchedulerPlan>,
     pub proofs: Vec<Proof>,
     pub checkpoints: Vec<Checkpoint>,
     pub tests: Vec<TestEntry>,
@@ -1063,11 +1075,18 @@ fn validate_model_resources(
     meter.arena("pools", module.pools.len())?;
     meter.arena("regions", module.regions.len())?;
     meter.arena("activations", module.activations.len())?;
+    meter.arena("schedulers", module.schedulers.len())?;
     meter.arena("proofs", module.proofs.len())?;
     meter.arena("checkpoints", module.checkpoints.len())?;
     meter.arena("tests", module.tests.len())?;
     meter.edge_slice(&module.startup_order)?;
     meter.edge_slice(&module.shutdown_order)?;
+
+    for scheduler in &module.schedulers {
+        meter.poll()?;
+        meter.edge_slice(&scheduler.actors)?;
+        meter.edge_slice(&scheduler.tasks)?;
+    }
 
     if let Some(group) = &module.compiled_test_group {
         meter.edge_slice(&group.tests)?;
@@ -2414,6 +2433,7 @@ fn validate_module(
                 .map_or(0, |group| group.id.0),
         });
     }
+    validate_scheduler_ownership(module, &mut errors);
     validate_image_order(module, &module.startup_order, true, &mut errors);
     validate_image_order(module, &module.shutdown_order, false, &mut errors);
     if module.peak_bytes < module.static_bytes {
@@ -2423,6 +2443,34 @@ fn validate_module(
         });
     }
     errors.finish()
+}
+
+fn validate_scheduler_ownership(module: &FlowWir, errors: &mut ValidationContext<'_>) {
+    let has_scheduled_work = !module.actors.is_empty() || !module.tasks.is_empty();
+    let exact = if has_scheduled_work {
+        module.schedulers.len() == 1
+            && module.schedulers[0].core == 0
+            && module.schedulers[0].actors.len() == module.actors.len()
+            && module.schedulers[0]
+                .actors
+                .iter()
+                .copied()
+                .eq(module.actors.iter().map(|actor| actor.id))
+            && module.schedulers[0].tasks.len() == module.tasks.len()
+            && module.schedulers[0]
+                .tasks
+                .iter()
+                .copied()
+                .eq(module.tasks.iter().map(|task| task.id))
+    } else {
+        module.schedulers.is_empty()
+    };
+    if !exact {
+        errors.push(ValidationError::InvalidRecord {
+            kind: "scheduler ownership partition",
+            id: module.schedulers.first().map_or(0, |plan| plan.core),
+        });
+    }
 }
 
 fn validate_image_order(
@@ -5996,6 +6044,7 @@ mod tests {
             pools: Vec::new(),
             regions: Vec::new(),
             activations: Vec::new(),
+            schedulers: Vec::new(),
             proofs: Vec::new(),
             checkpoints: Vec::new(),
             tests: Vec::new(),
@@ -7086,6 +7135,11 @@ mod tests {
             capacity_proof: ProofId(8),
             source,
         });
+        module.schedulers = vec![SchedulerPlan {
+            core: 0,
+            actors: vec![ActorId(0)],
+            tasks: Vec::new(),
+        }];
         module.startup_order = vec![PlanOwner::Runtime, PlanOwner::Actor(ActorId(0))];
         module.shutdown_order = vec![PlanOwner::Actor(ActorId(0)), PlanOwner::Runtime];
         module.static_bytes = 32;
@@ -7276,6 +7330,32 @@ mod tests {
         validate_actor_capacity_contract(&long_name, &mut errors);
         assert_eq!(errors.finish(), Err(ValidationFailure::Cancelled));
         assert!(polls.get() > 5);
+    }
+
+    #[test]
+    fn one_core_scheduler_plan_exactly_partitions_actor_and_task_ownership() {
+        let mut module = async_fixture();
+        module.schedulers = vec![SchedulerPlan {
+            core: 0,
+            actors: vec![ActorId(0)],
+            tasks: Vec::new(),
+        }];
+        module
+            .clone()
+            .validate()
+            .expect("exact core-zero ownership");
+
+        let mut wrong_core = module.clone();
+        wrong_core.schedulers[0].core = 1;
+        assert!(wrong_core.validate().is_err());
+
+        let mut omitted_actor = module.clone();
+        omitted_actor.schedulers[0].actors.clear();
+        assert!(omitted_actor.validate().is_err());
+
+        let mut duplicated_actor = module;
+        duplicated_actor.schedulers[0].actors.push(ActorId(0));
+        assert!(duplicated_actor.validate().is_err());
     }
 
     #[test]

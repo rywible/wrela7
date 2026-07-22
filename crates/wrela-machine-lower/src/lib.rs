@@ -556,6 +556,7 @@ fn supported_minimum(input: &OptimizedFlowWir) -> Result<MinimumFlow<'_>, Machin
         || !input.devices.is_empty()
         || !input.pools.is_empty()
         || !input.regions.is_empty()
+        || !input.schedulers.is_empty()
         || !input.checkpoints.is_empty()
         || !input.tests.is_empty()
         || input.startup_order.as_slice() != [flow::PlanOwner::Runtime]
@@ -1364,6 +1365,7 @@ fn lower_supported(
     request: &MachineLoweringRequest<'_>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(MachineWir, MachineLoweringReport), MachineLowerError> {
+    require_exact_core_zero_scheduler_ownership(request.input.wir().as_wir(), is_cancelled)?;
     if let Ok(minimum) = supported_minimum(request.input) {
         preflight_minimum_output(
             &minimum,
@@ -1382,6 +1384,39 @@ fn lower_supported(
         )
     } else {
         scalar::lower_scalar_image(request, is_cancelled)
+    }
+}
+
+fn require_exact_core_zero_scheduler_ownership(
+    input: &flow::FlowWir,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), MachineLowerError> {
+    check_cancelled(is_cancelled)?;
+    let has_scheduled_work = !input.actors.is_empty() || !input.tasks.is_empty();
+    let exact = if has_scheduled_work {
+        input.schedulers.len() == 1
+            && input.schedulers[0].core == 0
+            && input.schedulers[0].actors.len() == input.actors.len()
+            && input.schedulers[0]
+                .actors
+                .iter()
+                .copied()
+                .eq(input.actors.iter().map(|actor| actor.id))
+            && input.schedulers[0].tasks.len() == input.tasks.len()
+            && input.schedulers[0]
+                .tasks
+                .iter()
+                .copied()
+                .eq(input.tasks.iter().map(|task| task.id))
+    } else {
+        input.schedulers.is_empty()
+    };
+    if exact {
+        Ok(())
+    } else {
+        Err(unsupported(
+            "scheduler ownership beyond the exact core-zero partition",
+        ))
     }
 }
 
@@ -2227,8 +2262,9 @@ mod contract_tests {
     use super::{
         CANCELLABLE_COPY_CHUNK_BYTES, CanonicalMachineLowerer, IMAGE_ENTER_RUNTIME_REASON,
         MachineLowerError, MachineLowerer, MachineLoweringLimits, MachineLoweringOutput,
-        MachineLoweringRequest, check_cancelled, lower_supported, model_resources, seal,
-        validate_optimizer_report_contract, validate_request_identity,
+        MachineLoweringRequest, check_cancelled, lower_supported, model_resources,
+        require_exact_core_zero_scheduler_ownership, seal, validate_optimizer_report_contract,
+        validate_request_identity,
     };
     use wrela_build_model::{
         BuildConfiguration, BuildIdentity, BuildProfile, LanguageRevision, OptimizationLevel,
@@ -2246,9 +2282,10 @@ mod contract_tests {
         FlowTypeKind, FunctionId as FlowFunctionId, FunctionOrigin, FunctionRole,
         Immediate as FlowImmediate, Instruction as FlowInstruction,
         InstructionId as FlowInstructionId, PlanOwner, Proof as FlowProof, ProofId as FlowProofId,
-        ProofKind, RegionClass, RegionId, RegionPlan, ScalarType, Terminator as FlowTerminator,
-        TestEntry as FlowTestEntry, TestId as FlowTestId, TestKind as FlowTestKind, TypeId,
-        ValidatedFlowWir, Value as FlowValue, ValueId as FlowValueId,
+        ProofKind, RegionClass, RegionId, RegionPlan, ScalarType, SchedulerPlan,
+        Terminator as FlowTerminator, TestEntry as FlowTestEntry, TestId as FlowTestId,
+        TestKind as FlowTestKind, TypeId, ValidatedFlowWir, Value as FlowValue,
+        ValueId as FlowValueId,
     };
     use wrela_machine_wir::{
         BlockId, CallingConvention, ConversionOp, FloatPredicate, MachineFunctionOrigin,
@@ -3627,6 +3664,11 @@ mod contract_tests {
             capacity_proof: FlowProofId(8),
             source,
         });
+        flow.schedulers = vec![SchedulerPlan {
+            core: 0,
+            actors: vec![ActorId(0)],
+            tasks: Vec::new(),
+        }];
         flow.startup_order = vec![PlanOwner::Runtime, PlanOwner::Actor(ActorId(0))];
         flow.shutdown_order = vec![PlanOwner::Actor(ActorId(0)), PlanOwner::Runtime];
         flow.static_bytes = 32;
@@ -5751,6 +5793,32 @@ mod contract_tests {
             Err(MachineLowerError::InvalidLimits),
             "public machine policy validation must retain precedence over actor-state plan inspection"
         );
+    }
+
+    #[test]
+    fn machine_consumer_requires_exact_core_zero_scheduler_ownership() {
+        let (optimized, _, _) = async_activation_fixture();
+        let exact = optimized.wir().as_wir();
+        require_exact_core_zero_scheduler_ownership(exact, &|| false)
+            .expect("exact core-zero scheduler partition");
+
+        let mut wrong_core = exact.clone();
+        wrong_core.schedulers[0].core = 1;
+        assert!(matches!(
+            require_exact_core_zero_scheduler_ownership(&wrong_core, &|| false),
+            Err(MachineLowerError::UnsupportedInput {
+                feature: "scheduler ownership beyond the exact core-zero partition"
+            })
+        ));
+
+        let mut omitted_actor = exact.clone();
+        omitted_actor.schedulers[0].actors.clear();
+        assert!(matches!(
+            require_exact_core_zero_scheduler_ownership(&omitted_actor, &|| false),
+            Err(MachineLowerError::UnsupportedInput {
+                feature: "scheduler ownership beyond the exact core-zero partition"
+            })
+        ));
     }
 
     #[test]

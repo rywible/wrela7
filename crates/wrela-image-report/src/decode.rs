@@ -1636,8 +1636,8 @@ mod tests {
             }],
             representations: RepresentationFacts {
                 semantic_wir_version: 12,
-                flow_wir_version: 14,
-                flow_wir_wire_version: 14,
+                flow_wir_version: 15,
+                flow_wir_wire_version: 15,
                 machine_wir_version: 15,
                 runtime_abi_version: 2,
                 optimization_pipeline_name: "development-v1".to_owned(),

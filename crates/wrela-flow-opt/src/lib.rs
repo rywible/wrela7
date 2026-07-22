@@ -2282,6 +2282,11 @@ mod contract_tests {
             capacity_proof: flow::ProofId(8),
             source,
         }];
+        wir.schedulers = vec![flow::SchedulerPlan {
+            core: 0,
+            actors: vec![flow::ActorId(0)],
+            tasks: Vec::new(),
+        }];
         wir.startup_order = vec![
             flow::PlanOwner::Runtime,
             flow::PlanOwner::Actor(flow::ActorId(0)),
@@ -3563,7 +3568,7 @@ mod contract_tests {
         model.name = "m".repeat(CANCELLABLE_COMPARISON_CHUNK_BYTES * 3 + 1);
         let model = model
             .validate()
-            .expect("valid long-prefix FlowWir v14 model");
+            .expect("valid long-prefix FlowWir v15 model");
         let equal = model.clone();
 
         let all_polls = Cell::new(0_u32);
@@ -3602,7 +3607,7 @@ mod contract_tests {
         substituted.name.push('n');
         let substituted = substituted
             .validate()
-            .expect("valid same-length substituted FlowWir v14 model");
+            .expect("valid same-length substituted FlowWir v15 model");
         let mut work = WorkMeter::new(OptimizationLimits::standard().work, &|| false);
         assert!(
             !flow_wir_equal(model.as_wir(), substituted.as_wir(), &mut work)
@@ -3620,7 +3625,7 @@ mod contract_tests {
         group.name = "g".repeat(CANCELLABLE_COMPARISON_CHUNK_BYTES * 2 + 1);
         let model = model
             .validate()
-            .expect("valid FlowWir v14 compiled-group fixture");
+            .expect("valid FlowWir v15 compiled-group fixture");
         let group = model
             .as_wir()
             .compiled_test_group

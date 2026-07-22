@@ -322,6 +322,7 @@ fn flow_fixture(build: BuildIdentity) -> ValidatedFlowWir {
         pools: Vec::new(),
         regions: Vec::new(),
         activations: Vec::new(),
+        schedulers: Vec::new(),
         proofs: Vec::new(),
         checkpoints: Vec::new(),
         tests: Vec::new(),

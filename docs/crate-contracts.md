@@ -464,7 +464,7 @@ it. It injects phase implementations and bounded host capabilities, while
   bounds, and the HIR declaration/file bounds used to validate provenance.
 - SemanticWir v12 retains exact SSA aggregate field replacement as `InsertField`.
   Validation joins the prior aggregate's struct type, selected field, inserted
-  value type, and single result of the unchanged aggregate type; FlowWir v14
+  value type, and single result of the unchanged aggregate type; FlowWir v15
   preserves the same operation and independently repeats that join.
 - MachineWir v15 retains same-block nongeneric flat values with two or more
   primitive scalar fields as aligned unpacked structs. `MakeStruct`, `Copy`,
@@ -585,15 +585,23 @@ it. It injects phase implementations and bounded host capabilities, while
   single-slot task entry, and `DropCalleeThenPropagate` cancellation. General
   path-sensitive activations, concurrent task slots, actor methods, and runtime
   scheduling remain outside this bounded schema vertical.
+- FlowWir v15 carries one explicit cooperative-scheduler ownership plan for
+  every actor image admitted by the current single-core target profile. Core
+  zero must own every dense actor and task ID exactly once and in canonical
+  order; images without actors or tasks must carry no scheduler plan. Flow
+  lowering produces this partition, canonical wire v15 round-trips it, and
+  Machine lowering reauthenticates it before erasing it for the existing
+  same-core fused profiles. This is ownership authority only: it does not claim
+  a runtime dispatch loop, priority/fairness policy, parking, or resumption.
 - Every region records its closed class, owner, byte capacity, alignment,
   exact `CapacityBound` proof, and source span. Validation joins those fields
   rather than allowing report or Machine consumers to infer region provenance.
-- FlowWir v14 adds one exact actor-state `Promote` marker. Validation requires
+- FlowWir v15 adds one exact actor-state `Promote` marker. Validation requires
   an unsigned 64-bit value, the owning actor's canonical eight-byte `.state`
   image region, a source-identical eight-byte `RegionBound` proof listed on the
   turn function, and no result. This is proof/lifetime authority; the following
   store remains the concrete runtime action.
-- FlowWir v14 also appends `ActorReplyRequest` and `ActorReplyResolve` while
+- FlowWir v15 also appends `ActorReplyRequest` and `ActorReplyResolve` while
   retaining the exact actor, target, permit, reply proof, `u64` outcome, and
   request/result identity. Validation requires one request and one resolve,
   exactly one incoming typed-reply edge to the target, and the same sorted
@@ -845,7 +853,7 @@ it. It injects phase implementations and bounded host capabilities, while
   image entry alone receives the exact AArch64 UEFI two-pointer/`EFI_STATUS`
   boundary and an implicit `EFI_SUCCESS` value for a unit return.
 - For the canonical actor-state direct write, lowering authenticates the
-  FlowWir v14 promotion proof, owning `.state` region, value, source, and exact
+  FlowWir v15 promotion proof, owning `.state` region, value, source, and exact
   marker→address→store adjacency. The marker has no MachineWir operation and
   is excluded consistently from output, reservation, and exact instruction
   accounting; the address/store remains the concrete writable-global action.
@@ -1082,7 +1090,7 @@ it. It injects phase implementations and bounded host capabilities, while
 - That schema is the only accepted report shape. Its tag rejects stale or
   mismatched artifacts at the trust boundary; there is no legacy reader,
   migration, adapter, or fallback contract. Its embedded interface facts must
-  be exactly SemanticWir 12, FlowWir 14, Flow wire 14, MachineWir 15, and runtime
+  be exactly SemanticWir 12, FlowWir 15, Flow wire 15, MachineWir 15, and runtime
   ABI 2; nonzero stale or future values are rejected rather than tolerated.
 - Schema v10 also projects sealed actor, task, reportable region, and async
   activation plans into

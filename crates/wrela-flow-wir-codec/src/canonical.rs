@@ -11,9 +11,9 @@ use wrela_flow_wir::{
     DeviceId, DevicePlan, DmaOwnership, FailureKind, FenceKind, FlowFunction, FlowGlobal,
     FlowOperation, FlowType, FlowTypeKind, FlowWir, FunctionColor, FunctionId, FunctionOrigin,
     FunctionRole, GlobalId, Immediate, Instruction, InstructionId, PlanOwner, PoolId, PoolPlan,
-    Proof, ProofId, ProofKind, RegionClass, RegionId, RegionPlan, ScalarType, SourceSummary,
-    SwitchCase, TaskId, TaskPlan, Terminator, TestEntry, TestId, TestKind, TypeId, UnaryOp,
-    ValidatedFlowWir, Value, ValueId,
+    Proof, ProofId, ProofKind, RegionClass, RegionId, RegionPlan, ScalarType, SchedulerPlan,
+    SourceSummary, SwitchCase, TaskId, TaskPlan, Terminator, TestEntry, TestId, TestKind, TypeId,
+    UnaryOp, ValidatedFlowWir, Value, ValueId,
 };
 use wrela_source::{FileId, Span, TextRange};
 use wrela_test_model::{
@@ -600,6 +600,7 @@ impl<'a> Writer<'a> {
         self.vector(&model.pools, VectorKind::General, Self::pool)?;
         self.vector(&model.regions, VectorKind::General, Self::region)?;
         self.vector(&model.activations, VectorKind::General, Self::activation)?;
+        self.vector(&model.schedulers, VectorKind::General, Self::scheduler)?;
         self.vector(&model.proofs, VectorKind::General, Self::proof)?;
         self.vector(&model.checkpoints, VectorKind::General, Self::checkpoint)?;
         self.vector(&model.tests, VectorKind::Tests, Self::test_entry)?;
@@ -963,6 +964,12 @@ impl<'a> Writer<'a> {
         })?;
         self.u32(value.capacity_proof.0)?;
         self.span(&value.source)
+    }
+
+    fn scheduler(&mut self, value: &SchedulerPlan) -> Result<(), CodecError> {
+        self.u32(value.core)?;
+        self.id_vector(&value.actors, |id| id.0)?;
+        self.id_vector(&value.tasks, |id| id.0)
     }
 
     fn region_class(&mut self, value: RegionClass) -> Result<(), CodecError> {
@@ -1853,6 +1860,7 @@ impl<'a> Reader<'a> {
             pools: self.vector(VectorKind::General, Self::pool)?,
             regions: self.vector(VectorKind::General, Self::region)?,
             activations: self.vector(VectorKind::General, Self::activation)?,
+            schedulers: self.vector(VectorKind::General, Self::scheduler)?,
             proofs: self.vector(VectorKind::General, Self::proof)?,
             checkpoints: self.vector(VectorKind::General, Self::checkpoint)?,
             tests: self.vector(VectorKind::Tests, Self::test_entry)?,
@@ -2149,6 +2157,14 @@ impl<'a> Reader<'a> {
             },
             capacity_proof: ProofId(self.u32()?),
             source: self.span()?,
+        })
+    }
+
+    fn scheduler(&mut self) -> Result<SchedulerPlan, CodecError> {
+        Ok(SchedulerPlan {
+            core: self.u32()?,
+            actors: self.id_vector(ActorId)?,
+            tasks: self.id_vector(TaskId)?,
         })
     }
 
@@ -2805,6 +2821,7 @@ mod tests {
             pools: Vec::new(),
             regions: Vec::new(),
             activations: Vec::new(),
+            schedulers: Vec::new(),
             proofs: Vec::new(),
             checkpoints: Vec::new(),
             tests: vec![TestEntry {
@@ -3121,6 +3138,11 @@ mod tests {
             capacity_proof: ProofId(8),
             source,
         }];
+        model.schedulers = vec![SchedulerPlan {
+            core: 0,
+            actors: vec![ActorId(0)],
+            tasks: Vec::new(),
+        }];
         model.startup_order = vec![PlanOwner::Runtime, PlanOwner::Actor(ActorId(0))];
         model.shutdown_order = vec![PlanOwner::Actor(ActorId(0)), PlanOwner::Runtime];
         model.static_bytes = 32;
@@ -3142,7 +3164,7 @@ mod tests {
         harness_name.clone_from(&name);
         model
             .validate()
-            .expect("valid long-prefix FlowWir v14 fixture")
+            .expect("valid long-prefix FlowWir v15 fixture")
     }
 
     struct SubstitutingCodec<'a> {
@@ -3320,6 +3342,14 @@ mod tests {
         )
         .expect("async frame decodes");
         assert_eq!(decoded, model);
+        assert_eq!(
+            decoded.as_wir().schedulers,
+            [SchedulerPlan {
+                core: 0,
+                actors: vec![ActorId(0)],
+                tasks: Vec::new(),
+            }]
+        );
 
         // The two owner vectors and trailing scalar fields occupy a fixed
         // 40-byte tail for this Runtime+Actor fixture. Remove the actor from
@@ -4542,7 +4572,7 @@ mod tests {
                 &|| false,
             ),
             Err(CodecError::NonCanonical(
-                "codec output differs from the canonical FlowWir v14 encoding"
+                "codec output differs from the canonical FlowWir v15 encoding"
             ))
         ));
     }
