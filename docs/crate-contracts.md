@@ -647,6 +647,15 @@ it. It injects phase implementations and bounded host capabilities, while
   projection/view fact edges and payload, attaches the proof to the caller,
   and counts the projection declaration in exact reachable provenance.
   Every other projection shape keeps the named lowering boundary.
+- A `with` activation is lowered only when its owning function is either an
+  actor turn or an *ordinary* owner: a module-level, non-generic, parameterless,
+  unit-returning, synchronous source free function whose effect set claims
+  neither suspension nor failure. The scope machinery itself is role-agnostic —
+  every non-entry function receives the same scope lowering context — so this is
+  an admission profile, not a structural capability. Every other owner (methods,
+  closures, generic instances, parameterized or value-returning owners, any
+  other role) keeps the named `semantic-with-owner-lowering-pending` boundary,
+  and no owner profile admits an abnormal teardown path.
 - The exact typed-reply subset lowers one awaited installed-actor request to
   `ActorReplyRequest` and injects one `ActorReplyResolve` before the target's
   sole exact-`u64` return. Both operations carry the same sorted

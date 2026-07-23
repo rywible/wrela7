@@ -79,6 +79,47 @@ pub fn boot() -> Image:
     return img
 "#;
 
+/// Same admitted scope shape as `STRUCTURED_SCOPE_SOURCE`, but the `with`
+/// activations are owned by an ordinary module-level synchronous free function
+/// that the turn calls, rather than by the turn itself. Normal-path exit only:
+/// nothing here can suspend, fail, or unwind.
+const ORDINARY_OWNER_SCOPE_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Masked:
+    token: u32
+
+scope irqs_masked() -> Masked:
+    enter Masked(token=1)
+    exit state:
+        pass
+
+async fn checkpoint():
+    pass
+
+fn guarded():
+    with irqs_masked() as outer:
+        with irqs_masked() as inner:
+            pass
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        guarded()
+        await checkpoint()
+
+    @task
+    async fn pulse(mut self):
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#;
+
 fn package(name: &str, digest: Sha256Digest) -> PackageIdentity {
     PackageIdentity {
         name: PackageName::new(name).expect("package name"),
@@ -497,4 +538,296 @@ fn structured_scope_return_reaches_machine_and_deterministic_native_coff() {
             assert_eq!(first.bytes().get(..2), Some([0x64, 0xaa].as_slice()));
         }
     }
+}
+
+/// Runs the front half of the toolchain for a scope fixture. The existing
+/// structured-return vertical inlines the same sequence; this helper exists so
+/// the ordinary-owner case can reuse it without perturbing that test's pinned
+/// bounds.
+fn lower_scope_source_to_flow(
+    source: &str,
+) -> (
+    wrela_flow_lower::LowerOutput,
+    TargetPackage,
+    wrela_build_model::ValidatedBuildConfiguration,
+) {
+    let source_graph_digest = Sha256Digest::from_bytes([0xd1; 32]);
+    let target_digest = Sha256Digest::from_bytes([0xd2; 32]);
+    let mut sources = SourceDatabase::default();
+    let application_file = sources
+        .add(SourceInput {
+            path: "app.wr".to_owned(),
+            text: source.to_owned(),
+            digest: Sha256Digest::from_bytes([0xd3; 32]),
+        })
+        .expect("scope owner source");
+    let core_file = sources
+        .add(SourceInput {
+            path: "core/image.wr".to_owned(),
+            text: CORE_IMAGE_SOURCE.to_owned(),
+            digest: Sha256Digest::from_bytes([0xd4; 32]),
+        })
+        .expect("core image source");
+    let parsed_files = [application_file, core_file]
+        .into_iter()
+        .map(|file| {
+            let (parsed, diagnostics) = WrelaSyntaxParser::new()
+                .parse(
+                    ParseRequest {
+                        sources: &sources,
+                        file,
+                        limits: ParseLimits::standard(),
+                    },
+                    &never_cancelled,
+                )
+                .expect("scope source parses")
+                .into_parts();
+            assert!(diagnostics.is_empty(), "parse diagnostics: {diagnostics:?}");
+            parsed
+        })
+        .collect::<Vec<_>>();
+
+    let mut packages = PackageGraphBuilder::new(package(
+        "scope-application",
+        Sha256Digest::from_bytes([0xd5; 32]),
+    ));
+    let core = packages
+        .add_package(package("wrela-core", Sha256Digest::from_bytes([0xd6; 32])))
+        .expect("core package");
+    packages
+        .add_dependency(
+            packages.root(),
+            DependencyAlias::new("core").expect("core alias"),
+            core,
+        )
+        .expect("core dependency");
+    packages
+        .add_module(
+            packages.root(),
+            ModulePath::new(["app".to_owned()]).expect("app module"),
+            application_file,
+        )
+        .expect("app module record");
+    packages
+        .add_module(
+            core,
+            ModulePath::new(["image".to_owned()]).expect("core module"),
+            core_file,
+        )
+        .expect("core module record");
+    let hir_output = CanonicalHirLowerer::new()
+        .lower(
+            HirLowerRequest {
+                packages: Arc::new(packages.finish().expect("package graph")),
+                source_graph_digest,
+                parsed_files: &parsed_files,
+                sources: &sources,
+                changes: &HirChangeSet {
+                    previous_source_graph: None,
+                    changed_files: Vec::new(),
+                },
+                limits: HirLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("scope source lowers to HIR");
+    assert!(hir_output.diagnostics().is_empty());
+    let image_entry = *hir_output
+        .lowered()
+        .program()
+        .as_program()
+        .image_candidates
+        .first()
+        .expect("image entry");
+    let hir = Arc::new(hir_output.into_parts().0.into_program());
+
+    let profile = BuildProfile::development();
+    let profile_digest = Sha256Digest::from_bytes([0xd7; 32]);
+    let build = seal_build_configuration(
+        BuildConfiguration {
+            identity: BuildIdentity {
+                compiler: Sha256Digest::from_bytes([0xd8; 32]),
+                language: LanguageRevision::Design0_1,
+                target: TargetIdentity::aarch64_qemu_virt_uefi(),
+                target_package: target_digest,
+                standard_library: Sha256Digest::from_bytes([0xd9; 32]),
+                source_graph: source_graph_digest,
+                request: Sha256Digest::from_bytes([0xda; 32]),
+                profile: profile_digest,
+            },
+            profile,
+        },
+        profile_digest,
+    )
+    .expect("build configuration");
+    let target = TargetPackage::aarch64_qemu_virt_uefi(target_digest);
+    let analysis = CanonicalSemanticAnalyzer::new()
+        .analyze(
+            AnalysisRequest {
+                hir,
+                standard_library_package: PackageId(1),
+                target: target.semantic(),
+                build: &build,
+                mode: AnalysisMode::Image {
+                    name: "scope-image",
+                    entry: image_entry,
+                },
+                changes: &AnalysisChangeSet {
+                    previous_source_graph: None,
+                    changed_declarations: Vec::new(),
+                },
+                limits: AnalysisLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("scope semantic analysis");
+    assert!(
+        analysis.diagnostics().is_empty(),
+        "semantic diagnostics: {:?}",
+        analysis.diagnostics()
+    );
+    let analyzed = analysis.into_parts().0.expect("sealed scope image");
+    let semantic = CanonicalSemanticLowerer::new()
+        .lower(
+            SemanticLowerRequest {
+                input: analyzed,
+                limits: SemanticLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("scope owner reaches SemanticWir")
+        .into_parts()
+        .0;
+    let flow_output = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("scope owner reaches FlowWir");
+    (flow_output, target, build)
+}
+
+/// Widening the scope owner is a semantic-tier admission change; FlowWir is
+/// owner-agnostic and composes with it unchanged. Both generated cleanups land
+/// in the ordinary owner, inner before outer, and none is left in the calling
+/// turn.
+///
+/// The MachineWir tail stays closed, but for a reason that has nothing to do
+/// with scopes: the mailbox-once activation contract in `wrela-machine-lower`
+/// pins an actor turn's entry block to exactly `[MailboxReceive, AsyncCall]`,
+/// so a turn that also performs a plain synchronous call is refused under the
+/// pre-existing, named `machine-async-result-delivery-pending`. The control
+/// program below reproduces that refusal with the same turn shape and no `with`
+/// anywhere, so a later widening of the activation contract has to revisit this
+/// pin deliberately.
+#[test]
+fn ordinary_function_scope_owner_reaches_flow_and_pins_the_machine_tail() {
+    let (flow_output, target, build) = lower_scope_source_to_flow(ORDINARY_OWNER_SCOPE_SOURCE);
+    let wir = flow_output.wir().as_wir();
+    // FlowWir specializes one generated cleanup per activation, so the reverse
+    // teardown order is observable as the call order of scope 0 then scope 1.
+    let cleanup_for = |scope: u32| {
+        wir.functions
+            .iter()
+            .find(|function| {
+                matches!(
+                    function.origin,
+                    flow::FunctionOrigin::GeneratedCleanup { scope: id, .. } if id == scope
+                )
+            })
+            .expect("generated cleanup for activation")
+            .id
+    };
+    let (inner, outer) = (cleanup_for(0), cleanup_for(1));
+    let cleanup_calls = |function: &flow::FlowFunction| {
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match instruction.operation {
+                flow::FlowOperation::Call { function, .. } if function == inner => Some("inner"),
+                flow::FlowOperation::Call { function, .. } if function == outer => Some("outer"),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let owner = wir
+        .functions
+        .iter()
+        .find(|function| function.name.ends_with("::guarded"))
+        .expect("FlowWir ordinary scope owner");
+    assert_eq!(owner.role, flow::FunctionRole::Ordinary);
+    assert_eq!(owner.color, flow::FunctionColor::Sync);
+    assert_eq!(
+        cleanup_calls(owner),
+        ["inner", "outer"],
+        "an ordinary owner runs both cleanups inner-before-outer"
+    );
+    for turn in wir
+        .functions
+        .iter()
+        .filter(|function| matches!(function.role, flow::FunctionRole::ActorTurn(_)))
+    {
+        assert!(
+            cleanup_calls(turn).is_empty(),
+            "no cleanup is left behind in a calling turn"
+        );
+    }
+
+    let encoded = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: flow_output.wir(),
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("ordinary-owner scope FlowWir encodes canonically");
+    let error =
+        prepare_canonical_frame_for_codegen(encoded.bytes(), &target, &build, &never_cancelled)
+            .expect_err("the turn-entry activation contract still refuses this turn shape");
+    assert_eq!(
+        error.machine_lower_error(),
+        Some(&MachineLowerError::UnsupportedInput {
+            feature: "machine-async-result-delivery-pending",
+        })
+    );
+
+    // The same refusal with no scope anywhere: the wall is the turn's extra
+    // synchronous call, not the ordinary scope owner.
+    let scopeless_source = ORDINARY_OWNER_SCOPE_SOURCE.replace(
+        "    with irqs_masked() as outer:\n        with irqs_masked() as inner:\n            pass",
+        "    pass",
+    );
+    let (scopeless, target, build) = lower_scope_source_to_flow(&scopeless_source);
+    assert!(
+        !scopeless.wir().as_wir().functions.iter().any(|function| {
+            matches!(
+                function.origin,
+                flow::FunctionOrigin::GeneratedCleanup { .. }
+            )
+        }),
+        "the control program contains no scope at all"
+    );
+    let scopeless = encode_and_verify(
+        &CanonicalFlowWirCodec,
+        EncodeRequest {
+            wir: scopeless.wir(),
+            limits: CodecLimits::standard(),
+        },
+        &never_cancelled,
+    )
+    .expect("scopeless control FlowWir encodes canonically");
+    let error =
+        prepare_canonical_frame_for_codegen(scopeless.bytes(), &target, &build, &never_cancelled)
+            .expect_err("the control program is refused identically");
+    assert_eq!(
+        error.machine_lower_error(),
+        Some(&MachineLowerError::UnsupportedInput {
+            feature: "machine-async-result-delivery-pending",
+        })
+    );
 }

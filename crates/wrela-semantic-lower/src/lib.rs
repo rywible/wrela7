@@ -1493,12 +1493,56 @@ fn validate_actor_scope_subset(
                 subject: "scope activation".to_owned(),
                 fact: "owning function",
             })?;
-        if !matches!(function.role, sema::FunctionRole::ActorTurn(_)) {
-            return Err(unsupported(
-                "semantic-with-owner-lowering-pending (non-actor source function)",
-            ));
+        match function.role {
+            sema::FunctionRole::ActorTurn(_) => {}
+            sema::FunctionRole::Ordinary => validate_ordinary_scope_owner(program, function)?,
+            _ => {
+                return Err(unsupported(
+                    "semantic-with-owner-lowering-pending (non-actor source function)",
+                ));
+            }
         }
         validate_scope_normal_body(facts, program, activation.function, body, is_cancelled)?;
+    }
+    Ok(())
+}
+
+/// An ordinary (non-turn) owner of a `with` activation is admitted for exactly
+/// one shape: a synchronous, non-generic, parameterless, unit-returning free
+/// function declared directly in a source module, whose own effect set claims
+/// neither suspension nor failure. That is the smallest owner that reaches the
+/// already-authenticated normal-path scope lowering without introducing an
+/// abnormal exit anywhere: nothing in this profile can suspend, fail, or unwind,
+/// so the `EnterScope`/`CommitScope`/`ExitScope` sequence stays the sole
+/// teardown path. Methods, closures, generic instances, parameterized or
+/// value-returning owners, and every other role stay closed under the unchanged
+/// `semantic-with-owner-lowering-pending` name.
+fn validate_ordinary_scope_owner(
+    program: &wrela_hir::Program,
+    function: &sema::FunctionInstance,
+) -> Result<(), LowerError> {
+    let sema::FunctionOrigin::Source { declaration, .. } = function.origin else {
+        return Err(unsupported(
+            "semantic-with-owner-lowering-pending (non-actor source function)",
+        ));
+    };
+    let declaration = program
+        .declaration(declaration)
+        .ok_or(LowerError::MissingSemanticFact {
+            subject: function.name.clone(),
+            fact: "scope owner declaration",
+        })?;
+    if !matches!(declaration.owner, wrela_hir::DeclarationOwner::Module(_))
+        || !matches!(declaration.kind, wrela_hir::DeclarationKind::Function(_))
+        || function.color != wrela_hir::FunctionColor::Sync
+        || !function.generic_arguments.is_empty()
+        || !function.parameters.is_empty()
+        || function.result != sema::SemanticTypeId(0)
+        || function.effects.0 & (sema::EffectSet::SUSPEND | sema::EffectSet::MAY_FAIL) != 0
+    {
+        return Err(unsupported(
+            "semantic-with-owner-lowering-pending (non-actor source function)",
+        ));
     }
     Ok(())
 }
@@ -29166,6 +29210,264 @@ pub fn boot() -> Image:
             ),
             Err(LowerError::InvalidOutput(_)) | Err(LowerError::InvalidReport(_))
         ));
+    }
+
+    /// The `with` activation moves out of the actor turn into an ordinary
+    /// module-level synchronous free function, which the turn then calls. Only
+    /// the owner changes: the scope shape is the same parameterless free-call
+    /// protocol with literal flat state and pass-only exit that the actor-turn
+    /// increment already admits, and the exit is normal-path only.
+    fn ordinary_owner_scope_source() -> String {
+        PASS_ONLY_SCOPE_ACTOR_SOURCE
+            .replace(
+                "async fn checkpoint():\n    pass",
+                "async fn checkpoint():\n    pass\n\nfn guarded():\n    with irqs_masked() as outer:\n        with irqs_masked() as inner:\n            pass",
+            )
+            .replace(
+                "        with irqs_masked() as mask:\n            pass\n",
+                "        guarded()\n",
+            )
+    }
+
+    #[test]
+    fn ordinary_function_scope_owner_lowers_reverse_cleanup_outside_any_turn() {
+        let image = analyze_parsed_actor_source(&ordinary_owner_scope_source());
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("an ordinary free function must be able to own a pass-only scope");
+        let wir = lowered.wir().as_wir();
+        let [inner, outer] = wir.scopes.as_slice() else {
+            panic!("two exact scope activation plans")
+        };
+        assert_eq!(inner.name, "irqs_masked");
+        assert_eq!(outer.name, "irqs_masked");
+        assert!(inner.dependencies.is_empty());
+        assert_eq!(outer.dependencies, [wir::ScopeId(0)]);
+        assert_eq!(inner.reverse_source_order, 0);
+        assert_eq!(outer.reverse_source_order, 1);
+        assert_eq!(inner.abort, None);
+        assert_eq!(outer.abort, None);
+        assert!(!inner.suspend_safe && !outer.suspend_safe);
+        assert_eq!(
+            wir.functions[inner.exit.0 as usize].role,
+            wir::FunctionRole::Cleanup
+        );
+
+        let owner = wir
+            .functions
+            .iter()
+            .find(|function| function.name.ends_with("::guarded"))
+            .expect("the ordinary scope owner is lowered as a source function");
+        assert_eq!(owner.role, wir::FunctionRole::Ordinary);
+        assert_eq!(owner.color, wir::FunctionColor::Sync);
+        assert!(owner.parameters.is_empty());
+        assert!(
+            !wir.functions.iter().any(|function| matches!(
+                function.role,
+                wir::FunctionRole::ActorTurn(_)
+            ) && function.body.statements.iter().any(
+                |statement| matches!(
+                    statement,
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::EnterScope { .. },
+                        ..
+                    })
+                )
+            )),
+            "no scope marker is left behind in the actor turn"
+        );
+
+        let markers: Vec<_> = owner
+            .body
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                wir::SemanticStatement::Let(wir::LetStatement { operation, .. }) => match operation
+                {
+                    wir::SemanticOperation::EnterScope { scope, .. } => Some(("enter", scope.0)),
+                    wir::SemanticOperation::CommitScope { scope, .. } => Some(("commit", scope.0)),
+                    wir::SemanticOperation::ExitScope { scope } => Some(("exit", scope.0)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            markers,
+            [
+                ("enter", 1),
+                ("enter", 0),
+                ("commit", 0),
+                ("exit", 0),
+                ("commit", 1),
+                ("exit", 1),
+            ],
+            "an ordinary owner cleans inner before outer exactly like an actor turn"
+        );
+
+        let exact_operations = lowered.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact ordinary-owner scope operation bound");
+        let mut one_under = exact;
+        one_under.operations -= 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == one_under.operations
+        ));
+
+        let polls = Cell::new(0_u64);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            )
+            .expect("count ordinary-owner scope cancellation polls");
+        let cancel_at = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next == cancel_at
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), cancel_at);
+
+        let exit_position = |function: &wir::SemanticFunction, scope: u32| {
+            function
+                .body
+                .statements
+                .iter()
+                .position(|statement| {
+                    matches!(
+                        statement,
+                        wir::SemanticStatement::Let(wir::LetStatement {
+                            operation: wir::SemanticOperation::ExitScope { scope: id },
+                            ..
+                        }) if id.0 == scope
+                    )
+                })
+                .expect("exit marker")
+        };
+        let mut swapped = wir.clone();
+        let forged = swapped
+            .functions
+            .iter_mut()
+            .find(|function| function.name.ends_with("::guarded"))
+            .expect("forged ordinary owner");
+        let inner_exit = exit_position(forged, 0);
+        let outer_exit = exit_position(forged, 1);
+        forged.body.statements.swap(inner_exit, outer_exit);
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                swapped,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidOutput(_)) | Err(LowerError::InvalidReport(_))
+        ));
+
+        let mut dropped = wir.clone();
+        let forged = dropped
+            .functions
+            .iter_mut()
+            .find(|function| function.name.ends_with("::guarded"))
+            .expect("forged ordinary owner");
+        forged.body.statements.remove(inner_exit);
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                dropped,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidOutput(_)) | Err(LowerError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn scope_owners_outside_the_ordinary_profile_stay_closed_under_one_name() {
+        for owner in [
+            "fn guarded(flag: bool):\n    with irqs_masked() as mask:\n        pass",
+            "fn guarded() -> u32:\n    with irqs_masked() as mask:\n        pass\n    return 5",
+            "async fn guarded():\n    with irqs_masked() as mask:\n        pass",
+        ] {
+            let call = if owner.starts_with("async ") {
+                "        await guarded()\n"
+            } else if owner.contains("flag: bool") {
+                "        guarded(true)\n"
+            } else {
+                "        used: u32 = guarded()\n"
+            };
+            let source = PASS_ONLY_SCOPE_ACTOR_SOURCE
+                .replace(
+                    "async fn checkpoint():\n    pass",
+                    &format!("async fn checkpoint():\n    pass\n\n{owner}"),
+                )
+                .replace(
+                    "        with irqs_masked() as mask:\n            pass\n",
+                    call,
+                );
+            let image = analyze_parsed_actor_source(&source);
+            assert!(
+                matches!(
+                    CanonicalSemanticLowerer::new().lower(
+                        LowerRequest {
+                            input: image,
+                            limits: LoweringLimits::standard(),
+                        },
+                        &|| false,
+                    ),
+                    Err(LowerError::UnsupportedInput { feature })
+                        if feature == "semantic-with-owner-lowering-pending (non-actor source function)"
+                ),
+                "owner outside the admitted profile must stay closed: {owner}"
+            );
+        }
     }
 
     #[test]
