@@ -1495,7 +1495,9 @@ fn validate_actor_scope_subset(
             })?;
         match function.role {
             sema::FunctionRole::ActorTurn(_) => {}
-            sema::FunctionRole::Ordinary => validate_ordinary_scope_owner(program, function)?,
+            sema::FunctionRole::Ordinary => {
+                validate_ordinary_scope_owner(facts, program, function)?
+            }
             _ => {
                 return Err(unsupported(
                     "semantic-with-owner-lowering-pending (non-actor source function)",
@@ -1508,16 +1510,30 @@ fn validate_actor_scope_subset(
 }
 
 /// An ordinary (non-turn) owner of a `with` activation is admitted for exactly
-/// one shape: a synchronous, non-generic, parameterless, unit-returning free
-/// function declared directly in a source module, whose own effect set claims
-/// neither suspension nor failure. That is the smallest owner that reaches the
-/// already-authenticated normal-path scope lowering without introducing an
-/// abnormal exit anywhere: nothing in this profile can suspend, fail, or unwind,
-/// so the `EnterScope`/`CommitScope`/`ExitScope` sequence stays the sole
-/// teardown path. Methods, closures, generic instances, parameterized or
-/// value-returning owners, and every other role stay closed under the unchanged
+/// two shapes, both synchronous, non-generic, parameterless free functions
+/// declared directly in a source module:
+///
+/// * a **unit-returning** owner. Nothing in this profile can suspend, fail, or
+///   unwind, so the `EnterScope`/`CommitScope`/`ExitScope` sequence stays the
+///   sole teardown path.
+/// * an **outcome-returning** owner — one returning a canonical two-variant
+///   `core.option::Option` / `core.result::Result` specialization. That is the
+///   enclosing-function shape the already-admitted `?` propagation requires
+///   (`lower_result_try` / `lower_option_try` demand
+///   `self.function.result == <outcome type>`), so a `?` inside a `with` body
+///   in such an owner is a genuine abnormal exit whose cleanup this lowering
+///   must emit. The full outcome-type identity is re-verified where the `?`
+///   itself is lowered. Note that `?` propagation carries **no** effect flag in
+///   this analyzer — `MAY_FAIL` marks `assert` only — so the outcome result
+///   type, not the effect set, is what distinguishes this profile.
+///
+/// `SUSPEND` and `MAY_FAIL` owners stay closed: this profile has neither a
+/// suspension nor an assertion-abort teardown. Methods, closures, generic
+/// instances, parameterized owners, owners returning an ordinary value type,
+/// and every other role stay closed under the unchanged
 /// `semantic-with-owner-lowering-pending` name.
 fn validate_ordinary_scope_owner(
+    facts: &sema::PartialAnalysis,
     program: &wrela_hir::Program,
     function: &sema::FunctionInstance,
 ) -> Result<(), LowerError> {
@@ -1532,12 +1548,14 @@ fn validate_ordinary_scope_owner(
             subject: function.name.clone(),
             fact: "scope owner declaration",
         })?;
+    let result_admitted = function.result == sema::SemanticTypeId(0)
+        || is_core_outcome_type(facts, program, function.result);
     if !matches!(declaration.owner, wrela_hir::DeclarationOwner::Module(_))
         || !matches!(declaration.kind, wrela_hir::DeclarationKind::Function(_))
         || function.color != wrela_hir::FunctionColor::Sync
         || !function.generic_arguments.is_empty()
         || !function.parameters.is_empty()
-        || function.result != sema::SemanticTypeId(0)
+        || !result_admitted
         || function.effects.0 & (sema::EffectSet::SUSPEND | sema::EffectSet::MAY_FAIL) != 0
     {
         return Err(unsupported(
@@ -1545,6 +1563,91 @@ fn validate_ordinary_scope_owner(
         ));
     }
     Ok(())
+}
+
+/// Recognizes the canonical two-variant `core.option::Option[T]` /
+/// `core.result::Result[T, E]` specializations that postfix `?` propagates. This
+/// is the admission gate only; the exact variant, payload and declaration
+/// identity is re-checked by `lower_option_try` / `lower_result_try`.
+fn is_core_outcome_type(
+    facts: &sema::PartialAnalysis,
+    program: &wrela_hir::Program,
+    ty: sema::SemanticTypeId,
+) -> bool {
+    let Some(sema::SemanticTypeKind::Enumeration {
+        declaration,
+        variants,
+        ..
+    }) = facts.types.get(ty.0 as usize).map(|record| &record.kind)
+    else {
+        return false;
+    };
+    let Some(record) = program.declaration(*declaration) else {
+        return false;
+    };
+    let Some(module) = program.modules.get(record.module.0 as usize) else {
+        return false;
+    };
+    let Some(name) = record.name.as_ref().map(|name| name.as_str()) else {
+        return false;
+    };
+    record.visibility == wrela_hir::Visibility::Public
+        && variants.len() == 2
+        && matches!(
+            (name, module.path.dotted().as_str()),
+            ("Option", "option") | ("Result", "result")
+        )
+}
+
+/// Recognizes the exact `SemanticStatement::Match` that `lower_result_try` /
+/// `lower_option_try` synthesize for postfix `?`: a two-arm value-producing
+/// match whose success arm yields the unwrapped payload and whose failure arm
+/// reconstructs the outcome and returns it. Statement-level source `match`
+/// lowering always produces `results: Vec::new()`, and the only other
+/// value-producing match (`lower_enum_type_test`) yields constants from every
+/// arm, so no source-written `match` can present this shape.
+fn is_question_propagation_match(
+    arms: &[wir::SemanticMatchArm],
+    results: &[wir::ValueId],
+    source: Option<Span>,
+) -> bool {
+    let [success, failure] = arms else {
+        return false;
+    };
+    results.len() == 1
+        && source.is_some()
+        && success.variant.is_some()
+        && success.guard.is_none()
+        && failure.variant.is_some()
+        && failure.guard.is_none()
+        && matches!(success.body.statements.as_slice(),
+            [wir::SemanticStatement::Yield(values)] if *values == success.bindings)
+        && matches!(failure.body.statements.split_first(),
+            Some((
+                wir::SemanticStatement::Let(wir::LetStatement {
+                    operation: wir::SemanticOperation::ConstructEnum { .. },
+                    ..
+                }),
+                rest,
+            )) if matches!(rest.split_last(),
+                Some((wir::SemanticStatement::Return(propagated), teardown))
+                    if propagated.len() == 1 && teardown.iter().all(is_scope_teardown_statement)))
+}
+
+/// A `CommitScope`/`ExitScope` marker already inserted into a `?` failure arm by
+/// an inner activation. Recognizing these is what lets the enclosing activation
+/// re-recognize the failure arm and append its own teardown outside them, which
+/// is precisely how the reverse inner-before-outer order arises on the abnormal
+/// path.
+fn is_scope_teardown_statement(statement: &wir::SemanticStatement) -> bool {
+    matches!(
+        statement,
+        wir::SemanticStatement::Let(wir::LetStatement {
+            operation: wir::SemanticOperation::CommitScope { .. }
+                | wir::SemanticOperation::ExitScope { .. },
+            ..
+        })
+    )
 }
 
 fn scope_body_is_pass_only(program: &wrela_hir::Program, body: wrela_hir::BodyId) -> bool {
@@ -11417,11 +11520,24 @@ impl SourceFunctionLowerer<'_> {
                         allow_returns,
                     )?;
                 }
-                wir::SemanticStatement::Match { arms, .. } => {
+                wir::SemanticStatement::Match {
+                    arms,
+                    results,
+                    source: match_source,
+                    ..
+                } => {
                     let next = depth.checked_add(1).ok_or(LowerError::ResourceLimit {
                         resource: "SemanticWir structured region depth",
                         limit: u64::from(self.limits.structured_region_depth),
                     })?;
+                    // A user-written `match` inside a `with` body still has no
+                    // authenticated teardown for a return out of an arm. The one
+                    // admitted exception is the match that postfix `?` desugars
+                    // to, whose failure arm is a plain early return out of the
+                    // scope; that arm takes exactly the same reverse cleanup the
+                    // normal path takes, emitted before the propagating return.
+                    let question_propagation = allow_returns
+                        && is_question_propagation_match(arms, results, *match_source);
                     for arm in arms {
                         self.insert_scope_cleanup_before_returns(
                             &mut arm.body,
@@ -11429,7 +11545,7 @@ impl SourceFunctionLowerer<'_> {
                             state,
                             source,
                             next,
-                            false,
+                            question_propagation,
                         )?;
                     }
                 }
@@ -29429,12 +29545,333 @@ pub fn boot() -> Image:
         ));
     }
 
+    /// The fallible-owner shape: an ordinary module-level synchronous free
+    /// function returning `Option[u64]` owns two nested `with` activations, and
+    /// the inner body performs the already-admitted `?` propagation, whose Err
+    /// arm returns early out of both scopes.
+    fn fallible_owner_scope_source() -> String {
+        PASS_ONLY_SCOPE_ACTOR_SOURCE
+            .replace(
+                "async fn checkpoint():\n    pass",
+                "async fn checkpoint():\n    pass\n\nfn make_option() -> Option[u64]:\n    return Some(9)\n\nfn guarded() -> Option[u64]:\n    with irqs_masked() as outer:\n        with irqs_masked() as inner:\n            payload: u64 = make_option()?\n    return Some(4)",
+            )
+            .replace(
+                "        with irqs_masked() as mask:\n            pass\n",
+                "        outcome: Option[u64] = guarded()\n",
+            )
+    }
+
+    /// Flattens the scope markers of a region, tagging each with the exit path
+    /// it lies on: `"fallthrough"` for the region's own straight-line order and
+    /// `"failure"` for the propagating arm of a postfix-`?` match.
+    fn scope_markers(region: &wir::SemanticRegion) -> Vec<(&'static str, &'static str, u32)> {
+        fn walk(
+            region: &wir::SemanticRegion,
+            path: &'static str,
+            out: &mut Vec<(&'static str, &'static str, u32)>,
+        ) {
+            for statement in &region.statements {
+                match statement {
+                    wir::SemanticStatement::Let(wir::LetStatement { operation, .. }) => {
+                        match operation {
+                            wir::SemanticOperation::EnterScope { scope, .. } => {
+                                out.push((path, "enter", scope.0));
+                            }
+                            wir::SemanticOperation::CommitScope { scope, .. } => {
+                                out.push((path, "commit", scope.0));
+                            }
+                            wir::SemanticOperation::ExitScope { scope } => {
+                                out.push((path, "exit", scope.0));
+                            }
+                            _ => {}
+                        }
+                    }
+                    wir::SemanticStatement::Match { arms, .. } => {
+                        for arm in arms {
+                            walk(&arm.body, "failure", out);
+                        }
+                    }
+                    wir::SemanticStatement::If {
+                        then_region,
+                        else_region,
+                        ..
+                    } => {
+                        walk(then_region, path, out);
+                        walk(else_region, path, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(region, "fallthrough", &mut out);
+        out
+    }
+
+    #[test]
+    fn question_exit_out_of_a_with_body_cleans_both_scopes_in_reverse_before_propagating() {
+        let image = analyze_parsed_actor_source_with_option(&fallible_owner_scope_source());
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("a `?` early exit out of a `with` body must lower its cleanup");
+        let wir = lowered.wir().as_wir();
+        let [inner, outer] = wir.scopes.as_slice() else {
+            panic!("two exact scope activation plans")
+        };
+        assert_eq!(inner.name, "irqs_masked");
+        assert_eq!(outer.name, "irqs_masked");
+        assert!(inner.dependencies.is_empty());
+        assert_eq!(outer.dependencies, [wir::ScopeId(0)]);
+        assert_eq!(inner.reverse_source_order, 0);
+        assert_eq!(outer.reverse_source_order, 1);
+        assert_eq!(inner.abort, None);
+        assert_eq!(outer.abort, None);
+        assert!(!inner.suspend_safe && !outer.suspend_safe);
+        assert_eq!(
+            wir.functions[inner.exit.0 as usize].role,
+            wir::FunctionRole::Cleanup
+        );
+
+        let owner = wir
+            .functions
+            .iter()
+            .find(|function| function.name.ends_with("::guarded"))
+            .expect("the fallible scope owner is lowered as a source function");
+        assert_eq!(owner.role, wir::FunctionRole::Ordinary);
+        assert_eq!(owner.color, wir::FunctionColor::Sync);
+        assert!(owner.parameters.is_empty());
+        assert_eq!(owner.effects.0, 0, "`?` propagation claims no effect");
+
+        // Both exit paths are observed. The success fallthrough keeps the
+        // established normal-path order, and the propagating `?` arm repeats it
+        // verbatim before the early return.
+        assert_eq!(
+            scope_markers(&owner.body),
+            [
+                ("fallthrough", "enter", 1),
+                ("fallthrough", "enter", 0),
+                ("failure", "commit", 0),
+                ("failure", "exit", 0),
+                ("failure", "commit", 1),
+                ("failure", "exit", 1),
+                ("fallthrough", "commit", 0),
+                ("fallthrough", "exit", 0),
+                ("fallthrough", "commit", 1),
+                ("fallthrough", "exit", 1),
+            ],
+            "the `?` failure path cleans inner before outer exactly like the fallthrough"
+        );
+
+        let propagating_arm = owner
+            .body
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Match { arms, results, .. } if results.len() == 1 => {
+                    arms.last()
+                }
+                _ => None,
+            })
+            .expect("postfix question propagating arm");
+        assert!(
+            matches!(
+                propagating_arm.body.statements.as_slice(),
+                [
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::ConstructEnum { .. },
+                        ..
+                    }),
+                    ..,
+                    wir::SemanticStatement::Return(propagated),
+                ] if propagated.len() == 1
+            ),
+            "cleanup is emitted between reconstructing the outcome and returning it"
+        );
+        assert!(
+            matches!(
+                owner.body.statements.last(),
+                Some(wir::SemanticStatement::Return(values)) if values.len() == 1
+            ),
+            "the fallthrough still returns the owner's own outcome"
+        );
+
+        let exact_operations = lowered.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact question-exit scope operation bound");
+        let mut one_under = exact;
+        one_under.operations -= 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == one_under.operations
+        ));
+
+        let polls = Cell::new(0_u64);
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    polls.set(polls.get() + 1);
+                    false
+                },
+            )
+            .expect("count question-exit scope cancellation polls");
+        let cancel_at = polls.get();
+        polls.set(0);
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| {
+                    let next = polls.get() + 1;
+                    polls.set(next);
+                    next == cancel_at
+                },
+            ),
+            Err(LowerError::Cancelled)
+        ));
+        assert_eq!(polls.get(), cancel_at);
+
+        // Two structurally valid forgeries of the failure path: swapping the two
+        // `ExitScope` markers, and dropping the inner one entirely.
+        fn propagating_arm_of(wir: &mut wir::SemanticWir) -> &mut Vec<wir::SemanticStatement> {
+            &mut wir
+                .functions
+                .iter_mut()
+                .find(|function| function.name.ends_with("::guarded"))
+                .expect("forged fallible owner")
+                .body
+                .statements
+                .iter_mut()
+                .find_map(|statement| match statement {
+                    wir::SemanticStatement::Match { arms, results, .. } if results.len() == 1 => {
+                        arms.last_mut()
+                    }
+                    _ => None,
+                })
+                .expect("forged propagating arm")
+                .body
+                .statements
+        }
+        let exit_positions = |statements: &[wir::SemanticStatement]| {
+            statements
+                .iter()
+                .enumerate()
+                .filter_map(|(index, statement)| match statement {
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::ExitScope { .. },
+                        ..
+                    }) => Some(index),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut swapped = wir.clone();
+        let arm_statements = propagating_arm_of(&mut swapped);
+        let failure_exits = exit_positions(arm_statements);
+        let [inner_exit, outer_exit] = failure_exits.as_slice() else {
+            panic!("the failure path carries exactly two exit markers")
+        };
+        let (inner_exit, outer_exit) = (*inner_exit, *outer_exit);
+        arm_statements.swap(inner_exit, outer_exit);
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                swapped,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidOutput(_)) | Err(LowerError::InvalidReport(_))
+        ));
+
+        let mut dropped = wir.clone();
+        propagating_arm_of(&mut dropped).remove(inner_exit);
+        assert!(matches!(
+            seal(
+                &LowerRequest {
+                    input: image,
+                    limits: exact,
+                },
+                dropped,
+                lowered.report().clone(),
+                &|| false,
+            ),
+            Err(LowerError::InvalidOutput(_)) | Err(LowerError::InvalidReport(_))
+        ));
+    }
+
+    #[test]
+    fn a_source_match_arm_return_inside_a_with_body_stays_closed() {
+        let source = PASS_ONLY_SCOPE_ACTOR_SOURCE
+            .replace(
+                "async fn checkpoint():\n    pass",
+                "async fn checkpoint():\n    pass\n\nfn make_option() -> Option[u64]:\n    return Some(9)\n\nfn guarded() -> Option[u64]:\n    with irqs_masked() as outer:\n        outcome: Option[u64] = make_option()\n        match outcome:\n            case .None:\n                return None\n            case .Some(payload):\n                pass\n    return Some(4)",
+            )
+            .replace(
+                "        with irqs_masked() as mask:\n            pass\n",
+                "        outcome: Option[u64] = guarded()\n",
+            );
+        let image = analyze_parsed_actor_source_with_option(&source);
+        assert!(
+            matches!(
+                CanonicalSemanticLowerer::new().lower(
+                    LowerRequest {
+                        input: image,
+                        limits: LoweringLimits::standard(),
+                    },
+                    &|| false,
+                ),
+                Err(LowerError::UnsupportedInput { feature })
+                    if feature == "semantic-with-structured-return-cleanup-lowering-pending"
+            ),
+            "only the `?` desugaring's failure arm is admitted, not a source match arm return"
+        );
+    }
+
     #[test]
     fn scope_owners_outside_the_ordinary_profile_stay_closed_under_one_name() {
         for owner in [
             "fn guarded(flag: bool):\n    with irqs_masked() as mask:\n        pass",
             "fn guarded() -> u32:\n    with irqs_masked() as mask:\n        pass\n    return 5",
             "async fn guarded():\n    with irqs_masked() as mask:\n        pass",
+            // A `MAY_FAIL` (assertion-aborting) owner cannot be written here at
+            // all: `semantic-runtime-assertion-not-supported` walls runtime
+            // assertions outside selected `@test` functions upstream in sema.
+            // `validate_ordinary_scope_owner` still refuses `MAY_FAIL` so that
+            // widening that sema wall cannot silently admit an unlowered
+            // abort teardown.
         ] {
             let call = if owner.starts_with("async ") {
                 "        await guarded()\n"

@@ -33,13 +33,15 @@ use wrela_sema::{
 };
 use wrela_semantic_lower::{
     CanonicalSemanticLowerer, LowerRequest as SemanticLowerRequest,
-    LoweringLimits as SemanticLoweringLimits, SemanticLowerer,
+    LoweringLimits as SemanticLoweringLimits, SemanticLowerer, semantic_wir as semantic,
 };
 use wrela_source::{SourceDatabase, SourceInput};
 use wrela_syntax::{ParseLimits, ParseRequest, SyntaxParser, WrelaSyntaxParser};
 use wrela_target::TargetPackage;
 
 const CORE_IMAGE_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/image.wr");
+const CORE_OPTION_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/option.wr");
+const CORE_RESULT_SOURCE: &str = include_str!("../../../std/wrela-core-0.1/src/result.wr");
 const STRUCTURED_SCOPE_SOURCE: &str = r#"module app
 
 from core.image import Image, Target
@@ -107,6 +109,52 @@ fn guarded():
 pub struct Worker:
     pub async fn ping(mut self):
         guarded()
+        await checkpoint()
+
+    @task
+    async fn pulse(mut self):
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#;
+
+/// The first genuine abnormal exit out of a `with` body: an ordinary
+/// module-level synchronous free function returning `Option[u64]` owns two
+/// nested activations, and the inner body propagates with `?`. The success
+/// fallthrough and the propagating failure arm must each tear both scopes down
+/// inner-before-outer.
+const QUESTION_EXIT_SCOPE_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Masked:
+    token: u32
+
+scope irqs_masked() -> Masked:
+    enter Masked(token=1)
+    exit state:
+        pass
+
+async fn checkpoint():
+    pass
+
+fn make_option() -> Option[u64]:
+    return Some(9)
+
+fn guarded() -> Option[u64]:
+    with irqs_masked() as outer:
+        with irqs_masked() as inner:
+            payload: u64 = make_option()?
+    return Some(4)
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        outcome: Option[u64] = guarded()
         await checkpoint()
 
     @task
@@ -546,8 +594,33 @@ fn structured_scope_return_reaches_machine_and_deterministic_native_coff() {
 /// bounds.
 fn lower_scope_source_to_flow(
     source: &str,
+    include_outcomes: bool,
 ) -> (
     wrela_flow_lower::LowerOutput,
+    TargetPackage,
+    wrela_build_model::ValidatedBuildConfiguration,
+) {
+    let (semantic, target, build) = lower_scope_source_to_semantic(source, include_outcomes);
+    let flow_output = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect("scope owner reaches FlowWir");
+    (flow_output, target, build)
+}
+
+/// The same front half, stopping at SemanticWir. The `?`-exit fixture needs it
+/// because its FlowWir tail is pinned fail-closed for a reason unrelated to
+/// scopes (see `question_exit_out_of_a_with_body_...`).
+fn lower_scope_source_to_semantic(
+    source: &str,
+    include_outcomes: bool,
+) -> (
+    semantic::ValidatedSemanticWir,
     TargetPackage,
     wrela_build_model::ValidatedBuildConfiguration,
 ) {
@@ -568,8 +641,26 @@ fn lower_scope_source_to_flow(
             digest: Sha256Digest::from_bytes([0xd4; 32]),
         })
         .expect("core image source");
+    let outcome_files = include_outcomes.then(|| {
+        let option_file = sources
+            .add(SourceInput {
+                path: "core/option.wr".to_owned(),
+                text: CORE_OPTION_SOURCE.to_owned(),
+                digest: Sha256Digest::from_bytes([0xdb; 32]),
+            })
+            .expect("core option source");
+        let result_file = sources
+            .add(SourceInput {
+                path: "core/result.wr".to_owned(),
+                text: CORE_RESULT_SOURCE.to_owned(),
+                digest: Sha256Digest::from_bytes([0xdc; 32]),
+            })
+            .expect("core result source");
+        [option_file, result_file]
+    });
     let parsed_files = [application_file, core_file]
         .into_iter()
+        .chain(outcome_files.into_iter().flatten())
         .map(|file| {
             let (parsed, diagnostics) = WrelaSyntaxParser::new()
                 .parse(
@@ -615,6 +706,22 @@ fn lower_scope_source_to_flow(
             core_file,
         )
         .expect("core module record");
+    if let Some([option_file, result_file]) = outcome_files {
+        packages
+            .add_module(
+                core,
+                ModulePath::new(["option".to_owned()]).expect("core option module"),
+                option_file,
+            )
+            .expect("core option module record");
+        packages
+            .add_module(
+                core,
+                ModulePath::new(["result".to_owned()]).expect("core result module"),
+                result_file,
+            )
+            .expect("core result module record");
+    }
     let hir_output = CanonicalHirLowerer::new()
         .lower(
             HirLowerRequest {
@@ -698,16 +805,7 @@ fn lower_scope_source_to_flow(
         .expect("scope owner reaches SemanticWir")
         .into_parts()
         .0;
-    let flow_output = CanonicalFlowLowerer::new()
-        .lower(
-            FlowLowerRequest {
-                input: semantic,
-                limits: FlowLoweringLimits::standard(),
-            },
-            &never_cancelled,
-        )
-        .expect("scope owner reaches FlowWir");
-    (flow_output, target, build)
+    (semantic, target, build)
 }
 
 /// Widening the scope owner is a semantic-tier admission change; FlowWir is
@@ -725,7 +823,8 @@ fn lower_scope_source_to_flow(
 /// pin deliberately.
 #[test]
 fn ordinary_function_scope_owner_reaches_flow_and_pins_the_machine_tail() {
-    let (flow_output, target, build) = lower_scope_source_to_flow(ORDINARY_OWNER_SCOPE_SOURCE);
+    let (flow_output, target, build) =
+        lower_scope_source_to_flow(ORDINARY_OWNER_SCOPE_SOURCE, false);
     let wir = flow_output.wir().as_wir();
     // FlowWir specializes one generated cleanup per activation, so the reverse
     // teardown order is observable as the call order of scope 0 then scope 1.
@@ -802,7 +901,7 @@ fn ordinary_function_scope_owner_reaches_flow_and_pins_the_machine_tail() {
         "    with irqs_masked() as outer:\n        with irqs_masked() as inner:\n            pass",
         "    pass",
     );
-    let (scopeless, target, build) = lower_scope_source_to_flow(&scopeless_source);
+    let (scopeless, target, build) = lower_scope_source_to_flow(&scopeless_source, false);
     assert!(
         !scopeless.wir().as_wir().functions.iter().any(|function| {
             matches!(
@@ -829,5 +928,122 @@ fn ordinary_function_scope_owner_reaches_flow_and_pins_the_machine_tail() {
         Some(&MachineLowerError::UnsupportedInput {
             feature: "machine-async-result-delivery-pending",
         })
+    );
+}
+
+/// The `?` early exit out of a `with` body reaches SemanticWir with cleanup on
+/// both paths: the success fallthrough and the propagating failure arm each
+/// commit and exit both activations, inner before outer.
+///
+/// The FlowWir tail stays closed here, and for a reason that has nothing to do
+/// with scopes: the actor-image type slice in `wrela-flow-lower` admits a
+/// nominal `Enum` only when it is the declared result of the async-outcome
+/// profile, so an `Option[u64]` flowing anywhere in the image is refused under
+/// the pre-existing, named `actor types outside the stateless scalar slice`.
+/// The control program below reproduces that refusal with the same `?`
+/// propagation and no `with` anywhere, so widening the type slice later has to
+/// revisit this pin deliberately.
+#[test]
+fn question_exit_out_of_a_with_body_reaches_semantic_wir_and_pins_the_flow_tail() {
+    let (semantic, _target, _build) =
+        lower_scope_source_to_semantic(QUESTION_EXIT_SCOPE_SOURCE, true);
+    let wir = semantic.as_wir();
+    assert_eq!(wir.scopes.len(), 2, "two exact scope activation plans");
+    let owner = wir
+        .functions
+        .iter()
+        .find(|function| function.name.ends_with("::guarded"))
+        .expect("SemanticWir fallible scope owner");
+    let markers = |region: &semantic::SemanticRegion| {
+        region
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                semantic::SemanticStatement::Let(semantic::LetStatement { operation, .. }) => {
+                    match operation {
+                        semantic::SemanticOperation::EnterScope { scope, .. } => {
+                            Some(("enter", scope.0))
+                        }
+                        semantic::SemanticOperation::CommitScope { scope, .. } => {
+                            Some(("commit", scope.0))
+                        }
+                        semantic::SemanticOperation::ExitScope { scope } => Some(("exit", scope.0)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        markers(&owner.body),
+        [
+            ("enter", 1),
+            ("enter", 0),
+            ("commit", 0),
+            ("exit", 0),
+            ("commit", 1),
+            ("exit", 1),
+        ],
+        "the success fallthrough keeps the established reverse teardown"
+    );
+    let propagating_arm = owner
+        .body
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            semantic::SemanticStatement::Match { arms, results, .. } if results.len() == 1 => {
+                arms.last()
+            }
+            _ => None,
+        })
+        .expect("postfix question propagating arm");
+    assert_eq!(
+        markers(&propagating_arm.body),
+        [("commit", 0), ("exit", 0), ("commit", 1), ("exit", 1)],
+        "the `?` failure path tears both activations down in the same reverse order"
+    );
+
+    let flow = CanonicalFlowLowerer::new().lower(
+        FlowLowerRequest {
+            input: semantic,
+            limits: FlowLoweringLimits::standard(),
+        },
+        &never_cancelled,
+    );
+    assert!(
+        matches!(
+            flow,
+            Err(wrela_flow_lower::LowerError::UnsupportedInput { feature })
+                if feature == "actor types outside the stateless scalar slice"
+        ),
+        "the actor-image type slice still refuses an Option-typed image"
+    );
+
+    // The same refusal with no scope anywhere: the wall is the outcome type in
+    // an actor image, not the `?` exit out of a `with` body.
+    let scopeless_source = QUESTION_EXIT_SCOPE_SOURCE.replace(
+        "    with irqs_masked() as outer:\n        with irqs_masked() as inner:\n            payload: u64 = make_option()?\n",
+        "    payload: u64 = make_option()?\n",
+    );
+    let (scopeless, _target, _build) = lower_scope_source_to_semantic(&scopeless_source, true);
+    assert!(
+        scopeless.as_wir().scopes.is_empty(),
+        "the control program contains no scope at all"
+    );
+    let control = CanonicalFlowLowerer::new().lower(
+        FlowLowerRequest {
+            input: scopeless,
+            limits: FlowLoweringLimits::standard(),
+        },
+        &never_cancelled,
+    );
+    assert!(
+        matches!(
+            control,
+            Err(wrela_flow_lower::LowerError::UnsupportedInput { feature })
+                if feature == "actor types outside the stateless scalar slice"
+        ),
+        "the control program is refused identically"
     );
 }
