@@ -7928,13 +7928,24 @@ enum RegionExit {
     },
 }
 
+/// Per-scope activation state along one path: the entered state value and
+/// whether it has been committed, or `None` when the scope is not active.
+type ScopeStates = Vec<Option<(flow::ValueId, bool)>>;
+
 struct RegionWork<'a> {
     region: &'a semantic::SemanticRegion,
     next_statement: usize,
     block: flow::BlockId,
     exit: RegionExit,
     depth: u32,
-    scope_states: Vec<Option<(flow::ValueId, bool)>>,
+    scope_states: ScopeStates,
+    /// `scope_states` as it stood on entry to the innermost enclosing loop, or
+    /// `None` outside any loop. A `Break`/`Continue` edge leaves every scope
+    /// that edge's target loop contains, so the states at the edge must have
+    /// returned to this snapshot; comparing against it is what makes a dropped
+    /// or reordered `ExitScope` on a loop-exiting path detectable, exactly as
+    /// the empty-slot check does for `Return`.
+    loop_entry_scope_states: Option<ScopeStates>,
 }
 
 fn semantic_region_definitely_terminates(
@@ -8087,6 +8098,7 @@ fn lower_generated_function(
         exit: RegionExit::Root,
         depth: 1,
         scope_states,
+        loop_entry_scope_states: None,
     });
     let mut next_async_state = 0_u32;
     while let Some(mut item) = work.pop() {
@@ -8483,6 +8495,20 @@ fn lower_generated_function(
                         "FlowWir branch scope states",
                         limits.model_edges,
                     )?;
+                    // An `If` is not a loop target, so every nested region keeps
+                    // the same enclosing-loop snapshot.
+                    let continuation_loop_entry = copy_loop_entry_scope_states(
+                        &item.loop_entry_scope_states,
+                        limits.model_edges,
+                    )?;
+                    let then_loop_entry = copy_loop_entry_scope_states(
+                        &item.loop_entry_scope_states,
+                        limits.model_edges,
+                    )?;
+                    let else_loop_entry = copy_loop_entry_scope_states(
+                        &item.loop_entry_scope_states,
+                        limits.model_edges,
+                    )?;
                     if !terminal_branches {
                         push_bounded(
                             &mut work,
@@ -8493,6 +8519,7 @@ fn lower_generated_function(
                                 exit: item.exit,
                                 depth: item.depth,
                                 scope_states: continuation_scope_states,
+                                loop_entry_scope_states: continuation_loop_entry,
                             },
                             "scalar region work",
                             limits.model_edges,
@@ -8522,6 +8549,7 @@ fn lower_generated_function(
                             exit: branch_exit,
                             depth: next_depth,
                             scope_states: else_scope_states,
+                            loop_entry_scope_states: else_loop_entry,
                         },
                         "scalar region work",
                         limits.model_edges,
@@ -8535,6 +8563,7 @@ fn lower_generated_function(
                             exit: branch_exit,
                             depth: next_depth,
                             scope_states: then_scope_states,
+                            loop_entry_scope_states: then_loop_entry,
                         },
                         "scalar region work",
                         limits.model_edges,
@@ -8740,6 +8769,10 @@ fn lower_generated_function(
                                     "FlowWir match scope states",
                                     limits.model_edges,
                                 )?,
+                                loop_entry_scope_states: copy_loop_entry_scope_states(
+                                    &item.loop_entry_scope_states,
+                                    limits.model_edges,
+                                )?,
                             },
                             "scalar region work",
                             limits.model_edges,
@@ -8893,6 +8926,11 @@ fn lower_generated_function(
                                 "FlowWir match scope states",
                                 limits.model_edges,
                             )?,
+                            // A `Match` is not a loop target either.
+                            loop_entry_scope_states: copy_loop_entry_scope_states(
+                                &item.loop_entry_scope_states,
+                                limits.model_edges,
+                            )?,
                         });
                     }
                     let default = if let Some(default) = default {
@@ -8966,6 +9004,10 @@ fn lower_generated_function(
                                 "FlowWir loop scope states",
                                 limits.model_edges,
                             )?,
+                            loop_entry_scope_states: copy_loop_entry_scope_states(
+                                &item.loop_entry_scope_states,
+                                limits.model_edges,
+                            )?,
                         },
                         "scalar region work",
                         limits.model_edges,
@@ -8983,6 +9025,14 @@ fn lower_generated_function(
                                 "FlowWir loop scope states",
                                 limits.model_edges,
                             )?,
+                            // This loop is the target of any unlabelled
+                            // `Break`/`Continue` inside its body, so its entry
+                            // states are the snapshot those edges must match.
+                            loop_entry_scope_states: Some(copy_bounded(
+                                &item.scope_states,
+                                "FlowWir loop entry scope states",
+                                limits.model_edges,
+                            )?),
                         },
                         "scalar region work",
                         limits.model_edges,
@@ -8997,6 +9047,19 @@ fn lower_generated_function(
                         | RegionExit::LoopBranch { header, exit, .. } => (header, exit),
                         _ => return Err(unsupported("scalar loop control destination")),
                     };
+                    // This edge leaves every scope its target loop contains, so
+                    // the active-scope state must have returned to what it was on
+                    // entry to that loop. Without this a cleanup dropped from a
+                    // loop-exiting path would be invisible: the loop's exit
+                    // continuation inherits the pre-loop states, so the function's
+                    // `Return` check would see an empty slot and accept.
+                    let loop_entry = item
+                        .loop_entry_scope_states
+                        .as_deref()
+                        .ok_or(unsupported("scalar loop control destination"))?;
+                    if !polled_slices_equal(&item.scope_states, loop_entry, is_cancelled)? {
+                        return Err(unsupported("FlowWir loop control with an active scope"));
+                    }
                     let target = if matches!(statement, semantic::SemanticStatement::Break(_)) {
                         exit
                     } else {
@@ -9780,6 +9843,18 @@ fn try_vec<T>(capacity: usize, resource: &'static str, limit: u64) -> Result<Vec
         .try_reserve_exact(capacity)
         .map_err(|_| LowerError::ResourceLimit { resource, limit })?;
     Ok(output)
+}
+
+/// Carries an enclosing loop's entry snapshot into a nested region. `None` — no
+/// enclosing loop — is carried through unchanged.
+fn copy_loop_entry_scope_states(
+    states: &Option<ScopeStates>,
+    limit: u64,
+) -> Result<Option<ScopeStates>, LowerError> {
+    states
+        .as_deref()
+        .map(|states| copy_bounded(states, "FlowWir loop entry scope states", limit))
+        .transpose()
 }
 
 fn copy_bounded<T: Copy>(

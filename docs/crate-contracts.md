@@ -657,17 +657,29 @@ it. It injects phase implementations and bounded host capabilities, while
   capability. Every other owner (methods, closures, generic instances,
   parameterized owners, owners returning an ordinary value type, any other role)
   keeps the named `semantic-with-owner-lowering-pending` boundary.
-- Exactly one abnormal teardown path is lowered: the postfix `?` early exit out
-  of a `with` body in an outcome-returning ordinary owner. Cleanup is inserted
-  before an early return inside a `match` arm only for the exact match statement
-  that `?` desugars to (a two-arm value-producing match whose success arm yields
-  the payload and whose failure arm reconstructs the outcome, runs any
-  already-inserted inner teardown, and returns), and it repeats the normal
-  path's reverse inner-before-outer order. A return from a source-written
-  `match` arm inside a `with` body keeps the named
-  `semantic-with-structured-return-cleanup-lowering-pending` boundary; abort
-  phases, assertion failure, scope-held `await`, and break/continue keep
-  `semantic-with-abnormal-cleanup-lowering-pending`.
+- Scope teardown is computed from control flow, not recognized from statement
+  shapes. One general rule covers every path: walking the `with` body's
+  statement tree while counting the loop nesting *within the body*, cleanup
+  (`CommitScope` then `ExitScope`) is emitted before every `Return`, before
+  every `Break`/`Continue` at loop depth zero — whose target loop therefore
+  encloses the whole `with` — and by the caller on the fallthrough off the end
+  when the body does not already terminate. A `Break`/`Continue` targeting a
+  loop *inside* the body does not exit the scope and gets none. The position of
+  the exiting statement is irrelevant: a nested `if`, a source-written `match`
+  arm, the `?` desugaring's failure arm, and a loop body all take the identical
+  cleanup. Reverse inner-before-outer order for nested activations is not
+  coordinated anywhere — each activation applies the same walk inner-first and
+  inserts its pair immediately before the exiting statement, so an outer pair
+  necessarily lands outside an inner one.
+- Still named fail-closed, all of them construct-level rather than shape-level:
+  the `abort` phase and scope-held `await`/failure exits
+  (`semantic-with-abnormal-cleanup-lowering-pending` in its scope-abort and
+  await/failure/question forms), branded scope regions
+  (`semantic-with-region-lowering-pending`), receiver scopes
+  (`semantic-with-receiver-scope-pending`), parameterized acquisition
+  (`semantic-scope-parameter-lowering-pending`), non-pass phases
+  (`semantic-scope-cleanup-form-lowering-pending`), and more than one scope
+  protocol per image (`semantic-scope-protocol-lowering-pending`).
 - The exact typed-reply subset lowers one awaited installed-actor request to
   `ActorReplyRequest` and injects one `ActorReplyResolve` before the target's
   sole exact-`u64` return. Both operations carry the same sorted

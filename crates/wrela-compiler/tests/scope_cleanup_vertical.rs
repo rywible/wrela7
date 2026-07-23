@@ -1047,3 +1047,246 @@ fn question_exit_out_of_a_with_body_reaches_semantic_wir_and_pins_the_flow_tail(
         "the control program is refused identically"
     );
 }
+
+/// A `break` whose target loop *encloses* the `with` — the first loop-carried
+/// abnormal exit out of a scope. The activation is entered and torn down once
+/// per iteration, and the breaking edge tears it down before jumping out.
+const LOOP_BREAK_SCOPE_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+pub struct Masked:
+    token: u32
+
+scope irqs_masked() -> Masked:
+    enter Masked(token=1)
+    exit state:
+        pass
+
+async fn checkpoint():
+    pass
+
+fn guarded():
+    index: u32 = 0
+    while index < 8:
+        index += 1
+        with irqs_masked() as mask:
+            break
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        guarded()
+        await checkpoint()
+
+    @task
+    async fn pulse(mut self):
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#;
+
+/// The same owner with no `with` anywhere: a bare `break` out of a `while` in an
+/// ordinary free function called by the turn. It reproduces the FlowWir refusal
+/// below, which is what proves that wall is the loop-exiting edge itself and not
+/// the scope.
+const LOOP_BREAK_CONTROL_SOURCE: &str = r#"module app
+
+from core.image import Image, Target
+
+async fn checkpoint():
+    pass
+
+fn guarded():
+    index: u32 = 0
+    while index < 8:
+        index += 1
+        break
+
+@service
+pub struct Worker:
+    pub async fn ping(mut self):
+        guarded()
+        await checkpoint()
+
+    @task
+    async fn pulse(mut self):
+        await checkpoint()
+
+@image
+pub fn boot() -> Image:
+    img = Image(name="scope-image", target=Target.aarch64_qemu_virt_uefi)
+    installed = img.service(Worker, mailbox=2)
+    return img
+"#;
+
+/// A `break` whose target loop encloses the `with` tears the activation down on
+/// the breaking edge, and only on it.
+///
+/// Before this slice the semantic tier refused the program outright under
+/// `semantic-with-abnormal-cleanup-lowering-pending (early control-flow exit)`.
+/// The general rule computes the edge instead: `break` at loop nesting depth 0
+/// *within the body* targets a loop outside the `with`, so it exits the scope
+/// and cleans; the body cannot fall through past it, so no second teardown is
+/// appended.
+///
+/// **The vertical stops at SemanticWir, for a reason unrelated to scopes.**
+/// `wrela-flow-lower`'s actor-image source-region validation admits only
+/// fallthrough regions and refuses every `Break`/`Continue` under the
+/// pre-existing `actor non-fallthrough source region`, wherever it appears and
+/// whether or not a scope is involved. `LOOP_BREAK_CONTROL_SOURCE` carries the
+/// identical loop and `break` with no `with` at all and is refused identically,
+/// so the wall is the loop-exiting edge in an actor image, not the scope
+/// teardown. Widening that actor slice is a separate increment; until it lands,
+/// no `with` + `break` program reaches FlowWir, and the loop-control scope
+/// invariant added to `wrela-flow-lower` alongside this change
+/// (`FlowWir loop control with an active scope`) is a fail-closed guard that
+/// source cannot yet reach.
+#[test]
+fn break_out_of_a_loop_enclosing_a_with_cleans_on_the_breaking_edge_and_pins_the_flow_tail() {
+    let (semantic, _target, _build) =
+        lower_scope_source_to_semantic(LOOP_BREAK_SCOPE_SOURCE, false);
+    let wir = semantic.as_wir();
+    let [plan] = wir.scopes.as_slice() else {
+        panic!("one exact scope activation plan")
+    };
+    assert_eq!(plan.name, "irqs_masked");
+    assert_eq!(plan.abort, None);
+    assert!(!plan.suspend_safe);
+    assert_eq!(
+        wir.functions[plan.exit.0 as usize].role,
+        semantic::FunctionRole::Cleanup
+    );
+
+    let owner = wir
+        .functions
+        .iter()
+        .find(|function| function.name.ends_with("::guarded"))
+        .expect("the scope owner is lowered as a source function");
+    assert_eq!(owner.role, semantic::FunctionRole::Ordinary);
+
+    // Every scope marker sits inside the loop, and the teardown pair sits
+    // immediately before the `Break` — the whole observable content of the
+    // general rule for this program.
+    assert_eq!(
+        scope_marker_names(&owner.body),
+        ["enter", "commit", "exit"],
+        "the activation is entered and torn down exactly once, inside the loop"
+    );
+    assert!(
+        breaking_region(&owner.body).is_some_and(|statements| matches!(
+            statements,
+            [
+                ..,
+                semantic::SemanticStatement::Let(semantic::LetStatement {
+                    operation: semantic::SemanticOperation::CommitScope { .. },
+                    ..
+                }),
+                semantic::SemanticStatement::Let(semantic::LetStatement {
+                    operation: semantic::SemanticOperation::ExitScope { .. },
+                    ..
+                }),
+                semantic::SemanticStatement::Break(_),
+            ]
+        )),
+        "cleanup is emitted immediately before the break, not after it"
+    );
+
+    // The FlowWir wall, and the scope-free control program that proves what it
+    // is really refusing.
+    let flow_error = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: semantic,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect_err("FlowWir still refuses a loop-exiting edge in an actor image");
+    let (control, _target, _build) =
+        lower_scope_source_to_semantic(LOOP_BREAK_CONTROL_SOURCE, false);
+    let control_error = CanonicalFlowLowerer::new()
+        .lower(
+            FlowLowerRequest {
+                input: control,
+                limits: FlowLoweringLimits::standard(),
+            },
+            &never_cancelled,
+        )
+        .expect_err("the scope-free control program is refused the same way");
+    assert!(
+        matches!(
+            (&flow_error, &control_error),
+            (
+                wrela_flow_lower::LowerError::UnsupportedInput { feature },
+                wrela_flow_lower::LowerError::UnsupportedInput { feature: control },
+            ) if feature == control && *feature == "actor non-fallthrough source region"
+        ),
+        "the wall is the loop-exiting edge, not the scope: {flow_error:?} vs {control_error:?}"
+    );
+}
+
+/// The scope markers of a region tree in order, walking loops and branches.
+fn scope_marker_names(region: &semantic::SemanticRegion) -> Vec<&'static str> {
+    fn walk(region: &semantic::SemanticRegion, out: &mut Vec<&'static str>) {
+        for statement in &region.statements {
+            match statement {
+                semantic::SemanticStatement::Let(semantic::LetStatement { operation, .. }) => {
+                    match operation {
+                        semantic::SemanticOperation::EnterScope { .. } => out.push("enter"),
+                        semantic::SemanticOperation::CommitScope { .. } => out.push("commit"),
+                        semantic::SemanticOperation::ExitScope { .. } => out.push("exit"),
+                        _ => {}
+                    }
+                }
+                semantic::SemanticStatement::If {
+                    then_region,
+                    else_region,
+                    ..
+                } => {
+                    walk(then_region, out);
+                    walk(else_region, out);
+                }
+                semantic::SemanticStatement::Loop { body, .. } => walk(body, out),
+                semantic::SemanticStatement::Match { arms, .. } => {
+                    for arm in arms {
+                        walk(&arm.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(region, &mut out);
+    out
+}
+
+/// The statements of the region that ends in a `Break`, wherever it is nested.
+fn breaking_region(region: &semantic::SemanticRegion) -> Option<&[semantic::SemanticStatement]> {
+    if matches!(
+        region.statements.last(),
+        Some(semantic::SemanticStatement::Break(_))
+    ) {
+        return Some(region.statements.as_slice());
+    }
+    region
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            semantic::SemanticStatement::If {
+                then_region,
+                else_region,
+                ..
+            } => breaking_region(then_region).or_else(|| breaking_region(else_region)),
+            semantic::SemanticStatement::Loop { body, .. } => breaking_region(body),
+            semantic::SemanticStatement::Match { arms, .. } => {
+                arms.iter().find_map(|arm| breaking_region(&arm.body))
+            }
+            _ => None,
+        })
+}

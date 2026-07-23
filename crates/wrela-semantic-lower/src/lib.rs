@@ -1599,57 +1599,6 @@ fn is_core_outcome_type(
         )
 }
 
-/// Recognizes the exact `SemanticStatement::Match` that `lower_result_try` /
-/// `lower_option_try` synthesize for postfix `?`: a two-arm value-producing
-/// match whose success arm yields the unwrapped payload and whose failure arm
-/// reconstructs the outcome and returns it. Statement-level source `match`
-/// lowering always produces `results: Vec::new()`, and the only other
-/// value-producing match (`lower_enum_type_test`) yields constants from every
-/// arm, so no source-written `match` can present this shape.
-fn is_question_propagation_match(
-    arms: &[wir::SemanticMatchArm],
-    results: &[wir::ValueId],
-    source: Option<Span>,
-) -> bool {
-    let [success, failure] = arms else {
-        return false;
-    };
-    results.len() == 1
-        && source.is_some()
-        && success.variant.is_some()
-        && success.guard.is_none()
-        && failure.variant.is_some()
-        && failure.guard.is_none()
-        && matches!(success.body.statements.as_slice(),
-            [wir::SemanticStatement::Yield(values)] if *values == success.bindings)
-        && matches!(failure.body.statements.split_first(),
-            Some((
-                wir::SemanticStatement::Let(wir::LetStatement {
-                    operation: wir::SemanticOperation::ConstructEnum { .. },
-                    ..
-                }),
-                rest,
-            )) if matches!(rest.split_last(),
-                Some((wir::SemanticStatement::Return(propagated), teardown))
-                    if propagated.len() == 1 && teardown.iter().all(is_scope_teardown_statement)))
-}
-
-/// A `CommitScope`/`ExitScope` marker already inserted into a `?` failure arm by
-/// an inner activation. Recognizing these is what lets the enclosing activation
-/// re-recognize the failure arm and append its own teardown outside them, which
-/// is precisely how the reverse inner-before-outer order arises on the abnormal
-/// path.
-fn is_scope_teardown_statement(statement: &wir::SemanticStatement) -> bool {
-    matches!(
-        statement,
-        wir::SemanticStatement::Let(wir::LetStatement {
-            operation: wir::SemanticOperation::CommitScope { .. }
-                | wir::SemanticOperation::ExitScope { .. },
-            ..
-        })
-    )
-}
-
 fn scope_body_is_pass_only(program: &wrela_hir::Program, body: wrela_hir::BodyId) -> bool {
     program.body(body).is_some_and(|body| {
         body.statements.iter().all(|statement| {
@@ -1667,8 +1616,8 @@ fn validate_scope_normal_body(
     root: wrela_hir::BodyId,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), LowerError> {
-    let mut pending = vec![(root, true)];
-    while let Some((body, direct_cleanup_path)) = pending.pop() {
+    let mut pending = vec![root];
+    while let Some(body) = pending.pop() {
         check_cancelled(is_cancelled)?;
         let body = program.body(body).ok_or(LowerError::MissingSemanticFact {
             subject: "scope activation".to_owned(),
@@ -1701,33 +1650,27 @@ fn validate_scope_normal_body(
                 })?
                 .kind
             {
-                wrela_hir::StatementKind::Return(_) if !direct_cleanup_path => {
-                    return Err(unsupported(
-                        "semantic-with-structured-return-cleanup-lowering-pending",
-                    ));
-                }
-                wrela_hir::StatementKind::Return(_) => {}
-                wrela_hir::StatementKind::Break | wrela_hir::StatementKind::Continue => {
-                    return Err(unsupported(
-                        "semantic-with-abnormal-cleanup-lowering-pending (early control-flow exit)",
-                    ));
-                }
-                wrela_hir::StatementKind::With { body, .. } => {
-                    pending.push((*body, direct_cleanup_path));
-                }
-                wrela_hir::StatementKind::While { body, .. }
+                // Every control-flow edge leaving the `with` body runs the
+                // activation's cleanup first, wherever in the body's statement
+                // tree the edge originates; `insert_scope_cleanup_before_returns`
+                // computes that from the structure rather than recognizing an
+                // admitted position, so no statement position is refused here.
+                wrela_hir::StatementKind::Return(_)
+                | wrela_hir::StatementKind::Break
+                | wrela_hir::StatementKind::Continue => {}
+                wrela_hir::StatementKind::With { body, .. }
+                | wrela_hir::StatementKind::While { body, .. }
                 | wrela_hir::StatementKind::Loop { body }
-                | wrela_hir::StatementKind::For { body, .. } => pending.push((*body, false)),
+                | wrela_hir::StatementKind::For { body, .. } => pending.push(*body),
                 wrela_hir::StatementKind::If {
                     branches,
                     else_body,
                 } => {
-                    let structured_return = direct_cleanup_path && branches.len() == 1;
-                    pending.extend(branches.iter().map(|(_, body)| (*body, structured_return)));
-                    pending.extend(else_body.map(|body| (body, structured_return)));
+                    pending.extend(branches.iter().map(|(_, body)| *body));
+                    pending.extend(else_body);
                 }
                 wrela_hir::StatementKind::Match { arms, .. } => {
-                    pending.extend(arms.iter().map(|arm| (arm.body, false)));
+                    pending.extend(arms.iter().map(|arm| arm.body));
                 }
                 _ => {}
             }
@@ -9401,19 +9344,21 @@ impl SourceFunctionLowerer<'_> {
                         }
                     };
                     let mut lowered_body = self.lower_body(body, depth + 1, local_state)?;
-                    if lowered_body.statements.iter().any(|statement| {
-                        matches!(
-                            statement,
-                            wir::SemanticStatement::Break(_) | wir::SemanticStatement::Continue(_)
-                        )
-                    }) {
-                        return Err(unsupported(
-                            "semantic-with-abnormal-cleanup-lowering-pending (lowered early exit)",
-                        ));
-                    }
-                    let direct_return = matches!(
+                    // Cleanup for the fallthrough edge off the end of the body is
+                    // emitted here, by the caller. It must not be emitted when the
+                    // body cannot fall through — when it ends in a statement that
+                    // is itself an exiting edge the walk below already cleaned, or
+                    // in `Unreachable`. `Break`/`Continue` count exactly as
+                    // `Return` does; before the general rule they could not appear
+                    // here at all.
+                    let terminated = matches!(
                         lowered_body.statements.last(),
-                        Some(wir::SemanticStatement::Return(_))
+                        Some(
+                            wir::SemanticStatement::Return(_)
+                                | wir::SemanticStatement::Break(_)
+                                | wir::SemanticStatement::Continue(_)
+                                | wir::SemanticStatement::Unreachable
+                        )
                     );
                     self.insert_scope_cleanup_before_returns(
                         &mut lowered_body,
@@ -9421,12 +9366,12 @@ impl SourceFunctionLowerer<'_> {
                         state,
                         statement_source,
                         depth + 1,
-                        true,
+                        0,
                     )?;
                     for nested in lowered_body.statements.drain(..) {
                         self.push_statement(&mut statements, nested)?;
                     }
-                    if !direct_return {
+                    if !terminated {
                         self.push_effect(
                             &mut statements,
                             wir::SemanticOperation::CommitScope {
@@ -9443,7 +9388,7 @@ impl SourceFunctionLowerer<'_> {
                             Some(statement_source),
                         )?;
                     }
-                    returned = direct_return;
+                    returned = terminated;
                     if let Some(local) = binding {
                         local_state.set_empty(local)?;
                     }
@@ -11440,6 +11385,23 @@ impl SourceFunctionLowerer<'_> {
         Ok(())
     }
 
+    /// Runs one activation's cleanup on every control-flow edge that leaves the
+    /// `with` body, and on no edge that stays inside it.
+    ///
+    /// `region` is a region of the body's statement tree and `loop_depth` counts
+    /// the `Loop` statements enclosing it *within the body*. `Break`/`Continue`
+    /// carry no loop label in SemanticWir — they always target the innermost
+    /// enclosing `Loop` — so `loop_depth` is exactly what distinguishes an edge
+    /// to a loop inside the body (depth > 0, the scope is not exited, no
+    /// cleanup) from an edge to a loop enclosing the whole `with` (depth 0, the
+    /// scope is exited, cleanup). A `Return` leaves the body from anywhere.
+    /// Fallthrough off the end of the body is the caller's responsibility.
+    ///
+    /// Nested activations need no coordination: each applies this walk to the
+    /// same tree in inner-to-outer order, and each inserts its own pair
+    /// immediately before the exiting statement, so an outer activation's pair
+    /// lands outside an inner one's and the reverse inner-before-outer teardown
+    /// order emerges from the order of application alone.
     fn insert_scope_cleanup_before_returns(
         &mut self,
         region: &mut wir::SemanticRegion,
@@ -11447,7 +11409,7 @@ impl SourceFunctionLowerer<'_> {
         state: wir::ValueId,
         source: Span,
         depth: u32,
-        allow_returns: bool,
+        loop_depth: u32,
     ) -> Result<(), LowerError> {
         check_cancelled(self.is_cancelled)?;
         if depth > self.limits.structured_region_depth {
@@ -11471,29 +11433,34 @@ impl SourceFunctionLowerer<'_> {
         )?;
         for mut statement in std::mem::take(&mut region.statements) {
             check_cancelled(self.is_cancelled)?;
+            // A `Return` leaves the body from any position. A `Break` or
+            // `Continue` leaves it only when its target loop encloses the whole
+            // `with`, which is exactly `loop_depth == 0`.
+            let exits_the_body = match &statement {
+                wir::SemanticStatement::Return(_) => true,
+                wir::SemanticStatement::Break(_) | wir::SemanticStatement::Continue(_) => {
+                    loop_depth == 0
+                }
+                _ => false,
+            };
+            if exits_the_body {
+                self.push_effect(
+                    &mut rewritten,
+                    wir::SemanticOperation::CommitScope {
+                        scope: activation.scope,
+                        value: state,
+                    },
+                    Some(source),
+                )?;
+                self.push_effect(
+                    &mut rewritten,
+                    wir::SemanticOperation::ExitScope {
+                        scope: activation.scope,
+                    },
+                    Some(source),
+                )?;
+            }
             match &mut statement {
-                wir::SemanticStatement::Return(_) if allow_returns => {
-                    self.push_effect(
-                        &mut rewritten,
-                        wir::SemanticOperation::CommitScope {
-                            scope: activation.scope,
-                            value: state,
-                        },
-                        Some(source),
-                    )?;
-                    self.push_effect(
-                        &mut rewritten,
-                        wir::SemanticOperation::ExitScope {
-                            scope: activation.scope,
-                        },
-                        Some(source),
-                    )?;
-                }
-                wir::SemanticStatement::Return(_) => {
-                    return Err(unsupported(
-                        "semantic-with-structured-return-cleanup-lowering-pending",
-                    ));
-                }
                 wir::SemanticStatement::If {
                     then_region,
                     else_region,
@@ -11509,7 +11476,7 @@ impl SourceFunctionLowerer<'_> {
                         state,
                         source,
                         next,
-                        allow_returns,
+                        loop_depth,
                     )?;
                     self.insert_scope_cleanup_before_returns(
                         else_region,
@@ -11517,27 +11484,19 @@ impl SourceFunctionLowerer<'_> {
                         state,
                         source,
                         next,
-                        allow_returns,
+                        loop_depth,
                     )?;
                 }
-                wir::SemanticStatement::Match {
-                    arms,
-                    results,
-                    source: match_source,
-                    ..
-                } => {
+                // Neither `If` nor `Match` is a loop target, so an arm inherits
+                // the enclosing loop nesting unchanged. Nothing about the arm's
+                // shape is inspected: the `?` desugaring's failure arm and a
+                // source-written arm that returns take the same edge and get the
+                // same cleanup.
+                wir::SemanticStatement::Match { arms, .. } => {
                     let next = depth.checked_add(1).ok_or(LowerError::ResourceLimit {
                         resource: "SemanticWir structured region depth",
                         limit: u64::from(self.limits.structured_region_depth),
                     })?;
-                    // A user-written `match` inside a `with` body still has no
-                    // authenticated teardown for a return out of an arm. The one
-                    // admitted exception is the match that postfix `?` desugars
-                    // to, whose failure arm is a plain early return out of the
-                    // scope; that arm takes exactly the same reverse cleanup the
-                    // normal path takes, emitted before the propagating return.
-                    let question_propagation = allow_returns
-                        && is_question_propagation_match(arms, results, *match_source);
                     for arm in arms {
                         self.insert_scope_cleanup_before_returns(
                             &mut arm.body,
@@ -11545,7 +11504,7 @@ impl SourceFunctionLowerer<'_> {
                             state,
                             source,
                             next,
-                            question_propagation,
+                            loop_depth,
                         )?;
                     }
                 }
@@ -11554,8 +11513,18 @@ impl SourceFunctionLowerer<'_> {
                         resource: "SemanticWir structured region depth",
                         limit: u64::from(self.limits.structured_region_depth),
                     })?;
+                    let inner_loops =
+                        loop_depth.checked_add(1).ok_or(LowerError::ResourceLimit {
+                            resource: "SemanticWir structured region depth",
+                            limit: u64::from(self.limits.structured_region_depth),
+                        })?;
                     self.insert_scope_cleanup_before_returns(
-                        body, activation, state, source, next, false,
+                        body,
+                        activation,
+                        state,
+                        source,
+                        next,
+                        inner_loops,
                     )?;
                 }
                 _ => {}
@@ -29832,8 +29801,205 @@ pub fn boot() -> Image:
         ));
     }
 
+    /// Flattens the scope markers of a region, tagging each with the structural
+    /// path of the region it sits in — `"body"` plus one `/if`, `/match`, or
+    /// `/loop` segment per nesting level. Unlike `scope_markers` this walks
+    /// `Loop` bodies, which is what makes a loop-carried exit edge observable.
+    fn nested_scope_markers(region: &wir::SemanticRegion) -> Vec<(String, &'static str, u32)> {
+        fn walk(
+            region: &wir::SemanticRegion,
+            path: &str,
+            out: &mut Vec<(String, &'static str, u32)>,
+        ) {
+            for statement in &region.statements {
+                match statement {
+                    wir::SemanticStatement::Let(wir::LetStatement { operation, .. }) => {
+                        let marker = match operation {
+                            wir::SemanticOperation::EnterScope { scope, .. } => ("enter", scope.0),
+                            wir::SemanticOperation::CommitScope { scope, .. } => {
+                                ("commit", scope.0)
+                            }
+                            wir::SemanticOperation::ExitScope { scope } => ("exit", scope.0),
+                            _ => continue,
+                        };
+                        out.push((path.to_owned(), marker.0, marker.1));
+                    }
+                    wir::SemanticStatement::If {
+                        then_region,
+                        else_region,
+                        ..
+                    } => {
+                        walk(then_region, &format!("{path}/if"), out);
+                        walk(else_region, &format!("{path}/if"), out);
+                    }
+                    wir::SemanticStatement::Match { arms, .. } => {
+                        for arm in arms {
+                            walk(&arm.body, &format!("{path}/match"), out);
+                        }
+                    }
+                    wir::SemanticStatement::Loop { body, .. } => {
+                        walk(body, &format!("{path}/loop"), out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(region, "body", &mut out);
+        out
+    }
+
+    /// Builds an image whose ordinary module-level owner `guarded` has the given
+    /// body, called once from the admitted actor turn.
+    fn scope_owner_image(owner_body: &str) -> wrela_sema::AnalyzedImage {
+        let source = PASS_ONLY_SCOPE_ACTOR_SOURCE
+            .replace(
+                "async fn checkpoint():\n    pass",
+                &format!("async fn checkpoint():\n    pass\n\nfn guarded():\n{owner_body}"),
+            )
+            .replace(
+                "        with irqs_masked() as mask:\n            pass\n",
+                "        guarded()\n",
+            );
+        analyze_parsed_actor_source(&source)
+    }
+
+    fn lowered_scope_owner(image: wrela_sema::AnalyzedImage) -> wir::SemanticFunction {
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image,
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("the scope owner lowers");
+        lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .find(|function| function.name.ends_with("::guarded"))
+            .expect("the scope owner is lowered as a source function")
+            .clone()
+    }
+
+    /// The general rule, stated as a table: every edge that leaves the `with`
+    /// body runs the activation's cleanup first, and every edge that stays
+    /// inside it runs none. Nothing here is a recognized statement shape — the
+    /// only input is whether the edge's target lies inside or outside the body.
     #[test]
-    fn a_source_match_arm_return_inside_a_with_body_stays_closed() {
+    fn every_edge_leaving_a_with_body_cleans_and_every_edge_staying_inside_does_not() {
+        // A `return` from inside a loop inside the body leaves the scope, so it
+        // cleans; the loop's own normal exit falls through to the body's end and
+        // cleans there.
+        assert_eq!(
+            nested_scope_markers(
+                &lowered_scope_owner(scope_owner_image(
+                    "    with irqs_masked() as mask:\n        index: u32 = 0\n        while index < 8:\n            index += 1\n            return"
+                ))
+                .body
+            ),
+            [
+                ("body".to_owned(), "enter", 0),
+                ("body/loop/if".to_owned(), "commit", 0),
+                ("body/loop/if".to_owned(), "exit", 0),
+                ("body".to_owned(), "commit", 0),
+                ("body".to_owned(), "exit", 0),
+            ],
+            "a return out of a loop inside the body cleans before returning"
+        );
+
+        // A `break` whose target loop *encloses* the whole `with` leaves the
+        // scope, so it cleans. The body cannot fall through past it, so no
+        // second cleanup is appended.
+        assert_eq!(
+            nested_scope_markers(
+                &lowered_scope_owner(scope_owner_image(
+                    "    index: u32 = 0\n    while index < 8:\n        index += 1\n        with irqs_masked() as mask:\n            break"
+                ))
+                .body
+            ),
+            [
+                ("body/loop/if".to_owned(), "enter", 0),
+                ("body/loop/if".to_owned(), "commit", 0),
+                ("body/loop/if".to_owned(), "exit", 0),
+            ],
+            "a break to a loop enclosing the `with` cleans exactly once"
+        );
+
+        // The same statement, `break`, with its target loop *inside* the body.
+        // The scope is not exited, so it must not clean; only the fallthrough
+        // off the end of the body does.
+        assert_eq!(
+            nested_scope_markers(
+                &lowered_scope_owner(scope_owner_image(
+                    "    with irqs_masked() as mask:\n        index: u32 = 0\n        while index < 8:\n            index += 1\n            break"
+                ))
+                .body
+            ),
+            [
+                ("body".to_owned(), "enter", 0),
+                ("body".to_owned(), "commit", 0),
+                ("body".to_owned(), "exit", 0),
+            ],
+            "a break to a loop inside the body does not exit the scope and must not clean"
+        );
+
+        // `continue` takes the same edge classification as `break`.
+        assert_eq!(
+            nested_scope_markers(
+                &lowered_scope_owner(scope_owner_image(
+                    "    index: u32 = 0\n    while index < 8:\n        index += 1\n        with irqs_masked() as mask:\n            continue"
+                ))
+                .body
+            ),
+            [
+                ("body/loop/if".to_owned(), "enter", 0),
+                ("body/loop/if".to_owned(), "commit", 0),
+                ("body/loop/if".to_owned(), "exit", 0),
+            ],
+            "a continue to a loop enclosing the `with` cleans exactly once"
+        );
+    }
+
+    /// Reverse inner-before-outer teardown on a loop-carried exit edge is not
+    /// coordinated anywhere: each activation runs the same walk over the same
+    /// tree, inner first, and inserts its pair immediately before the exiting
+    /// statement, so the outer pair necessarily lands outside the inner one.
+    #[test]
+    fn nested_activations_clean_inner_before_outer_on_a_loop_carried_return() {
+        let owner = lowered_scope_owner(scope_owner_image(
+            "    with irqs_masked() as outer:\n        with irqs_masked() as inner:\n            index: u32 = 0\n            while index < 8:\n                index += 1\n                return",
+        ));
+        assert_eq!(
+            nested_scope_markers(&owner.body),
+            [
+                ("body".to_owned(), "enter", 1),
+                ("body".to_owned(), "enter", 0),
+                ("body/loop/if".to_owned(), "commit", 0),
+                ("body/loop/if".to_owned(), "exit", 0),
+                ("body/loop/if".to_owned(), "commit", 1),
+                ("body/loop/if".to_owned(), "exit", 1),
+                ("body".to_owned(), "commit", 0),
+                ("body".to_owned(), "exit", 0),
+                ("body".to_owned(), "commit", 1),
+                ("body".to_owned(), "exit", 1),
+            ],
+            "the return inside the loop tears both activations down inner before outer"
+        );
+    }
+
+    /// Previously `a_source_match_arm_return_inside_a_with_body_stays_closed`,
+    /// which pinned this program to
+    /// `semantic-with-structured-return-cleanup-lowering-pending`. That refusal
+    /// existed only because cleanup for a `match`-arm return was recognized
+    /// rather than computed: `is_question_propagation_match` admitted exactly
+    /// the `Match` that postfix `?` desugars to and nothing else. The general
+    /// rule does not inspect the arm at all, so a source-written arm return now
+    /// takes the identical cleanup the `?` arm takes.
+    #[test]
+    fn a_source_match_arm_return_inside_a_with_body_cleans_before_returning() {
         let source = PASS_ONLY_SCOPE_ACTOR_SOURCE
             .replace(
                 "async fn checkpoint():\n    pass",
@@ -29844,20 +30010,102 @@ pub fn boot() -> Image:
                 "        outcome: Option[u64] = guarded()\n",
             );
         let image = analyze_parsed_actor_source_with_option(&source);
+        let lowered = CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: LoweringLimits::standard(),
+                },
+                &|| false,
+            )
+            .expect("a source match arm return out of a `with` body must lower its cleanup");
+        let owner = lowered
+            .wir()
+            .as_wir()
+            .functions
+            .iter()
+            .find(|function| function.name.ends_with("::guarded"))
+            .expect("the scope owner is lowered as a source function")
+            .clone();
+        assert_eq!(
+            nested_scope_markers(&owner.body),
+            [
+                ("body".to_owned(), "enter", 0),
+                ("body/match".to_owned(), "commit", 0),
+                ("body/match".to_owned(), "exit", 0),
+                ("body".to_owned(), "commit", 0),
+                ("body".to_owned(), "exit", 0),
+            ],
+            "the returning arm cleans, the falling-through arm does not"
+        );
+        let arms = owner
+            .body
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                wir::SemanticStatement::Match { arms, .. } => Some(arms),
+                _ => None,
+            })
+            .expect("the source match is lowered as a match statement");
+        let returning = arms
+            .iter()
+            .filter(|arm| {
+                matches!(
+                    arm.body.statements.last(),
+                    Some(wir::SemanticStatement::Return(_))
+                )
+            })
+            .collect::<Vec<_>>();
+        let [returning] = returning.as_slice() else {
+            panic!("exactly one arm of the source match returns")
+        };
         assert!(
             matches!(
-                CanonicalSemanticLowerer::new().lower(
-                    LowerRequest {
-                        input: image,
-                        limits: LoweringLimits::standard(),
-                    },
-                    &|| false,
-                ),
-                Err(LowerError::UnsupportedInput { feature })
-                    if feature == "semantic-with-structured-return-cleanup-lowering-pending"
+                returning.body.statements.as_slice(),
+                [
+                    ..,
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::CommitScope { .. },
+                        ..
+                    }),
+                    wir::SemanticStatement::Let(wir::LetStatement {
+                        operation: wir::SemanticOperation::ExitScope { .. },
+                        ..
+                    }),
+                    wir::SemanticStatement::Return(_),
+                ]
             ),
-            "only the `?` desugaring's failure arm is admitted, not a source match arm return"
+            "cleanup is emitted immediately before the arm's return, not after it"
         );
+
+        // The widened surface is still exactly bounded.
+        let exact_operations = lowered.report().operations;
+        let mut exact = LoweringLimits::standard();
+        exact.operations = exact_operations;
+        CanonicalSemanticLowerer::new()
+            .lower(
+                LowerRequest {
+                    input: image.clone(),
+                    limits: exact,
+                },
+                &|| false,
+            )
+            .expect("exact match-arm-return scope operation bound");
+        let mut one_under = exact;
+        one_under.operations -= 1;
+        assert!(matches!(
+            CanonicalSemanticLowerer::new().lower(
+                LowerRequest {
+                    input: image,
+                    limits: one_under,
+                },
+                &|| false,
+            ),
+            Err(LowerError::ResourceLimit {
+                resource: "SemanticWir operations",
+                limit,
+            }) if limit == one_under.operations
+        ));
     }
 
     #[test]

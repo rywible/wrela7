@@ -293,14 +293,11 @@ wrela-semantic-lower semantic-scope-enter-lowering-pending (non-scalar state fie
 wrela-semantic-lower semantic-scope-parameter-lowering-pending (parameterized acquisition)
 wrela-semantic-lower semantic-scope-protocol-lowering-pending (multiple scope protocols)
 wrela-semantic-lower semantic-with-abnormal-cleanup-lowering-pending (await, failure, or question exit)
-wrela-semantic-lower semantic-with-abnormal-cleanup-lowering-pending (early control-flow exit)
-wrela-semantic-lower semantic-with-abnormal-cleanup-lowering-pending (lowered early exit)
 wrela-semantic-lower semantic-with-abnormal-cleanup-lowering-pending (scope abort phase)
 wrela-semantic-lower semantic-with-cleanup-lowering-pending (scope protocols and activations in generated tests)
 wrela-semantic-lower semantic-with-cleanup-lowering-pending (scope protocols and activations)
 wrela-semantic-lower semantic-with-owner-lowering-pending (non-actor source function)
 wrela-semantic-lower semantic-with-region-lowering-pending (branded scope region)
-wrela-semantic-lower semantic-with-structured-return-cleanup-lowering-pending
 ```
 <!-- refusal-tag-index: named end -->
 
@@ -315,6 +312,7 @@ wrela-flow-lower FlowWir duplicate scope enter
 wrela-flow-lower FlowWir entered scope identity
 wrela-flow-lower FlowWir exited scope identity
 wrela-flow-lower FlowWir function returns with an active scope
+wrela-flow-lower FlowWir loop control with an active scope
 wrela-flow-lower FlowWir scope commit state
 wrela-flow-lower FlowWir scope exit without commit
 wrela-machine-lower a FIFO activation without actor ownership

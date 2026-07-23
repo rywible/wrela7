@@ -8241,13 +8241,25 @@ fn validate_exact_statement_fact(
                             && record.source_name.as_deref() == Some(local_record.name.as_str())
                     })
                     .ok_or_else(|| invalid("branch join value provenance is invalid"))?;
-                if exact_runtime_source_type(
-                    analysis,
-                    local_record
-                        .ty
-                        .as_ref()
-                        .ok_or_else(|| invalid("branch join local lacks a type"))?,
-                ) != Some(value_record.ty)
+                // A joined local carries its declared type when the source
+                // annotated one. Some source locals are deliberately unannotated
+                // — a `with ... as name` binding takes its type from the
+                // acquisition result, which the `With` arm below checks — so an
+                // absent annotation is not an error. The invariant either way is
+                // that a local's type does not change across the join, so an
+                // unannotated local is checked against the type already recorded
+                // for its other definitions in this function rather than skipped.
+                let joined_type_matches = match local_record.ty.as_ref() {
+                    Some(declared) => {
+                        exact_runtime_source_type(analysis, declared) == Some(value_record.ty)
+                    }
+                    None => analysis.values.iter().all(|record| {
+                        record.function != function.id
+                            || record.origin != SemanticValueOrigin::Local(definition.local)
+                            || record.ty == value_record.ty
+                    }),
+                };
+                if !joined_type_matches
                     || analysis.expressions.iter().any(|expression| {
                         expression.function == function.id
                             && expression.result == Some(definition.value)
