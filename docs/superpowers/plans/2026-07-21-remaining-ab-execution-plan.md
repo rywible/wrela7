@@ -355,12 +355,20 @@ dependency order once the floor supports them:
 5. **Group D** feature verticals as their floor pieces land; **E4-adjacent**
    Lane A/B breadth throughout.
 
-## 7. Diagnostic codes introduced this session (register in any F4 error-index)
-`semantic-runtime-enum-unit-construction-pending`,
+## 7. Named refusals introduced this session (register in any F4 error-index)
+
+**Correction (2026-07-22).** This list originally presented every name below as a
+`Diagnostic::code`. Three of them are not: they are **lowering refusal tags**,
+the `feature` string of an `UnsupportedInput` refusal in `wrela-semantic-lower`.
+They never reach `wrela_diagnostics::Diagnostic::code`, they carry a
+parenthesised qualifier as part of their stable text, and they belong to a
+separate index. Two further names no longer exist in source at all. The two
+live namespaces are now enumerated and drift-checked separately by `cargo
+xdiag`: [diagnostic codes](../../language/diagnostic-index.md) and
+[lowering refusal tags](../../language/refusal-tag-index.md).
+
+### 7.1 Diagnostic codes (`Diagnostic::code`, indexed in `diagnostic-index.md`)
 `semantic-runtime-enum-recursive-payload`,
-`semantic-runtime-enum-enum-payload-construction-pending`,
-`semantic-enum-heterogeneous-lowering-pending`,
-`semantic-enum-nominal-payload-lowering-pending`,
 `semantic-driver-handler-waits`,
 `semantic-projection-generic-pending`,
 `semantic-projection-wrapped-carrier-pending`,
@@ -374,10 +382,26 @@ dependency order once the floor supports them:
 `semantic-projection-mutable-source`,
 `semantic-projection-body-form-pending`,
 `semantic-projection-condition-pending`,
-`semantic-projection-yield-source`,
-`semantic-projection-yield-field`, and
-`semantic-projection-lowering-pending`. (Plus the message change on
+`semantic-projection-yield-source`, and
+`semantic-projection-yield-field`. (Plus the message change on
 `semantic-runtime-enum-payload-shape`: "exactly one" → "at most one".)
+
+### 7.2 Lowering refusal tags (`UnsupportedInput { feature }`, indexed in `refusal-tag-index.md`)
+These are **not** diagnostic codes. Their stable text includes the qualifier:
+- `semantic-enum-heterogeneous-lowering-pending (per-variant differing scalar enum payloads)`
+- `semantic-enum-nominal-payload-lowering-pending (flat-struct or nongeneric-enum nominal enum payloads)`
+- `semantic-projection-lowering-pending (…)` — four distinct qualifiers today
+  (`projection protocols`, `projection protocols in actor images`,
+  `projection activation outside authenticated context`, and
+  `outside generated read-only scalar projection subset`)
+
+### 7.3 Listed here but absent from source (do not register)
+`semantic-runtime-enum-unit-construction-pending` and
+`semantic-runtime-enum-enum-payload-construction-pending` appear in neither
+index because neither string exists anywhere in the workspace. §3's
+"fail-closed diagnostics already emitted" bullets naming them are stale; the
+unit-variant and enum-payload construction tails are no longer marked by those
+names. Re-derive the current name before citing either.
 
 ## 8. Progress ledger
 Keep the table in

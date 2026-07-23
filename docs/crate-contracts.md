@@ -1682,12 +1682,17 @@ it. It injects phase implementations and bounded host capabilities, while
   source-unused workspace edge, untested interface crate, unreviewed
   registry/Git/path dependency, feature-forwarding change, inconsistent
   AArch64 triple/CPU/X18/machine pin, or reintroduced x86 target.
-  `diagnostic-index` (`cargo xdiag`) re-derives every `Diagnostic::code` value
-  from workspace source without running the compiler and reconciles it against
-  `docs/language/diagnostic-index.md`, naming added, removed, duplicated, and
-  re-owned codes. It fails closed on any construction site whose code is not a
-  literal unless that site is declared in `DIAGNOSTIC_CODE_EXCLUSIONS`, and
-  fails again when a declared exclusion disappears; `cargo xnightly` runs it.
+  `diagnostic-index` (`cargo xdiag`) re-derives two disjoint source namespaces
+  without running the compiler: every `Diagnostic::code` value, reconciled
+  against `docs/language/diagnostic-index.md`, and every lowering
+  `UnsupportedInput { feature }` refusal tag, reconciled against
+  `docs/language/refusal-tag-index.md` in a named and a prose block. Both name
+  added, removed, duplicated, and re-owned entries. Each fails closed on any
+  construction site that does not reduce to literals unless that site is
+  declared in `DIAGNOSTIC_CODE_EXCLUSIONS` / `REFUSAL_TAG_EXCLUSIONS`, and fails
+  again when a declared exclusion disappears; refusal-tag carriers resolve
+  crate-wide and a carrier whose visibility escapes its crate is refused.
+  `cargo xnightly` runs it.
   `cargo xgate <slice-or-crate>` validates the locked, host-filtered Cargo
   resolution against reviewed workspace and versioned external/transitive
   closures, prints the complete slice contract, then runs scoped formatting,

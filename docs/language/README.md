@@ -48,6 +48,9 @@ request, public effects are visible, and modules and build phases are defined.
 14. [Diagnostic code index](diagnostic-index.md) — non-normative, the enumerated
     and drift-checked set of stable `Diagnostic::code` values with their owning
     crate (`cargo xdiag`).
+15. [Lowering refusal tag index](refusal-tag-index.md) — non-normative, the
+    enumerated and drift-checked set of `UnsupportedInput { feature }` tags that
+    name the pipeline's deferred tails, with their owning crate (`cargo xdiag`).
 
 ### Audience paths (one language, two vocabularies)
 

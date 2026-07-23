@@ -59,12 +59,13 @@ values and are out of scope here:
 - **Lint names.** `crates/wrela-compiler/src/local_lint.rs` copies the
   registered `LintName` into `Diagnostic::code` for lint findings. The lint
   registry, not a phase, owns those names. Recorded as an exclusion below.
-- **Lowering refusal tags.** `wrela-semantic-lower`, `wrela-flow-lower`, and
-  `wrela-machine-lower` reject unsupported input with
-  `LowerError::UnsupportedInput { feature }` / `MachineLowerError`, whose
-  `feature` strings are code-shaped prose such as
-  `"semantic-enum-heterogeneous-lowering-pending (per-variant differing scalar
-  enum payloads)"`. They never reach `Diagnostic::code`.
+- **Lowering refusal tags.** `wrela-semantic-lower`, `wrela-flow-lower`,
+  `wrela-machine-lower`, and `wrela-compiler` reject unsupported input with
+  `UnsupportedInput { feature }`, whose `feature` strings are code-shaped prose
+  such as `"semantic-enum-heterogeneous-lowering-pending (per-variant differing
+  scalar enum payloads)"`. They never reach `Diagnostic::code`. That second
+  namespace has its own enumerated, drift-checked list — see
+  [the lowering refusal tag index](refusal-tag-index.md).
 - **Engine protocol synthetic codes.** `crates/wrela-compiler/src/engine.rs`
   pushes `engine-*` codes onto `EngineEvent::Diagnostic`, a transport event
   rather than a source diagnostic.

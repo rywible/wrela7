@@ -12,7 +12,7 @@ use std::time::Instant;
 const HELP: &str = "\
 xtask commands:
   architecture-check [--root <absolute-workspace>]  enforce crate dependency contracts
-  diagnostic-index [--root <absolute-workspace>]    reconcile the stable diagnostic code index
+  diagnostic-index [--root <absolute-workspace>]    reconcile the stable diagnostic code and lowering refusal tag indexes
   slices              list focused development slices
   check <slice|crate> [...]  cargo check --all-targets for one boundary
   test <slice|crate> [...]   cargo test for one boundary
@@ -1027,9 +1027,13 @@ fn main() -> ExitCode {
         }
         Some("diagnostic-index") => {
             let remaining = arguments.collect::<Vec<_>>();
-            match architecture_root(&remaining).and_then(|root| check_diagnostic_index(&root)) {
+            match architecture_root(&remaining).and_then(|root| {
+                check_diagnostic_index(&root)?;
+                check_refusal_tag_index(&root)
+            }) {
                 Ok(()) => {
                     println!("diagnostic code index matches the workspace sources");
+                    println!("lowering refusal tag index matches the workspace sources");
                     ExitCode::SUCCESS
                 }
                 Err(error) => {
@@ -2986,6 +2990,52 @@ const DIAGNOSTIC_CODE_EXCLUSIONS: &[DiagnosticCodeExclusion] = &[DiagnosticCodeE
     reason: "lint findings carry the registered lint name, not a phase-owned code",
 }];
 
+/// Checked-in inventory of every stable lowering refusal tag. This is a second,
+/// disjoint namespace: the `feature` string of an `UnsupportedInput` refusal
+/// never reaches `wrela_diagnostics::Diagnostic::code`.
+const REFUSAL_TAG_INDEX_PATH: &str = "docs/language/refusal-tag-index.md";
+const REFUSAL_TAG_INDEX_NAMED_BEGIN: &str = "<!-- refusal-tag-index: named begin -->";
+const REFUSAL_TAG_INDEX_NAMED_END: &str = "<!-- refusal-tag-index: named end -->";
+const REFUSAL_TAG_INDEX_PROSE_BEGIN: &str = "<!-- refusal-tag-index: prose begin -->";
+const REFUSAL_TAG_INDEX_PROSE_END: &str = "<!-- refusal-tag-index: prose end -->";
+const REFUSAL_TAG_INDEX_EXCLUSIONS_BEGIN: &str = "<!-- refusal-tag-index: exclusions begin -->";
+const REFUSAL_TAG_INDEX_EXCLUSIONS_END: &str = "<!-- refusal-tag-index: exclusions end -->";
+
+/// The refusal variant and the field that carries its tag.
+const REFUSAL_TAG_VARIANT: &str = "UnsupportedInput";
+const REFUSAL_TAG_FIELD: &str = "feature";
+
+/// A refusal-tag construction site the source-based extractor cannot read.
+/// Currently empty: every workspace site reduces to literals. An entry here
+/// must still be present in source, or the check fails.
+const REFUSAL_TAG_EXCLUSIONS: &[DiagnosticCodeExclusion] = &[];
+
+/// The message nouns of one index namespace, so that the shared exclusion
+/// reconciler names the right constant, document, and noun in its failures.
+struct ExclusionContract {
+    plural: &'static str,
+    singular: &'static str,
+    constant: &'static str,
+    kind: &'static str,
+    index_path: &'static str,
+}
+
+const DIAGNOSTIC_CODE_EXCLUSION_CONTRACT: ExclusionContract = ExclusionContract {
+    plural: "diagnostic codes",
+    singular: "code",
+    constant: "DIAGNOSTIC_CODE_EXCLUSIONS",
+    kind: "diagnostic-code",
+    index_path: DIAGNOSTIC_INDEX_PATH,
+};
+
+const REFUSAL_TAG_EXCLUSION_CONTRACT: ExclusionContract = ExclusionContract {
+    plural: "lowering refusal tags",
+    singular: "tag",
+    constant: "REFUSAL_TAG_EXCLUSIONS",
+    kind: "refusal-tag",
+    index_path: REFUSAL_TAG_INDEX_PATH,
+};
+
 /// One workspace source file considered by the diagnostic-code extractor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiagnosticSourceUnit {
@@ -3345,6 +3395,57 @@ fn function_is_exported(bytes: &[u8], function: &MaskedFunction) -> bool {
         }
         match &bytes[start..cursor] {
             b"pub" => return true,
+            b"const" | b"async" | b"unsafe" | b"default" => cursor = start,
+            _ => return false,
+        }
+    }
+}
+
+/// Whether a function is reachable outside its own crate. Refusal-tag carrier
+/// call sites are searched crate-wide, so a carrier whose visibility escapes the
+/// crate must be refused instead of silently under-reporting. `pub(crate)`,
+/// `pub(super)`, and `pub(in path)` cannot be re-exported more widely than they
+/// are declared, so they stay crate-confined.
+fn function_escapes_crate(bytes: &[u8], function: &MaskedFunction) -> bool {
+    let mut cursor = function.signature_start;
+    let mut restricted = false;
+    loop {
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor > 0 && bytes[cursor - 1] == b')' {
+            // A visibility restriction such as `pub(crate)`.
+            let mut depth = 0i32;
+            let mut open = cursor - 1;
+            loop {
+                match bytes[open] {
+                    b')' => depth += 1,
+                    b'(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                if open == 0 {
+                    return false;
+                }
+                open -= 1;
+            }
+            restricted = true;
+            cursor = open;
+            continue;
+        }
+        let mut start = cursor;
+        while start > 0 && is_identifier_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        if start == cursor {
+            return false;
+        }
+        match &bytes[start..cursor] {
+            b"pub" => return !restricted,
             b"const" | b"async" | b"unsafe" | b"default" => cursor = start,
             _ => return false,
         }
@@ -3915,6 +4016,17 @@ fn local_code_binder(
     function: &MaskedFunction,
     offset: usize,
 ) -> Option<usize> {
+    local_binder(unit, function, offset, "code")
+}
+
+/// Offset of the initializer of the nearest `let`/`for` binder before `offset`
+/// that binds `name`.
+fn local_binder(
+    unit: &MaskedUnit<'_>,
+    function: &MaskedFunction,
+    offset: usize,
+    name: &str,
+) -> Option<usize> {
     let bytes = &unit.masked.bytes;
     let mut best = None;
     for keyword in ["let", "for"] {
@@ -3961,7 +4073,7 @@ fn local_code_binder(
             let pattern = &unit.unit.text[pattern_start..binder_end];
             if !pattern
                 .split(|character: char| !is_identifier_byte(character as u8))
-                .any(|token| token == "code")
+                .any(|token| token == name)
             {
                 continue;
             }
@@ -4096,8 +4208,12 @@ fn render_diagnostic_index(codes: &BTreeMap<String, BTreeSet<String>>) -> String
 }
 
 fn render_diagnostic_exclusions() -> String {
+    render_exclusions(DIAGNOSTIC_CODE_EXCLUSIONS)
+}
+
+fn render_exclusions(exclusions: &[DiagnosticCodeExclusion]) -> String {
     let mut block = String::from("\n```text\n");
-    for exclusion in DIAGNOSTIC_CODE_EXCLUSIONS {
+    for exclusion in exclusions {
         block.push_str(exclusion.path);
         block.push_str(" `");
         block.push_str(exclusion.expression);
@@ -4134,7 +4250,22 @@ fn reconcile_diagnostic_index(
     block: &str,
     codes: &BTreeMap<String, BTreeSet<String>>,
 ) -> Result<(), String> {
-    let entries = parse_diagnostic_index(block)?;
+    reconcile_index(
+        parse_diagnostic_index(block)?,
+        codes,
+        "diagnostic index",
+        render_diagnostic_index(codes),
+    )
+}
+
+/// Compare one parsed index block against the keys extracted from source,
+/// naming every direction of drift.
+fn reconcile_index(
+    entries: Vec<(String, Vec<String>)>,
+    codes: &BTreeMap<String, BTreeSet<String>>,
+    noun: &str,
+    replacement: String,
+) -> Result<(), String> {
     let mut counts = BTreeMap::<String, u32>::new();
     let mut documented = BTreeMap::<String, Vec<String>>::new();
     for (code, owners) in entries {
@@ -4174,8 +4305,7 @@ fn reconcile_diagnostic_index(
         return Ok(());
     }
     Err(format!(
-        "documented diagnostic index has drifted\n  added by source: {added:?}\n  removed from source: {removed:?}\n  duplicated in the index: {duplicated:?}\n  owner drift: {owner_drift:?}\nreplace the marked block with:{}",
-        render_diagnostic_index(codes)
+        "documented {noun} has drifted\n  added by source: {added:?}\n  removed from source: {removed:?}\n  duplicated in the index: {duplicated:?}\n  owner drift: {owner_drift:?}\nreplace the marked block with:{replacement}"
     ))
 }
 
@@ -4190,6 +4320,21 @@ fn marked_block<'a>(text: &'a str, begin: &str, end: &str, path: &Path) -> Resul
 fn reconcile_diagnostic_exclusions(
     rejections: &[DiagnosticCodeRejection],
     exclusions: &[DiagnosticCodeExclusion],
+) -> Result<(), String> {
+    reconcile_exclusions(rejections, exclusions, &DIAGNOSTIC_CODE_EXCLUSION_CONTRACT)
+}
+
+fn reconcile_refusal_tag_exclusions(
+    rejections: &[DiagnosticCodeRejection],
+    exclusions: &[DiagnosticCodeExclusion],
+) -> Result<(), String> {
+    reconcile_exclusions(rejections, exclusions, &REFUSAL_TAG_EXCLUSION_CONTRACT)
+}
+
+fn reconcile_exclusions(
+    rejections: &[DiagnosticCodeRejection],
+    exclusions: &[DiagnosticCodeExclusion],
+    contract: &ExclusionContract,
 ) -> Result<(), String> {
     let declared: BTreeSet<_> = exclusions
         .iter()
@@ -4208,8 +4353,11 @@ fn reconcile_diagnostic_exclusions(
         .collect();
     if !unexcluded.is_empty() {
         return Err(format!(
-            "diagnostic codes are constructed non-literally at sites the index does not declare\n  {}\nadd a DIAGNOSTIC_CODE_EXCLUSIONS entry with its reason, or build the code from a literal",
-            unexcluded.join("\n  ")
+            "{} are constructed non-literally at sites the index does not declare\n  {}\nadd a {} entry with its reason, or build the {} from a literal",
+            contract.plural,
+            unexcluded.join("\n  "),
+            contract.constant,
+            contract.singular
         ));
     }
     let stale: Vec<_> = declared
@@ -4218,7 +4366,8 @@ fn reconcile_diagnostic_exclusions(
         .collect();
     if !stale.is_empty() {
         return Err(format!(
-            "declared diagnostic-code exclusions no longer exist in source: {stale:?}\nremove them from DIAGNOSTIC_CODE_EXCLUSIONS and from {DIAGNOSTIC_INDEX_PATH}"
+            "declared {} exclusions no longer exist in source: {stale:?}\nremove them from {} and from {}",
+            contract.kind, contract.constant, contract.index_path
         ));
     }
     Ok(())
@@ -4256,6 +4405,456 @@ pub(crate) fn check_diagnostic_index(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Result of reading every `UnsupportedInput { feature }` tag out of source.
+#[derive(Debug, Default)]
+struct RefusalTagScan {
+    tags: BTreeMap<String, BTreeSet<String>>,
+    rejections: Vec<DiagnosticCodeRejection>,
+}
+
+/// One `UnsupportedInput { … }` construction site located in masked source.
+enum RefusalTagSeed {
+    /// Byte range of the `feature` expression.
+    Expression(usize, usize),
+    /// Byte range of a construction site that carries no readable `feature`
+    /// field, which the extractor refuses rather than skips.
+    AbsentField(usize, usize),
+}
+
+/// Mutable state threaded through refusal-tag extraction.
+#[derive(Default)]
+struct TagScanState {
+    tags: BTreeMap<String, BTreeSet<String>>,
+    rejections: Vec<DiagnosticCodeRejection>,
+    /// `(crate, function name, argument position)` of a tag-carrying parameter.
+    carriers: BTreeSet<(String, String, usize)>,
+}
+
+/// Whether a refusal tag follows the stable `<tier>-<name>-pending` naming
+/// convention, optionally qualified by a parenthesised detail. The remaining
+/// tags are prose fragments of the refusal message.
+fn is_named_refusal_tag(tag: &str) -> bool {
+    is_code_shaped(tag.split_once(" (").map_or(tag, |(name, _)| name))
+}
+
+/// Read every refusal tag the workspace can put in `UnsupportedInput`.
+fn scan_refusal_tags(units: &[DiagnosticSourceUnit]) -> RefusalTagScan {
+    let masked: Vec<_> = units
+        .iter()
+        .map(|unit| MaskedUnit {
+            unit,
+            masked: mask_rust_source(&unit.text),
+        })
+        .collect();
+    let mut state = TagScanState::default();
+
+    for (index, unit) in masked.iter().enumerate() {
+        for seed in refusal_tag_seeds(unit) {
+            match seed {
+                RefusalTagSeed::Expression(start, end) => {
+                    record_tag_resolution(&masked, index, start, end, "refusal tag", &mut state);
+                }
+                RefusalTagSeed::AbsentField(start, end) => {
+                    state.rejections.push(DiagnosticCodeRejection {
+                        path: unit.unit.path.clone(),
+                        line: unit.line(start),
+                        context: "refusal tag field is absent".to_owned(),
+                        expression: unit.expression_text(start, end),
+                    });
+                }
+            }
+        }
+    }
+
+    let mut resolved = BTreeSet::new();
+    loop {
+        let pending: Vec<_> = state.carriers.difference(&resolved).cloned().collect();
+        if pending.is_empty() {
+            break;
+        }
+        for carrier in pending {
+            resolved.insert(carrier.clone());
+            resolve_tag_carrier_calls(&masked, &carrier, &mut state);
+        }
+    }
+
+    state
+        .rejections
+        .sort_by(|left, right| (&left.path, left.line).cmp(&(&right.path, right.line)));
+    state.rejections.dedup();
+    RefusalTagScan {
+        tags: state.tags,
+        rejections: state.rejections,
+    }
+}
+
+/// Every `UnsupportedInput { … }` construction site in one masked file.
+fn refusal_tag_seeds(unit: &MaskedUnit<'_>) -> Vec<RefusalTagSeed> {
+    let bytes = &unit.masked.bytes;
+    let mut seeds = Vec::new();
+    for offset in find_all(bytes, REFUSAL_TAG_VARIANT.as_bytes()) {
+        if offset > 0 && (is_identifier_byte(bytes[offset - 1]) || bytes[offset - 1] == b'.') {
+            continue;
+        }
+        let after = offset + REFUSAL_TAG_VARIANT.len();
+        if bytes
+            .get(after)
+            .is_some_and(|byte| is_identifier_byte(*byte))
+        {
+            continue;
+        }
+        let brace = skip_whitespace(bytes, after, bytes.len());
+        if bytes.get(brace) != Some(&b'{') {
+            continue;
+        }
+        let close = matching_delimiter(bytes, brace);
+        // A match or `if let` pattern destructures the variant instead of
+        // constructing one.
+        let arrow = skip_whitespace(bytes, close + 1, bytes.len());
+        if bytes.get(arrow) == Some(&b'=') && bytes.get(arrow + 1) == Some(&b'>') {
+            continue;
+        }
+        // A `feature:` outside any function body is the enum's own field
+        // declaration; a `#[cfg(test)]` item does not define the index.
+        if unit.enclosing_function(brace).is_none() || unit.in_test(brace) {
+            continue;
+        }
+        let mut field = None;
+        for (start, end) in split_top_level(bytes, brace + 1, close) {
+            let start = skip_whitespace(bytes, start, end);
+            let Some(name) = identifier_at(bytes, start) else {
+                continue;
+            };
+            if name != REFUSAL_TAG_FIELD {
+                continue;
+            }
+            let colon = skip_whitespace(bytes, start + name.len(), end);
+            field = Some(if bytes.get(colon) == Some(&b':') {
+                (colon + 1, end)
+            } else {
+                (start, start + name.len())
+            });
+        }
+        seeds.push(match field {
+            Some((start, end)) => RefusalTagSeed::Expression(start, end),
+            None => RefusalTagSeed::AbsentField(offset, close + 1),
+        });
+    }
+    seeds
+}
+
+fn record_tag_resolution(
+    masked: &[MaskedUnit<'_>],
+    index: usize,
+    start: usize,
+    end: usize,
+    context: &str,
+    state: &mut TagScanState,
+) {
+    let unit = &masked[index];
+    match resolve_tag_expression(masked, index, start, end, 0, state) {
+        Ok(tags) => {
+            for tag in tags {
+                state
+                    .tags
+                    .entry(tag)
+                    .or_default()
+                    .insert(unit.unit.crate_name.clone());
+            }
+        }
+        Err(()) => state.rejections.push(DiagnosticCodeRejection {
+            path: unit.unit.path.clone(),
+            line: unit.line(start),
+            context: format!("{context} is not a literal"),
+            expression: unit.expression_text(start, end),
+        }),
+    }
+}
+
+fn resolve_tag_expression(
+    masked: &[MaskedUnit<'_>],
+    index: usize,
+    start: usize,
+    end: usize,
+    depth: u32,
+    state: &mut TagScanState,
+) -> Result<Vec<String>, ()> {
+    if depth > 4 {
+        return Err(());
+    }
+    let unit = &masked[index];
+    let bytes = &unit.masked.bytes;
+    let start = skip_whitespace(bytes, start, end.min(bytes.len()));
+    let mut end = end.min(bytes.len());
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if start >= end {
+        return Err(());
+    }
+
+    // Rule 1: a string literal, optionally followed by a no-op conversion.
+    if let Some(value) = unit.masked.literals.get(&start) {
+        let literal_end = start + value.len() + 2;
+        let suffix = unit
+            .unit
+            .text
+            .get(literal_end.min(unit.unit.text.len())..end)
+            .unwrap_or_default()
+            .trim();
+        if DIAGNOSTIC_CODE_LITERAL_SUFFIXES.contains(&suffix) {
+            return Ok(vec![value.clone()]);
+        }
+        return Err(());
+    }
+
+    let Some(name) = identifier_at(bytes, start) else {
+        return Err(());
+    };
+    let suffix = unit
+        .unit
+        .text
+        .get(start + name.len()..end)
+        .unwrap_or_default()
+        .trim();
+
+    // Rule 2: a file-local `&str` constant.
+    if let Some(value) = unit.masked.constants.get(&name) {
+        if DIAGNOSTIC_CODE_LITERAL_SUFFIXES.contains(&suffix) {
+            return Ok(vec![value.clone()]);
+        }
+        return Err(());
+    }
+
+    // Rule 3: an `if`/`else` selection between refusal tags — both count.
+    if name == "if" {
+        let Some(then_open) = bytes[start..end].iter().position(|byte| *byte == b'{') else {
+            return Err(());
+        };
+        let then_open = start + then_open;
+        let then_close = matching_delimiter(bytes, then_open);
+        let mut tags =
+            resolve_tag_expression(masked, index, then_open + 1, then_close, depth + 1, state)?;
+        let Some(else_open) = bytes[then_close..end].iter().position(|byte| *byte == b'{') else {
+            return Err(());
+        };
+        let else_open = then_close + else_open;
+        let else_close = matching_delimiter(bytes, else_open);
+        tags.extend(resolve_tag_expression(
+            masked,
+            index,
+            else_open + 1,
+            else_close,
+            depth + 1,
+            state,
+        )?);
+        return Ok(tags);
+    }
+
+    if !DIAGNOSTIC_CODE_LITERAL_SUFFIXES.contains(&suffix) {
+        return Err(());
+    }
+    let Some(function) = unit.enclosing_function(start) else {
+        return Err(());
+    };
+
+    // Rule 4: a parameter of the enclosing function, which makes that function
+    // a *carrier*: its call sites across the same crate are then resolved at the
+    // matching argument position, transitively. A carrier whose visibility
+    // escapes its crate is refused instead.
+    let parameters = parameter_names(&function.parameters);
+    if let Some(position) = parameters.iter().position(|parameter| *parameter == name) {
+        if function_escapes_crate(bytes, function) {
+            return Err(());
+        }
+        state.carriers.insert((
+            unit.unit.crate_name.clone(),
+            function.name.clone(),
+            position,
+        ));
+        return Ok(Vec::new());
+    }
+
+    // Rule 5: a `let` binder in the enclosing function, read through at its
+    // initializer.
+    let Some(initializer) = local_binder(unit, function, start, &name) else {
+        return Err(());
+    };
+    resolve_tag_expression(
+        masked,
+        index,
+        initializer,
+        statement_end(bytes, initializer),
+        depth + 1,
+        state,
+    )
+}
+
+fn resolve_tag_carrier_calls(
+    masked: &[MaskedUnit<'_>],
+    carrier: &(String, String, usize),
+    state: &mut TagScanState,
+) {
+    let (crate_name, name, position) = carrier;
+    for index in 0..masked.len() {
+        let unit = &masked[index];
+        if unit.unit.crate_name != *crate_name {
+            continue;
+        }
+        let bytes = &unit.masked.bytes;
+        for offset in find_all(bytes, name.as_bytes()) {
+            if offset > 0 && is_identifier_byte(bytes[offset - 1]) {
+                continue;
+            }
+            let after = offset + name.len();
+            if bytes
+                .get(after)
+                .is_some_and(|byte| is_identifier_byte(*byte))
+            {
+                continue;
+            }
+            let open = skip_whitespace(bytes, after, bytes.len());
+            if bytes.get(open) != Some(&b'(') {
+                continue;
+            }
+            let before = unit.unit.text[..offset].trim_end();
+            if before.ends_with("fn") {
+                continue;
+            }
+            if before.ends_with(':') && !before.ends_with("::") {
+                continue;
+            }
+            if unit.in_test(offset) {
+                continue;
+            }
+            let close = matching_delimiter(bytes, open);
+            let arguments = split_top_level(bytes, open + 1, close);
+            let Some((argument_start, argument_end)) = arguments.get(*position) else {
+                state.rejections.push(DiagnosticCodeRejection {
+                    path: unit.unit.path.clone(),
+                    line: unit.line(offset),
+                    context: format!("refusal tag argument to `{name}`"),
+                    expression: unit.expression_text(offset, close + 1),
+                });
+                continue;
+            };
+            record_tag_resolution(
+                masked,
+                index,
+                *argument_start,
+                *argument_end,
+                &format!("refusal tag argument to `{name}`"),
+                state,
+            );
+        }
+    }
+}
+
+/// `<owner>[,<owner>] <tag>`: refusal tags contain spaces, so the owning crates
+/// lead the line and the tag runs to its end.
+fn render_refusal_tag_index(tags: &BTreeMap<String, BTreeSet<String>>) -> String {
+    let mut block = String::from("\n```text\n");
+    for (tag, owners) in tags {
+        block.push_str(&owners.iter().cloned().collect::<Vec<_>>().join(","));
+        block.push(' ');
+        block.push_str(tag);
+        block.push('\n');
+    }
+    block.push_str("```\n");
+    block
+}
+
+fn parse_refusal_tag_index(block: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    let mut entries = Vec::new();
+    for line in block.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("```") {
+            continue;
+        }
+        let (owners, tag) = line
+            .split_once(' ')
+            .ok_or_else(|| format!("refusal tag index entry {line:?} has no owning crate"))?;
+        entries.push((
+            tag.to_owned(),
+            owners
+                .split(',')
+                .map(|owner| owner.trim().to_owned())
+                .collect(),
+        ));
+    }
+    Ok(entries)
+}
+
+fn reconcile_refusal_tag_section(
+    block: &str,
+    tags: &BTreeMap<String, BTreeSet<String>>,
+    noun: &str,
+) -> Result<(), String> {
+    reconcile_index(
+        parse_refusal_tag_index(block)?,
+        tags,
+        noun,
+        render_refusal_tag_index(tags),
+    )
+}
+
+pub(crate) fn check_refusal_tag_index(root: &Path) -> Result<(), String> {
+    let units = collect_diagnostic_sources(root)?;
+    let scan = scan_refusal_tags(&units);
+    reconcile_refusal_tag_exclusions(&scan.rejections, REFUSAL_TAG_EXCLUSIONS)?;
+
+    let path = root.join(REFUSAL_TAG_INDEX_PATH);
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let (named, prose): (BTreeMap<_, _>, BTreeMap<_, _>) = scan
+        .tags
+        .into_iter()
+        .partition(|(tag, _)| is_named_refusal_tag(tag));
+    // Every section is reconciled before reporting, so one run prints every
+    // block a regeneration has to replace.
+    let mut failures = Vec::new();
+    if let Err(error) = reconcile_refusal_tag_section(
+        marked_block(
+            &text,
+            REFUSAL_TAG_INDEX_NAMED_BEGIN,
+            REFUSAL_TAG_INDEX_NAMED_END,
+            &path,
+        )?,
+        &named,
+        "named refusal tag index",
+    ) {
+        failures.push(error);
+    }
+    if let Err(error) = reconcile_refusal_tag_section(
+        marked_block(
+            &text,
+            REFUSAL_TAG_INDEX_PROSE_BEGIN,
+            REFUSAL_TAG_INDEX_PROSE_END,
+            &path,
+        )?,
+        &prose,
+        "prose refusal reason index",
+    ) {
+        failures.push(error);
+    }
+    let documented_exclusions = marked_block(
+        &text,
+        REFUSAL_TAG_INDEX_EXCLUSIONS_BEGIN,
+        REFUSAL_TAG_INDEX_EXCLUSIONS_END,
+        &path,
+    )?;
+    let expected_exclusions = render_exclusions(REFUSAL_TAG_EXCLUSIONS);
+    if documented_exclusions != expected_exclusions {
+        failures.push(format!(
+            "documented refusal-tag exclusions have drifted; replace the marked block with:{expected_exclusions}"
+        ));
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(failures.join("\n\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -4267,11 +4866,13 @@ mod tests {
     use super::{
         DEVELOPMENT_SLICES, DIAGNOSTIC_CODE_EXCLUSIONS, DiagnosticCodeExclusion,
         DiagnosticCodeRejection, DiagnosticSourceUnit, EXTERNAL_DEPENDENCIES, FullRoute,
-        GateClosure, GateRequest, REVIEWED_EXTERNAL_PACKAGES, architecture_root,
-        check_architecture, check_diagnostic_index, collect_diagnostic_sources,
-        compare_gate_closure, configure_cargo_gate_environment, expected_gate_closure,
-        full_route_steps, gate_target, parse_gate_arguments, reconcile_diagnostic_exclusions,
-        reconcile_diagnostic_index, render_diagnostic_index, scan_diagnostic_codes,
+        GateClosure, GateRequest, REFUSAL_TAG_EXCLUSIONS, REVIEWED_EXTERNAL_PACKAGES,
+        architecture_root, check_architecture, check_diagnostic_index, check_refusal_tag_index,
+        collect_diagnostic_sources, compare_gate_closure, configure_cargo_gate_environment,
+        expected_gate_closure, full_route_steps, gate_target, is_named_refusal_tag,
+        parse_gate_arguments, reconcile_diagnostic_exclusions, reconcile_diagnostic_index,
+        reconcile_refusal_tag_exclusions, reconcile_refusal_tag_section, render_diagnostic_index,
+        render_refusal_tag_index, scan_diagnostic_codes, scan_refusal_tags,
         validate_development_slice_metadata, workspace_root,
     };
 
@@ -4896,5 +5497,418 @@ fn call() { emit(span, "example-exported-carrier"); }
     fn documented_diagnostic_index_matches_workspace_sources() {
         let root = workspace_root().expect("workspace root");
         check_diagnostic_index(&root).expect("diagnostic index");
+    }
+
+    fn crate_unit(crate_name: &str, path: &str, text: &str) -> DiagnosticSourceUnit {
+        DiagnosticSourceUnit {
+            crate_name: crate_name.to_owned(),
+            path: path.to_owned(),
+            text: text.to_owned(),
+        }
+    }
+
+    fn scanned_tags(units: &[DiagnosticSourceUnit]) -> Vec<String> {
+        let scan = scan_refusal_tags(units);
+        assert!(
+            scan.rejections.is_empty(),
+            "unexpected rejections: {:?}",
+            scan.rejections
+        );
+        scan.tags.keys().cloned().collect()
+    }
+
+    #[test]
+    fn refusal_tag_extraction_reads_every_admitted_carrier_form() {
+        // Rule 1 (literal field), rule 2 (file-local `&str` constant), rule 3
+        // (`if`/`else` selection). The enum declaration, the `Display` match
+        // pattern, and `#[cfg(test)]` items are not construction sites.
+        let direct = crate_unit(
+            "wrela-example",
+            "crates/wrela-example/src/direct.rs",
+            r#"
+const PENDING: &str = "example-const-lowering-pending (constant carrier)";
+pub enum LowerError {
+    Cancelled,
+    UnsupportedInput { feature: &'static str },
+}
+impl fmt::Display for LowerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedInput { feature } => write!(formatter, "no {feature}"),
+            Self::Cancelled => formatter.write_str("cancelled"),
+        }
+    }
+}
+fn direct() -> LowerError {
+    LowerError::UnsupportedInput {
+        feature: "example-direct-lowering-pending (direct field)",
+    }
+}
+fn constant() -> LowerError {
+    LowerError::UnsupportedInput { feature: PENDING }
+}
+fn selected(flag: bool) -> LowerError {
+    LowerError::UnsupportedInput {
+        feature: if flag {
+            "example-then-lowering-pending"
+        } else {
+            "example-else-lowering-pending"
+        },
+    }
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ignored() {
+        let _ = LowerError::UnsupportedInput {
+            feature: "example-test-only-lowering-pending",
+        };
+    }
+}
+"#,
+        );
+        assert_eq!(
+            scanned_tags(std::slice::from_ref(&direct)),
+            [
+                "example-const-lowering-pending (constant carrier)",
+                "example-direct-lowering-pending (direct field)",
+                "example-else-lowering-pending",
+                "example-then-lowering-pending",
+            ]
+        );
+
+        // Rule 4 (a parameter carrier, resolved transitively at every call site
+        // in the same crate, including other files) and rule 5 (a `let` binder).
+        let helper = crate_unit(
+            "wrela-example",
+            "crates/wrela-example/src/helper.rs",
+            r#"
+fn unsupported(feature: &'static str) -> LowerError {
+    LowerError::UnsupportedInput { feature }
+}
+fn reject(values: &[u8], feature: &'static str) -> Result<(), LowerError> {
+    if values.is_empty() {
+        return Err(unsupported(feature));
+    }
+    Ok(())
+}
+fn call_sites() -> Result<(), LowerError> {
+    Err(unsupported(
+        "example-helper-lowering-pending (same file)",
+    ))?;
+    reject(&[], "example-relayed-lowering-pending (relayed)")
+}
+"#,
+        );
+        let other = crate_unit(
+            "wrela-example",
+            "crates/wrela-example/src/other.rs",
+            r#"
+use super::unsupported;
+fn bound() -> LowerError {
+    let feature = "example-local-lowering-pending (local binder)";
+    unsupported(feature)
+}
+fn plain() -> LowerError {
+    unsupported("example-crosswise-lowering-pending (other file)")
+}
+"#,
+        );
+        assert_eq!(
+            scanned_tags(&[helper.clone(), other.clone()]),
+            [
+                "example-crosswise-lowering-pending (other file)",
+                "example-helper-lowering-pending (same file)",
+                "example-local-lowering-pending (local binder)",
+                "example-relayed-lowering-pending (relayed)",
+            ]
+        );
+    }
+
+    #[test]
+    fn refusal_tag_extraction_confines_a_carrier_to_its_own_crate() {
+        let first = crate_unit(
+            "wrela-first",
+            "crates/wrela-first/src/lib.rs",
+            r#"
+fn unsupported(feature: &'static str) -> LowerError {
+    LowerError::UnsupportedInput { feature }
+}
+fn call() -> LowerError { unsupported("example-first-lowering-pending") }
+"#,
+        );
+        let second = crate_unit(
+            "wrela-second",
+            "crates/wrela-second/src/lib.rs",
+            r#"
+fn unsupported(feature: &'static str) -> LowerError {
+    LowerError::UnsupportedInput { feature }
+}
+fn call() -> LowerError { unsupported("example-second-lowering-pending") }
+"#,
+        );
+        let scan = scan_refusal_tags(&[first, second]);
+        assert!(scan.rejections.is_empty(), "{:?}", scan.rejections);
+        assert_eq!(
+            scan.tags
+                .get("example-first-lowering-pending")
+                .map(|owners| owners.iter().cloned().collect::<Vec<_>>()),
+            Some(vec!["wrela-first".to_owned()])
+        );
+        assert_eq!(
+            scan.tags
+                .get("example-second-lowering-pending")
+                .map(|owners| owners.iter().cloned().collect::<Vec<_>>()),
+            Some(vec!["wrela-second".to_owned()])
+        );
+    }
+
+    #[test]
+    fn refusal_tag_extraction_fails_closed_on_unreadable_refusal_sites() {
+        let scan = scan_refusal_tags(&[crate_unit(
+            "wrela-example",
+            "crates/wrela-example/src/lib.rs",
+            "fn f() -> LowerError { LowerError::UnsupportedInput { feature: describe(kind) } }",
+        )]);
+        assert!(scan.tags.is_empty(), "{:?}", scan.tags);
+        assert_eq!(
+            scan.rejections
+                .iter()
+                .map(DiagnosticCodeRejection::describe)
+                .collect::<Vec<_>>(),
+            [
+                "crates/wrela-example/src/lib.rs:1 refusal tag is not a literal: `describe(kind)`"
+                    .to_owned()
+            ]
+        );
+
+        let absent = scan_refusal_tags(&[crate_unit(
+            "wrela-example",
+            "crates/wrela-example/src/absent.rs",
+            "fn f(error: LowerError) -> bool { matches!(error, LowerError::UnsupportedInput { .. }) }",
+        )]);
+        assert!(absent.tags.is_empty(), "{:?}", absent.tags);
+        assert_eq!(
+            absent
+                .rejections
+                .iter()
+                .map(DiagnosticCodeRejection::describe)
+                .collect::<Vec<_>>(),
+            [
+                "crates/wrela-example/src/absent.rs:1 refusal tag field is absent: \
+              `UnsupportedInput { .. }`"
+                    .to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn refusal_tag_extraction_fails_closed_on_a_carrier_that_escapes_its_crate() {
+        let confined = crate_unit(
+            "wrela-example",
+            "crates/wrela-example/src/confined.rs",
+            r#"
+pub(crate) fn unsupported(feature: &'static str) -> LowerError {
+    LowerError::UnsupportedInput { feature }
+}
+fn call() -> LowerError { unsupported("example-confined-lowering-pending") }
+"#,
+        );
+        assert_eq!(
+            scanned_tags(std::slice::from_ref(&confined)),
+            ["example-confined-lowering-pending"]
+        );
+
+        // The same carrier, exported from the crate: its call sites may live in
+        // a crate this extractor never associates with these tags, so it must be
+        // refused rather than resolved crate-locally.
+        let escaping = crate_unit(
+            "wrela-example",
+            "crates/wrela-example/src/escaping.rs",
+            r#"
+pub fn unsupported(feature: &'static str) -> LowerError {
+    LowerError::UnsupportedInput { feature }
+}
+fn call() -> LowerError { unsupported("example-escaping-lowering-pending") }
+"#,
+        );
+        let scan = scan_refusal_tags(std::slice::from_ref(&escaping));
+        assert!(scan.tags.is_empty(), "{:?}", scan.tags);
+        assert_eq!(
+            scan.rejections
+                .iter()
+                .map(DiagnosticCodeRejection::describe)
+                .collect::<Vec<_>>(),
+            [
+                "crates/wrela-example/src/escaping.rs:3 refusal tag is not a literal: `feature`"
+                    .to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn named_refusal_tags_are_separated_from_prose_refusal_reasons() {
+        assert!(is_named_refusal_tag(
+            "machine-async-result-delivery-pending"
+        ));
+        assert!(is_named_refusal_tag(
+            "semantic-with-owner-lowering-pending (non-actor source function)"
+        ));
+        assert!(!is_named_refusal_tag(
+            "a binary operation with an unknown type"
+        ));
+        assert!(!is_named_refusal_tag("FlowWir cleanup helper identity"));
+        assert!(!is_named_refusal_tag(
+            "suspending or trapping scalar control flow"
+        ));
+    }
+
+    fn index_tags(entries: &[(&str, &str)]) -> BTreeMap<String, BTreeSet<String>> {
+        entries
+            .iter()
+            .map(|(owner, tag)| ((*tag).to_owned(), BTreeSet::from([(*owner).to_owned()])))
+            .collect()
+    }
+
+    #[test]
+    fn refusal_tag_reconciliation_accepts_an_exact_index_and_names_drift_in_each_direction() {
+        let tags = index_tags(&[
+            ("wrela-example", "example-first-lowering-pending (one)"),
+            ("wrela-example", "example-second-lowering-pending (two)"),
+        ]);
+        let exact = render_refusal_tag_index(&tags);
+        assert_eq!(
+            exact,
+            "\n```text\nwrela-example example-first-lowering-pending (one)\n\
+             wrela-example example-second-lowering-pending (two)\n```\n"
+        );
+        const NOUN: &str = "named refusal tag index";
+        reconcile_refusal_tag_section(&exact, &tags, NOUN).expect("exact index");
+
+        let added = reconcile_refusal_tag_section(
+            "\n```text\nwrela-example example-first-lowering-pending (one)\n```\n",
+            &tags,
+            NOUN,
+        )
+        .expect_err("added tag must fail");
+        assert!(
+            added.contains("added by source: [\"example-second-lowering-pending (two)\"]"),
+            "{added}"
+        );
+
+        let removed = reconcile_refusal_tag_section(
+            "\n```text\nwrela-example example-first-lowering-pending (one)\n\
+             wrela-example example-second-lowering-pending (two)\n\
+             wrela-example example-third-lowering-pending (three)\n```\n",
+            &tags,
+            NOUN,
+        )
+        .expect_err("removed tag must fail");
+        assert!(
+            removed.contains("removed from source: [\"example-third-lowering-pending (three)\"]"),
+            "{removed}"
+        );
+
+        let duplicated = reconcile_refusal_tag_section(
+            "\n```text\nwrela-example example-first-lowering-pending (one)\n\
+             wrela-example example-first-lowering-pending (one)\n\
+             wrela-example example-second-lowering-pending (two)\n```\n",
+            &tags,
+            NOUN,
+        )
+        .expect_err("duplicate tag must fail");
+        assert!(
+            duplicated.contains(
+                "duplicated in the index: [\"example-first-lowering-pending (one) (2 entries)\"]"
+            ),
+            "{duplicated}"
+        );
+
+        let reowned = reconcile_refusal_tag_section(
+            "\n```text\nwrela-other example-first-lowering-pending (one)\n\
+             wrela-example example-second-lowering-pending (two)\n```\n",
+            &tags,
+            NOUN,
+        )
+        .expect_err("owner drift must fail");
+        assert!(
+            reowned.contains(
+                "owner drift: [\"example-first-lowering-pending (one): documented wrela-other, \
+                 source wrela-example\"]"
+            ),
+            "{reowned}"
+        );
+    }
+
+    #[test]
+    fn refusal_tag_exclusion_reconciliation_rejects_undeclared_and_stale_sites() {
+        let rejection = DiagnosticCodeRejection {
+            path: "crates/wrela-example/src/lib.rs".to_owned(),
+            line: 9,
+            context: "refusal tag is not a literal".to_owned(),
+            expression: "describe(kind)".to_owned(),
+        };
+        let declared = [DiagnosticCodeExclusion {
+            path: "crates/wrela-example/src/lib.rs",
+            expression: "describe(kind)",
+            reason: "the refusal names a caller-supplied shape",
+        }];
+        reconcile_refusal_tag_exclusions(std::slice::from_ref(&rejection), &declared)
+            .expect("declared exclusion");
+
+        let undeclared = reconcile_refusal_tag_exclusions(std::slice::from_ref(&rejection), &[])
+            .expect_err("undeclared non-literal site must fail");
+        assert!(
+            undeclared.contains(
+                "crates/wrela-example/src/lib.rs:9 refusal tag is not a literal: `describe(kind)`"
+            ),
+            "{undeclared}"
+        );
+
+        let stale = reconcile_refusal_tag_exclusions(&[], &declared)
+            .expect_err("stale exclusion must fail");
+        assert!(
+            stale.contains(
+                "declared refusal-tag exclusions no longer exist in source: \
+                 [\"crates/wrela-example/src/lib.rs `describe(kind)`\"]"
+            ),
+            "{stale}"
+        );
+    }
+
+    #[test]
+    fn workspace_refusal_tags_have_only_the_declared_non_literal_exclusions() {
+        let root = workspace_root().expect("workspace root");
+        let units = collect_diagnostic_sources(&root).expect("diagnostic sources");
+        let scan = scan_refusal_tags(&units);
+        assert_eq!(
+            scan.rejections
+                .iter()
+                .map(|rejection| (rejection.path.clone(), rejection.expression.clone()))
+                .collect::<Vec<_>>(),
+            REFUSAL_TAG_EXCLUSIONS
+                .iter()
+                .map(|exclusion| (exclusion.path.to_owned(), exclusion.expression.to_owned()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            scan.tags
+                .values()
+                .flatten()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            strings(&[
+                "wrela-compiler",
+                "wrela-flow-lower",
+                "wrela-machine-lower",
+                "wrela-semantic-lower",
+            ])
+        );
+    }
+
+    #[test]
+    fn documented_refusal_tag_index_matches_workspace_sources() {
+        let root = workspace_root().expect("workspace root");
+        check_refusal_tag_index(&root).expect("refusal tag index");
     }
 }
