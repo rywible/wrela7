@@ -1659,8 +1659,8 @@ it. It injects phase implementations and bounded host capabilities, while
 
 ### `xtask`
 
-- Input: maintainer command (`architecture-check`, `slices`, `check`, `test`,
-  `lint`, `gate`) and Cargo's own locked metadata.
+- Input: maintainer command (`architecture-check`, `diagnostic-index`, `slices`,
+  `check`, `test`, `lint`, `gate`) and Cargo's own locked metadata.
 - Output: architecture validation and the focused-slice check/test/lint/gate
   commands. `xtask` no longer acquires, builds, or assembles anything; it does
   not touch LLVM, LLD, QEMU, firmware, or a distribution tree. LLVM, LLD, and
@@ -1670,6 +1670,12 @@ it. It injects phase implementations and bounded host capabilities, while
   source-unused workspace edge, untested interface crate, unreviewed
   registry/Git/path dependency, feature-forwarding change, inconsistent
   AArch64 triple/CPU/X18/machine pin, or reintroduced x86 target.
+  `diagnostic-index` (`cargo xdiag`) re-derives every `Diagnostic::code` value
+  from workspace source without running the compiler and reconciles it against
+  `docs/language/diagnostic-index.md`, naming added, removed, duplicated, and
+  re-owned codes. It fails closed on any construction site whose code is not a
+  literal unless that site is declared in `DIAGNOSTIC_CODE_EXCLUSIONS`, and
+  fails again when a declared exclusion disappears; `cargo xnightly` runs it.
   `cargo xgate <slice-or-crate>` validates the locked, host-filtered Cargo
   resolution against reviewed workspace and versioned external/transitive
   closures, prints the complete slice contract, then runs scoped formatting,

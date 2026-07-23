@@ -12,6 +12,7 @@ use std::time::Instant;
 const HELP: &str = "\
 xtask commands:
   architecture-check [--root <absolute-workspace>]  enforce crate dependency contracts
+  diagnostic-index [--root <absolute-workspace>]    reconcile the stable diagnostic code index
   slices              list focused development slices
   check <slice|crate> [...]  cargo check --all-targets for one boundary
   test <slice|crate> [...]   cargo test for one boundary
@@ -1024,6 +1025,19 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("diagnostic-index") => {
+            let remaining = arguments.collect::<Vec<_>>();
+            match architecture_root(&remaining).and_then(|root| check_diagnostic_index(&root)) {
+                Ok(()) => {
+                    println!("diagnostic code index matches the workspace sources");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some(command @ ("check" | "test" | "lint")) => {
             let Some(slice) = arguments.next() else {
                 eprintln!("error: xtask {command} requires a slice\n");
@@ -1845,6 +1859,15 @@ fn run_nightly(root: &Path) -> Result<PathBuf, String> {
         Err(error) => {
             report.push_str(&format!("  result: FAIL\n  error: {error}\n"));
             failures.push(format!("cargo xtask architecture-check: {error}"));
+        }
+    }
+
+    report.push_str("step: cargo xtask diagnostic-index\n");
+    match check_diagnostic_index(&worktree) {
+        Ok(()) => report.push_str("  result: PASS\n"),
+        Err(error) => {
+            report.push_str(&format!("  result: FAIL\n  error: {error}\n"));
+            failures.push(format!("cargo xtask diagnostic-index: {error}"));
         }
     }
 
@@ -2929,17 +2952,1327 @@ fn compare_set(
     ))
 }
 
+/// Checked-in inventory of every stable source diagnostic code.
+const DIAGNOSTIC_INDEX_PATH: &str = "docs/language/diagnostic-index.md";
+const DIAGNOSTIC_INDEX_CODES_BEGIN: &str = "<!-- diagnostic-index: codes begin -->";
+const DIAGNOSTIC_INDEX_CODES_END: &str = "<!-- diagnostic-index: codes end -->";
+const DIAGNOSTIC_INDEX_EXCLUSIONS_BEGIN: &str = "<!-- diagnostic-index: exclusions begin -->";
+const DIAGNOSTIC_INDEX_EXCLUSIONS_END: &str = "<!-- diagnostic-index: exclusions end -->";
+
+/// Bounded-copy helpers that move a code into limit-checked storage without
+/// changing its text. Extraction looks through them at their first argument.
+const DIAGNOSTIC_CODE_COPY_HELPERS: &[&str] = &[
+    "clone_text",
+    "copy_builtin_attribute_diagnostic_text",
+    "copy_static_analysis_text",
+    "try_copy_string_cancellable",
+];
+
+/// Conversions that may follow a code literal without changing its text.
+const DIAGNOSTIC_CODE_LITERAL_SUFFIXES: &[&str] = &["", ".to_owned()", ".to_string()", ".into()"];
+
+/// A diagnostic-code construction site the source-based extractor cannot read.
+/// Every entry must still be present, or the check fails: silently dropping a
+/// site would make the index under-report.
+struct DiagnosticCodeExclusion {
+    path: &'static str,
+    expression: &'static str,
+    reason: &'static str,
+}
+
+const DIAGNOSTIC_CODE_EXCLUSIONS: &[DiagnosticCodeExclusion] = &[DiagnosticCodeExclusion {
+    path: "crates/wrela-compiler/src/local_lint.rs",
+    expression: "lint.as_str().to_owned()",
+    reason: "lint findings carry the registered lint name, not a phase-owned code",
+}];
+
+/// One workspace source file considered by the diagnostic-code extractor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticSourceUnit {
+    crate_name: String,
+    path: String,
+    text: String,
+}
+
+/// A construction site whose code the extractor refused to guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticCodeRejection {
+    path: String,
+    line: usize,
+    context: String,
+    expression: String,
+}
+
+impl DiagnosticCodeRejection {
+    fn describe(&self) -> String {
+        format!(
+            "{}:{} {}: `{}`",
+            self.path, self.line, self.context, self.expression
+        )
+    }
+}
+
+/// Result of reading every admitted code carrier out of workspace source.
+#[derive(Debug, Default)]
+struct DiagnosticCodeScan {
+    codes: BTreeMap<String, BTreeSet<String>>,
+    rejections: Vec<DiagnosticCodeRejection>,
+}
+
+/// A function body and its parameter list, located in masked source.
+struct MaskedFunction {
+    name: String,
+    parameters: String,
+    signature_start: usize,
+    body_start: usize,
+    body_end: usize,
+}
+
+/// Source with comments and string contents blanked so that byte offsets stay
+/// aligned with the original text while delimiter nesting stays readable.
+struct MaskedSource {
+    bytes: Vec<u8>,
+    literals: BTreeMap<usize, String>,
+    test_regions: Vec<(usize, usize)>,
+    functions: Vec<MaskedFunction>,
+    constants: BTreeMap<String, String>,
+}
+
+fn mask_rust_source(text: &str) -> MaskedSource {
+    let source = text.as_bytes();
+    let mut bytes = source.to_vec();
+    let mut literals = BTreeMap::new();
+    let mut index = 0;
+    while index < source.len() {
+        match source[index] {
+            b'/' if source.get(index + 1) == Some(&b'/') => {
+                while index < source.len() && source[index] != b'\n' {
+                    bytes[index] = b' ';
+                    index += 1;
+                }
+            }
+            b'/' if source.get(index + 1) == Some(&b'*') => {
+                let mut depth = 1u32;
+                bytes[index] = b' ';
+                bytes[index + 1] = b' ';
+                index += 2;
+                while index < source.len() && depth > 0 {
+                    if source[index] == b'/' && source.get(index + 1) == Some(&b'*') {
+                        depth += 1;
+                    } else if source[index] == b'*' && source.get(index + 1) == Some(&b'/') {
+                        depth -= 1;
+                    }
+                    if source[index] != b'\n' {
+                        bytes[index] = b' ';
+                    }
+                    index += 1;
+                }
+            }
+            b'"' | b'r' | b'b' => {
+                let Some((start, content, end)) = read_string_literal(source, index) else {
+                    index += 1;
+                    continue;
+                };
+                literals.insert(start, content);
+                for byte in &mut bytes[start..end] {
+                    if *byte != b'\n' {
+                        *byte = b'\0';
+                    }
+                }
+                bytes[start] = b'"';
+                index = end;
+            }
+            b'\'' => {
+                index += read_char_literal(source, index);
+            }
+            _ => index += 1,
+        }
+    }
+    let test_regions = masked_test_regions(&bytes);
+    let functions = masked_functions(&bytes);
+    let constants = masked_constants(&bytes, &literals);
+    MaskedSource {
+        bytes,
+        literals,
+        test_regions,
+        functions,
+        constants,
+    }
+}
+
+/// Read `"..."`, `r#"..."#`, `b"..."`, or `br#"..."#` starting at `index`.
+/// Returns the opening-quote offset, the raw content, and the end offset.
+fn read_string_literal(source: &[u8], index: usize) -> Option<(usize, String, usize)> {
+    let mut cursor = index;
+    if source[cursor] == b'b' {
+        cursor += 1;
+    }
+    let raw = source.get(cursor) == Some(&b'r');
+    if raw {
+        cursor += 1;
+    }
+    let mut hashes = 0usize;
+    while source.get(cursor) == Some(&b'#') {
+        hashes += 1;
+        cursor += 1;
+    }
+    if source.get(cursor) != Some(&b'"') || (hashes > 0 && !raw) {
+        return None;
+    }
+    let quote = cursor;
+    cursor += 1;
+    let content_start = cursor;
+    if raw {
+        loop {
+            if cursor >= source.len() {
+                return None;
+            }
+            if source[cursor] == b'"'
+                && source[cursor + 1..]
+                    .iter()
+                    .take(hashes)
+                    .filter(|byte| **byte == b'#')
+                    .count()
+                    == hashes
+            {
+                let content = String::from_utf8_lossy(&source[content_start..cursor]).into_owned();
+                return Some((quote, content, cursor + 1 + hashes));
+            }
+            cursor += 1;
+        }
+    }
+    loop {
+        if cursor >= source.len() {
+            return None;
+        }
+        match source[cursor] {
+            b'\\' => cursor += 2,
+            b'"' => {
+                let content = String::from_utf8_lossy(&source[content_start..cursor]).into_owned();
+                return Some((quote, content, cursor + 1));
+            }
+            _ => cursor += 1,
+        }
+    }
+}
+
+/// Length of a character literal at `index`, or 1 when the quote opens a
+/// lifetime instead.
+fn read_char_literal(source: &[u8], index: usize) -> usize {
+    let rest = &source[index + 1..];
+    match rest.first() {
+        Some(b'\\') => {
+            let mut cursor = 1;
+            while index + 1 + cursor < source.len() && source[index + 1 + cursor] != b'\'' {
+                cursor += 1;
+            }
+            cursor + 2
+        }
+        Some(_) if rest.get(1) == Some(&b'\'') => 3,
+        _ => 1,
+    }
+}
+
+fn masked_test_regions(bytes: &[u8]) -> Vec<(usize, usize)> {
+    const MARKER: &[u8] = b"#[cfg(test)]";
+    let mut regions = Vec::new();
+    let mut index = 0;
+    while index + MARKER.len() <= bytes.len() {
+        if &bytes[index..index + MARKER.len()] != MARKER {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + MARKER.len();
+        while cursor < bytes.len() && bytes[cursor] != b'{' && bytes[cursor] != b';' {
+            cursor += 1;
+        }
+        if cursor < bytes.len() && bytes[cursor] == b'{' {
+            regions.push((index, matching_delimiter(bytes, cursor)));
+        } else {
+            regions.push((index, cursor.min(bytes.len())));
+        }
+        index += MARKER.len();
+    }
+    regions
+}
+
+fn matching_delimiter(bytes: &[u8], open: usize) -> usize {
+    let mut depth = 0i32;
+    let mut index = open;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return index;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    bytes.len().saturating_sub(1)
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn identifier_at(bytes: &[u8], index: usize) -> Option<String> {
+    if index >= bytes.len() || !(bytes[index].is_ascii_alphabetic() || bytes[index] == b'_') {
+        return None;
+    }
+    let mut end = index;
+    while end < bytes.len() && is_identifier_byte(bytes[end]) {
+        end += 1;
+    }
+    Some(String::from_utf8_lossy(&bytes[index..end]).into_owned())
+}
+
+fn skip_whitespace(bytes: &[u8], mut index: usize, limit: usize) -> usize {
+    while index < limit && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn masked_functions(bytes: &[u8]) -> Vec<MaskedFunction> {
+    let mut functions = Vec::new();
+    let mut index = 0;
+    while index + 2 <= bytes.len() {
+        if &bytes[index..index + 2] != b"fn"
+            || (index > 0 && is_identifier_byte(bytes[index - 1]))
+            || bytes
+                .get(index + 2)
+                .is_some_and(|byte| is_identifier_byte(*byte))
+        {
+            index += 1;
+            continue;
+        }
+        let name_start = skip_whitespace(bytes, index + 2, bytes.len());
+        let Some(name) = identifier_at(bytes, name_start) else {
+            index += 2;
+            continue;
+        };
+        let mut cursor = name_start + name.len();
+        // Skip an optional generic parameter list before the value parameters.
+        cursor = skip_whitespace(bytes, cursor, bytes.len());
+        if bytes.get(cursor) == Some(&b'<') {
+            let mut depth = 0i32;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'<' => depth += 1,
+                    b'>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            cursor += 1;
+                            break;
+                        }
+                    }
+                    b'{' | b';' => break,
+                    _ => {}
+                }
+                cursor += 1;
+            }
+            cursor = skip_whitespace(bytes, cursor, bytes.len());
+        }
+        if bytes.get(cursor) != Some(&b'(') {
+            index += 2;
+            continue;
+        }
+        let parameters_end = matching_delimiter(bytes, cursor);
+        let parameters = String::from_utf8_lossy(&bytes[cursor + 1..parameters_end]).into_owned();
+        let mut body = parameters_end + 1;
+        while body < bytes.len() && bytes[body] != b'{' && bytes[body] != b';' {
+            body += 1;
+        }
+        if body >= bytes.len() || bytes[body] == b';' {
+            index = parameters_end + 1;
+            continue;
+        }
+        let body_end = matching_delimiter(bytes, body);
+        functions.push(MaskedFunction {
+            name,
+            parameters,
+            signature_start: index,
+            body_start: body,
+            body_end,
+        });
+        index = body + 1;
+    }
+    functions
+}
+
+/// Whether a function is reachable outside its own file. Carrier call sites are
+/// only searched within the defining file, so an exported carrier must be
+/// rejected instead of silently under-reporting.
+fn function_is_exported(bytes: &[u8], function: &MaskedFunction) -> bool {
+    let mut cursor = function.signature_start;
+    loop {
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor > 0 && bytes[cursor - 1] == b')' {
+            // A visibility restriction such as `pub(crate)`.
+            let mut depth = 0i32;
+            let mut open = cursor - 1;
+            loop {
+                match bytes[open] {
+                    b')' => depth += 1,
+                    b'(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                if open == 0 {
+                    return false;
+                }
+                open -= 1;
+            }
+            cursor = open;
+            continue;
+        }
+        let mut start = cursor;
+        while start > 0 && is_identifier_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        if start == cursor {
+            return false;
+        }
+        match &bytes[start..cursor] {
+            b"pub" => return true,
+            b"const" | b"async" | b"unsafe" | b"default" => cursor = start,
+            _ => return false,
+        }
+    }
+}
+
+fn masked_constants(bytes: &[u8], literals: &BTreeMap<usize, String>) -> BTreeMap<String, String> {
+    let mut constants = BTreeMap::new();
+    let mut index = 0;
+    while index + 5 <= bytes.len() {
+        if &bytes[index..index + 5] != b"const"
+            || (index > 0 && is_identifier_byte(bytes[index - 1]))
+        {
+            index += 1;
+            continue;
+        }
+        let name_start = skip_whitespace(bytes, index + 5, bytes.len());
+        let Some(name) = identifier_at(bytes, name_start) else {
+            index += 5;
+            continue;
+        };
+        let mut cursor = skip_whitespace(bytes, name_start + name.len(), bytes.len());
+        if bytes.get(cursor) != Some(&b':') {
+            index += 5;
+            continue;
+        }
+        let statement_end = bytes[cursor..]
+            .iter()
+            .position(|byte| *byte == b';')
+            .map_or(bytes.len(), |offset| cursor + offset);
+        let Some(equals) = bytes[cursor..statement_end]
+            .iter()
+            .position(|byte| *byte == b'=')
+        else {
+            index += 5;
+            continue;
+        };
+        cursor = skip_whitespace(bytes, cursor + equals + 1, statement_end);
+        if let Some(value) = literals.get(&cursor) {
+            constants.insert(name, value.clone());
+        }
+        index = statement_end.max(index + 5);
+    }
+    constants
+}
+
+/// Split a delimited list at top-level commas, returning byte ranges relative
+/// to the start of `bytes`.
+fn split_top_level(bytes: &[u8], start: usize, end: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut depth = 0i32;
+    let mut item = start;
+    let mut index = start;
+    while index < end {
+        match bytes[index] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'<' if bytes.get(index + 1) != Some(&b'-') => depth += 1,
+            b'>' if index > start && bytes[index - 1] != b'-' && bytes[index - 1] != b'=' => {
+                depth -= 1;
+            }
+            b',' if depth == 0 => {
+                ranges.push((item, index));
+                item = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if bytes[item..end]
+        .iter()
+        .any(|byte| !byte.is_ascii_whitespace())
+    {
+        ranges.push((item, end));
+    }
+    ranges
+}
+
+/// Parameter names of a function, with any receiver dropped so that indices
+/// line up with method-call argument positions.
+fn parameter_names(parameters: &str) -> Vec<String> {
+    let bytes = parameters.as_bytes();
+    split_top_level(bytes, 0, bytes.len())
+        .into_iter()
+        .map(|(start, end)| {
+            let text = parameters[start..end].trim();
+            text.split(':').next().unwrap_or(text).trim().to_owned()
+        })
+        .filter(|name| !name.ends_with("self"))
+        .collect()
+}
+
+fn is_code_shaped(value: &str) -> bool {
+    let mut segments = value.split('-');
+    let first = segments.next().unwrap_or_default();
+    let mut count = 1;
+    if first.is_empty()
+        || !first
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    for segment in segments {
+        count += 1;
+        if segment.is_empty()
+            || !segment
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        {
+            return false;
+        }
+    }
+    count >= 2
+}
+
+/// Mutable state threaded through the extraction fixed point.
+#[derive(Default)]
+struct CodeScanState {
+    codes: BTreeMap<String, BTreeSet<String>>,
+    rejections: Vec<DiagnosticCodeRejection>,
+    carriers: BTreeSet<(usize, String, usize)>,
+    field_units: BTreeSet<usize>,
+}
+
+struct MaskedUnit<'a> {
+    unit: &'a DiagnosticSourceUnit,
+    masked: MaskedSource,
+}
+
+impl MaskedUnit<'_> {
+    fn line(&self, offset: usize) -> usize {
+        self.masked.bytes[..offset.min(self.masked.bytes.len())]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            + 1
+    }
+
+    fn in_test(&self, offset: usize) -> bool {
+        self.masked
+            .test_regions
+            .iter()
+            .any(|(start, end)| *start <= offset && offset <= *end)
+    }
+
+    fn enclosing_function(&self, offset: usize) -> Option<&MaskedFunction> {
+        self.masked
+            .functions
+            .iter()
+            .filter(|function| function.body_start <= offset && offset <= function.body_end)
+            .min_by_key(|function| function.body_end - function.body_start)
+    }
+
+    fn expression_text(&self, start: usize, end: usize) -> String {
+        self.unit.text[start.min(self.unit.text.len())..end.min(self.unit.text.len())]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The identifier that immediately precedes the innermost enclosing brace,
+    /// or `None` when the innermost enclosing delimiter is not a brace.
+    fn enclosing_brace_owner(&self, offset: usize) -> Option<Option<String>> {
+        let bytes = &self.masked.bytes;
+        let mut depth = 0i32;
+        let mut index = offset;
+        while index > 0 {
+            index -= 1;
+            match bytes[index] {
+                b'}' | b']' | b')' => depth += 1,
+                b'{' | b'[' | b'(' => {
+                    if depth == 0 {
+                        if bytes[index] != b'{' {
+                            return Some(None);
+                        }
+                        let mut name_end = index;
+                        while name_end > 0 && bytes[name_end - 1].is_ascii_whitespace() {
+                            name_end -= 1;
+                        }
+                        let mut name_start = name_end;
+                        while name_start > 0 && is_identifier_byte(bytes[name_start - 1]) {
+                            name_start -= 1;
+                        }
+                        if name_start == name_end {
+                            return Some(None);
+                        }
+                        return Some(Some(
+                            String::from_utf8_lossy(&bytes[name_start..name_end]).into_owned(),
+                        ));
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        Some(None)
+    }
+}
+
+/// Read every diagnostic code the workspace assigns to `Diagnostic::code`.
+fn scan_diagnostic_codes(units: &[DiagnosticSourceUnit]) -> DiagnosticCodeScan {
+    let masked: Vec<_> = units
+        .iter()
+        .map(|unit| MaskedUnit {
+            unit,
+            masked: mask_rust_source(&unit.text),
+        })
+        .collect();
+    let mut state = CodeScanState::default();
+
+    for (index, unit) in masked.iter().enumerate() {
+        for offset in find_all(&unit.masked.bytes, b".code") {
+            let after = skip_whitespace(&unit.masked.bytes, offset + 5, unit.masked.bytes.len());
+            if unit.masked.bytes.get(after) != Some(&b'=')
+                || unit.masked.bytes.get(after + 1) == Some(&b'=')
+            {
+                continue;
+            }
+            seed_code_position(&masked, index, after + 1, "diagnostic code", &mut state);
+        }
+        for offset in struct_field_positions(unit, "code") {
+            // Only initializers inside a function body are struct literals;
+            // a `code:` at item level is a struct or enum field declaration.
+            if unit.enclosing_function(offset).is_none()
+                || unit.enclosing_brace_owner(offset).flatten().as_deref() != Some("Diagnostic")
+            {
+                continue;
+            }
+            seed_code_position(&masked, index, offset, "diagnostic code", &mut state);
+        }
+    }
+
+    let mut resolved_carriers = BTreeSet::new();
+    let mut resolved_field_units = BTreeSet::new();
+    loop {
+        let pending_carriers: Vec<_> = state
+            .carriers
+            .difference(&resolved_carriers)
+            .cloned()
+            .collect();
+        let pending_fields: Vec<_> = state
+            .field_units
+            .difference(&resolved_field_units)
+            .copied()
+            .collect();
+        if pending_carriers.is_empty() && pending_fields.is_empty() {
+            break;
+        }
+        for carrier in pending_carriers {
+            resolved_carriers.insert(carrier.clone());
+            resolve_carrier_calls(&masked, &carrier, &mut state);
+        }
+        for index in pending_fields {
+            resolved_field_units.insert(index);
+            resolve_code_fields(&masked, index, &mut state);
+        }
+    }
+
+    state
+        .rejections
+        .sort_by(|left, right| (&left.path, left.line).cmp(&(&right.path, right.line)));
+    state.rejections.dedup();
+    DiagnosticCodeScan {
+        codes: state.codes,
+        rejections: state.rejections,
+    }
+}
+
+fn find_all(bytes: &[u8], needle: &[u8]) -> Vec<usize> {
+    let mut hits = Vec::new();
+    let mut index = 0;
+    while index + needle.len() <= bytes.len() {
+        if &bytes[index..index + needle.len()] == needle {
+            hits.push(index);
+            index += needle.len();
+        } else {
+            index += 1;
+        }
+    }
+    hits
+}
+
+/// Offsets just past `name:` for every struct-literal-shaped field of that name.
+fn struct_field_positions(unit: &MaskedUnit<'_>, name: &str) -> Vec<usize> {
+    let bytes = &unit.masked.bytes;
+    let mut positions = Vec::new();
+    for offset in find_all(bytes, name.as_bytes()) {
+        if offset > 0 && (is_identifier_byte(bytes[offset - 1]) || bytes[offset - 1] == b'.') {
+            continue;
+        }
+        let after = offset + name.len();
+        if bytes.get(after) != Some(&b':') || bytes.get(after + 1) == Some(&b':') {
+            continue;
+        }
+        positions.push(skip_whitespace(bytes, after + 1, bytes.len()));
+    }
+    positions
+}
+
+/// Resolve one code position, recording either its codes or a rejection.
+fn seed_code_position(
+    masked: &[MaskedUnit<'_>],
+    index: usize,
+    offset: usize,
+    context: &str,
+    state: &mut CodeScanState,
+) {
+    let unit = &masked[index];
+    if unit.in_test(offset) {
+        return;
+    }
+    let bytes = &unit.masked.bytes;
+    let start = skip_whitespace(bytes, offset, bytes.len());
+    let (start, end) = if identifier_at(bytes, start).as_deref() == Some("Some")
+        && bytes.get(skip_whitespace(bytes, start + 4, bytes.len())) == Some(&b'(')
+    {
+        let open = skip_whitespace(bytes, start + 4, bytes.len());
+        (open + 1, matching_delimiter(bytes, open))
+    } else {
+        (start, statement_end(bytes, start))
+    };
+    record_resolution(masked, index, start, end, context, state);
+}
+
+fn statement_end(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0i32;
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    return index;
+                }
+                depth -= 1;
+            }
+            b',' | b';' if depth == 0 => return index,
+            _ => {}
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
+fn record_resolution(
+    masked: &[MaskedUnit<'_>],
+    index: usize,
+    start: usize,
+    end: usize,
+    context: &str,
+    state: &mut CodeScanState,
+) {
+    let unit = &masked[index];
+    match resolve_code_expression(masked, index, start, end, 0, state) {
+        Ok(codes) => {
+            for code in codes {
+                state
+                    .codes
+                    .entry(code)
+                    .or_default()
+                    .insert(unit.unit.crate_name.clone());
+            }
+        }
+        Err(()) => state.rejections.push(DiagnosticCodeRejection {
+            path: unit.unit.path.clone(),
+            line: unit.line(start),
+            context: format!("{context} is not a literal"),
+            expression: unit.expression_text(start, end),
+        }),
+    }
+}
+
+fn resolve_code_expression(
+    masked: &[MaskedUnit<'_>],
+    index: usize,
+    start: usize,
+    end: usize,
+    depth: u32,
+    state: &mut CodeScanState,
+) -> Result<Vec<String>, ()> {
+    if depth > 4 {
+        return Err(());
+    }
+    let unit = &masked[index];
+    let bytes = &unit.masked.bytes;
+    let start = skip_whitespace(bytes, start, end.min(bytes.len()));
+    let mut end = end.min(bytes.len());
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if start >= end {
+        return Err(());
+    }
+
+    // Rule 1: a string literal, optionally followed by a no-op conversion.
+    if let Some(value) = unit.masked.literals.get(&start) {
+        let literal_end = start + value.len() + 2;
+        let suffix = unit
+            .unit
+            .text
+            .get(literal_end.min(unit.unit.text.len())..end)
+            .unwrap_or_default()
+            .trim();
+        if DIAGNOSTIC_CODE_LITERAL_SUFFIXES.contains(&suffix) {
+            return Ok(vec![value.clone()]);
+        }
+        return Err(());
+    }
+
+    if let Some(name) = identifier_at(bytes, start) {
+        let after = skip_whitespace(bytes, start + name.len(), end);
+
+        // Rule 2: a file-local `&str` constant.
+        if after == end {
+            if let Some(value) = unit.masked.constants.get(&name) {
+                return Ok(vec![value.clone()]);
+            }
+        }
+        if let Some(value) = unit.masked.constants.get(&name) {
+            let suffix = unit
+                .unit
+                .text
+                .get(start + name.len()..end)
+                .unwrap_or_default()
+                .trim();
+            if DIAGNOSTIC_CODE_LITERAL_SUFFIXES.contains(&suffix) {
+                return Ok(vec![value.clone()]);
+            }
+        }
+
+        // Rule 3: a bounded copy helper, read through at its first argument.
+        if DIAGNOSTIC_CODE_COPY_HELPERS.contains(&name.as_str()) && bytes.get(after) == Some(&b'(')
+        {
+            let close = matching_delimiter(bytes, after);
+            let arguments = split_top_level(bytes, after + 1, close);
+            if let Some((argument_start, argument_end)) = arguments.first() {
+                return resolve_code_expression(
+                    masked,
+                    index,
+                    *argument_start,
+                    *argument_end,
+                    depth + 1,
+                    state,
+                );
+            }
+            return Err(());
+        }
+
+        // Rule 4: an `if`/`else` selection between code expressions.
+        if name == "if" {
+            let Some(then_open) = bytes[start..end].iter().position(|byte| *byte == b'{') else {
+                return Err(());
+            };
+            let then_open = start + then_open;
+            let then_close = matching_delimiter(bytes, then_open);
+            let mut codes = resolve_code_expression(
+                masked,
+                index,
+                then_open + 1,
+                then_close,
+                depth + 1,
+                state,
+            )?;
+            let Some(else_open) = bytes[then_close..end].iter().position(|byte| *byte == b'{')
+            else {
+                return Err(());
+            };
+            let else_open = then_close + else_open;
+            let else_close = matching_delimiter(bytes, else_open);
+            codes.extend(resolve_code_expression(
+                masked,
+                index,
+                else_open + 1,
+                else_close,
+                depth + 1,
+                state,
+            )?);
+            return Ok(codes);
+        }
+
+        // Rule 5/6: the identifier `code`, bound by a parameter or a local
+        // binder within the enclosing function.
+        let code_suffix = unit
+            .unit
+            .text
+            .get(start + name.len()..end)
+            .unwrap_or_default()
+            .trim();
+        if name == "code" && DIAGNOSTIC_CODE_LITERAL_SUFFIXES.contains(&code_suffix) {
+            if let Some(function) = unit.enclosing_function(start) {
+                let names = parameter_names(&function.parameters);
+                if let Some(position) = names.iter().position(|parameter| parameter == "code") {
+                    // Call sites are only searched in the defining file, so an
+                    // exported carrier could hide codes and must be rejected.
+                    if function_is_exported(bytes, function) {
+                        return Err(());
+                    }
+                    state
+                        .carriers
+                        .insert((index, function.name.clone(), position));
+                    return Ok(Vec::new());
+                }
+                if let Some(initializer) = local_code_binder(unit, function, start) {
+                    if let Ok(codes) = resolve_code_expression(
+                        masked,
+                        index,
+                        initializer,
+                        statement_end(bytes, initializer),
+                        depth + 1,
+                        state,
+                    ) {
+                        return Ok(codes);
+                    }
+                    let codes =
+                        code_shaped_literals(unit, initializer, statement_end(bytes, initializer));
+                    if !codes.is_empty() {
+                        return Ok(codes);
+                    }
+                }
+            }
+            return Err(());
+        }
+    }
+
+    // Rule 8: a field access ending in `.code`, seeded from the struct literals
+    // of the same file.
+    if unit.unit.text[start..end].ends_with(".code")
+        && unit.unit.text[start..end]
+            .bytes()
+            .all(|byte| is_identifier_byte(byte) || byte == b'.')
+    {
+        state.field_units.insert(index);
+        return Ok(Vec::new());
+    }
+
+    // Rule 7: a selector call whose arguments are all code-shaped literals.
+    if let Some(open) = bytes[start..end].iter().position(|byte| *byte == b'(') {
+        let open = start + open;
+        let path = unit.unit.text[start..open].trim();
+        if !path.is_empty()
+            && path
+                .bytes()
+                .all(|byte| is_identifier_byte(byte) || byte == b'.')
+        {
+            let close = matching_delimiter(bytes, open);
+            let mut codes = Vec::new();
+            for (argument_start, argument_end) in split_top_level(bytes, open + 1, close) {
+                let argument_start = skip_whitespace(bytes, argument_start, argument_end);
+                match unit.masked.literals.get(&argument_start) {
+                    Some(value) if is_code_shaped(value) => codes.push(value.clone()),
+                    _ => return Err(()),
+                }
+            }
+            if !codes.is_empty() {
+                return Ok(codes);
+            }
+        }
+    }
+
+    Err(())
+}
+
+/// Offset of the initializer of the nearest `let`/`for` binder before `offset`
+/// that binds the name `code`.
+fn local_code_binder(
+    unit: &MaskedUnit<'_>,
+    function: &MaskedFunction,
+    offset: usize,
+) -> Option<usize> {
+    let bytes = &unit.masked.bytes;
+    let mut best = None;
+    for keyword in ["let", "for"] {
+        for start in find_all(&bytes[function.body_start..offset], keyword.as_bytes()) {
+            let start = function.body_start + start;
+            if start > 0 && is_identifier_byte(bytes[start - 1]) {
+                continue;
+            }
+            let pattern_start = skip_whitespace(bytes, start + keyword.len(), offset);
+            if pattern_start == start + keyword.len() {
+                continue;
+            }
+            let separator = if keyword == "let" { b'=' } else { b'\0' };
+            let mut cursor = pattern_start;
+            let mut depth = 0i32;
+            let mut binder_end = None;
+            while cursor < offset {
+                match bytes[cursor] {
+                    b'(' | b'[' => depth += 1,
+                    b')' | b']' => depth -= 1,
+                    b'=' if depth == 0
+                        && separator == b'='
+                        && bytes.get(cursor + 1) != Some(&b'=') =>
+                    {
+                        binder_end = Some(cursor);
+                        break;
+                    }
+                    b'{' | b';' => break,
+                    _ => {}
+                }
+                if keyword == "for"
+                    && depth == 0
+                    && identifier_at(bytes, cursor).as_deref() == Some("in")
+                    && !is_identifier_byte(bytes[cursor.saturating_sub(1)])
+                {
+                    binder_end = Some(cursor);
+                    break;
+                }
+                cursor += 1;
+            }
+            let Some(binder_end) = binder_end else {
+                continue;
+            };
+            let pattern = &unit.unit.text[pattern_start..binder_end];
+            if !pattern
+                .split(|character: char| !is_identifier_byte(character as u8))
+                .any(|token| token == "code")
+            {
+                continue;
+            }
+            let initializer = skip_whitespace(
+                bytes,
+                binder_end + if keyword == "let" { 1 } else { 2 },
+                offset,
+            );
+            best = Some(best.map_or(initializer, |previous: usize| previous.max(initializer)));
+        }
+    }
+    best
+}
+
+fn code_shaped_literals(unit: &MaskedUnit<'_>, start: usize, end: usize) -> Vec<String> {
+    unit.masked
+        .literals
+        .range(start..end)
+        .map(|(_, value)| value.clone())
+        .filter(|value| is_code_shaped(value))
+        .collect()
+}
+
+fn resolve_carrier_calls(
+    masked: &[MaskedUnit<'_>],
+    carrier: &(usize, String, usize),
+    state: &mut CodeScanState,
+) {
+    let (index, name, position) = carrier;
+    let unit = &masked[*index];
+    let bytes = &unit.masked.bytes;
+    for offset in find_all(bytes, name.as_bytes()) {
+        if offset > 0 && is_identifier_byte(bytes[offset - 1]) {
+            continue;
+        }
+        let open = skip_whitespace(bytes, offset + name.len(), bytes.len());
+        if bytes.get(open) != Some(&b'(') {
+            continue;
+        }
+        let before = unit.unit.text[..offset].trim_end();
+        if before.ends_with("fn") || before.ends_with(':') {
+            continue;
+        }
+        if unit.in_test(offset) {
+            continue;
+        }
+        let close = matching_delimiter(bytes, open);
+        let arguments = split_top_level(bytes, open + 1, close);
+        let Some((argument_start, argument_end)) = arguments.get(*position) else {
+            state.rejections.push(DiagnosticCodeRejection {
+                path: unit.unit.path.clone(),
+                line: unit.line(offset),
+                context: format!("`code` argument to `{name}`"),
+                expression: unit.expression_text(offset, close + 1),
+            });
+            continue;
+        };
+        record_resolution(
+            masked,
+            *index,
+            *argument_start,
+            *argument_end,
+            &format!("`code` argument to `{name}`"),
+            state,
+        );
+    }
+}
+
+fn resolve_code_fields(masked: &[MaskedUnit<'_>], index: usize, state: &mut CodeScanState) {
+    let unit = &masked[index];
+    for offset in struct_field_positions(unit, "code") {
+        if unit.enclosing_function(offset).is_none() {
+            continue;
+        }
+        let Some(Some(owner)) = unit.enclosing_brace_owner(offset) else {
+            continue;
+        };
+        if owner == "Diagnostic" {
+            continue;
+        }
+        seed_code_position(masked, index, offset, "diagnostic code field", state);
+    }
+}
+
+/// Every workspace production source file, in canonical order.
+fn collect_diagnostic_sources(root: &Path) -> Result<Vec<DiagnosticSourceUnit>, String> {
+    let mut units = Vec::new();
+    for crate_name in discover_workspace_crates(root)? {
+        let directory = if crate_name == "xtask" {
+            root.join("xtask/src")
+        } else {
+            root.join("crates").join(&crate_name).join("src")
+        };
+        if !directory.is_dir() {
+            continue;
+        }
+        let mut files = Vec::new();
+        collect_files(&directory, &mut files)?;
+        files.sort();
+        for path in files {
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| format!("{} is outside the workspace", path.display()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = fs::read_to_string(&path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            units.push(DiagnosticSourceUnit {
+                crate_name: crate_name.clone(),
+                path: relative,
+                text,
+            });
+        }
+    }
+    units.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(units)
+}
+
+fn render_diagnostic_index(codes: &BTreeMap<String, BTreeSet<String>>) -> String {
+    let mut block = String::from("\n```text\n");
+    for (code, owners) in codes {
+        block.push_str(code);
+        block.push(' ');
+        block.push_str(&owners.iter().cloned().collect::<Vec<_>>().join(", "));
+        block.push('\n');
+    }
+    block.push_str("```\n");
+    block
+}
+
+fn render_diagnostic_exclusions() -> String {
+    let mut block = String::from("\n```text\n");
+    for exclusion in DIAGNOSTIC_CODE_EXCLUSIONS {
+        block.push_str(exclusion.path);
+        block.push_str(" `");
+        block.push_str(exclusion.expression);
+        block.push_str("` — ");
+        block.push_str(exclusion.reason);
+        block.push('\n');
+    }
+    block.push_str("```\n");
+    block
+}
+
+fn parse_diagnostic_index(block: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    let mut entries = Vec::new();
+    for line in block.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("```") {
+            continue;
+        }
+        let (code, owners) = line
+            .split_once(' ')
+            .ok_or_else(|| format!("diagnostic index entry {line:?} has no owning crate"))?;
+        entries.push((
+            code.to_owned(),
+            owners
+                .split(',')
+                .map(|owner| owner.trim().to_owned())
+                .collect(),
+        ));
+    }
+    Ok(entries)
+}
+
+fn reconcile_diagnostic_index(
+    block: &str,
+    codes: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<(), String> {
+    let entries = parse_diagnostic_index(block)?;
+    let mut counts = BTreeMap::<String, u32>::new();
+    let mut documented = BTreeMap::<String, Vec<String>>::new();
+    for (code, owners) in entries {
+        *counts.entry(code.clone()).or_default() += 1;
+        documented.insert(code, owners);
+    }
+    let duplicated: Vec<_> = counts
+        .iter()
+        .filter(|(_, count)| **count != 1)
+        .map(|(code, count)| format!("{code} ({count} entries)"))
+        .collect();
+    let documented_codes: BTreeSet<_> = documented.keys().cloned().collect();
+    let source_codes: BTreeSet<_> = codes.keys().cloned().collect();
+    let added: Vec<_> = source_codes
+        .difference(&documented_codes)
+        .cloned()
+        .collect();
+    let removed: Vec<_> = documented_codes
+        .difference(&source_codes)
+        .cloned()
+        .collect();
+    let owner_drift: Vec<_> = documented
+        .iter()
+        .filter_map(|(code, owners)| {
+            let expected = codes.get(code)?;
+            let expected: Vec<_> = expected.iter().cloned().collect();
+            (owners != &expected).then(|| {
+                format!(
+                    "{code}: documented {}, source {}",
+                    owners.join(", "),
+                    expected.join(", ")
+                )
+            })
+        })
+        .collect();
+    if added.is_empty() && removed.is_empty() && duplicated.is_empty() && owner_drift.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "documented diagnostic index has drifted\n  added by source: {added:?}\n  removed from source: {removed:?}\n  duplicated in the index: {duplicated:?}\n  owner drift: {owner_drift:?}\nreplace the marked block with:{}",
+        render_diagnostic_index(codes)
+    ))
+}
+
+fn marked_block<'a>(text: &'a str, begin: &str, end: &str, path: &Path) -> Result<&'a str, String> {
+    text.split_once(begin)
+        .and_then(|(_, rest)| rest.split_once(end).map(|(block, _)| block))
+        .ok_or_else(|| format!("{} omits the {begin} / {end} markers", path.display()))
+}
+
+/// Every refused construction site must be a declared exclusion, and every
+/// declared exclusion must still exist.
+fn reconcile_diagnostic_exclusions(
+    rejections: &[DiagnosticCodeRejection],
+    exclusions: &[DiagnosticCodeExclusion],
+) -> Result<(), String> {
+    let declared: BTreeSet<_> = exclusions
+        .iter()
+        .map(|exclusion| (exclusion.path, exclusion.expression))
+        .collect();
+    let observed: BTreeSet<_> = rejections
+        .iter()
+        .map(|rejection| (rejection.path.as_str(), rejection.expression.as_str()))
+        .collect();
+    let unexcluded: Vec<_> = rejections
+        .iter()
+        .filter(|rejection| {
+            !declared.contains(&(rejection.path.as_str(), rejection.expression.as_str()))
+        })
+        .map(DiagnosticCodeRejection::describe)
+        .collect();
+    if !unexcluded.is_empty() {
+        return Err(format!(
+            "diagnostic codes are constructed non-literally at sites the index does not declare\n  {}\nadd a DIAGNOSTIC_CODE_EXCLUSIONS entry with its reason, or build the code from a literal",
+            unexcluded.join("\n  ")
+        ));
+    }
+    let stale: Vec<_> = declared
+        .difference(&observed)
+        .map(|(path, expression)| format!("{path} `{expression}`"))
+        .collect();
+    if !stale.is_empty() {
+        return Err(format!(
+            "declared diagnostic-code exclusions no longer exist in source: {stale:?}\nremove them from DIAGNOSTIC_CODE_EXCLUSIONS and from {DIAGNOSTIC_INDEX_PATH}"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn check_diagnostic_index(root: &Path) -> Result<(), String> {
+    let units = collect_diagnostic_sources(root)?;
+    let scan = scan_diagnostic_codes(&units);
+    reconcile_diagnostic_exclusions(&scan.rejections, DIAGNOSTIC_CODE_EXCLUSIONS)?;
+
+    let path = root.join(DIAGNOSTIC_INDEX_PATH);
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    reconcile_diagnostic_index(
+        marked_block(
+            &text,
+            DIAGNOSTIC_INDEX_CODES_BEGIN,
+            DIAGNOSTIC_INDEX_CODES_END,
+            &path,
+        )?,
+        &scan.codes,
+    )?;
+    let documented_exclusions = marked_block(
+        &text,
+        DIAGNOSTIC_INDEX_EXCLUSIONS_BEGIN,
+        DIAGNOSTIC_INDEX_EXCLUSIONS_END,
+        &path,
+    )?;
+    let expected_exclusions = render_diagnostic_exclusions();
+    if documented_exclusions != expected_exclusions {
+        return Err(format!(
+            "documented diagnostic-code exclusions have drifted; replace the marked block with:{expected_exclusions}"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
     use std::ffi::OsStr;
     use std::process::Command;
 
+    use std::collections::BTreeMap;
+
     use super::{
-        DEVELOPMENT_SLICES, EXTERNAL_DEPENDENCIES, FullRoute, GateClosure, GateRequest,
-        REVIEWED_EXTERNAL_PACKAGES, architecture_root, check_architecture, compare_gate_closure,
-        configure_cargo_gate_environment, expected_gate_closure, full_route_steps, gate_target,
-        parse_gate_arguments, validate_development_slice_metadata, workspace_root,
+        DEVELOPMENT_SLICES, DIAGNOSTIC_CODE_EXCLUSIONS, DiagnosticCodeExclusion,
+        DiagnosticCodeRejection, DiagnosticSourceUnit, EXTERNAL_DEPENDENCIES, FullRoute,
+        GateClosure, GateRequest, REVIEWED_EXTERNAL_PACKAGES, architecture_root,
+        check_architecture, check_diagnostic_index, collect_diagnostic_sources,
+        compare_gate_closure, configure_cargo_gate_environment, expected_gate_closure,
+        full_route_steps, gate_target, parse_gate_arguments, reconcile_diagnostic_exclusions,
+        reconcile_diagnostic_index, render_diagnostic_index, scan_diagnostic_codes,
+        validate_development_slice_metadata, workspace_root,
     };
 
     fn strings(values: &[&str]) -> BTreeSet<String> {
@@ -3178,5 +4511,390 @@ mod tests {
     fn workspace_matches_dependency_contracts() {
         let root = workspace_root().expect("workspace root");
         check_architecture(&root).expect("architecture contract");
+    }
+
+    fn unit(path: &str, text: &str) -> DiagnosticSourceUnit {
+        DiagnosticSourceUnit {
+            crate_name: "wrela-example".to_owned(),
+            path: path.to_owned(),
+            text: text.to_owned(),
+        }
+    }
+
+    fn scanned(units: &[DiagnosticSourceUnit]) -> Vec<String> {
+        let scan = scan_diagnostic_codes(units);
+        assert!(
+            scan.rejections.is_empty(),
+            "unexpected rejections: {:?}",
+            scan.rejections
+        );
+        scan.codes.keys().cloned().collect()
+    }
+
+    #[test]
+    fn extraction_reads_every_admitted_code_carrier_form() {
+        // Rule 1 (literal), rule 2 (file-local `&str` constant), rule 3 (bounded
+        // copy helper), rule 4 (`if`/`else` selection).
+        let direct = unit(
+            "crates/wrela-example/src/direct.rs",
+            r#"
+const PENDING: &str = "example-const-code";
+fn one(request: &Request) -> Diagnostic {
+    let mut diagnostic = Diagnostic::error(Category::TYPE, span, "message");
+    diagnostic.code = Some("example-direct-code".to_owned());
+    diagnostic.code = Some(PENDING.to_owned());
+    diagnostic.code = Some(copy_static_analysis_text("example-copied-code", limit)?);
+    diagnostic.code = Some(if flag {
+        "example-then-code"
+    } else {
+        "example-else-code"
+    });
+    diagnostic
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ignored() {
+        let mut diagnostic = Diagnostic::error(Category::TYPE, span, "message");
+        diagnostic.code = Some("example-test-only-code".to_owned());
+    }
+}
+"#,
+        );
+        assert_eq!(
+            scanned(std::slice::from_ref(&direct)),
+            [
+                "example-const-code",
+                "example-copied-code",
+                "example-direct-code",
+                "example-else-code",
+                "example-then-code",
+            ]
+        );
+
+        // Rule 5 (carrier parameter named `code`, resolved at same-file call
+        // sites, transitively through a second carrier).
+        let carrier = unit(
+            "crates/wrela-example/src/carrier.rs",
+            r#"
+fn emit(source: Span, code: &'static str, message: &str) -> Diagnostic {
+    let mut diagnostic = Diagnostic::error(Category::TYPE, source, message);
+    diagnostic.code = Some(code.to_owned());
+    diagnostic
+}
+fn relay(source: Span, code: &'static str) -> Diagnostic {
+    emit(source, code, "relayed")
+}
+fn call_sites() {
+    emit(span, "example-carrier-code", "direct call");
+    relay(span, "example-relayed-code");
+}
+"#,
+        );
+        assert_eq!(
+            scanned(std::slice::from_ref(&carrier)),
+            ["example-carrier-code", "example-relayed-code"]
+        );
+
+        // Rule 6 (`let`/`for` binder whose initializer selects among code-shaped
+        // literals) and rule 7 (selector call whose arguments are all
+        // code-shaped literals).
+        let selection = unit(
+            "crates/wrela-example/src/selection.rs",
+            r#"
+fn emit(source: Span, code: &'static str) -> Diagnostic {
+    let mut diagnostic = Diagnostic::error(Category::TYPE, source, "message");
+    diagnostic.code = Some(code.to_owned());
+    diagnostic
+}
+fn selected(form: Form) -> Diagnostic {
+    let (code, message) = match form {
+        Form::Function => ("example-function-code", "a function needs more work"),
+        Form::Method => ("example-method-code", "a method needs more work"),
+    };
+    let _ = message;
+    emit(span, code)
+}
+fn selector(form: Form) -> Diagnostic {
+    emit(span, form.code("example-selector-a", "example-selector-b"))
+}
+"#,
+        );
+        assert_eq!(
+            scanned(std::slice::from_ref(&selection)),
+            [
+                "example-function-code",
+                "example-method-code",
+                "example-selector-a",
+                "example-selector-b",
+            ]
+        );
+
+        // Rule 8 (struct field named `code`, seeded from every struct literal in
+        // the same file that initializes such a field).
+        let field = unit(
+            "crates/wrela-example/src/field.rs",
+            r#"
+struct EscapeDiagnostic {
+    code: &'static str,
+    message: &'static str,
+}
+fn emit(source: Span, code: &'static str) -> Diagnostic {
+    let mut diagnostic = Diagnostic::error(Category::SYNTAX, source, "message");
+    diagnostic.code = Some(code.to_owned());
+    diagnostic
+}
+fn scan(decoded: DecodedEscape) -> Diagnostic {
+    emit(span, decoded.code)
+}
+fn decode() -> EscapeDiagnostic {
+    EscapeDiagnostic {
+        code: "example-field-code",
+        message: "invalid escape",
+    }
+}
+"#,
+        );
+        assert_eq!(
+            scanned(std::slice::from_ref(&field)),
+            ["example-field-code"]
+        );
+    }
+
+    #[test]
+    fn extraction_records_the_owning_crate_of_every_code() {
+        let scan = scan_diagnostic_codes(&[
+            DiagnosticSourceUnit {
+                crate_name: "wrela-first".to_owned(),
+                path: "crates/wrela-first/src/lib.rs".to_owned(),
+                text: "fn f() { diagnostic.code = Some(\"example-shared\".to_owned()); }"
+                    .to_owned(),
+            },
+            DiagnosticSourceUnit {
+                crate_name: "wrela-second".to_owned(),
+                path: "crates/wrela-second/src/lib.rs".to_owned(),
+                text: "fn f() { diagnostic.code = Some(\"example-shared\".to_owned()); \
+                       diagnostic.code = Some(\"example-owned\".to_owned()); }"
+                    .to_owned(),
+            },
+        ]);
+        assert!(scan.rejections.is_empty(), "{:?}", scan.rejections);
+        assert_eq!(
+            scan.codes
+                .get("example-shared")
+                .map(|owners| owners.iter().cloned().collect::<Vec<_>>()),
+            Some(vec!["wrela-first".to_owned(), "wrela-second".to_owned()])
+        );
+        assert_eq!(
+            scan.codes
+                .get("example-owned")
+                .map(|owners| owners.iter().cloned().collect::<Vec<_>>()),
+            Some(vec!["wrela-second".to_owned()])
+        );
+    }
+
+    #[test]
+    fn extraction_fails_closed_on_a_non_literal_construction_site() {
+        let scan = scan_diagnostic_codes(&[unit(
+            "crates/wrela-example/src/lint.rs",
+            "fn f() { diagnostic.code = Some(lint.as_str().to_owned()); }",
+        )]);
+        assert!(scan.codes.is_empty(), "{:?}", scan.codes);
+        assert_eq!(
+            scan.rejections
+                .iter()
+                .map(DiagnosticCodeRejection::describe)
+                .collect::<Vec<_>>(),
+            [
+                "crates/wrela-example/src/lint.rs:1 diagnostic code is not a literal: \
+                 `lint.as_str().to_owned()`"
+                    .to_owned()
+            ]
+        );
+        assert_eq!(
+            scan.rejections[0].path,
+            "crates/wrela-example/src/lint.rs".to_owned()
+        );
+        assert_eq!(
+            scan.rejections[0].expression,
+            "lint.as_str().to_owned()".to_owned()
+        );
+    }
+
+    #[test]
+    fn extraction_fails_closed_on_an_exported_code_carrier() {
+        let private = unit(
+            "crates/wrela-example/src/private.rs",
+            r#"
+fn emit(source: Span, code: &'static str) -> Diagnostic {
+    let mut diagnostic = Diagnostic::error(Category::TYPE, source, "message");
+    diagnostic.code = Some(code.to_owned());
+    diagnostic
+}
+fn call() { emit(span, "example-private-carrier"); }
+"#,
+        );
+        assert_eq!(
+            scanned(std::slice::from_ref(&private)),
+            ["example-private-carrier"]
+        );
+
+        // The same carrier, exported: its call sites may live in another file,
+        // so it must be refused rather than searched same-file only.
+        let exported = unit(
+            "crates/wrela-example/src/exported.rs",
+            r#"
+pub(crate) fn emit(source: Span, code: &'static str) -> Diagnostic {
+    let mut diagnostic = Diagnostic::error(Category::TYPE, source, "message");
+    diagnostic.code = Some(code.to_owned());
+    diagnostic
+}
+fn call() { emit(span, "example-exported-carrier"); }
+"#,
+        );
+        let scan = scan_diagnostic_codes(std::slice::from_ref(&exported));
+        assert!(scan.codes.is_empty(), "{:?}", scan.codes);
+        assert_eq!(
+            scan.rejections
+                .iter()
+                .map(DiagnosticCodeRejection::describe)
+                .collect::<Vec<_>>(),
+            [
+                "crates/wrela-example/src/exported.rs:4 diagnostic code is not a literal: \
+                 `code.to_owned()`"
+                    .to_owned()
+            ]
+        );
+    }
+
+    fn index_codes(entries: &[(&str, &str)]) -> BTreeMap<String, BTreeSet<String>> {
+        entries
+            .iter()
+            .map(|(code, owner)| ((*code).to_owned(), BTreeSet::from([(*owner).to_owned()])))
+            .collect()
+    }
+
+    #[test]
+    fn reconciliation_accepts_an_exact_index_and_names_drift_in_each_direction() {
+        let codes = index_codes(&[
+            ("example-first", "wrela-example"),
+            ("example-second", "wrela-example"),
+        ]);
+        let exact = render_diagnostic_index(&codes);
+        assert_eq!(
+            exact,
+            "\n```text\nexample-first wrela-example\nexample-second wrela-example\n```\n"
+        );
+        reconcile_diagnostic_index(&exact, &codes).expect("exact index");
+
+        let added =
+            reconcile_diagnostic_index("\n```text\nexample-first wrela-example\n```\n", &codes)
+                .expect_err("added code must fail");
+        assert!(
+            added.contains("added by source: [\"example-second\"]"),
+            "{added}"
+        );
+
+        let removed = reconcile_diagnostic_index(
+            "\n```text\nexample-first wrela-example\nexample-second wrela-example\n\
+             example-third wrela-example\n```\n",
+            &codes,
+        )
+        .expect_err("removed code must fail");
+        assert!(
+            removed.contains("removed from source: [\"example-third\"]"),
+            "{removed}"
+        );
+
+        let duplicated = reconcile_diagnostic_index(
+            "\n```text\nexample-first wrela-example\nexample-first wrela-example\n\
+             example-second wrela-example\n```\n",
+            &codes,
+        )
+        .expect_err("duplicate code must fail");
+        assert!(
+            duplicated.contains("duplicated in the index: [\"example-first (2 entries)\"]"),
+            "{duplicated}"
+        );
+
+        let reowned = reconcile_diagnostic_index(
+            "\n```text\nexample-first wrela-other\nexample-second wrela-example\n```\n",
+            &codes,
+        )
+        .expect_err("owner drift must fail");
+        assert!(
+            reowned.contains(
+                "owner drift: [\"example-first: documented wrela-other, source wrela-example\"]"
+            ),
+            "{reowned}"
+        );
+    }
+
+    #[test]
+    fn workspace_diagnostic_codes_have_only_the_declared_non_literal_exclusions() {
+        let root = workspace_root().expect("workspace root");
+        let units = collect_diagnostic_sources(&root).expect("diagnostic sources");
+        let scan = scan_diagnostic_codes(&units);
+        assert_eq!(
+            scan.rejections
+                .iter()
+                .map(|rejection| (rejection.path.clone(), rejection.expression.clone()))
+                .collect::<Vec<_>>(),
+            DIAGNOSTIC_CODE_EXCLUSIONS
+                .iter()
+                .map(|exclusion| (exclusion.path.to_owned(), exclusion.expression.to_owned()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            scan.codes
+                .values()
+                .flatten()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            strings(&["wrela-hir-lower", "wrela-sema", "wrela-syntax"])
+        );
+    }
+
+    #[test]
+    fn exclusion_reconciliation_rejects_undeclared_and_stale_non_literal_sites() {
+        let rejection = DiagnosticCodeRejection {
+            path: "crates/wrela-example/src/lint.rs".to_owned(),
+            line: 7,
+            context: "diagnostic code is not a literal".to_owned(),
+            expression: "lint.as_str().to_owned()".to_owned(),
+        };
+        let declared = [DiagnosticCodeExclusion {
+            path: "crates/wrela-example/src/lint.rs",
+            expression: "lint.as_str().to_owned()",
+            reason: "lint findings carry the registered lint name",
+        }];
+        reconcile_diagnostic_exclusions(std::slice::from_ref(&rejection), &declared)
+            .expect("declared exclusion");
+
+        let undeclared = reconcile_diagnostic_exclusions(std::slice::from_ref(&rejection), &[])
+            .expect_err("undeclared non-literal site must fail");
+        assert!(
+            undeclared.contains(
+                "crates/wrela-example/src/lint.rs:7 diagnostic code is not a literal: \
+                 `lint.as_str().to_owned()`"
+            ),
+            "{undeclared}"
+        );
+
+        let stale =
+            reconcile_diagnostic_exclusions(&[], &declared).expect_err("stale exclusion must fail");
+        assert!(
+            stale.contains(
+                "declared diagnostic-code exclusions no longer exist in source: \
+                 [\"crates/wrela-example/src/lint.rs `lint.as_str().to_owned()`\"]"
+            ),
+            "{stale}"
+        );
+    }
+
+    #[test]
+    fn documented_diagnostic_index_matches_workspace_sources() {
+        let root = workspace_root().expect("workspace root");
+        check_diagnostic_index(&root).expect("diagnostic index");
     }
 }

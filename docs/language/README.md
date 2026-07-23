@@ -45,6 +45,9 @@ request, public effects are visible, and modules and build phases are defined.
     corrected block-driver/filesystem/app slice (**aspirational**).
 13. [Design decisions](design-decisions.md) — non-normative reconciliation of
     the source discussions and explicit exclusions.
+14. [Diagnostic code index](diagnostic-index.md) — non-normative, the enumerated
+    and drift-checked set of stable `Diagnostic::code` values with their owning
+    crate (`cargo xdiag`).
 
 ### Audience paths (one language, two vocabularies)
 

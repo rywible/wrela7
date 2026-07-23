@@ -8,6 +8,7 @@ WRELA_LLVM_PREFIX = "/opt/homebrew/opt/llvm"
 [alias]
 xtask = "run --locked --offline --package xtask --"
 xarch = "run --locked --offline --package xtask -- architecture-check"
+xdiag = "run --locked --offline --package xtask -- diagnostic-index"
 xcheck = "run --locked --offline --package xtask -- check"
 xtest = "run --locked --offline --package xtask -- test"
 xlint = "run --locked --offline --package xtask -- lint"
